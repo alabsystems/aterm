@@ -99,6 +99,10 @@ GOTCHAS
   * Containment precedence: explicit flag > $ATERM_CONTAINMENT_MODE > default `user`;
     a malformed mode fails CLOSED to `containment`. The OS sandbox is actuated on macOS
     only; elsewhere it is rlimits + capability gate, and aterm says so on stderr.
+  * macOS: `Operation not permitted` on a file macOS treats as private is privacy consent
+    (TCC), not a broken tool — and it can arrive with NO dialog at all. `aterm doctor` has a
+    `privacy:` row, `aterm ctl privacy` has the whole posture, and `aterm help permissions`
+    says what to do about it. Only a human can grant it; aterm cannot.
   * `-h`/`--help` prints the terse CLI usage; `aterm help` (this manual) is the full guide."#,
         ),
     },
@@ -228,21 +232,27 @@ WHAT IT IS
   The batteries behind aterm. atpkg installs and keeps current the toolchain
   programs published by one configurable account (trust, clean, ay, ny, ...) —
   and if you launched the aterm app, it has already run: first launch records
-  adoption and then fills the store FROM THE SIGNED NETWORK INDEX, and the windowed
-  app updates it from then on (CLI-only use never auto-updates; see GOTCHAS). The
-  download is the lean app alone — the sealed offline seed was retired on
-  there is no sealed offline seed any more, so first launch needs a network. Think "rustup
-  married to a silent updater". Nothing installs except through a
-  compile-time-pinned Ed25519 offline root key over a signed, freshness-stamped
-  index, and verification happens BEFORE any parse, enforced by construction: the
-  only way to get the bytes the parser consumes is to pass a verify function —
-  handing it unverified bytes does not type-check. `atpkg run` is the engine
-  behind the `aterm <tool>` launcher.
+  adoption and installs the ALab toolset over the signed network index, unattended
+  (adoption IS the consent; the one thing disclosed up front is size, summed from
+  the signed cost rows), and the windowed app updates it from then on (CLI-only
+  use never auto-updates; see GOTCHAS). Think "rustup married to a silent
+  updater". Nothing installs except under the one trust root aterm itself updates
+  under: a PAPER MASTER (public key compiled in; secret half on paper, on no
+  computer) signs the roster of MACHINE keys, and a machine on that roster signs
+  the freshness-stamped index and every package manifest — `aterm pkg doctor`
+  prints the anchor as `paper master pinned (fingerprint …)`. Verification happens
+  BEFORE any parse, enforced by construction: the only way to get the bytes the
+  parser consumes is to pass a verify function — handing it unverified bytes does
+  not type-check. `atpkg run` is the engine behind the `aterm <tool>` launcher,
+  and atpkg also OWNS the seams the Trust toolchain reaches you through — rustup's
+  `trust` link, PATH, and a checkout's toolchain pins — which is why `aterm pkg
+  doctor` is the first thing to run when a build says a toolchain is missing.
 
 KEY USAGE (spelled as you type them — daily verbs first)
   aterm pkg install --default-set
-                             the whole ALab toolset in one step — the usual first
-                             command (the app's first GUI launch already ran it)
+                             the whole ALab toolset in one step — the documented
+                             consent act, and the usual first command on a CLI-only
+                             box (the app's first launch runs it unattended)
   aterm pkg list             what you have: each program's live build, plus builds
                              kept for rollback — local, no network. Human table on
                              a terminal; pipe it (or pass --porcelain) for the
@@ -280,21 +290,22 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              opt-in
   aterm pkg run <tool> [-- args]
                              exec the store binary — what `aterm <tool>` dispatches to
-  aterm pkg seed             the first-launch bootstrap, runnable by hand. Since the
-                             sealed seed was retired (2026-08-26) a lean install has
-                             nothing to unpack: it RECORDS ADOPTION — the consent
-                             seam — lays pending stubs for the default set, and
-                             leaves the fetching to `update`, which pulls from the
-                             signed network index. The GUI runs it once per launch;
-                             [packages].seed_install=false turns it from install
-                             into announce-only. Releases cut before 2026-08-26
-                             still carry a seal, and this is what reads it.
+  aterm pkg seed             the first-launch bootstrap, runnable by hand. On a
+                             lean app (every release since v0.63.0) it records
+                             adoption, lays a pending stub for each default-set
+                             name so the tools answer on PATH before their bytes
+                             land, and consults the signed index — so it is NOT
+                             offline; the update pass right behind it does the
+                             installing. Only a pre-v0.63 seeded bundle fills the
+                             store from its own bundled registry. The GUI
+                             runs it once per launch; [packages].seed_install=false
+                             turns it from adopt-and-install into announce-only
 
 OCCASIONAL (recovery and preference)
   aterm pkg uninstall <program> | --all
                              remove one program, or the WHOLE managed toolset and its
-                             disk (~4 GB for the full default set, of which trust is
-                             ~3.2 GB) in one step — the way out is as single-step
+                             disk (the signed on-disk sum — about 4 GiB today) in one
+                             step — the way out is as single-step
                              as the way in. Either form stops atpkg auto-completing the
                              set; [packages].exclude drops one program while keeping it
   aterm pkg rollback <program>
@@ -322,20 +333,47 @@ WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see
   what's installed. The managed tools do their own work; atpkg is what lays them down.
   Distinct from `targo --unverified ship`/aterm-release (which CUTS aterm.app itself).
+  When a toolchain looks MISSING: rustup's exact words `error: toolchain 'trust' is not
+  installed` mean the `trust` link under ~/.rustup no longer reaches the managed store.
+  Run `aterm pkg doctor` — it names the seam that broke — and `aterm pkg doctor --fix`
+  re-asserts it through the same code the install pass runs. Never rebuild a toolchain
+  from source to answer that message.
+  When a foreign shell needs the tools: `eval "$(aterm pkg shellenv)"` — the one export
+  line, PATH APPENDED, for the shell you are in (the same line doctor shows; no rc file
+  is written).
+  When you want the seams spelled out — which rustup link, which PATH hook, which
+  checkout pins, and what each currently points at — `aterm pkg seam` lists them.
 
 GOTCHAS (in the order they bite)
   * PATH: the managed tools are on PATH only in shells started inside aterm (shell.d
     APPENDS the managed bin/, never shadowing system sudo/ssh/git). In a plain
-    Terminal.app, over ssh, or in CI, use `aterm <tool>` or the export line
-    `aterm pkg doctor` prints. Nothing writes into ~/.zshrc, by design.
+    Terminal.app, over ssh, or in CI, use `aterm <tool>` or `eval "$(aterm pkg
+    shellenv)"` — the same export line `aterm pkg doctor` prints. Nothing writes into
+    ~/.zshrc, by design. And bin/ NEVER carries a `cargo`, `rustc`, or `rustup` shim
+    (those names are on the sensitive-shim deny-list): cargo reaches the compiler
+    through rustup's `trust` toolchain link, which atpkg points at `store/trust/current`
+    and re-asserts on every install and update pass — a store update moves the
+    compiler without touching rustup.
   * AUTOMATIC updates ride the windowed app: `aterm --window` runs the update pass on a
     6h loop (ATPKG_UPDATE_INTERVAL_SECS), and the app's own self-update check is likewise
     window-only. Headless or CLI-only usage updates NOTHING automatically — run
-    `aterm pkg update` explicitly, or drive it from a scheduler (launchd/cron).
-  * The root anchor is COMPILED IN — a committed constant (aterm-update-core::pins), not a
-    build env var — so a plain `targo --unverified build` is fully armed. The kill switch is
-    ATPKG_DISABLE: set it and the network verbs (install/update/rollback) refuse with
-    exit 1; local read/maintenance verbs (list/which/run/doctor/verify/...) still work.
+    `aterm pkg update` explicitly, or drive it from a scheduler (launchd/cron). Every
+    update pass, automatic or by hand, also re-asserts the seams and the shell.d hooks,
+    so a pass that moved no bytes still repairs a link or hook that drifted.
+  * The root anchor is COMPILED IN — the paper master's public key, a committed constant
+    (aterm-update-core::pins::PAPER_MASTER_PUBKEYS), not a build env var — so a plain
+    `targo --unverified build` is fully armed. There is no atpkg-specific root and no
+    rotatable release key any more: the machine keys the paper master's roster names
+    sign everything, and a revoked machine stops being trusted at the next index fetch,
+    with no aterm rebuild. The kill switch is ATPKG_DISABLE: set it and the network
+    verbs (install/update/rollback) refuse with exit 1; local read/maintenance verbs
+    (list/which/run/doctor/verify/...) still work.
+  * `aterm pkg doctor` is the truth about THIS machine, not this page: every check
+    prints ok / warn / FAIL. `--strict` makes a warn exit non-zero (for gates and
+    scripts), `--porcelain` prints the stable one-check-per-line form for parsers, and
+    `--fix` repairs what it can — the rustup link and the PATH hook first — through the
+    same owner code the install pass runs, never a second implementation. What --fix
+    cannot repair it names, with the verb that can.
   * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
     test-pinned to the dispatch table — it never advertises a verb that does not run."#,
         ),
@@ -363,16 +401,22 @@ KEY USAGE
                                  gate: exit 0 only if the selector matches >=1 obligation
                                  and ALL selected are proved (an empty report is NOT a proof)
   targo trust doctor | solvers   backend health; expect `ready: true`, `available: 6/6`
-  targo / trustc                 drop-in cargo / rustc that VERIFY by default
-  targo --unverified <cmd>       …the opt-out: an ordinary, vanilla-Rust build
-                                 (`-Ztrust-verify=off` is the same switch)
+  trustc                         a drop-in rustc that VERIFIES by default
+                                 (`-Ztrust-verify=off` compiles as vanilla Rust)
+  targo <cmd>                    REFUSED. targo has exactly two lanes and neither
+                                 is silent — pick one:
+  targo trust <cmd>                VERIFIED: fail-closed, with a per-unit proof
+                                   report and a dependency-TCB ledger
+  targo --unverified <cmd>         UNVERIFIED: the proof pipeline is off, and the
+                                   artifact carries no proof claim
   aterm pkg install trust        install/upgrade the prebuilt toolchain (signed network index)
 
 WHEN TO REACH FOR IT
   Use `targo trust check` whenever the goal is to compile AND prove real Rust — it is the
-  only tool that reaches MIR-level invariants. Use `targo --unverified` for an ordinary
-  vanilla-Rust build — plain `targo`/`trustc` verify, which is why this repo's own
-  .cargo/config.toml passes `-Ztrust-verify=off`. Reach for a leaf prover (ay/ty/clean/...) directly only to debug that backend.
+  only tool that reaches MIR-level invariants. `targo --unverified` is the ordinary
+  vanilla-Rust build; a bare `targo build` is refused rather than quietly unverified,
+  which is why every command in this manual names a lane. (`trustc` on its own DOES
+  verify — that is why this repo's .cargo/config.toml passes `-Ztrust-verify=off`.) Reach for a leaf prover (ay/ty/clean/...) directly only to debug that backend.
 
 GOTCHAS
   * INSTALL: a prebuilt, self-contained sysroot SHIPS — `aterm pkg install trust`, or the
@@ -583,6 +627,23 @@ GOTCHAS
     ONNX/.pt. `--verify` is a report request, feature-gated."#,
         ),
     },
+];
+
+/// The dispatchable pages that are NOT [`TOPICS`] entries — generated, or named
+/// after a verb rather than a tool. One list, because it was two: the unknown-topic
+/// listing and its test each carried their own copy, so a page could be added to
+/// one and stay invisible in the other. `agent` also answers to `instructions`,
+/// which is an alias rather than a page.
+const EXTRA_PAGES: &[&str] = &[
+    "config",
+    "ship",
+    "update",
+    "windowing",
+    "drive",
+    "fleet",
+    "trust-backends",
+    "permissions",
+    "agent",
 ];
 
 /// Every `help <topic>` key, in display order — used by the completeness gate to
@@ -824,6 +885,92 @@ COMMANDS
   aterm help introspection the control protocol underneath
 "#;
 
+/// The folders macOS asks about, named from the consent module's own table
+/// instead of typed here.
+///
+/// Two reasons, and the second is the load-bearing one. The path literals live
+/// in exactly ONE module (`aterm_containment::consent`) and reach the CLI as
+/// data — design §3.3 guardrail 4, fenced by `tools/grep_guard.sh` B13 — and
+/// this is also what stops the manual from drifting away from the list the
+/// warm-up and `aterm ctl privacy` actually use. These are folder NAMES in
+/// prose, never a path anything opens.
+fn protected_folder_names() -> String {
+    aterm_containment::Folder::ALL
+        .iter()
+        .map(|f| f.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `aterm help permissions` — design §5.5, the page an agent lands on after an
+/// EPERM it did not cause.
+///
+/// Generated rather than a `const` so the folder list comes from
+/// [`protected_folder_names`]. Every claim here is one an agent otherwise gets
+/// wrong in a way that costs a session: that a missing dialog means it is not a
+/// permissions wall, that retrying might work, that `sudo` is the escalation, or
+/// that aterm could grant this if it wanted to.
+///
+/// What it deliberately does NOT say is that the grant ends macOS consent
+/// dialogs. Which services a grant covers is not measured (design §7 S4), so the
+/// page describes what the grant is and stops there.
+fn permissions_page() -> String {
+    let folders = protected_folder_names();
+    format!(
+        "\
+permissions — macOS privacy (TCC), and the EPERM that arrives with no dialog
+
+WHAT YOU ARE SEEING
+  `Operation not permitted` (EPERM) is macOS PRIVACY when the path is under one of the
+  folders macOS protects ({folders}), an external or network volume, a
+  folder another app syncs for you, or another app's private data. Not a broken tool, not
+  a bad path, and not a bug in aterm. It can arrive with NO DIALOG AT ALL, so \"nothing
+  popped up\" does not mean this is not a permissions wall — and when a dialog IS raised,
+  it is a system modal only a human can answer, the syscall that raised it is parked until
+  they do, and it never times out.
+
+WHAT TO DO, IN ORDER
+  1. `aterm ctl privacy`               the whole posture, before you retry anything.
+  2. Read `full_disk_access=`, `prompt_possible=`, and your own session's `fs_consent=`
+     and `attribution=` (`aterm ctl @<sid> status` carries the last two per session).
+  3. Tell your operator what you found. If `full_disk_access=denied`, one grant in
+     System Settings ▸ Privacy & Security ▸ Full Disk Access removes this class of
+     interruption for the folders that grant covers. YOU cannot grant it, and neither
+     can aterm — only a human, in Settings.
+  4. `aterm ctl @<sid> await consent timeout=<ms>` parks until the posture CHANGES.
+     A latch means aterm's own posture moved; aterm cannot see what a human clicked.
+
+WHAT NOT TO DO
+  * Do not retry in a loop. macOS asks a human once and remembers the answer; a retry
+    either hits the same wall or parks another syscall behind the same unanswered dialog.
+  * Do not `sudo`. Privacy consent is per-app, not per-user: root does not carry it, and
+    the same denial applies.
+  * Do not rewrite the path, copy the file somewhere else, or work around it silently.
+    The operator ends up with a result they cannot reproduce and never learns why.
+  * Do not report the tool as broken. Name the wall: which path, and what `privacy` said.
+
+WHY IT NAMES ATERM, NOT YOUR TOOL
+  macOS keys file access to the RESPONSIBLE process, and every program started inside a
+  session inherits aterm as that process. So the alert names aterm however deep the
+  process tree goes, and a grant made for aterm is what the program you ran gets. Run from
+  a shell under another terminal, the verdict belongs to THAT terminal instead — which is
+  why `aterm doctor`'s `privacy:` row names the responsible app rather than assuming
+  itself.
+
+GOTCHAS
+  * `attribution=adopted` means this session outlived the aterm process that started it
+    (an update was applied in place; your shell kept running). Its file access may differ
+    from a fresh tab's — opening a new tab is a valid recovery, and cheap.
+  * Per-folder state is `unknown` BY CONSTRUCTION: the only way to learn whether a folder
+    is readable is to read it, which is the very act that raises the prompt. `unknown` is
+    not `denied`, and neither is inferred from the Full Disk Access state.
+  * A dev build's grants do not persist: its code identity changes on every build, and
+    macOS keys the grant to that identity. `aterm doctor` says so when it applies.
+  * This whole page is macOS. Elsewhere an EPERM is an ordinary permission error.
+"
+    )
+}
+
 /// `aterm help fleet`. `fleet` was a front-door verb aliased onto the
 /// introspection page, whose entire fleet content was four lines — while the
 /// verb carries a whole claim lifecycle nothing documented.
@@ -1009,6 +1156,31 @@ fn agent_page(sid: Option<&str>) -> String {
          If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
          unreadable token) — act on the reason; it never means \"empty\" unless it says so.\n",
     );
+    // §5.5. This sits BEFORE the tool list because it is the failure an agent
+    // meets first and misreads worst: an EPERM that no dialog announced reads as
+    // a broken tool, and the recovery an agent reaches for by reflex — retry,
+    // then `sudo`, then a different path — is wrong three times over. The folder
+    // names come from the consent module (grep_guard B13); the page behind
+    // `aterm help permissions` carries the rest.
+    let _ = write!(
+        s,
+        "\nMACOS FILE PERMISSIONS (an EPERM that may arrive with no dialog)\n  \
+         `Operation not permitted` on a path under one of the folders macOS protects\n  \
+         ({}), an external or network volume, a folder another app syncs\n  \
+         for you, or another app's private data is macOS privacy — not a broken tool — and\n  \
+         it can arrive with NO DIALOG AT ALL, so \"nothing popped up\" does not mean this is\n  \
+         not a permissions wall. Run `aterm ctl privacy` BEFORE retrying. Do not retry in a\n  \
+         loop, do not `sudo`, do not rewrite the path: macOS asks a human once and remembers\n  \
+         the answer, and an unanswered dialog never times out. If `full_disk_access=denied`,\n  \
+         tell your operator that one grant in System Settings ▸ Privacy & Security ▸ Full\n  \
+         Disk Access removes this class of interruption for the folders that grant covers —\n  \
+         you cannot grant it and neither can aterm. `aterm ctl @<sid> await consent\n  \
+         timeout=<ms>` parks until the posture changes. If `attribution=adopted`, this\n  \
+         session outlived the aterm process that started it and its file access may differ\n  \
+         from a fresh tab's — opening a new tab is a valid recovery.\n  \
+         Full page: `aterm help permissions`.\n",
+        protected_folder_names(),
+    );
     s.push_str(
         "\nENV HYGIENE (why your agent context vars may be missing)\n  \
          aterm STRIPS AI-agent context variables from the shell it spawns — every CLAUDE*,\n  \
@@ -1101,6 +1273,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("update") => (UPDATE_PAGE.to_string(), 0),
         Some("windowing") => (WINDOWING_PAGE.to_string(), 0),
         Some("drive") => (DRIVE_PAGE.to_string(), 0),
+        Some("permissions") => (permissions_page(), 0),
         Some("fleet") => (FLEET_PAGE.to_string(), 0),
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
@@ -1122,16 +1295,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
                 }
                 // The pages that are not TOPICS entries: generated or
                 // verb-shaped, but every bit as real to someone guessing.
-                for extra in [
-                    "config",
-                    "ship",
-                    "update",
-                    "windowing",
-                    "drive",
-                    "fleet",
-                    "trust-backends",
-                    "agent",
-                ] {
+                for extra in EXTRA_PAGES {
                     let _ = writeln!(msg, "  {extra}");
                 }
                 (msg, 2)
@@ -1218,7 +1382,7 @@ mod tests {
     fn the_unknown_topic_listing_names_the_extra_pages() {
         let (msg, code) = render(Some("no-such-topic"), None);
         assert_eq!(code, 2);
-        for extra in ["config", "ship", "update", "windowing", "drive", "agent"] {
+        for extra in EXTRA_PAGES {
             assert!(msg.contains(extra), "the listing omits {extra}: {msg}");
         }
     }
@@ -1303,6 +1467,118 @@ mod tests {
             page.contains("`aterm ctl help` prints the short catalog; `aterm ctl help <verb>` the full entry for one verb."),
             "the manual must say where the short and per-verb forms live"
         );
+    }
+
+    /// Every page in [`EXTRA_PAGES`] dispatches. The listing is what a guessing
+    /// reader is told exists, so a name in it that answers "unknown topic" is
+    /// worse than no listing at all.
+    #[test]
+    fn every_extra_page_dispatches() {
+        for name in EXTRA_PAGES {
+            let (page, code) = render(Some(name), None);
+            assert_eq!(code, 0, "extra page {name} should render 0");
+            assert!(!page.trim().is_empty(), "extra page {name} rendered empty");
+        }
+    }
+
+    /// `aterm help permissions` (design §5.5) — every load-bearing point, each
+    /// one a thing an agent otherwise gets wrong at real cost.
+    #[test]
+    fn the_permissions_page_teaches_the_whole_eperm_recovery() {
+        let (page, code) = render(Some("permissions"), None);
+        assert_eq!(code, 0);
+        for needle in [
+            // it is privacy, and the absence of a dialog proves nothing
+            "Operation not permitted",
+            "NO DIALOG AT ALL",
+            "never times out",
+            // the one first move
+            "`aterm ctl privacy`",
+            "before you retry",
+            // the three reflexes that are wrong
+            "Do not retry in a loop",
+            "Do not `sudo`",
+            "Do not rewrite the path",
+            // who can fix it, and who cannot
+            "Full Disk Access",
+            "can aterm — only a human",
+            // the handoff case, and the cheap recovery
+            "attribution=adopted",
+            "opening a new tab is a valid recovery",
+            // the await verb
+            "await consent",
+        ] {
+            assert!(
+                page.contains(needle),
+                "permissions page missing {needle:?}\n{page}"
+            );
+        }
+        // The folder names come from the consent module's own table, not from a
+        // literal typed into this file (grep_guard B13).
+        for folder in aterm_containment::Folder::ALL {
+            assert!(
+                page.contains(folder.as_str()),
+                "permissions page does not name the {} folder\n{page}",
+                folder.as_str()
+            );
+        }
+    }
+
+    /// The honesty posture the owner ruled on: aterm may say the grant removes
+    /// this CLASS of interruption for the folders it covers, and may not say it
+    /// ends prompts. No page may promise elimination, and none may ask for a
+    /// fresh launch (grep_guard B12).
+    #[test]
+    fn no_permissions_text_overclaims_or_asks_for_a_relaunch() {
+        let pages = [
+            render(Some("permissions"), None).0,
+            render(None, Some("s-abc123")).0,
+            render(Some("aterm"), None).0,
+        ];
+        for page in &pages {
+            let lower = page.to_ascii_lowercase();
+            for banned in [
+                "no more prompts",
+                "removes all prompts",
+                "eliminates",
+                "restart",
+                "relaunch",
+                "reopen",
+                "next launch",
+            ] {
+                assert!(!lower.contains(banned), "a page says {banned:?}\n{page}");
+            }
+        }
+    }
+
+    /// The agent brief is where an agent lands by default inside a session, so
+    /// the EPERM paragraph has to be THERE, not only behind a topic it would
+    /// have to know to ask for.
+    #[test]
+    fn the_agent_brief_carries_the_macos_permission_gotcha() {
+        let (page, _) = render(None, Some("s-abc123"));
+        for needle in [
+            "MACOS FILE PERMISSIONS",
+            "NO DIALOG",
+            "`aterm ctl privacy` BEFORE retrying",
+            "do not `sudo`",
+            "attribution=adopted",
+            "aterm help permissions",
+        ] {
+            assert!(
+                page.contains(needle),
+                "agent brief missing {needle:?}\n{page}"
+            );
+        }
+    }
+
+    /// The front-door page's GOTCHAS name it too, and point at the deep dive —
+    /// this is the list a human reads before they ever see a dialog.
+    #[test]
+    fn the_aterm_page_gotchas_name_macos_privacy() {
+        let (page, _) = render(Some("aterm"), None);
+        assert!(page.contains("Operation not permitted"), "{page}");
+        assert!(page.contains("aterm help permissions"), "{page}");
     }
 
     #[test]

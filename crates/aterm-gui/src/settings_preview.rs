@@ -334,6 +334,11 @@ impl CursorPreviewSpec {
         crate::app_config::resolve_trail_style(self.effective_trail_style_raw(), &empty)
     }
 
+    fn resolved_trail_presentation(&self) -> crate::app_config::ResolvedTrailPresentation {
+        let raw = self.effective_trail_style_raw();
+        crate::app_config::resolve_trail_presentation_from_style(raw, self.resolved_trail_style())
+    }
+
     /// Match the runtime's broad-style gate plus its raw-token companion
     /// predicates. A non-pet rainbow spelling owns the flying kitty — the
     /// historical `nyan` / `rainbow` aliases and the explicit `… flying`
@@ -346,16 +351,11 @@ impl CursorPreviewSpec {
     /// resident now, exactly like the `rainbow kitty` it is a geometry of; this
     /// preview follows because it asks the engine's own predicate.
     pub(crate) fn trail_companion(&self) -> PreviewTrailCompanion {
-        if self.resolved_trail_style().style != Some(GlowStyle::RainbowKitty) {
+        let presentation = self.resolved_trail_presentation();
+        if presentation.style.style != Some(GlowStyle::RainbowKitty) {
             return PreviewTrailCompanion::None;
         }
-        let raw = self.effective_trail_style_token();
-        if GlowStyle::style_names_any_pet(raw) {
-            let species = if GlowStyle::style_names_dog_pet(raw) {
-                aterm_effects::kitty_pet::PetSpecies::Dog
-            } else {
-                aterm_effects::kitty_pet::PetSpecies::Cat
-            };
+        if let Some(species) = presentation.pet_species {
             PreviewTrailCompanion::Pet(species)
         } else {
             PreviewTrailCompanion::FlyingKitty
@@ -363,10 +363,10 @@ impl CursorPreviewSpec {
     }
 
     fn glow_config(&self, theme: Theme, head_dx: f32) -> crate::cursor_glow::GlowConfig {
+        let presentation = self.resolved_trail_presentation();
         crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: self.trail_enabled,
-                style_raw: self.effective_trail_style_raw(),
                 color: self.color,
                 accent: self.accent,
                 duration_ms: self.duration_ms,
@@ -376,7 +376,7 @@ impl CursorPreviewSpec {
                 ring: self.ring,
                 wake_persist_s: self.wake_persist_s,
             },
-            self.resolved_trail_style(),
+            presentation,
             theme.cursor,
             aterm_render::theme_is_dark(theme.bg),
             // The preview HAS a theme in scope and no Terminal, so there is

@@ -19,6 +19,16 @@
 //! [`crate::spectrum::generate_spectrum_lut`] joins adjacent anchors with a smooth per-channel
 //! interpolation. The anchors themselves are stored verbatim.
 //!
+//! # The pace
+//!
+//! The arc is DRAWN in one coordinate and SAMPLED in another. The drawing
+//! coordinate is the path ([`crate::spectrum::SPECTRUM_STRIDE`]), where every
+//! authored position in this file lives; the table is then resampled from it so
+//! that equal steps of `t` are equal steps of PERCEIVED colour
+//! ([`crate::spectrum::SPECTRUM_PACE_HUE_SHARE`]), with the green→blue crossing
+//! exempt and fast. A ribbon reads one entry per cell, so this is what makes a
+//! typed line a sweep instead of a set of vertical stripes.
+//!
 //! # Cyan policy
 //!
 //! The continuous green-to-blue leg necessarily crosses cyan. The dense-walk
@@ -30,9 +40,9 @@
 //!
 //! [`crate::spectrum::SPECTRUM_LUT`] contains
 //! [`crate::spectrum::SPECTRUM_LUT_LEN`] (`511`) `0x00RRGGBB` entries,
-//! or just under 2 KiB. The seven anchors land exactly at `85 * i`
-//! ([`crate::spectrum::SPECTRUM_STRIDE`]). A spectrum read is two adjacent table lookups plus one
-//! lerp.
+//! or just under 2 KiB. The seven anchors land exactly on the indices
+//! [`crate::spectrum::SPECTRUM_ANCHOR_AT`] names, and are stored verbatim
+//! there. A spectrum read is two adjacent table lookups plus one lerp.
 
 use crate::effect_util::lerp_rgb;
 
@@ -99,19 +109,109 @@ pub const SPECTRUM_STOPS: usize = 7;
 /// blue: a hole where a seventh of the rainbow should be, measured at median
 /// `S 0.38`, hue `171°` over a 244-frame capture.
 ///
+/// # …and what 2026-08-31 measured about its WIDTH
+///
+/// The owner, four times, most recently *"FIX that grey band that's really
+/// fucking stupid"*. Measured on a 76-key line at 90 ms, band row `y = 112`,
+/// shipped default on Nord: the band is continuous red→violet with ZERO cyan
+/// violations and `S 0.54 – 0.79` everywhere EXCEPT the crossing, where **two
+/// whole ribbon slabs** — columns `684..713`, `30` device pixels — read
+/// `S 0.195` at hue `180.0°` and `S 0.222` at hue `200.8°`, between flanks at
+/// `S 0.566` and `S 0.526`.
+///
+/// **THE SATURATION IS THE RULING WORKING, SO THE ONLY LEVER IS WIDTH, AND
+/// WIDTH IS COUNTED IN SLABS.** `emit_rainbow_ribbon` tiles a long mark at ONE
+/// slab per cell (`rainbow_ribbon_stride` spends the quad budget on length, not
+/// sub-cell resolution) and each slab is ONE [`spectrum`] read, so the pale zone
+/// is `paled table entries ÷ entries-per-cell` and its floor is one slab —
+/// `15` device pixels at the shipped retina metrics. A sub-slab seam is not
+/// reachable by any colour law, and **since 2026-08-31 the shipped band is AT
+/// that floor**: the same capture, same line, same ground now reads one slab.
+///
+/// **AND THE PALED SPAN WAS SET BY THE COMPOSITE, NOT BY THE ARC'S OWN HUES.**
+/// [`clear_light_of_cyan`] judges the PIXEL. A bed quad at the crossing's
+/// legibility cap (`60/61`, i.e. `~24 %` coverage) is three parts ground to one
+/// part arc, so the shipped ground's `222.9°` dragged a green at RAW hue `146°`
+/// to a composited `166°` — inside the window. Measured through the bed's own
+/// law at the bed's own coverage, the palable band was a band of raw hue about
+/// `146° .. 201°`: **`55°`**, against the ruling's own `35°`, and every degree
+/// of it had to be crossed. Of the fourteen entries that paled, **seven were
+/// the roof and seven were the APPROACH FLANK** — arc hues `149° .. 160°`,
+/// nowhere near the window, dragged into it by the ground alone.
+///
+/// **SO THE DRAG IS GONE (2026-08-31): `super::cursor_glow`'s
+/// `rainbow_bed_true_hue` gives it back.** The bed solves for the ink whose
+/// COMPOSITE lands on the arc's own hue, so the glass shows the rainbow this
+/// table authors instead of that rainbow leaning `14°` toward the page. Two
+/// things follow and both are why this constant could then move:
+///
+/// * the palable band collapses from `55°` of raw hue to the window's own
+///   `~39°` — the flank stops being palable at all, because the flank's
+///   composite now wears the flank's hue;
+/// * and the arc's hue PACING is at last the pacing on the glass, so
+///   `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole`'s budget
+///   (`18° + 640/cw`, tightest `53.6°` per `14.2` entries at `cw = 18`) is
+///   being spent on the thing it is measuring.
+///
+/// **WHAT THIS RE-PACE THEN BUYS.** The roof spans `160° → 208°` — `48°` in
+/// seven steps of `5.3–8.7°` — starting at slot `40` instead of `39`, with the
+/// inner pacing knots pulled in to `33` and `52` to pay for it. The window's
+/// upper shoulder (`204°`) is now cleared by the roof's own last sample instead
+/// of eight slots later on the exit ramp, which is where six of the surviving
+/// paled entries used to sit. Measured through the bed's own law on the shipped
+/// Nord ground: **`14` paled table entries → `5`**, and on a real capture of
+/// the owner's own 76-key line at 90 ms the paled ribbon run falls
+/// **2 slabs → 1** — `30` device pixels of grey to `15`, flanked by `S 0.46`
+/// green and `S 0.56` blue with zero cyan violations in the frame.
+/// `the_crossing_is_a_seam_not_a_region` pins both.
+///
+/// **THE OTHER LEVER WAS MEASURED AND IT IS CAPPED.** Trading brightness for
+/// coverage at the crossing (a darker, denser crossing composites the same light
+/// with less ground in the mix) does narrow the palable band — measured at equal
+/// composited luma on Nord: `52°` at `cov 62`, `53°` at `85`, `47°` at `120`,
+/// `45°` at `160`, `40°` at `240`. It buys at most a fifth, and it cannot be
+/// spent here: at `cov 240` the crossing's value is `V 0.40`, which is BELOW
+/// indigo, and `spectrum_stays_saturated_across_the_whole_arc` requires the
+/// arc's darkest entry to be an authored anchor; the roof's knots would also
+/// fall to chroma `55` against [`spectrum_roof_hsv`]'s floor of `100`. The
+/// honest ceiling for that lever is `V 0.51` (indigo's own), which is `cov 157`,
+/// `45°`, and still under the knot floor. The hue the ground steals was the
+/// bigger half and it is free.
+///
 /// # What the roof is, and why this exact shape
 ///
-/// `#80FFD4 → #80D2FF`: hue `160° → 201°` in seven steps of `4.4–7.2°`, value
-/// riding a roof `255 → 217 → 255`, saturation held at a FLOOR of `≈ 0.50` —
-/// chroma spread `109–127`, far over the family's 24-level grey bar and over
-/// the on-glass gate's own `100`. Three properties are bought at once, and
-/// each is at its bar:
+/// `#6FEBC2 → #6FB1EB`: hue `160° → 208°` in seven steps of `5.3–8.7°`, value a
+/// PLATEAU at `235`, saturation held at a FLOOR of `≈ 0.53` — chroma spread
+/// `124`, far over the family's 24-level grey bar and over the on-glass
+/// gate's own `100`. (`V 235 / S 0.53` is the measured optimum of the
+/// 2026-08-30 palette lab: a `V 255 / S 0.50` roof solves to the identical
+/// legibility ceilings as the retired one — extra peak brightness buys
+/// nothing — while the slightly deeper saturation lifts the crossing's solved
+/// ceilings, which is light the equalized [`super::cursor_glow`] caps table
+/// spends on the seam.) Three properties are bought at once, and each is at its
+/// bar:
 ///
 /// * **the window is crossed in FIVE table entries** (hue `165–200` spans slots
 ///   41–45 of the interval) instead of ten — the fastest transit the 16-level
-///   channel bar and the aliasing budget below allow;
-/// * **the crossing is BRIGHT.** `V ≥ 217` where the lerp sagged to `130`, so
-///   the pixels the light-law pales are pale AND bright — a seam, not a hole;
+///   channel bar and the aliasing budget below allow, and since 2026-08-31 the
+///   roof clears the softened window's `204°` shoulder too, at its own last
+///   sample rather than eight slots later on the exit ramp;
+/// * **the crossing is BRIGHT, AND SINCE 2026-08-31 IT NO LONGER SAGS.** The
+///   roof rode `235 → 200 → 235`, so its own darkest sample sat at the one place
+///   the light-law pales anyway: a pale AND dim notch. Flattening it to its own
+///   peak costs nothing anyone can price — the committed caps still clear their
+///   freshly solved ceilings, the paled span does not move a single entry — and
+///   it buys three things that are measured: the arc keeps **`17` more levels of
+///   its own chroma** through the transit (`min chroma on the read 103 → 120`,
+///   against `the_band_is_never_cyan_on_glass`'s floor of `100`, which it used
+///   to clear by three), the steepest chord in the WHOLE table falls
+///   `15 → 14` levels — `16` since the 2026-08-31 re-pace bought the seam a
+///   whole slab with it, still under [`spectrum_lut_has_bounded_adjacent_steps`]'
+///   own roof ceiling — and the whole-cell chord the ribbon draws across the
+///   crossing stops cutting the corner so deep
+///   (`rainbow_tall_colour_field_is_one_continuous_spectrum`: `0.0850 → 0.0638`
+///   against a bound of `0.09`). The paled pixels themselves come up `V 0.378 →
+///   0.385`: a seam, not a hole;
 /// * **the flanks arrive DESATURATED, and that is the cyan true-peak bound.**
 ///   Nothing on glass is one colour: the beam interpolates between neighbours,
 ///   edges antialias, and the one-pixel blend where the green flank meets the
@@ -119,18 +219,30 @@ pub const SPECTRUM_STOPS: usize = 7;
 ///   made it. A first cut of this roof kept `S = 1` right up to the transit
 ///   and a 246-frame capture answered with in-window blend pixels at
 ///   `S 0.84` — worse than the `0.60` the retired grey crossing peaked at,
-///   because its junction colours were already washed. The taper (`S 1 → 0.80`
-///   by slot 31, `→ 0.50` at the roof, mirrored on the exit) puts the bound
-///   back where the old arc had it without giving back the chroma: every
-///   source within reach of the window carries `S ≤ 0.53`, so no blend of
-///   them can read more saturated than that plus the ground's own lean.
+///   because its junction colours were already washed. The taper (`S 1 → 0.65`
+///   by slot 33 on the approach and `0.72` by slot 52 on the exit, `→ 0.53` at
+///   the roof) puts the bound back where the old arc had it without giving back
+///   the chroma: every source within reach of the window carries `S ≤ 0.56`, so
+///   no blend of them can read more saturated than that plus the ground's own
+///   lean. **The APPROACH's knot went DEEPER than its mirror (`0.72 -> 0.65`)**,
+///   and it is `the_zoom_streak_resolves_its_colour_on_the_arc` that priced it
+///   — `0.72` reads `10.02 %` against its `10 %` bound and `0.65` reads
+///   `9.96 %`, which is the whole of the room there is:
+///   the re-pace leaves the arc four more entries between hue `140°` and `160°`,
+///   and that gate measures how far an additively-composited pixel sits under
+///   the table AT ITS OWN HUE — so the reference the new entries are judged
+///   against had to come down with them.
 ///
-/// The roof's hue SPAN is `41.2°`, and that number is an aliasing budget, not
+/// The roof's hue SPAN is `48.0°`, and that number is an aliasing budget, not
 /// taste: `rainbow_palette_has_no_cyan_anchor_and_no_grey_hole` bounds the hue
 /// a half-cell sample step may carry (`18° + 640/cw`, tightest at `cw = 18`:
 /// `53.6°` per `14.2` table entries). The whole transit plus its slow flanks
-/// must fit under that window — a `50°` roof measured `54.1°` and failed by
-/// half a degree, so the span is set where the worst window reads `~52.5°`.
+/// must fit under that window — a `50°` roof on the old pacing measured `54.1°`
+/// and failed by half a degree, and the span is set where the worst window
+/// reads `51.8°`. Buying the extra `6.8°` cost the flanks their old rate: the
+/// inner knots moved in to slots `33` and `52`, which drops the approach and
+/// exit either side of the roof to `~0.9°`/slot from `1.5°`, and the seven
+/// slots that freed are exactly the seven the transit spends.
 ///
 /// **WHY NOT 100 % OF COLUMNS.** The paint scanner counts a pixel at
 /// `max ≥ 110 && max−min ≥ 60`. A composited pixel inside the window is held to
@@ -141,14 +253,14 @@ pub const SPECTRUM_STOPS: usize = 7;
 /// of glass — with counting columns immediately on both flanks, verified on
 /// capture rather than claimed.
 pub const SPECTRUM_CROSSING_ROOF: [u32; SPECTRUM_ROOF_LEN] = [
-    0x0080_FFD4, // 160°, the roof's on-ramp, S 0.50 from here to the off-ramp
-    0x007A_F5D5,
-    0x0074_E9D5, // enters HSV [165, 200] past here
-    0x006C_D9D2, // 176.1°, V 217 — the roof's floor…
-    0x006C_D2D9, // …and its byte-mirror at 183.9°
-    0x0074_D5E9,
-    0x007A_D3F5, // leaves the window past here
-    0x0080_D2FF, // 201.3°, the off-ramp
+    0x006F_EBC2, // 160.2°, the roof's on-ramp, S 0.53 from here to the off-ramp
+    0x006F_EBCE, // 166.0° — enters HSV [165, 200] past here
+    0x006F_EBD9, // 171.3°
+    0x006F_EBE9, // 179.0° — the transit's green half…
+    0x006F_DBEB, // 187.7° — …and its blue half
+    0x006F_CBEB, // 195.5°
+    0x006F_BDEB, // 202.3° — leaves the window, and the softened 204° shoulder
+    0x006F_B1EB, // 208.1°, the off-ramp — V 235 flat from the on-ramp to here
 ];
 
 /// How many samples [`SPECTRUM_CROSSING_ROOF`] carries.
@@ -157,11 +269,24 @@ pub const SPECTRUM_ROOF_LEN: usize = 8;
 /// The green→blue interval's index — the one interval the roof redraws.
 const SPECTRUM_ROOF_SEG: usize = 3;
 
-/// The interval slot the roof's first sample is pinned at. `39..=46` of the
+/// The interval slot the roof's first sample is pinned at. `40..=47` of the
 /// 85-slot interval: the window transit sits just past the interval's middle,
 /// which is where the plain mix crossed it too, so the re-draw moves WHERE
 /// nothing was and re-paces only what it must.
-const SPECTRUM_ROOF_AT: usize = 39;
+///
+/// **`39 -> 40` WITH THE 2026-08-31 RE-PACE, AND ONE SLOT IS ALL IT MAY MOVE.**
+/// The roof now carries the exit past the softened window's `204°` shoulder
+/// itself, which takes a slot at each end. The obvious spelling — `41`, keeping
+/// the roof's own gap to the inner pacing knot — was measured and REFUSED by
+/// `the_zoom_streak_resolves_its_colour_on_the_arc`: every slot the roof starts
+/// later is a slot the arc spends between hue `140°` and `160°`, where an
+/// additively-composited streak pixel is `0.2` of saturation under the table it
+/// came from, and four extra entries there moved that gate's off-arc tail
+/// `9.88 % -> 10.35 %` against its `10 %` bound. At `40` the same census reads
+/// `9.96 %`: the exit's own bin improves by as much as the approach's gives up
+/// (`150 -> 52` px against `44 -> 146`), which is the redistribution being a
+/// redistribution rather than a loss.
+const SPECTRUM_ROOF_AT: usize = 40;
 
 /// **THE FOUR PACING KNOTS**, `(interval slot, colour)` — two on each side of
 /// the roof, all at full value.
@@ -173,15 +298,24 @@ const SPECTRUM_ROOF_AT: usize = 39;
 /// half-cell spacing — `14.2` table entries at `cw = 18` — and allows at most
 /// `18° + 640/cw` of hue between two samples. The half-cell window is TWICE the
 /// roof's own width, so whatever hue the flanks carry rides in the same window
-/// as the roof's `41.2°`: without these knots the PCHIP through anchor-and-roof
+/// as the roof's `48.0°`: without these knots the PCHIP through anchor-and-roof
 /// alone let the approach drift fast enough that the worst window measured
 /// `54.1°` against `cw = 18`'s `53.6°`. The inner pair pins the flanks to
-/// `~1.5°`/slot for the eight slots beside the roof (worst window: `52.5°`);
+/// `~0.9°`/slot for the eight slots beside the roof (worst window: `51.8°`);
 /// the outer pair keeps the remaining approach and exit from paying the
 /// difference.
 ///
-/// **The SATURATION taper.** The outer pair carries `S = 0.85` and the inner
-/// pair `S = 0.68`, the ramp down to the roof's `0.50` floor — see the roof's
+/// **THE INNER PAIR MOVED IN (2026-08-31), AND THAT IS WHAT PAID FOR THE
+/// SEAM.** `31 -> 33` and `54 -> 52`: the roof's span grew `41.2° -> 48.0°` to
+/// carry the exit past the softened window's own `204°` shoulder, and the
+/// aliasing window is a fixed `14.2` entries, so every degree the transit takes
+/// has to come off the flanks beside it. Sixteen degrees of flank became seven
+/// — the knots' hues moved with their slots (`147.9° -> 156.1°`,
+/// `205.9° -> 209.0°`) — and the worst window came DOWN, `52.5° -> 51.8°`.
+///
+/// **The SATURATION taper.** The outer pair carries `S = 0.90` and the inner
+/// pair `S = 0.65` on the approach and `0.72` on the exit, the ramp down to the
+/// roof's `0.53` floor — see the roof's
 /// own account of the on-glass blend pixels this bounds. It reaches this far
 /// out (`140°`, a whole side of green away from the window) because the bound
 /// is on BLENDS: a pixel where the flank's light meets the seam's wears an
@@ -192,23 +326,166 @@ const SPECTRUM_ROOF_AT: usize = 39;
 ///
 /// None is a stop, and none is inside the window.
 const SPECTRUM_ROOF_PACE: [(usize, u32); 4] = [
-    (22, 0x0026_FF6F), // hue 140°, S 0.85 — the approach
-    (31, 0x0052_FFA3), // hue 148°, S 0.68 — the taper's on-ramp
-    (54, 0x0052_B4FF), // hue 206°, S 0.68 — the taper's off-ramp
-    (60, 0x0026_8BFF), // hue 212°, S 0.85 — the exit
+    (22, 0x0019_FF66), // hue 140°, S 0.90 — the approach
+    (33, 0x0059_FFBD), // hue 156°, S 0.65 — the taper's on-ramp
+    (52, 0x0047_A6FF), // hue 209°, S 0.72 — the taper's off-ramp
+    (60, 0x0019_75FF), // hue 216°, S 0.90 — the exit
 ];
 
-/// The LUT's length: **511 entries, just under 2 KiB**. This gives each of the
-/// six anchor intervals exactly 85 steps while keeping the table compact.
+/// The LUT's length: **511 entries, just under 2 KiB**, and the length of the
+/// PATH the table is sampled from ([`SPECTRUM_STRIDE`]).
 pub const SPECTRUM_LUT_LEN: usize = 511;
 
-/// Entries per anchor interval. `85 x 6 == 510`, so the seven anchors land on
-/// the exact indices `85 * i` and are stored verbatim.
+/// **THE PATH'S SLOTS PER ANCHOR INTERVAL** — the coordinate the arc is DRAWN
+/// in, which since the 2026-08-31 re-pace is no longer the coordinate it is
+/// SAMPLED in.
+///
+/// Every authored position in this file — the roof's [`SPECTRUM_ROOF_AT`], the
+/// four [`SPECTRUM_ROOF_PACE`] knots, the crossing's exempt span — is a slot of
+/// this path: `85 * i` is anchor `i`, and the whole path is `510` units long.
+/// The generator then RESAMPLES that path by perceptual pace
+/// ([`generate_spectrum_lut`]), so a table index is a distance along the arc and
+/// not a slot of it. Where the anchors ended up is [`SPECTRUM_ANCHOR_AT`], and
+/// where the crossing ended up is [`SPECTRUM_CROSSING_AT`]; both are committed
+/// and both are re-derived by the generator.
 pub const SPECTRUM_STRIDE: usize = (SPECTRUM_LUT_LEN - 1) / (SPECTRUM_STOPS - 1);
 const _: () = assert!(
     SPECTRUM_STRIDE * (SPECTRUM_STOPS - 1) == SPECTRUM_LUT_LEN - 1,
-    "the seven anchors must land on exact table indices"
+    "the seven anchors must land on exact path slots"
 );
+
+// ---------------------------------------------------------------------------
+// THE PACE — how the path's 510 units are spent across the table's 510 steps.
+// ---------------------------------------------------------------------------
+
+/// **THE SHARE OF THE PACE THAT IS HUE**, against the share that is perceptual
+/// distance — `0.60`.
+///
+/// # The defect (2026-08-31)
+///
+/// The owner: *"in 0.68, I'm seeing vertical stripes. That looks like a bug…
+/// in the rainbow"*, and on the dev build after it, *"I still see this
+/// problem"* — the fourth time in this campaign that the blending was called
+/// not smooth.
+///
+/// It was the PARAMETERIZATION, and it was measurable without a camera. The
+/// path above is paced by its own drawing law: [`smoothstep01`] has ZERO slope
+/// at every anchor, so the arc DWELLS at each of the seven names and races
+/// between them, and the seven anchor intervals carry wildly different amounts
+/// of hue in the same 85 slots — `30°` from red to orange, `60°` from yellow to
+/// green, `120°` across the crossing, and **`7.5°` from indigo to violet**. A
+/// ribbon reads ONE table entry per cell, so equal cell steps sampled unequal
+/// arc: measured on the shipped table at the traverse a 34-key line lays, the
+/// per-cell hue steps ran `0.7° .. 34.9°` around a median of `10.8°` — a
+/// fiftyfold spread. Where the hue stalls the eye sees a WIDE BLOCK of one
+/// colour; where it leaps it sees a HARD EDGE. Those blocks and edges are the
+/// vertical stripes.
+///
+/// # Why the pace is not perceptual distance alone
+///
+/// Re-pacing by cumulative ΔE in a uniform space (OKLab, [`spectrum_oklab`]) is
+/// the right instrument and it is most of this constant — but ΔE alone answers
+/// the wrong question at two places on THIS arc, and both were measured:
+///
+/// * **indigo → violet** is `7.5°` of hue and a large ΔE (`#4B0082` is dark,
+///   `#9400D3` is bright), so pure-ΔE pacing spends `77` entries there and the
+///   hue stalls at `1.8°`/cell — the violet block, back;
+/// * **the greens**, hue `100° .. 150°`, are the opposite: a large hue span at
+///   small ΔE, so pure-ΔE pacing crosses them in `46°` steps — the hard edge,
+///   back.
+///
+/// So the pace is a BLEND of two currencies, each normalized by its own total
+/// over the non-exempt arc: perceptual distance, and HSV hue — the space this
+/// file already states the cyan ruling, the window, and every saturation floor
+/// in. Measured over the whole blend, at the 16-cell traverse:
+///
+/// ```text
+///   hue share   per-cell hue step        per-cell ΔE
+///               max/med   min/med        max/med   min/med
+///   0.00 (ΔE)     3.53      0.23           1.30      0.45
+///   0.50          1.42      0.35           1.77      0.27
+///   0.60          1.33      0.40           2.10      0.28
+///   0.70          1.24      0.49           2.20      0.24
+///   1.00 (hue)    1.16      0.50           2.44      0.19
+/// ```
+///
+/// `0.60` is where the hue spread is inside the owner-facing bar (`±40 %` of
+/// its median) with the perceptual spread still under the shipped table's own
+/// (`2.10` against `1.49`, and the green plateau it prices is the arc's, not
+/// the pace's — the shipped table's own minimum there is `0.020`). Past `0.70`
+/// the hue keeps improving by hundredths and the perceptual spread pays for all
+/// of it.
+const SPECTRUM_PACE_HUE_SHARE: f64 = 0.60;
+
+/// **THE SHARE OF THE PACE THAT IS BYTES** — `0.30`, and it is what keeps the
+/// table's own staircase bound.
+///
+/// A pace that answers only to the eye starves the places where the arc moves
+/// far in BYTES for little perceived change: with this at zero the entry before
+/// green read `#21FF00`, a `33`-level chord against
+/// `spectrum_lut_has_bounded_adjacent_steps`' ceiling of `5` outside the roof.
+/// The third currency is the Chebyshev byte distance along the path, normalized
+/// like the others, so a byte-fast stretch buys entries in proportion to how
+/// fast it is. Measured: at `0.15` and above the worst adjacent step OUTSIDE
+/// the crossing is `4` levels — under the shipped ceiling, which therefore did
+/// not move. `0.30` is the middle of the flat part of that curve (`0.15`
+/// through `0.60` all measure `4`), and it costs the hue spread nothing
+/// (`max/med 1.53 -> 1.58` between `0.0` and `0.30`).
+const SPECTRUM_PACE_BYTE_SHARE: f64 = 0.30;
+
+/// How finely the pacing integral is taken, in samples per path slot. `64` puts
+/// about `32 600` samples on the path; the resulting entry positions move by
+/// less than a thousandth of a slot if it is doubled, which is two orders under
+/// the rounding that commits them.
+const SPECTRUM_PACE_FINE: usize = 64;
+
+/// **THE FIRST PATH SLOT OF THE CROSSING'S EXEMPT SPAN**, and its last: the
+/// outer [`SPECTRUM_ROOF_PACE`] knot on each side, and everything between them.
+///
+/// **THE CROSSING IS THE ONE PLACE THE ARC IS SUPPOSED TO BE FAST**, and this is
+/// where the re-pace is told so. The span is lifted out of the pacing whole:
+/// its `38` steps are spent slot-for-slot exactly as the path draws them, so
+/// every entry from the approach knot (`140°`) to the exit knot (`216°`) is
+/// BYTE-IDENTICAL to the shipped table's, and every measurement the crossing
+/// campaign took of it still holds — the seam is one ribbon slab, the taper's
+/// saturation ramp is the same width in cells, and the aliasing window the
+/// knots were placed to satisfy contains the same colours it did.
+///
+/// **IT IS THE WHOLE KNOT STRUCTURE AND NOT JUST THE ROOF, AND THAT WAS
+/// MEASURED.** Exempting only [`SPECTRUM_CROSSING_ROOF`]'s eight samples leaves
+/// the taper's flanks to the pace, which spreads them from `47` entries to `98`
+/// — and the flanks are the arc's only desaturated stretch, so the ribbon's
+/// washed cells went `2 -> 4` at the settled traverse. The taper is not
+/// decoration the pace may stretch; it is the blend bound the roof's own doc
+/// prices.
+const SPECTRUM_CROSSING_LO: usize = SPECTRUM_ROOF_PACE[0].0;
+/// The last path slot of the exempt span — see [`SPECTRUM_CROSSING_LO`].
+const SPECTRUM_CROSSING_HI: usize = SPECTRUM_ROOF_PACE[3].0;
+
+/// **WHERE THE SEVEN NAMES LANDED**, in table indices — `@generated` beside
+/// [`SPECTRUM_LUT`] by the same pass, and pinned by
+/// `spectrum_reproduces_its_anchors_exactly`.
+///
+/// Under the retired even parameterization this was `85 * i` and did not need
+/// saying. The pace spends the table where the arc moves, so it is now a
+/// measurement: red and violet still sit on the ends (the arc is a clamped
+/// `[0, 1]` and its endpoints are the two turnarounds), and the five interior
+/// names sit where their share of the pace put them. Every consumer that needs
+/// a name — [`spectrum_stop`], [`spectrum_snap_index`] — reads it here rather
+/// than multiplying, so a re-pace cannot leave a caller pointing at the wrong
+/// colour.
+pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = [0, 63, 142, 258, 394, 471, 510];
+
+/// **WHERE THE CROSSING'S EXEMPT SPAN LANDED** — the table index of its first
+/// entry, `@generated` with the table.
+///
+/// `SPECTRUM_CROSSING_AT ..= SPECTRUM_CROSSING_AT + (SPECTRUM_CROSSING_HI -
+/// SPECTRUM_CROSSING_LO)` is the run of entries that are the path's own slots
+/// verbatim, and the run every crossing gate measures.
+pub const SPECTRUM_CROSSING_AT: usize = 298;
+
+/// How many entries the exempt crossing span spends — one per path slot.
+pub const SPECTRUM_CROSSING_ENTRIES: usize = SPECTRUM_CROSSING_HI - SPECTRUM_CROSSING_LO + 1;
 
 /// **THE CYAN WINDOW** (§2.3.4), in **HSV degrees** — the space the design of
 /// record states the ruling in, and the space this file measures it in.
@@ -430,13 +707,114 @@ fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
     [r + m, g + m, b + m]
 }
 
-/// **THE GENERATOR.** Builds [`SPECTRUM_LUT`] from the seven anchors.
+/// **THE PATH**, at any real position along it — the arc as it is DRAWN, before
+/// the pace decides how much table to spend on each part of it.
 ///
-/// Five intervals use [`smoothstep01`] followed by per-channel sRGB
-/// interpolation. The green→blue interval instead follows the authored
-/// [`SPECTRUM_CROSSING_ROOF`] with a monotone cubic in HSV. Both paths have zero
-/// slope at the seven named anchors, so the reflected sweep turns around without
-/// a colour crease while reproducing every anchor exactly.
+/// `x` is in path slots, `0 ..= 510`: `85 * i` is anchor `i`. Five intervals are
+/// [`smoothstep01`] followed by per-channel sRGB interpolation; the green→blue
+/// interval follows the authored [`SPECTRUM_CROSSING_ROOF`] through a monotone
+/// cubic in HSV. Both have zero slope at the seven named anchors, so the path
+/// reproduces every anchor exactly and turns around without a colour crease.
+///
+/// It returns UNQUANTIZED sRGB. The pace integrates over tens of thousands of
+/// samples of this and a `u8` staircase would make that integral measure the
+/// rounding rather than the arc; rounding happens once, where an entry is
+/// committed.
+fn spectrum_path(x: f64) -> [f64; 3] {
+    let x = x.clamp(0.0, (SPECTRUM_LUT_LEN - 1) as f64);
+    let seg = ((x / SPECTRUM_STRIDE as f64).floor() as usize).min(SPECTRUM_STOPS - 2);
+    let slot = x - (seg * SPECTRUM_STRIDE) as f64;
+    // THE GREEN→BLUE INTERVAL IS DRAWN THROUGH THE ROOF, in HSV rather than per
+    // channel — see [`SPECTRUM_CROSSING_ROOF`]'s own account of why.
+    if seg == SPECTRUM_ROOF_SEG && slot > 0.0 {
+        let (h, s, v) = spectrum_roof_hsv(slot);
+        return hsv_srgb(h, s, v);
+    }
+    // THE EASED PER-CHANNEL MIX BETWEEN TWO AUTHORED STOPS, and nothing else.
+    let k = smoothstep01(slot / SPECTRUM_STRIDE as f64);
+    let chan = |c: u32, sh: u32| f64::from((c >> sh) & 0xff) / 255.0;
+    let (a, b) = (SPECTRUM_ANCHORS[seg], SPECTRUM_ANCHORS[seg + 1]);
+    [
+        chan(a, 16) + (chan(b, 16) - chan(a, 16)) * k,
+        chan(a, 8) + (chan(b, 8) - chan(a, 8)) * k,
+        chan(a, 0) + (chan(b, 0) - chan(a, 0)) * k,
+    ]
+}
+
+/// The path colour as the byte triple an entry would commit — one rounding, and
+/// the same one [`spectrum_from_hsv`] performs.
+fn spectrum_path_byte(x: f64) -> u32 {
+    let c = spectrum_path(x);
+    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (byte(c[0]) << 16) | (byte(c[1]) << 8) | byte(c[2])
+}
+
+/// **OKLab of an unquantized sRGB triple** — the uniform space the pace measures
+/// perceived distance in.
+///
+/// Björn Ottosson's matrices, verbatim. It is used for ONE thing: the length of
+/// a step along the path, so that equal steps of the table are equal steps of
+/// the eye. Nothing that ships reads it — the arc's own colours are authored in
+/// sRGB and its rulings are stated in HSV.
+fn spectrum_oklab(c: [f64; 3]) -> [f64; 3] {
+    let lin = |v: f64| {
+        if v <= 0.040_45 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let (r, g, b) = (lin(c[0]), lin(c[1]), lin(c[2]));
+    let l = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
+    let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
+    let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
+    [
+        0.210_454_255_3 * l + 0.793_617_785_0 * m - 0.004_072_046_8 * s,
+        1.977_998_495_1 * l - 2.428_592_205_0 * m + 0.450_593_709_9 * s,
+        0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766_0 * s,
+    ]
+}
+
+/// The HSV hue of an unquantized triple, in degrees — [`spectrum_hsv`]'s hue,
+/// asked of the path rather than of a committed byte.
+fn spectrum_path_hue(c: [f64; 3]) -> f64 {
+    let (r, g, b) = (c[0], c[1], c[2]);
+    let hi = r.max(g).max(b);
+    let d = hi - r.min(g).min(b);
+    if d <= 0.0 {
+        return 0.0;
+    }
+    if hi == r {
+        60.0 * ((g - b) / d).rem_euclid(6.0)
+    } else if hi == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    }
+}
+
+/// **THE GENERATOR.** Builds [`SPECTRUM_LUT`], [`SPECTRUM_ANCHOR_AT`] and
+/// [`SPECTRUM_CROSSING_AT`] by resampling [`spectrum_path`] at an even PACE.
+///
+/// # What it does, in one paragraph
+///
+/// The path is cut into eight legs at the seven anchors and at the crossing's
+/// two outer knots. The crossing leg spends one entry per path slot, exactly as
+/// the path draws it. Every other leg spends entries in proportion to its share
+/// of the pace — a blend of perceptual distance ([`SPECTRUM_PACE_HUE_SHARE`]),
+/// HSV hue and byte distance ([`SPECTRUM_PACE_BYTE_SHARE`]), each normalized by
+/// its own non-exempt total — and places them at EQUAL pace inside itself. The
+/// seven anchors fall on leg boundaries, so they land on exact indices and are
+/// stored verbatim, as they always were.
+///
+/// # Why the table and not the read
+///
+/// The pace could have lived in [`spectrum`], as a warp applied to `t`. It lives
+/// in the TABLE instead so that everything that walks `SPECTRUM_LUT` — the
+/// crossing census, the adjacent-step bound, the certifier's chord walk, the
+/// no-cyan dwell — measures the arc that ships, at the spacing it ships at. A
+/// warp behind the read would leave every one of those gates measuring a table
+/// no eye ever sees.
 ///
 /// The repo's discipline for a derived table (see `RAINBOW_BAND_COV_CAPS` and
 /// `certify_rainbow_band_cov_caps`): the table ships as a `const` so it costs
@@ -444,32 +822,253 @@ fn hsv_srgb(hue_deg: f64, s: f64, v: f64) -> [f64; 3] {
 /// never drift from the law that produced them.
 #[must_use]
 pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
+    generate_spectrum_table().lut
+}
+
+/// **THE GENERATOR'S FULL RESULT** — the table, and the three things about it
+/// that used to be arithmetic and are now measurements.
+pub struct SpectrumTable {
+    /// The committed [`SPECTRUM_LUT`].
+    pub lut: [u32; SPECTRUM_LUT_LEN],
+    /// The committed [`SPECTRUM_ANCHOR_AT`].
+    pub anchor_at: [usize; SPECTRUM_STOPS],
+    /// The committed [`SPECTRUM_CROSSING_AT`].
+    pub crossing_at: usize,
+    /// **WHERE EACH ENTRY CAME FROM ON THE PATH**, in path slots — the pace's
+    /// own record, and the only way back from a table position to the drawing
+    /// coordinate every authored position in this file is stated in. What reads
+    /// it is `super::cursor_glow`'s legibility-ceiling table, which is solved
+    /// per COLOUR and must therefore follow its colours through a re-pace.
+    pub path_at: [f32; SPECTRUM_LUT_LEN],
+}
+
+/// [`generate_spectrum_lut`]'s full result — see [`SpectrumTable`].
+#[must_use]
+pub fn generate_spectrum_table() -> SpectrumTable {
+    // THE EIGHT LEGS, in path slots: the six anchor intervals, with the
+    // green→blue one split at the crossing's two outer knots.
+    const LEGS: usize = SPECTRUM_STOPS + 1;
+    const CROSSING_LEG: usize = SPECTRUM_ROOF_SEG + 1;
+    let crossing_lo = (SPECTRUM_ROOF_SEG * SPECTRUM_STRIDE + SPECTRUM_CROSSING_LO) as f64;
+    let crossing_hi = (SPECTRUM_ROOF_SEG * SPECTRUM_STRIDE + SPECTRUM_CROSSING_HI) as f64;
+    let mut bounds = [0.0f64; LEGS + 1];
+    for (i, b) in bounds.iter_mut().enumerate() {
+        *b = match i {
+            0..=SPECTRUM_ROOF_SEG => (i * SPECTRUM_STRIDE) as f64,
+            CROSSING_LEG => crossing_lo,
+            5 => crossing_hi,
+            _ => ((i - 2) * SPECTRUM_STRIDE) as f64,
+        };
+    }
+
+    // THE PACE, INTEGRATED. Three currencies, sampled together so they are the
+    // same walk: perceptual distance, HSV hue, and Chebyshev bytes.
+    let mut walk: Vec<Vec<(f64, [f64; 3])>> = Vec::with_capacity(LEGS);
+    let mut totals = [0.0f64; 3];
+    for leg in 0..LEGS {
+        let (a, b) = (bounds[leg], bounds[leg + 1]);
+        let steps = ((b - a) * SPECTRUM_PACE_FINE as f64) as usize;
+        let mut cum = Vec::with_capacity(steps + 1);
+        let mut acc = [0.0f64; 3];
+        let mut prev = spectrum_path(a);
+        cum.push((a, acc));
+        for i in 1..=steps {
+            let x = a + (b - a) * i as f64 / steps as f64;
+            let cur = spectrum_path(x);
+            let (pl, cl) = (spectrum_oklab(prev), spectrum_oklab(cur));
+            acc[0] += ((pl[0] - cl[0]).powi(2) + (pl[1] - cl[1]).powi(2) + (pl[2] - cl[2]).powi(2))
+                .sqrt();
+            acc[1] += {
+                let d = spectrum_path_hue(cur) - spectrum_path_hue(prev);
+                (d - 360.0 * (d / 180.0).trunc()).abs()
+            };
+            acc[2] += (0..3)
+                .map(|k| (prev[k] - cur[k]).abs())
+                .fold(0.0f64, f64::max);
+            cum.push((x, acc));
+            prev = cur;
+        }
+        if leg != CROSSING_LEG {
+            for (t, a) in totals.iter_mut().zip(acc) {
+                *t += a;
+            }
+        }
+        walk.push(cum);
+    }
+    // ONE COST out of the three, each normalized by its own non-exempt total, so
+    // the blend's shares mean what they say whatever units the currencies are in.
+    let cost = |c: [f64; 3]| {
+        (1.0 - SPECTRUM_PACE_BYTE_SHARE)
+            * ((1.0 - SPECTRUM_PACE_HUE_SHARE) * c[0] / totals[0]
+                + SPECTRUM_PACE_HUE_SHARE * c[1] / totals[1])
+            + SPECTRUM_PACE_BYTE_SHARE * c[2] / totals[2]
+    };
+
+    // THE BUDGETS. The crossing spends one entry per path slot; the rest share
+    // what is left in proportion to cost, by largest remainder so the table is
+    // exactly `SPECTRUM_LUT_LEN` long however the fractions fall.
+    let mut budget = [0usize; LEGS];
+    let mut want = [0.0f64; LEGS];
+    let free: f64 = (0..LEGS)
+        .filter(|&l| l != CROSSING_LEG)
+        .map(|l| cost(walk[l].last().expect("a leg has samples").1))
+        .sum();
+    // The steps the paced legs share: the table's own, less the one the crossing
+    // spends per slot it holds.
+    let purse = SPECTRUM_LUT_LEN - SPECTRUM_CROSSING_ENTRIES;
+    for leg in 0..LEGS {
+        want[leg] = if leg == CROSSING_LEG {
+            (SPECTRUM_CROSSING_ENTRIES - 1) as f64
+        } else {
+            cost(walk[leg].last().expect("a leg has samples").1) / free * purse as f64
+        };
+        budget[leg] = want[leg].floor() as usize;
+    }
+    let mut order: Vec<usize> = (0..LEGS).filter(|&l| l != CROSSING_LEG).collect();
+    order.sort_by(|&a, &b| {
+        (want[b] - budget[b] as f64)
+            .partial_cmp(&(want[a] - budget[a] as f64))
+            .expect("the pace is finite")
+    });
+    let mut short = SPECTRUM_LUT_LEN - 1 - budget.iter().sum::<usize>();
+    for &leg in &order {
+        if short == 0 {
+            break;
+        }
+        budget[leg] += 1;
+        short -= 1;
+    }
+    assert_eq!(short, 0, "the pace could not spend the table");
+
+    // THE ENTRIES.
     let mut lut = [0u32; SPECTRUM_LUT_LEN];
-    for seg in 0..SPECTRUM_STOPS - 1 {
-        for slot in 0..=SPECTRUM_STRIDE {
-            let idx = seg * SPECTRUM_STRIDE + slot;
-            // THE ANCHORS, VERBATIM. Stored rather than solved so the arc's
-            // control points are bit-for-bit the seven named constants.
-            if slot == 0 || idx == SPECTRUM_LUT_LEN - 1 {
-                lut[idx] = SPECTRUM_ANCHORS[if slot == 0 { seg } else { seg + 1 }];
-                continue;
+    let mut path_at = [0.0f32; SPECTRUM_LUT_LEN];
+    let mut anchor_at = [0usize; SPECTRUM_STOPS];
+    let mut crossing_at = 0usize;
+    let mut idx = 0usize;
+    for leg in 0..LEGS {
+        // WHICH NAME, IF ANY, THIS LEG STARTS ON — the anchors are leg
+        // boundaries, so they land on exact indices and are stored VERBATIM,
+        // bit-for-bit the seven named constants.
+        let start = bounds[leg];
+        if (start as usize).is_multiple_of(SPECTRUM_STRIDE) && (start as usize) < SPECTRUM_LUT_LEN {
+            anchor_at[start as usize / SPECTRUM_STRIDE] = idx;
+        }
+        if leg == CROSSING_LEG {
+            crossing_at = idx;
+            // THE EXEMPT SPAN, SLOT FOR SLOT — the path's own entries, so the
+            // crossing that ships is the crossing that was solved.
+            for i in 0..budget[leg] {
+                lut[idx + i] = spectrum_path_byte(start + i as f64);
+                path_at[idx + i] = (start + i as f64) as f32;
             }
-            // THE GREEN→BLUE INTERVAL IS DRAWN THROUGH THE ROOF, in HSV rather
-            // than per channel — see `spectrum_roof_entry` and
-            // [`SPECTRUM_CROSSING_ROOF`]'s own account of why.
-            if seg == SPECTRUM_ROOF_SEG {
-                lut[idx] = spectrum_roof_entry(slot);
-                continue;
-            }
-            // THE EASED PER-CHANNEL MIX BETWEEN TWO AUTHORED STOPS, and nothing
-            // else. `smoothstep01` is C¹ with ZERO SLOPE at each anchor, which is
-            // what makes the arc C¹ across every control point and at both
-            // turnarounds of the reflected sweep.
-            let k = smoothstep01(slot as f64 / SPECTRUM_STRIDE as f64);
-            lut[idx] = lerp_rgb(SPECTRUM_ANCHORS[seg], SPECTRUM_ANCHORS[seg + 1], k as f32);
+            idx += budget[leg];
+            continue;
+        }
+        let total = cost(walk[leg].last().expect("a leg has samples").1);
+        for j in 0..budget[leg] {
+            let x = spectrum_pace_at(&walk[leg], &cost, total * j as f64 / budget[leg] as f64);
+            lut[idx + j] = spectrum_path_byte(x);
+            path_at[idx + j] = x as f32;
+        }
+        idx += budget[leg];
+    }
+    anchor_at[SPECTRUM_STOPS - 1] = SPECTRUM_LUT_LEN - 1;
+    path_at[SPECTRUM_LUT_LEN - 1] = (SPECTRUM_LUT_LEN - 1) as f32;
+    for (i, &at) in anchor_at.iter().enumerate() {
+        lut[at] = SPECTRUM_ANCHORS[i];
+        path_at[at] = (i * SPECTRUM_STRIDE) as f32;
+    }
+    SpectrumTable {
+        lut,
+        anchor_at,
+        crossing_at,
+        path_at,
+    }
+}
+
+/// **WHERE THE ARC CROSSES THE MIDDLE OF THE CYAN WINDOW**, in `t`.
+///
+/// Several fixtures and non-vacuity controls in this crate need to point at the
+/// crossing — "aim the sample window at the handoff", "show that this predicate
+/// CAN see cyan" — and every one of them used to transcribe a number
+/// (`0.5843`, `0.52`, `3.5/6`) that was true of where the crossing sat in the
+/// path. The pace moves it ([`SPECTRUM_CROSSING_AT`]), and a transcribed
+/// position does not follow, so the question is answered from the table: the
+/// entry whose hue is nearest the window's own centre.
+///
+/// A control aimed here is aimed at the arc's most cyan-capable colour by
+/// construction, which is what those clauses are actually asking for.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn spectrum_crossing_position() -> f32 {
+    let mid = 0.5 * (SPECTRUM_CYAN_LO + SPECTRUM_CYAN_HI);
+    let (mut best, mut near) = (0usize, f64::MAX);
+    for (i, &c) in SPECTRUM_LUT.iter().enumerate() {
+        let d = (spectrum_hsv(c).0 - mid).abs();
+        if d < near {
+            near = d;
+            best = i;
         }
     }
-    lut
+    best as f32 / (SPECTRUM_LUT_LEN - 1) as f32
+}
+
+/// **HOW WIDE THE CROSSING IS IN `t`** — the exempt span's own share of the
+/// table, which is the distance a control has to step to land on either FLANK
+/// of the crossing rather than in it.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn spectrum_crossing_width() -> f32 {
+    SPECTRUM_CROSSING_ENTRIES as f32 / (SPECTRUM_LUT_LEN - 1) as f32
+}
+
+/// **THE PACE, INVERTED** — the PATH position, normalized to `[0, 1]`, that a
+/// table position `t` came from.
+///
+/// The legibility ceilings `super::cursor_glow` solves are properties of a
+/// COLOUR, and the table was solved on an even grid of the path. A re-pace moves
+/// a colour's `t` without moving the colour, so the ceiling has to follow it —
+/// this is the map that lets a derivation state that in one line, and it is the
+/// only thing outside this module that needs to know the pace exists.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn spectrum_path_of(t: f32) -> f32 {
+    static PATH: std::sync::LazyLock<[f32; SPECTRUM_LUT_LEN]> =
+        std::sync::LazyLock::new(|| generate_spectrum_table().path_at);
+    let x = t.clamp(0.0, 1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
+    let i = (x as usize).min(SPECTRUM_LUT_LEN - 1);
+    let j = (i + 1).min(SPECTRUM_LUT_LEN - 1);
+    (PATH[i] + (PATH[j] - PATH[i]) * (x - i as f32)) / (SPECTRUM_LUT_LEN - 1) as f32
+}
+
+/// Where along a leg the pace has spent `want` — the inverse of the cumulative
+/// cost, by binary search and one linear step inside the bracket it lands in.
+fn spectrum_pace_at(
+    cum: &[(f64, [f64; 3])],
+    cost: &impl Fn([f64; 3]) -> f64,
+    want: f64,
+) -> f64 {
+    if want <= 0.0 {
+        return cum[0].0;
+    }
+    let (mut lo, mut hi) = (0usize, cum.len() - 1);
+    if want >= cost(cum[hi].1) {
+        return cum[hi].0;
+    }
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if cost(cum[mid].1) <= want {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let (c0, c1) = (cost(cum[lo].1), cost(cum[hi].1));
+    if c1 <= c0 {
+        return cum[lo].0;
+    }
+    cum[lo].0 + (cum[hi].0 - cum[lo].0) * (want - c0) / (c1 - c0)
 }
 
 /// One interior entry of the green→blue interval: a monotone cubic (Fritsch–
@@ -499,7 +1098,7 @@ pub fn generate_spectrum_lut() -> [u32; SPECTRUM_LUT_LEN] {
 /// `the_band_is_never_cyan_on_glass` holds the whole arc to — so an edited
 /// sample that reopened a grey hole fails the regeneration here, with the
 /// knot named, rather than at the gate.
-fn spectrum_roof_entry(slot: usize) -> u32 {
+fn spectrum_roof_hsv(slot: f64) -> (f64, f64, f64) {
     const KNOTS: usize = SPECTRUM_ROOF_LEN + 6;
     let mut xs = [0.0f64; KNOTS];
     let mut hue = [0.0f64; KNOTS];
@@ -529,17 +1128,28 @@ fn spectrum_roof_entry(slot: usize) -> u32 {
         SPECTRUM_STRIDE,
         SPECTRUM_ANCHORS[SPECTRUM_ROOF_SEG + 1],
     );
-    let x = slot as f64;
-    let h = pchip_eval(&xs, &hue, x);
-    let s = pchip_eval(&xs, &sat, x);
-    let v = pchip_eval(&xs, &val, x);
-    let rgb = hsv_srgb(h, s, v);
+    (
+        pchip_eval(&xs, &hue, slot),
+        pchip_eval(&xs, &sat, slot),
+        pchip_eval(&xs, &val, slot),
+    )
+}
+
+/// **THE INVERSE OF [`spectrum_hsv`], IN ONE SPELLING.** The roof's generator and
+/// `super::cursor_glow`'s `rainbow_bed_true_hue` both have to turn an `(H, S, V)`
+/// back into the byte triple this family compares against, and a second spelling
+/// of the same rounding is how a table and its consumer come to disagree by a
+/// level. `hue` may be any real; it wraps.
+#[inline]
+#[must_use]
+pub(crate) fn spectrum_from_hsv(hue: f64, sat: f64, val: f64) -> u32 {
+    let rgb = hsv_srgb(hue, sat, val);
     let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
     (byte(rgb[0]) << 16) | (byte(rgb[1]) << 8) | byte(rgb[2])
 }
 
 /// Monotone cubic Hermite (Fritsch–Carlson) through `(xs, ys)`, endpoint
-/// tangents pinned at ZERO — see [`spectrum_roof_entry`] for why both choices
+/// tangents pinned at ZERO — see [`spectrum_roof_hsv`] for why both choices
 /// are load-bearing. Knot abscissae must be strictly increasing.
 fn pchip_eval<const N: usize>(xs: &[f64; N], ys: &[f64; N], x: f64) -> f64 {
     // Secant slopes, then limited interior tangents.
@@ -584,7 +1194,7 @@ fn pchip_eval<const N: usize>(xs: &[f64; N], ys: &[f64; N], x: f64) -> f64 {
 /// Two adjacent table lookups and one lerp. INTERPOLATED, NOT ROUNDED: a nearest-entry
 /// lookup would put a 511-entry
 /// staircase back on top of a curve built to remove one. Adjacent entries are at
-/// most 5 levels apart on the five ordinary intervals and at most 16 through the
+/// most 5 levels apart on the five ordinary intervals and at most 15 through the
 /// authored crossing roof, so the straight mix between them remains continuous.
 ///
 /// `t` outside `0..=1` clamps rather than wraps, on purpose: the arc is
@@ -1116,14 +1726,17 @@ pub(crate) fn spectrum_caret_max_byte_rate(base: u32, mix: f32) -> f32 {
 /// Where named stop `i` sits in `t` — `0` is red, `SPECTRUM_STOPS - 1` is
 /// violet. Out-of-range indices clamp to the ends.
 ///
-/// EVENLY SPACED, and that is load-bearing rather than a simplification: even
-/// spacing puts the anchors on the exact table indices `85 * i`, so they can be
-/// stored verbatim.
+/// **READ OUT OF [`SPECTRUM_ANCHOR_AT`], NOT DIVIDED.** The stops were evenly
+/// spaced in `t` while the table was evenly spaced along the path; since the
+/// 2026-08-31 re-pace the table is spaced by PACE, so a name's position is
+/// wherever the pace put it. It is still exact — the anchors are leg boundaries,
+/// so each lands on an integer index and `spectrum(stop_position(i))` still
+/// resolves to the anchor's own bytes.
 #[inline]
 #[must_use]
 #[cfg(test)]
 pub(crate) fn spectrum_stop_position(i: usize) -> f32 {
-    i.min(SPECTRUM_STOPS - 1) as f32 / (SPECTRUM_STOPS - 1) as f32
+    SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)] as f32 / (SPECTRUM_LUT_LEN - 1) as f32
 }
 
 /// The colour of named stop `i` — red, orange, yellow, green, blue, indigo,
@@ -1134,7 +1747,7 @@ pub(crate) fn spectrum_stop_position(i: usize) -> f32 {
 #[inline]
 #[must_use]
 pub fn spectrum_stop(i: usize) -> u32 {
-    SPECTRUM_LUT[i.min(SPECTRUM_STOPS - 1) * SPECTRUM_STRIDE]
+    SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i.min(SPECTRUM_STOPS - 1)]]
 }
 
 /// WHICH NAME IS THIS? The nearest named stop's INDEX to spectrum position `t`.
@@ -1143,10 +1756,26 @@ pub fn spectrum_stop(i: usize) -> u32 {
 /// light-theme ink for a snapped mark can read it out of a precomputed table
 /// instead of re-running the recipe (see `InkRole::band_ink`), and so the two
 /// can never disagree about which name a position has.
+///
+/// **NEAREST ON THE TABLE, NOT ON A DIVISION.** While the stops sat at `85 * i`
+/// this was a multiply and a round. The pace moved them
+/// ([`SPECTRUM_ANCHOR_AT`]), so the question is asked where the answer lives:
+/// which committed anchor index is `t` nearest. Seven compares, none of them
+/// able to disagree with [`spectrum_stop`].
 #[inline]
 #[must_use]
 pub fn spectrum_snap_index(t: f32) -> usize {
-    (t.clamp(0.0, 1.0) * (SPECTRUM_STOPS - 1) as f32).round() as usize
+    let x = t.clamp(0.0, 1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
+    let mut best = 0usize;
+    let mut near = f32::INFINITY;
+    for (i, &at) in SPECTRUM_ANCHOR_AT.iter().enumerate() {
+        let d = (x - at as f32).abs();
+        if d < near {
+            near = d;
+            best = i;
+        }
+    }
+    best
 }
 
 /// SNAP TO A NAME (§2.3.3). The nearest named stop's colour to spectrum position
@@ -1187,8 +1816,8 @@ pub(crate) fn spectrum_max_byte_rate() -> f32 {
 /// `0` and violet at index `510`.
 ///
 /// **`@generated` by [`generate_spectrum_lut`] — do not edit by hand.** The seven
-/// anchors sit verbatim at indices `0 / 85 / 170 / 255 / 340 / 425 / 510`;
-/// entries between them are smooth per-channel interpolations.
+/// anchors sit verbatim at the indices [`SPECTRUM_ANCHOR_AT`] names; entries
+/// between them are the drawn path, resampled at an even PACE.
 ///
 /// Regenerate after any change to the anchors or interpolation law:
 ///
@@ -1198,91 +1827,91 @@ pub(crate) fn spectrum_max_byte_rate() -> f32 {
 /// ```
 #[rustfmt::skip]
 pub const SPECTRUM_LUT: [u32; SPECTRUM_LUT_LEN] = [
-    0x00FF_0000, 0x00FF_0000, 0x00FF_0000, 0x00FF_0000, 0x00FF_0100, 0x00FF_0100,
-    0x00FF_0200, 0x00FF_0200, 0x00FF_0300, 0x00FF_0400, 0x00FF_0500, 0x00FF_0600,
-    0x00FF_0700, 0x00FF_0800, 0x00FF_0900, 0x00FF_0A00, 0x00FF_0C00, 0x00FF_0D00,
-    0x00FF_0F00, 0x00FF_1000, 0x00FF_1200, 0x00FF_1300, 0x00FF_1500, 0x00FF_1700,
-    0x00FF_1900, 0x00FF_1A00, 0x00FF_1C00, 0x00FF_1E00, 0x00FF_2000, 0x00FF_2200,
-    0x00FF_2400, 0x00FF_2600, 0x00FF_2800, 0x00FF_2B00, 0x00FF_2D00, 0x00FF_2F00,
-    0x00FF_3100, 0x00FF_3300, 0x00FF_3500, 0x00FF_3800, 0x00FF_3A00, 0x00FF_3C00,
-    0x00FF_3E00, 0x00FF_4100, 0x00FF_4300, 0x00FF_4500, 0x00FF_4700, 0x00FF_4A00,
-    0x00FF_4C00, 0x00FF_4E00, 0x00FF_5000, 0x00FF_5200, 0x00FF_5400, 0x00FF_5700,
-    0x00FF_5900, 0x00FF_5B00, 0x00FF_5D00, 0x00FF_5F00, 0x00FF_6100, 0x00FF_6300,
-    0x00FF_6500, 0x00FF_6600, 0x00FF_6800, 0x00FF_6A00, 0x00FF_6C00, 0x00FF_6D00,
-    0x00FF_6F00, 0x00FF_7000, 0x00FF_7200, 0x00FF_7300, 0x00FF_7500, 0x00FF_7600,
-    0x00FF_7700, 0x00FF_7800, 0x00FF_7900, 0x00FF_7A00, 0x00FF_7B00, 0x00FF_7C00,
-    0x00FF_7D00, 0x00FF_7D00, 0x00FF_7E00, 0x00FF_7E00, 0x00FF_7F00, 0x00FF_7F00,
-    0x00FF_7F00, 0x00FF_7F00, 0x00FF_7F00, 0x00FF_7F00, 0x00FF_7F00, 0x00FF_8000,
-    0x00FF_8000, 0x00FF_8100, 0x00FF_8100, 0x00FF_8200, 0x00FF_8300, 0x00FF_8400,
-    0x00FF_8500, 0x00FF_8600, 0x00FF_8700, 0x00FF_8800, 0x00FF_8A00, 0x00FF_8B00,
-    0x00FF_8C00, 0x00FF_8E00, 0x00FF_8F00, 0x00FF_9100, 0x00FF_9300, 0x00FF_9400,
-    0x00FF_9600, 0x00FF_9800, 0x00FF_9A00, 0x00FF_9C00, 0x00FF_9E00, 0x00FF_A000,
-    0x00FF_A200, 0x00FF_A400, 0x00FF_A600, 0x00FF_A800, 0x00FF_AA00, 0x00FF_AC00,
-    0x00FF_AE00, 0x00FF_B000, 0x00FF_B300, 0x00FF_B500, 0x00FF_B700, 0x00FF_B900,
-    0x00FF_BC00, 0x00FF_BE00, 0x00FF_C000, 0x00FF_C200, 0x00FF_C500, 0x00FF_C700,
-    0x00FF_C900, 0x00FF_CB00, 0x00FF_CE00, 0x00FF_D000, 0x00FF_D200, 0x00FF_D400,
-    0x00FF_D600, 0x00FF_D800, 0x00FF_DA00, 0x00FF_DC00, 0x00FF_DE00, 0x00FF_E000,
-    0x00FF_E200, 0x00FF_E400, 0x00FF_E600, 0x00FF_E800, 0x00FF_EA00, 0x00FF_EB00,
-    0x00FF_ED00, 0x00FF_EF00, 0x00FF_F000, 0x00FF_F200, 0x00FF_F300, 0x00FF_F400,
-    0x00FF_F600, 0x00FF_F700, 0x00FF_F800, 0x00FF_F900, 0x00FF_FA00, 0x00FF_FB00,
-    0x00FF_FC00, 0x00FF_FD00, 0x00FF_FD00, 0x00FF_FE00, 0x00FF_FE00, 0x00FF_FF00,
-    0x00FF_FF00, 0x00FF_FF00, 0x00FF_FF00, 0x00FF_FF00, 0x00FF_FF00, 0x00FE_FF00,
-    0x00FD_FF00, 0x00FC_FF00, 0x00FB_FF00, 0x00FA_FF00, 0x00F9_FF00, 0x00F7_FF00,
-    0x00F5_FF00, 0x00F3_FF00, 0x00F1_FF00, 0x00EF_FF00, 0x00ED_FF00, 0x00EA_FF00,
-    0x00E7_FF00, 0x00E4_FF00, 0x00E2_FF00, 0x00DE_FF00, 0x00DB_FF00, 0x00D8_FF00,
-    0x00D5_FF00, 0x00D1_FF00, 0x00CD_FF00, 0x00CA_FF00, 0x00C6_FF00, 0x00C2_FF00,
-    0x00BE_FF00, 0x00BA_FF00, 0x00B6_FF00, 0x00B2_FF00, 0x00AE_FF00, 0x00AA_FF00,
-    0x00A5_FF00, 0x00A1_FF00, 0x009D_FF00, 0x0098_FF00, 0x0094_FF00, 0x008F_FF00,
-    0x008B_FF00, 0x0086_FF00, 0x0082_FF00, 0x007D_FF00, 0x0079_FF00, 0x0074_FF00,
-    0x0070_FF00, 0x006B_FF00, 0x0067_FF00, 0x0062_FF00, 0x005E_FF00, 0x005A_FF00,
-    0x0055_FF00, 0x0051_FF00, 0x004D_FF00, 0x0049_FF00, 0x0045_FF00, 0x0041_FF00,
-    0x003D_FF00, 0x0039_FF00, 0x0035_FF00, 0x0032_FF00, 0x002E_FF00, 0x002A_FF00,
-    0x0027_FF00, 0x0024_FF00, 0x0021_FF00, 0x001D_FF00, 0x001B_FF00, 0x0018_FF00,
-    0x0015_FF00, 0x0012_FF00, 0x0010_FF00, 0x000E_FF00, 0x000C_FF00, 0x000A_FF00,
-    0x0008_FF00, 0x0006_FF00, 0x0005_FF00, 0x0004_FF00, 0x0003_FF00, 0x0002_FF00,
-    0x0001_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF00, 0x0000_FF02,
-    0x0001_FF04, 0x0002_FF07, 0x0003_FF0A, 0x0004_FF0F, 0x0005_FF13, 0x0006_FF19,
-    0x0008_FF1E, 0x000A_FF24, 0x000B_FF2A, 0x000D_FF31, 0x0010_FF37, 0x0012_FF3E,
-    0x0014_FF45, 0x0016_FF4B, 0x0019_FF52, 0x001B_FF58, 0x001E_FF5E, 0x0021_FF64,
-    0x0023_FF6A, 0x0026_FF6F, 0x0029_FF74, 0x002D_FF7A, 0x0032_FF7F, 0x0036_FF85,
-    0x003C_FF8B, 0x0041_FF91, 0x0047_FF97, 0x004D_FF9D, 0x0052_FFA3, 0x0058_FFA9,
-    0x005F_FFB0, 0x0067_FFB6, 0x006E_FFBC, 0x0075_FFC3, 0x007B_FFC9, 0x007F_FFCF,
-    0x0080_FFD4, 0x007A_F5D5, 0x0074_E9D5, 0x006C_D9D2, 0x006C_D2D9, 0x0074_D5E9,
-    0x007A_D3F5, 0x0080_D2FF, 0x007F_CFFF, 0x007B_CCFF, 0x0076_C9FF, 0x006F_C5FF,
-    0x0068_C1FF, 0x0060_BDFF, 0x0059_B9FF, 0x0052_B4FF, 0x004B_AEFF, 0x0042_A8FF,
-    0x0039_A0FF, 0x0031_98FF, 0x002A_91FF, 0x0026_8BFF, 0x0023_85FF, 0x0020_80FF,
-    0x001E_79FF, 0x001B_73FF, 0x0019_6CFF, 0x0016_65FF, 0x0014_5EFF, 0x0012_56FF,
-    0x0010_4FFF, 0x000E_48FF, 0x000C_40FF, 0x000B_39FF, 0x0009_32FF, 0x0008_2BFF,
-    0x0006_25FF, 0x0005_1EFF, 0x0004_19FF, 0x0003_13FF, 0x0002_0FFF, 0x0002_0AFF,
-    0x0001_07FF, 0x0001_04FF, 0x0000_02FF, 0x0000_00FF, 0x0000_00FF, 0x0000_00FF,
-    0x0000_00FF, 0x0000_00FF, 0x0000_00FE, 0x0001_00FE, 0x0001_00FD, 0x0001_00FD,
-    0x0002_00FC, 0x0002_00FB, 0x0003_00FA, 0x0003_00F9, 0x0004_00F8, 0x0005_00F7,
-    0x0005_00F6, 0x0006_00F5, 0x0007_00F3, 0x0008_00F2, 0x0009_00F1, 0x000A_00EF,
-    0x000B_00ED, 0x000B_00EC, 0x000C_00EA, 0x000E_00E8, 0x000F_00E7, 0x0010_00E5,
-    0x0011_00E3, 0x0012_00E1, 0x0013_00DF, 0x0014_00DD, 0x0015_00DB, 0x0017_00D9,
-    0x0018_00D7, 0x0019_00D5, 0x001A_00D3, 0x001C_00D1, 0x001D_00CF, 0x001E_00CD,
-    0x0020_00CA, 0x0021_00C8, 0x0022_00C6, 0x0024_00C4, 0x0025_00C2, 0x0026_00BF,
-    0x0027_00BD, 0x0029_00BB, 0x002A_00B9, 0x002B_00B7, 0x002D_00B4, 0x002E_00B2,
-    0x002F_00B0, 0x0031_00AE, 0x0032_00AC, 0x0033_00AA, 0x0034_00A8, 0x0036_00A6,
-    0x0037_00A4, 0x0038_00A2, 0x0039_00A0, 0x003A_009E, 0x003B_009C, 0x003C_009A,
-    0x003D_0099, 0x003F_0097, 0x0040_0095, 0x0040_0094, 0x0041_0092, 0x0042_0090,
-    0x0043_008F, 0x0044_008E, 0x0045_008C, 0x0046_008B, 0x0046_008A, 0x0047_0089,
-    0x0048_0088, 0x0048_0087, 0x0049_0086, 0x0049_0085, 0x004A_0084, 0x004A_0084,
-    0x004A_0083, 0x004B_0083, 0x004B_0082, 0x004B_0082, 0x004B_0082, 0x004B_0082,
-    0x004B_0082, 0x004B_0082, 0x004B_0082, 0x004B_0083, 0x004C_0083, 0x004C_0083,
-    0x004C_0084, 0x004D_0084, 0x004D_0085, 0x004E_0085, 0x004E_0086, 0x004F_0086,
-    0x0050_0087, 0x0050_0088, 0x0051_0089, 0x0052_008A, 0x0053_008A, 0x0053_008B,
-    0x0054_008C, 0x0055_008D, 0x0056_008E, 0x0057_008F, 0x0058_0091, 0x0059_0092,
-    0x005A_0093, 0x005B_0094, 0x005C_0095, 0x005E_0097, 0x005F_0098, 0x0060_0099,
-    0x0061_009A, 0x0062_009C, 0x0063_009D, 0x0065_009F, 0x0066_00A0, 0x0067_00A1,
-    0x0068_00A3, 0x006A_00A4, 0x006B_00A6, 0x006C_00A7, 0x006E_00A8, 0x006F_00AA,
-    0x0070_00AB, 0x0071_00AD, 0x0073_00AE, 0x0074_00AF, 0x0075_00B1, 0x0077_00B2,
-    0x0078_00B4, 0x0079_00B5, 0x007A_00B6, 0x007C_00B8, 0x007D_00B9, 0x007E_00BB,
-    0x007F_00BC, 0x0080_00BD, 0x0081_00BE, 0x0083_00C0, 0x0084_00C1, 0x0085_00C2,
-    0x0086_00C3, 0x0087_00C4, 0x0088_00C6, 0x0089_00C7, 0x008A_00C8, 0x008B_00C9,
-    0x008C_00CA, 0x008C_00CB, 0x008D_00CB, 0x008E_00CC, 0x008F_00CD, 0x008F_00CE,
-    0x0090_00CF, 0x0091_00CF, 0x0091_00D0, 0x0092_00D0, 0x0092_00D1, 0x0093_00D1,
-    0x0093_00D2, 0x0093_00D2, 0x0094_00D2, 0x0094_00D3, 0x0094_00D3, 0x0094_00D3,
+    0x00FF_0000, 0x00FF_0200, 0x00FF_0500, 0x00FF_0700, 0x00FF_0A00, 0x00FF_0C00,
+    0x00FF_0F00, 0x00FF_1100, 0x00FF_1400, 0x00FF_1600, 0x00FF_1800, 0x00FF_1B00,
+    0x00FF_1D00, 0x00FF_1F00, 0x00FF_2200, 0x00FF_2400, 0x00FF_2600, 0x00FF_2800,
+    0x00FF_2A00, 0x00FF_2D00, 0x00FF_2F00, 0x00FF_3100, 0x00FF_3300, 0x00FF_3500,
+    0x00FF_3700, 0x00FF_3900, 0x00FF_3B00, 0x00FF_3D00, 0x00FF_3F00, 0x00FF_4100,
+    0x00FF_4300, 0x00FF_4500, 0x00FF_4700, 0x00FF_4900, 0x00FF_4B00, 0x00FF_4D00,
+    0x00FF_4F00, 0x00FF_5100, 0x00FF_5300, 0x00FF_5400, 0x00FF_5600, 0x00FF_5800,
+    0x00FF_5A00, 0x00FF_5C00, 0x00FF_5E00, 0x00FF_5F00, 0x00FF_6100, 0x00FF_6300,
+    0x00FF_6500, 0x00FF_6700, 0x00FF_6800, 0x00FF_6A00, 0x00FF_6C00, 0x00FF_6E00,
+    0x00FF_6F00, 0x00FF_7100, 0x00FF_7300, 0x00FF_7500, 0x00FF_7600, 0x00FF_7800,
+    0x00FF_7A00, 0x00FF_7C00, 0x00FF_7D00, 0x00FF_7F00, 0x00FF_8100, 0x00FF_8200,
+    0x00FF_8400, 0x00FF_8600, 0x00FF_8700, 0x00FF_8900, 0x00FF_8B00, 0x00FF_8C00,
+    0x00FF_8E00, 0x00FF_9000, 0x00FF_9100, 0x00FF_9300, 0x00FF_9500, 0x00FF_9600,
+    0x00FF_9800, 0x00FF_9A00, 0x00FF_9B00, 0x00FF_9D00, 0x00FF_9F00, 0x00FF_A000,
+    0x00FF_A200, 0x00FF_A400, 0x00FF_A500, 0x00FF_A700, 0x00FF_A800, 0x00FF_AA00,
+    0x00FF_AC00, 0x00FF_AD00, 0x00FF_AF00, 0x00FF_B100, 0x00FF_B200, 0x00FF_B400,
+    0x00FF_B500, 0x00FF_B700, 0x00FF_B900, 0x00FF_BA00, 0x00FF_BC00, 0x00FF_BD00,
+    0x00FF_BF00, 0x00FF_C100, 0x00FF_C200, 0x00FF_C400, 0x00FF_C500, 0x00FF_C700,
+    0x00FF_C900, 0x00FF_CA00, 0x00FF_CC00, 0x00FF_CE00, 0x00FF_CF00, 0x00FF_D100,
+    0x00FF_D200, 0x00FF_D400, 0x00FF_D600, 0x00FF_D700, 0x00FF_D900, 0x00FF_DA00,
+    0x00FF_DC00, 0x00FF_DD00, 0x00FF_DF00, 0x00FF_E100, 0x00FF_E200, 0x00FF_E400,
+    0x00FF_E500, 0x00FF_E700, 0x00FF_E900, 0x00FF_EA00, 0x00FF_EC00, 0x00FF_ED00,
+    0x00FF_EF00, 0x00FF_F100, 0x00FF_F200, 0x00FF_F400, 0x00FF_F500, 0x00FF_F700,
+    0x00FF_F900, 0x00FF_FA00, 0x00FF_FC00, 0x00FF_FD00, 0x00FF_FF00, 0x00FD_FF00,
+    0x00FB_FF00, 0x00F9_FF00, 0x00F7_FF00, 0x00F5_FF00, 0x00F3_FF00, 0x00F1_FF00,
+    0x00EF_FF00, 0x00ED_FF00, 0x00EC_FF00, 0x00EA_FF00, 0x00E8_FF00, 0x00E6_FF00,
+    0x00E4_FF00, 0x00E2_FF00, 0x00E0_FF00, 0x00DE_FF00, 0x00DC_FF00, 0x00DA_FF00,
+    0x00D8_FF00, 0x00D6_FF00, 0x00D4_FF00, 0x00D2_FF00, 0x00D0_FF00, 0x00CE_FF00,
+    0x00CC_FF00, 0x00CA_FF00, 0x00C8_FF00, 0x00C6_FF00, 0x00C4_FF00, 0x00C2_FF00,
+    0x00C0_FF00, 0x00BE_FF00, 0x00BC_FF00, 0x00BA_FF00, 0x00B8_FF00, 0x00B6_FF00,
+    0x00B4_FF00, 0x00B1_FF00, 0x00AF_FF00, 0x00AD_FF00, 0x00AB_FF00, 0x00A9_FF00,
+    0x00A7_FF00, 0x00A5_FF00, 0x00A3_FF00, 0x00A1_FF00, 0x009F_FF00, 0x009D_FF00,
+    0x009B_FF00, 0x0099_FF00, 0x0096_FF00, 0x0094_FF00, 0x0092_FF00, 0x0090_FF00,
+    0x008E_FF00, 0x008C_FF00, 0x008A_FF00, 0x0087_FF00, 0x0085_FF00, 0x0083_FF00,
+    0x0081_FF00, 0x007F_FF00, 0x007D_FF00, 0x007A_FF00, 0x0078_FF00, 0x0076_FF00,
+    0x0074_FF00, 0x0072_FF00, 0x006F_FF00, 0x006D_FF00, 0x006B_FF00, 0x0069_FF00,
+    0x0066_FF00, 0x0064_FF00, 0x0062_FF00, 0x0060_FF00, 0x005D_FF00, 0x005B_FF00,
+    0x0059_FF00, 0x0056_FF00, 0x0054_FF00, 0x0052_FF00, 0x004F_FF00, 0x004D_FF00,
+    0x004B_FF00, 0x0048_FF00, 0x0046_FF00, 0x0044_FF00, 0x0041_FF00, 0x003F_FF00,
+    0x003C_FF00, 0x003A_FF00, 0x0038_FF00, 0x0035_FF00, 0x0033_FF00, 0x0030_FF00,
+    0x002E_FF00, 0x002B_FF00, 0x0029_FF00, 0x0026_FF00, 0x0024_FF00, 0x0021_FF00,
+    0x001F_FF00, 0x001C_FF00, 0x001A_FF00, 0x0017_FF00, 0x0015_FF00, 0x0012_FF00,
+    0x0010_FF00, 0x000D_FF00, 0x000A_FF00, 0x0008_FF00, 0x0005_FF00, 0x0003_FF00,
+    0x0000_FF00, 0x0000_FF03, 0x0001_FF06, 0x0001_FF08, 0x0002_FF0B, 0x0003_FF0E,
+    0x0003_FF11, 0x0004_FF14, 0x0004_FF16, 0x0005_FF19, 0x0005_FF1C, 0x0006_FF1F,
+    0x0006_FF21, 0x0007_FF24, 0x0008_FF27, 0x0008_FF29, 0x0009_FF2C, 0x0009_FF2E,
+    0x000A_FF31, 0x000B_FF34, 0x000B_FF36, 0x000C_FF39, 0x000C_FF3B, 0x000D_FF3E,
+    0x000E_FF40, 0x000E_FF43, 0x000F_FF45, 0x0010_FF47, 0x0010_FF4A, 0x0011_FF4C,
+    0x0012_FF4F, 0x0012_FF51, 0x0013_FF53, 0x0014_FF56, 0x0014_FF58, 0x0015_FF5A,
+    0x0016_FF5D, 0x0017_FF5F, 0x0017_FF61, 0x0018_FF64, 0x0019_FF66, 0x001C_FF6D,
+    0x0020_FF75, 0x0025_FF7E, 0x002B_FF87, 0x0031_FF91, 0x0038_FF9A, 0x0040_FFA3,
+    0x0047_FFAB, 0x004D_FFB2, 0x0054_FFB8, 0x0059_FFBD, 0x005E_FEC0, 0x0063_FBC1,
+    0x0067_F7C1, 0x006A_F3C1, 0x006D_EFC0, 0x006E_ECC0, 0x006F_EBC2, 0x006F_EBCE,
+    0x006F_EBD9, 0x006F_EBE9, 0x006F_DBEB, 0x006F_CBEB, 0x006F_BDEB, 0x006F_B1EB,
+    0x006C_B0ED, 0x0065_AFF2, 0x005B_ADF8, 0x0050_AAFD, 0x0047_A6FF, 0x0040_A1FF,
+    0x0038_9BFF, 0x0031_95FF, 0x002B_8EFF, 0x0025_87FF, 0x0020_80FF, 0x001C_7AFF,
+    0x0019_75FF, 0x0018_73FF, 0x0018_72FF, 0x0017_70FF, 0x0016_6EFF, 0x0016_6CFF,
+    0x0015_6BFF, 0x0015_69FF, 0x0014_67FF, 0x0013_66FF, 0x0013_64FF, 0x0012_62FF,
+    0x0012_60FF, 0x0011_5FFF, 0x0011_5DFF, 0x0010_5BFF, 0x0010_59FF, 0x000F_57FF,
+    0x000F_56FF, 0x000F_54FF, 0x000E_52FF, 0x000E_50FF, 0x000D_4EFF, 0x000D_4CFF,
+    0x000C_4BFF, 0x000C_49FF, 0x000C_47FF, 0x000B_45FF, 0x000B_43FF, 0x000A_41FF,
+    0x000A_3FFF, 0x000A_3DFF, 0x0009_3BFF, 0x0009_39FF, 0x0008_37FF, 0x0008_35FF,
+    0x0008_33FF, 0x0007_31FF, 0x0007_2FFF, 0x0007_2DFF, 0x0006_2BFF, 0x0006_29FF,
+    0x0005_27FF, 0x0005_24FF, 0x0005_22FF, 0x0004_20FF, 0x0004_1EFF, 0x0004_1BFF,
+    0x0003_19FF, 0x0003_17FF, 0x0003_14FF, 0x0002_12FF, 0x0002_0FFF, 0x0002_0DFF,
+    0x0001_0AFF, 0x0001_08FF, 0x0001_05FF, 0x0000_03FF, 0x0000_00FF, 0x0001_00FD,
+    0x0003_00FB, 0x0004_00F8, 0x0005_00F6, 0x0007_00F4, 0x0008_00F2, 0x0009_00F0,
+    0x000A_00EE, 0x000C_00EC, 0x000D_00EA, 0x000E_00E7, 0x000F_00E5, 0x0011_00E3,
+    0x0012_00E1, 0x0013_00DF, 0x0014_00DD, 0x0015_00DB, 0x0017_00D9, 0x0018_00D8,
+    0x0019_00D6, 0x001A_00D4, 0x001B_00D2, 0x001C_00D0, 0x001D_00CE, 0x001E_00CC,
+    0x0020_00CA, 0x0021_00C9, 0x0022_00C7, 0x0023_00C5, 0x0024_00C3, 0x0025_00C2,
+    0x0026_00C0, 0x0027_00BE, 0x0028_00BC, 0x0029_00BB, 0x002A_00B9, 0x002B_00B7,
+    0x002C_00B6, 0x002D_00B4, 0x002E_00B3, 0x002F_00B1, 0x0030_00B0, 0x0031_00AE,
+    0x0031_00AD, 0x0032_00AB, 0x0033_00AA, 0x0034_00A8, 0x0035_00A7, 0x0036_00A5,
+    0x0037_00A4, 0x0038_00A2, 0x0038_00A1, 0x0039_00A0, 0x003A_009E, 0x003B_009D,
+    0x003C_009B, 0x003D_009A, 0x003D_0099, 0x003E_0098, 0x003F_0096, 0x0040_0095,
+    0x0040_0094, 0x0041_0092, 0x0042_0091, 0x0043_0090, 0x0043_008F, 0x0044_008D,
+    0x0045_008C, 0x0046_008B, 0x0046_008A, 0x0047_0089, 0x0048_0088, 0x0048_0086,
+    0x0049_0085, 0x004A_0084, 0x004A_0083, 0x004B_0082, 0x004D_0084, 0x004E_0086,
+    0x0050_0088, 0x0052_0089, 0x0053_008B, 0x0055_008D, 0x0057_008F, 0x0059_0091,
+    0x005A_0093, 0x005C_0095, 0x005E_0097, 0x0060_0099, 0x0061_009B, 0x0063_009D,
+    0x0065_009F, 0x0067_00A1, 0x0069_00A3, 0x006B_00A5, 0x006C_00A7, 0x006E_00A9,
+    0x0070_00AB, 0x0072_00AD, 0x0074_00B0, 0x0076_00B2, 0x0078_00B4, 0x007A_00B6,
+    0x007C_00B8, 0x007E_00BA, 0x0080_00BD, 0x0082_00BF, 0x0084_00C1, 0x0086_00C3,
+    0x0088_00C5, 0x008A_00C8, 0x008C_00CA, 0x008E_00CC, 0x0090_00CE, 0x0092_00D1,
     0x0094_00D3,
 ];
 
@@ -1313,7 +1942,10 @@ mod tests {
     #[test]
     #[ignore = "table generator; run explicitly to regenerate SPECTRUM_LUT"]
     fn emit_spectrum_lut() {
-        let lut = generate_spectrum_lut();
+        let table = generate_spectrum_table();
+        let (lut, anchor_at, crossing_at) = (table.lut, table.anchor_at, table.crossing_at);
+        println!("pub const SPECTRUM_ANCHOR_AT: [usize; SPECTRUM_STOPS] = {anchor_at:?};");
+        println!("pub const SPECTRUM_CROSSING_AT: usize = {crossing_at};");
         for row in lut.chunks(6) {
             let cells: Vec<String> = row
                 .iter()
@@ -1348,12 +1980,35 @@ mod tests {
     /// rather than solving anything that could round them.
     #[test]
     fn spectrum_reproduces_its_anchors_exactly() {
+        // WHERE THE NAMES LANDED IS ITSELF GENERATED. The pace decides it, so
+        // the committed index table is checked against the generator's before
+        // anything is read through it.
+        let table = generate_spectrum_table();
+        let (anchor_at, crossing_at) = (table.anchor_at, table.crossing_at);
+        assert_eq!(
+            anchor_at, SPECTRUM_ANCHOR_AT,
+            "SPECTRUM_ANCHOR_AT drifted from the pace that places the anchors"
+        );
+        assert_eq!(
+            crossing_at, SPECTRUM_CROSSING_AT,
+            "SPECTRUM_CROSSING_AT drifted from the pace that places the crossing"
+        );
+        assert_eq!(SPECTRUM_ANCHOR_AT[0], 0, "red is the arc's own start");
+        assert_eq!(
+            SPECTRUM_ANCHOR_AT[SPECTRUM_STOPS - 1],
+            SPECTRUM_LUT_LEN - 1,
+            "violet is the arc's own end"
+        );
+        assert!(
+            SPECTRUM_ANCHOR_AT.windows(2).all(|w| w[0] < w[1]),
+            "the seven names must land in ROYGBIV order: {SPECTRUM_ANCHOR_AT:?}"
+        );
         for (i, &anchor) in SPECTRUM_ANCHORS.iter().enumerate() {
             assert_eq!(
-                SPECTRUM_LUT[i * SPECTRUM_STRIDE],
+                SPECTRUM_LUT[SPECTRUM_ANCHOR_AT[i]],
                 anchor,
                 "table index {} is not anchor {i}",
-                i * SPECTRUM_STRIDE
+                SPECTRUM_ANCHOR_AT[i]
             );
             assert_eq!(spectrum_stop(i), anchor, "stop {i}");
             // …and the OPEN gradient resolves the anchor at its own position,
@@ -1521,8 +2176,10 @@ mod tests {
         let mut dip_seg = 0usize;
         for seg in 0..SPECTRUM_STOPS - 1 {
             let floor = lum[seg].min(lum[seg + 1]);
-            for slot in 1..SPECTRUM_STRIDE {
-                let y = luminance(SPECTRUM_LUT[seg * SPECTRUM_STRIDE + slot]);
+            // THE INTERVAL IS THE ONE BETWEEN TWO NAMES, wherever the pace put
+            // them — not a fixed count of entries.
+            for idx in SPECTRUM_ANCHOR_AT[seg] + 1..SPECTRUM_ANCHOR_AT[seg + 1] {
+                let y = luminance(SPECTRUM_LUT[idx]);
                 let dip = (floor - y) / floor;
                 if dip > worst_dip {
                     worst_dip = dip;
@@ -1568,13 +2225,15 @@ mod tests {
     ///
     /// **THE ONE EXCEPTION IS AUTHORED, BOUNDED, AND BRIGHT.** The green→blue
     /// crossing's roof ([`SPECTRUM_CROSSING_ROOF`]) tapers `S` to a floor of
-    /// `0.50` across the pacing knots' span and back — the on-glass cyan
+    /// `0.53` across the pacing knots' span and back — the on-glass cyan
     /// true-peak bound, priced there in the roof's own doc. It is NOT the grey
     /// hole coming back, and the clauses below say precisely why not: the
-    /// taper's entries hold `V ≥ 0.85` (the hole was `V 0.51` grey) and chroma
-    /// `≥ 109` (the hole's midpoint was chroma 12; the on-glass gate's bar is
-    /// 100), and every entry OUTSIDE the pacing knots' span still reads
-    /// `S = 1` exactly, so the taper cannot creep.
+    /// taper's entries hold `V ≥ 0.92` (the hole was `V 0.51` grey — and since
+    /// 2026-08-31 the roof's value is a PLATEAU, so the taper no longer sags at
+    /// the one place the light-law pales it) and chroma `≥ 124` (the hole's
+    /// midpoint was chroma 12; the on-glass gate's bar is 100), and every entry
+    /// OUTSIDE the pacing knots' span still reads `S = 1` exactly, so the taper
+    /// cannot creep.
     ///
     /// **VALUE IS THE ANCHORS' OWN, AND ITS FLOOR IS AN AUTHORED COLOUR.**
     /// `min V = 0.510` is indigo `#4B0082` itself — a named ROYGBIV stop, not a
@@ -1604,8 +2263,8 @@ mod tests {
         // roof's 0.50 floor and back), so the exception zone is that interval
         // and the guard is that it may not creep past it — the other five
         // intervals hold S = 1 exactly, entry for entry.
-        let taper = (SPECTRUM_ROOF_SEG * SPECTRUM_STRIDE + 1)
-            ..=((SPECTRUM_ROOF_SEG + 1) * SPECTRUM_STRIDE - 1);
+        let taper =
+            (SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG] + 1)..=(SPECTRUM_ANCHOR_AT[SPECTRUM_ROOF_SEG + 1] - 1);
         for (i, &rgb) in SPECTRUM_LUT.iter().enumerate() {
             let (_, s, _) = spectrum_hsv(rgb);
             if taper.contains(&i) {
@@ -1664,8 +2323,34 @@ mod tests {
 
     /// Adjacent generated entries stay close enough that the LUT cannot print a
     /// visible staircase, and [`spectrum`] remains continuous between them. The
-    /// 16-level ceiling is exact: the authored crossing's consecutive
-    /// `#74E9D5 → #6CD9D2` samples move green `233 → 217`.
+    /// 14-level ceiling is exact: the authored crossing's consecutive
+    /// `#6FEBE3 → #6FE3EB` samples move green `235 → 227` and blue `227 → 235`.
+    ///
+    /// **`15 -> 14` WHEN THE ROOF'S VALUE WENT FLAT (2026-08-31).** The retired
+    /// sag spent 35 levels of `V` inside seven entries and got them back again;
+    /// a plateau spends none, so the steepest table chord in the whole arc got
+    /// SHALLOWER while the crossing kept its hues.
+    ///
+    /// **`14 -> 16` WHEN THE CROSSING BECAME A SEAM (2026-08-31), and the
+    /// direction is recorded because it is the wrong one.** The roof's hue span
+    /// grew `41.2° -> 48.0°` over the same seven steps to carry the exit past
+    /// the softened window's own shoulder, and a wider turn at a fixed `V` and
+    /// `S` is a longer chord: the steepest pair is now `#6FEBE9 -> #6FDBEB`,
+    /// green `235 -> 219`. Two levels of table chord bought a whole ribbon slab
+    /// of grey (`2 -> 1` at the traverse a 76-key line lays,
+    /// `the_crossing_is_a_seam_not_a_region`), and `16` is exactly the roof
+    /// ceiling this test already allowed — so what moved is the pin, not the
+    /// bound, and the pin is at the bound with nothing left to spend.
+    ///
+    /// **THE EXCEPTION'S SCOPE TIGHTENED WITH THE 2026-08-31 RE-PACE, AND ITS
+    /// NUMBERS DID NOT MOVE.** The `16` used to be allowed across the whole
+    /// green→blue interval because that was the interval the roof was drawn in;
+    /// the pace made the crossing its own run of entries
+    /// ([`SPECTRUM_CROSSING_AT`]), so the ceiling now applies to exactly those
+    /// and the ordinary `5` applies to every other entry of that interval too.
+    /// Measured on the re-paced table: the worst step outside the crossing is
+    /// `4` levels — the pace's byte currency ([`SPECTRUM_PACE_BYTE_SHARE`]) is
+    /// what keeps it there.
     #[test]
     fn spectrum_lut_has_bounded_adjacent_steps() {
         let fresh = generate_spectrum_lut();
@@ -1680,7 +2365,9 @@ mod tests {
                 })
                 .max()
                 .unwrap_or(0);
-            let ceiling = if i / SPECTRUM_STRIDE == SPECTRUM_ROOF_SEG {
+            let ceiling = if (SPECTRUM_CROSSING_AT..SPECTRUM_CROSSING_AT + SPECTRUM_CROSSING_ENTRIES)
+                .contains(&i)
+            {
                 16
             } else {
                 5

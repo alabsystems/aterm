@@ -805,7 +805,14 @@ fn download_max_time_secs(max_filesize: u64) -> u64 {
 /// [`api_get_args`].
 fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a str; 19] {
     [
-        "-fSL",
+        // `-s` matters as much as `-S` here, and its absence was load-bearing: without
+        // it curl writes its PROGRESS METER to stderr, and this lane's stderr is
+        // captured into the failure message. A machine that failed this download 95
+        // consecutive times logged 95 walls of `--:--:--   0` with the actual cause
+        // buried at the end of each one, unreadable
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). `-S` keeps real errors,
+        // which is the pairing `download_bytes_args` already uses.
+        "-fsSL",
         // https-only redirects — see `download_bytes_args`.
         "--proto-redir",
         "=https",

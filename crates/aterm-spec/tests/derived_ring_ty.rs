@@ -20,11 +20,11 @@
 // The property models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
     Model, aa_edge_hardening_model, active_handle_model, alt_selection_park_model,
-    anchored_artifact_transaction_model, artifact_reader_lease_model,
-    artifact_reply_publication_model, asymmetric_pad_layout_model, capture_after_present_model,
-    channel_bind_model, chrome_face_gate_model, clipboard_mailbox_model,
-    closed_recovery_ledgers_model, coalesce_model, composed_sync_hold_model,
-    composite_accessibility_route_model, config_catalog_snapshot_model,
+    anchored_artifact_transaction_model, artifact_handoff_capacity_model,
+    artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
+    capture_after_present_model, channel_bind_model, chrome_face_gate_model,
+    clipboard_mailbox_model, closed_recovery_ledgers_model, coalesce_model,
+    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
     config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
     ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
     cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
@@ -88,8 +88,9 @@ use aterm_spec::derive::{
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
     vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
-    video_recording_lifecycle_model, video_tap_slot_model, visible_pad_crop_model,
-    watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
+    video_batch_publication_durability_model, video_recording_lifecycle_model,
+    video_tap_slot_model, visible_pad_crop_model, watcher_failure_recovery_model,
+    watcher_latch_model, wide_center_model, window_routing_model,
 };
 use aterm_spec::verify;
 use std::process::Command;
@@ -2537,25 +2538,181 @@ fn derived_artifact_reply_publication_requires_ack_or_quarantine_expiry() {
 }
 
 #[test]
+fn derived_artifact_handoff_capacity_refuses_overbooking() {
+    let model = artifact_handoff_capacity_model();
+    assert_proves_and_catches(&model);
+
+    let one = model.successors("Acquire", &model.init_state())[0].clone();
+    let grown = model.successors("ReconcileGrow", &one)[0].clone();
+    assert_eq!(
+        (
+            grown["live"],
+            grown["descriptor_units"],
+            grown["charge_two"],
+            grown["charge_three"],
+            grown["selected"],
+        ),
+        (1, 3, 0, 1, 3)
+    );
+    let grown_release = model.successors("Release", &grown)[0].clone();
+    assert_eq!(
+        (grown_release["live"], grown_release["descriptor_units"]),
+        (0, 0),
+        "release returns the reconciled exact charge"
+    );
+    let shrunk = model.successors("ReconcileShrink", &one)[0].clone();
+    assert_eq!(
+        (
+            shrunk["live"],
+            shrunk["descriptor_units"],
+            shrunk["charge_one"],
+            shrunk["charge_two"],
+            shrunk["selected"],
+        ),
+        (1, 1, 1, 0, 1)
+    );
+    let shrunk_release = model.successors("Release", &shrunk)[0].clone();
+    assert_eq!(
+        (shrunk_release["live"], shrunk_release["descriptor_units"]),
+        (0, 0),
+        "a charge-one permit remains releasable"
+    );
+
+    let mixed = model.successors("Acquire", &grown)[0].clone();
+    assert_eq!(
+        (
+            mixed["live"],
+            mixed["descriptor_units"],
+            mixed["charge_two"],
+            mixed["charge_three"],
+            mixed["selected"],
+        ),
+        (2, 5, 1, 1, 2),
+        "a later acquisition must not overwrite the earlier permit's charge"
+    );
+    let ordinary_first = model.successors("Release", &mixed)[0].clone();
+    let select_grown = model.successors("SelectThree", &ordinary_first)[0].clone();
+    let all_released = model.successors("Release", &select_grown)[0].clone();
+    assert_eq!(
+        (all_released["live"], all_released["descriptor_units"]),
+        (0, 0),
+        "mixed charges release without orphaning units"
+    );
+    let select_grown = model.successors("SelectThree", &mixed)[0].clone();
+    let grown_first = model.successors("Release", &select_grown)[0].clone();
+    let select_ordinary = model.successors("SelectTwo", &grown_first)[0].clone();
+    let reverse_released = model.successors("Release", &select_ordinary)[0].clone();
+    assert_eq!(
+        (
+            reverse_released["live"],
+            reverse_released["descriptor_units"],
+        ),
+        (0, 0),
+        "the opposite mixed-charge release order is also balanced"
+    );
+
+    let one_and_two = model.successors("Acquire", &shrunk)[0].clone();
+    let one_and_two_and_two = model.successors("Acquire", &one_and_two)[0].clone();
+    let selected_one = model.successors("SelectOne", &one_and_two_and_two)[0].clone();
+    assert_eq!(
+        (
+            selected_one["live"],
+            selected_one["descriptor_units"],
+            selected_one["charge_one"],
+            selected_one["charge_two"],
+            selected_one["selected"],
+        ),
+        (3, 5, 1, 2, 1)
+    );
+    assert_eq!(
+        model.successors("ReconcileGrow", &selected_one)[0]["descriptor_units"],
+        6,
+        "one unit of headroom is real"
+    );
+    assert_eq!(
+        model.successors("RefuseReconcile", &selected_one)[0],
+        selected_one,
+        "a direct one-to-three jump is refused atomically despite that headroom"
+    );
+
+    let mut state = model.init_state();
+    for _ in 0..3 {
+        state = model.successors("Acquire", &state)[0].clone();
+    }
+    assert_eq!((state["live"], state["descriptor_units"]), (3, 6));
+    assert!(model.successors("Acquire", &state).is_empty());
+    assert_eq!(
+        model.successors("RefuseAtCap", &state)[0]["live"],
+        3,
+        "descriptor capacity binds before the count cap"
+    );
+    assert_eq!(
+        model.successors("RefuseReconcile", &state)[0]["descriptor_units"],
+        6
+    );
+    assert_eq!(model.successors("Release", &state)[0]["live"], 2);
+}
+
+#[test]
+fn derived_video_batch_publication_requires_current_directory_barrier() {
+    let model = video_batch_publication_durability_model();
+    assert_proves_and_catches(&model);
+    assert_eq!(
+        verify::audit_dead_negative_controls(&model, &["BuggyPublishBeforeSync"]),
+        Ok(1),
+        "the pre-barrier marker mutant must be reachable and violate the ordering invariant"
+    );
+
+    let mut state = model.init_state();
+    assert!(model.fire("WriteMember", &mut state));
+    assert_eq!((state["members"], state["synced_members"]), (1, 0));
+    assert!(
+        !model.action_enabled("PublishMarker", &state),
+        "a file-synced member alone cannot make the batch visible"
+    );
+
+    assert!(model.fire("SyncBatch", &mut state));
+    assert_eq!((state["members"], state["synced_members"]), (1, 1));
+    assert!(model.fire("WriteMember", &mut state));
+    assert_eq!((state["members"], state["synced_members"]), (2, 1));
+    assert!(
+        !model.action_enabled("PublishMarker", &state),
+        "a later member invalidates an earlier directory barrier"
+    );
+
+    assert!(model.fire("SyncBatch", &mut state));
+    assert!(model.fire("PublishMarker", &mut state));
+    assert_eq!(
+        (state["members"], state["synced_members"], state["marker"]),
+        (2, 2, 1)
+    );
+    assert!(model.check_invariant("MarkerCoversEveryMember", &state));
+}
+
+#[test]
 fn derived_artifact_reader_lease_sweeps_only_after_final_release() {
     let model = artifact_reader_lease_model();
     assert_proves_and_catches(&model);
-    let negative_controls = ["BuggyAcquireDuringSweep", "BuggyStartSweepEarly"];
+    let negative_controls = [
+        "BuggyAcquireDuringSweep",
+        "BuggyAcquireReplacedIdentity",
+        "BuggyStartSweepEarly",
+    ];
     assert_eq!(
         verify::audit_dead_negative_controls(&model, &negative_controls),
         Ok(negative_controls.len()),
-        "both refcount/sweep ordering mutants must fire and fail independently"
+        "every refcount, sweep, and identity mutant must fire and fail independently"
     );
 
     let mut state = model.init_state();
     assert!(model.fire("Acquire", &mut state));
     assert!(model.fire("Acquire", &mut state));
     assert!(model.fire("Arm", &mut state));
-    assert_eq!((state["readers"], state["armed"]), (2, 1));
+    assert_eq!((state["leases"], state["armed"]), (2, 1));
 
     assert!(model.fire("Release", &mut state));
     assert_eq!(
-        (state["readers"], state["pending"], state["sweeping"]),
+        (state["leases"], state["pending"], state["sweeping"]),
         (1, 0, 0),
         "the first of two readers cannot start the convergence sweep"
     );
@@ -2563,20 +2720,20 @@ fn derived_artifact_reader_lease_sweeps_only_after_final_release() {
 
     assert!(model.fire("Release", &mut state));
     assert_eq!(
-        (state["readers"], state["pending"], state["sweeping"]),
+        (state["leases"], state["pending"], state["sweeping"]),
         (0, 1, 0),
         "the final release schedules exactly one capability-bound sweep"
     );
     assert!(model.fire("RejectAcquireWhileSweeping", &mut state));
-    assert_eq!(state["readers"], 0);
+    assert_eq!(state["leases"], 0);
     assert!(model.fire("StartSweep", &mut state));
     assert_eq!((state["pending"], state["sweeping"]), (0, 1));
     assert!(model.fire("RejectAcquireWhileSweeping", &mut state));
-    assert_eq!(state["readers"], 0);
+    assert_eq!(state["leases"], 0);
     assert!(model.fire("FinishSweep", &mut state));
     assert_eq!(
         (
-            state["readers"],
+            state["leases"],
             state["armed"],
             state["pending"],
             state["sweeping"],
@@ -2591,8 +2748,8 @@ fn derived_artifact_reader_lease_sweeps_only_after_final_release() {
     let armed = buggy.successors("Arm", &acquired)[0].clone();
     let early = buggy.successors("BuggyStartSweepEarly", &armed)[0].clone();
     assert!(
-        !buggy.check_invariant("MaintenanceExcludesReaders", &early),
-        "negative control: maintenance cannot begin with a live reader"
+        !buggy.check_invariant("MaintenanceExcludesLeases", &early),
+        "negative control: maintenance cannot begin with a live lease"
     );
 
     let mut pending = model.init_state();
@@ -2603,8 +2760,19 @@ fn derived_artifact_reader_lease_sweeps_only_after_final_release() {
         .successors("BuggyAcquireDuringSweep", &pending)[0]
         .clone();
     assert!(
-        !buggy.check_invariant("MaintenanceExcludesReaders", &pending),
-        "negative control: a new reader cannot enter the last-release/sweep interval"
+        !buggy.check_invariant("MaintenanceExcludesLeases", &pending),
+        "negative control: a new lease cannot enter the last-release/sweep interval"
+    );
+
+    let mut replaced = model.init_state();
+    assert!(model.fire("Acquire", &mut replaced));
+    assert!(model.fire("ReplaceIdentity", &mut replaced));
+    assert!(model.fire("RejectReplacedIdentity", &mut replaced));
+    assert!(!model.action_enabled("Acquire", &replaced));
+    let joined = buggy.successors("BuggyAcquireReplacedIdentity", &replaced)[0].clone();
+    assert!(
+        !buggy.check_invariant("ReplacementNeverJoinsLeaseGroup", &joined),
+        "negative control: a replacement identity cannot join a live lease group"
     );
 }
 
@@ -2797,6 +2965,8 @@ fn capture_tap_models_are_registered_for_global_verification() {
         "ExactInstanceRetention",
         "AnchoredArtifactTransaction",
         "ArtifactReplyPublication",
+        "ArtifactHandoffCapacity",
+        "VideoBatchPublicationDurability",
         "ArtifactReaderLease",
         "PresentedFrameTap",
         "VideoTapSlot",

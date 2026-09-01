@@ -63,7 +63,42 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// The shipped `CFBundleIdentifier` (`aterm-release`'s bundle stamper default).
+/// It is the FIXTURE's id in the pure parser test and the last-resort fallback
+/// for a bundle whose plist cannot be read — never the id the live guard
+/// asserts against, which is read from the bundle under test.
 const BUNDLE_ID: &str = "com.aterm.aterm";
+
+/// The `CFBundleIdentifier` of the bundle under test.
+///
+/// The launchd label LaunchServices mints is `application.<that id>.<hex>.<hex>`,
+/// so pinning the release channel's literal here would fail the guard for a dev
+/// build stamped `com.aterm.aterm.dev` — a build that is otherwise exercising
+/// exactly the handoff this file exists to protect. Read it from the bundle
+/// instead (design 3.1, blast radius: the launchd job label).
+fn bundle_id_of(app: &Path) -> String {
+    let plist = std::fs::read_to_string(app.join("Contents/Info.plist")).unwrap_or_default();
+    plist_string(&plist, "CFBundleIdentifier").map_or_else(|| BUNDLE_ID.to_string(), str::to_owned)
+}
+
+/// One XML plist string value, by exact key. Release and dev bundles are both
+/// emitted as XML; anything else reads as absent and the caller falls back.
+fn plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = text;
+    loop {
+        let at = rest.find("<key>")?;
+        let after = &rest[at + "<key>".len()..];
+        let end = after.find("</key>")?;
+        let found = after[..end].trim();
+        let tail = &after[end + "</key>".len()..];
+        if found == key {
+            let value = tail.trim_start().strip_prefix("<string>")?;
+            let close = value.find("</string>")?;
+            let value = value[..close].trim();
+            return (!value.is_empty()).then_some(value);
+        }
+        rest = tail;
+    }
+}
 
 /// The launchd label prefix LaunchServices gives one running INSTANCE of
 /// `bundle_id`. The trailing dot is load-bearing: without it a neighbouring
@@ -242,6 +277,63 @@ fn running_application_job_reads_the_launchctl_table() {
     assert_eq!(labels, vec!["application.com.aterm.aterm.0x10a5f.0x10a5f"]);
 }
 
+/// The label the live guard asserts against is the RUNNING bundle's, not a
+/// literal. A dev bundle stamps `com.aterm.aterm.dev`, LaunchServices mints
+/// `application.com.aterm.aterm.dev.<hex>.<hex>` for it, and the guard must
+/// bind to THAT — the dev prefix must not match a release job, and the
+/// fixture assertion must name the job the bundle under test actually owns.
+///
+/// NOTE the one-way asymmetry pinned below: `application.com.aterm.aterm.` IS
+/// a prefix of the dev label, so the release id still MATCHES a dev job. The
+/// trailing dot excludes `com.aterm.aterm-helper` but cannot exclude a
+/// dot-suffixed child id. Separating the channels in that direction would mean
+/// requiring exactly two trailing `<hex>.<hex>` components, which is a change
+/// to the parser this file's guard is built on and is deliberately NOT made
+/// here.
+#[test]
+fn the_asserted_label_follows_the_bundles_own_identifier() {
+    let dev = "<plist><dict><key>CFBundleIdentifier</key><string>com.aterm.aterm.dev</string>\
+               </dict></plist>";
+    assert_eq!(
+        plist_string(dev, "CFBundleIdentifier"),
+        Some("com.aterm.aterm.dev")
+    );
+    // A plist with no identifier (or a binary one) falls back rather than
+    // asserting nothing at all.
+    assert_eq!(
+        plist_string("bplist00\u{0}garbage", "CFBundleIdentifier"),
+        None
+    );
+
+    let printout = "gui/501 = {\n\
+         \t    4711     0\tapplication.com.aterm.aterm.dev.0x1.0x1\n\
+         \t    4712     0\tapplication.com.aterm.aterm.0x2.0x2\n\
+         }\n";
+    assert_eq!(
+        running_application_job(printout, "com.aterm.aterm.dev", 4711).as_deref(),
+        Some("application.com.aterm.aterm.dev.0x1.0x1"),
+        "the dev channel finds its own job"
+    );
+    assert_eq!(
+        running_application_job(printout, "com.aterm.aterm.dev", 4712),
+        None,
+        "and never the release channel's"
+    );
+    // The asymmetry, stated rather than assumed: the release prefix DOES match
+    // a dev job, so binding the guard to the running bundle's own id is what
+    // makes a dev run assert against its own job instead of borrowing the
+    // release channel's spelling.
+    assert_eq!(
+        running_application_job(printout, BUNDLE_ID, 4711).as_deref(),
+        Some("application.com.aterm.aterm.dev.0x1.0x1"),
+        "the release prefix is a prefix of the dev label"
+    );
+    assert_eq!(
+        running_application_job(printout, BUNDLE_ID, 4712).as_deref(),
+        Some("application.com.aterm.aterm.0x2.0x2"),
+    );
+}
+
 /// The overlap successor must be a new LaunchServices application job.
 #[test]
 #[ignore = "live LaunchServices/launchd e2e; needs ATERM_HANDOFF_E2E_APP"]
@@ -258,6 +350,10 @@ fn survivor_is_a_live_launchd_application_job() {
         app.display()
     );
     assert!(ctl.exists(), "{} has no aterm-ctl alias", app.display());
+    // ID-RELATIVE: a dev bundle stamps its own `CFBundleIdentifier`, and the
+    // launchd label follows it. Reading it is what keeps this guard live for
+    // both channels.
+    let bundle_id = bundle_id_of(&app);
     let uid = current_uid();
 
     // `open -n` is the fixture's own load-bearing detail: it is what makes
@@ -286,7 +382,7 @@ fn survivor_is_a_live_launchd_application_job() {
     // `seamless::commit_and_exit`'s `_exit(0)` is what strands the survivor, so
     // the closing assertion can report exactly which context was lost.
     let Some(original_job) =
-        running_application_job(&launchctl_print_gui(uid), BUNDLE_ID, original)
+        running_application_job(&launchctl_print_gui(uid), &bundle_id, original)
     else {
         panic!(
             "the freshly opened instance {original} is not a launchd application \
@@ -341,7 +437,7 @@ fn survivor_is_a_live_launchd_application_job() {
 
     let printout = launchctl_print_gui(uid);
     assert!(
-        running_application_job(&printout, BUNDLE_ID, survivor).is_some(),
+        running_application_job(&printout, &bundle_id, survivor).is_some(),
         "survivor {survivor} is alive but owns no `{prefix}*` job in gui/{uid}.\n\
          EXPECTED: the successor was launched through LaunchServices \
          (createsNewApplicationInstance), so launchd minted it a job of its own \
@@ -356,6 +452,6 @@ fn survivor_is_a_live_launchd_application_job() {
          TO FIX: land blockers B2, B3 and B4 (this file's module docs name the \
          call site that owns each; B1 is already done), then replace the \
          `spawn` in `app_update_handoff::run_handoff_worker`.",
-        prefix = application_job_prefix(BUNDLE_ID)
+        prefix = application_job_prefix(&bundle_id)
     );
 }

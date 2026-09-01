@@ -9,11 +9,18 @@
 //! This is the ONLY thing that puts the atpkg-managed `bin/` on an interactive shell's PATH,
 //! and it **APPENDS** it (append-not-prepend, mirroring [`crate::store::append_bin_to_path`])
 //! so a managed tool can never shadow system `sudo`/`ssh`/`git` even on the interactive PATH.
-//! REACH: `~/.aterm/shell.d` is sourced by aterm's own shell integration
-//! (`aterm-shell-integration`'s zsh/bash/fish/ps1 scripts) — i.e. by shells running INSIDE
-//! an aterm session, NOT by every login shell. Nothing writes a source line into
-//! `~/.zshrc`/`~/.bashrc`, so a Terminal.app/ssh/CI shell reaches managed tools only via
-//! `aterm <tool>` / `atpkg run` (or the manual rc-file line `atpkg doctor` prints).
+//! REACH: `~/.aterm/shell.d` is sourced from two places. aterm's own shell integration
+//! (`aterm-shell-integration`'s zsh/bash/fish/ps1 scripts) sources it for shells running
+//! INSIDE an aterm session; and [`ensure_rc_sources_hooks`] adds a marker-bounded block
+//! to the user's `~/.zshrc` / `~/.bashrc` / fish config so an ORDINARY interactive shell
+//! — Terminal.app, iTerm, VS Code, ssh, an agent's shell — gets the managed tools too.
+//! It edits only rc files that already exist and never creates one.
+//!
+//! That second half is new. Until it landed, a Terminal.app shell reached managed tools
+//! only via `aterm <tool>` / `atpkg run` or a PATH line the user pasted by hand, which
+//! for a product whose users run coding agents in other terminals threw away most of the
+//! value of installing a toolchain
+//! (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B9).
 //! `~/.aterm/shell.d` is OUTSIDE the managed prefix, so [`refresh`] hardens both `~/.aterm`
 //! and `~/.aterm/shell.d` with `ensure_private_dir` (symlink-refusing, `0700`, fail-closed)
 //! BEFORE writing, and each file is written `0600` via temp + rename. Entirely best-effort:
@@ -103,7 +110,74 @@ pub fn refresh(layout: &Layout) {
     }
     let _ = write_hooks(&shell_d, &layout.bin_dir());
     #[cfg(unix)]
+    ensure_rc_sources_hooks(&home);
+    #[cfg(unix)]
     ensure_command_links(&home);
+}
+
+/// The markers bounding atpkg's block in a user's shell rc. Present so the block can be
+/// found, refreshed and removed exactly — never matched by content, which drifts.
+const RC_BEGIN: &str = "# >>> atpkg shell integration >>>";
+const RC_END: &str = "# <<< atpkg shell integration <<<";
+
+/// Source the `shell.d` hooks from the user's own rc, so the managed toolchain is on
+/// PATH in EVERY shell — Terminal.app, iTerm, VS Code, ssh, an agent's shell — not only
+/// inside an aterm session.
+///
+/// Until this existed, `shell.d` was written on every install and sourced only by
+/// aterm's own integration, so `trustc` was not found anywhere else and `doctor` could
+/// only print a PATH line for the user to paste by hand. For a product whose users run
+/// coding agents in other terminals that is most of the value of installing a toolchain
+/// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B9).
+///
+/// Deliberately conservative about touching a file it does not own:
+/// * only rc files that ALREADY EXIST are edited — atpkg never creates a shell's rc;
+/// * the block is bounded by [`RC_BEGIN`]/[`RC_END`] so it is idempotent (present ⇒
+///   nothing happens) and a user can delete it in one motion;
+/// * it SOURCES `shell.d` rather than inlining a PATH, so the path stays correct after
+///   the prefix moves and there is exactly one generator;
+/// * the sourced hook appends, never prepends, so a managed tool cannot shadow system
+///   `sudo`/`ssh`/`git`;
+/// * every step is best-effort — wiring PATH must never fail an install.
+#[cfg(unix)]
+fn ensure_rc_sources_hooks(home: &Path) {
+    for (rc, hook) in [
+        (".zshrc", "00-atpkg.zsh"),
+        (".bashrc", "00-atpkg.bash"),
+        (".config/fish/config.fish", "00-atpkg.fish"),
+    ] {
+        let rc_path = home.join(rc);
+        // Never CREATE an rc: a shell the user does not use should not gain one, and a
+        // file we invent is a file we own forever.
+        let Ok(existing) = fs::read_to_string(&rc_path) else {
+            continue;
+        };
+        if existing.contains(RC_BEGIN) {
+            continue; // already wired; the hook body itself is what gets refreshed
+        }
+        let hook_path = home.join(".aterm").join("shell.d").join(hook);
+        let line = if hook.ends_with(".fish") {
+            format!("test -f {p}; and source {p}", p = sh_quote(&hook_path))
+        } else {
+            format!("[ -f {p} ] && . {p}", p = sh_quote(&hook_path))
+        };
+        let mut next = existing;
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(&format!(
+            "\n{RC_BEGIN}\n\
+             # Puts the ALab toolchain on PATH. Managed by atpkg; delete this block to opt out.\n\
+             {line}\n\
+             {RC_END}\n"
+        ));
+        // Same temp+rename discipline the hook files use: a reader never sees a
+        // half-written rc, and a failure leaves the original untouched.
+        let tmp = rc_path.with_extension(format!("atpkg-{}.tmp", std::process::id()));
+        if fs::write(&tmp, next).is_ok() && fs::rename(&tmp, &rc_path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
 }
 
 /// Put `aterm` and `atpkg` in `~/.local/bin` when we are running from an app bundle.
@@ -232,6 +306,46 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The rc block goes in exactly once, sources the hook, and is removable.
+    ///
+    /// Before this, `shell.d` was written on every install and sourced only by aterm's
+    /// own integration, so the managed toolchain was invisible in Terminal.app, iTerm,
+    /// VS Code and any agent shell — most of the value of installing a toolchain
+    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B9).
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_is_idempotent_and_only_touches_existing_rc_files() {
+        let home = tmp("rcwire");
+        let zshrc = home.join(".zshrc");
+        std::fs::write(&zshrc, "# pre-existing user content\nexport FOO=1\n").unwrap();
+        // .bashrc deliberately absent: atpkg must not CREATE an rc for a shell the
+        // user does not use — a file we invent is a file we own forever.
+
+        ensure_rc_sources_hooks(&home);
+        let once = std::fs::read_to_string(&zshrc).unwrap();
+        assert!(
+            once.contains(RC_BEGIN) && once.contains(RC_END),
+            "block written"
+        );
+        assert!(
+            once.contains(".aterm/shell.d/00-atpkg.zsh"),
+            "it must SOURCE the generated hook, not inline a PATH that can go stale"
+        );
+        assert!(
+            once.starts_with("# pre-existing user content"),
+            "the user's own content must be preserved, and preserved FIRST"
+        );
+        assert!(!home.join(".bashrc").exists(), "no rc was invented");
+
+        // Idempotent: a second refresh must not stack a second block.
+        ensure_rc_sources_hooks(&home);
+        let twice = std::fs::read_to_string(&zshrc).unwrap();
+        assert_eq!(twice, once, "a second pass must be a no-op");
+        assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

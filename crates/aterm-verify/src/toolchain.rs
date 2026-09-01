@@ -30,11 +30,23 @@
 //!    lane; the workspace rides `--unverified` until the Trust-Std campaign
 //!    greens, the same statement `.cargo/config.toml`'s off-switch already makes.
 //!
-//! 4. THE DIRECTORY MUST BE THE PIN. `rust-toolchain.toml` names `trust`; a
+//! 4. THE STORE IS A CANDIDATE, AND IT COMES BEFORE THE SOURCE TREE. The
+//!    ordinary way to get the pinned toolchain is `aterm pkg install trust`,
+//!    which lays it down under the atpkg prefix as `store/trust/current/bin`
+//!    (the per-program live-build link atpkg flips on every update). That
+//!    directory is probed right after an explicit `$TRUST_STAGE2_BIN` and
+//!    BEFORE `$HOME/trust/build/host/stage2/bin`, the from-source developer
+//!    alternative — the same order `aterm-release`'s gates use. The prefix is
+//!    resolved the way atpkg resolves it ([`atpkg_prefix`]: `[packages].prefix`
+//!    from aterm.toml, else the platform default) as a dependency-free MIRROR,
+//!    because this crate has no dependencies by charter (see its Cargo.toml).
+//!
+//! 5. THE DIRECTORY MUST BE THE PIN. `rust-toolchain.toml` names `trust`; a
 //!    directory carrying a file called `targo` is not evidence that it is that
 //!    toolchain, and rule 2 above ADOPTS such a directory off the caller's PATH.
 //!    Every candidate is therefore checked against the pinned channel before it
-//!    becomes THE toolchain — see [`is_pinned_toolchain`] — and a candidate that
+//!    becomes THE toolchain — see `is_pinned_toolchain`, private to this
+//!    module — and a candidate that
 //!    fails is REFUSED and named, never silently used. Without that check the
 //!    gate would run a different frontend and a different lint set under the
 //!    pinned one's name and still print the merge-contract sentence, which is
@@ -146,6 +158,85 @@ fn is_pinned_toolchain(dir: &Path, pinned: Option<&str>) -> bool {
     !sysroot.is_empty() && Path::new(sysroot).join("lib/rustlib").is_dir()
 }
 
+/// The atpkg install prefix, resolved the way atpkg resolves it — as a MIRROR,
+/// not a dependency edge (this crate has none, by charter).
+///
+/// `[packages].prefix` from the user config (`<xdg_config_home>/aterm/aterm.toml`,
+/// else `<home>/.config/aterm/aterm.toml` — `atpkg::config::config_path`'s rule),
+/// `~`-expanded, absolute paths only; anything else falls back to the platform
+/// default `atpkg::platform::default_prefix` lays down: `Library/Application
+/// Support/aterm/pkg` under `home` on macOS, `.local/share/aterm/pkg` elsewhere.
+/// atpkg's own `vet_prefix` chain check is the authority on whether a configured
+/// prefix is SAFE; this only has to agree with it about where to LOOK, and a
+/// prefix that would fail atpkg's check simply holds no store.
+#[must_use]
+pub fn atpkg_prefix(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
+    let cfg = xdg_config_home
+        .filter(|d| !d.as_os_str().is_empty())
+        .map_or_else(|| home.join(".config"), Path::to_path_buf)
+        .join("aterm/aterm.toml");
+    if let Ok(text) = std::fs::read_to_string(&cfg)
+        && let Some(configured) = configured_prefix_in(&text, home)
+    {
+        return configured;
+    }
+    default_atpkg_prefix(home)
+}
+
+/// The platform default prefix (the mirror of `atpkg::platform::default_prefix`).
+#[must_use]
+pub fn default_atpkg_prefix(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/aterm/pkg")
+    } else {
+        home.join(".local/share/aterm/pkg")
+    }
+}
+
+/// `[packages].prefix` out of aterm.toml text, expanded against `home`.
+///
+/// A line scan for the same reason [`pinned_channel_in`] is one: the key is
+/// written on one line, and a scan that misses yields `None` — the default
+/// prefix — never a wrong prefix. Only the `[packages]` table is read; a
+/// `prefix` key under any other table is ignored, as atpkg ignores it.
+#[must_use]
+pub fn configured_prefix_in(toml: &str, home: &Path) -> Option<PathBuf> {
+    let mut in_packages = false;
+    for line in toml.lines().map(str::trim) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_packages = line == "[packages]";
+            continue;
+        }
+        if !in_packages {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("prefix") else {
+            continue;
+        };
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let value = rest[..rest.find('"')?].trim();
+        return match value {
+            "" => None,
+            "~" => Some(home.to_path_buf()),
+            v if v.starts_with("~/") => Some(home.join(&v[2..])),
+            v if Path::new(v).is_absolute() => Some(PathBuf::from(v)),
+            _ => None, // relative, or `~user`: not a prefix
+        };
+    }
+    None
+}
+
+/// `<prefix>/store/trust/current/bin` — where `aterm pkg install trust` puts the
+/// pinned toolchain's drivers (`atpkg::store::Layout::program_current("trust")`).
+#[must_use]
+pub fn store_stage2_bin(prefix: &Path) -> PathBuf {
+    prefix.join("store/trust/current/bin")
+}
+
 /// The `bin` of the sysroot `rustc` resolves to under `path_env`.
 ///
 /// THIS IS HOW A rustup-LINKED PIN IS REACHED. `rust-toolchain.toml` is honoured
@@ -193,11 +284,16 @@ pub struct Toolchain {
     /// "there was one and it was the wrong one" — the diagnosis and the remedy
     /// for that are nothing like the ones for "there was none".
     pub refused: Option<PathBuf>,
+    /// The atpkg store candidate that was probed (`store/trust/current/bin` under
+    /// the resolved prefix), whether or not it held anything — so the diagnostic
+    /// can name the place `aterm pkg install trust` would have filled.
+    pub store_bin: Option<PathBuf>,
 }
 
 impl Toolchain {
     /// `$TRUST_STAGE2_BIN`, else the first PROMOTED toolchain under `home` that
-    /// satisfies the pin, canonicalised when it exists.
+    /// satisfies the pin, else the atpkg store's `store/trust/current/bin`, else
+    /// `$HOME/trust/build/host/stage2/bin`, canonicalised when it exists.
     ///
     /// SEALED FIRST, BUILD TREE LAST. The default used to be
     /// `$HOME/trust/build/host/stage2/bin` outright — a live build tree, checked
@@ -205,25 +301,34 @@ impl Toolchain {
     /// the whole length of every rebuild. The order is now
     /// `~/toolchains/<channel>-current/bin` (the sealed promote target, moved
     /// atomically by `trust/scripts/promote-toolchain.sh` and nothing else), then
-    /// `~/.rustup/toolchains/<channel>/bin` (the rustup link — the same directory
-    /// today, but an independent spelling that survives a layout change on either
-    /// side), then the stage2 tree. A candidate must carry a `targo` AND be the
-    /// pin to win; when none does, the stage2 path stays as the reported location
-    /// so the "no targo" diagnosis keeps naming a place the reader recognises.
+    /// `~/.rustup/toolchains/<channel>/bin` (the rustup link — the seam atpkg
+    /// lays and re-asserts into its store, and an independent spelling that
+    /// survives a layout change on either side), then the atpkg store itself,
+    /// then the stage2 tree. A candidate must carry a `targo` AND be the pin to
+    /// win; when none does, the stage2 path stays as the reported location so
+    /// the "no targo" diagnosis keeps naming a place the reader recognises.
     ///
-    /// GOLDEN-PATH FALLBACK: when the DEFAULT stage2 tree carries no targo and
-    /// no explicit `$TRUST_STAGE2_BIN` named one, the drivers are looked up on
-    /// `path_env` — a machine provisioned by `aterm pkg seed` has no `$HOME/trust`
-    /// checkout at all; its verified toolchain lives in the managed store and
-    /// reaches this process through PATH (shell.d, or the `tools/verify.sh`
-    /// wrapper, which prepends the store's shim dir itself). Positional
-    /// stage2-only discovery left every stage on such a machine skipping with
-    /// "no targo" — the same skew class the aterm-grid compile probe had. An
-    /// EXPLICIT override never falls back: naming a toolchain that is not
-    /// there is an error to surface, not a preference to route around.
-    /// `pinned` is the channel `rust-toolchain.toml` names ([`pinned_channel`]);
-    /// `None` disables the check and restores the pre-guard behaviour, which is
-    /// what the pure unit tests below want and what a repo with no pin means.
+    /// THE STORE COMES AHEAD OF THE BUILD TREE among the defaults (only the
+    /// promoted spellings above outrank it): `aterm pkg install trust` is the
+    /// ordinary way to have the pinned toolchain at all, and the store's
+    /// live-build link is the one path that keeps pointing at it across
+    /// updates. The prefix is [`atpkg_prefix`] — `$XDG_CONFIG_HOME` is the one
+    /// environment read here, for the config file atpkg itself reads; callers
+    /// that hold a snapshot use [`Self::discover_with_store`].
+    ///
+    /// GOLDEN-PATH FALLBACK: when neither default tree carries a targo and no
+    /// explicit `$TRUST_STAGE2_BIN` named one, the drivers are looked up on
+    /// `path_env` — a machine whose store lives at a prefix this mirror cannot
+    /// see still reaches its toolchain through PATH (shell.d, or the
+    /// `tools/verify.sh` wrapper, which prepends the store's shim dir itself).
+    /// Positional stage2-only discovery left every stage on such a machine
+    /// skipping with "no targo" — the same skew class the aterm-grid compile
+    /// probe had. An EXPLICIT override never falls back: naming a toolchain
+    /// that is not there is an error to surface, not a preference to route
+    /// around. `pinned` is the channel `rust-toolchain.toml` names
+    /// ([`pinned_channel`]); `None` disables the check and restores the
+    /// pre-guard behaviour, which is what the pure unit tests below want and
+    /// what a repo with no pin means.
     #[must_use]
     pub fn discover(
         stage2_bin: Option<&Path>,
@@ -231,22 +336,60 @@ impl Toolchain {
         path_env: &OsStr,
         pinned: Option<&str>,
     ) -> Self {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+        let prefix = atpkg_prefix(home, xdg.as_deref());
+        Self::discover_with_store(stage2_bin, home, Some(&prefix), path_env, pinned)
+    }
+
+    /// [`Self::discover`] with the atpkg prefix supplied by the caller (`None`
+    /// skips the store probe entirely). The resolution order, first hit wins:
+    ///
+    /// 1. `stage2_bin` — an explicit override; checked, never fallen back from.
+    /// 2. `<home>/toolchains/<channel>-current/bin` — the sealed promote target.
+    /// 3. `<home>/.rustup/toolchains/<channel>/bin` — the rustup link (the seam
+    ///    atpkg lays into its store).
+    /// 4. `<store_prefix>/store/trust/current/bin` — the atpkg store.
+    /// 5. `<home>/trust/build/host/stage2/bin` — a from-source stage2.
+    /// 6. every `path_env` directory, then the sysroot `rustc --print sysroot`
+    ///    names (how a rustup-LINKED pin is reached).
+    ///
+    /// Every candidate must BE the pin (`is_pinned_toolchain`, private to this
+    /// module); the first one
+    /// that carries a targo and is not gets remembered in `refused` for the
+    /// diagnostic, and the search goes on past it.
+    #[must_use]
+    pub fn discover_with_store(
+        stage2_bin: Option<&Path>,
+        home: &Path,
+        store_prefix: Option<&Path>,
+        path_env: &OsStr,
+        pinned: Option<&str>,
+    ) -> Self {
         let explicit = stage2_bin.is_some();
         let stage2_tree = home.join("trust/build/host/stage2/bin");
-        let declared = stage2_bin.map_or_else(
-            || {
+        let store_bin = (!explicit)
+            .then(|| store_prefix.map(store_stage2_bin))
+            .flatten();
+        // The promoted spellings, ahead of everything but an explicit override:
+        // the sealed promote target, then the rustup link (the seam atpkg lays
+        // into its store). A hit here is final — the store probe below stands
+        // down for it.
+        let channel_hit = (!explicit)
+            .then(|| {
                 let channel = pinned.unwrap_or("trust");
                 [
                     home.join(format!("toolchains/{channel}-current/bin")),
                     home.join(format!(".rustup/toolchains/{channel}/bin")),
-                    stage2_tree.clone(),
                 ]
                 .into_iter()
                 .find(|d| is_executable_file(&d.join("targo")) && is_pinned_toolchain(d, pinned))
-                .unwrap_or_else(|| stage2_tree.clone())
-            },
-            Path::to_path_buf,
-        );
+            })
+            .flatten();
+        let settled_by_channel = channel_hit.is_some();
+        let declared = stage2_bin
+            .map(Path::to_path_buf)
+            .or(channel_hit)
+            .unwrap_or_else(|| stage2_tree.clone());
         let mut tool_dir = if declared.is_dir() {
             std::fs::canonicalize(&declared).unwrap_or(declared)
         } else {
@@ -261,11 +404,32 @@ impl Toolchain {
         let mut refused = (is_executable_file(&tool_dir.join("targo"))
             && !is_pinned_toolchain(&tool_dir, pinned))
         .then(|| tool_dir.clone());
-        if !explicit && (refused.is_some() || !is_executable_file(&tool_dir.join("targo"))) {
-            // PATH first (the golden path: a store-provisioned machine reaches its
-            // toolchain that way), then the rustup-linked sysroot. Every candidate
-            // must BE the pin; the first one that carries a targo and is not gets
-            // remembered for the diagnostic.
+        // The store, AHEAD of the source-tree default: a pinned targo there wins
+        // outright; a targo there that is not the pin is refused and remembered,
+        // exactly like a PATH impostor.
+        let mut settled = settled_by_channel;
+        if let Some(store) = &store_bin
+            && !settled
+            && is_executable_file(&store.join("targo"))
+        {
+            let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.clone());
+            if is_pinned_toolchain(&store, pinned) {
+                tool_dir = store;
+                refused = None;
+                settled = true;
+            } else {
+                refused.get_or_insert(store);
+            }
+        }
+        if !explicit
+            && !settled
+            && (refused.is_some() || !is_executable_file(&tool_dir.join("targo")))
+        {
+            // PATH next (the golden path for a store this mirror cannot see: a
+            // store-provisioned machine reaches its toolchain that way), then
+            // the rustup-linked sysroot. Every candidate must BE the pin; the
+            // first one that carries a targo and is not gets remembered for the
+            // diagnostic.
             // `once_with` keeps the sysroot probe LAZY: it spawns a process, and a
             // PATH hit must not pay for a candidate it never needed.
             let from_path = std::env::split_paths(path_env);
@@ -293,6 +457,7 @@ impl Toolchain {
             tippy,
             stage2_dir: tool_dir,
             refused,
+            store_bin,
         }
     }
 
@@ -341,6 +506,12 @@ impl Toolchain {
         p
     }
 
+    /// The remedy every "no toolchain" diagnostic leads with. The signed
+    /// package index is the ordinary source of the pinned toolchain; building
+    /// one from source is the developer alternative, named second.
+    pub const INSTALL_REMEDY: &'static str = "`aterm pkg install trust` (then `aterm pkg doctor` \
+         to confirm the store); from source instead: python3 x.py build --stage 2 in $HOME/trust";
+
     /// The diagnostic for a stage2 that is absent — or mid-rebuild, which empties
     /// the directory and refills it at the end.
     #[must_use]
@@ -349,44 +520,53 @@ impl Toolchain {
             return format!(
                 "targo at {} is NOT the toolchain rust-toolchain.toml pins (no branded rustc \
                  beside it), so running the gate there would use a different frontend and a \
-                 different lint set under the pinned one's name. Refusing. Fix: link the pinned \
-                 toolchain and put the rustup shim first on PATH — `rustup toolchain link trust \
-                 <stage-sysroot>` then `export PATH=\"$HOME/.cargo/bin:$PATH\"` — or point \
-                 TRUST_STAGE2_BIN at the real stage2 bin",
-                dir.display()
+                 different lint set under the pinned one's name. Refusing. Fix: {} — the gate \
+                 finds the store on its own; or link the pinned toolchain and put the rustup \
+                 shim first on PATH — `rustup toolchain link trust <stage-sysroot>` then \
+                 `export PATH=\"$HOME/.cargo/bin:$PATH\"` — or point TRUST_STAGE2_BIN at the \
+                 real stage2 bin",
+                dir.display(),
+                Self::INSTALL_REMEDY,
             );
         }
+        let store = self.store_bin.as_ref().map_or_else(String::new, |s| {
+            format!(" nor in the atpkg store at {}", s.display())
+        });
         format!(
-            "targo not found at {} (build the Trust stage2: python3 x.py build --stage 2 in $HOME/trust, or set TRUST_STAGE2_BIN; a rustup-linked pin is found through `rustc --print sysroot` when ~/.cargo/bin is on PATH)",
-            self.targo.display()
+            "targo not found at {}{store}. Fix: {}; or set TRUST_STAGE2_BIN (a rustup-linked pin \
+             is found through `rustc --print sysroot` when ~/.cargo/bin is on PATH)",
+            self.targo.display(),
+            Self::INSTALL_REMEDY,
         )
     }
 
     /// The diagnostic for a doc-running stage that cannot start: no `trustdoc`
     /// in the stage2, no caller-exported `RUSTDOC`, and no bare `trustdoc` on
     /// the children's PATH, so cargo's `[build] rustdoc = "trustdoc"`
-    /// (.cargo/config.toml) has nothing to exec. The one remedy that works
-    /// from THIS state is rebuilding the stage2 — a farm link needs a stage2
-    /// trustdoc to point at, so `cargo ship provision` can only link
-    /// `~/.local/bin/trustdoc` (for direct cargo runs) once the rebuild lands.
+    /// (.cargo/config.toml) has nothing to exec. The remedy is a stage2 that
+    /// carries trustdoc — the store's does (`aterm pkg install trust` shims it
+    /// onto PATH as well); a from-source stage2 needs the rebuild. Then `cargo
+    /// ship provision` can link `~/.local/bin/trustdoc` for direct cargo runs.
     #[must_use]
     pub fn missing_trustdoc_label(&self) -> String {
         format!(
             "no doc driver: {} is not an executable doc driver and no `trustdoc` \
              resolves on PATH, so cargo's [build] rustdoc = \"trustdoc\" \
-             (.cargo/config.toml) has nothing to exec for the doctest lane. Rebuild the \
-             stage2 so it carries trustdoc (python3 x.py build --stage 2 in $HOME/trust, or \
-             `atpkg install trust`) — the gate then binds it directly, and `cargo ship \
-             provision` can link ~/.local/bin/trustdoc for direct cargo runs",
-            self.trustdoc.display()
+             (.cargo/config.toml) has nothing to exec for the doctest lane. Fix: {} — the \
+             store's stage2 carries trustdoc and shims it onto PATH; the gate then binds it \
+             directly, and `cargo ship provision` can link ~/.local/bin/trustdoc for direct \
+             cargo runs",
+            self.trustdoc.display(),
+            Self::INSTALL_REMEDY,
         )
     }
 
     #[must_use]
     pub fn missing_tippy_label(&self) -> String {
         format!(
-            "tippy lint (Trust stage2 toolchain not built — looked for targo-tippy and targo-clippy in {})",
-            self.stage2_dir.display()
+            "tippy lint (no targo-tippy or targo-clippy in {} — fix: {})",
+            self.stage2_dir.display(),
+            Self::INSTALL_REMEDY,
         )
     }
 }
@@ -444,6 +624,192 @@ mod tests {
         assert!(label.contains("x.py build --stage 2"), "{label}");
         assert!(label.contains("~/.local/bin/trustdoc"), "{label}");
         assert!(label.contains(".cargo/config.toml"), "{label}");
+    }
+
+    #[test]
+    fn every_remedy_leads_with_the_package_manager_and_names_source_second() {
+        // The signed index is the ordinary way to have the toolchain; x.py is the
+        // developer alternative. Every diagnostic says them in that order.
+        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""), None);
+        for label in [
+            t.missing_targo_label(),
+            t.missing_trustdoc_label(),
+            t.missing_tippy_label(),
+        ] {
+            let pkg = label.find("aterm pkg install trust").unwrap_or_else(|| {
+                panic!("the remedy must lead with the package manager: {label}")
+            });
+            let src = label
+                .find("x.py build --stage 2")
+                .unwrap_or_else(|| panic!("the from-source alternative must be named: {label}"));
+            assert!(pkg < src, "package manager first, source second: {label}");
+        }
+        // The absent-toolchain label also names where the store WOULD have been.
+        let label = t.missing_targo_label();
+        assert!(label.contains("atpkg store at"), "{label}");
+        assert!(label.contains("store/trust/current/bin"), "{label}");
+    }
+
+    #[test]
+    fn the_atpkg_store_is_probed_ahead_of_the_from_source_default() {
+        // `aterm pkg install trust` lays the toolchain down at
+        // <prefix>/store/trust/current/bin, with `current` a symlink at the
+        // numbered build — exactly the shape built here, under a fake HOME.
+        let home = crate::mktemp_dir("atv-store").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let build = prefix.join("store/trust/6808/bin");
+        fs::create_dir_all(&build).expect("mkdir");
+        exec_stub(&build.join("targo"));
+        driver_stub(&build.join("trustc"));
+        std::os::unix::fs::symlink(
+            prefix.join("store/trust/6808"),
+            prefix.join("store/trust/current"),
+        )
+        .expect("ln current");
+        // A from-source stage2 beside it, ALSO pinned — the store must still win.
+        let source = home.join("trust/build/host/stage2/bin");
+        fs::create_dir_all(&source).expect("mkdir");
+        exec_stub(&source.join("targo"));
+        driver_stub(&source.join("trustc"));
+
+        let t = Toolchain::discover_with_store(
+            None,
+            &home,
+            Some(&prefix),
+            OsStr::new(""),
+            Some("trust"),
+        );
+        assert!(t.have_targo());
+        assert_eq!(
+            t.stage2_dir,
+            fs::canonicalize(&build).expect("canonicalize"),
+            "the store's live build, resolved to its physical numbered dir"
+        );
+        assert_eq!(
+            t.store_bin.as_deref(),
+            Some(store_stage2_bin(&prefix).as_path())
+        );
+
+        // Without the store the from-source default is what it always was.
+        let t = Toolchain::discover_with_store(None, &home, None, OsStr::new(""), Some("trust"));
+        assert!(t.have_targo());
+        assert_eq!(
+            t.stage2_dir,
+            fs::canonicalize(&source).expect("canonicalize")
+        );
+        assert!(t.store_bin.is_none());
+
+        // An EXPLICIT override never consults the store.
+        let t = Toolchain::discover_with_store(
+            Some(&source),
+            &home,
+            Some(&prefix),
+            OsStr::new(""),
+            Some("trust"),
+        );
+        assert_eq!(
+            t.stage2_dir,
+            fs::canonicalize(&source).expect("canonicalize")
+        );
+        assert!(t.store_bin.is_none());
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_store_targo_that_is_not_the_pin_is_refused_and_the_search_goes_on() {
+        let home = crate::mktemp_dir("atv-storepin").expect("mktemp");
+        let prefix = default_atpkg_prefix(&home);
+        let store = store_stage2_bin(&prefix);
+        fs::create_dir_all(&store).expect("mkdir");
+        exec_stub(&store.join("targo")); // no trustc beside it: an impostor
+        let real = home.join("elsewhere/bin");
+        fs::create_dir_all(&real).expect("mkdir");
+        exec_stub(&real.join("targo"));
+        driver_stub(&real.join("trustc"));
+
+        let t = Toolchain::discover_with_store(
+            None,
+            &home,
+            Some(&prefix),
+            OsStr::new(real.to_string_lossy().as_ref()),
+            Some("trust"),
+        );
+        assert!(t.have_targo(), "PATH still wins past a refused store");
+        assert_eq!(t.stage2_dir, fs::canonicalize(&real).expect("canonicalize"));
+
+        let t = Toolchain::discover_with_store(
+            None,
+            &home,
+            Some(&prefix),
+            OsStr::new(""),
+            Some("trust"),
+        );
+        assert!(!t.have_targo(), "fail-closed: the impostor is not adopted");
+        assert_eq!(
+            t.refused,
+            Some(fs::canonicalize(&store).expect("canonicalize"))
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn the_prefix_mirror_honours_a_configured_packages_prefix() {
+        let home = Path::new("/fake-home");
+        // Only the [packages] table's key counts, `~` expands against home, a
+        // relative value is not a prefix, and a commented line is not read.
+        assert_eq!(
+            configured_prefix_in("[packages]\nprefix = \"~/lab/pkg\"\n", home),
+            Some(PathBuf::from("/fake-home/lab/pkg"))
+        );
+        assert_eq!(
+            configured_prefix_in(
+                "[packages]\n# prefix = \"~/decoy\"\nprefix = \"/opt/aterm/pkg\"\n",
+                home
+            ),
+            Some(PathBuf::from("/opt/aterm/pkg"))
+        );
+        assert_eq!(
+            configured_prefix_in("[packages]\nprefix = \"relative/pkg\"\n", home),
+            None
+        );
+        assert_eq!(
+            configured_prefix_in("[packages]\nprefix = \"~user/pkg\"\n", home),
+            None
+        );
+        assert_eq!(
+            configured_prefix_in("[other]\nprefix = \"/opt/x\"\n", home),
+            None
+        );
+        assert_eq!(configured_prefix_in("", home), None);
+
+        // The file itself: XDG_CONFIG_HOME first, else <home>/.config; no file
+        // means the platform default under home.
+        let tmp = crate::mktemp_dir("atv-prefix").expect("mktemp");
+        assert_eq!(atpkg_prefix(&tmp, None), default_atpkg_prefix(&tmp));
+        let xdg = tmp.join("xdg");
+        fs::create_dir_all(xdg.join("aterm")).expect("mkdir");
+        fs::write(
+            xdg.join("aterm/aterm.toml"),
+            "[packages]\nprefix = \"/opt/lab\"\n",
+        )
+        .expect("write");
+        assert_eq!(atpkg_prefix(&tmp, Some(&xdg)), PathBuf::from("/opt/lab"));
+        fs::create_dir_all(tmp.join(".config/aterm")).expect("mkdir");
+        fs::write(
+            tmp.join(".config/aterm/aterm.toml"),
+            "[packages]\nprefix = \"~/mine\"\n",
+        )
+        .expect("write");
+        assert_eq!(atpkg_prefix(&tmp, None), tmp.join("mine"));
+        assert_eq!(
+            store_stage2_bin(&default_atpkg_prefix(Path::new("/h"))).to_string_lossy(),
+            if cfg!(target_os = "macos") {
+                "/h/Library/Application Support/aterm/pkg/store/trust/current/bin"
+            } else {
+                "/h/.local/share/aterm/pkg/store/trust/current/bin"
+            }
+        );
+        fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

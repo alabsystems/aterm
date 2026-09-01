@@ -25,9 +25,12 @@ aterm-render = { path = "../aterm-render", default-features = false }
 # Keep generated glue compatible with the other web artifacts in this workspace.
 wasm-bindgen = "=0.2.108"
 console_error_panic_hook = "0.1"
-# Some transitive dependencies select getrandom; wasm32-unknown-unknown needs
-# its JS entropy backend even though MatrixRain itself is deterministically seeded.
-getrandom = { version = "0.2", features = ["js"] }
+# NO getrandom ROW — the third copy of the same defensive line, and the same
+# measurement retires it: nothing in this crate's wasm32 closure selects
+# getrandom, and MatrixRain is deterministically seeded. This module's closure
+# is a strict subset of aterm-wasm's (held by aterm_forge::loc's
+# the_wasm_cells_cover_every_shipped_web_crate), so it gets no forge cell of its
+# own and the saving is counted on wasm-cpu. Guarded by tools/grep_guard.sh B13.
 
 [lints]
 workspace = true

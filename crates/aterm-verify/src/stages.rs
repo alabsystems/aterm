@@ -9,7 +9,8 @@
 //! a reviewer diffing two languages — including the details that are easy to lose
 //! and expensive to lose: tippy's separate `CARGO_TARGET_DIR` and
 //! `TRUST_NO_MIGRATE_WARN`, the doc-driver rule on the doc-running stages
-//! ([`DocDriver`]: `RUSTDOC=<stage2>/trustdoc` when the stage2 carries it,
+//! (`DocDriver` — private to this module, so named rather than linked:
+//! `RUSTDOC=<stage2>/trustdoc` when the stage2 carries it,
 //! the caller's own export or the PATH farm link otherwise, a diagnosis when
 //! nothing exists), `ATERM_SEARCH_REGEX_LANE=1` on the regex lane, and `--unverified` on
 //! every driver invocation (naming the lane is the point: `targo` REFUSES a bare
@@ -33,6 +34,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Doctests => doctests(ctx, &mut r),
         StageId::RegexLane => regex_lane(ctx, &mut r),
         StageId::Tippy => tippy(ctx, &mut r),
+        StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
         StageId::InstallChannel => install_channel(ctx, &mut r),
         StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
@@ -198,7 +200,14 @@ pub fn tippy_gated_args(scope: &Scope) -> Option<Vec<String>> {
 /// `targo --unverified run -q -p xtask -- gate <name>`
 #[must_use]
 pub fn xtask_gate_args(gate: &str) -> Vec<String> {
-    [
+    xtask_gate_args_with(gate, &[])
+}
+
+/// [`xtask_gate_args`] plus flags for the verb. Separate so the flags a stage
+/// passes are visible at the stage rather than buried in a string.
+#[must_use]
+pub fn xtask_gate_args_with(gate: &str, flags: &[&str]) -> Vec<String> {
+    let mut a: Vec<String> = [
         "--unverified",
         "run",
         "-q",
@@ -210,7 +219,9 @@ pub fn xtask_gate_args(gate: &str) -> Vec<String> {
     ]
     .into_iter()
     .map(String::from)
-    .collect()
+    .collect();
+    a.extend(flags.iter().map(|f| String::from(*f)));
+    a
 }
 
 /// `targo --unverified build --manifest-path tools/freeze-safety-gate/Cargo.toml`
@@ -233,11 +244,61 @@ pub const KANI_CRATES: [&str; 3] = ["aterm-parser", "aterm-render", "aterm-uds"]
 /// The exact command one Kani floor run spawns. `KANI_CRATE` selects which
 /// crate's proofs the script drives; lose it and every iteration of the loop
 /// runs the same default, so two of the three crates go unproven while the
-/// ladder still prints three green rows.
-fn kani_cmd(gate: &std::path::Path, krate: &str) -> Cmd {
+/// ladder still prints three green rows. `TRUST_MC_SYSROOT` / `AY_BIN_DIR`
+/// carry what THIS process resolved ([`trust_mc_sysroot`], [`ay_bin_dir`]) so
+/// the script and the availability decision above it can never disagree
+/// about which trust-mc is being driven.
+fn kani_cmd(
+    gate: &std::path::Path,
+    krate: &str,
+    mc_root: &std::path::Path,
+    ay_dir: &std::path::Path,
+) -> Cmd {
     Cmd::new(gate)
         .env("KANI_CRATE", krate)
+        .env("TRUST_MC_SYSROOT", mc_root)
+        .env("AY_BIN_DIR", ay_dir)
         .capture(Capture::Emit)
+}
+
+/// Where trust-mc lives — the same order `scripts/verify-kani-proofs.sh` uses:
+///
+/// 1. `$TRUST_MC_SYSROOT` — an explicit location, never fallen back from.
+/// 2. `<atpkg prefix>/store/trust-mc/current` — what `aterm pkg install
+///    trust-mc` lays down, and the only sysroot most machines have. Taken when
+///    it carries the driver (`bin/trust-mc-driver`); the managed bundle ships
+///    no `cargo-trust-mc` name — the script derives that symlink OUTSIDE the
+///    store, which is tree_root-attested and immutable.
+/// 3. `$HOME/trust/first-party/trust-mc/target/trust-mc` — a from-source dev build.
+#[must_use]
+pub fn trust_mc_sysroot(env: &crate::EnvSnapshot) -> std::path::PathBuf {
+    if let Some(explicit) = &env.trust_mc_sysroot {
+        return explicit.clone();
+    }
+    let store = crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref())
+        .join("store/trust-mc/current");
+    if is_executable_file(&store.join("bin/trust-mc-driver"))
+        || is_executable_file(&store.join("bin/cargo-trust-mc"))
+    {
+        return store;
+    }
+    env.home.join("trust/first-party/trust-mc/target/trust-mc")
+}
+
+/// Where the `ay` solver lives, in the script's order: `$AY_BIN_DIR`, else the
+/// atpkg shim dir (`<prefix>/bin`, where `aterm pkg install ay` shims it), else
+/// the from-source dev build `$HOME/trust/first-party/ay/target/release`.
+#[must_use]
+pub fn ay_bin_dir(env: &crate::EnvSnapshot) -> std::path::PathBuf {
+    if let Some(explicit) = &env.ay_bin_dir {
+        return explicit.clone();
+    }
+    let shims =
+        crate::toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref()).join("bin");
+    if is_executable_file(&shims.join("ay")) {
+        return shims;
+    }
+    env.home.join("trust/first-party/ay/target/release")
 }
 
 /// The redraw harness's target name — the `[[bin]]`, the built file and the
@@ -652,6 +713,42 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 // 3) GREP GUARDS (zero-tolerance, always whole-tree)
 // ---------------------------------------------------------------------------
+/// FORMATTING — `xtask gate lint --fmt-only`, i.e. the formatter lane's BOTH
+/// passes and no other lane.
+///
+/// This stage did not exist until 2026-08-31, and the gap was declared rather
+/// than hidden: `verify.sh` ran a tippy stage and no fmt stage, and said so.
+/// Declaring a limit is not covering it. `.githooks/pre-push` has been advisory
+/// since 2026-08-24, so between those two facts NOTHING in this repository ran
+/// the formatter unless a human chose to — and the MEASURED consequence was
+/// three consecutive rebases of `main` arriving with drift (5 files, 2, 1), one
+/// of them in `aterm-link`, a crate outside `members = ["crates/*"]` that
+/// `targo-fmt --all` structurally cannot see.
+///
+/// It is cheap enough to be uncontroversial: the check needs no compiler —
+/// trustfmt parses and prints, it does not build — and cost 7.5 s over 1,761
+/// tracked files on two measured runs. The `MainTarget` lane is for the xtask
+/// binary this shells through, not for the check.
+///
+/// NO SKIP WITHOUT A TOOLCHAIN, and that asymmetry is deliberate: the lane
+/// itself already distinguishes a formatter that found drift (FINDING) from one
+/// that could not run (NOT RUN), and both block there. Adding a second opinion
+/// here would let a stage-level skip hide a lane-level not-run — the exact
+/// confusion the fmt lane spent a month in. The only skip is the one every
+/// xtask stage shares: no targo, so the verb cannot be built at all.
+fn formatting(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("formatting (no targo)");
+        return;
+    }
+    run_labeled(
+        ctx,
+        r,
+        "gate lint --fmt-only",
+        &targo(ctx, xtask_gate_args_with("lint", &["--fmt-only"])),
+    );
+}
+
 fn grep_guards(ctx: &Ctx, r: &mut Report) {
     let g = ctx.tools_dir().join("grep_guard.sh");
     if !is_executable_file(&g) {
@@ -989,16 +1086,8 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let gate = ctx.root.join("scripts/verify-kani-proofs.sh");
-    let mc_root = ctx.env.trust_mc_sysroot.clone().unwrap_or_else(|| {
-        ctx.env
-            .home
-            .join("trust/first-party/trust-mc/target/trust-mc")
-    });
-    let ay_dir = ctx
-        .env
-        .ay_bin_dir
-        .clone()
-        .unwrap_or_else(|| ctx.env.home.join("trust/first-party/ay/target/release"));
+    let mc_root = trust_mc_sysroot(&ctx.env);
+    let ay_dir = ay_bin_dir(&ctx.env);
 
     if !is_executable_file(&gate) {
         r.cannot_run(format!(
@@ -1015,7 +1104,9 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
             "          at {} (the embedded + ty tiers still ran).",
             mc_root.display()
         ));
-        r.skip("trust-mc / Kani BMC floor (tool unavailable; pending build)");
+        r.raw("          fix: `aterm pkg install trust-mc` (`aterm pkg doctor` names the store);");
+        r.raw("          or set TRUST_MC_SYSROOT at a from-source build-trust-mc sysroot.");
+        r.skip("trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)");
         return;
     }
     if !is_executable_file(&ay_dir.join("ay")) && !have_on_path("ay", &ctx.path_env) {
@@ -1024,7 +1115,10 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
             "          at {} and on PATH (the embedded + ty tiers still ran).",
             ay_dir.display()
         ));
-        r.skip("trust-mc / Kani BMC floor (solver unavailable; pending build)");
+        r.raw(
+            "          fix: `aterm pkg install ay`; or set AY_BIN_DIR at a from-source ay build.",
+        );
+        r.skip("trust-mc / Kani BMC floor (solver unavailable; `aterm pkg install ay`)");
         return;
     }
     for krate in KANI_CRATES {
@@ -1032,7 +1126,7 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
             ctx,
             r,
             &format!("verify-kani-proofs.sh ({krate})"),
-            &kani_cmd(&gate, krate),
+            &kani_cmd(&gate, krate, &mc_root, &ay_dir),
         );
     }
 }
@@ -1632,11 +1726,22 @@ mod tests {
         // and all three iterations prove the same crate while the ladder still
         // prints three green rows — three claims, one of them true.
         let gate = std::path::Path::new("/repo/tools/verify-kani-proofs.sh");
+        let mc = std::path::Path::new("/store/trust-mc/current");
+        let ay = std::path::Path::new("/store/bin");
         let selectors: Vec<String> = KANI_CRATES
             .iter()
             .map(|k| {
-                let cmd = kani_cmd(gate, k);
-                assert_eq!(env_names(&cmd), ["KANI_CRATE"]);
+                let cmd = kani_cmd(gate, k, mc, ay);
+                assert_eq!(
+                    env_names(&cmd),
+                    ["KANI_CRATE", "TRUST_MC_SYSROOT", "AY_BIN_DIR"]
+                );
+                assert_eq!(
+                    cmd.envs[1].1.as_os_str(),
+                    mc.as_os_str(),
+                    "the script drives THIS trust-mc"
+                );
+                assert_eq!(cmd.envs[2].1.as_os_str(), ay.as_os_str(), "and THIS ay");
                 cmd.envs[0].1.to_string_lossy().into_owned()
             })
             .collect();
@@ -1649,6 +1754,65 @@ mod tests {
             KANI_CRATES.len(),
             "each run must select a DIFFERENT crate"
         );
+    }
+
+    #[test]
+    fn trust_mc_and_ay_resolve_env_then_store_then_source() {
+        // The order the script uses, decided in one place so the availability
+        // check and the run can never disagree. Explicit env wins outright; the
+        // atpkg store is taken only when it really holds the tool; the
+        // from-source dev build is the last resort.
+        let home = crate::mktemp_dir("atv-kani").expect("mktemp");
+        let prefix = crate::toolchain::default_atpkg_prefix(&home);
+        let env = EnvSnapshot {
+            home: home.clone(),
+            ..EnvSnapshot::default()
+        };
+        assert_eq!(
+            trust_mc_sysroot(&env),
+            home.join("trust/first-party/trust-mc/target/trust-mc"),
+            "no store, no override: the dev default"
+        );
+        assert_eq!(
+            ay_bin_dir(&env),
+            home.join("trust/first-party/ay/target/release")
+        );
+
+        // `aterm pkg install trust-mc` / `ay` shape: the live-build link for the
+        // sysroot, the shim dir for the solver.
+        let mc = prefix.join("store/trust-mc/current/bin");
+        std::fs::create_dir_all(&mc).expect("mkdir");
+        std::fs::write(mc.join("trust-mc-driver"), b"#!/bin/sh\nexit 0\n").expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                mc.join("trust-mc-driver"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod");
+        }
+        let shims = prefix.join("bin");
+        std::fs::create_dir_all(&shims).expect("mkdir");
+        std::fs::write(shims.join("ay"), b"#!/bin/sh\nexit 0\n").expect("write");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(shims.join("ay"), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        assert_eq!(
+            trust_mc_sysroot(&env),
+            prefix.join("store/trust-mc/current")
+        );
+        assert_eq!(ay_bin_dir(&env), shims);
+
+        let env = EnvSnapshot {
+            trust_mc_sysroot: Some(PathBuf::from("/explicit/sysroot")),
+            ay_bin_dir: Some(PathBuf::from("/explicit/ay")),
+            ..env
+        };
+        assert_eq!(trust_mc_sysroot(&env), PathBuf::from("/explicit/sysroot"));
+        assert_eq!(ay_bin_dir(&env), PathBuf::from("/explicit/ay"));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -190,7 +190,7 @@ impl InstanceStreams {
     #[must_use]
     pub fn authorize(req: RequestedInstance, scope: Scope) -> Self {
         InstanceStreams {
-            sessions: req.sessions && matches!(scope, Scope::Owner),
+            sessions: req.sessions && scope.is_owner_class(),
         }
     }
 
@@ -622,7 +622,7 @@ impl AdoptScope {
     /// Grant `@*` adoption IFF it was requested AND the connection is Owner.
     #[must_use]
     pub fn authorize(requested: bool, scope: Scope) -> Self {
-        AdoptScope(requested && matches!(scope, Scope::Owner))
+        AdoptScope(requested && scope.is_owner_class())
     }
 
     /// The refusing default — no adoption. What every non-`@*` subscribe passes.
@@ -1030,7 +1030,17 @@ fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
     match kind {
         "meta-change" => Some("meta"),
         "closing" => Some("closing"),
-        _ => None,
+        // The FABRIC digest (design §11.2): `inbox`, `inbox-seen`, `post`,
+        // `post-landed`, `hold`. Their wire name IS the record kind, and the list
+        // lives beside the code that WRITES them
+        // ([`crate::fabric::FABRIC_EVENT_KINDS`]) rather than being retyped here,
+        // so a sixth fabric event cannot ship recorded-but-never-pushed — the
+        // exact drift the `closing` row shipped with. NONE of them carries a body:
+        // `inbox` is a count and an offset, `post` an address and a kind. The
+        // digest tells an agent that mail EXISTS; reading it is a separate,
+        // deliberate `inbox` call, so a watcher is never handed message text it
+        // did not ask for.
+        other => crate::fabric::fabric_event_wire_kind(other),
     }
 }
 

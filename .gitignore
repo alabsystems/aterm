@@ -90,3 +90,23 @@ release.conf
 # shipped code — their caches are pure build residue).
 __pycache__/
 *.pyc
+
+# REGISTERED LINKED WORKTREES OF THIS REPO, parked inside the superproject's own
+# working directory. `.fabric-wt/a1a2` is a live `git worktree` checkout (its
+# `.git` file points at `<repo>/.git/worktrees/a1a2`, branch `fabric/a1-a2`) and
+# `.fabric-wt/astream` is a symlink to a sibling repo — neither is content of
+# THIS tree, and neither may be deleted to tidy the status output: another
+# session's uncommitted work lives in them.
+#
+# WHY THE IGNORE IS LOAD-BEARING, not cosmetic. Git reports a nested worktree as
+# one untracked line, `?? .fabric-wt/`, and `gates::clean_tree`
+# (crates/aterm-release/src/gates.rs) refuses to claim a release on ANY
+# `git status --porcelain` line — so an unignored `.fabric-wt/` is a hard stop on
+# `cargo ship cut`, not noise. MEASURED here: 1,072,342 entries under
+# `.fabric-wt/a1a2` alone (`find .fabric-wt/a1a2 -mindepth 1 | wc -l`), of which
+# 871,344 — 81% — are that checkout's own `target/`.
+#
+# Nothing in the tree reads this path — `git grep fabric-wt` over all tracked
+# content matches only this rule, and no script under `tools/`, `scripts/` or
+# `.githooks/` names it — so ignoring it hides no tracked or trackable input.
+/.fabric-wt/

@@ -9,9 +9,22 @@
 //! ## Verification
 //!
 //! Verification is in progress and coverage varies by module:
-//! - **TLA+ specs** define key invariants (see `tla/`)
-//! - **Fuzz targets** live in `crates/aterm-core/fuzz`
+//! - **TLA+ specs** define key invariants — `crates/aterm-spec-models/specs/`
+//!   (eight live machines; six retired ones under `specs/legacy/`)
 //! - **Property-based tests** live in `src/tests/proptest/`
+//! - **Fuzz-shaped tests** for this crate are ordinary integration tests —
+//!   `tests/fuzz_process_never_panics.rs`, `tests/fuzz_alt_screen.rs`,
+//!   `tests/fuzz_resize_reflow.rs` — so they ride `cargo test`. The one
+//!   `cargo-fuzz` target in the workspace is `crates/aterm-scrollback/fuzz`.
+//!
+//! Two of those lines were false and are corrected here (2026-08-31, each
+//! checked by listing the path): there has never been a `tla/` directory in
+//! this repository — `find . -name '*.tla'` returns fourteen files, all under
+//! `crates/aterm-spec-models/specs/` — and `crates/aterm-core/fuzz`, which this
+//! header still pointed at, was deleted on 2026-06-08 by 66857c1c, the commit
+//! that removed this crate's carried-over `benches/`, `fuzz/` and
+//! `media_bridge/` cruft. `src/tests/proptest/` is real and was the only one of
+//! the three a reader could follow.
 //!
 //! ## Components
 //!

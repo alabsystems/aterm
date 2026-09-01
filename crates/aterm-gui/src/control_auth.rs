@@ -98,6 +98,58 @@ pub const VIDEO_DIR: &str = "video";
 /// non-abortable at the guarded wire boundary.
 pub(crate) const VIDEO_PUBLISHED_FILE: &str = ".published";
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn enter_low_nofile_test_child(
+    environment: &str,
+    exact_test: &str,
+    spare_descriptors: usize,
+) -> bool {
+    if std::env::var_os(environment).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", exact_test, "--nocapture", "--test-threads=1"])
+            .env(environment, "1")
+            .output()
+            .expect("spawn isolated low-NOFILE test");
+        assert!(
+            output.status.success(),
+            "low-NOFILE child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return false;
+    }
+
+    let fd_dir = ["/proc/self/fd", "/dev/fd"]
+        .into_iter()
+        .find(|path| Path::new(path).is_dir())
+        .expect("Unix exposes the process descriptor directory");
+    let open = std::fs::read_dir(fd_dir).unwrap().count();
+    let target =
+        libc::rlim_t::try_from(open + spare_descriptors).expect("descriptor limit fits rlim_t");
+    let mut inherited = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `inherited` is valid writable storage for one rlimit value.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, inherited.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: successful getrlimit initialized the whole value.
+    let inherited = unsafe { inherited.assume_init() };
+    assert!(
+        target <= inherited.rlim_max,
+        "test needs {spare_descriptors} spare descriptors"
+    );
+    let constrained = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: inherited.rlim_max,
+    };
+    // SAFETY: the child-only mutation preserves the inherited hard ceiling.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const constrained) },
+        0
+    );
+    true
+}
+
 /// One conservative filesystem-wide lock excludes concurrent explicit image
 /// writes in the shared `images/` namespace. Contenders fail busy instead of
 /// blocking the single encode lane. Locking the namespace (rather than a
@@ -141,17 +193,22 @@ pub(crate) fn automatic_capture_name(stem: &str) -> String {
     automatic_capture_name_for(stem, process_instance_id(), sequence)
 }
 
-/// Ownership of an artifact until its client acknowledges the guarded reply or
-/// a failed/legacy handoff finishes its additional quarantine interval.
-/// Server-unique auto images/videos use the process-local `key` for retention;
-/// caller-explicit images additionally hold the shared namespace's OS advisory
-/// lock so different aterm processes and aliased filename spellings fail busy
-/// instead of racing one another.
+/// Ownership of a filesystem artifact through a guarded reply's acknowledgement
+/// or a failed/legacy handoff's additional quarantine interval. Inline image
+/// bytes release their path lease before the write-only socket handoff and keep
+/// only the memory/admission permit through flush. Server-unique auto
+/// images/videos use the process-local `key` for retention; caller-explicit
+/// images additionally hold the shared namespace's OS advisory lock so
+/// different aterm processes and aliased filename spellings fail busy instead
+/// of racing one another.
 #[derive(Debug)]
 pub(crate) struct ArtifactPathLease {
     key: Option<PathBuf>,
     os_lock: Option<std::fs::File>,
-    video_reader: bool,
+    /// Capability local to this lease. It shares the lease owner's admitted
+    /// directory chain and therefore can never outlive that owner's capacity
+    /// charge. The final lease uses its own capability for convergence.
+    video_sweep: Option<VideoRetentionSweep>,
 }
 
 #[cfg_attr(
@@ -173,6 +230,16 @@ fn artifact_reader_acquire_anchor() {}
     )
 )]
 fn artifact_reader_reject_acquire_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactReaderLease",
+        action = "RejectReplacedIdentity",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_reader_lease"
+    )
+)]
+fn artifact_reader_reject_replaced_identity_anchor() {}
 
 #[cfg_attr(
     test,
@@ -242,25 +309,42 @@ fn retention_sweep_gate() -> &'static std::sync::Mutex<()> {
 }
 
 #[derive(Debug)]
-struct VideoReaderSweep {
+struct VideoRetentionSweep {
     root: crate::pinned_dir::PinnedDir,
     fresh: std::ffi::OsString,
+    identity: VideoLeaseIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoLeaseIdentity {
+    root: crate::pinned_dir::PinnedDirIdentity,
+    recording: crate::pinned_dir::PinnedDirIdentity,
 }
 
 #[derive(Default)]
 struct ArtifactLeaseState {
     count: usize,
-    /// Installed only after a frames reader's final identity validation. The
-    /// exact root capability, rather than a pathname reopened later, binds the
-    /// last-release convergence sweep to the namespace that was actually read.
-    video_reader_sweep: Option<VideoReaderSweep>,
+    /// Values, not retained handles: every descriptor remains owned by an
+    /// admitted producer/reader lease. Comparing both the instance root and the
+    /// recording child prevents a replacement namespace—or the same recording
+    /// inode moved into one—from joining an older lexical-path lease group.
+    video_identity: Option<VideoLeaseIdentity>,
+    /// Set at the marker visibility boundary or after a reader's final closed
+    /// identity validation. Whichever local lease is last performs the sweep.
+    video_sweep_requested: bool,
     /// A count-zero entry remains present while its capability-bound sweep runs.
     /// New readers fail closed instead of entering between the last-release
     /// decision and a retention rename.
     sweeping: bool,
 }
 
-fn register_unique_artifact_path(key: PathBuf) -> Option<ArtifactPathLease> {
+fn register_unique_artifact_path(
+    key: PathBuf,
+    video_sweep: VideoRetentionSweep,
+) -> Option<ArtifactPathLease> {
+    if video_sweep.root.path().join(&video_sweep.fresh) != key {
+        return None;
+    }
     let (leases, _) = artifact_path_leases();
     let mut held = leases
         .lock()
@@ -272,14 +356,17 @@ fn register_unique_artifact_path(key: PathBuf) -> Option<ArtifactPathLease> {
         key.clone(),
         ArtifactLeaseState {
             count: 1,
-            video_reader_sweep: None,
+            video_identity: Some(video_sweep.identity),
+            video_sweep_requested: false,
             sweeping: false,
         },
     );
+    drop(held);
+    artifact_reader_acquire_anchor();
     Some(ArtifactPathLease {
         key: Some(key),
         os_lock: None,
-        video_reader: false,
+        video_sweep: Some(video_sweep),
     })
 }
 
@@ -326,7 +413,8 @@ pub(crate) fn acquire_capture_name_lease(
         key.clone(),
         ArtifactLeaseState {
             count: 1,
-            video_reader_sweep: None,
+            video_identity: None,
+            video_sweep_requested: false,
             sweeping: false,
         },
     );
@@ -335,7 +423,7 @@ pub(crate) fn acquire_capture_name_lease(
     let mut lease = ArtifactPathLease {
         key: Some(key),
         os_lock: None,
-        video_reader: false,
+        video_sweep: None,
     };
     if !automatic {
         // Lock the SAME retained authority the writer uses. On Unix the
@@ -374,11 +462,26 @@ pub(crate) fn acquire_capture_name_lease(
 /// original publication reply may share one recording, so this lease is
 /// refcounted.
 ///
-/// `None` means the previous final reader is already running the capability-
-/// bound convergence sweep. The caller must drop its pinned candidate handles
-/// and retry rather than returning paths from that in-between state.
-pub(crate) fn retain_video_artifact_path(path: &Path) -> Option<ArtifactPathLease> {
-    let key = path.to_path_buf();
+/// `None` means the previous final producer-or-reader lease is already running
+/// the capability-bound convergence sweep. The caller must drop its pinned
+/// candidate handles and retry rather than returning paths from that in-between
+/// state.
+pub(crate) fn retain_video_artifact_path(
+    root: crate::pinned_dir::PinnedDir,
+    fresh: std::ffi::OsString,
+    recording: &crate::pinned_dir::PinnedDir,
+) -> std::io::Result<Option<ArtifactPathLease>> {
+    let key = root.path().join(&fresh);
+    if recording.path() != key {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "video lease capability does not match its recording",
+        ));
+    }
+    let identity = VideoLeaseIdentity {
+        root: root.retained_identity()?,
+        recording: recording.retained_identity()?,
+    };
     let (leases, _) = artifact_path_leases();
     let mut held = leases
         .lock()
@@ -386,27 +489,43 @@ pub(crate) fn retain_video_artifact_path(path: &Path) -> Option<ArtifactPathLeas
     let state = held.entry(key.clone()).or_default();
     if state.sweeping {
         artifact_reader_reject_acquire_anchor();
-        return None;
+        return Ok(None);
+    }
+    match state.video_identity {
+        Some(expected) if expected != identity => {
+            artifact_reader_reject_replaced_identity_anchor();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "recording identity changed while acquiring retention",
+            ));
+        }
+        Some(_) => {}
+        None => state.video_identity = Some(identity),
     }
     state.count = state.count.saturating_add(1);
+    drop(held);
     artifact_reader_acquire_anchor();
-    Some(ArtifactPathLease {
+    Ok(Some(ArtifactPathLease {
         key: Some(key),
         os_lock: None,
-        video_reader: true,
-    })
+        video_sweep: Some(VideoRetentionSweep {
+            root,
+            fresh,
+            identity,
+        }),
+    }))
 }
 
 impl ArtifactPathLease {
-    /// Arm last-release retention only after the reader has revalidated every
-    /// namespace, marker, index, and frame identity. Acquiring the lease before
-    /// that validation prevents a producer/older sweep from removing the
-    /// recording in the gap; delaying this hook prevents a failed read from
-    /// causing unrelated retention work.
-    pub(crate) fn arm_video_reader_sweep(
+    /// Request one last-release retention sweep. A producer arms at the
+    /// irreversible marker-publication boundary; a reader arms only after it
+    /// has revalidated every namespace, marker, index, and frame identity.
+    /// Acquiring a reader lease before that validation prevents a producer or
+    /// older sweep from removing the recording in the gap, while delaying the
+    /// reader's request prevents a failed read from causing unrelated work.
+    pub(crate) fn arm_video_retention_sweep(
         &self,
-        root: crate::pinned_dir::PinnedDir,
-        fresh: std::ffi::OsString,
+        recording: &crate::pinned_dir::PinnedDir,
     ) -> std::io::Result<()> {
         let Some(key) = self.key.as_ref() else {
             return Err(std::io::Error::new(
@@ -414,12 +533,30 @@ impl ArtifactPathLease {
                 "artifact lease was already released",
             ));
         };
-        if root.path().join(&fresh) != *key {
+        let Some(sweep) = self.video_sweep.as_ref() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "video sweep capability does not match its retained recording",
+                "artifact lease has no video sweep capability",
+            ));
+        };
+        if recording.path() != key {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "video retention capability does not match its recording path",
             ));
         }
+        // Bind Arm to the exact lease-local capability, not merely the
+        // registry's cached identities. The recording check is last and is the
+        // linearization point: replacement before it refuses Arm; replacement
+        // after it is an allowed post-Arm environment transition.
+        sweep.root.validate_path_identity()?;
+        if recording.retained_identity()? != sweep.identity.recording {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "recording identity changed while arming retention",
+            ));
+        }
+        recording.validate_path_identity()?;
         let (leases, _) = artifact_path_leases();
         let mut held = leases
             .lock()
@@ -436,18 +573,13 @@ impl ArtifactPathLease {
                 "video retention sweep is already in progress",
             ));
         }
-        match state.video_reader_sweep.as_ref() {
-            Some(existing)
-                if existing.fresh != fresh || !existing.root.same_directory_identity(&root) =>
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "recording namespace changed while arming retention",
-                ));
-            }
-            Some(_) => {}
-            None => state.video_reader_sweep = Some(VideoReaderSweep { root, fresh }),
+        if state.video_identity != Some(sweep.identity) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "recording identity changed while arming retention",
+            ));
         }
+        state.video_sweep_requested = true;
         artifact_reader_arm_anchor();
         Ok(())
     }
@@ -513,22 +645,29 @@ impl Drop for ArtifactPathLease {
         let Some(state) = held.get_mut(&key) else {
             return;
         };
+        let video_lease = self.video_sweep.is_some();
         debug_assert!(state.count > 0, "artifact lease count underflow");
         state.count = state.count.saturating_sub(1);
-        if self.video_reader {
+        if video_lease {
             artifact_reader_release_anchor();
         }
         let sweep = if state.count == 0 {
-            match state.video_reader_sweep.take() {
-                Some(sweep) => {
-                    state.sweeping = true;
-                    artifact_reader_start_sweep_anchor();
-                    Some(sweep)
+            if state.video_sweep_requested {
+                match self.video_sweep.take() {
+                    Some(sweep) => {
+                        state.sweeping = true;
+                        artifact_reader_start_sweep_anchor();
+                        Some(sweep)
+                    }
+                    None => {
+                        debug_assert!(false, "armed video lease lost its sweep capability");
+                        held.remove(&key);
+                        None
+                    }
                 }
-                None => {
-                    held.remove(&key);
-                    None
-                }
+            } else {
+                held.remove(&key);
+                None
             }
         } else {
             None
@@ -536,7 +675,7 @@ impl Drop for ArtifactPathLease {
         changed.notify_all();
         drop(held);
         if let Some(sweep) = sweep {
-            prune_video_after_reader_release(&sweep.root, &sweep.fresh);
+            prune_video_after_final_lease(&sweep.root, &sweep.fresh);
             let mut held = leases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -982,9 +1121,43 @@ pub struct ConfinedVideoDir {
     name: std::ffi::OsString,
     _retention_lease: ArtifactPathLease,
     published: bool,
+    batch_synced: std::cell::Cell<bool>,
+}
+
+/// Closed identity checkpoint for one frame in a private video bundle.
+///
+/// A recording may contain hundreds of frames. Retaining each writer's
+/// [`crate::pinned_dir::PinnedFile`] until the control reply is acknowledged
+/// consumes one OS descriptor per frame and can exhaust macOS's default soft
+/// limit. The pinned recording directory already anchors the namespace; this
+/// compact seal records the filename and its device/inode (Unix) or
+/// volume/file-index (Windows), and validation reopens one frame at a time.
+/// This is wire-edge replacement detection, not continuous exclusion: after the
+/// writer closes, a same-user process can mutate the file and OS identities can
+/// eventually be reused. That is the least-common-denominator Unix guarantee.
+#[derive(Debug)]
+pub(crate) struct VideoFrameSeal {
+    name: std::ffi::OsString,
+    identity: crate::pinned_dir::PinnedFileIdentity,
 }
 
 impl ConfinedVideoDir {
+    fn ensure_unpublished(&self) -> std::io::Result<()> {
+        if self.published {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "published video recording is immutable",
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn is_published(&self) -> bool {
+        self.published
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         self.path
@@ -992,30 +1165,66 @@ impl ConfinedVideoDir {
             .expect("live confined video dir owns its path")
     }
 
+    #[cfg(test)]
     pub(crate) fn write_new_private(
         &self,
         name: &std::ffi::OsStr,
         bytes: &[u8],
     ) -> std::io::Result<crate::pinned_dir::PinnedFile> {
+        self.ensure_unpublished()?;
+        self.batch_synced.set(false);
         self.recording
             .as_ref()
             .expect("live confined video dir")
             .write_new_private(name, bytes)
     }
 
-    pub(crate) fn write_new_private_authorized(
+    /// Durably write one frame, then close its per-file descriptor and retain
+    /// only an identity seal. Publication reopens seals sequentially, keeping the
+    /// live descriptor count constant regardless of recording length.
+    pub(crate) fn write_sealed_frame(
+        &self,
+        name: &std::ffi::OsStr,
+        bytes: &[u8],
+    ) -> std::io::Result<VideoFrameSeal> {
+        let file = self.write_batch_member_authorized(name, bytes, || true)?;
+        Ok(VideoFrameSeal {
+            name: name.to_os_string(),
+            identity: file.into_identity()?,
+        })
+    }
+
+    /// Write a durable frame/index batch member without syncing the recording
+    /// directory yet. Per-member work stays on the retained recording
+    /// capability and validates only the renamed entry; [`Self::publish`] is the
+    /// mandatory full-path batch barrier before the visibility marker exists.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "VideoBatchPublicationDurability",
+            action = "WriteMember",
+            project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
+        )
+    )]
+    pub(crate) fn write_batch_member_authorized(
         &self,
         name: &std::ffi::OsStr,
         bytes: &[u8],
         authorize: impl FnOnce() -> bool,
     ) -> std::io::Result<crate::pinned_dir::PinnedFile> {
+        self.ensure_unpublished()?;
+        // A failed or cancelled write must invalidate a prior batch barrier too:
+        // only a later successful `publish` may authorize marker creation.
+        self.batch_synced.set(false);
         self.recording
             .as_ref()
             .expect("live confined video dir")
-            .write_new_private_authorized(name, bytes, authorize)
+            .write_new_private_deferred_dir_sync_authorized(name, bytes, authorize)
     }
 
     pub(crate) fn remove_file_if_exists(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        self.ensure_unpublished()?;
+        self.batch_synced.set(false);
         self.recording
             .as_ref()
             .expect("live confined video dir")
@@ -1023,6 +1232,7 @@ impl ConfinedVideoDir {
     }
 
     fn cleanup(&mut self) -> std::io::Result<()> {
+        self.ensure_unpublished()?;
         let Some(recording) = self.recording.as_ref() else {
             return Ok(());
         };
@@ -1033,44 +1243,43 @@ impl ConfinedVideoDir {
         Ok(())
     }
 
-    pub fn abort(mut self) -> std::io::Result<()> {
+    pub(crate) fn abort_in_place(&mut self) -> std::io::Result<()> {
         self.cleanup()
     }
 
-    /// Publish only after `index.json` is durable. Retention runs after the
-    /// `.published` marker and again on last reader-lease release — never at
-    /// mint, and never in this fallible pre-marker phase — so a refused/failed
-    /// request never deletes a prior good recording.
-    pub(crate) fn publish(
-        &mut self,
-        frames: &[crate::pinned_dir::PinnedFile],
-        index: &crate::pinned_dir::PinnedFile,
-    ) -> std::io::Result<PathBuf> {
-        let recording = self.recording.as_ref().expect("live confined video dir");
-        recording.validate_path_identity()?;
-        for frame in frames {
-            frame.validate_path_identity()?;
-        }
-        index.validate_path_identity()?;
-        recording.sync()?;
-        self.instance.sync()?;
-        recording.validate_path_identity()?;
-        for frame in frames {
-            frame.validate_path_identity()?;
-        }
-        index.validate_path_identity()?;
-        Ok(self.path().to_path_buf())
+    pub fn abort(mut self) -> std::io::Result<()> {
+        self.abort_in_place()
     }
 
-    pub(crate) fn prune_after_publish(&self) {
-        if let Err(error) = prune_video_dirs(&self.instance, &self.name) {
-            eprintln!("aterm-gui: video retention skipped after successful publish: {error}");
-        }
-        if let Err(error) = self.instance.sync() {
-            eprintln!(
-                "aterm-gui: video retention directory sync failed after successful publish: {error}"
-            );
-        }
+    /// Publish only after `index.json` is durable. Marker publication requests
+    /// one retention sweep, which the final producer-or-reader lease performs;
+    /// retention never runs at mint or in this fallible pre-marker phase, so a
+    /// refused/failed request never deletes a prior good recording. This is also
+    /// the required parent-directory durability barrier for all deferred
+    /// frame/index writes.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "VideoBatchPublicationDurability",
+            action = "SyncBatch",
+            project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
+        )
+    )]
+    pub(crate) fn publish(
+        &mut self,
+        frames: &[VideoFrameSeal],
+        index: &crate::pinned_dir::PinnedFile,
+    ) -> std::io::Result<PathBuf> {
+        self.ensure_unpublished()?;
+        self.batch_synced.set(false);
+        let recording = self.recording.as_ref().expect("live confined video dir");
+        self.validate_batch_paths(recording)?;
+        recording.sync()?;
+        Self::validate_frame_entries(recording, frames)?;
+        index.validate_entry_identity_at_retained()?;
+        self.validate_batch_paths(recording)?;
+        self.batch_synced.set(true);
+        Ok(self.path().to_path_buf())
     }
 
     /// Atomically publish the marker readers require and make the recording
@@ -1079,35 +1288,94 @@ impl ConfinedVideoDir {
     /// marker may have been visible, even a later sync/identity failure leaves
     /// the recording intact until launch-namespace cleanup: a successful reader
     /// may already have received paths and need to open them after disconnect.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "VideoBatchPublicationDurability",
+            action = "PublishMarker",
+            project = "aterm_gui::artifact_transaction_conformance::project_video_batch_publication_durability"
+        )
+    )]
     pub(crate) fn publish_marker(&mut self) -> std::io::Result<crate::pinned_dir::PinnedFile> {
+        self.publish_marker_with_hook(|| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_marker_with_test_hook(
+        &mut self,
+        after_publish: impl FnOnce(),
+    ) -> std::io::Result<crate::pinned_dir::PinnedFile> {
+        self.publish_marker_with_hook(after_publish)
+    }
+
+    fn publish_marker_with_hook(
+        &mut self,
+        after_publish: impl FnOnce(),
+    ) -> std::io::Result<crate::pinned_dir::PinnedFile> {
+        self.ensure_unpublished()?;
+        if !self.batch_synced.get() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "video batch has not passed its durability barrier",
+            ));
+        }
         // Borrow the flag field separately so the commit hook can set it while
         // `recording` is still immutably borrowed for the write.
         let published = &mut self.published;
-        self.recording
-            .as_ref()
-            .expect("live confined video dir")
-            .write_new_private_with_hooks(
-                std::ffi::OsStr::new(VIDEO_PUBLISHED_FILE),
-                b"aterm-video-published-v1\n",
-                || {},
-                || *published = true,
-            )
+        let retention_lease = &self._retention_lease;
+        let mut arm_error = None;
+        let recording = self.recording.as_ref().expect("live confined video dir");
+        let result = recording.write_new_private_with_hooks(
+            std::ffi::OsStr::new(VIDEO_PUBLISHED_FILE),
+            b"aterm-video-published-v1\n",
+            || {},
+            || {
+                *published = true;
+                if let Err(error) = retention_lease.arm_video_retention_sweep(recording) {
+                    arm_error = Some(error);
+                }
+                after_publish();
+            },
+        );
+        arm_error.map_or(result, Err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_synced_for_test(&self) -> bool {
+        self.batch_synced.get()
     }
 
     pub(crate) fn validate_for_reply(
         &self,
-        frames: &[crate::pinned_dir::PinnedFile],
+        frames: &[VideoFrameSeal],
         index: &crate::pinned_dir::PinnedFile,
     ) -> std::io::Result<()> {
-        self.instance.validate_path_identity()?;
-        self.recording
-            .as_ref()
-            .expect("live confined video dir")
-            .validate_path_identity()?;
+        let recording = self.recording.as_ref().expect("live confined video dir");
+        self.validate_batch_paths(recording)?;
+        Self::validate_frame_entries(recording, frames)?;
+        index.validate_entry_identity_at_retained()?;
+        self.validate_batch_paths(recording)
+    }
+
+    fn validate_batch_paths(
+        &self,
+        recording: &crate::pinned_dir::PinnedDir,
+    ) -> std::io::Result<()> {
+        // `recording` was derived from `instance` and retains its complete
+        // ancestor chain, so its full validation already covers the instance.
+        recording.validate_path_identity()
+    }
+
+    fn validate_frame_entries(
+        recording: &crate::pinned_dir::PinnedDir,
+        frames: &[VideoFrameSeal],
+    ) -> std::io::Result<()> {
         for frame in frames {
-            frame.validate_path_identity()?;
+            frame
+                .identity
+                .validate_at_retained(recording, &frame.name)?;
         }
-        index.validate_path_identity()
+        Ok(())
     }
 }
 
@@ -1132,20 +1400,40 @@ impl Drop for ConfinedVideoDir {
 /// the launch namespace and recording name are minted here. Every file inside
 /// is written through the retained directory capability used by image output.
 #[must_use]
+#[cfg(test)]
 pub fn confine_video_dir(sock_dir: &Path) -> Option<ConfinedVideoDir> {
-    confine_video_dir_for_instance(sock_dir, process_instance_id())
+    confine_video_dir_with_admission(sock_dir, |_| true)
 }
 
 #[must_use]
+pub(crate) fn confine_video_dir_with_admission(
+    sock_dir: &Path,
+    admit: impl FnOnce(&Path) -> bool,
+) -> Option<ConfinedVideoDir> {
+    confine_video_dir_for_instance_with_admission(sock_dir, process_instance_id(), admit)
+}
+
+#[must_use]
+#[cfg(test)]
 fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<ConfinedVideoDir> {
+    confine_video_dir_for_instance_with_admission(sock_dir, instance, |_| true)
+}
+
+#[must_use]
+fn confine_video_dir_for_instance_with_admission(
+    sock_dir: &Path,
+    instance: &str,
+    admit: impl FnOnce(&Path) -> bool,
+) -> Option<ConfinedVideoDir> {
     if !valid_instance_component(instance) {
         return None;
     }
     let video_root = ensure_canonical_direct_child(sock_dir, VIDEO_DIR).ok()?;
     let canon = ensure_canonical_direct_child(&video_root, instance).ok()?;
+    let instance_dir = crate::pinned_dir::PinnedDir::open_with_admission(&canon, admit).ok()?;
+    let instance_identity = instance_dir.retained_identity().ok()?;
     hold_current_instance_lease(&canon).ok()?;
     sweep_dead_instance_namespaces_with(&video_root, instance, &imp::pid_alive);
-    let instance_dir = crate::pinned_dir::PinnedDir::open(&canon).ok()?;
     static RECORDING_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let base = RECORDING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for n in 0..1000u32 {
@@ -1153,7 +1441,21 @@ fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<Con
         match instance_dir.create_child(&name) {
             Ok(recording) => {
                 let path = recording.path().to_path_buf();
-                let Some(retention_lease) = register_unique_artifact_path(path.clone()) else {
+                let Ok(recording_identity) = recording.retained_identity() else {
+                    let _ = instance_dir.remove_child_tree_exact(&name, &recording);
+                    return None;
+                };
+                let video_sweep = VideoRetentionSweep {
+                    root: instance_dir.clone(),
+                    fresh: name.clone(),
+                    identity: VideoLeaseIdentity {
+                        root: instance_identity,
+                        recording: recording_identity,
+                    },
+                };
+                let Some(retention_lease) =
+                    register_unique_artifact_path(path.clone(), video_sweep)
+                else {
                     let _ = instance_dir.remove_child_tree_exact(&name, &recording);
                     continue;
                 };
@@ -1164,6 +1466,7 @@ fn confine_video_dir_for_instance(sock_dir: &Path, instance: &str) -> Option<Con
                     name,
                     _retention_lease: retention_lease,
                     published: false,
+                    batch_synced: std::cell::Cell::new(false),
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1180,7 +1483,17 @@ const AUTO_IMAGE_SCAN_BUDGET: usize = 256;
 /// auto namespace. Explicit caller names continue to use direct `images/`
 /// children and are therefore outside every automatic retention sweep.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn confine_automatic_image_path(sock_dir: &Path, stem: &str) -> Option<ConfinedImage> {
+    confine_automatic_image_path_with_admission(sock_dir, stem, |_| true)
+}
+
+#[must_use]
+pub(crate) fn confine_automatic_image_path_with_admission(
+    sock_dir: &Path,
+    stem: &str,
+    admit: impl FnOnce(&Path) -> bool,
+) -> Option<ConfinedImage> {
     if stem.is_empty()
         || !stem
             .bytes()
@@ -1191,9 +1504,9 @@ pub(crate) fn confine_automatic_image_path(sock_dir: &Path, stem: &str) -> Optio
     let images = ensure_canonical_direct_child(sock_dir, IMAGES_DIR).ok()?;
     let auto = ensure_canonical_direct_child(&images, AUTO_IMAGES_DIR).ok()?;
     let dir = ensure_canonical_direct_child(&auto, process_instance_id()).ok()?;
+    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&dir, admit).ok()?;
     hold_current_instance_lease(&dir).ok()?;
     sweep_dead_instance_namespaces_with(&auto, process_instance_id(), &imp::pid_alive);
-    let pinned = crate::pinned_dir::PinnedDir::open(&dir).ok()?;
     Some(ConfinedImage {
         dir,
         file_name: automatic_capture_name(stem).into(),
@@ -1293,8 +1606,8 @@ pub(crate) fn cleanup_failed_automatic_image(target: &ConfinedImage) {
 /// Recordings kept on disk, INCLUDING the one just created. Each recording can
 /// hold up to a full frame budget in PNGs (hundreds of MiB at `full`), so an
 /// agent that records in a loop would otherwise grow one process-instance
-/// namespace without bound; the server prunes after each successful publish,
-/// oldest first.
+/// namespace without bound. Marker publication requests a sweep; the final
+/// producer-or-reader lease performs it, oldest first.
 const VIDEO_KEEP: usize = 8;
 
 /// Delete recordings beyond [`VIDEO_KEEP`], never touching `fresh` (the dir just
@@ -1317,18 +1630,14 @@ const VIDEO_PRUNE_DELETE_ENTRY_LIMIT: usize = 16_384;
 const VIDEO_SCAN_WORK: usize = 64;
 const VIDEO_FILE_OPEN_WORK: usize = 4 * 1024;
 const VIDEO_DELETE_WORK: usize = 4 * 1024;
-const VIDEO_INDEX_LIMIT: usize = 16 * 1024 * 1024;
-const VIDEO_FRAME_LIMIT: usize = 10_000;
 
-/// One shared retention allowance covers directory scans, index bytes, exact
-/// file probes, renames, and deletes across the whole sweep. Per-recording
-/// limits alone multiplied by the scan bound into gigabytes of parsing and
-/// millions of opens; this counter makes that multiplication impossible.
+/// One shared retention allowance covers directory scans, file probes, renames,
+/// and deletes across the whole sweep. This prevents a
+/// crowded namespace from multiplying retention work without bound.
 #[derive(Debug)]
 struct VideoPruneWork {
     remaining: usize,
     scanned: usize,
-    index_bytes: usize,
     file_opens: usize,
     deletes: usize,
     renames: usize,
@@ -1339,7 +1648,6 @@ impl VideoPruneWork {
         Self {
             remaining: limit,
             scanned: 0,
-            index_bytes: 0,
             file_opens: 0,
             deletes: 0,
             renames: 0,
@@ -1370,14 +1678,6 @@ impl VideoPruneWork {
         true
     }
 
-    fn bytes(&mut self, bytes: usize) -> bool {
-        if !self.spend(bytes) {
-            return false;
-        }
-        self.index_bytes = self.index_bytes.saturating_add(bytes);
-        true
-    }
-
     fn delete(&mut self) -> bool {
         if !self.spend(VIDEO_DELETE_WORK) {
             return false;
@@ -1396,7 +1696,7 @@ impl VideoPruneWork {
 }
 
 enum CompletionProbe {
-    Complete(Vec<crate::pinned_dir::PinnedFile>),
+    Complete((crate::pinned_dir::PinnedFile, crate::pinned_dir::PinnedFile)),
     Invalid,
     Exhausted,
 }
@@ -1420,54 +1720,11 @@ fn completed_recording(
     if !work.file_open() {
         return CompletionProbe::Exhausted;
     }
-    // `read_private(limit)` reads at most limit+1 bytes. Leave room for that
-    // sentinel so even an oversized index cannot cross the global allowance.
-    let read_limit = VIDEO_INDEX_LIMIT.min(work.remaining.saturating_sub(1));
-    if read_limit == 0 {
-        return CompletionProbe::Exhausted;
-    }
-    let (bytes, index) =
-        match recording.read_private_at_retained(std::ffi::OsStr::new("index.json"), read_limit) {
-            Ok(value) => value,
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::InvalidData {
-                    let consumed = read_limit.saturating_add(1).min(work.remaining);
-                    let _ = work.bytes(consumed);
-                    if read_limit < VIDEO_INDEX_LIMIT {
-                        return CompletionProbe::Exhausted;
-                    }
-                }
-                return CompletionProbe::Invalid;
-            }
-        };
-    if !work.bytes(bytes.len()) {
-        return CompletionProbe::Exhausted;
-    }
-    let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(&bytes) else {
+    let Ok(index) = recording.pin_private_file_at_retained(std::ffi::OsStr::new("index.json"))
+    else {
         return CompletionProbe::Invalid;
     };
-    let Some(frames) = value.get("frames").and_then(aterm_json::Value::as_array) else {
-        return CompletionProbe::Invalid;
-    };
-    if frames.len() > VIDEO_FRAME_LIMIT {
-        return CompletionProbe::Invalid;
-    }
-    let mut files = Vec::with_capacity(frames.len().saturating_add(2));
-    files.push(marker);
-    files.push(index);
-    for frame in frames {
-        let Some(name) = frame.get("file").and_then(aterm_json::Value::as_str) else {
-            return CompletionProbe::Invalid;
-        };
-        if !work.file_open() {
-            return CompletionProbe::Exhausted;
-        }
-        let Ok(file) = recording.pin_private_file_at_retained(std::ffi::OsStr::new(name)) else {
-            return CompletionProbe::Invalid;
-        };
-        files.push(file);
-    }
-    CompletionProbe::Complete(files)
+    CompletionProbe::Complete((marker, index))
 }
 
 fn cleanup_video_tombstone(
@@ -1514,9 +1771,7 @@ fn prune_video_dirs_with_work(
         }
         let text = name.to_string_lossy();
         if text.starts_with(".prune-") {
-            if let Ok(recording) = root.child(&name) {
-                tombstones.push((name, recording));
-            }
+            tombstones.push(name);
             continue;
         }
         if name == fresh || !text.starts_with("rec-") {
@@ -1537,7 +1792,7 @@ fn prune_video_dirs_with_work(
             if leased.contains(&name) {
                 protected_completed = protected_completed.saturating_add(1);
             } else {
-                completed.push((name, recording));
+                completed.push(name);
             }
         }
     }
@@ -1545,25 +1800,31 @@ fn prune_video_dirs_with_work(
     // Finish quarantined partial work first. A bounded sweep may stop midway,
     // but the next publication recognizes the tombstone and continues instead
     // of orphaning a directory whose index marker was already removed.
-    tombstones.sort_by(|left, right| left.0.cmp(&right.0));
-    for (name, recording) in tombstones {
+    tombstones.sort();
+    for name in tombstones {
+        let Ok(recording) = root.child(&name) else {
+            continue;
+        };
         if !cleanup_video_tombstone(root, &name, &recording, work) && work.remaining == 0 {
             return Ok(());
         }
     }
 
-    completed.sort_by(|left, right| left.0.cmp(&right.0));
+    completed.sort();
     // `fresh` and every other completed reply whose lease still spans a socket
-    // write occupy keep slots. Only unleased, fully validated oldest candidates
+    // write occupy keep slots. Only unleased, marker-authorized oldest candidates
     // are quarantined. Completion probing and cleanup share the same allowance.
     let protected = 1usize.saturating_add(protected_completed);
     let unprotected_keep = VIDEO_KEEP.saturating_sub(protected);
     let mut needed = completed.len().saturating_sub(unprotected_keep);
-    for (name, recording) in completed {
+    for name in completed {
         if needed == 0 {
             break;
         }
-        let guards = match completed_recording(&recording, work) {
+        let Ok(recording) = root.child(&name) else {
+            continue;
+        };
+        let completion_guards = match completed_recording(&recording, work) {
             CompletionProbe::Complete(guards) => guards,
             CompletionProbe::Invalid => continue,
             CompletionProbe::Exhausted => break,
@@ -1575,10 +1836,10 @@ fn prune_video_dirs_with_work(
         let sequence = PRUNE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tombstone =
             std::ffi::OsString::from(format!(".prune-p{}-{sequence:020}", std::process::id()));
-        // Windows file guards deny deletion while validation is in flight.
-        // Release them only after the candidate is complete and immediately
-        // before the handle-rooted quarantine rename.
-        drop(guards);
+        // Keep the marker/index identities pinned through the completion
+        // decision, then release their two handles immediately before the
+        // handle-rooted quarantine rename.
+        drop(completion_guards);
         let path = root.path().join(&name);
         let renamed = mutate_unleased_artifact(&path, || {
             root.rename_child_exact(&name, &recording, &tombstone)
@@ -1603,20 +1864,20 @@ fn prune_video_dirs(
     prune_video_dirs_with_work(root, fresh, &mut work)
 }
 
-/// A frames reply may temporarily force the recording count above the cap.
-/// When its final shared lease releases (after every exact reader handle), run
-/// another bounded sweep without waiting for a future recording. Preserve the
-/// just-advertised recording as `fresh`: the response has crossed its ACK
-/// boundary, but the client still needs a stable pathname to open.
-fn prune_video_after_reader_release(
+/// A producer reply or frames reply may temporarily force the recording count
+/// above the cap. When the final shared lease releases, run the single requested
+/// bounded sweep without waiting for a future recording. Preserve the
+/// just-advertised recording as `fresh`: a response may already have crossed its
+/// ACK boundary while the client still needs a stable pathname to open.
+fn prune_video_after_final_lease(
     root: &crate::pinned_dir::PinnedDir,
     recording_name: &std::ffi::OsStr,
 ) {
     if let Err(error) = prune_video_dirs(root, recording_name) {
-        eprintln!("aterm-gui: video retention skipped after reader release: {error}");
+        eprintln!("aterm-gui: video retention skipped after final lease release: {error}");
     }
     if let Err(error) = root.sync() {
-        eprintln!("aterm-gui: video retention sync failed after reader release: {error}");
+        eprintln!("aterm-gui: video retention sync failed after final lease release: {error}");
     }
 }
 
@@ -2027,7 +2288,7 @@ impl ConfinedImage {
         file: &crate::pinned_dir::PinnedFile,
     ) -> std::io::Result<()> {
         self.pinned.validate_path_identity()?;
-        file.validate_path_identity()
+        file.validate_entry_identity_at_retained()
     }
 
     #[cfg(test)]
@@ -2042,16 +2303,22 @@ impl ConfinedImage {
     }
 }
 
-/// Confine a caller-supplied `image` path to the `images/` subdir of the
-/// socket directory.
+#[must_use]
+#[cfg(test)]
+pub fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedImage> {
+    confine_image_path_with_admission(sock_dir, requested, |_| true)
+}
+
+/// Resolve a caller-supplied `image` path inside the socket directory's
+/// `images/` subdir, independently of later resource admission.
 ///
 /// The subdir is created `0700`. A relative or bare-filename request is
 /// resolved INTO the subdir; an absolute request must already live inside it.
 /// NESTED target directories are FORBIDDEN — the file must be a direct child of
 /// `images/` — so the only directory component is the canonical subdir itself
 /// (closing the intermediate-dir symlink-swap window, TOCTOU-1). Returns the
-/// canonical dir + validated filename, or `None` (→ `ERR path`) when the request
-/// would escape or names a nested path.
+/// canonical dir + validated filename, or `None` when the request would escape
+/// or names a nested path.
 ///
 /// SPEC: this is the real `Confine` action of the external `PathConfine.tla` model
 /// (TRUST_NATIVE_TLA Phase 2, control-socket CONFINEMENT family). The spec's
@@ -2062,7 +2329,7 @@ impl ConfinedImage {
 /// parent prefix, then the writer FOLLOWED a symlinked last segment). A `Some(_)`
 /// here maps to the spec's `committed=TRUE, target="inside"`; a `None` (escape) maps
 /// to `committed=FALSE, target="none"`. Tier-1 conformance drives this against a real
-/// planted symlink (`tests/conformance_pathconfine.rs`).
+/// planted symlink (`crates/aterm-gui/src/lib.rs::path_confine_conformance`).
 // Anchor gated on `test` ALONE (not a feature): the relocated `spec_xref_closure`
 // gate lives in THIS crate's own test build, so `cfg(test)` already makes this
 // anchor visible to it — no cross-crate `spec-anchors` feature is needed here.
@@ -2080,7 +2347,10 @@ impl ConfinedImage {
     )
 )]
 #[must_use]
-pub fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedImage> {
+fn resolve_confined_image_target(
+    sock_dir: &Path,
+    requested: &str,
+) -> Option<(PathBuf, std::ffi::OsString)> {
     let canon_images = ensure_canonical_direct_child(sock_dir, IMAGES_DIR).ok()?;
 
     let req = Path::new(requested);
@@ -2129,10 +2399,20 @@ pub fn confine_image_path(sock_dir: &Path, requested: &str) -> Option<ConfinedIm
     {
         return None;
     }
-    let pinned = crate::pinned_dir::PinnedDir::open(&canon_images).ok()?;
+    Some((canon_images, file_name.to_os_string()))
+}
+
+#[must_use]
+pub(crate) fn confine_image_path_with_admission(
+    sock_dir: &Path,
+    requested: &str,
+    admit: impl FnOnce(&Path) -> bool,
+) -> Option<ConfinedImage> {
+    let (canon_images, file_name) = resolve_confined_image_target(sock_dir, requested)?;
+    let pinned = crate::pinned_dir::PinnedDir::open_with_admission(&canon_images, admit).ok()?;
     Some(ConfinedImage {
         dir: canon_images,
-        file_name: file_name.to_os_string(),
+        file_name,
         pinned,
     })
 }
@@ -2502,6 +2782,34 @@ mod tests {
         let allowed =
             confine_image_path(&dir, inside.to_str().unwrap()).expect("absolute-inside allowed");
         assert!(allowed.display_path().ends_with("images/ok.png"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_confinement_decision_is_distinct_from_capacity_admission() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-img-confine-admission-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+
+        let (images, name) = resolve_confined_image_target(&dir, "shot.png")
+            .expect("the pure confinement decision accepts a direct child");
+        assert_eq!(images, dir.join(IMAGES_DIR).canonicalize().unwrap());
+        assert_eq!(name, std::ffi::OsStr::new("shot.png"));
+
+        let mut admission_checked = false;
+        let rejected = confine_image_path_with_admission(&dir, "shot.png", |_| {
+            admission_checked = true;
+            false
+        });
+        assert!(admission_checked, "capacity is consulted after confinement");
+        assert!(
+            rejected.is_none(),
+            "a confined path can still be refused by resource admission"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3088,14 +3396,14 @@ mod tests {
             "publishing the marker does not release the producer lease"
         );
 
-        let reader = retain_video_artifact_path(&path).expect("marker-visible reader lease");
         let root = crate::pinned_dir::PinnedDir::open_resolved(path.parent().unwrap()).unwrap();
-        reader
-            .arm_video_reader_sweep(
-                root,
-                path.file_name().expect("recording name").to_os_string(),
-            )
-            .unwrap();
+        let name = path.file_name().expect("recording name").to_os_string();
+        let reader_recording = root.child(&name).unwrap();
+        let reader = retain_video_artifact_path(root, name, &reader_recording)
+            .unwrap()
+            .expect("marker-visible reader lease");
+        reader.arm_video_retention_sweep(&reader_recording).unwrap();
+        drop(reader_recording);
         assert_eq!(
             artifact_lease_count(&path),
             Some(2),
@@ -3126,6 +3434,198 @@ mod tests {
             "reader-release retention preserves the just-advertised recording"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn video_producer_sweeps_from_its_local_root_when_reader_releases_first() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-video-producer-final-sweep-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let instance = format!("p{}-producer-final", std::process::id());
+
+        let mut producer = confine_video_dir_for_instance(&dir, &instance).unwrap();
+        let path = producer.path().to_path_buf();
+        let root_path = path.parent().unwrap().to_path_buf();
+        let index = producer
+            .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
+            .unwrap();
+        producer.publish(&[], &index).unwrap();
+        let marker = producer.publish_marker().unwrap();
+
+        let oldest = root_path.join("rec-00000000000000000000-100");
+        for sequence in 100..112 {
+            write_completed_video_fixture(
+                &root_path,
+                &format!("rec-00000000000000000000-{sequence:03}"),
+            );
+        }
+
+        let reader_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let name = path.file_name().unwrap().to_os_string();
+        let reader_recording = reader_root.child(&name).unwrap();
+        let reader = retain_video_artifact_path(reader_root, name, &reader_recording)
+            .unwrap()
+            .expect("reader overlaps the published producer");
+        drop(reader_recording);
+        drop(reader);
+        assert!(
+            oldest.is_dir(),
+            "a nonfinal reader release cannot run retention"
+        );
+
+        drop(marker);
+        drop(index);
+        drop(producer);
+        assert!(
+            !oldest.exists(),
+            "the final producer retains its own charged root through the sweep"
+        );
+        assert!(path.is_dir(), "the fresh published recording is retained");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unarmed_final_reader_inherits_sweep_request_on_its_local_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-video-unarmed-final-reader-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let root_path = dir.join("recordings");
+        ensure_private_dir(&root_path).unwrap();
+        for sequence in 0..12 {
+            write_completed_video_fixture(&root_path, &format!("rec-{sequence:020}-000"));
+        }
+        let fresh = std::ffi::OsString::from("rec-00000000000000000011-000");
+
+        let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let first_recording = first_root.child(&fresh).unwrap();
+        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
+            .unwrap()
+            .expect("first reader lease");
+        let key = first.key.clone().expect("reader owns its canonical key");
+        first.arm_video_retention_sweep(&first_recording).unwrap();
+        drop(first_recording);
+
+        let second_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let second_recording = second_root.child(&fresh).unwrap();
+        let second = retain_video_artifact_path(second_root, fresh, &second_recording)
+            .unwrap()
+            .expect("overlapping reader lease");
+        drop(second_recording);
+
+        drop(first);
+        assert_eq!(artifact_lease_count(&key), Some(1));
+        assert_eq!(
+            completed_video_fixture_count(&root_path),
+            12,
+            "the first release cannot sweep through a live second reader"
+        );
+
+        let moved = dir.join("recordings-original");
+        std::fs::rename(&root_path, &moved).unwrap();
+        ensure_private_dir(&root_path).unwrap();
+        for sequence in 100..112 {
+            write_completed_video_fixture(&root_path, &format!("rec-{sequence:020}-000"));
+        }
+        std::fs::write(root_path.join("sentinel"), b"replacement").unwrap();
+
+        drop(second);
+        assert!(
+            completed_video_fixture_count(&moved) < 12,
+            "the unarmed final reader honors the prior sweep request on its own root"
+        );
+        assert_eq!(
+            completed_video_fixture_count(&root_path),
+            12,
+            "the replacement at the old lexical path is untouched"
+        );
+        assert_eq!(
+            std::fs::read(root_path.join("sentinel")).unwrap(),
+            b"replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_reader_registry_rejects_replaced_recording_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-video-reader-identity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let root_path = dir.join("recordings");
+        ensure_private_dir(&root_path).unwrap();
+        let fresh = std::ffi::OsString::from("rec-00000000000000000000-000");
+        write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
+
+        let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let first_recording = first_root.child(&fresh).unwrap();
+        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
+            .unwrap()
+            .expect("first reader lease");
+        drop(first_recording);
+
+        let moved = root_path.join("recording-original");
+        std::fs::rename(root_path.join(&fresh), &moved).unwrap();
+        write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
+        let replacement_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let replacement = replacement_root.child(&fresh).unwrap();
+        let error = retain_video_artifact_path(replacement_root, fresh, &replacement)
+            .expect_err("a replacement cannot join the live recording lease group");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(artifact_lease_count(first.key.as_ref().unwrap()), Some(1));
+
+        drop(replacement);
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_reader_registry_rejects_same_recording_moved_to_replacement_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-video-reader-root-identity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let root_path = dir.join("recordings");
+        ensure_private_dir(&root_path).unwrap();
+        let fresh = std::ffi::OsString::from("rec-00000000000000000000-000");
+        write_completed_video_fixture(&root_path, fresh.to_str().unwrap());
+
+        let first_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let first_recording = first_root.child(&fresh).unwrap();
+        let first = retain_video_artifact_path(first_root, fresh.clone(), &first_recording)
+            .unwrap()
+            .expect("first reader lease");
+        drop(first_recording);
+
+        let original_root = dir.join("recordings-original");
+        std::fs::rename(&root_path, &original_root).unwrap();
+        ensure_private_dir(&root_path).unwrap();
+        std::fs::rename(original_root.join(&fresh), root_path.join(&fresh)).unwrap();
+
+        let replacement_root = crate::pinned_dir::PinnedDir::open_resolved(&root_path).unwrap();
+        let same_recording = replacement_root.child(&fresh).unwrap();
+        let error = retain_video_artifact_path(replacement_root, fresh, &same_recording)
+            .expect_err("the same recording inode cannot cross into a replacement root");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(artifact_lease_count(first.key.as_ref().unwrap()), Some(1));
+
+        drop(same_recording);
+        drop(first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3286,10 +3786,11 @@ mod tests {
         let index = fresh
             .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
             .unwrap();
-        let published = fresh.publish(&[], &index).expect("publish + prune");
+        let published = fresh.publish(&[], &index).expect("publish durable batch");
         let marker = fresh.publish_marker().unwrap();
-        fresh.prune_after_publish();
         drop(marker);
+        drop(index);
+        drop(fresh);
         assert_eq!(published, fresh_path);
         let mut recs: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
@@ -3357,8 +3858,9 @@ mod tests {
             .unwrap();
         fresh.publish(&[], &fresh_index).unwrap();
         let fresh_marker = fresh.publish_marker().unwrap();
-        fresh.prune_after_publish();
         drop(fresh_marker);
+        drop(fresh_index);
+        drop(fresh);
 
         assert!(
             queued_path.join("index.json").is_file(),
@@ -3382,8 +3884,6 @@ mod tests {
             "queued video replies consume retention slots without exceeding the cap"
         );
 
-        drop(fresh_index);
-        drop(fresh);
         drop(queued);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3396,18 +3896,11 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let frame_entries = (0..8)
-            .map(|index| aterm_json::json!({ "file": format!("frame-{index}.png") }))
-            .collect::<Vec<_>>();
-        let index = aterm_json::to_vec(&aterm_json::json!({ "frames": frame_entries })).unwrap();
         for recording in 0..9 {
             let dir = root.join(format!("rec-{recording:020}-000"));
             std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("index.json"), &index).unwrap();
+            std::fs::write(dir.join("index.json"), b"{\"frames\":[]}").unwrap();
             std::fs::write(dir.join(VIDEO_PUBLISHED_FILE), b"published").unwrap();
-            for frame in 0..8 {
-                std::fs::write(dir.join(format!("frame-{frame}.png")), b"png").unwrap();
-            }
         }
         let fresh_name = std::ffi::OsString::from("rec-99999999999999999999-000");
         let fresh = root.join(&fresh_name);
@@ -3417,20 +3910,15 @@ mod tests {
         let pinned = crate::pinned_dir::PinnedDir::open_resolved(&root).unwrap();
 
         // Ten scanned entries + two cheap marker/index probes for each of nine
-        // candidates, then exactly one marker, one index, and three frame guards
-        // in the deep completion check. Leave one unit short of a fourth frame
-        // open. The old per-recording limits would multiply here; the shared
-        // counter must stop this one probe deterministically.
-        let limit = 10 * VIDEO_SCAN_WORK
-            + (18 + 2 + 3) * VIDEO_FILE_OPEN_WORK
-            + index.len()
-            + (VIDEO_FILE_OPEN_WORK - 1);
+        // candidates, then one marker probe in the completion check. Leave one
+        // unit short of its index probe so the shared budget stops before any
+        // mutation.
+        let limit = 10 * VIDEO_SCAN_WORK + 19 * VIDEO_FILE_OPEN_WORK + (VIDEO_FILE_OPEN_WORK - 1);
         let mut work = VideoPruneWork::new(limit);
         prune_video_dirs_with_work(&pinned, &fresh_name, &mut work).unwrap();
 
         assert_eq!(work.scanned, 10);
-        assert_eq!(work.file_opens, 23);
-        assert_eq!(work.index_bytes, index.len());
+        assert_eq!(work.file_opens, 19);
         assert_eq!(work.renames, 0);
         assert_eq!(work.deletes, 0);
         assert!(work.remaining < VIDEO_FILE_OPEN_WORK);
@@ -3442,9 +3930,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(unix)]
+    /// Scanning keeps names, not one open directory per recording. Run the
+    /// complete retention pass below a descriptor limit that cannot hold all
+    /// candidate directories simultaneously.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn video_publish_rejects_deleted_frame_before_index_commit() {
+    fn video_prune_directory_handles_stay_bounded() {
+        const CHILD: &str = "ATERM_TEST_VIDEO_PRUNE_NOFILE";
+        if !enter_low_nofile_test_child(
+            CHILD,
+            "control_auth::tests::video_prune_directory_handles_stay_bounded",
+            16,
+        ) {
+            return;
+        }
+
+        let temp = aterm_tempfile::tempdir().expect("temporary video root");
+        let root = temp.path();
+        for sequence in 0..32 {
+            write_completed_video_fixture(root, &format!("rec-{sequence:020}-000"));
+        }
+        let fresh = std::ffi::OsString::from("rec-99999999999999999999-000");
+        write_completed_video_fixture(root, fresh.to_str().unwrap());
+        let pinned = crate::pinned_dir::PinnedDir::open_resolved(root).unwrap();
+
+        prune_video_dirs(&pinned, &fresh).unwrap();
+        assert_eq!(completed_video_fixture_count(root), VIDEO_KEEP);
+        assert!(root.join(&fresh).is_dir());
+    }
+
+    #[test]
+    fn video_prune_treats_corrupt_and_oversized_indexes_as_completed() {
+        let temp = aterm_tempfile::tempdir().expect("temporary video root");
+        let root = temp.path();
+        for sequence in 0..(VIDEO_KEEP + 2) {
+            write_completed_video_fixture(root, &format!("rec-{sequence:020}-000"));
+        }
+        let corrupt = root.join("rec-00000000000000000000-000");
+        std::fs::write(corrupt.join("index.json"), b"not json").unwrap();
+        let oversized = root.join("rec-00000000000000000001-000");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(oversized.join("index.json"))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        let fresh = std::ffi::OsString::from("rec-99999999999999999999-000");
+        write_completed_video_fixture(root, fresh.to_str().unwrap());
+        let pinned = crate::pinned_dir::PinnedDir::open_resolved(root).unwrap();
+        prune_video_dirs(&pinned, &fresh).unwrap();
+
+        assert!(
+            !corrupt.exists(),
+            "retention completion is the marker/index identity pair, not JSON parsing"
+        );
+        assert!(
+            !oversized.exists(),
+            "retention never reads an attacker-sized completed index"
+        );
+        assert_eq!(completed_video_fixture_count(root), VIDEO_KEEP);
+        assert!(root.join(fresh).is_dir());
+    }
+
+    #[test]
+    fn video_member_write_after_sync_invalidates_marker_guard() {
+        let temp = aterm_tempfile::tempdir().expect("temporary video root");
+        let instance = format!("p{}-batch-state", std::process::id());
+        let mut recording = confine_video_dir_for_instance(temp.path(), &instance).unwrap();
+        let path = recording.path().to_path_buf();
+        let index = recording
+            .write_batch_member_authorized(
+                std::ffi::OsStr::new("index.json"),
+                b"{\"frames\":[]}",
+                || true,
+            )
+            .unwrap();
+        assert!(!recording.batch_synced_for_test());
+        recording.publish(&[], &index).unwrap();
+        assert!(recording.batch_synced_for_test());
+
+        let late_frame = recording
+            .write_sealed_frame(std::ffi::OsStr::new("frame_0001.png"), b"png")
+            .unwrap();
+        assert!(!recording.batch_synced_for_test());
+        let error = recording
+            .publish_marker()
+            .expect_err("a later member invalidates the earlier directory barrier");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!path.join(VIDEO_PUBLISHED_FILE).exists());
+
+        recording.publish(&[late_frame], &index).unwrap();
+        assert!(recording.batch_synced_for_test());
+        drop(recording.publish_marker().unwrap());
+        assert!(path.join(VIDEO_PUBLISHED_FILE).is_file());
+    }
+
+    #[test]
+    fn video_publish_rejects_replaced_frame_before_index_commit() {
         let dir =
             std::env::temp_dir().join(format!("aterm-video-frame-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3453,11 +4036,14 @@ mod tests {
         let mut recording = confine_video_dir_for_instance(&dir, &instance).unwrap();
         let path = recording.path().to_path_buf();
         let frame = recording
-            .write_new_private(std::ffi::OsStr::new("frame_0001.png"), b"png")
+            .write_sealed_frame(std::ffi::OsStr::new("frame_0001.png"), b"png")
             .unwrap();
-        recording
-            .remove_file_if_exists(std::ffi::OsStr::new("frame_0001.png"))
-            .unwrap();
+        std::fs::rename(path.join("frame_0001.png"), path.join("frame_original.png")).unwrap();
+        drop(
+            recording
+                .write_new_private(std::ffi::OsStr::new("frame_0001.png"), b"replacement")
+                .unwrap(),
+        );
         let index = recording
             .write_new_private(
                 std::ffi::OsStr::new("index.json"),
@@ -3467,7 +4053,7 @@ mod tests {
 
         assert!(
             recording.publish(&[frame], &index).is_err(),
-            "an index may never certify a deleted or replaced frame"
+            "an index may never certify a same-name replacement"
         );
         drop(index);
         drop(recording);
@@ -3523,6 +4109,16 @@ mod tests {
         let reused = ensure_canonical_direct_child(&root, "p424242-reused").unwrap();
         let lease = open_instance_lease(&reused, true).unwrap();
         lease.try_lock().unwrap();
+        // EXPLICIT `unlock()`, not just `drop`. `flock` rides the open-file-
+        // description, and a concurrent test's `fork()` (any `pre_exec`
+        // Command) that lands between our open and the drop hands the child a
+        // duplicate that keeps the lock alive until its execve — hundreds of
+        // milliseconds under load — so a sweep racing that window classified
+        // this lease Held and kept the namespace. `LOCK_UN` strips the lock
+        // from the shared description itself, every duplicate included, so the
+        // sweep below deterministically sees the state this scenario names:
+        // "the exact launch's lease is unlocked".
+        lease.unlock().unwrap();
         drop(lease);
         sweep_dead_instance_namespaces_with(&root, "p1-current", |_| true);
         assert!(
@@ -3690,7 +4286,8 @@ mod tests {
             .unwrap();
         let _ = fresh.publish(&[], &index).unwrap();
         drop(fresh.publish_marker().unwrap());
-        fresh.prune_after_publish();
+        drop(index);
+        drop(fresh);
 
         assert!(
             !root.join("rec-00000000000000000010-000").exists(),

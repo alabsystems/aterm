@@ -52,7 +52,7 @@
 //! by hand.
 
 use crate::Outcome;
-use crate::model::CellSurvey;
+use crate::model::{Cell, CellSurvey};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -246,6 +246,18 @@ pub fn render(rows: &[Row]) -> String {
 ///
 /// Only third-party facts are armed — see the module docs on why
 /// `shipped.<triple> packages` and `lock packages` are supported but not seeded.
+///
+/// FROZEN, AND ITS wasm ROW IS PRE-CORRECTION. This body is the 2026-08-22
+/// measurement kept verbatim; its `shipped.wasm32-unknown-unknown` row was taken
+/// with the wasm cell rooted at the `aterm` BINARY, which is never compiled for
+/// wasm32 ([`crate::resolve::default_cells`] records what that got wrong). It is
+/// NOT restated here, because there is no 2026-08-22 measurement of the two
+/// shipped browser modules to restate it with, and inventing one would be worse
+/// than a labelled stale number. Nothing in the product calls this —
+/// [`seed_from_live`] is what `--update` writes into an empty checkout, and it
+/// measures the live matrix. Against that matrix this body's wasm scope no
+/// longer names a cell, so [`validate_metric`] refuses it by name rather than
+/// accepting it.
 pub fn seed() -> String {
     let mut s = String::new();
     let cells: &[(&str, [u64; 5])] = &[
@@ -346,9 +358,12 @@ struct ScopeDetail {
     /// falls back to the fork, so the same commit measures the fork's own
     /// edits on a machine whose cargo cache never received the replaced crate.
     /// MEASURED 2026-08-30: that is 685 lines for `winit 0.30.13` and 28 for
-    /// `smol_str 0.2.2`, i.e. 713 in every one of the four cells, which was
-    /// enough to turn four `third_party_loc` rows RED against ceilings taken
-    /// on a machine that had both. A RED row that cannot name that cause reads
+    /// `smol_str 0.2.2`, i.e. 713 in every one of the four cells the matrix had
+    /// that day, which was enough to turn four `third_party_loc` rows RED
+    /// against ceilings taken on a machine that had both. It reaches THREE of
+    /// the five cells now: the wasm row was replaced by the two shipped browser
+    /// modules later the same day, and neither `aterm-wasm` nor `aterm-gpu-web`
+    /// pulls `winit` or `smol_str`. A RED row that cannot name that cause reads
     /// as dependency drift and invites `--allow-regress`, which would record
     /// aterm's own fork edits as third-party growth and keep the headroom
     /// forever — so the row names it.
@@ -383,13 +398,39 @@ fn u(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+/// The ratchet scope one cell's rows live under.
+///
+/// A scope must name exactly ONE cell, because a scope is this file's primary
+/// key: two cells sharing a scope would overwrite each other's live values and
+/// the ratchet would silently bound only whichever ran last.
+///
+/// The triple was that key for as long as every triple had one cell, and it
+/// still is for the three native cells — `shipped.aarch64-apple-darwin` and its
+/// two siblings are unchanged, reason columns and all. `wasm32-unknown-unknown`
+/// now carries TWO cells, because aterm ships two browser modules and neither is
+/// a build of the other (`resolve::default_cells` records why), so those two
+/// append their cell handle: `shipped.wasm32-unknown-unknown.wasm-gpu`.
+///
+/// Removing one of a shared triple's cells does not silently rename the other:
+/// its ratchet rows would then name a scope nothing measures, and
+/// [`validate_metric`] turns that into a COULD-NOT-RUN naming the file and the
+/// cell, never a pass.
+fn scope_of(cell: &Cell, cells: &[Cell]) -> String {
+    if cells.iter().filter(|c| c.triple == cell.triple).count() > 1 {
+        format!("shipped.{}.{}", cell.triple, cell.name)
+    } else {
+        format!("shipped.{}", cell.triple)
+    }
+}
+
 fn measure(root: &Path) -> Result<Live, String> {
     let mut live = Live::default();
 
-    for cell in crate::resolve::default_cells() {
-        let scope = format!("shipped.{}", cell.triple);
+    let cells = crate::resolve::default_cells();
+    for cell in &cells {
+        let scope = scope_of(cell, &cells);
         live.scopes.push(scope.clone());
-        match crate::loc::survey_cell(root, &cell) {
+        match crate::loc::survey_cell(root, cell) {
             Ok(s) => {
                 live.set(&scope, "packages", u(s.graph.nodes.len()));
                 live.set(&scope, "third_party_packages", u(s.third_party().count()));
@@ -707,13 +748,16 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
     {
         let _ = writeln!(
             s,
-            "      MEASURED FROM THE FORK, NOT FROM UPSTREAM: {}. `loc::package_dir` prefers a \
-             pristine registry checkout of the same version and falls back to `vendor/<name>` \
-             when this machine has none, so those packages contribute aterm's OWN fork edits \
-             here and upstream's lines on a machine that has the pristine tree. Cargo cannot \
-             fetch one for a patched package (source-less lock entry), so the difference is a \
-             property of the CACHE, not of this tree. Rule it out before recording a \
-             regression: `cargo forge attest` names every fork it could not diff.",
+            "      MEASURED FROM THE FORK, NOT FROM UPSTREAM: {}. Since 2026-08-30 that is \
+             DETERMINISTIC — `loc::package_dir` resolves a patched package to the path that \
+             compiles, before the registry is consulted. It used to prefer a pristine registry \
+             checkout of the same version and fall back to `vendor/<name>` when the machine had \
+             none, silently, so the number depended on the operator's CARGO_HOME and the same \
+             commit read green on the ratcheting machine and red everywhere else. Cargo cannot \
+             fetch a pristine copy for a patched package (source-less lock entry), so that \
+             branch could never be relied on. These lines are aterm's own fork edits and they \
+             are the surface that ships; `cargo forge attest` is where fork-vs-upstream drift \
+             is audited.",
             d.vendored_measured.join(", ")
         );
     }

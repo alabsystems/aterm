@@ -13,9 +13,15 @@
 //! twice. Here the read is bounded by construction (`getentropy(2)`, else
 //! `read_exact` into the caller's fixed buffer), the hex encoding is proved
 //! total/exact/injective by the `rand_kani_proofs` trust-mc harnesses, and
-//! `tools/grep_guard.sh` fails the pre-push gate if a quoted `/dev/urandom`
-//! path literal reappears outside this module (and aterm-tempfile's zero-dep
-//! twin).
+//! `tools/grep_guard.sh` check B4 fails if a quoted `/dev/urandom` path literal
+//! reappears outside this module (and aterm-tempfile's zero-dep twin).
+//!
+//! WHERE B4 ACTUALLY RUNS, corrected 2026-08-31: this said "fails the pre-push
+//! gate". It does not — `.githooks/pre-push` was demoted to ADVISORY on
+//! 2026-08-24 and executes nothing. `grep_guard.sh` is a whole-tree stage of
+//! `tools/verify.sh` (`aterm_verify::stages::grep_guards`, unconditional in
+//! every mode including `--changed`), so the guard is real and the merge
+//! contract carries it; no hook does.
 //!
 //! Unix mints from `getentropy(2)` (macOS and modern Linux, no fd) with a
 //! bounded `/dev/urandom` fallback; Windows mints from `BCryptGenRandom`

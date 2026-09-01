@@ -339,6 +339,91 @@ mod tests {
         );
     }
 
+    /// THE FORMAT AXIS, COUPLED ACROSS BACKENDS.
+    ///
+    /// `metal::pipelines::metal_format` is a hand-copied match, and format is
+    /// the one axis THE PIPELINE TABLE did not couple: a judge made all three
+    /// non-`Present` roles wrong AT ONCE with only the control test failing —
+    /// and it is the axis three of the four deleted hand-written Metal tests
+    /// had already drifted on (`Bgra8Unorm` vs `Rgba8Unorm`, `Bgra8UnormSrgb`
+    /// vs `Rgba8UnormSrgb`). This sweep computes BOTH sides — the `wgpu`
+    /// resolve (`TargetFormats::resolve` over this module's own plan) and the
+    /// Metal match — for every role x present format, so any single wrong row
+    /// fails by name.
+    ///
+    /// The equality is by format NAME (`Debug`): `metal::ffi::PixelFormat`'s
+    /// variants are named after their `wgpu::TextureFormat` twins, which makes
+    /// the comparison a cross-backend statement rather than a re-spelling of
+    /// either side. It lives HERE, not in `metal/`, because THE ROW's rule is
+    /// that no `wgpu` type crosses into the first-party Metal module — tests
+    /// included.
+    ///
+    /// Metal runs the NATIVE plan and only that plan: pixel-format views are
+    /// unconditional on Metal (`TEXTURE_USAGE_PIXEL_FORMAT_VIEW`, proven
+    /// creatable on the GPU by `metal::tests::the_four_renderer_formats_exist`),
+    /// so `srgb_offscreen == true` is the one state the backend can be in.
+    /// The downlevel half of the sweep pins where the two plans differ —
+    /// exactly one role — so a `format_plan` change that widens or moves the
+    /// divergence is a visible diff beside the equality it would undermine.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_metal_format_axis_equals_the_wgpu_resolve_for_every_role() {
+        use crate::metal::ffi::PixelFormat;
+        use crate::metal::pipelines::metal_format;
+        use crate::pipeline_table::{TargetFormats, TargetRole};
+
+        const ROLES: [TargetRole; 4] = [
+            TargetRole::OffscreenSrgb,
+            TargetRole::OffscreenUnorm,
+            TargetRole::Edr,
+            TargetRole::Present,
+        ];
+        let native = TargetFormats {
+            offscreen_srgb: offscreen_srgb_view_format(true),
+            offscreen_unorm: offscreen_format(true),
+            present: None,
+        };
+        // Both formats `pick_surface_format` can choose.
+        for (wgpu_present, metal_present) in [
+            (TextureFormat::Bgra8Unorm, PixelFormat::Bgra8Unorm),
+            (TextureFormat::Rgba8Unorm, PixelFormat::Rgba8Unorm),
+        ] {
+            for role in ROLES {
+                let wgpu_side = native.with_present(wgpu_present).resolve(role);
+                let metal_side = metal_format(role, metal_present);
+                assert_eq!(
+                    format!("{wgpu_side:?}"),
+                    format!("{metal_side:?}"),
+                    "{role:?} on a {wgpu_present:?} swapchain: metal_format \
+                     disagrees with the wgpu resolve — this axis can be wrong \
+                     on every offscreen role at once with every pipeline still \
+                     building"
+                );
+            }
+        }
+        // The downlevel plan (GLES/WebGL2: no format views, the offscreen
+        // texture is ITSELF sRGB) diverges from Metal on exactly ONE role.
+        let downlevel = TargetFormats {
+            offscreen_srgb: offscreen_srgb_view_format(false),
+            offscreen_unorm: offscreen_format(false),
+            present: None,
+        };
+        let diverging: Vec<TargetRole> = ROLES[..3]
+            .iter()
+            .copied()
+            .filter(|&r| {
+                format!("{:?}", downlevel.resolve(r))
+                    != format!("{:?}", metal_format(r, PixelFormat::Bgra8Unorm))
+            })
+            .collect();
+        assert_eq!(
+            diverging,
+            [TargetRole::OffscreenUnorm],
+            "Metal implements the native plan; downlevel differs only where \
+             the single sRGB offscreen replaces the Unorm view"
+        );
+    }
+
     /// The SDR boost gate is total + mutually exclusive with the EDR boost: it
     /// never fires on the f16 swapchain (where `glow_boost_pass` owns the crown),
     /// never with an empty stream, and never at a non-positive/poisoned budget.

@@ -224,8 +224,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        20,
-        "18 gate stages plus the two --full tiers"
+        21,
+        "19 gate stages plus the two --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -691,6 +691,7 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
                 "targo test -p aterm-search --features regex (trustdoc) (selftest: not executed)"
             ),
             ("skip", "tippy lint (selftest: not executed)"),
+            ("skip", "gate lint --fmt-only (selftest: not executed)"),
             ("skip", "grep_guard.sh (selftest)"),
             ("skip", "test-install-channel.sh (selftest: not executed)"),
             (
@@ -802,7 +803,13 @@ fn the_full_tier_reports_an_unavailable_prover_prominently_and_never_as_discharg
         "  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: trust-mc is unavailable"
     ));
     assert!(ladder.contains("(the embedded + ty tiers still ran)."));
-    assert!(ladder.contains("  skip  trust-mc / Kani BMC floor (tool unavailable; pending build)"));
+    // The skip line names the REPAIR, not a vague future: `stages.rs` moved
+    // this label from "pending build" to the install command on 2026-08-31
+    // (ecb1d6691, atpkg owning the toolchain seam) and left this assertion on
+    // the old wording, so the tier's own contract test was red on main.
+    assert!(ladder.contains(
+        "  skip  trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)"
+    ));
     // Never described as discharged, and the skip forfeits the contract.
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
     assert!(!ladder.contains("verify-kani-proofs.sh (aterm-parser)"));

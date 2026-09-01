@@ -73,9 +73,15 @@
 //!    [`plan::Lane`]) and the two timing-measuring smokes run exclusively, because
 //!    a gate that decides "present starvation" while a lint compiles on the other
 //!    seven cores would be measuring the gate, not the build.
-//!  * Exit codes distinguish FAILED from COULD-NOT-RUN (`1` vs `3`), the same
-//!    distinction `.githooks/pre-push` already reasons about. The ladder line is
-//!    `FAIL` either way — a broken environment still never reads as green.
+//!  * Exit codes distinguish FAILED from COULD-NOT-RUN (`1` vs `3`) — the
+//!    distinction the 633-line BLOCKING `.githooks/pre-push` reasoned about
+//!    before it was demoted to advisory on 2026-08-24 (it had separate "✗ LINT
+//!    GATE COULD NOT RUN" and "✗ L0 TEMPORAL-SAFETY GATE COULD NOT RUN" arms).
+//!    The hook is gone as a caller; the distinction is not, because it was never
+//!    the hook's to own. `tools/verify.sh` documents all four codes at its
+//!    hand-off and passes ours through untouched, and it reaches for `3` itself
+//!    on every path where the gate was never built. The ladder line is `FAIL`
+//!    either way — a broken environment still never reads as green.
 //!  * `--scope=` with an empty value is a usage error instead of silently meaning
 //!    "the whole workspace". In bash that spelling widened the claim to the merge
 //!    contract; that is the exact class of bug the verdict discipline exists to
@@ -114,8 +120,16 @@ pub use scope::Scope;
 pub use toolchain::Toolchain;
 pub use verdict::{MERGE_CONTRACT_SENTENCE, Verdict};
 
-/// Exit codes. The pre-push hook already reasons about FAILED vs COULD-NOT-RUN,
-/// so the gate speaks the same distinction out loud.
+/// Exit codes. FAILED and COULD-NOT-RUN are kept apart because a broken
+/// environment is not a finding about the tree, and conflating them is how a
+/// gate stops being read.
+///
+/// The blocking pre-push hook reasoned about that distinction, and this comment
+/// used to cite it as the reason. It is no longer a caller — advisory since
+/// 2026-08-24 — but the reason outlived it, and the distinction now has a live
+/// consumer either way: `tools/verify.sh` documents all four codes where it
+/// `exec`s this binary, passes ours through untouched, and returns `3` itself
+/// whenever the gate could not be built at all.
 pub mod exit {
     /// Everything that ran was green (the verdict text says *which* green).
     pub const PASS: i32 = 0;
@@ -141,6 +155,10 @@ pub struct EnvSnapshot {
     pub trust_stage2_bin: Option<PathBuf>,
     pub trust_mc_sysroot: Option<PathBuf>,
     pub ay_bin_dir: Option<PathBuf>,
+    /// `XDG_CONFIG_HOME` — where atpkg's own config (`aterm/aterm.toml`, the
+    /// `[packages].prefix` override) lives when set; the store probe reads the
+    /// same file atpkg does ([`toolchain::atpkg_prefix`]).
+    pub xdg_config_home: Option<PathBuf>,
     pub ssh_connection: Option<String>,
     pub skip_gui_smoke: Option<String>,
     /// `ATERM_VERIFY_BASE` — the default `--base` for `--changed`.
@@ -173,6 +191,7 @@ impl EnvSnapshot {
             trust_stage2_bin: var_path("TRUST_STAGE2_BIN"),
             trust_mc_sysroot: var_path("TRUST_MC_SYSROOT"),
             ay_bin_dir: var_path("AY_BIN_DIR"),
+            xdg_config_home: var_path("XDG_CONFIG_HOME").filter(|p| !p.as_os_str().is_empty()),
             ssh_connection: std::env::var("SSH_CONNECTION").ok(),
             skip_gui_smoke: std::env::var("ATERM_SKIP_GUI_SMOKE").ok(),
             verify_base: std::env::var("ATERM_VERIFY_BASE")
@@ -227,9 +246,14 @@ impl Ctx {
         env: EnvSnapshot,
         scratch: PathBuf,
     ) -> Self {
-        let tools = Toolchain::discover(
+        // The atpkg prefix, resolved ONCE from the snapshot (the same file atpkg
+        // reads) and handed to every store probe: the compiler's, and the
+        // trust-mc / ay lanes' in `stages::kani_floor`.
+        let prefix = toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+        let tools = Toolchain::discover_with_store(
             env.trust_stage2_bin.as_deref(),
             &env.home,
+            Some(&prefix),
             &env.path,
             crate::toolchain::pinned_channel(&root).as_deref(),
         );
@@ -371,7 +395,29 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     Ok(verdict.exit)
 }
 
-/// Stage 0 of the script: pin the hooks so the L0 pre-push gate is active.
+/// Stage 0 of the script: pin `core.hooksPath` at `.githooks`, so a clone runs
+/// the hooks this repo committed rather than the empty `.git/hooks`.
+///
+/// WHAT THE PIN BUYS, AND WHAT IT DOES NOT — said here because the line this
+/// function PRINTS used to oversell it, and that line is read by every operator
+/// on a fresh clone. It said `(pre-push L0 gate active)`, which told them a
+/// blocking L0 gate had just been switched on for them. Nothing was.
+/// `.githooks/pre-push` has been ADVISORY since 2026-08-24: its entire body is
+/// one printf and `exit 0`, and it runs no gate at all — it was demoted on its
+/// own written rule ("a hook slow enough to be bypassed is worse than none")
+/// once `tools/paint_guard.sh` took a blocking push to twelve minutes.
+///
+/// The pin itself is still worth doing and still true, so it is still announced:
+/// an unpinned clone runs `.git/hooks`, which is empty, so the committed hooks —
+/// advisory or not — may as well not exist, and the advisory line is the only
+/// thing that tells a new operator the merge contract exists.
+///
+/// The L0 obligations are enforced by exactly two mechanisms, neither of them a
+/// hook: the unconditional freeze-gate stage of THIS run
+/// ([`plan::StageId::FreezeGate`]), and `run_freeze_safety_gate` in
+/// `crates/aterm-release/src/publish.rs`, which is mandatory and runs before the
+/// ledger claim. Between an ungated commit and `origin/main` there is nothing.
+///
 /// Idempotent, and skipped entirely under `--selftest`, exactly as before.
 fn pin_hooks(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<()> {
     if ctx.selftest {
@@ -393,7 +439,10 @@ fn pin_hooks(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<()> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     if current != ".githooks" && git(&["config", "core.hooksPath", ".githooks"]).is_some() {
-        out.write_all(b"  hooks pinned: core.hooksPath = .githooks (pre-push L0 gate active)\n")?;
+        out.write_all(
+            b"  hooks pinned: core.hooksPath = .githooks (pre-push is ADVISORY \
+              and blocks nothing; the L0 gate is this run's freeze stage)\n",
+        )?;
     }
     Ok(())
 }

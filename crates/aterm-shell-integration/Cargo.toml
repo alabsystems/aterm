@@ -24,12 +24,14 @@ aterm-containment = { workspace = true, optional = true }
 [target.'cfg(any(unix, windows))'.dependencies]
 aterm-uds = { workspace = true }
 
-# wasm32-unknown-unknown has no OS entropy syscall and no aterm-uds, so the
-# nonce mint calls the JS `crypto.getRandomValues` bridge directly — the same
-# source the retired `rand_core::OsRng` reached there, one indirection fewer.
-# Target-gated, so native builds are unaffected.
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
+# THERE IS DELIBERATELY NO wasm32 DEPENDENCY TABLE HERE, and src/lib.rs's
+# `fill_nonce_entropy` carries the reasoning: the capability-nonce mint has one
+# caller in the workspace (crates/aterm-gui/src/spawn.rs, seeding a spawned
+# shell's environment) and a browser has no PTY to spawn, so the wasm arm was a
+# `getrandom = { version = "0.2", features = ["js"] }` row holding an entropy
+# bridge nothing could reach. The mint is `cfg(any(unix, windows))` now — it
+# exists exactly where `aterm_uds::rand` does, and adding a target means adding
+# its audited CSPRNG here first. Guarded by tools/grep_guard.sh B13.
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }

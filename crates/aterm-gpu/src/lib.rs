@@ -14,7 +14,14 @@
 
 use aterm_render::Frame;
 
+mod device_layer;
 mod format_plan;
+// THE PIPELINE TABLE: the one declaration of all eighteen render pipelines —
+// entry points, colour-target role, blend factors, write mask, vertex layout and
+// topology — read by BOTH the wgpu renderer and the first-party Metal backend, so
+// a state change cannot land on one and miss the other. See its header for what
+// the hand-copied constants it replaces actually cost.
+mod pipeline_table;
 // The one-future park/unpark executor the native init path drives wgpu's async
 // adapter/device acquisition on (retired `pollster`). Native-only: blocking the
 // browser main thread is forbidden, so the wasm path awaits instead.
@@ -247,6 +254,19 @@ pub struct GpuContext {
     /// set, rebuilds the whole GPU stack (new instance/adapter/device + per-window
     /// surfaces) or downgrades to the CPU softbuffer backend, instead of freezing.
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// W5 — the METAL loss-domain hook: the first-party swapchain's
+    /// [`metal::loss::LossLatch`], wired here (once, at attach) so the
+    /// frontend's existing `device_lost()` poll — and therefore
+    /// `recover_from_gpu_loss` — consumes Metal device loss through the SAME
+    /// seam wgpu's callback feeds. Metal has no device-lost callback to
+    /// register (`metal/loss.rs` — loss is classified from command-buffer
+    /// outcomes), so the latch IS the callback's stand-in and this cell is
+    /// its delivery. Empty until the W6 flip wires a live Metal surface
+    /// (production today never sets it — `device_lost()`'s answer is
+    /// byte-identical to the pre-W5 load); the W5 wiring test drives it with
+    /// an injected loss.
+    #[cfg(target_os = "macos")]
+    metal_loss: std::sync::OnceLock<std::sync::Arc<metal::loss::LossLatch>>,
     /// H1 (Windows Mica/Acrylic): whether THIS instance was built on the DX12
     /// DirectComposition VISUAL swapchain path (`Dx12SwapchainKind::DxgiFromVisual`)
     /// — i.e. the request latch was set at build time AND the DX12 backend won
@@ -260,9 +280,44 @@ pub struct GpuContext {
 /// Row alignment required by `copy_texture_to_buffer`.
 const ALIGN: usize = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
 
-fn padded_bytes_per_row(width: usize) -> usize {
+/// THE READBACK ROW-PADDING CONTRACT (W4): wgpu requires
+/// `copy_texture_to_buffer` strides to be multiples of 256
+/// (`COPY_BYTES_PER_ROW_ALIGNMENT`), so every `Frame` readback stages through
+/// rows of this padded width and strips the tail. `pub(crate)` because the
+/// Metal readback arm (`device_layer::metal_try_read_back`) must reproduce
+/// the SAME stride — Metal itself would accept a tight stride, and a Metal
+/// arm that used one would produce an identical `Frame` TODAY while silently
+/// diverging from the byte contract every wgpu-side consumer of the staging
+/// buffer shape assumes (the stride bug's cautionary sibling, map §3).
+pub(crate) fn padded_bytes_per_row(width: usize) -> usize {
     let unpadded = width * 4;
     unpadded.div_ceil(ALIGN) * ALIGN
+}
+
+/// Unpack a PADDED RGBA8 staging buffer into an `aterm_render::Frame`
+/// (`0xTTRRGGBB`, top byte = `255 - alpha` — the CPU renderer's TRANSMITTANCE
+/// encoding), stripping the per-row padding tail. Extracted VERBATIM from
+/// `try_read_back` so the Metal readback arm shares the exact unpack — the
+/// `Frame` byte contract has ONE spelling, whichever backend filled the rows.
+pub(crate) fn frame_from_padded_rgba(bytes: &[u8], w: usize, h: usize, padded: usize) -> Frame {
+    let mut pixels = Vec::with_capacity(w * h);
+    for row in 0..h {
+        let base = row * padded;
+        let src = &bytes[base..base + w * 4];
+        // `src` is exactly `w * 4` bytes, so the `as_chunks` remainder is always
+        // empty — the discarded tail is the one `chunks_exact` also dropped.
+        pixels.extend(src.as_chunks::<4>().0.iter().map(|c| {
+            ((255 - u32::from(c[3])) << 24)
+                | (u32::from(c[0]) << 16)
+                | (u32::from(c[1]) << 8)
+                | u32::from(c[2])
+        }));
+    }
+    Frame {
+        width: w,
+        height: h,
+        pixels,
+    }
 }
 
 /// Map an `ATERM_GPU_BACKEND` value to a wgpu backend mask.
@@ -327,6 +382,32 @@ fn backends_from_env() -> wgpu::Backends {
         }),
         _ => default,
     }
+}
+
+/// W6a — THE DARK-LAUNCH SWITCH for the first-party Metal renderer arm:
+/// `ATERM_METAL=1` (exactly `1`) selects the Metal device/encoder/present
+/// path inside `GpuRenderer` on macOS. Read ONCE at backend init (the first
+/// call latches, like every other `ATERM_GPU_*` knob is read at construct
+/// time) — flipping the variable mid-process changes nothing.
+///
+/// The wgpu path stays the DEFAULT: with the variable unset the built
+/// renderer is byte-identical to the pre-W6a build. This switch exists so
+/// the Metal arm can be driven on a real window (probe instances, the W6
+/// drills) before the flip; it is slated for REMOVAL at W6b, when Metal
+/// becomes the macOS default and the escape hatch inverts (map §5 W6).
+#[cfg(target_os = "macos")]
+pub fn metal_backend_selected() -> bool {
+    static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(|| metal_selected_from(std::env::var("ATERM_METAL").ok().as_deref()))
+}
+
+/// The pure decision behind [`metal_backend_selected`]: exactly the string
+/// `"1"` arms the dark launch. NOT a truthy parse — `true`/`yes`/`2` stay
+/// off, so a typo cannot half-arm a renderer swap the way a lenient parse
+/// would; the flag is a switch, not a tuning knob.
+#[cfg(target_os = "macos")]
+fn metal_selected_from(v: Option<&str>) -> bool {
+    v == Some("1")
 }
 
 /// `ATERM_GPU_POWER` (see [`backends_from_env`] for the env-var table).
@@ -533,6 +614,18 @@ impl GpuContext {
             DX12_VISUAL_SWAPCHAIN_ACTIVE
                 .store(ctx.visual_swapchain, std::sync::atomic::Ordering::Relaxed);
         }
+        // W6a — the ARMED path's init (map W5 addendum, "the loss hook"): when
+        // the dark-launch switch selects the Metal arm, mint the process loss
+        // domain NOW and wire it into `device_lost()`, so the frontend's
+        // existing poll consumes Metal loss from the very first armed frame.
+        // With the switch off this is byte-for-byte the pre-W6a constructor
+        // (the OnceLock stays empty and `device_lost()` short-circuits).
+        #[cfg(target_os = "macos")]
+        if metal_backend_selected() {
+            let wired =
+                ctx.wire_metal_loss_latch(std::sync::Arc::new(metal::loss::LossLatch::new()));
+            debug_assert!(wired, "a fresh context's loss-latch cell is empty");
+        }
         Ok(ctx)
     }
 
@@ -634,6 +727,8 @@ impl GpuContext {
             instance,
             adapter,
             device_lost,
+            #[cfg(target_os = "macos")]
+            metal_loss: std::sync::OnceLock::new(),
             // Seeded false; ONLY the native `new()` (which owns the descriptor
             // decision) upgrades it — the wasm/web path never has a DComp visual.
             visual_swapchain: false,
@@ -652,7 +747,54 @@ impl GpuContext {
     /// atomic load), so it is safe to poll every presented frame.
     #[inline]
     pub fn device_lost(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.metal_loss.get().is_some_and(|l| l.is_lost()) {
+            return true;
+        }
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// W6 flip-drill — the FIRST latched loss's classification, for the
+    /// frontend's downgrade diagnostics (`recover_from_gpu_loss` prints it).
+    /// `Some` only for a Metal-latch loss: the wgpu callback prints its own
+    /// `(reason, msg)` on stderr at latch time and stores only the flag, so a
+    /// wgpu-path loss reports `None` here and its reason is already on the
+    /// log. Metal losses carry `CbOutcome::Lost`'s Debug form — the exact
+    /// classification (`MTLCommandBufferErrorPageFault`, ...) the latch
+    /// recorded first.
+    #[must_use]
+    pub fn device_loss_reason(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        if let Some(r) = self.metal_loss.get().and_then(|l| l.reason()) {
+            return Some(r.to_owned());
+        }
+        None
+    }
+
+    /// W5 — wire a Metal loss latch into [`Self::device_lost`] (see the
+    /// `metal_loss` field). One latch per context lifetime — the process has
+    /// ONE Metal loss domain (`metal/loss.rs`), and a context that outlives a
+    /// loss is rebuilt, not re-wired; a second wire is therefore a no-op that
+    /// reports `false` rather than silently swapping domains.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn wire_metal_loss_latch(
+        &self,
+        latch: std::sync::Arc<metal::loss::LossLatch>,
+    ) -> bool {
+        self.metal_loss.set(latch).is_ok()
+    }
+
+    /// W6a — the ARMED renderer's loss domain: the latch wired at construct
+    /// (the `ATERM_METAL=1` init), wiring a fresh one first when the cell is
+    /// still empty (the test-armed path, which bypasses the env switch).
+    /// Either way the returned latch IS the one `device_lost()` polls.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn metal_loss_latch_or_wire(&self) -> std::sync::Arc<metal::loss::LossLatch> {
+        if let Some(l) = self.metal_loss.get() {
+            return std::sync::Arc::clone(l);
+        }
+        let _ = self.wire_metal_loss_latch(std::sync::Arc::new(metal::loss::LossLatch::new()));
+        std::sync::Arc::clone(self.metal_loss.get().expect("wired just above"))
     }
 
     /// Clamp a texture pixel dimension to `1..=max_texture_dimension_2d`.
@@ -668,6 +810,17 @@ impl GpuContext {
     #[inline]
     fn clamp_tex_dim(&self, d: u32) -> u32 {
         d.max(1).min(self.device.limits().max_texture_dimension_2d)
+    }
+
+    /// This context as the W3 DEVICE LAYER's live arm — the handle every
+    /// routed construction site does its resource work through. Always the
+    /// Wgpu variant here: the Metal arm is minted by the differential tests
+    /// (and by W6's flip) from `metal::resources::MetalResourceDevice`.
+    pub(crate) fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
+        crate::device_layer::DeviceHandle::Wgpu {
+            device: &self.device,
+            queue: &self.queue,
+        }
     }
 
     /// Create an offscreen colour target (Rgba8Unorm; render + copy-src +
@@ -691,36 +844,35 @@ impl GpuContext {
         // (`clamp_tex_dim(clamped) == clamped`); it still bounds any future caller.
         let width = self.clamp_tex_dim(width);
         let height = self.clamp_tex_dim(height);
-        self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("aterm-gpu offscreen"),
-            size: wgpu::Extent3d {
+        // The linear-light rationale the pre-layer descriptor carried, kept at the
+        // routed site: the base passes fixed-function-blend in LINEAR light. With
+        // VIEW_FORMATS (native) the texture stays Rgba8Unorm + an sRGB-typed
+        // ALIAS view; WebGL2/GLES can't alias formats, so there the texture
+        // ITSELF is Rgba8UnormSrgb (and `alias` above is `None`). Either way the
+        // STORED bytes are sRGB, so readback is identical. COPY_DST serves the
+        // M1b scroll band shift; RENDER_ATTACHMENT + COPY_SRC + TEXTURE_BINDING
+        // as before — `TexUsage::OFFSCREEN` is exactly that set.
+        // Routed through the W3 DEVICE LAYER (the Wgpu arm is the live one):
+        // same label, format, usage and view-formats as the direct
+        // `create_texture` this replaced, byte for byte.
+        let format = crate::device_layer::TexelFormat::from_wgpu(self.offscreen_format())
+            .expect("the offscreen format is inside the map's closed set of six");
+        let alias = crate::format_plan::offscreen_view_formats(self.srgb_offscreen)
+            .first()
+            .map(|f| {
+                crate::device_layer::TexelFormat::from_wgpu(*f)
+                    .expect("the offscreen alias view format is inside the closed set")
+            });
+        self.device_layer()
+            .create_texture_2d(
+                "aterm-gpu offscreen",
+                format,
                 width,
                 height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            // Linear-light compositing needs the base passes to fixed-function-blend in
-            // LINEAR light. With VIEW_FORMATS (native) we keep an Rgba8Unorm texture +
-            // attach an sRGB-typed VIEW for that. WebGL2/GLES can't alias formats, so
-            // there we make the texture ITSELF Rgba8UnormSrgb — the base passes attach
-            // its default (sRGB) view and STILL blend in linear light (the format
-            // auto-decodes/encodes). Either way the STORED bytes are sRGB, so readback
-            // is identical. The blit re-encodes on the downlevel path (it samples the
-            // sRGB view, which auto-decodes) — see BLIT_SHADER's encode_srgb.
-            format: self.offscreen_format(),
-            // COPY_DST is needed by the M1b sub-row scroll band shift, which copies
-            // the shifted grid band back into the offscreen (via a scratch texture);
-            // it also leaves every non-shift path byte-identical (a pure capability
-            // add). RENDER_ATTACHMENT (draw target) + COPY_SRC (readback / bloom /
-            // the shift's source copy) + TEXTURE_BINDING (blit source) as before.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: crate::format_plan::offscreen_view_formats(self.srgb_offscreen),
-        })
+                crate::device_layer::TexUsage::OFFSCREEN,
+                alias,
+            )
+            .into_wgpu()
     }
 
     /// The offscreen colour-target format (== `off.view` format). Delegates to the
@@ -737,6 +889,19 @@ impl GpuContext {
     /// `off.view_srgb` build with this. See [`crate::format_plan`].
     pub(crate) fn offscreen_srgb_view_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_srgb_view_format(self.srgb_offscreen)
+    }
+
+    /// The offscreen's two view formats packaged for
+    /// [`crate::pipeline_table::TargetFormats::resolve`], so a construction
+    /// site never chooses between them by hand — the pipeline's own
+    /// [`crate::pipeline_table::TargetRole`] does. Sites that also target the
+    /// swapchain add it with `with_present`.
+    pub(crate) fn pipeline_targets(&self) -> crate::pipeline_table::TargetFormats {
+        crate::pipeline_table::TargetFormats {
+            offscreen_srgb: self.offscreen_srgb_view_format(),
+            offscreen_unorm: self.offscreen_format(),
+            present: None,
+        }
     }
 
     /// Read an Rgba8Unorm texture back into an `aterm_render::Frame`
@@ -833,27 +998,12 @@ impl GpuContext {
         // gives the compiler a fixed-size, bounds-check-free window; the packing
         // expression below is byte-for-byte the old one.
         let bytes: &[u8] = &data;
-
-        let mut pixels = Vec::with_capacity(w * h);
-        for row in 0..h {
-            let base = row * padded;
-            let src = &bytes[base..base + w * 4];
-            // `src` is exactly `w * 4` bytes, so the `as_chunks` remainder is always
-            // empty — the discarded tail is the one `chunks_exact` also dropped.
-            pixels.extend(src.as_chunks::<4>().0.iter().map(|c| {
-                ((255 - u32::from(c[3])) << 24)
-                    | (u32::from(c[0]) << 16)
-                    | (u32::from(c[1]) << 8)
-                    | u32::from(c[2])
-            }));
-        }
+        // The unpack itself is the shared `frame_from_padded_rgba` — one
+        // spelling of the Frame byte contract for both backends (W4).
+        let frame = frame_from_padded_rgba(bytes, w, h, padded);
         drop(data);
         buffer.unmap();
-        Ok(Frame {
-            width: w,
-            height: h,
-            pixels,
-        })
+        Ok(frame)
     }
 
     /// Phase-1 proof of life: clear an offscreen target to a colour and read it
@@ -914,6 +1064,21 @@ mod env_override_tests {
         assert_eq!(parse_gpu_backend("Metal"), Some(wgpu::Backends::METAL));
         assert_eq!(parse_gpu_backend("opengl"), None);
         assert_eq!(parse_gpu_backend(""), None);
+    }
+
+    /// W6a: the dark-launch switch is exactly `ATERM_METAL=1` — not a truthy
+    /// parse (see `metal_selected_from`). The OnceLock wrapper is one latch
+    /// over this pure decision, so the decision is what gets pinned.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_dark_launch_arms_on_exactly_one() {
+        assert!(metal_selected_from(Some("1")));
+        assert!(!metal_selected_from(Some("0")));
+        assert!(!metal_selected_from(Some("true")));
+        assert!(!metal_selected_from(Some("yes")));
+        assert!(!metal_selected_from(Some("2")));
+        assert!(!metal_selected_from(Some("")));
+        assert!(!metal_selected_from(None));
     }
 
     #[test]

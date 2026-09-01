@@ -8,12 +8,17 @@
 //! (success judged by DWARF file existence — inherited dsymutil exit-code
 //! caveat — plus UUID match), `strip -x` on shipped copies, and the dSYM zip.
 //!
-//! ONE compiler lane (owner decision, 2026-07): the repo's rust-toolchain.toml
-//! pins Trust and .cargo/config.toml carries the documented verification
-//! opt-out. Both architectures build from one read-only source take and one
-//! lock-checksummed, offline dependency bundle; only their compiler differs.
-//! No `RUSTC=…`, `RUSTC_BOOTSTRAP`, RUSTFLAGS surgery, or `--no-trust` escape
-//! hatch exists. The native binary must still self-report `+t` (see [`run`]).
+//! TWO compiler lanes and no third (owner decision, 2026-07): the native aarch64
+//! slice on Trust (the repo's rust-toolchain.toml pin plus .cargo/config.toml's
+//! documented verification opt-out) and the x86_64-apple-darwin compat slice on
+//! upstream stable. Both architectures build from one read-only source take and one
+//! lock-checksummed, offline dependency bundle; only their compiler differs — which
+//! is why "ONE compiler lane", as this paragraph used to open, described the opposite
+//! of the sentence that followed it. The ONLY toolchain override is
+//! `RUSTUP_TOOLCHAIN=stable` on the compat slice, set in `run_cargo` AFTER inherited
+//! RUSTC / RUSTC_BOOTSTRAP / RUSTFLAGS / RUSTUP_TOOLCHAIN are scrubbed on both lanes:
+//! no `RUSTC=…` pin, no RUSTFLAGS surgery, no `--no-trust` flag. The native binary
+//! must still self-report `+t` (see [`run`]).
 //!
 //! The ONE exception: the x86_64-apple-darwin compat slice of the universal
 //! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. The reason is

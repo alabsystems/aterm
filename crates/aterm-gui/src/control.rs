@@ -168,7 +168,10 @@ pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primar
 /// lives flat at `src/control_media.rs` (sibling of `control.rs`), so `#[path]`
 /// points at it.
 #[path = "control_media.rs"]
-mod control_media;
+// `pub(crate)` so the one main-thread RPC (`call_main`) is reachable from the
+// sibling verb modules that are not children of `control` — `control_privacy`
+// takes exactly the same hop `chrome`/`panes` do.
+pub(crate) mod control_media;
 /// The aimed-spawn target (design S3) crosses the module seam: the control
 /// thread builds it in `control_media::cmd_spawn`, the event loop carries it
 /// in `Wake::SpawnSession`, so the root needs the name.
@@ -540,6 +543,46 @@ pub(crate) enum Scope {
     /// deputy (whoami over-reporting / audit mis-attribution) where the cached op
     /// drifted from what the token actually authorizes against the now-active session.
     Edge(EdgeToken),
+    /// THE FABRIC BRIDGE: the near end of one of the two `socketpair`s the instance
+    /// keeps when it launches its `aterm-link serve` child. Authority is a
+    /// CONNECTION, not a token — this scope is pre-resolved by the server for the
+    /// inherited fd instead of being presented on an `AUTH` line, so there is no
+    /// token file to steal and the only way to be the bridge is to be the process
+    /// aterm spawned.
+    ///
+    /// It carries Owner's power PLUS the `Access::BridgeOnly` verbs — `deliver`,
+    /// `hold`, `outbox` and `outbox sent`, the pinned set in
+    /// `aterm_types::control_verbs` — which no other scope may call, Owner
+    /// included. That asymmetry is the design: Owner scope is what every
+    /// in-session client already holds, so a prompt-injected agent holding Owner
+    /// must not be able to forge an attested human order into a sibling's inbox,
+    /// lift a fleet halt locally, or read every session's outbound traffic.
+    Bridge,
+}
+
+impl Scope {
+    /// OWNER-CLASS: this connection carries full instance authority. `Bridge` does
+    /// (it is Owner plus the bridge verbs), `Edge` never does.
+    ///
+    /// Every site that used to read `matches!(scope, Scope::Owner)` as "is this the
+    /// god token?" means THIS. The two spellings are kept distinct on purpose, and
+    /// TWO sites keep the arms apart — neither of them the one this doc used to
+    /// name:
+    ///
+    /// * [`crate::control_session::cmd_whoami`] is the only site that ANSWERS them
+    ///   differently (`owner` vs `bridge`). It is the distinction `Bridge::new`'s
+    ///   startup probe reads to tell inherited mode from observer mode, so it is
+    ///   the one to check when auditing where Owner and Bridge diverge.
+    /// * [`crate::control_session::caller_actor`] keeps a separate `Scope::Bridge`
+    ///   arm but answers `ExitActor::Unknown` for BOTH: the exits ledger records
+    ///   `by=-` for a bridge-initiated close exactly as it does for an
+    ///   Owner-token one, because naming the bridge would widen the `exits` wire
+    ///   with a fourth `by=` token (§11.2 keeps that as a separate item). This doc
+    ///   used to call it "the one site where the bridge must be attributed as
+    ///   itself", which is the opposite of what it does.
+    pub(crate) fn is_owner_class(self) -> bool {
+        matches!(self, Scope::Owner | Scope::Bridge)
+    }
 }
 
 /// The verb table: one row per control verb, the single source of truth for its
@@ -711,6 +754,18 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
             Some("set" | "unset") => Some(Escalation::Op(Op::WriteInput)),
             _ => None,
         },
+        // `inbox` is verb-level `Read` (the listing and `inbox get` are pure
+        // reads), but `inbox seen` ADVANCES the handled watermark — a decision
+        // about a message, recorded on the events digest and persisted by the
+        // bridge. Exactly the `meta set` shape and exactly the same hazard: the
+        // base gate reads the KEYWORD's op-class, so without this a read-only edge
+        // could mark another agent's mail handled. `WriteInput`, not ConfigWrite:
+        // nothing durable on disk is rewritten. The `inbox seen` table row carries
+        // the same `Write` class, so the row and the fence agree.
+        "inbox" => match rest.split_whitespace().next() {
+            Some("seen") => Some(Escalation::Op(Op::WriteInput)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -755,7 +810,10 @@ pub(crate) enum FrontControlSurface {
 /// target — self or sibling) keeps the self and cross paths on one predicate.
 fn scope_holds_op(scope: Scope, need: Op, ctx: &SessionCtx) -> bool {
     match scope {
-        Scope::Owner => true,
+        // Owner-class: the god token, and the bridge connection which is Owner
+        // PLUS the four `Access::BridgeOnly` verbs no token reaches (`deliver`,
+        // `hold`, `outbox`, `outbox sent`). Both hold every op.
+        Scope::Owner | Scope::Bridge => true,
         Scope::Edge(presented) => {
             let table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
             decide_edge(&table, &presented, &ctx.self_id, need, &ctx.nonce).is_permitted()
@@ -766,7 +824,7 @@ fn scope_holds_op(scope: Scope, need: Op, ctx: &SessionCtx) -> bool {
 fn scope_holds_escalation(scope: Scope, need: Escalation, ctx: &SessionCtx) -> bool {
     match need {
         Escalation::Op(op) => scope_holds_op(scope, op, ctx),
-        Escalation::OwnerOnly => matches!(scope, Scope::Owner),
+        Escalation::OwnerOnly => scope.is_owner_class(),
     }
 }
 
@@ -1133,7 +1191,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     // ApplyUpdate` / `open update` faces the menu path already fences. The in-session AI
     // drives with the OWNER token (flagless self-location), so "SEE via status + PRESS
     // via apply" is unaffected; only a non-owner peer/child edge is refused.
-    if update_is_owner_only_subcmd(rest) && !matches!(scope, Scope::Owner) {
+    if update_is_owner_only_subcmd(rest) && !scope.is_owner_class() {
         log_denial(
             AUDIT_SUBSYSTEM,
             &format!("update {}", rest.trim()),
@@ -1398,6 +1456,13 @@ pub struct ImageReq {
     /// PNG is ON DISK at the confined path), `Ok((0, 0, None))` when no window
     /// displays the target, or `Err` when the encode/write failed.
     pub reply: Sender<ImageReply>,
+    /// Reserve global artifact capacity before this request enters the
+    /// main-thread queue. File replies carry the live-object permit through
+    /// socket write, ACK, and any failed-ACK quarantine. Byte replies release it
+    /// immediately after their body is flushed because no server-side path was
+    /// published; both forms drop their target capability before that release.
+    /// Declared last so whole-request teardown closes accounted resources first.
+    pub(crate) handoff: ReplyRetentionPermit,
 }
 
 const CAPTURE_CANCEL_LIVE: u8 = 0;
@@ -1467,21 +1532,234 @@ impl CaptureCancellation {
     }
 }
 
-/// Behavior implemented by an exact artifact guard carried to the socket edge.
-/// `prepare_write` revalidates the names an OK response is about to certify;
-/// it also crosses irrevocable publication ownership before any OK bytes can
-/// become visible. The guard itself remains live through write, flush, and the
-/// client's explicit post-response acknowledgement.
+/// Behavior implemented by a filesystem-artifact guard carried to the socket
+/// edge. `prepare_write` revalidates names an OK response is about to certify
+/// and crosses irrevocable publication ownership before any OK bytes can become
+/// visible. The guard remains live through write, flush, and the client's
+/// explicit post-response acknowledgement. Inline PNG bytes use the separate
+/// write-only handoff: their filesystem lease is already gone, and their memory
+/// stays admitted only through successful write and flush.
 pub(crate) trait WireRetention: Send {
     fn prepare_write(&mut self) -> Result<(), String>;
 }
 
+/// Bound queued, in-flight, and quarantined artifact handoffs together. The
+/// object cap limits expensive jobs; the descriptor-unit cap also accounts for
+/// the depth of retained absolute directory chains, so four unusually deep
+/// socket paths cannot defeat a count-only limit.
+const ARTIFACT_HANDOFF_LIMIT: usize = 4;
+const ARTIFACT_HANDOFF_SUFFIX_UNITS: usize =
+    crate::pinned_dir::PINNED_DIR_OPERATION_DESCRIPTOR_UNITS;
+const ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT: usize =
+    crate::pinned_dir::PINNED_DIR_OPEN_COMPONENT_LIMIT + ARTIFACT_HANDOFF_SUFFIX_UNITS;
+pub(crate) const ARTIFACT_HANDOFF_BUSY: &str = "artifact handoff busy; retry";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ArtifactHandoffUsage {
+    live: usize,
+    descriptor_units: usize,
+}
+
+#[derive(Debug)]
+struct ArtifactHandoffPermit {
+    usage: &'static Mutex<ArtifactHandoffUsage>,
+    descriptor_units: usize,
+    descriptor_limit: usize,
+}
+
+/// Capacity reserved before an artifact encoder or reader starts expensive or
+/// externally visible work. Binding it to a guard transfers the same permit
+/// into the reply, ACK wait, and failed-ACK quarantine.
+#[derive(Debug)]
+pub(crate) struct ReplyRetentionPermit(ArtifactHandoffPermit);
+
+/// Admission for an in-memory artifact body. Unlike a published path, it has
+/// no identity or lifetime to preserve after the bounded socket flush, so it is
+/// deliberately outside the acknowledgement/quarantine state machine.
+pub(crate) struct WriteOnlyRetention {
+    _permit: ArtifactHandoffPermit,
+}
+
+#[cfg(test)]
+impl ReplyRetentionPermit {
+    /// Isolate hand-built unit fixtures from the process-global production
+    /// admission pool. Capacity tests exercise [`ReplyRetention::try_reserve`]
+    /// directly; unrelated renderer/video fixtures should not race each other
+    /// for those four slots merely because the test harness runs in parallel.
+    pub(crate) fn unmetered_for_test() -> Self {
+        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+        Self(
+            ArtifactHandoffPermit::try_acquire_from(&USAGE, usize::MAX, usize::MAX, 1)
+                .expect("unmetered test permit capacity"),
+        )
+    }
+}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "Acquire",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_acquire_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "RefuseAtCap",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_refuse_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "Release",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_release_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "ReconcileGrow",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_reconcile_grow_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "ReconcileShrink",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_reconcile_shrink_anchor() {}
+
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "ArtifactHandoffCapacity",
+        action = "RefuseReconcile",
+        project = "aterm_gui::artifact_transaction_conformance::project_artifact_handoff_capacity"
+    )
+)]
+fn artifact_handoff_refuse_reconcile_anchor() {}
+
+impl ArtifactHandoffPermit {
+    fn try_acquire_from(
+        usage: &'static Mutex<ArtifactHandoffUsage>,
+        live_limit: usize,
+        descriptor_limit: usize,
+        descriptor_units: usize,
+    ) -> Option<Self> {
+        let mut current = usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = current.live < live_limit
+            && descriptor_units > 0
+            && descriptor_units <= descriptor_limit
+            && current.descriptor_units <= descriptor_limit - descriptor_units;
+        if available {
+            current.live += 1;
+            current.descriptor_units += descriptor_units;
+            drop(current);
+            artifact_handoff_acquire_anchor();
+            Some(Self {
+                usage,
+                descriptor_units,
+                descriptor_limit,
+            })
+        } else {
+            drop(current);
+            artifact_handoff_refuse_anchor();
+            None
+        }
+    }
+
+    fn try_acquire(descriptor_units: usize) -> Option<Self> {
+        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+        Self::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT,
+            descriptor_units,
+        )
+    }
+
+    /// Replace the provisional pre-confinement charge with the component depth
+    /// of the exact pinned path. The update is atomic with competing permits;
+    /// failure leaves the old charge intact so dropping this permit remains
+    /// balanced.
+    fn try_reconcile_descriptor_units(&mut self, descriptor_units: usize) -> bool {
+        if descriptor_units == 0 || descriptor_units > self.descriptor_limit {
+            artifact_handoff_refuse_reconcile_anchor();
+            return false;
+        }
+        let previous_units = self.descriptor_units;
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(usage.descriptor_units >= self.descriptor_units);
+        let other_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
+        if other_units > self.descriptor_limit - descriptor_units {
+            drop(usage);
+            artifact_handoff_refuse_reconcile_anchor();
+            return false;
+        }
+        usage.descriptor_units = other_units + descriptor_units;
+        self.descriptor_units = descriptor_units;
+        drop(usage);
+        match descriptor_units.cmp(&previous_units) {
+            std::cmp::Ordering::Greater => artifact_handoff_reconcile_grow_anchor(),
+            std::cmp::Ordering::Less => artifact_handoff_reconcile_shrink_anchor(),
+            std::cmp::Ordering::Equal => {}
+        }
+        true
+    }
+}
+
+impl Drop for ArtifactHandoffPermit {
+    fn drop(&mut self) {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(usage.live > 0, "artifact handoff permit underflow");
+        debug_assert!(
+            usage.descriptor_units >= self.descriptor_units,
+            "artifact handoff descriptor budget underflow"
+        );
+        usage.live = usage.live.saturating_sub(1);
+        usage.descriptor_units = usage.descriptor_units.saturating_sub(self.descriptor_units);
+        drop(usage);
+        artifact_handoff_release_anchor();
+    }
+}
+
 /// Type-erased ownership that remains live until a control reply is completely
-/// consumed and explicitly acknowledged. Concrete guards retain and revalidate
-/// exact file/directory handles.
+/// consumed and explicitly acknowledged. Concrete guards retain publication
+/// capabilities and revalidate filesystem identities at the wire boundary.
 pub(crate) struct ReplyRetention {
     guard: Option<Box<dyn WireRetention>>,
     phase: ReplyRetentionPhase,
+    _permit: Option<ArtifactHandoffPermit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1492,10 +1770,41 @@ enum ReplyRetentionPhase {
 }
 
 impl ReplyRetention {
-    pub(crate) fn new(guard: impl WireRetention + 'static) -> Self {
+    #[cfg(test)]
+    pub(crate) fn try_reserve() -> Option<ReplyRetentionPermit> {
+        ArtifactHandoffPermit::try_acquire(1).map(ReplyRetentionPermit)
+    }
+
+    /// Reserve the count slot plus a conservative descriptor charge before
+    /// opening any artifact path. `PinnedDir` retains one handle per absolute
+    /// component; the fixed suffix covers artifact subdirectories, files, and
+    /// transient validation handles.
+    pub(crate) fn try_reserve_for_path(path: &std::path::Path) -> Option<ReplyRetentionPermit> {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            }
+        });
+        let descriptor_units = artifact_descriptor_units(&resolved);
+        ArtifactHandoffPermit::try_acquire(descriptor_units).map(ReplyRetentionPermit)
+    }
+
+    #[cfg(test)]
+    fn try_new<G: WireRetention + 'static>(guard: G) -> Result<Self, G> {
+        let Some(permit) = Self::try_reserve() else {
+            return Err(guard);
+        };
+        Ok(permit.retain(guard))
+    }
+
+    #[cfg(test)]
+    fn new(guard: impl WireRetention + 'static) -> Self {
         Self {
             guard: Some(Box::new(guard)),
             phase: ReplyRetentionPhase::Queued,
+            _permit: None,
         }
     }
 
@@ -1588,6 +1897,45 @@ impl ReplyRetention {
     fn release_guard_anchor(&self) {}
 }
 
+impl ReplyRetentionPermit {
+    /// Reconcile the provisional charge after exact path resolution but before
+    /// its retained ancestor chain opens. `PinnedDir` invokes this at that
+    /// boundary, so competing requests cannot construct unaccounted chains.
+    pub(crate) fn try_reconcile_for_resolved_path(&mut self, path: &std::path::Path) -> bool {
+        self.0
+            .try_reconcile_descriptor_units(artifact_descriptor_units(path))
+    }
+
+    pub(crate) fn retain(self, guard: impl WireRetention + 'static) -> ReplyRetention {
+        ReplyRetention {
+            guard: Some(Box::new(guard)),
+            phase: ReplyRetentionPhase::Queued,
+            _permit: Some(self.0),
+        }
+    }
+
+    pub(crate) fn release_path_and_retain_in_memory<T>(
+        mut self,
+        path_capability: T,
+    ) -> WriteOnlyRetention {
+        // Close the filesystem capability before changing its charge. Keeping
+        // both operations in this consuming helper makes their order explicit
+        // at every call site, including early-return and teardown paths.
+        drop(path_capability);
+        assert!(
+            self.0.try_reconcile_descriptor_units(1),
+            "shrinking a live artifact permit to its in-memory charge must fit"
+        );
+        WriteOnlyRetention { _permit: self.0 }
+    }
+}
+
+fn artifact_descriptor_units(path: &std::path::Path) -> usize {
+    path.components()
+        .count()
+        .saturating_add(ARTIFACT_HANDOFF_SUFFIX_UNITS)
+}
+
 impl Drop for ReplyRetention {
     fn drop(&mut self) {
         if self.phase == ReplyRetentionPhase::Queued {
@@ -1603,10 +1951,34 @@ impl Drop for ReplyRetention {
     }
 }
 
-/// A value coupled to exact artifact handles that certify any paths it names.
+/// Wire ownership has two intentionally separate completion boundaries.
+/// Filesystem publications require a causal peer ACK; an in-memory body needs
+/// only the same bounded write+flush that already applies to every handoff.
+pub(crate) enum ReplyHandoff {
+    Acknowledged(ReplyRetention),
+    WriteOnly(WriteOnlyRetention),
+}
+
+impl ReplyHandoff {
+    pub(crate) fn prepare_write(&mut self) -> Result<(), String> {
+        match self {
+            Self::Acknowledged(retention) => retention.prepare_write(),
+            Self::WriteOnly(_) => Ok(()),
+        }
+    }
+
+    fn prepare_failed_anchor(&mut self) {
+        match self {
+            Self::Acknowledged(retention) => retention.prepare_failed_anchor(),
+            Self::WriteOnly(_) => unreachable!("write-only handoff preparation cannot fail"),
+        }
+    }
+}
+
+/// A value coupled to artifact retention through the complete wire handoff.
 pub(crate) struct Retained<T> {
     pub(crate) value: T,
-    pub(crate) retention: Option<ReplyRetention>,
+    pub(crate) retention: Option<ReplyHandoff>,
 }
 
 impl<T> Retained<T> {
@@ -1628,11 +2000,18 @@ impl<T> Retained<T> {
     pub(crate) fn guarded(value: T, retention: ReplyRetention) -> Self {
         Self {
             value,
-            retention: Some(retention),
+            retention: Some(ReplyHandoff::Acknowledged(retention)),
         }
     }
 
-    pub(crate) fn into_parts(self) -> (T, Option<ReplyRetention>) {
+    pub(crate) fn write_retained(value: T, retention: WriteOnlyRetention) -> Self {
+        Self {
+            value,
+            retention: Some(ReplyHandoff::WriteOnly(retention)),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (T, Option<ReplyHandoff>) {
         (self.value, self.retention)
     }
 }
@@ -1675,20 +2054,29 @@ impl<T: std::fmt::Display> std::fmt::Display for Retained<T> {
     }
 }
 
-/// One ordinary RPC response plus any artifact handles that must span its
-/// explicit consume acknowledgement. Most replies are plain strings; capture
-/// replies attach retention.
+/// One ordinary RPC response plus any artifact ownership that must span its
+/// socket write. Published paths retain handles through an explicit consume
+/// acknowledgement; inline bytes retain only their bounded memory permit
+/// through flush. Most replies are plain strings.
 pub(crate) struct ControlReply {
     body: String,
-    retention: Option<ReplyRetention>,
+    retention: Option<ReplyHandoff>,
 }
 
 impl ControlReply {
+    #[cfg(test)]
     pub(crate) fn guarded(body: String, retention: Option<ReplyRetention>) -> Self {
+        Self {
+            body,
+            retention: retention.map(ReplyHandoff::Acknowledged),
+        }
+    }
+
+    pub(crate) fn with_handoff(body: String, retention: Option<ReplyHandoff>) -> Self {
         Self { body, retention }
     }
 
-    fn into_body_retaining(self, slot: &mut Option<ReplyRetention>) -> String {
+    fn into_body_retaining(self, slot: &mut Option<ReplyHandoff>) -> String {
         let Self { body, retention } = self;
         *slot = retention;
         body
@@ -1698,7 +2086,7 @@ impl ControlReply {
     pub(crate) fn prepare_retention_for_test(&mut self) -> Result<(), String> {
         self.retention
             .as_mut()
-            .map_or_else(|| Ok(()), ReplyRetention::prepare_write)
+            .map_or_else(|| Ok(()), ReplyHandoff::prepare_write)
     }
 }
 
@@ -2066,6 +2454,35 @@ impl SubscriptionDispatch {
     }
 }
 
+/// THE SAFETY PROPERTY, as a drop guard. When the bridge connection ends — the
+/// child exited, was SIGKILLed, closed its fd, or the serving thread unwound —
+/// every session that bridge ever delivered to or held is put under `hold on
+/// reason=fabric-lost origin=fleet`, and the instance reports
+/// `fabric=disconnected`.
+///
+/// A GUARD RATHER THAN A TRAILING CALL, deliberately: a halt reachable only on
+/// the happy path is not fail-closed. The whole point of putting `hold` behind
+/// the bridge connection is that a halted agent cannot lift it, and an agent that
+/// shares the bridge's uid CAN kill the bridge (T1, §9.3). Killing it must
+/// therefore be strictly worse for that agent than leaving it alone — which is
+/// true exactly when the halt does not depend on the process staying alive.
+struct BridgeLostGuard {
+    store: Store,
+    /// The incarnation this guard speaks for. The HOLD sweep ignores it — a halt
+    /// that a `kill -9` lifts is not a halt — but `fabric=disconnected` is stored
+    /// only while this generation still owns the link, so a guard left over from
+    /// a bridge that is already gone cannot report its live replacement dead. See
+    /// [`crate::fabric::BridgeGeneration`] for the interleaving that made this
+    /// necessary.
+    generation: crate::fabric::BridgeGeneration,
+}
+
+impl Drop for BridgeLostGuard {
+    fn drop(&mut self) {
+        crate::fabric::bridge_lost(&self.store, self.generation);
+    }
+}
+
 struct ControlWorkerContext {
     active: ActiveHandle,
     store: Store,
@@ -2087,11 +2504,58 @@ impl ControlWorkerContext {
             &self.subscribers,
             &self.proxy,
             &self.image_queue,
-            self.token.as_str(),
+            ScopeSource::AuthLine(self.token.as_str()),
             &self.sock_dir,
             &self.subscriptions,
             self.operator.as_ref(),
         );
+    }
+
+    /// Serve one INHERITED bridge fd (see [`ScopeSource::PreResolved`]). Marks the
+    /// instance `fabric=connected` while it is served; the [`BridgeLostGuard`]
+    /// applies the fabric-lost halt when the connection ends, however it ends.
+    fn serve_bridge(&self, mut stream: CtlStream, generation: crate::fabric::BridgeGeneration) {
+        crate::fabric::bridge_attached(generation);
+        let _lost = BridgeLostGuard {
+            store: self.store.clone(),
+            generation,
+        };
+        match serve_borrowed(
+            &stream,
+            &self.active,
+            &self.store,
+            &self.subscribers,
+            &self.proxy,
+            &self.image_queue,
+            ScopeSource::PreResolved(Scope::Bridge),
+            &self.sock_dir,
+            self.operator.as_ref(),
+        ) {
+            ServeDisposition::Close => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+            // THE BRIDGE'S PUSH LANE STAYS ON THIS THREAD. `subscribe @* events,
+            // sessions` is the second half of the bridge, and it is served INLINE
+            // rather than handed to the subscription pool — for two reasons, and
+            // the first is a correctness one. The `BridgeLostGuard` above fires
+            // when THIS function returns, so handing the connection away would
+            // apply the fabric-lost halt the moment the bridge flipped to push
+            // mode, with the bridge alive and watching. Second, the design's lane
+            // accounting: the bridge is a resident child, not a client, and it
+            // costs zero of the pool lanes an operator's parked `await` competes
+            // for.
+            ServeDisposition::Subscribe { line, scope } => {
+                run_subscribe_socket(
+                    &line,
+                    &self.active,
+                    &self.store,
+                    &self.subscribers,
+                    scope,
+                    &mut stream,
+                );
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
     }
 
     fn serve_subscription(&self, mut job: SubscriptionJob) {
@@ -2111,6 +2575,42 @@ impl ControlWorkerContext {
 
 /// Create the process-lifetime worker set once. Returns the number successfully
 /// started so startup can fail closed if the OS cannot provide even one lane.
+/// The process's control-worker context, published once the control server is
+/// running. The FABRIC BRIDGE seam reads it so an inherited socketpair end is
+/// served against the same registry, active handle and event-loop proxy every
+/// ordinary lane uses — one process, one view of its sessions.
+static BRIDGE_CONTEXT: std::sync::OnceLock<Arc<ControlWorkerContext>> = std::sync::OnceLock::new();
+
+/// SERVE ONE INHERITED FABRIC-BRIDGE CONNECTION — the near end of a
+/// `socketpair(AF_UNIX)` whose far end belongs to the `aterm-link serve` child
+/// this instance spawned. The connection is served with [`Scope::Bridge`]
+/// PRE-RESOLVED: no `AUTH` line is read, because the authority is the fd and not
+/// anything the peer can say, and when it closes the fabric-lost halt lands.
+///
+/// Returns `false` when the control server is not up yet (nothing to serve
+/// against) or a thread could not be started — never a partial attach.
+///
+/// THE LAUNCHER is [`crate::fabric_launch`], which reads `[fabric] command`,
+/// makes the two socketpairs, spawns the child with the far ends on fds 3 and 4,
+/// and calls this once per near end. Both ends are `Scope::Bridge`; either one
+/// closing fires the fail-closed halt, which is §11.2's "when either fd closes".
+///
+/// `generation` identifies the LAUNCH, not the lane: the launcher mints one and
+/// passes the same value to both near ends, so either guard still reports the
+/// link lost while neither can clobber a LATER launch's `fabric=connected`.
+pub(crate) fn attach_fabric_bridge(
+    stream: CtlStream,
+    generation: crate::fabric::BridgeGeneration,
+) -> bool {
+    let Some(context) = BRIDGE_CONTEXT.get().cloned() else {
+        return false;
+    };
+    std::thread::Builder::new()
+        .name("aterm-fabric-bridge".to_string())
+        .spawn(move || context.serve_bridge(stream, generation))
+        .is_ok()
+}
+
 fn spawn_control_workers(
     dispatch: &Arc<BoundedDispatch<CtlStream>>,
     context: &Arc<ControlWorkerContext>,
@@ -2349,6 +2849,9 @@ pub fn spawn(
             subscriptions: subscription_dispatch.clone(),
             operator: operator.clone(),
         });
+        // Publish the context for the fabric-bridge seam BEFORE the lanes start
+        // accepting: a bridge attached later must never find a half-built process.
+        let _ = BRIDGE_CONTEXT.set(worker_context.clone());
         let workers = spawn_control_workers(&connection_dispatch, &worker_context);
         connection_dispatch.set_capacity(workers);
         if workers == 0 {
@@ -2435,6 +2938,15 @@ pub fn spawn(
         // a second surface — the env deny-list covers only the env path, not the
         // shared config file. The same per-launch token gates network and local hop.
         crate::net_listen::maybe_spawn(token.as_str(), &sock_path, &network_config);
+        // THE FABRIC BRIDGE, secure-default-OFF like the listener above: only a
+        // configured `[fabric] command` (or `$ATERM_FABRIC_COMMAND`) launches the
+        // `aterm-link serve` child. It is started HERE — after the bind, after
+        // the lanes, after `BRIDGE_CONTEXT` is published — so the connection it
+        // inherits is served against a process that is already whole. It costs
+        // zero of the pool lanes above: the bridge is a resident child, not a
+        // client (§3.1's lane accounting).
+        #[cfg(unix)]
+        crate::fabric_launch::spawn_supervisor(&network_config);
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -2583,7 +3095,7 @@ fn proxy_forward_plan(
     // (hop 1) or its same-trust-domain sibling reach (hop 2). A scoped Edge
     // connection cannot escalate to a session it was never granted (it falls
     // through to local resolution, which denies the cross-process sid).
-    if !matches!(scope, Scope::Owner) {
+    if !scope.is_owner_class() {
         return None;
     }
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -2747,7 +3259,7 @@ fn try_net_dial<R: Read>(
     }
     // Dialing OUT wields the saved connection's full remote-drive authority, so it
     // is OWNER-only: a connection that itself arrived over an edge cannot dial out.
-    if !matches!(scope, Scope::Owner) {
+    if !scope.is_owner_class() {
         reply("ERR dial requires owner scope (an edge token cannot dial out)\n");
         return true;
     }
@@ -2791,6 +3303,7 @@ fn request_head(line: &str) -> (Option<Selector>, &str, &str) {
 fn dispatch_meta_verb(
     verb: &str,
     rest: &str,
+    selector: Option<&Selector>,
     scope: Scope,
     proxy: &EventLoopProxy<Wake>,
 ) -> Option<String> {
@@ -2798,6 +3311,15 @@ fn dispatch_meta_verb(
         "version" => Some(crate::build_info::control_line()),
         "update" => Some(cmd_update(rest, scope, proxy)),
         "help" | "verbs" => Some(cmd_help(rest)),
+        // `privacy` — the macOS consent posture. Instance-wide and self-scoped:
+        // unlike the other meta verbs (whose answer is the same whoever is
+        // named, so a selector is merely ignored), this one aggregates PER
+        // SESSION, so a selector would read as "the posture of that session"
+        // and be silently wrong. It is rejected, as the verb's help states.
+        "privacy" => Some(match selector {
+            None | Some(Selector::SelfTok) => crate::control_privacy::cmd_privacy(rest, proxy),
+            Some(_) => crate::control_privacy::no_selector_error().to_string(),
+        }),
         _ => None,
     }
 }
@@ -2821,7 +3343,7 @@ fn dispatch_app_verb(
                 proxy,
                 rest,
                 sock_dir,
-                matches!(scope, Scope::Owner),
+                scope.is_owner_class(),
             ));
         }
         "chrome" => control_media::cmd_chrome(proxy),
@@ -2838,6 +3360,7 @@ fn dispatch_app_verb(
         "act" => control_media::cmd_act(proxy, rest),
         "invoke" => control_media::cmd_invoke(proxy, rest),
         "rain" => control_media::cmd_rain(proxy, rest),
+        "streak" => control_media::cmd_streak(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
         "trail" => control_media::cmd_trail(proxy, rest),
         // No selector on this path, so no `@<sid>` aim; `window=` still aims.
@@ -2885,6 +3408,115 @@ fn retired_bottom_hud_verb_error(verb: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `post` must refuse this connection.
+///
+/// `post` is the one verb whose scope gate is a PER-HANDLER check rather than a
+/// class in the verb table (the documented shape `family`'s explicit-sid form
+/// already uses): an `Edge` connection is refused outright, not checked for a
+/// write edge. A write-input edge over session S authorizes typing INTO S; it
+/// must not authorize speaking AS S on the bus, because the sender of a post is
+/// attested by the instance Owner and every reader downstream treats `from=` as
+/// identity. Named and pure so the refusal is testable as itself.
+fn post_scope_denied(scope: Scope) -> bool {
+    !scope.is_owner_class()
+}
+
+/// Whether this `lease` request is a non-bridge connection claiming the bridge's
+/// own `holder=fabric:*` namespace.
+///
+/// DESIGN §11.2: `Scope::Bridge` "has Owner's power plus the `BridgeOnly` verbs
+/// (`deliver`, `hold`, `lease … holder=fabric:*`), which no other scope may call,
+/// Owner included". The first two are `Access::BridgeOnly` rows in the verb table
+/// and are gated by [`dispatch_bridge_verb`]; the third is a SUB-FORM of an
+/// ordinary Owner verb, so no table row can express it and it was enforced
+/// nowhere — `lease_acquire` accepts any 1..=64 printable-ASCII holder from any
+/// scope that may run `lease`.
+///
+/// WHAT THAT BOUGHT AN INJECTED AGENT, all three of which are §6.6/§9.3
+/// properties: `who` and `lease status` showed `driving=lease:fabric:h-andrew`,
+/// attributing the agent's own drive to a human, to every local driver and to a
+/// person at the glass; `Bridge::local_lease_holder` filters holders starting
+/// with `fabric:`, so the bridge never wrote the §6.6 row-5 `holder=owner-cli:<h>`
+/// event and the drive stayed invisible on the bus control ledger; and a genuine
+/// human claim arriving afterwards was refused as a different live holder's
+/// lease, so the real mirror never took.
+///
+/// ACQUIRE ONLY, which is the clause §11.2 states. The RESIDUAL is `lease release
+/// … force`: it steals any cooperative hold, `fabric:` ones included, from any
+/// caller who may run `lease` — a deliberate operator override with its own
+/// argument (a crashed driver must not wedge the session forever) that predates
+/// the fabric and is not narrowed here. Stealing the lease is visible in `who`
+/// under the thief's own name; FORGING it was not.
+fn lease_forges_fabric_holder(scope: Scope, rest: &str) -> bool {
+    if matches!(scope, Scope::Bridge) {
+        return false;
+    }
+    let mut toks = rest.split_whitespace();
+    if toks.next() != Some("acquire") {
+        return false;
+    }
+    toks.filter_map(|t| t.strip_prefix("holder="))
+        .any(|h| h.starts_with("fabric:"))
+}
+
+/// THE BRIDGE PLANE — the FOUR `Access::BridgeOnly` verbs: `deliver`, `hold`,
+/// `outbox` and `outbox sent`.
+///
+/// `None` = not a bridge verb, carry on. Answered BEFORE session resolution
+/// because each names its target session as an ARGUMENT (the `raise <sid>`
+/// shape) and the bridge may be the only connection this instance has: a fabric
+/// halt must land on a windowless, terminal-less instance exactly as it lands on
+/// a busy one.
+///
+/// TWO REFUSALS, and both are the point. A SELECTOR is rejected — `@<other>
+/// deliver <sid> …` could otherwise aim the bridge plane at a session the sid
+/// argument does not name. And every scope but `Bridge` is denied, OWNER
+/// INCLUDED: this is the one place in the dispatch where Owner is not enough,
+/// because Owner is what every in-session client already holds and these are the
+/// verbs a prompt-injected agent would reach for first — `deliver` to forge an
+/// attested human order into a sibling's inbox, `hold` to lift the halt that was
+/// meant to stop it, `outbox` to read every session's outbound traffic, and
+/// `outbox sent` to release a `post --wait` for a message that never left the
+/// machine. This heading, the audit reason below and `Scope::Bridge`'s own doc
+/// all name the same four: the set was widened to four in the table while the
+/// site that ENFORCES it went on describing two, which is where an auditor
+/// enumerating the fenced set looks first.
+///
+/// Pure over `(verb, rest, selector, scope, store)`, so the decision this
+/// function makes IS the one the tests exercise — no mirror to drift.
+fn dispatch_bridge_verb(
+    verb: &str,
+    rest: &str,
+    selector: Option<&Selector>,
+    scope: Scope,
+    store: &Store,
+) -> Option<String> {
+    if !aterm_types::control_verbs::is_bridge_only(verb) {
+        return None;
+    }
+    if !matches!(selector, None | Some(Selector::SelfTok)) || !matches!(scope, Scope::Bridge) {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            &format!("bridge-only {verb}"),
+            aterm_containment::mode_or_containment(),
+            &format!("only the inherited bridge connection may run {verb}"),
+        );
+        return Some("ERR denied\n".to_string());
+    }
+    Some(match verb {
+        "deliver" => crate::fabric::cmd_deliver(store, rest),
+        "hold" => crate::fabric::cmd_hold(store, rest),
+        // `spec()` keys on the KEYWORD, so `outbox sent` reaches here as
+        // `verb == "outbox"`; the sub-form splits inside the handler exactly as
+        // `inbox get`/`inbox seen` do.
+        "outbox" => crate::fabric::cmd_outbox_verb(store, rest),
+        // The BridgeOnly set is pinned by the table test
+        // `access_exceptions_are_exactly_the_declared_sets`, so every member has a
+        // handler above.
+        _ => unreachable!("bridge-only verb {verb:?} without a dispatch handler"),
+    })
+}
+
 /// Handle requests whose authority/target class does not depend on a session.
 /// Returning `None` means the normal session/edge resolver must continue.
 #[allow(clippy::too_many_arguments)]
@@ -2909,7 +3541,7 @@ fn dispatch_before_session(
     };
 
     if spec.access == Access::AnyScopeMeta {
-        return dispatch_meta_verb(verb, rest, scope, proxy).map(Into::into);
+        return dispatch_meta_verb(verb, rest, selector.as_ref(), scope, proxy).map(Into::into);
     }
 
     // Fleet reads and connection-management metadata remain useful when the
@@ -2917,7 +3549,7 @@ fn dispatch_before_session(
     // (`grant`/`revoke`/`whoami`) intentionally falls through and reports the
     // typed no-terminal error when no live context exists.
     if spec.access == Access::OwnerOnly {
-        if !matches!(selector, None | Some(Selector::SelfTok)) || !matches!(scope, Scope::Owner) {
+        if !matches!(selector, None | Some(Selector::SelfTok)) || !scope.is_owner_class() {
             return Some("ERR denied\n".into());
         }
         return match verb {
@@ -2933,7 +3565,11 @@ fn dispatch_before_session(
         .map(Into::into);
     }
 
-    let principal = if matches!(scope, Scope::Owner) {
+    if let Some(response) = dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, store) {
+        return Some(response.into());
+    }
+
+    let principal = if scope.is_owner_class() {
         NativeControlPrincipal::Owner
     } else {
         NativeControlPrincipal::Edge
@@ -2996,7 +3632,7 @@ fn dispatch_before_session(
     // session path: they describe terminal payloads, not app pixels.
     if verb == "image"
         && resolve_active(active).is_none()
-        && matches!(scope, Scope::Owner)
+        && scope.is_owner_class()
         && matches!(selector, None | Some(Selector::SelfTok))
         && rest.split_whitespace().next() != Some("read")
     {
@@ -3037,6 +3673,22 @@ fn dispatch_before_session(
         NativeControlDecision::ResolveSession | NativeControlDecision::NoActiveTerminal => {
             return None;
         }
+    }
+    // THE FLEET HALT, APP LANE (design §5.3). Two App-target verbs are in the §5.3
+    // set and neither resolves a session, so the halt gate in the session dispatch
+    // is STRUCTURALLY unreachable for them. `invoke` reaches a PTY — `invoke
+    // Paste` writes the OS clipboard into the front tab's PTY through
+    // `App::paste_clipboard`, and `invoke SelectAll` + `copy` chooses those bytes
+    // off the session's own screen first. `tab` RETIRES a session: `tab close [N]`
+    // reaches `App::close_tab_via_verb` and destroys the tab's session, which is
+    // the third of the three things `fabric::is_pty_reaching` says a halt covers —
+    // a driver refused `@<sid> close` used to substitute `tab close` and get the
+    // same effect. Checked HERE, after authorization, for the same reason the
+    // session gate is placed after it: an unauthorized caller must learn nothing
+    // about the target's state. `app_halt_refusal` explains why the question it
+    // asks is "is ANY session held" rather than "is the front one held".
+    if let Some(refusal) = crate::fabric::app_halt_refusal(store, verb) {
+        return Some(refusal.into());
     }
     let active_term = resolve_active(active).map(|(term, _, _, _)| term);
     dispatch_app_verb(verb, rest, scope, proxy, sock_dir, active_term.as_ref())
@@ -3102,7 +3754,7 @@ fn dispatch_request(
     let explicit_live = selector
         .as_ref()
         .is_some_and(|selector| selector_is_live(store, selector));
-    let principal = if matches!(scope, Scope::Owner) {
+    let principal = if scope.is_owner_class() {
         NativeControlPrincipal::Owner
     } else {
         NativeControlPrincipal::Edge
@@ -3159,7 +3811,7 @@ fn dispatch_request(
         front_active_session,
         &mut retention,
     );
-    ControlReply::guarded(body, retention)
+    ControlReply::with_handoff(body, retention)
 }
 
 /// Serve one connection: AUTHENTICATE the first line against the capability
@@ -3182,15 +3834,19 @@ enum ServeDisposition {
 struct PendingArtifactAck {
     retention: ReplyRetention,
     nonce: String,
+    deadline: std::time::Instant,
 }
 
 /// A complete guarded response gets this long to finish its client handoff.
-/// A valid nonce acknowledgement releases the exact handles immediately. Any
+/// A valid nonce acknowledgement releases the artifact guards immediately. Any
 /// timeout, early request-half close, legacy client, or partial wire failure
 /// transfers them to the process-global quarantine for this *additional* grace
-/// interval, so a failed ACK can never become an immediate same-name race.
-const ARTIFACT_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// interval. Exact publication capabilities stay live; closed frame identities
+/// are revalidated at the wire checkpoint but do not continuously exclude a
+/// later same-name replacement.
+const ARTIFACT_HANDOFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const ARTIFACT_FAILURE_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(30);
+const MIN_ARTIFACT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 struct QuarantinedArtifactReply {
     until: std::time::Instant,
@@ -3279,7 +3935,7 @@ fn artifact_reply_quarantine_reaper() {
             }
         }
         drop(entries);
-        // Exact filesystem/OS locks are released outside the queue mutex.
+        // Filesystem publication guards are released outside the queue mutex.
         drop(expired);
     }
 }
@@ -3297,6 +3953,14 @@ fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::
     quarantine.changed.notify_one();
 }
 
+#[cfg(test)]
+fn write_control_reply(
+    writer: &mut impl Write,
+    reply: ControlReply,
+) -> std::io::Result<Option<PendingArtifactAck>> {
+    write_control_reply_with_timeout_arm(writer, reply, ARTIFACT_HANDOFF_TIMEOUT, |_| Ok(()))
+}
+
 #[cfg_attr(
     test,
     aterm_spec::refines(
@@ -3305,19 +3969,42 @@ fn quarantine_artifact_reply_until(retention: ReplyRetention, until: std::time::
         project = "aterm_gui::artifact_transaction_conformance::project_artifact_reply"
     )
 )]
-fn write_control_reply(
+fn artifact_reply_write_wire_anchor() {}
+
+fn write_control_reply_to_stream(
+    stream: &CtlStream,
+    writer: &mut impl Write,
+    reply: ControlReply,
+) -> std::io::Result<Option<PendingArtifactAck>> {
+    write_control_reply_with_timeout_arm(writer, reply, ARTIFACT_HANDOFF_TIMEOUT, |timeout| {
+        stream.set_write_timeout(timeout)
+    })
+}
+
+fn write_control_reply_with_timeout_arm(
     writer: &mut impl Write,
     mut reply: ControlReply,
+    handoff_timeout: std::time::Duration,
+    mut set_write_timeout: impl FnMut(Option<std::time::Duration>) -> std::io::Result<()>,
 ) -> std::io::Result<Option<PendingArtifactAck>> {
+    let mut handoff_deadline = reply
+        .retention
+        .is_some()
+        .then(|| std::time::Instant::now() + handoff_timeout);
+    let requires_ack = matches!(
+        reply.retention.as_ref(),
+        Some(ReplyHandoff::Acknowledged(_))
+    );
     // Mint the causal challenge BEFORE fallible wire preparation. Video
     // preparation can publish its durable marker; entropy failure must therefore
     // remain an invisible, abortable ERR rather than occur after that boundary.
-    let mut nonce = if reply.retention.is_some() {
+    let mut nonce = if requires_ack {
         match aterm_uds::rand::hex_token::<16>() {
             Ok(nonce) => Some(nonce),
             Err(error) => {
                 reply.body = format!("ERR artifact acknowledgement setup failed: {error}\n");
                 reply.retention = None;
+                handoff_deadline = None;
                 None
             }
         }
@@ -3332,40 +4019,156 @@ fn write_control_reply(
         retention.prepare_failed_anchor();
         reply.body = format!("ERR artifact reply validation failed: {error}\n");
         reply.retention = None;
+        handoff_deadline = None;
         nonce = None;
     }
     // `reply` remains in scope through the complete write + flush; guarded
     // retention is then returned to the explicit ACK waiter.
-    let write = (|| {
-        writer.write_all(reply.body.as_bytes())?;
-        if let Some(nonce) = nonce.as_deref() {
-            writer.write_all(
-                aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes(),
+    let mut write_timeout_armed = false;
+    let write = if let Some(deadline) = handoff_deadline {
+        let mut arm_write_timeout = |remaining| {
+            set_write_timeout(Some(remaining))?;
+            write_timeout_armed = true;
+            Ok(())
+        };
+        (|| {
+            write_all_until(
+                writer,
+                reply.body.as_bytes(),
+                deadline,
+                &mut arm_write_timeout,
             )?;
-            writer.write_all(nonce.as_bytes())?;
-            writer.write_all(b"\n")?;
-        }
-        writer.flush()
-    })();
+            if let Some(nonce) = nonce.as_deref() {
+                write_all_until(
+                    writer,
+                    aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes(),
+                    deadline,
+                    &mut arm_write_timeout,
+                )?;
+                write_all_until(writer, nonce.as_bytes(), deadline, &mut arm_write_timeout)?;
+                write_all_until(writer, b"\n", deadline, &mut arm_write_timeout)?;
+            }
+            flush_until(writer, deadline, &mut arm_write_timeout)
+        })()
+    } else {
+        (|| {
+            writer.write_all(reply.body.as_bytes())?;
+            writer.flush()
+        })()
+    };
+    // The potentially multi-megabyte inline body is the resource covered by a
+    // write-only permit. Free it before releasing or quarantining any handoff,
+    // so a newly admitted request can never overlap unaccounted reply memory.
+    drop(std::mem::take(&mut reply.body));
     if let Err(error) = write {
-        if let Some(mut retention) = reply.retention.take() {
-            retention.write_failed_anchor();
-            quarantine_artifact_reply_until(
-                retention,
-                std::time::Instant::now() + ARTIFACT_FAILURE_QUARANTINE,
-            );
+        match reply.retention.take() {
+            Some(ReplyHandoff::Acknowledged(mut retention)) => {
+                retention.write_failed_anchor();
+                quarantine_artifact_reply_until(
+                    retention,
+                    std::time::Instant::now() + ARTIFACT_FAILURE_QUARANTINE,
+                );
+            }
+            Some(ReplyHandoff::WriteOnly(retention)) => drop(retention),
+            None => {}
         }
         return Err(error);
     }
-    Ok(reply
-        .retention
-        .take()
-        .zip(nonce)
-        .map(|(retention, nonce)| PendingArtifactAck { retention, nonce }))
+    let pending = match (reply.retention.take(), nonce) {
+        (Some(ReplyHandoff::Acknowledged(retention)), Some(nonce)) => {
+            // The guarded body and causal challenge are now fully written and
+            // flushed. Plain and write-only replies do not participate in the
+            // acknowledged-publication state machine.
+            artifact_reply_write_wire_anchor();
+            Some(PendingArtifactAck {
+                retention,
+                nonce,
+                deadline: handoff_deadline.expect("guarded reply owns its handoff deadline"),
+            })
+        }
+        (Some(ReplyHandoff::WriteOnly(retention)), None) => {
+            drop(retention);
+            None
+        }
+        (None, None) => None,
+        _ => unreachable!("reply handoff and acknowledgement nonce stay paired"),
+    };
+    if pending.is_none() && write_timeout_armed {
+        // Write-only replies keep the authenticated connection alive. Do not
+        // leak their bounded handoff deadline into later ordinary responses on
+        // that persistent stream.
+        set_write_timeout(None)?;
+    }
+    Ok(pending)
+}
+
+fn remaining_artifact_io_budget(
+    deadline: std::time::Instant,
+) -> std::io::Result<std::time::Duration> {
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "artifact handoff deadline expired",
+        ));
+    }
+    Ok(deadline
+        .saturating_duration_since(now)
+        .max(MIN_ARTIFACT_IO_TIMEOUT))
+}
+
+fn write_all_until(
+    writer: &mut impl Write,
+    mut bytes: &[u8],
+    deadline: std::time::Instant,
+    arm_write_timeout: &mut impl FnMut(std::time::Duration) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        arm_write_timeout(remaining_artifact_io_budget(deadline)?)?;
+        match writer.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write guarded artifact reply",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn flush_until(
+    writer: &mut impl Write,
+    deadline: std::time::Instant,
+    arm_write_timeout: &mut impl FnMut(std::time::Duration) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    loop {
+        arm_write_timeout(remaining_artifact_io_budget(deadline)?)?;
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Guarded artifact replies are one-shot at the connection level. After writing
-/// the complete ordinary response frame, retain every exact identity until the
+/// the complete ordinary response frame, retain its publication guard until the
 /// server then appends an unpredictable `ACK-CHALLENGE <nonce>` trailer. The
 /// shipping client can echo `ACK <nonce>` only after consuming the full framed
 /// response and trailer; a pre-pipelined ACK cannot guess the challenge.
@@ -3399,28 +4202,18 @@ fn await_guarded_reply_close_with_quarantine(
     let PendingArtifactAck {
         mut retention,
         nonce,
+        deadline,
     } = pending;
     let expected = format!(
         "{}{nonce}",
         aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX
     );
-    let deadline = std::time::Instant::now() + ARTIFACT_ACK_TIMEOUT;
-    let now = std::time::Instant::now();
-    if now >= deadline
-        || stream
-            .set_read_timeout(Some(deadline.saturating_duration_since(now)))
-            .is_err()
-    {
-        retention.acknowledge_failed_anchor();
-        quarantine_artifact_reply_until(retention, std::time::Instant::now() + failure_quarantine);
-        return ArtifactAckOutcome::AcknowledgementQuarantined;
-    }
     // EXACTLY one line decides the outcome — the challenge is one-shot, so a
     // line that is not the ACK is a failure and never a re-read: reading again
     // would let a peer keep guessing the nonce inside one deadline. The read
-    // timeout set above bounds this single read, and `read_request_line` folds
-    // its expiry, EOF, and I/O failure alike into `None`.
-    match read_request_line(reader) {
+    // absolute deadline is recomputed before every byte read, and
+    // `read_request_line_until` folds expiry, EOF, and I/O failure into `None`.
+    match read_request_line_until(stream, reader, deadline) {
         Some(line) if line == expected => {
             retention.acknowledge_peer_anchor();
             let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -3438,6 +4231,20 @@ fn await_guarded_reply_close_with_quarantine(
     }
 }
 
+/// How a connection's [`Scope`] is decided before the first request runs.
+#[derive(Clone, Copy)]
+enum ScopeSource<'a> {
+    /// The ordinary socket: the first line MUST be `AUTH <hex>` / `TOKEN <hex>
+    /// <verb…>`, matched against the instance token (=> `Owner`) or resolved as an
+    /// edge token (=> `Edge`).
+    AuthLine(&'a str),
+    /// THE BRIDGE: an inherited `socketpair` end whose scope is a property of the
+    /// FD, not of anything the peer says. No handshake is read and no token
+    /// exists — the connection IS the credential, because the only holder of the
+    /// far end is the child this instance spawned.
+    PreResolved(Scope),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve(
     stream: CtlStream,
@@ -3446,7 +4253,7 @@ fn serve(
     subscribers: &Subscribers,
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
-    token: &str,
+    scope_source: ScopeSource<'_>,
     sock_dir: &std::path::Path,
     subscriptions: &SubscriptionDispatch,
     operator: Option<&crate::operator_host::ControlHandle>,
@@ -3458,7 +4265,7 @@ fn serve(
         subscribers,
         proxy,
         queue,
-        token,
+        scope_source,
         sock_dir,
         operator,
     ) {
@@ -3482,10 +4289,45 @@ fn serve_borrowed(
     subscribers: &Subscribers,
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
-    token: &str,
+    scope_source: ScopeSource<'_>,
     sock_dir: &std::path::Path,
     operator: Option<&crate::operator_host::ControlHandle>,
 ) -> ServeDisposition {
+    // THE BRIDGE LANE. A pre-resolved scope reads NO handshake: there is nothing
+    // to authenticate, because the authority is the fd itself. Skipping the auth
+    // read is not a shortcut — reading a first line here would create exactly the
+    // thing this design removes, a credential the peer utters and something else
+    // could utter too.
+    if let ScopeSource::PreResolved(scope) = scope_source {
+        if arm_authenticated_read_poll(stream).is_err() {
+            return ServeDisposition::Close;
+        }
+        let mut reader = BufReader::new(stream);
+        let mut writer = stream;
+        while let Some(line) = read_authenticated_request_line(&mut reader) {
+            if let Some(disposition) = serve_request_line(
+                line,
+                scope,
+                stream,
+                &mut reader,
+                &mut writer,
+                active,
+                store,
+                subscribers,
+                proxy,
+                queue,
+                sock_dir,
+                operator,
+            ) {
+                return disposition;
+            }
+        }
+        return ServeDisposition::Close;
+    }
+    let ScopeSource::AuthLine(token) = scope_source else {
+        // Unreachable: the arm above returns for every `PreResolved`.
+        return ServeDisposition::Close;
+    };
     // Bound the UNAUTHENTICATED phase: `read_request_line` has no deadline of its
     // own, so a same-uid peer that connects and then goes silent would park this
     // thread forever before ever presenting a token. The timeout surfaces as a
@@ -3630,22 +4472,30 @@ fn serve_request_line(
     // before cross-process proxying so `@other operator...` cannot redirect the
     // instance's queue authority to a child socket.
     if let Some((selector, rest)) = operator_command_request(&line) {
-        let response = if !matches!(scope, Scope::Owner)
-            || !matches!(selector, None | Some(Selector::SelfTok))
-        {
-            "ERR denied\n".to_string()
-        } else if let Some(operator) = operator {
-            operator.command(store, rest)
-        } else {
-            "ERR operator unavailable\n".to_string()
-        };
+        let response =
+            if !scope.is_owner_class() || !matches!(selector, None | Some(Selector::SelfTok)) {
+                "ERR denied\n".to_string()
+            } else if let Some(operator) = operator {
+                operator.command(store, rest)
+            } else {
+                "ERR operator unavailable\n".to_string()
+            };
         if writer.write_all(response.as_bytes()).is_err() || writer.flush().is_err() {
             return Some(ServeDisposition::Close);
         }
         return None;
     }
     if binary_frame_verb(&line) == Some("operator-propose-bin") {
-        if !run_operator_proposal_bin(&line, reader, scope, operator, store, subscribers, writer) {
+        if !run_operator_proposal_bin(
+            &line,
+            reader,
+            scope,
+            active,
+            operator,
+            store,
+            subscribers,
+            writer,
+        ) {
             return Some(ServeDisposition::Close);
         }
         return None;
@@ -3668,6 +4518,18 @@ fn serve_request_line(
     // an ordinary RPC worker.
     if is_subscribe_line(&line) {
         return Some(ServeDisposition::Subscribe { line, scope });
+    }
+    // POST FRAME: `post … len=<n>` consumes the following N raw bytes as the
+    // message BODY. Intercepted here for the same reason `feed-bin` is — the
+    // dispatch cannot reach the stream — and framed with the same discipline: a
+    // valid length is ALWAYS consumed (even on a refusal) so the next request line
+    // is correctly framed, and a length this server will not read closes the
+    // connection rather than letting the body fall through as control verbs.
+    if let Some(len) = post_frame_len(&line) {
+        if !run_post_bin(&line, len, reader, active, store, scope, writer) {
+            return Some(ServeDisposition::Close);
+        }
+        return None;
     }
     // BINARY FRAME: `feed-bin`/`paste-bin <n>` consumes the following N raw bytes
     // from the SAME buffered stream and feeds them to the resolved target's PTY —
@@ -3709,7 +4571,7 @@ fn serve_request_line(
         sock_dir,
     );
     // A dead client (broken pipe) must not crash the app — just drop it.
-    match write_control_reply(writer, resp) {
+    match write_control_reply_to_stream(stream, writer, resp) {
         Ok(Some(retention)) => {
             await_guarded_reply_close(stream, reader, retention);
             Some(ServeDisposition::Close)
@@ -3728,6 +4590,20 @@ fn read_request_line(reader: &mut impl BufRead) -> Option<String> {
     read_request_line_with_idle_retry(reader, false)
 }
 
+/// Read one line under one monotonic operation deadline. Kernel socket
+/// timeouts bound individual reads, so the remaining budget must be re-armed
+/// before every byte; otherwise a peer can retain a guarded artifact forever
+/// by sending each next byte just before a fresh full timeout expires.
+fn read_request_line_until(
+    stream: &CtlStream,
+    reader: &mut impl BufRead,
+    deadline: std::time::Instant,
+) -> Option<String> {
+    read_request_line_with_policy(reader, false, || {
+        stream.set_read_timeout(Some(remaining_artifact_io_budget(deadline)?))
+    })
+}
+
 /// Read one authenticated polling request without imposing an application idle
 /// deadline. Kernel timeout ticks are retried indefinitely, retaining any
 /// partially received line, while EOF and real I/O errors still end the lane.
@@ -3739,8 +4615,17 @@ fn read_request_line_with_idle_retry(
     reader: &mut impl BufRead,
     retry_idle_timeout: bool,
 ) -> Option<String> {
+    read_request_line_with_policy(reader, retry_idle_timeout, || Ok(()))
+}
+
+fn read_request_line_with_policy(
+    reader: &mut impl BufRead,
+    retry_idle_timeout: bool,
+    mut before_read: impl FnMut() -> std::io::Result<()>,
+) -> Option<String> {
     let mut buf = Vec::with_capacity(64);
     loop {
+        before_read().ok()?;
         let mut byte = [0u8; 1];
         match reader.read(&mut byte) {
             Ok(0) => {
@@ -3884,6 +4769,44 @@ fn binary_frame_verb(line: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether this request line is a LENGTH-PREFIXED `post` — the form that carries a
+/// body up to [`crate::fabric::BODY_MAX`] on the stream instead of on the line, so
+/// model-generated text never passes through argv (the `send --stdin` rule applied
+/// to messages). `Some(Ok(n))` announces n bytes; `Some(Err(()))` is a `len=` this
+/// server will not read (over cap or unparseable), which desyncs the stream and
+/// therefore closes the connection.
+///
+/// The scan follows `cmd_post`'s own rule — OPTIONS LEAD, the first token that is
+/// not one begins the inline text — so a `post … hello len=3` whose `len=` sits in
+/// the BODY is not a frame, and the two parsers cannot disagree about where the
+/// text starts. That symmetry is load-bearing: a detector that saw a frame the
+/// handler did not would leave n bytes of body to be read as control verbs.
+fn post_frame_len(line: &str) -> Option<Result<usize, ()>> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let mut it = line.split_whitespace();
+    let tok = match it.next() {
+        Some(t) if t.starts_with('@') => it.next(),
+        other => other,
+    };
+    if tok != Some("post") {
+        return None;
+    }
+    for tok in it {
+        if let Some(v) = tok.strip_prefix("len=") {
+            return Some(match v.parse::<usize>() {
+                Ok(n) if n <= crate::fabric::BODY_MAX => Ok(n),
+                _ => Err(()),
+            });
+        }
+        // The option vocabulary `cmd_post` accepts before the body begins — the
+        // SAME predicate the handler uses, not a copy of it.
+        if !crate::fabric::post_option_token(tok) {
+            return None;
+        }
+    }
+    None
+}
+
 /// Resolve only the target-bearing prefix of a binary input header.  This is
 /// deliberately independent of the length/trailing-argument parser: once an
 /// authenticated client has named a real write verb and target, even a malformed
@@ -3917,8 +4840,11 @@ enum FeedBinFrame {
     Malformed,
     /// Well-formed but the declared length exceeds [`MAX_FEED_BIN`].
     TooLarge,
-    /// A valid frame: optional selector + payload length (`<= MAX_FEED_BIN`).
-    Ok(Option<Selector>, usize),
+    /// A valid frame: optional selector, payload length (`<= MAX_FEED_BIN`), and
+    /// the A6 idempotency key when the line carried one. The key rides the
+    /// HEADER, not the payload, because the payload is opaque bytes and a frame
+    /// whose key is refused must still consume them to keep the stream framed.
+    Ok(Option<Selector>, usize, Option<String>),
 }
 
 /// Parse a `[@<sel>] feed-bin <n>` request line. Pure, so the framing parse is
@@ -3946,12 +4872,27 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
             None => return FeedBinFrame::Malformed,
         }
     };
-    // Reject trailing tokens: the canonical form is exactly `[@sel] feed-bin <n>`.
-    // `feed-bin 1 junk` must NOT parse as a valid 1-byte frame — that would consume
-    // a byte of the following pipelined request line and desync the stream. A
-    // trailing token means the line is malformed (no announced payload), so keep
-    // the connection and consume nothing. (Trailing WHITESPACE is already dropped
-    // by split_whitespace, so only a real extra token trips this.)
+    // Exactly ONE optional trailing token is allowed, and only on `feed-bin`: the
+    // A6 idempotency key `id=<epoch>:<producer>:<seq>` (§11.2). `paste-bin` and
+    // `operator-propose-bin` share this parser and take no key, so their canonical
+    // form stays exactly `[@sel] <verb> <n>`.
+    //
+    // Every OTHER trailing token is still malformed. `feed-bin 1 junk` must NOT
+    // parse as a valid 1-byte frame — that would consume a byte of the following
+    // pipelined request line and desync the stream. A trailing token means the
+    // line is malformed (no announced payload), so keep the connection and consume
+    // nothing. (Trailing WHITESPACE is already dropped by split_whitespace, so only
+    // a real extra token trips this.) A key that is well-formed as a TOKEN but
+    // not as a key is NOT malformed here: the frame announced its payload, so the
+    // payload is read and the refusal comes from the key parser downstream.
+    let idem = match it.next() {
+        None => None,
+        Some(tok) if verb == "feed-bin" => match tok.strip_prefix("id=") {
+            Some(key) => Some(key.to_string()),
+            None => return FeedBinFrame::Malformed,
+        },
+        Some(_) => return FeedBinFrame::Malformed,
+    };
     if it.next().is_some() {
         return FeedBinFrame::Malformed;
     }
@@ -3961,7 +4902,7 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
     if n > MAX_FEED_BIN {
         return FeedBinFrame::TooLarge;
     }
-    FeedBinFrame::Ok(selector, n)
+    FeedBinFrame::Ok(selector, n, idem)
 }
 
 #[derive(Deserialize)]
@@ -4586,17 +5527,26 @@ fn operator_input_error_summary(status: &str) -> Option<String> {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the operator frame's independent collaborators: the header line, the \
+              stream it must consume, the connection scope, the active handle (the \
+              halted session it is self-scoped to), the operator handle, the registry \
+              and the subscribers it notifies, and the writer"
+)]
 fn run_operator_proposal_bin<W: Write>(
     line: &str,
     reader: &mut impl BufRead,
     scope: Scope,
+    active: &ActiveHandle,
     operator: Option<&crate::operator_host::ControlHandle>,
     store: &Store,
     subscribers: &Subscribers,
     writer: &mut W,
 ) -> bool {
     let (selector, n) = match parse_feed_bin(line, "operator-propose-bin") {
-        FeedBinFrame::Ok(selector, n) => (selector, n),
+        // The key arm is `feed-bin`-only in the parser, so this is always `None`.
+        FeedBinFrame::Ok(selector, n, _) => (selector, n),
         FeedBinFrame::Malformed => {
             let _ = writer.write_all(b"ERR usage: operator-propose-bin <n> then <n> JSON bytes\n");
             let _ = writer.flush();
@@ -4612,12 +5562,22 @@ fn run_operator_proposal_bin<W: Write>(
     // touching its body: reading attacker-chosen bytes after an authority,
     // routing, availability, or operator-specific size failure needlessly parks
     // a scarce control lane and contradicts the fail-closed framing contract.
-    let pre_body_error = if !matches!(scope, Scope::Owner) || selector.is_some() {
-        Some("ERR denied\n")
+    // `operator-propose-bin` is on the §5.3 halted list: it hands the embedded
+    // operator an actuation proposal, which is driving. It is self-scoped (a
+    // selector is refused just below), so the held session to ask about is the
+    // active one — the same session every other bare verb on this connection
+    // resolves to. Checked here, at its own interception, for the same reason
+    // `feed-bin` repeats the check: this frame never reaches the dispatch gate.
+    let halted = resolve_active(active)
+        .and_then(|(_, _, _, ctx)| crate::fabric::halt_refusal(&ctx, "operator-propose-bin"));
+    let pre_body_error = if !scope.is_owner_class() || selector.is_some() {
+        Some("ERR denied\n".to_string())
+    } else if let Some(refusal) = halted {
+        Some(refusal)
     } else if operator.is_none() {
-        Some("ERR operator unavailable\n")
+        Some("ERR operator unavailable\n".to_string())
     } else if n > MAX_OPERATOR_PROPOSAL {
-        Some("ERR operator proposal too large\n")
+        Some("ERR operator proposal too large\n".to_string())
     } else {
         None
     };
@@ -4692,6 +5652,55 @@ fn run_feed_bin<W: Write>(
     )
 }
 
+/// Serve one length-prefixed `post`: read the announced body off the stream, then
+/// hand it to the same [`crate::fabric::cmd_post`] the inline form uses.
+///
+/// Returns `false` to CLOSE the connection — only when the stream is unrecoverably
+/// desynced (a length we refuse to read, or a short read mid-frame). Every other
+/// outcome replies and keeps the connection framed.
+///
+/// The authority rule is `post`'s, not `feed`'s: an EDGE-token connection is
+/// refused outright rather than checked for a write edge, because the sender of a
+/// post is attested by the instance Owner and an edge over session S would
+/// otherwise speak as S on the bus. The refusal still consumes the body.
+fn run_post_bin<W: Write>(
+    line: &str,
+    len: Result<usize, ()>,
+    reader: &mut impl BufRead,
+    active: &ActiveHandle,
+    store: &Store,
+    scope: Scope,
+    writer: &mut W,
+) -> bool {
+    let Ok(n) = len else {
+        let _ = writer.write_all(b"ERR too large\n");
+        let _ = writer.flush();
+        return false;
+    };
+    let mut body = vec![0u8; n];
+    if read_exact_authenticated(reader, &mut body).is_err() {
+        return false;
+    }
+    let (selector, verb, rest) = request_head(line);
+    debug_assert_eq!(verb, "post");
+    let target = match selector.as_ref() {
+        None | Some(Selector::SelfTok) => resolve_active(active),
+        Some(sel) => resolve_explicit(store, sel),
+    };
+    let response = match target {
+        _ if post_scope_denied(scope) => "ERR denied\n".to_string(),
+        Some((_, _, _, ctx)) => crate::fabric::cmd_post(&ctx, rest, Some(body)),
+        None if matches!(selector, Some(Selector::Local(_) | Selector::Sid(_))) => {
+            "ERR no such session\n".to_string()
+        }
+        None => NO_ACTIVE_TERMINAL.to_string(),
+    };
+    if writer.write_all(response.as_bytes()).is_err() {
+        return false;
+    }
+    writer.flush().is_ok()
+}
+
 #[derive(Clone, Copy)]
 struct FeedBinRoute<'a> {
     active: &'a ActiveHandle,
@@ -4732,7 +5741,7 @@ where
             Some(sel) => resolve_explicit(route.store, sel),
         });
     let header_authorized = header_target.as_ref().is_some_and(|(_, _, _, ctx)| {
-        matches!(route.scope, Scope::Owner) || cross_session_authorized(route.scope, "feed", ctx)
+        route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx)
     });
     if header_authorized && let Some((_, _, session, _)) = header_target.as_ref() {
         let response = clear_license(*session);
@@ -4746,8 +5755,8 @@ where
         }
     }
 
-    let (selector, n) = match parse_feed_bin(line, verb) {
-        FeedBinFrame::Ok(selector, n) => (selector, n),
+    let (selector, n, idem_key) = match parse_feed_bin(line, verb) {
+        FeedBinFrame::Ok(selector, n, idem) => (selector, n, idem),
         FeedBinFrame::Malformed => {
             // No parseable length ⇒ no payload was announced; a client that merely
             // typo'd the verb stays framed. No payload read.
@@ -4789,7 +5798,7 @@ where
         Some(sel) => resolve_explicit(route.store, sel),
     };
     let authorized = target.as_ref().is_some_and(|(_, _, _, ctx)| {
-        matches!(route.scope, Scope::Owner) || cross_session_authorized(route.scope, "feed", ctx)
+        route.scope.is_owner_class() || cross_session_authorized(route.scope, "feed", ctx)
     });
 
     // The binary paste twin has the same hybrid target contract as inline
@@ -4797,7 +5806,7 @@ where
     // bare/self paste with native front content enters the main-thread input
     // seam. `feed-bin` remains raw PTY input and can never take this branch.
     if paste {
-        let principal = if matches!(route.scope, Scope::Owner) {
+        let principal = if route.scope.is_owner_class() {
             NativeControlPrincipal::Owner
         } else {
             NativeControlPrincipal::Edge
@@ -4876,6 +5885,17 @@ where
         return false;
     }
 
+    // THE FLEET HALT: `feed-bin`/`paste-bin` reach the PTY HERE, intercepted in
+    // `serve` before `handle()`, so they bypass the verb-dispatch halt gate the
+    // same way they bypass the self-feed floor below. Repeat it against the
+    // RESOLVED target, so a cross-session binary frame into a held session is
+    // refused too. The payload is already consumed, so the stream stays framed.
+    if let Some(refusal) = crate::fabric::halt_refusal(&ctx, verb) {
+        let _ = writer.write_all(refusal.as_bytes());
+        let _ = writer.flush();
+        return true;
+    }
+
     // TURN LEASE: `feed-bin` reaches the PTY HERE, bypassing the verb-dispatch
     // fast-fail that refuses `send/key/feed/…` while a turn holds the lease. Without
     // this mirror, raw bytes interleave into a mid-flight turn every other write verb
@@ -4912,50 +5932,54 @@ where
     // / `@<sid>` that resolves back to the visible tab. Pass the exact session
     // target so a racing tab switch degrades to hidden-session delivery rather
     // than pasting into whichever tab became front.
-    if front_terminal_session == Some(target_session) {
-        let event = if paste {
-            InputEvent::Paste(
-                String::from_utf8_lossy(&payload).into_owned(),
-                PasteFraming::AtDrain,
-            )
-        } else {
-            // Raw front-session input is not the user's fingers. It still
-            // enters App::input so that seam closes any older licence before
-            // writing the exact bytes. The direct route below retains its
-            // background egress but runs an explicit session-wide fence first,
-            // because another window may still present that session.
-            InputEvent::KeySequence(payload.clone())
-        };
-        let response = match dispatch_front_input(event, Some(target_session)) {
-            Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
-            Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
-            Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
-            Err(error) => error,
-        };
-        if writer.write_all(response.as_bytes()).is_err() {
-            return false;
+    // A6: the exactly-once gate, wrapped around the write and NOTHING else — every
+    // refusal above (authority, the halt, the turn lease, the self-feed floor)
+    // must answer without consuming the key's sequence. `feed-bin` is the verb the
+    // bridge's in-doubt window actually sits on, so this is the call site that
+    // closes §6.5's last DESIGNED row; a frame with no `id=` runs the closure
+    // unguarded and is byte-identical to the pre-A6 wire.
+    let response = crate::pty_idem::guarded(&ctx, route.scope, verb, idem_key.as_deref(), || {
+        if front_terminal_session == Some(target_session) {
+            let event = if paste {
+                InputEvent::Paste(
+                    String::from_utf8_lossy(&payload).into_owned(),
+                    PasteFraming::AtDrain,
+                )
+            } else {
+                // Raw front-session input is not the user's fingers. It still
+                // enters App::input so that seam closes any older licence before
+                // writing the exact bytes. The direct route below retains its
+                // background egress but runs an explicit session-wide fence first,
+                // because another window may still present that session.
+                InputEvent::KeySequence(payload.clone())
+            };
+            return match dispatch_front_input(event, Some(target_session)) {
+                Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
+                Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
+                Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
+                Err(error) => error,
+            };
         }
-        return writer.flush().is_ok();
-    }
 
-    if paste {
-        // PASTE semantics: run the payload through `format_paste` under the target's
-        // lock (bracketed-paste guards when DECSET 2004 is on + control-byte sanitize
-        // + LF->CR), exactly as the `paste` verb does — then write the transformed
-        // bytes. Reading the mode HERE, as the bytes are made, IS the verb's framing
-        // contract (`PasteFraming::AtDrain`): a driver was shown no confirmation, so
-        // there is no earlier answer to keep faith with. A human Cmd-V differs on
-        // purpose — it carries the mode its confirmation was judged under. The payload
-        // is interpreted as UTF-8 (lossy): a paste is text, and the sanitizer would
-        // strip raw control bytes anyway.
-        let text = String::from_utf8_lossy(&payload);
-        let out = term_lock(&term).format_paste(&text);
-        control_input::write_pty(&ctx.sink, &out);
-    } else {
-        control_input::write_pty(&ctx.sink, &payload);
-    }
-    let reply = format!("OK {n} bytes\n");
-    if writer.write_all(reply.as_bytes()).is_err() {
+        if paste {
+            // PASTE semantics: run the payload through `format_paste` under the target's
+            // lock (bracketed-paste guards when DECSET 2004 is on + control-byte sanitize
+            // + LF->CR), exactly as the `paste` verb does — then write the transformed
+            // bytes. Reading the mode HERE, as the bytes are made, IS the verb's framing
+            // contract (`PasteFraming::AtDrain`): a driver was shown no confirmation, so
+            // there is no earlier answer to keep faith with. A human Cmd-V differs on
+            // purpose — it carries the mode its confirmation was judged under. The payload
+            // is interpreted as UTF-8 (lossy): a paste is text, and the sanitizer would
+            // strip raw control bytes anyway.
+            let text = String::from_utf8_lossy(&payload);
+            let out = term_lock(&term).format_paste(&text);
+            control_input::write_pty(&ctx.sink, &out);
+        } else {
+            control_input::write_pty(&ctx.sink, &payload);
+        }
+        format!("OK {n} bytes\n")
+    });
+    if writer.write_all(response.as_bytes()).is_err() {
         return false;
     }
     writer.flush().is_ok()
@@ -5203,7 +6227,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // is indistinguishable from a hang, and fail-closed matches the rest of the
     // surface. (`InstanceStreams::authorize` re-applies the same rule as a type-level
     // invariant, so a future caller that forgets this refusal still cannot grant it.)
-    if req.instance.sessions && !matches!(scope, Scope::Owner) {
+    if req.instance.sessions && !scope.is_owner_class() {
         log_denial(
             AUDIT_SUBSYSTEM,
             "subscribe -> sessions",
@@ -5238,7 +6262,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
     // the same rule as a type-level invariant, so this refusal cannot be lost by
     // a future caller.
     let adopt_all = sel_tok == "@*";
-    if adopt_all && !matches!(scope, Scope::Owner) {
+    if adopt_all && !scope.is_owner_class() {
         log_denial(
             AUDIT_SUBSYSTEM,
             "subscribe -> @*",
@@ -5327,7 +6351,7 @@ fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
         // allowed" let an edge scoped to session B read whatever tab became frontmost
         // after a tab/window switch (the global ActiveHandle retargets `@.`) — the
         // same confused-deputy read escape `handle()`'s self gate closes.
-        if !matches!(scope, Scope::Owner) && !cross_session_authorized(scope, "subscribe", &ctx) {
+        if !scope.is_owner_class() && !cross_session_authorized(scope, "subscribe", &ctx) {
             log_denial(
                 AUDIT_SUBSYSTEM,
                 &format!("subscribe -> {}", ctx.self_id.as_str()),
@@ -5508,7 +6532,7 @@ fn dispatch_authorized(scope: Scope, verb: &str, rest: &str, target_ctx: &Sessio
         // a fine-op escalation is decided (like the base gate) by `scope_holds_op` — an
         // edge granted exactly that op passes, a plain WriteInput edge does not. Owner
         // satisfies both (it is the `Scope::Owner` short-circuit in `scope_holds_op`).
-        Some(Escalation::OwnerOnly) => matches!(scope, Scope::Owner),
+        Some(Escalation::OwnerOnly) => scope.is_owner_class(),
         Some(Escalation::Op(need)) => scope_holds_op(scope, need, target_ctx),
         // No escalation: fall back to the verb's base required op (None => unknown verb,
         // default-DENY).
@@ -5549,7 +6573,7 @@ fn front_drive_escalation(
     verb: &str,
     surface: FrontControlSurface,
 ) -> Option<Escalation> {
-    if matches!(scope, Scope::Owner) || !is_front_driving_verb(verb) {
+    if scope.is_owner_class() || !is_front_driving_verb(verb) {
         return None;
     }
     match surface {
@@ -6180,9 +7204,10 @@ fn handle(
     // already resolved it, so naming it here costs nothing and lets an explicit
     // `@<sid>` for that tab take the App input seam (see `front_routed_input`).
     front_active_session: Option<u64>,
-    // Artifact verbs park their exact-handle guard here: it must outlive this
-    // `String` body all the way to the socket write and the client's ACK.
-    reply_retention: &mut Option<ReplyRetention>,
+    // Artifact verbs park their handoff here: it must outlive this `String`
+    // body through the bounded socket write. Published paths additionally wait
+    // for the client's ACK; in-memory bytes release after flush.
+    reply_retention: &mut Option<ReplyHandoff>,
 ) -> String {
     // Tolerate CRLF clients; the protocol itself is bare-LF terminated.
     let line = line.strip_suffix('\r').unwrap_or(line);
@@ -6223,6 +7248,14 @@ fn handle(
             // supports from a running instance (`verbs` is the alias); `rest` picks
             // the short catalog, one verb's full entry, or the complete catalog.
             "help" | "verbs" => cmd_help(rest),
+            // The macOS consent posture behind EPERM: Full Disk Access, the
+            // signing identity a grant is keyed to, and one row per live
+            // session. Self-scoped — a selector would read as a per-session
+            // claim this instance-wide verb does not make, so it is refused.
+            "privacy" => match selector {
+                None | Some(Selector::SelfTok) => crate::control_privacy::cmd_privacy(rest, proxy),
+                Some(_) => crate::control_privacy::no_selector_error().to_string(),
+            },
             // The AnyScopeMeta set is pinned by the table test
             // `access_exceptions_are_exactly_the_declared_sets`, so every member has a
             // handler above.
@@ -6243,7 +7276,7 @@ fn handle(
         if !matches!(selector, None | Some(Selector::SelfTok)) {
             return "ERR denied\n".to_string();
         }
-        if !matches!(scope, Scope::Owner) {
+        if !scope.is_owner_class() {
             return "ERR denied\n".to_string();
         }
         return match verb {
@@ -6301,6 +7334,15 @@ fn handle(
         };
     }
 
+    // The BRIDGE PLANE. Production answers `deliver`/`hold` in
+    // `dispatch_before_session` (they need no session and the bridge may be this
+    // instance's only connection), so this is defense in depth for a caller that
+    // reaches `handle` directly — and it calls the SAME decision function, so the
+    // two entries cannot drift into disagreeing about who may deliver.
+    if let Some(response) = dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, store) {
+        return response;
+    }
+
     // Resolve the dispatch target. No selector (or `@.`) => the verbatim self
     // tuple (zero regression). Otherwise resolve the sibling from the registry.
     let self_tuple: Target = (
@@ -6332,23 +7374,22 @@ fn handle(
     // escalation: Settings -> ConfigWrite; any transient overlay -> Owner-only.
     // Owner and cross-session requests never take this hop.  A failed hop is an
     // authorization failure, never "no surface" (fail closed).
-    let front_surface =
-        if !is_cross && !matches!(scope, Scope::Owner) && is_front_driving_verb(verb) {
-            match control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }) {
-                Ok(surface) => surface,
-                Err(error) => {
-                    log_denial(
-                        AUDIT_SUBSYSTEM,
-                        &format!("self {verb} front-surface authorization failed"),
-                        aterm_containment::mode_or_containment(),
-                        &format!("could not observe front input authority: {error}"),
-                    );
-                    return "ERR denied\n".to_string();
-                }
+    let front_surface = if !is_cross && !scope.is_owner_class() && is_front_driving_verb(verb) {
+        match control_media::call_main(proxy, |reply| Wake::FrontControlSurface { reply }) {
+            Ok(surface) => surface,
+            Err(error) => {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("self {verb} front-surface authorization failed"),
+                    aterm_containment::mode_or_containment(),
+                    &format!("could not observe front input authority: {error}"),
+                );
+                return "ERR denied\n".to_string();
             }
-        } else {
-            FrontControlSurface::None
-        };
+        }
+    } else {
+        FrontControlSurface::None
+    };
     let front_escalation = front_drive_escalation(scope, verb, front_surface);
 
     // Op-scope gate (design 7.2). EXHAUSTIVE, fail-closed. Gates on the EFFECTIVE op
@@ -6377,7 +7418,7 @@ fn handle(
             );
             return "ERR denied\n".to_string();
         }
-    } else if !matches!(scope, Scope::Owner)
+    } else if !scope.is_owner_class()
         && !front_escalation.map_or_else(
             || dispatch_authorized(scope, verb, rest, ctx),
             |need| scope_holds_escalation(scope, need, ctx),
@@ -6453,6 +7494,16 @@ fn handle(
         }
     }
 
+    // A6: take a LEADING `id=<key>` off the four verbs that accept one
+    // (`crate::pty_idem::KEYED_VERBS`), so every arm below parses the SAME tail
+    // it always did. Stripped HERE, after the op-scope gate (which reads the raw
+    // `rest` for the `invoke`/`open` escalation) and before the halt gate, the
+    // self-feed floor and the turn arbitration — all of which must refuse a
+    // request whether or not it carries a key, and must refuse it WITHOUT
+    // consuming the key's sequence.
+    let (idem_key, rest) = crate::pty_idem::take_key(verb, rest);
+    let rest: &str = &rest;
+
     // Every AUTHORIZED control attempt that can inject bytes, signal the
     // child, or mutate its cursor coordinate space is a newer input boundary —
     // even when its arguments are malformed and dispatch later returns an
@@ -6478,6 +7529,26 @@ fn handle(
         if !cleared.starts_with("OK") {
             return cleared;
         }
+    }
+
+    // THE FLEET HALT (design §5.3). Every PTY-reaching verb resolving to a HELD
+    // session answers `ERR halted <reason>` — a TRANSIENT class beside `ERR busy`,
+    // so a driver's existing back-off already does the right thing.
+    //
+    // FROM ANY SCOPE, Owner and Bridge included: a halt only the unprivileged obey
+    // is decoration, and the whole point of putting `hold` behind `Scope::Bridge`
+    // is that the halted party cannot be the one who lifts it. Placed HERE, after
+    // authorization, so an unauthorized caller still learns nothing about the
+    // target's state, and beside the self-feed floor because the two are the same
+    // kind of thing: un-bypassable per-session refusals at the one seam every
+    // socket-driven PTY write passes. `feed-bin`/`paste-bin` are intercepted
+    // BEFORE this dispatch and repeat the check in `run_feed_bin_routed`, exactly
+    // as the floor does; `operator-propose-bin` repeats it at its own interception.
+    // The verb list is `fabric::is_pty_reaching`, which is the §5.3 set and
+    // nothing else: `post`, `inbox seen`, `meta set`, `lease` and every read verb
+    // stay answerable, because a halted agent must still be able to ask why.
+    if let Some(refusal) = crate::fabric::halt_refusal(ctx, verb) {
+        return refusal;
     }
 
     // D3: the un-bypassable SELF-FEED FLOOR. Every self-targeted input-injection
@@ -6522,7 +7593,13 @@ fn handle(
         }
     }
 
-    let resp = match verb {
+    // A6: the PTY seam's exactly-once gate. Placed HERE — after every refusal
+    // that is decided before a byte can move (authority, halt, self-feed floor,
+    // turn arbitration) and immediately around the arm that writes — so a
+    // sequence is consumed only by an attempt that actually reached the seam.
+    // A request with no `id=` runs the closure unguarded, byte-identically to
+    // before this rung.
+    let resp = crate::pty_idem::guarded(ctx, scope, verb, idem_key.as_deref(), || match verb {
         // `text [trim]`: the arm RECEIVES its argument tail. It used to call the
         // bare emitter and drop `rest` on the floor, so `text trim` (or any guessed
         // modifier) returned the full grid with no `ERR usage` — an agent could not
@@ -6543,11 +7620,52 @@ fn handle(
         // as `ReadScreen` like every other read verb; cross-session reads a sibling's
         // table through the same `@<selector>` resolution + gate.
         "edges" | "grants" => control_session::cmd_edges(ctx),
+        // `inbox` — the session's FABRIC MAILBOX, three sub-forms under one
+        // keyword: the bare listing (`Lines`), `inbox get <id>` (a byte body) and
+        // `inbox seen <id>` (a status line). The keyword is `Read`-classed and
+        // `escalated_op` raises `seen` to `WriteInput`, the `meta set` shape, so a
+        // read-only edge can read this session's mail but never mark it handled.
+        "inbox" => crate::fabric::cmd_inbox_verb(ctx, rest),
+        // `post` — queue one outbound fabric message. REFUSES an edge-token
+        // connection in the handler (a documented per-handler check, like
+        // `family`'s explicit-sid form): a write-input edge over session S would
+        // otherwise speak AS S on the bus, and the sender of a post must be
+        // attested by the instance Owner. Exempt from `hold` on purpose — a halted
+        // agent must still be able to `post kind=ask "why am I halted?"`.
+        // The length-prefixed body form is intercepted in the serve loop (it must
+        // read the frame off the stream); this arm serves the inline-text form.
+        "post" => {
+            if post_scope_denied(scope) {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("post -> {}", ctx.self_id.as_str()),
+                    aterm_containment::mode_or_containment(),
+                    "post is attested by the instance owner; an edge cannot speak as a session",
+                );
+                return "ERR denied\n".to_string();
+            }
+            crate::fabric::cmd_post(ctx, rest, None)
+        }
         // `lease`: the explicit COOPERATIVE drive lease for raw (non-`turn`) drivers.
         // op-class Write (a driving assertion — cross-session needs a write edge), but
         // deliberately NOT in the write-arbitration seam above (it MANAGES the lease,
         // it does not inject input), so `lease status`/`release` answer even mid-turn.
-        "lease" => control_session::cmd_lease(ctx, rest),
+        //
+        // THE `fabric:` NAMESPACE IS THE BRIDGE'S (§11.2), which is why the gate is
+        // here and not inside `cmd_lease`: this is the seam that knows the
+        // connection's SCOPE. See [`lease_forges_fabric_holder`].
+        "lease" => {
+            if lease_forges_fabric_holder(scope, rest) {
+                log_denial(
+                    AUDIT_SUBSYSTEM,
+                    &format!("lease acquire holder=fabric:* -> {}", ctx.self_id.as_str()),
+                    aterm_containment::mode_or_containment(),
+                    "the `fabric:` lease namespace is the bridge connection's;                      authority is a connection, never a name",
+                );
+                return "ERR denied\n".to_string();
+            }
+            control_session::cmd_lease(ctx, rest)
+        }
         // `family [<sid>]`: the session HIERARCHY (parent + children) for a target,
         // from the registry's parent links. The no-arg form walks from the RESOLVED
         // (gated) session; an EXPLICIT `<sid>` argument walks an ARBITRARY node, so it
@@ -6564,7 +7682,15 @@ fn handle(
         // predicates, so it works for alt-screen agent TUIs (Claude) — unlike
         // `wait` (OSC-133-only). Registers a subscriber so it wakes on output AND at
         // the idle deadline — no fixed-interval poll.
-        "await" => control_session::cmd_await(term, store, session, rest, subscribers),
+        // `await consent` is NOT an Observation-Kernel predicate: its evidence is
+        // the instance's consent posture, not this terminal's content, so it
+        // takes the main-thread posture hop instead of a `WatcherSpec`. Split
+        // here rather than inside `cmd_await` so the kernel path keeps its exact
+        // grammar and its `term`-only inputs.
+        "await" if rest.split_whitespace().next() == Some("consent") => {
+            crate::control_privacy::cmd_await_consent(proxy, session, rest)
+        }
+        "await" => control_session::cmd_await(term, store, session, ctx, rest, subscribers),
         // `turn`: one complete human turn — type text (paste semantics), VERIFIED
         // submit (content_seq must advance, else re-press: the server-side fix for
         // the client-racy paste-chip/Enter seam), settle, return the settled screen.
@@ -6576,7 +7702,7 @@ fn handle(
         // input-API-blind): cross = the source-blind seam on the resolved target,
         // self = the event-loop seam, exactly like the plain `paste`/`key` arms.
         "turn" => {
-            if !matches!(scope, Scope::Owner) && !cross_session_authorized(scope, "text", ctx) {
+            if !scope.is_owner_class() && !cross_session_authorized(scope, "text", ctx) {
                 log_denial(
                     AUDIT_SUBSYSTEM,
                     &format!("turn -> {}", ctx.self_id.as_str()),
@@ -6811,7 +7937,7 @@ fn handle(
         // and correlate pre-routing input attempts with later submitted frames; the
         // tap does not observe compositor selection or scanout. `keys` is owner-only
         // (enforced inside); its samples are not PTY-delivery or glyph receipts.
-        "video" => control_media::cmd_video(proxy, rest, sock_dir, matches!(scope, Scope::Owner))
+        "video" => control_media::cmd_video(proxy, rest, sock_dir, scope.is_owner_class())
             .into_body_retaining(reply_retention),
         // `chrome`: the resolved instance's front window native UI (app-level; `@<sid>`
         // routes to the instance, per the rule above — `@peer chrome` reads the peer's).
@@ -6839,6 +7965,10 @@ fn handle(
         // the classifier. Read-only and App-level like `rain status` (`@peer tone`
         // reads the peer's front window).
         "tone" => control_media::cmd_tone(proxy, rest),
+        // `streak [status]`: the FRONT window's PRISM WAKE state — every gate
+        // between program output and a comet. Read-only and App-level like
+        // `tone` (`@peer streak` reads the peer's front window).
+        "streak" => control_media::cmd_streak(proxy, rest),
         // `trail [status|<n>]`: the FOCUSED window's cursor-trail diagnostics.
         // The `<n>` form prints the last n spawn-seam verdicts from the
         // engine's diagnostic ring — licensed/declined + reason
@@ -7042,7 +8172,7 @@ fn handle(
         "status" => control_media::cmd_session_status(proxy, session, rest),
         // `sessions`/`grant`/`revoke`/`whoami` are handled SELF-SCOPED above.
         _ => "ERR unknown verb (try: help)\n".to_string(),
-    };
+    });
     // R13: stamp the `content_seq` baseline on a successful input-write reply so a
     // driver can correlate its own input with the resulting output race-free:
     //   read a seq -> write (send/key/…) -> `await seq <that+1>` for the response.
@@ -7255,6 +8385,506 @@ mod tests {
         }
     }
 
+    #[test]
+    fn artifact_handoff_permits_bound_and_release_capacity() {
+        const CHARGE: usize = 2;
+        const DESCRIPTOR_LIMIT: usize = 6;
+        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+        let model = aterm_spec::derive::artifact_handoff_capacity_model();
+        type CapacityState = (usize, usize, [usize; 3], usize);
+        let project = |state: CapacityState| {
+            crate::artifact_transaction_conformance::project_artifact_handoff_capacity(
+                &model,
+                crate::artifact_transaction_conformance::ArtifactHandoffCapacityObservation {
+                    live: i64::try_from(state.0).unwrap(),
+                    descriptor_units: i64::try_from(state.1).unwrap(),
+                    charge_one: i64::try_from(state.2[0]).unwrap(),
+                    charge_two: i64::try_from(state.2[1]).unwrap(),
+                    charge_three: i64::try_from(state.2[2]).unwrap(),
+                    selected: i64::try_from(state.3).unwrap(),
+                },
+            )
+        };
+        let validate = |action: &str, before: CapacityState, after: CapacityState| {
+            let (conforms, evidence) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                &project(before),
+                &project(after),
+                Some(action),
+                "artifact handoff capacity",
+            );
+            assert!(conforms, "{action} {before:?}->{after:?}: {evidence}");
+        };
+
+        let mut permits = Vec::new();
+        let descriptor_slots = DESCRIPTOR_LIMIT / CHARGE;
+        for before in 0..descriptor_slots {
+            permits.push(
+                ArtifactHandoffPermit::try_acquire_from(
+                    &USAGE,
+                    ARTIFACT_HANDOFF_LIMIT,
+                    DESCRIPTOR_LIMIT,
+                    CHARGE,
+                )
+                .unwrap(),
+            );
+            validate(
+                "Acquire",
+                (before, before * CHARGE, [0, before, 0], CHARGE),
+                (
+                    before + 1,
+                    (before + 1) * CHARGE,
+                    [0, before + 1, 0],
+                    CHARGE,
+                ),
+            );
+        }
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            ArtifactHandoffUsage {
+                live: descriptor_slots,
+                descriptor_units: DESCRIPTOR_LIMIT,
+            }
+        );
+        assert!(
+            ArtifactHandoffPermit::try_acquire_from(
+                &USAGE,
+                ARTIFACT_HANDOFF_LIMIT,
+                DESCRIPTOR_LIMIT,
+                CHARGE,
+            )
+            .is_none()
+        );
+        validate(
+            "RefuseAtCap",
+            (
+                descriptor_slots,
+                DESCRIPTOR_LIMIT,
+                [0, descriptor_slots, 0],
+                CHARGE,
+            ),
+            (
+                descriptor_slots,
+                DESCRIPTOR_LIMIT,
+                [0, descriptor_slots, 0],
+                CHARGE,
+            ),
+        );
+
+        let (overbooked, evidence) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &project((
+                descriptor_slots,
+                DESCRIPTOR_LIMIT,
+                [0, descriptor_slots, 0],
+                CHARGE,
+            )),
+            &project((
+                descriptor_slots + 1,
+                DESCRIPTOR_LIMIT + CHARGE,
+                [0, descriptor_slots + 1, 0],
+                CHARGE,
+            )),
+            Some("Acquire"),
+            "artifact handoff overbook negative control",
+        );
+        assert!(
+            !overbooked,
+            "an Acquire at capacity must be rejected: {evidence}"
+        );
+
+        while let Some(permit) = permits.pop() {
+            let before = {
+                let usage = USAGE.lock().unwrap();
+                (usage.live, usage.descriptor_units)
+            };
+            drop(permit);
+            validate(
+                "Release",
+                (before.0, before.1, [0, before.0, 0], CHARGE),
+                (
+                    before.0 - 1,
+                    before.1 - CHARGE,
+                    [0, before.0 - 1, 0],
+                    CHARGE,
+                ),
+            );
+        }
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut reconciled = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("provisional charge fits");
+        validate(
+            "Acquire",
+            (0, 0, [0, 0, 0], CHARGE),
+            (1, CHARGE, [0, 1, 0], CHARGE),
+        );
+        assert!(reconciled.try_reconcile_descriptor_units(CHARGE + 1));
+        validate(
+            "ReconcileGrow",
+            (1, CHARGE, [0, 1, 0], CHARGE),
+            (1, CHARGE + 1, [0, 0, 1], CHARGE + 1),
+        );
+        drop(reconciled);
+        validate(
+            "Release",
+            (1, CHARGE + 1, [0, 0, 1], CHARGE + 1),
+            (0, 0, [0, 0, 0], CHARGE + 1),
+        );
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut reconciled = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("second provisional charge fits");
+        assert!(reconciled.try_reconcile_descriptor_units(CHARGE - 1));
+        validate(
+            "ReconcileShrink",
+            (1, CHARGE, [0, 1, 0], CHARGE),
+            (1, CHARGE - 1, [1, 0, 0], CHARGE - 1),
+        );
+        drop(reconciled);
+        validate(
+            "Release",
+            (1, CHARGE - 1, [1, 0, 0], CHARGE - 1),
+            (0, 0, [0, 0, 0], CHARGE - 1),
+        );
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let in_memory = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("byte reply provisional charge fits");
+        struct AccountedCapabilityProbe {
+            usage: &'static Mutex<ArtifactHandoffUsage>,
+            expected_units: usize,
+        }
+
+        impl Drop for AccountedCapabilityProbe {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.usage.lock().unwrap().descriptor_units,
+                    self.expected_units,
+                    "the accounted capability must close before its charge shrinks"
+                );
+            }
+        }
+
+        let retention = ReplyRetentionPermit(in_memory).release_path_and_retain_in_memory(
+            AccountedCapabilityProbe {
+                usage: &USAGE,
+                expected_units: CHARGE,
+            },
+        );
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            ArtifactHandoffUsage {
+                live: 1,
+                descriptor_units: 1,
+            },
+            "dropping the path capability releases its descriptor charge"
+        );
+        validate(
+            "ReconcileShrink",
+            (1, CHARGE, [0, 1, 0], CHARGE),
+            (1, 1, [1, 0, 0], 1),
+        );
+        drop(retention);
+        validate("Release", (1, 1, [1, 0, 0], 1), (0, 0, [0, 0, 0], 1));
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut grown = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("mixed-charge first permit fits");
+        assert!(grown.try_reconcile_descriptor_units(CHARGE + 1));
+        let ordinary = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("mixed-charge second permit fits");
+        validate("Acquire", (1, 3, [0, 0, 1], 3), (2, 5, [0, 1, 1], 2));
+        drop(ordinary);
+        validate("Release", (2, 5, [0, 1, 1], 2), (1, 3, [0, 0, 1], 2));
+        validate("SelectThree", (1, 3, [0, 0, 1], 2), (1, 3, [0, 0, 1], 3));
+        drop(grown);
+        validate("Release", (1, 3, [0, 0, 1], 3), (0, 0, [0, 0, 0], 3));
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut grown = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("reverse-order first permit fits");
+        assert!(grown.try_reconcile_descriptor_units(CHARGE + 1));
+        let ordinary = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("reverse-order second permit fits");
+        validate("SelectThree", (2, 5, [0, 1, 1], 2), (2, 5, [0, 1, 1], 3));
+        drop(grown);
+        validate("Release", (2, 5, [0, 1, 1], 3), (1, 2, [0, 1, 0], 3));
+        validate("SelectTwo", (1, 2, [0, 1, 0], 3), (1, 2, [0, 1, 0], 2));
+        drop(ordinary);
+        validate("Release", (1, 2, [0, 1, 0], 2), (0, 0, [0, 0, 0], 2));
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut small = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("far-refusal selected permit fits");
+        assert!(small.try_reconcile_descriptor_units(1));
+        let ordinary_a = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("far-refusal first competing permit fits");
+        let ordinary_b = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            CHARGE,
+        )
+        .expect("far-refusal second competing permit fits");
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            ArtifactHandoffUsage {
+                live: 3,
+                descriptor_units: 5,
+            }
+        );
+        assert!(
+            !small.try_reconcile_descriptor_units(3),
+            "a direct one-to-three jump cannot consume two units of one-unit headroom"
+        );
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            ArtifactHandoffUsage {
+                live: 3,
+                descriptor_units: 5,
+            },
+            "failed far reconciliation leaves the original charge intact"
+        );
+        validate(
+            "RefuseReconcile",
+            (3, 5, [1, 2, 0], 1),
+            (3, 5, [1, 2, 0], 1),
+        );
+        drop(small);
+        validate("Release", (3, 5, [1, 2, 0], 1), (2, 4, [0, 2, 0], 1));
+        validate("SelectTwo", (2, 4, [0, 2, 0], 1), (2, 4, [0, 2, 0], 2));
+        drop(ordinary_a);
+        validate("Release", (2, 4, [0, 2, 0], 2), (1, 2, [0, 1, 0], 2));
+        drop(ordinary_b);
+        validate("Release", (1, 2, [0, 1, 0], 2), (0, 0, [0, 0, 0], 2));
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut saturated = (0..descriptor_slots)
+            .map(|_| {
+                ArtifactHandoffPermit::try_acquire_from(
+                    &USAGE,
+                    ARTIFACT_HANDOFF_LIMIT,
+                    DESCRIPTOR_LIMIT,
+                    CHARGE,
+                )
+                .expect("representative charge fits")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !saturated[0].try_reconcile_descriptor_units(CHARGE + 1),
+            "exact pinned depth cannot grow past aggregate capacity"
+        );
+        validate(
+            "RefuseReconcile",
+            (
+                descriptor_slots,
+                DESCRIPTOR_LIMIT,
+                [0, descriptor_slots, 0],
+                CHARGE,
+            ),
+            (
+                descriptor_slots,
+                DESCRIPTOR_LIMIT,
+                [0, descriptor_slots, 0],
+                CHARGE,
+            ),
+        );
+        while let Some(permit) = saturated.pop() {
+            drop(permit);
+        }
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut count_permits = Vec::new();
+        for _ in 0..ARTIFACT_HANDOFF_LIMIT {
+            count_permits.push(
+                ArtifactHandoffPermit::try_acquire_from(
+                    &USAGE,
+                    ARTIFACT_HANDOFF_LIMIT,
+                    usize::MAX,
+                    1,
+                )
+                .expect("count slot remains available"),
+            );
+        }
+        assert!(
+            ArtifactHandoffPermit::try_acquire_from(&USAGE, ARTIFACT_HANDOFF_LIMIT, usize::MAX, 1,)
+                .is_none(),
+            "object count refuses work independently of descriptor capacity"
+        );
+        drop(count_permits);
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let deep = ArtifactHandoffPermit::try_acquire_from(
+            &USAGE,
+            ARTIFACT_HANDOFF_LIMIT,
+            DESCRIPTOR_LIMIT,
+            DESCRIPTOR_LIMIT - 2,
+        )
+        .expect("one deep request fits the descriptor budget");
+        assert!(
+            ArtifactHandoffPermit::try_acquire_from(
+                &USAGE,
+                ARTIFACT_HANDOFF_LIMIT,
+                DESCRIPTOR_LIMIT,
+                3,
+            )
+            .is_none(),
+            "descriptor saturation refuses work before the object-count cap"
+        );
+        drop(deep);
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+        assert!(
+            ArtifactHandoffPermit::try_acquire_from(
+                &USAGE,
+                ARTIFACT_HANDOFF_LIMIT,
+                DESCRIPTOR_LIMIT,
+                DESCRIPTOR_LIMIT + 1,
+            )
+            .is_none(),
+            "a single over-budget descriptor charge must be refused"
+        );
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+    }
+
+    /// Drive the shipping reservation through a real failed ACK. The permit
+    /// must remain charged while its guard is in the process-global quarantine,
+    /// then return only when the quarantine reaper drops that guard.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn quarantined_reply_holds_production_handoff_capacity() {
+        const CHILD: &str = "ATERM_TEST_ARTIFACT_HANDOFF_QUARANTINE";
+        if !crate::control_auth::enter_low_nofile_test_child(
+            CHILD,
+            "control::tests::quarantined_reply_holds_production_handoff_capacity",
+            96,
+        ) {
+            return;
+        }
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let retention = ReplyRetention::try_new(WireProbe {
+            alive: Arc::clone(&alive),
+            prepared,
+            fail_prepare: false,
+        })
+        .unwrap_or_else(|_| panic!("first production permit is available"));
+        let reply = ControlReply::guarded("OK guarded\n".to_string(), Some(retention));
+        let mut wire = Vec::new();
+        let pending = write_control_reply(&mut wire, reply)
+            .expect("wire write")
+            .expect("guarded reply");
+        let (mut client, server) = CtlStream::pair().unwrap();
+        client.write_all(b"ACK wrong\n").unwrap();
+        client.flush().unwrap();
+        let mut reader = BufReader::new(&server);
+        assert_eq!(
+            await_guarded_reply_close_with_quarantine(
+                &server,
+                &mut reader,
+                pending,
+                std::time::Duration::from_secs(1),
+            ),
+            ArtifactAckOutcome::AcknowledgementQuarantined
+        );
+        assert!(alive.load(Ordering::Acquire));
+
+        let mut admitted = Vec::new();
+        for _ in 1..ARTIFACT_HANDOFF_LIMIT {
+            admitted.push(
+                ReplyRetention::try_new(WireProbe {
+                    alive: Arc::new(AtomicBool::new(true)),
+                    prepared: Arc::new(AtomicBool::new(false)),
+                    fail_prepare: false,
+                })
+                .unwrap_or_else(|_| panic!("capacity below the quarantined reply remains usable")),
+            );
+        }
+        let refused_alive = Arc::new(AtomicBool::new(true));
+        let refused = ReplyRetention::try_new(WireProbe {
+            alive: Arc::clone(&refused_alive),
+            prepared: Arc::new(AtomicBool::new(false)),
+            fail_prepare: false,
+        });
+        assert!(
+            refused.is_err(),
+            "quarantine must consume its production permit"
+        );
+        drop(refused);
+        assert!(!refused_alive.load(Ordering::Acquire));
+        drop(admitted);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while alive.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!alive.load(Ordering::Acquire), "quarantine must expire");
+
+        let mut reopened = Vec::new();
+        for _ in 0..ARTIFACT_HANDOFF_LIMIT {
+            reopened.push(
+                ReplyRetention::try_new(WireProbe {
+                    alive: Arc::new(AtomicBool::new(true)),
+                    prepared: Arc::new(AtomicBool::new(false)),
+                    fail_prepare: false,
+                })
+                .unwrap_or_else(|_| panic!("expired quarantine returns every permit")),
+            );
+        }
+        drop(reopened);
+    }
+
     struct GuardCheckingWriter {
         alive: Arc<AtomicBool>,
         prepared: Arc<AtomicBool>,
@@ -7348,14 +8978,190 @@ mod tests {
         assert!(aterm_types::control_verbs::valid_artifact_ack_nonce(nonce));
         assert!(
             alive.load(Ordering::Acquire),
-            "exact handles remain live after write and flush until client acknowledgement"
+            "artifact guards remain live after write and flush until client acknowledgement"
         );
         pending.retention.acknowledge_peer_anchor();
         drop(pending);
         assert!(
             !alive.load(Ordering::Acquire),
-            "client acknowledgement releases the exact handles"
+            "client acknowledgement releases the artifact guards"
         );
+    }
+
+    #[test]
+    fn in_memory_handoff_releases_after_flush_without_ack_or_quarantine() {
+        static USAGE: Mutex<ArtifactHandoffUsage> = Mutex::new(ArtifactHandoffUsage {
+            live: 0,
+            descriptor_units: 0,
+        });
+
+        struct UsageCheckingWriter {
+            bytes: usize,
+            fail_flush: bool,
+        }
+
+        impl Write for UsageCheckingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(
+                    *USAGE.lock().unwrap(),
+                    ArtifactHandoffUsage {
+                        live: 1,
+                        descriptor_units: 1,
+                    },
+                    "the in-memory permit spans every body write"
+                );
+                assert!(
+                    !bytes.starts_with(
+                        aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX.as_bytes()
+                    ),
+                    "a write-only reply emits no acknowledgement challenge"
+                );
+                self.bytes += bytes.len();
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert_eq!(
+                    *USAGE.lock().unwrap(),
+                    ArtifactHandoffUsage {
+                        live: 1,
+                        descriptor_units: 1,
+                    },
+                    "the in-memory permit spans the socket flush"
+                );
+                if self.fail_flush {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "injected write-only flush failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let make_reply = || {
+            let permit = ArtifactHandoffPermit::try_acquire_from(&USAGE, 1, 1, 1)
+                .expect("write-only handoff capacity");
+            let retention = ReplyRetentionPermit(permit).release_path_and_retain_in_memory(());
+            ControlReply::with_handoff(
+                "x".repeat(1024 * 1024),
+                Some(ReplyHandoff::WriteOnly(retention)),
+            )
+        };
+
+        let mut writer = UsageCheckingWriter {
+            bytes: 0,
+            fail_flush: false,
+        };
+        assert!(
+            write_control_reply(&mut writer, make_reply())
+                .expect("write-only reply")
+                .is_none(),
+            "an in-memory reply has no pending ACK"
+        );
+        assert_eq!(writer.bytes, 1024 * 1024);
+        assert_eq!(*USAGE.lock().unwrap(), ArtifactHandoffUsage::default());
+
+        let mut failing = UsageCheckingWriter {
+            bytes: 0,
+            fail_flush: true,
+        };
+        let error = match write_control_reply(&mut failing, make_reply()) {
+            Err(error) => error,
+            Ok(_) => panic!("flush failure must propagate without quarantine"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            *USAGE.lock().unwrap(),
+            ArtifactHandoffUsage::default(),
+            "a failed in-memory write releases immediately instead of quarantining"
+        );
+    }
+
+    #[test]
+    fn in_memory_handoff_restores_timeout_before_next_persistent_reply() {
+        struct TimeoutCheckingWriter {
+            timeout: Arc<Mutex<Option<std::time::Duration>>>,
+            expected_armed: bool,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for TimeoutCheckingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(
+                    self.timeout.lock().unwrap().is_some(),
+                    self.expected_armed,
+                    "each reply must observe only its own timeout policy"
+                );
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert_eq!(
+                    self.timeout.lock().unwrap().is_some(),
+                    self.expected_armed,
+                    "flush must observe the same timeout policy as body writes"
+                );
+                Ok(())
+            }
+        }
+
+        let timeout = Arc::new(Mutex::new(None));
+        let retention =
+            ReplyRetentionPermit::unmetered_for_test().release_path_and_retain_in_memory(());
+        let inline = ControlReply::with_handoff(
+            "OK inline\n".to_string(),
+            Some(ReplyHandoff::WriteOnly(retention)),
+        );
+        let mut inline_wire = TimeoutCheckingWriter {
+            timeout: Arc::clone(&timeout),
+            expected_armed: true,
+            bytes: Vec::new(),
+        };
+        let setter_timeout = Arc::clone(&timeout);
+        assert!(
+            write_control_reply_with_timeout_arm(
+                &mut inline_wire,
+                inline,
+                std::time::Duration::from_secs(1),
+                |value| {
+                    *setter_timeout.lock().unwrap() = value;
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(inline_wire.bytes, b"OK inline\n");
+        assert_eq!(
+            *timeout.lock().unwrap(),
+            None,
+            "the write-only deadline must be cleared before keep-alive resumes"
+        );
+
+        let ordinary = ControlReply::with_handoff("OK next\n".to_string(), None);
+        let mut ordinary_wire = TimeoutCheckingWriter {
+            timeout: Arc::clone(&timeout),
+            expected_armed: false,
+            bytes: Vec::new(),
+        };
+        let setter_timeout = Arc::clone(&timeout);
+        assert!(
+            write_control_reply_with_timeout_arm(
+                &mut ordinary_wire,
+                ordinary,
+                std::time::Duration::from_secs(1),
+                |value| {
+                    *setter_timeout.lock().unwrap() = value;
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(ordinary_wire.bytes, b"OK next\n");
     }
 
     #[test]
@@ -7381,6 +9187,99 @@ mod tests {
         assert!(
             alive.load(Ordering::Acquire),
             "a full path may already be visible, so write failure must quarantine its guard"
+        );
+    }
+
+    #[test]
+    fn nonreading_peer_cannot_hold_a_guarded_write_past_its_deadline() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let reply = ControlReply::guarded(
+            "x".repeat(8 * 1024 * 1024),
+            Some(ReplyRetention::new(WireProbe {
+                alive: Arc::clone(&alive),
+                prepared,
+                fail_prepare: false,
+            })),
+        );
+        let (_nonreading_client, server) = CtlStream::pair().unwrap();
+        let mut writer = &server;
+        let started = std::time::Instant::now();
+        let error = match write_control_reply_with_timeout_arm(
+            &mut writer,
+            reply,
+            std::time::Duration::from_millis(100),
+            |timeout| server.set_write_timeout(timeout),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a non-reading peer must exhaust the whole-write deadline"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "partial writes must share one deadline rather than refresh it"
+        );
+        assert!(
+            alive.load(Ordering::Acquire),
+            "a timed-out partial reply transfers its guard to quarantine"
+        );
+    }
+
+    #[test]
+    fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let prepared = Arc::new(AtomicBool::new(false));
+        let reply = ControlReply::guarded(
+            "OK guarded\n".to_string(),
+            Some(ReplyRetention::new(WireProbe {
+                alive,
+                prepared,
+                fail_prepare: false,
+            })),
+        );
+        let mut wire = Vec::new();
+        let pending = write_control_reply_with_timeout_arm(
+            &mut wire,
+            reply,
+            std::time::Duration::from_millis(250),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .expect("guarded response");
+        let ack = format!(
+            "{}{nonce}\n",
+            aterm_types::control_verbs::ARTIFACT_REPLY_ACK_PREFIX,
+            nonce = pending.nonce.as_str()
+        );
+        let (mut client, server) = CtlStream::pair().unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let writer_sent = Arc::clone(&sent);
+        let dribbler = std::thread::spawn(move || {
+            for byte in ack.bytes() {
+                if client.write_all(&[byte]).is_err() || client.flush().is_err() {
+                    break;
+                }
+                writer_sent.fetch_add(1, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        });
+        let started = std::time::Instant::now();
+        let mut reader = BufReader::new(&server);
+        assert_eq!(
+            await_guarded_reply_close_with_quarantine(
+                &server,
+                &mut reader,
+                pending,
+                std::time::Duration::from_millis(20),
+            ),
+            ArtifactAckOutcome::AcknowledgementQuarantined
+        );
+        let _ = server.shutdown(std::net::Shutdown::Both);
+        dribbler.join().unwrap();
+        assert!(sent.load(Ordering::Acquire) > 1, "the peer really dribbled");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "per-byte progress must not create a fresh acknowledgement budget"
         );
     }
 
@@ -7757,6 +9656,9 @@ mod tests {
         );
         let store = crate::session_store::new_store();
         let subscribers = crate::subscribe::new_registry();
+        // No active session: the halt lookup has nothing to ask about, which is
+        // the state every pre-body refusal below is judged in.
+        let active: ActiveHandle = Arc::new(Mutex::new(None));
 
         let assert_rejected = |line: &str,
                                scope: Scope,
@@ -7769,6 +9671,7 @@ mod tests {
                     line,
                     &mut reader,
                     scope,
+                    &active,
                     operator,
                     &store,
                     &subscribers,
@@ -9965,6 +11868,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         let active: ActiveHandle = Arc::new(Mutex::new(Some(ActiveSession {
             term: term_a.clone(),
@@ -10417,6 +12321,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         let handle = SessionHandle {
             sid,
@@ -10690,6 +12595,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let before = ctx.cast.lock().unwrap().event_count();
@@ -10913,6 +12819,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         })
     }
 
@@ -10927,7 +12834,7 @@ mod tests {
         // NOW-ACTIVE session for the verb's op (`cross_session_authorized`) — NOT
         // op-match alone, so an edge cannot drive a session it was never granted on
         // after the active handle swings (tab/window switch).
-        matches!(scope, Scope::Owner) || cross_session_authorized(scope, verb, active)
+        scope.is_owner_class() || cross_session_authorized(scope, verb, active)
     }
 
     /// An `Edge` scope carrying a throwaway, UNGRANTED token. Since authority is
@@ -10964,8 +12871,10 @@ mod tests {
     #[test]
     fn every_dispatched_verb_is_in_the_table() {
         let src = include_str!("control.rs");
-        // The dispatch match body. ANCHOR ON `let resp = match verb {` — the
-        // ROUTER's match, closing with `};` because it is a let-binding.
+        // The dispatch match body. ANCHOR ON the ROUTER's `match verb {`, which
+        // A6 moved inside `pty_idem::guarded(…)` — the router now closes with
+        // `});` (the guard call) rather than `};` (a let-binding), so BOTH halves
+        // of the anchor moved together and both are pinned here.
         //
         // REGRESSION (this test was vacuous): the anchor used to be the bare
         // `    match verb {`, whose FIRST occurrence in this file is
@@ -10973,15 +12882,23 @@ mod tests {
         // scrape therefore walked a handful of already-classified escalation
         // arms and never saw the dispatch table at all, so a router arm missing
         // from `VERBS` would have sailed straight through. Keep both the anchor
-        // and the `\n    };\n` terminator exact.
+        // and the `\n    });\n` terminator exact; the sentinel loop below is what
+        // proves a moved anchor did not empty the scrape again.
         let body = src
-            .split_once("    let resp = match verb {")
-            .and_then(|(_, r)| r.split_once("\n    };\n"))
+            .split_once("idem_key.as_deref(), || match verb {")
+            .and_then(|(_, r)| r.split_once("\n    });\n"))
             .map(|(m, _)| m)
             .expect("dispatch match body");
         // Non-vacuity: the router body must actually contain known dispatch arms.
         // Without this, a future anchor drift silently empties the scrape again.
-        for sentinel in ["\"text\" =>", "\"screen\" =>", "\"cursor\" =>"] {
+        for sentinel in [
+            "\"text\" =>",
+            "\"screen\" =>",
+            "\"cursor\" =>",
+            // The router's LAST arm: proves the scrape reached the end of the
+            // match, not just its first few rows.
+            "ERR unknown verb (try: help)",
+        ] {
             assert!(
                 body.contains(sentinel),
                 "dispatch scrape lost its anchor — {sentinel} not found in the \
@@ -11049,6 +12966,8 @@ mod tests {
         let sources = [
             include_str!("control_query.rs"),
             include_str!("control_session.rs"),
+            // `cmd_privacy_json` lives with the rest of the consent posture.
+            include_str!("control_privacy.rs"),
             // The selection verbs live in `aterm-control` now; scrape them THERE
             // or `blocks` becomes an unserved JSON_CAPABLE_VERBS entry and the
             // non-vacuity floor below goes soft.
@@ -11146,6 +13065,7 @@ mod tests {
             "fn try_net_dial",
             "fn is_subscribe_line",
             "fn binary_frame_verb",
+            "fn post_frame_len",
         ];
         for helper in helpers {
             // The helper's body: from its first definition (the real fn — this
@@ -11298,6 +13218,10 @@ mod tests {
                 // `meta` it takes no `escalated_op` entry.
                 "status",
                 "metrics",
+                // `streak` OBSERVES the PRISM WAKE engine and every gate in
+                // front of it; the knobs it reports are rewritten through
+                // `settings`, never here.
+                "streak",
                 // `tone` OBSERVES the mood classifier; the knob it reports is
                 // rewritten through `settings` (ConfigWrite), never here.
                 "tone",
@@ -11312,11 +13236,29 @@ mod tests {
                 "ready",
                 "await",
                 "wait",
+                // `privacy` OBSERVES the macOS consent posture. Read-op like
+                // every other observer: each fact it aggregates is one `status`
+                // already exposes a session at a time, so it introduces no new
+                // authority. (Owner-gated in dispatch it is NOT — the whole
+                // point is that a supervising agent can read it.)
+                "privacy",
                 "subscribe",
                 "who",
                 "family",
                 "edges",
                 "grants",
+                // The fabric INBOX is a read surface: `inbox` lists the session's
+                // message rows and `inbox get` returns one body. Reading mail moves
+                // no PTY and leaves no trace on the bus, so a read-only edge may do
+                // it; `inbox seen` (the decision) is the Write half below.
+                "inbox",
+                "inbox get",
+                // The fabric OUTBOX is the same read class, one plane over: it
+                // reads mail on its way OUT. The op-class says what the verb
+                // DOES; what stops an edge (or an Owner token) from calling it is
+                // the orthogonal `BridgeOnly` scope gate, exactly as `who` is
+                // Read-op and Owner-gated.
+                "outbox",
             ],
             "ReadScreen set (every observer/view-state verb, incl. Owner-gated `who`)",
         );
@@ -11356,6 +13298,19 @@ mod tests {
                 "close",
                 "lease",
                 "act",
+                // The fabric WRITE half. None of the five reaches a PTY — `post`
+                // queues an outbound message, `inbox seen` records a decision, and
+                // `deliver`/`hold`/`outbox sent` are the bridge plane — but each
+                // MUTATES state a read-only edge must not touch, so they take the
+                // write op-class. The three bridge verbs are additionally
+                // `Access::BridgeOnly`, which no op-class can express: op-class and
+                // scope-gate are orthogonal, the same way `who` is a Read verb
+                // behind an Owner gate.
+                "inbox seen",
+                "post",
+                "deliver",
+                "hold",
+                "outbox sent",
             ],
             "WriteInput set (input vocabulary + app-drive verbs)",
         );
@@ -12900,6 +14855,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         SessionHandle {
             sid,
@@ -14967,13 +16923,13 @@ mod tests {
         // Bare form.
         assert!(matches!(
             parse_feed_bin("feed-bin 4", "feed-bin"),
-            FeedBinFrame::Ok(None, 4)
+            FeedBinFrame::Ok(None, 4, None)
         ));
         assert!(binary_frame_verb("feed-bin 4").is_some());
         // Cross-session form.
         assert!(matches!(
             parse_feed_bin("@7 feed-bin 10", "feed-bin"),
-            FeedBinFrame::Ok(Some(Selector::Local(7)), 10)
+            FeedBinFrame::Ok(Some(Selector::Local(7)), 10, None)
         ));
         assert!(binary_frame_verb("@7 feed-bin 10").is_some());
         // Not feed-bin.
@@ -14998,7 +16954,7 @@ mod tests {
         ));
         // Exactly the cap is allowed.
         assert!(
-            matches!(parse_feed_bin(&format!("feed-bin {MAX_FEED_BIN}"), "feed-bin"), FeedBinFrame::Ok(None, n) if n == MAX_FEED_BIN)
+            matches!(parse_feed_bin(&format!("feed-bin {MAX_FEED_BIN}"), "feed-bin"), FeedBinFrame::Ok(None, n, None) if n == MAX_FEED_BIN)
         );
         // Trailing tokens after the length are Malformed (NOT a valid frame): a
         // canonical frame is exactly `[@sel] feed-bin <n>`. Treating `feed-bin 1 junk`
@@ -15014,7 +16970,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_feed_bin("feed-bin 4   ", "feed-bin"),
-            FeedBinFrame::Ok(None, 4)
+            FeedBinFrame::Ok(None, 4, None)
         ));
     }
 
@@ -16672,6 +18628,899 @@ mod tests {
         );
     }
 
+    /// THE ONE AUTHORITY NO TOKEN UNLOCKS. `deliver` and `hold` are refused to
+    /// every scope but the bridge connection — Owner INCLUDED, which is the whole
+    /// design: `aterm-ctl @self` is Owner, so an Owner classification would put
+    /// the two verbs that forge an attested `from=` and lift a fleet halt inside
+    /// the blast radius of one prompt injection. This drives the SAME decision
+    /// function the dispatch calls, not a mirror of it.
+    #[test]
+    fn the_bridge_verbs_refuse_every_scope_but_the_bridge_inbox_hold() {
+        // Both verbs record the session as bridge-governed in the process-wide
+        // link, so this takes the same reset guard every other link-touching test
+        // does — see `fabric::with_link_reset`.
+        crate::fabric::with_link_reset(the_bridge_verbs_refuse_every_scope_but_the_bridge_body);
+    }
+
+    fn the_bridge_verbs_refuse_every_scope_but_the_bridge_body() {
+        let store = session_store::new_store();
+        let handle = crate::session_store::test_handle(1);
+        let sid = handle.sid.as_str().to_string();
+        store.write().unwrap().register(handle);
+        let edge = Scope::Edge(EdgeToken::generate());
+        let run = |scope: Scope, line: &str| {
+            let (selector, verb, rest) = request_head(line);
+            dispatch_bridge_verb(verb, rest, selector.as_ref(), scope, &store)
+        };
+
+        for (scope, name) in [(Scope::Owner, "owner"), (edge, "edge")] {
+            assert_eq!(
+                run(
+                    scope,
+                    &format!("deliver {sid} off=1 from=h-a kind=task text=x")
+                )
+                .as_deref(),
+                Some("ERR denied\n"),
+                "deliver from {name} scope"
+            );
+            assert_eq!(
+                run(scope, &format!("hold {sid} on reason=x")).as_deref(),
+                Some("ERR denied\n"),
+                "hold from {name} scope"
+            );
+            // The OUTBOUND plane is the same authority: reading `outbox` from an
+            // Owner-token connection would read every session's outbound traffic,
+            // and forging `outbox sent` would release a `post --wait` for a
+            // message that never left the machine.
+            assert_eq!(
+                run(scope, "outbox").as_deref(),
+                Some("ERR denied\n"),
+                "outbox from {name} scope"
+            );
+            assert_eq!(
+                run(scope, &format!("outbox sent {sid} 1 off=9")).as_deref(),
+                Some("ERR denied\n"),
+                "outbox sent from {name} scope"
+            );
+        }
+        // From the inherited bridge connection, both land.
+        assert_eq!(
+            run(
+                Scope::Bridge,
+                &format!("deliver {sid} off=1 from=h-a kind=task trust=human text=x")
+            )
+            .as_deref(),
+            Some("OK 1\n")
+        );
+        assert_eq!(
+            run(Scope::Bridge, &format!("hold {sid} on reason=x")).as_deref(),
+            Some("OK hold=1\n")
+        );
+        assert_eq!(
+            run(Scope::Bridge, "outbox").as_deref(),
+            Some("OK 0\n"),
+            "an empty outbox is a zero-length frame, not a refusal"
+        );
+        assert_eq!(
+            run(Scope::Bridge, &format!("outbox sent {sid} 1 off=9")).as_deref(),
+            Some("ERR no such post\n"),
+            "reached the handler, which is the point"
+        );
+        // A SELECTOR is refused even from the bridge: `@<other> deliver <sid> …`
+        // would otherwise aim the bridge plane at a session the sid does not name.
+        assert_eq!(
+            run(
+                Scope::Bridge,
+                &format!("@1 deliver {sid} off=2 from=h-a kind=task text=x")
+            )
+            .as_deref(),
+            Some("ERR denied\n")
+        );
+        // Everything else falls through untouched.
+        assert!(run(Scope::Bridge, "text").is_none());
+        assert!(run(Scope::Owner, "inbox").is_none());
+    }
+
+    /// `post` is the one verb whose scope gate is a per-handler check: an EDGE is
+    /// refused outright rather than checked for a write edge, because a write-input
+    /// edge over session S authorizes typing INTO S and must not authorize speaking
+    /// AS S on the bus. The bridge is owner-class, so it may post.
+    #[test]
+    fn post_refuses_an_edge_token_connection_inbox_hold() {
+        assert!(!post_scope_denied(Scope::Owner));
+        assert!(!post_scope_denied(Scope::Bridge));
+        assert!(post_scope_denied(Scope::Edge(EdgeToken::generate())));
+        // The scope split it rests on, stated once: Bridge is Owner PLUS the two
+        // bridge verbs, and an Edge is neither.
+        assert!(Scope::Owner.is_owner_class() && Scope::Bridge.is_owner_class());
+        assert!(!Scope::Edge(EdgeToken::generate()).is_owner_class());
+    }
+
+    /// THE HALT LIVES ON THE CONTROL SEAMS AND NOWHERE ELSE. Four call sites —
+    /// the verb dispatch, the `feed-bin`/`paste-bin` frame, the operator proposal
+    /// frame, and the APP lane (`dispatch_before_session`, which answers `invoke`
+    /// before any session exists) — and that is exactly the set of paths by which
+    /// a SOCKET client reaches the PTY. The input seam the KEYBOARD travels
+    /// (`App::input`/`input.rs`) must not mention it: a fleet halt stops drivers,
+    /// not the human at the glass, and a halt that locked the keyboard would be a
+    /// remote agent's ability to lock a person out of their own terminal.
+    #[test]
+    fn the_halt_gate_sits_only_on_the_socket_seams_inbox_hold() {
+        // The PRODUCTION half of this file: everything before its `mod tests`, so
+        // this test's own references (and the guard test's below) are not counted.
+        let control = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("control.rs has a tests module");
+        let calls = control.matches("fabric::halt_refusal(").count();
+        assert_eq!(
+            calls, 3,
+            "the SESSION halt gate has exactly three production call sites: the verb \
+             dispatch, the feed-bin/paste-bin frame, and the operator proposal frame"
+        );
+        // And the APP lane, which is a different gate because an App-target verb
+        // never resolves a session: `invoke Paste` was answered in
+        // `dispatch_before_session`, so `halt_refusal` was structurally
+        // unreachable for it and a standing fleet halt did not stop it.
+        assert_eq!(
+            control.matches("fabric::app_halt_refusal(").count(),
+            1,
+            "the App-lane halt gate has exactly one production call site: \
+             dispatch_before_session, before dispatch_app_verb"
+        );
+        for (name, src) in [
+            ("input.rs", include_str!("input.rs")),
+            ("app_input.rs", include_str!("app_input.rs")),
+            ("control_input.rs", include_str!("control_input.rs")),
+        ] {
+            assert!(
+                !src.contains("halt_refusal"),
+                "{name} must not gate the human input path on a fleet halt"
+            );
+        }
+        // AND THE SET ITSELF IS DERIVED FROM THE VERB TABLE. That derivation used
+        // to live here, unnamed, and walked only `Target::Session` rows — so the
+        // App lane was covered by a hand-written two-element literal underneath
+        // it, and `tab close` (which retires a session exactly as `close` does)
+        // was invisible to both. It now lives in
+        // `crate::fabric::tests::the_halt_set_is_derived_from_the_verb_table`,
+        // beside the set it derives, under the name `is_pty_reaching`'s doc cites,
+        // and it walks EVERY row whatever its target. THIS test is about the GATE:
+        // where the halt is asked, and where it must never be.
+    }
+
+    /// THE `fabric:` LEASE NAMESPACE IS THE BRIDGE CONNECTION'S (DESIGN §11.2).
+    ///
+    /// §11.2 gives `Scope::Bridge` "Owner's power plus the `BridgeOnly` verbs
+    /// (`deliver`, `hold`, `lease … holder=fabric:*`), which no other scope may
+    /// call, Owner included". The first two are table rows and are gated by
+    /// `dispatch_bridge_verb`; the third is a SUB-FORM of an ordinary Owner verb,
+    /// so no table row expresses it and nothing enforced it — `lease_acquire`
+    /// takes any 1..=64 printable-ASCII holder from any scope that may run
+    /// `lease`. An in-session agent (every `aterm-ctl @self` is Owner) could
+    /// therefore show `driving=lease:fabric:h-andrew` in `who` to every local
+    /// driver and to the person at the glass, attribute its own drive to that
+    /// human, keep the drive off the bus control ledger (the bridge filters
+    /// `fabric:` holders out of its §6.6 row-5 event), and pre-empt the real
+    /// mirror when the human finally claimed the keyboard.
+    #[test]
+    fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
+        // The bridge's own mirror, verbatim from `Bridge::acquire_lease`.
+        assert!(!lease_forges_fabric_holder(
+            Scope::Bridge,
+            "acquire holder=fabric:h-andrew ttl=30000"
+        ));
+        // The same line from any other scope is a forgery.
+        for scope in [
+            Scope::Owner,
+            Scope::Edge(aterm_session::EdgeToken::generate()),
+        ] {
+            assert!(lease_forges_fabric_holder(
+                scope,
+                "acquire holder=fabric:h-andrew ttl=30000"
+            ));
+            assert!(lease_forges_fabric_holder(
+                scope,
+                "acquire ttl=1 holder=fabric:"
+            ));
+            // An ordinary holder is untouched: this fences a NAMESPACE, not the verb.
+            assert!(!lease_forges_fabric_holder(scope, "acquire holder=drv-7"));
+            assert!(!lease_forges_fabric_holder(scope, "acquire"));
+            assert!(!lease_forges_fabric_holder(scope, "status"));
+            assert!(!lease_forges_fabric_holder(scope, ""));
+            // ACQUIRE only, which is the clause §11.2 states. `release … force`
+            // stealing a `fabric:` hold is a separate, pre-existing operator
+            // override, recorded in the function's doc rather than narrowed here.
+            assert!(!lease_forges_fabric_holder(
+                scope,
+                "release holder=fabric:h-andrew"
+            ));
+        }
+        // AND THE GATE IS WIRED. A pure predicate nothing calls is a comment.
+        let production = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(p, _)| p)
+            .expect("control.rs has a tests module");
+        assert_eq!(
+            production
+                .matches("lease_forges_fabric_holder(scope, rest)")
+                .count(),
+            1,
+            "the `lease` dispatch arm must be the one production caller of the fence"
+        );
+    }
+
+    /// THE AUDIT TRAIL NAMES THE VERB THAT WAS REFUSED.
+    ///
+    /// `Access::BridgeOnly` was widened to FOUR verbs (`deliver`, `hold`,
+    /// `outbox`, `outbox sent`) and pinned there by
+    /// `access_exceptions_are_exactly_the_declared_sets`, but the site that
+    /// ENFORCES it went on describing two — and wrote the literal reason "only the
+    /// inherited bridge connection may run deliver/hold" into the security audit
+    /// log for every refusal, `outbox` included. An operator triaging a suspected
+    /// compromise then reads a reason naming two verbs the caller never used, and
+    /// cannot tell an attempted inbox forgery from an attempted read of every
+    /// session's outbound traffic.
+    #[test]
+    fn the_bridge_plane_denial_names_the_verb_and_the_doc_names_all_four() {
+        let production = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(p, _)| p)
+            .expect("control.rs has a tests module");
+        assert!(
+            !production.contains("may run deliver/hold"),
+            "the audit reason must name the verb actually refused, not a fixed pair"
+        );
+        assert!(
+            production.contains("only the inherited bridge connection may run {verb}"),
+            "the audit reason must interpolate the refused verb"
+        );
+        // And the enforcement site's own heading — the first place an auditor
+        // reads to enumerate the fenced set — must name all four.
+        let heading = production
+            .split_once("fn dispatch_bridge_verb(")
+            .map(|(before, _)| before)
+            .and_then(|before| {
+                before
+                    .rfind("/// THE BRIDGE PLANE")
+                    .map(|at| before[at..].to_string())
+            })
+            .expect("dispatch_bridge_verb keeps its heading");
+        for verb in ["`deliver`", "`hold`", "`outbox`", "`outbox sent`"] {
+            assert!(
+                heading.contains(verb),
+                "the bridge-plane heading omits {verb}"
+            );
+        }
+        // Every one of them really is fenced, whatever the prose says.
+        for verb in ["deliver", "hold", "outbox", "outbox sent"] {
+            assert!(aterm_types::control_verbs::is_bridge_only(verb), "{verb}");
+        }
+    }
+
+    /// The fail-closed halt is a DROP GUARD, so it fires however the bridge
+    /// connection ends — a clean return, a hangup, or an unwind out of the serving
+    /// worker. Dropping the guard is the exact production event ("the bridge is
+    /// gone"), so this test IS the mechanism.
+    #[test]
+    fn dropping_the_bridge_guard_halts_the_governed_sessions_inbox_hold() {
+        // Dropping the guard moves the INSTANCE link to `disconnected`, which is
+        // what `status`'s `fabric=` and `post --wait` read — so this must not run
+        // beside a test that reads it. The reset guard serializes them.
+        crate::fabric::with_link_reset(dropping_the_bridge_guard_halts_the_governed_sessions_body);
+    }
+
+    fn dropping_the_bridge_guard_halts_the_governed_sessions_body() {
+        let store = session_store::new_store();
+        let handle = crate::session_store::test_handle(1);
+        let sid = handle.sid.as_str().to_string();
+        let ctx = handle.ctx.clone();
+        store.write().unwrap().register(handle);
+        assert_eq!(
+            dispatch_bridge_verb(
+                "deliver",
+                &format!("{sid} off=1 from=h-a kind=task trust=human text=x"),
+                None,
+                Scope::Bridge,
+                &store,
+            )
+            .as_deref(),
+            Some("OK 1\n")
+        );
+        assert!(crate::fabric::halt_refusal(&ctx, "turn").is_none());
+        drop(BridgeLostGuard {
+            store: store.clone(),
+            generation: crate::fabric::next_bridge_generation(),
+        });
+        assert_eq!(
+            crate::fabric::halt_refusal(&ctx, "turn").as_deref(),
+            Some("ERR halted reason=fabric-lost origin=fleet\n"),
+            "killing the bridge HALTS what it governed; it does not free it"
+        );
+    }
+
+    /// The length-prefixed `post` frame is detected by the SAME option vocabulary
+    /// the handler parses with, so a `len=` inside a message BODY is not a frame —
+    /// the desync that would follow (n announced bytes nobody reads, then parsed
+    /// as control verbs) is the reason the two must not be separate parsers.
+    #[test]
+    fn the_post_frame_detector_agrees_with_the_body_rule_inbox_hold() {
+        assert_eq!(post_frame_len("post to=h-a kind=note len=12"), Some(Ok(12)));
+        assert_eq!(
+            post_frame_len("@s-a post to=h-a kind=ask --wait len=3"),
+            Some(Ok(3))
+        );
+        assert_eq!(
+            post_frame_len("post to=h-a kind=note hello len=12"),
+            None,
+            "a `len=` inside the BODY is not a frame"
+        );
+        assert_eq!(post_frame_len("post to=h-a kind=note hi"), None);
+        assert_eq!(post_frame_len("send len=4"), None);
+        assert!(matches!(
+            post_frame_len("post to=h-a kind=note len=99999999"),
+            Some(Err(()))
+        ));
+        assert!(matches!(
+            post_frame_len("post to=h-a kind=note len=abc"),
+            Some(Err(()))
+        ));
+    }
+
+    // ---- A6: exactly-once at the PTY seam ---------------------------------------
+
+    /// Drive one `feed-bin` frame through the PRODUCTION framing path, recording
+    /// every event that reached the input seam. Returns `(reply, events)`; the
+    /// caller asserts on both, so "typed once" is counted at the seam rather than
+    /// inferred from a reply.
+    #[cfg(unix)]
+    fn feed_bin_once(
+        active: &ActiveHandle,
+        store: &Store,
+        line: &str,
+        payload: &[u8],
+        seen: &std::cell::RefCell<Vec<Vec<u8>>>,
+    ) -> String {
+        let mut body = payload.to_vec();
+        body.extend_from_slice(b"after\n");
+        let mut reader = std::io::Cursor::new(body);
+        let mut dispatch = |event: InputEvent, _session| {
+            if let InputEvent::KeySequence(bytes) = &event {
+                seen.borrow_mut().push(bytes.clone());
+            }
+            Ok(InputOutcome::Ok)
+        };
+        let mut clear_license = |_session| "OK\n".to_string();
+        let mut out = Vec::new();
+        assert!(
+            run_feed_bin_routed(
+                line,
+                "feed-bin",
+                &mut reader,
+                FeedBinRoute {
+                    active,
+                    store,
+                    scope: Scope::Owner,
+                },
+                &mut dispatch,
+                &mut clear_license,
+                &mut out,
+            ),
+            "the frame must keep the connection: {line}"
+        );
+        // THE STREAM STAYS FRAMED whatever the key decided. A duplicate is refused
+        // AFTER the announced payload is consumed, so the next request line is the
+        // one the client sent — never payload bytes falling through as verbs.
+        assert_eq!(
+            read_request_line(&mut reader).as_deref(),
+            Some("after"),
+            "the announced payload must be consumed even by a refused frame"
+        );
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// **A6, the substance of the rung.** `feed-bin id=k` twice TYPES ONCE, and the
+    /// second answers `dup=1` — which is exactly the bridge's in-doubt window made
+    /// resolvable. A bridge that crashes between "wrote the bytes" and "recorded
+    /// that it wrote them" replays the same key on restart: if the write landed it
+    /// is told `dup=1` and nothing is typed twice, and if it did not the bytes go
+    /// out for the first time. Both sides of the window, one mechanism, no silent
+    /// duplicate and no silent loss.
+    #[test]
+    #[cfg(unix)]
+    fn feed_idempotent_feed_bin_types_once_and_the_replay_says_dup() {
+        let store = session_store::new_store();
+        let (front, _rx) = pipe_session(1);
+        let key = format!("{}:9:1", front.ctx.nonce.to_hex());
+        store.write().unwrap().register(front.clone());
+        let active = active_for_handle(&front);
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        // The bridge writes, then dies before it can record the result.
+        let first = feed_bin_once(
+            &active,
+            &store,
+            &format!("@1 feed-bin 3 id={key}"),
+            b"ABC",
+            &seen,
+        );
+        assert_eq!(first, "OK 3 bytes\n");
+        assert_eq!(seen.borrow().as_slice(), [b"ABC".to_vec()]);
+
+        // It restarts and replays the SAME key. Nothing is typed.
+        let replay = feed_bin_once(
+            &active,
+            &store,
+            &format!("@1 feed-bin 3 id={key}"),
+            b"ABC",
+            &seen,
+        );
+        assert_eq!(replay, "OK dup=1\n", "the replay is recognized, not typed");
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "exactly one keystroke reached the seam across the crash window"
+        );
+
+        // The OTHER side of the window: a key the endpoint never saw is FRESH, so a
+        // bridge that crashed BEFORE the write loses nothing by replaying.
+        let next = format!("{}:9:2", front.ctx.nonce.to_hex());
+        assert_eq!(
+            feed_bin_once(
+                &active,
+                &store,
+                &format!("@1 feed-bin 3 id={next}"),
+                b"DEF",
+                &seen
+            ),
+            "OK 3 bytes\n"
+        );
+        assert_eq!(seen.borrow().len(), 2);
+
+        // And an UNKEYED frame is the pre-A6 wire, byte for byte.
+        assert_eq!(
+            feed_bin_once(&active, &store, "@1 feed-bin 3", b"GHI", &seen),
+            "OK 3 bytes\n"
+        );
+        assert_eq!(seen.borrow().len(), 3);
+    }
+
+    /// A RELAUNCHED session is a fresh epoch, so its high-water starts empty: an id
+    /// minted for the dead incarnation can neither suppress a live keystroke nor be
+    /// applied to a shell it was never meant for. It is refused BY NAME (`ERR
+    /// epoch`), which is the third possible answer and the only honest one — a
+    /// silent apply and a silent suppress are the two failures this rung exists to
+    /// remove.
+    #[test]
+    #[cfg(unix)]
+    fn feed_idempotent_a_relaunched_session_starts_a_fresh_high_water() {
+        let store = session_store::new_store();
+        let (dead, _rx_a) = pipe_session(1);
+        let dead_key = format!("{}:9:1", dead.ctx.nonce.to_hex());
+        store.write().unwrap().register(dead.clone());
+        let active = active_for_handle(&dead);
+        let seen = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            feed_bin_once(
+                &active,
+                &store,
+                &format!("@1 feed-bin 3 id={dead_key}"),
+                b"ABC",
+                &seen
+            ),
+            "OK 3 bytes\n"
+        );
+        assert_eq!(
+            feed_bin_once(
+                &active,
+                &store,
+                &format!("@1 feed-bin 3 id={dead_key}"),
+                b"ABC",
+                &seen
+            ),
+            "OK dup=1\n"
+        );
+        assert_eq!(seen.borrow().len(), 1);
+
+        // The session is relaunched: a new launch nonce, a new endpoint.
+        let store = session_store::new_store();
+        let (live, _rx_b) = pipe_session(2);
+        assert_ne!(live.ctx.nonce, dead.ctx.nonce, "a relaunch mints a nonce");
+        store.write().unwrap().register(live.clone());
+        let active = active_for_handle(&live);
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        // The dead session's id is refused, not obeyed.
+        assert_eq!(
+            feed_bin_once(
+                &active,
+                &store,
+                &format!("@2 feed-bin 3 id={dead_key}"),
+                b"ABC",
+                &seen
+            ),
+            "ERR epoch\n"
+        );
+        assert!(seen.borrow().is_empty(), "a dead epoch types nothing");
+
+        // The SAME producer and sequence under the LIVE epoch is fresh — the mark
+        // did not survive the relaunch, so a live keystroke is not suppressed.
+        let live_key = format!("{}:9:1", live.ctx.nonce.to_hex());
+        assert_eq!(
+            feed_bin_once(
+                &active,
+                &store,
+                &format!("@2 feed-bin 3 id={live_key}"),
+                b"ABC",
+                &seen
+            ),
+            "OK 3 bytes\n",
+            "a fresh epoch starts a fresh high-water"
+        );
+        assert_eq!(seen.borrow().len(), 1);
+    }
+
+    /// `is_owner_class`'s DOC NAMES THE RIGHT SITES AND DESCRIBES THEM RIGHTLY.
+    ///
+    /// It used to say "there is exactly one such site ([`caller_actor`], where the
+    /// bridge must be attributed as itself)". Both halves were false against the
+    /// tree, and this is the doc an auditor reads FIRST when checking "an
+    /// Owner-class check that folded Bridge in where it should not have" — so it
+    /// sent them to a function that does not distinguish the two and told them no
+    /// other function does. `aterm` has no evidence manifest; this comment IS the
+    /// claim, which is why it is pinned.
+    #[test]
+    fn the_owner_class_doc_names_the_site_that_actually_distinguishes_bridge() {
+        // THE BEHAVIOUR the doc now describes.
+        let h = registered_session(0, -1, b"");
+        assert_eq!(
+            control_session::caller_actor(Scope::Owner, &h.ctx),
+            control_session::caller_actor(Scope::Bridge, &h.ctx),
+            "caller_actor keeps the arms apart but answers `by=-` for both"
+        );
+        assert_ne!(
+            control_session::cmd_whoami(&h.ctx, Scope::Owner),
+            control_session::cmd_whoami(&h.ctx, Scope::Bridge),
+            "cmd_whoami is the site that reports them differently"
+        );
+
+        // AND THE DOC. Scoped to the `is_owner_class` block so an unrelated
+        // mention elsewhere in the file cannot satisfy it.
+        let src = include_str!("control.rs");
+        let doc = src
+            .split_once("    pub(crate) fn is_owner_class(self) -> bool {")
+            .map(|(before, _)| before)
+            .and_then(|before| before.rsplit_once("impl Scope {"))
+            .map(|(_, doc)| doc.to_string())
+            .expect("the is_owner_class doc block");
+        assert!(
+            doc.contains("cmd_whoami"),
+            "the doc must name the site that actually distinguishes Owner from Bridge"
+        );
+        assert!(
+            !doc.contains("exactly one such site"),
+            "there are two, and neither is the one the old sentence named"
+        );
+    }
+
+    /// A MARK'S PRODUCER IS NAMESPACED BY AUTHORITY, so a local driver cannot
+    /// burn the BRIDGE's sequence.
+    ///
+    /// The key's `<producer>` is a u64 the CALLER types, and only the `<epoch>`
+    /// was checked — which is public anti-spoof state, on the Owner-readable
+    /// roster as `nonce=` and in every session's `$ATERM_LAUNCH_NONCE`. So one
+    /// benign verb from an in-session agent (Owner, which every `aterm-ctl @self`
+    /// holds) —
+    /// `send id=<epoch>:<the bridge's producer id>:18446744073709551615` — pinned
+    /// the bridge's high-water at the top of the u64 range. `send` with an empty
+    /// tail answers `OK` and types nothing, so the mark settled `Applied` with no
+    /// bytes moved and no timeline row. From then on every `Bridge::feed`, whose
+    /// key is `{epoch}:{producer_id}:{off+1}` and therefore always lower, was
+    /// answered `OK dup=1` with NOTHING written, while the bridge published
+    /// `ev applied dup=1` on the fleet log: §6.6's "human always wins" drive path
+    /// silently dead and §10's causal record asserting the opposite.
+    ///
+    /// `Scope::Bridge` is a CONNECTION, not a token, so its marks live in a
+    /// namespace no token can CLAIM in. ANSWERING is not claiming, and the last
+    /// stanza is that distinction: a local caller naming a sequence the bridge has
+    /// already consumed is still answered `OK dup=1` and still writes nothing,
+    /// which is the property `aterm-link`'s
+    /// `a_consumed_sequence_is_answered_without_writing_however_it_is_asked`
+    /// names and an operator debugging a stuck driver depends on. What is fenced
+    /// is INSTALLING a high-water in the bridge's namespace — the act that
+    /// suppresses a write.
+    #[test]
+    fn feed_idempotent_a_producer_is_namespaced_by_the_callers_authority() {
+        let h = registered_session(0, -1, b"");
+        let hex = h.ctx.nonce.to_hex();
+        let bridge_producer = 7u64;
+
+        // T1's one verb: claim the bridge's producer at the top of the range.
+        let attack = format!("{hex}:{bridge_producer}:{}", u64::MAX);
+        assert_eq!(
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(attack.as_str()), || {
+                // `cmd_send` with an empty tail: OK, and nothing typed.
+                "OK\n".to_string()
+            }),
+            "OK\n"
+        );
+
+        // The human's keystroke, arriving over the bridge under the bridge's own
+        // key. It must RUN.
+        let typed = std::cell::Cell::new(0u32);
+        let bridge_key = format!("{hex}:{bridge_producer}:1");
+        let feed = || {
+            crate::pty_idem::guarded(
+                &h.ctx,
+                Scope::Bridge,
+                "feed-bin",
+                Some(bridge_key.as_str()),
+                || {
+                    typed.set(typed.get() + 1);
+                    "OK 3 bytes\n".to_string()
+                },
+            )
+        };
+        assert_eq!(
+            feed(),
+            "OK 3 bytes\n",
+            "an Owner caller claimed the bridge's producer and swallowed the keystroke"
+        );
+        assert_eq!(typed.get(), 1, "the bytes actually reached the seam");
+
+        // And the bridge's own replay is still recognized INSIDE its own realm —
+        // the exactly-once property this module exists for is unchanged.
+        assert_eq!(feed(), "OK dup=1\n");
+        assert_eq!(typed.get(), 1);
+
+        // The local realm still remembers its own claim, so nothing was weakened
+        // for the caller that made it.
+        assert_eq!(
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(attack.as_str()), || {
+                panic!("a local replay must not run again")
+            }),
+            "OK dup=1\n"
+        );
+
+        // ANSWERING IS NOT CLAIMING. The fence is one-way and it is on the
+        // INSTALL, so an Owner connection asking about a sequence the BRIDGE
+        // consumed is still answered from the bridge's mark and still writes
+        // nothing — "however it is asked", which is what an operator debugging a
+        // stuck driver has and what aterm-link's fleet_comms_e2e pins by name.
+        let other = format!("{hex}:{}:1", bridge_producer + 1);
+        assert_eq!(
+            crate::pty_idem::guarded(
+                &h.ctx,
+                Scope::Bridge,
+                "feed-bin",
+                Some(other.as_str()),
+                || "OK 3 bytes\n".to_string()
+            ),
+            "OK 3 bytes\n"
+        );
+        assert_eq!(
+            crate::pty_idem::guarded(
+                &h.ctx,
+                Scope::Owner,
+                "feed-bin",
+                Some(other.as_str()),
+                || { panic!("a consumed sequence must be answered without writing") }
+            ),
+            "OK dup=1\n",
+            "the bridge's consumed sequence is answerable from any connection"
+        );
+    }
+
+    /// `turn id=k` twice SUBMITS ONCE. The guard wraps the same
+    /// [`control_session::cmd_turn`] the dispatch calls, with a `TurnIo` that counts
+    /// what actually reached the app.
+    #[test]
+    fn feed_idempotent_turn_submits_once() {
+        use std::cell::{Cell, RefCell};
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let term = &h.term;
+        let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+
+        let pasted: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let presses = Cell::new(0u32);
+        let paste = |text: &str| {
+            pasted.borrow_mut().push(text.to_string());
+            term.lock().unwrap().process(text.as_bytes());
+            true
+        };
+        let press = |name: &str| {
+            presses.set(presses.get() + 1);
+            assert_eq!(name, "enter");
+            term.lock().unwrap().process(b"\r\nresponse-line\r\n");
+            true
+        };
+        let run = || {
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "turn", Some(key.as_str()), || {
+                control_session::cmd_turn(
+                    term,
+                    &store,
+                    0,
+                    "idle=50 timeout=5000 hello peer",
+                    &subscribe::new_registry(),
+                    &h.ctx,
+                    &TurnIo {
+                        paste: &paste,
+                        press: &press,
+                    },
+                )
+            })
+        };
+
+        let first = run();
+        assert!(
+            first.starts_with("OK 24 turn submitted=1"),
+            "the first turn runs: {}",
+            first.lines().next().unwrap_or("")
+        );
+        let again = run();
+        // IN `turn`'s OWN FRAMING. `turn` is `Framing::Lines` (`OK <n>` then n
+        // rows), so the duplicate is a ZERO-ROW listing with the marker in the
+        // tail. A bare `OK dup=1` made `aterm-ctl` read `dup=1` as a row count and
+        // answer `malformed response header` — a client error a driver retrying
+        // after a crash cannot tell from a broken server, which is the opposite of
+        // what the documented duplicate is for.
+        assert_eq!(again, "OK 0 dup=1\n", "the replay does not re-submit");
+        // And a Lines client can PARSE it. This is `aterm-ctl`'s `stream_count`
+        // rule verbatim (`aterm-ctl/src/lib.rs`: the tail's first whitespace token
+        // as a row count); a header it cannot parse is `malformed response header`
+        // and rc=1.
+        let tail = again.trim_end().strip_prefix("OK ").expect("an OK header");
+        assert_eq!(
+            tail.split_whitespace()
+                .next()
+                .and_then(|t| t.parse::<usize>().ok()),
+            Some(0),
+            "a Lines client reads the dup header as a zero-row listing: {again:?}"
+        );
+        assert_eq!(
+            pasted.borrow().as_slice(),
+            ["hello peer"],
+            "typed exactly once"
+        );
+        assert_eq!(presses.get(), 1, "submitted exactly once");
+    }
+
+    /// The IN-DOUBT verdict, which is what makes an unknown outcome visible rather
+    /// than silent. An attempt that did not answer `OK` may still have typed —
+    /// `cmd_turn` types its text and can then fail to submit — so the sequence is
+    /// KEPT and its outcome recorded as unknown. A replay is told so in those words
+    /// and runs nothing; the session's `timeline` carries the row a human reads.
+    ///
+    /// The two carve-outs are the other half: `ERR busy` and `ERR denied` are
+    /// decided before any byte moves, so they give the sequence back and the
+    /// driver's retry is a first attempt.
+    #[test]
+    fn feed_idempotent_an_unknown_outcome_is_reported_and_never_replayed() {
+        let h = registered_session(0, -1, b"");
+        let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+        let runs = std::cell::Cell::new(0u32);
+
+        // A write that failed in a way that says nothing about the PTY.
+        let out =
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(key.as_str()), || {
+                runs.set(runs.get() + 1);
+                "ERR write failed\n".to_string()
+            });
+        assert_eq!(out, "ERR write failed\n");
+        // The replay is refused rather than re-typed OR reported as a duplicate.
+        let replay =
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(key.as_str()), || {
+                runs.set(runs.get() + 1);
+                "ERR write failed\n".to_string()
+            });
+        assert_eq!(replay, "ERR in-doubt seq=1\n");
+        assert_eq!(runs.get(), 1, "an in-doubt sequence is never replayed");
+
+        // VISIBLE: the row is on this session's timeline, with no input bytes on it.
+        let timeline = h.ctx.timeline.lock().unwrap();
+        let doubt: Vec<_> = timeline
+            .since(None)
+            .filter(|e| e.kind == "in-doubt")
+            .collect();
+        assert_eq!(doubt.len(), 1, "exactly one in-doubt row");
+        assert_eq!(doubt[0].payload, "producer=4 seq=1 reply=ERR-write");
+        drop(timeline);
+
+        // The carve-outs: a lease or authority refusal is decided before any byte,
+        // so it gives the sequence back.
+        for refusal in ["ERR busy turn=7\n", "ERR denied\n"] {
+            let h = registered_session(0, -1, b"");
+            let key = format!("{}:4:1", h.ctx.nonce.to_hex());
+            let runs = std::cell::Cell::new(0u32);
+            let attempt = || {
+                crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(key.as_str()), || {
+                    runs.set(runs.get() + 1);
+                    if runs.get() == 1 {
+                        refusal.to_string()
+                    } else {
+                        "OK 3 bytes\n".to_string()
+                    }
+                })
+            };
+            assert_eq!(attempt(), refusal);
+            assert_eq!(attempt(), "OK 3 bytes\n", "{refusal} released the sequence");
+            assert_eq!(runs.get(), 2);
+            // And having landed, it is now a duplicate.
+            assert_eq!(attempt(), "OK dup=1\n");
+            assert_eq!(runs.get(), 2);
+            assert!(
+                h.ctx
+                    .timeline
+                    .lock()
+                    .unwrap()
+                    .since(None)
+                    .all(|e| e.kind != "in-doubt"),
+                "a pre-write refusal is not in doubt"
+            );
+        }
+    }
+
+    /// A sequence BELOW the mark is a duplicate too — the producer moved on, so
+    /// everything under its high-water was consumed. And a mark is per producer:
+    /// two drivers cannot make each other's keys look like replays.
+    #[test]
+    fn feed_idempotent_the_mark_is_per_producer_and_covers_everything_under_it() {
+        let h = registered_session(0, -1, b"");
+        let hex = h.ctx.nonce.to_hex();
+        let runs = std::cell::Cell::new(0u32);
+        let go = |key: String| {
+            crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(key.as_str()), || {
+                runs.set(runs.get() + 1);
+                "OK\n".to_string()
+            })
+        };
+        assert_eq!(go(format!("{hex}:1:5")), "OK\n");
+        assert_eq!(go(format!("{hex}:1:3")), "OK dup=1\n", "under the mark");
+        assert_eq!(go(format!("{hex}:1:5")), "OK dup=1\n", "at the mark");
+        assert_eq!(go(format!("{hex}:1:6")), "OK\n", "above the mark");
+        // A DIFFERENT producer's sequence 5 is its own first attempt.
+        assert_eq!(go(format!("{hex}:2:5")), "OK\n");
+        assert_eq!(runs.get(), 3);
+    }
+
+    /// THE GUARD SITS ON THE PTY SEAMS AND NOWHERE ELSE. Two production call sites:
+    /// the verb dispatch (`send`/`key`/`turn`) and the `feed-bin` frame, which is
+    /// intercepted before that dispatch and would otherwise slip past. A third site
+    /// would mean a verb consuming a driver's sequence without typing; a missing one
+    /// would mean a keyed verb that silently ignores its key.
+    #[test]
+    fn feed_idempotent_the_guard_sits_only_on_the_pty_seams() {
+        let control = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("control.rs has a tests module");
+        assert_eq!(
+            control.matches("pty_idem::guarded(").count(),
+            2,
+            "the exactly-once gate has exactly two production call sites: the verb \
+             dispatch and the feed-bin frame"
+        );
+        assert_eq!(
+            control.matches("pty_idem::take_key(").count(),
+            1,
+            "the line verbs' key is taken once, at the dispatch"
+        );
+        // The keyed set is §11.2's, and every member is PTY-reaching — a key may
+        // only ever be consumed by something that can type.
+        assert_eq!(
+            crate::pty_idem::KEYED_VERBS,
+            ["send", "key", "feed-bin", "turn"]
+        );
+        for verb in crate::pty_idem::KEYED_VERBS {
+            assert!(
+                crate::fabric::is_pty_reaching(verb),
+                "{verb} takes an idempotency key but cannot reach the PTY"
+            );
+        }
+    }
+
     /// Build an [`ActiveHandle`] over a `pipe_session` handle (the cross-session
     /// feed-bin tests resolve `@.`/self through the active handle the same way the
     /// production `serve` loop does).
@@ -16730,6 +19579,7 @@ mod tests {
             speed: 12.0,
             resume_grant: 0.0,
             woken: 0,
+            bloom: 0,
             glow_active: true,
             pet_active: true,
             cat_active: false,

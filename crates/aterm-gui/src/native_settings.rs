@@ -12,6 +12,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use aterm_containment::consent::{
+    DrClass, FdaState, Folder, ProbeLabel, ResetAttempt, ResetOffer, ResetOfferInputs,
+    ResetOutcome, ResetPlan, SpikeEvidence, TccutilPresence,
+};
 use aterm_grapheme::GraphemeClusters;
 
 use crate::about::AboutState;
@@ -498,6 +502,21 @@ pub(crate) struct SettingsViewState {
     /// process environment and every view of a key reports the same effective
     /// value.
     environment_overrides: BTreeMap<String, crate::app_config::ActiveEnvironmentOverride>,
+    /// The macOS file-access posture the host published (design §3.4). `None`
+    /// means nothing has been observed — a headless instance, a unit test and
+    /// every non-macOS build stay here, and the Security page then carries no
+    /// macOS access block at all rather than an invented one.
+    macos_access: Option<MacosAccess>,
+    /// The injected arms for this block's two OS gestures. Inert by default,
+    /// so a view nobody armed cannot reach `NSWorkspace` or spawn `tccutil`.
+    consent_gestures: ConsentGestures,
+    /// Owner presses of *Ask for folder access now* that the host has not
+    /// performed yet. The warm-up worker and its bounded automatic-apply hold
+    /// are owned by `App` (§3.5), which cannot be reached from a reducer, so
+    /// the gesture is recorded here and drained by
+    /// `App::sync_settings_consent_posture`. It saturates at one: a second
+    /// press while one is outstanding must not queue a second worker.
+    consent_warmup_requests: u8,
 }
 
 impl SettingsViewState {
@@ -571,6 +590,9 @@ impl SettingsViewState {
             title_summary_health: None,
             assets,
             environment_overrides,
+            macos_access: None,
+            consent_gestures: ConsentGestures::inert(),
+            consent_warmup_requests: 0,
         }
     }
 
@@ -766,6 +788,38 @@ impl SettingsViewState {
         self.title_summary_health = Some(health);
         self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
         true
+    }
+
+    /// Publish the macOS file-access posture into this view (design §3.4). The
+    /// App owns the cached probe and calls this only on a real change; native
+    /// Settings remains an IO-free projection and never asks the OS a consent
+    /// question while painting.
+    pub(crate) fn replace_macos_access(&mut self, access: MacosAccess) -> bool {
+        if self.macos_access.as_ref() == Some(&access) {
+            return false;
+        }
+        self.macos_access = Some(access);
+        self.common.presentation_revision = self.common.presentation_revision.saturating_add(1);
+        true
+    }
+
+    /// Install the live gesture arms. Only a windowed host calls this; a view
+    /// that is never armed keeps the arms that cannot reach the OS.
+    pub(crate) fn arm_consent_gestures(&mut self, gestures: ConsentGestures) {
+        self.consent_gestures = gestures;
+    }
+
+    /// The published posture, for the host-side fence test. Production reads it
+    /// through the renderer, which is why this is test-only.
+    #[cfg(test)]
+    pub(crate) const fn macos_access_for_test(&self) -> Option<&MacosAccess> {
+        self.macos_access.as_ref()
+    }
+
+    /// Take the outstanding *Ask for folder access now* press, if there is one.
+    /// Draining is the host's job, and it is the only caller.
+    pub(crate) fn take_consent_warmup_request(&mut self) -> bool {
+        std::mem::take(&mut self.consent_warmup_requests) > 0
     }
 
     fn is_explicit(&self, key: &str) -> bool {
@@ -2353,6 +2407,84 @@ impl SettingsApp {
                     view.feedback = Some("Undoing…".to_string());
                     cx.repaint(crate::native_app::DamageRegion::All);
                 }
+                EventResult::Handled
+            }
+            // ---------------------------------------------------------------
+            // The macOS access block's four owner gestures (§3.4, §3.7).
+            //
+            // Every one of them requires this press. None is a `VERBS` row,
+            // none has a control dispatch arm, and none is reachable from a
+            // `Wake` the control thread raises — a consent-raising action a
+            // program inside a session could fire would be a consent surface
+            // an agent controls, which is the rule §3.5 and §3.7 share.
+            // ---------------------------------------------------------------
+            MACOS_ACCESS_OPEN_FDA | MACOS_ACCESS_OPEN_FILES => {
+                let pane = if action == MACOS_ACCESS_OPEN_FDA {
+                    crate::menu::PrivacyPane::FullDiskAccess
+                } else {
+                    crate::menu::PrivacyPane::FilesAndFolders
+                };
+                let words = crate::menu::privacy_settings_path_words(pane);
+                // `openURL:` reports that System Settings TOOK the URL, never
+                // that it scrolled to the row — so the route in words goes out
+                // on every outcome, not only the degraded ones.
+                view.feedback = Some(match (view.consent_gestures.open_settings)(pane) {
+                    crate::menu::SettingsOpen::Anchored | crate::menu::SettingsOpen::PaneRoot => {
+                        format!("Opened System Settings \u{2014} look under {words}.")
+                    }
+                    crate::menu::SettingsOpen::Refused => {
+                        format!("System Settings did not open. The setting is at {words}.")
+                    }
+                });
+                cx.repaint(crate::native_app::DamageRegion::All);
+                EventResult::Handled
+            }
+            MACOS_ACCESS_WARM_UP => {
+                let live = view
+                    .macos_access
+                    .as_ref()
+                    .is_some_and(|access| access.warmup_live);
+                if live {
+                    // A second press starts no second worker. Walking the
+                    // folders in sequence is the whole design (§3.5): a second
+                    // worker would stack a second system dialog.
+                    view.feedback =
+                        Some("aterm is already asking macOS about these folders.".to_string());
+                } else {
+                    view.consent_warmup_requests = 1;
+                    view.feedback = Some(
+                        "Asking macOS about these folders one at a time. macOS decides when it \
+                         puts its question on screen."
+                            .to_string(),
+                    );
+                }
+                cx.repaint(crate::native_app::DamageRegion::All);
+                EventResult::Handled
+            }
+            MACOS_ACCESS_ASK_AGAIN => {
+                // The plan and the button agree by construction: both come from
+                // `MacosAccess::reset_plan`, which is `None` whenever the offer
+                // is suppressed or nothing is denied.
+                let plan = view.macos_access.as_ref().and_then(MacosAccess::reset_plan);
+                if let Some(plan) = plan {
+                    let attempts = (view.consent_gestures.run_reset)(&plan);
+                    let report = MacosAccessReset::from_attempts(&attempts);
+                    view.feedback = Some(
+                        macos_access_reset_lines(&report)
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "Nothing was changed.".to_string()),
+                    );
+                    if let Some(access) = view.macos_access.as_mut() {
+                        access.reset = Some(report);
+                    }
+                    view.common.presentation_revision =
+                        view.common.presentation_revision.saturating_add(1);
+                } else {
+                    view.feedback =
+                        Some("There is no saved answer aterm can ask macOS to clear.".to_string());
+                }
+                cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
             "about/copy-build-info" => {
@@ -10265,6 +10397,19 @@ fn settings_fields_page(
     let compact_smart_title_health = show_smart_title_health
         && width == SettingsWidth::Compact
         && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
+    // THE MACOS ACCESS BLOCK (design §3.4/§3.7). Same leading-showcase slot the
+    // Smart Titles card uses, on the Security route only, and only once the
+    // host has published a posture — so a headless instance, a unit test and
+    // every non-macOS build render the ordinary page unchanged.
+    let show_macos_access = !modified_only
+        && !global_search
+        && prefers_macos_access(state)
+        && state.choice_picker.is_none()
+        && !show_renderer_preview_now
+        && !show_smart_title_health;
+    let compact_macos_access = show_macos_access
+        && width == SettingsWidth::Compact
+        && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
     let display_faces_showcase =
         display_faces_showcase_eligible.then(|| display_faces_card(state, width));
     // THE CURSOR KITTY CARD. Unlike the Display Faces showcase it can never be
@@ -10487,6 +10632,8 @@ fn settings_fields_page(
         renderer_preview_height(width)
     } else if show_smart_title_health {
         smart_title_health_height(compact_smart_title_health)
+    } else if let Some(access) = state.macos_access.as_ref().filter(|_| show_macos_access) {
+        macos_access_height(access, compact_macos_access)
     } else {
         0.0
     };
@@ -10729,6 +10876,9 @@ fn settings_fields_page(
     }
     if show_smart_title_health {
         out.push(smart_title_health_card(state, compact_smart_title_health));
+    }
+    if let Some(access) = state.macos_access.as_ref().filter(|_| show_macos_access) {
+        out.push(macos_access_card(access, compact_macos_access));
     }
     if let Some((card, _height)) = display_faces_showcase {
         out.push(card);
@@ -12752,6 +12902,810 @@ fn smart_title_health_card(state: &SettingsViewState, compact: bool) -> UiNode {
     .layout(
         Layout::column()
             .height(Length::Fixed(smart_title_health_height(compact)))
+            .padding(Insets::all(12.0))
+            .gap(0.0)
+            .clipped(),
+    )
+    .children(children)
+}
+
+// ---------------------------------------------------------------------------
+// The "macOS access" block on Settings ▸ Security (design §3.4, §3.7)
+// ---------------------------------------------------------------------------
+//
+// # What this block is allowed to say
+//
+// Spikes §7 S1 (how far a grant reaches) and §7 S4 (which folders a grant
+// actually covers) have NOT been run. So:
+//
+// * **no scope sentence exists here at all.** `FdaScope` is `Unknown` on this
+//   tree and §3.4's escalation clause is explicit about what to ship in that
+//   case — `fda_scope` on the `privacy` verb and no scope sentence in the UI.
+//   Neither of §3.4's two pre-drafted variants is present, and
+//   `the_panel_never_speaks_about_scope` fails if one appears.
+// * **no string names a folder a grant covers.** The coverage sentence is
+//   selected by [`SpikeEvidence::fda_coverage_measured`], which is `false`
+//   everywhere today, so the shipped sentence says what is true: Full Disk
+//   Access is the single grant macOS offers for this, and aterm has not
+//   measured on this Mac what it covers. Strengthening that claim is a named
+//   field flip a reviewer can see, not a sentence someone rewrites.
+// * **nothing promises elimination.** The owner's ruling is that mitigating
+//   this annoyance is acceptable; the panel mitigates and says so.
+//
+// # What it never reports
+//
+// The System Settings toggle. "Toggle ON while every check silently fails" is
+// the most misleading failure in this area (§1.2's stale-`csreq` case), and a
+// toggle mirror would hide exactly the thing worth surfacing. Every state here
+// comes from aterm's OWN probe, and one line says so out loud.
+//
+// # Why the OS gestures are function pointers
+//
+// Opening System Settings touches `NSWorkspace`, and `tccutil reset` mutates
+// the human's privacy state. Both are reachable from a reducer that a unit test
+// can drive, which is the exact shape that killed `WindowServer` on 2026-08-17
+// (`AGENTS.md` rule 5, `tools/grep_guard.sh` B9). So they take the
+// `lock_modifiers` / `ConsentProbes` treatment: [`ConsentGestures`] is a bundle
+// of injected pointers whose default is the INERT arm, and only a windowed host
+// installs the live one.
+
+/// One folder's published row: the folder, and what the warm-up observed.
+pub(crate) type MacosAccessRow = (Folder, crate::consent_warmup::WarmupRow);
+
+/// What one *Ask again* gesture did, folded by
+/// `aterm_containment::consent::reset_outcome`.
+///
+/// `reset` is exactly the set the warm-up may be offered for afterwards;
+/// `declined` is one line per invocation that ran and exited nonzero. A partial
+/// success is carried as a partial success — [`ResetOutcome::AllReset`] is the
+/// only value allowed to speak for the whole set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MacosAccessReset {
+    pub(crate) outcome: ResetOutcome,
+    pub(crate) reset: Vec<Folder>,
+    pub(crate) declined: Vec<(Folder, Option<i32>)>,
+}
+
+impl MacosAccessReset {
+    /// Fold a completed set of invocations. Pure: the spawning happened in the
+    /// gesture, and this only classifies what came back.
+    pub(crate) fn from_attempts(attempts: &[ResetAttempt]) -> Self {
+        Self {
+            outcome: aterm_containment::consent::reset_outcome(attempts),
+            reset: aterm_containment::consent::folders_reset(attempts),
+            declined: aterm_containment::consent::folders_declined(attempts),
+        }
+    }
+}
+
+/// The facts the panel renders, published by the host. Pure data: every
+/// renderer below is a total function of it, so the whole string table is
+/// testable without a window, an event loop, or an OS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MacosAccess {
+    /// `[privacy] enabled`. `false` means aterm asked nothing and claims
+    /// nothing — a different fact from a denial, and spelled differently.
+    pub(crate) enabled: bool,
+    /// The cached Full Disk Access probe's verdict.
+    pub(crate) fda: FdaState,
+    /// Why that verdict — including every case where no syscall was performed.
+    pub(crate) probe: ProbeLabel,
+    /// The designated requirement a grant would be bound to. `Cdhash` /
+    /// `Unsigned` are what makes a grant die on the next build.
+    pub(crate) dr: DrClass,
+    /// Which blocking measurements have actually been made. Everything here is
+    /// `UNMEASURED` today; the panel's claims are gated on it.
+    pub(crate) evidence: SpikeEvidence,
+    /// The RUNNING bundle's id. `None` outside a `.app` — and then there is no
+    /// reset to offer, because a reset needs a subject.
+    pub(crate) bundle_id: Option<String>,
+    /// Whether `/usr/bin/tccutil` is a runnable file. Unknown fails closed: a
+    /// destructive button is never shown on an unproven tool.
+    pub(crate) tccutil: TccutilPresence,
+    /// `[privacy] warmup == "on-request"` — whether the gesture is offered.
+    pub(crate) warmup_offered: bool,
+    /// A worker is walking folders right now.
+    pub(crate) warmup_live: bool,
+    /// The rows, in walk order.
+    pub(crate) warmup_rows: Vec<MacosAccessRow>,
+    /// The last *Ask again*, if one has run in this process.
+    pub(crate) reset: Option<MacosAccessReset>,
+}
+
+impl Default for MacosAccess {
+    /// The honest zero state: nothing observed, nothing claimed.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fda: FdaState::Unknown,
+            probe: ProbeLabel::RefusedDisabled,
+            dr: DrClass::Unknown,
+            evidence: SpikeEvidence::UNMEASURED,
+            bundle_id: None,
+            tccutil: TccutilPresence::Unknown,
+            warmup_offered: false,
+            warmup_live: false,
+            warmup_rows: Vec::new(),
+            reset: None,
+        }
+    }
+}
+
+impl MacosAccess {
+    /// `prompt_possible` — through the consent module's own join, never a
+    /// second copy of the rule. A held grant whose breadth is unmeasured leaves
+    /// a prompt possible, and the panel says so.
+    pub(crate) fn prompt_possible(&self) -> bool {
+        aterm_containment::ConsentPosture::join(aterm_containment::PostureInputs {
+            adoption: aterm_containment::Attribution::Live,
+            fda: self.fda,
+            responsible: aterm_containment::Responsible::Unknown,
+            observed_eperm: self
+                .warmup_rows
+                .iter()
+                .any(|(_, row)| *row == crate::consent_warmup::WarmupRow::Denied),
+            evidence: self.evidence,
+        })
+        .prompt_possible
+    }
+
+    /// The folders the warm-up observed an `EPERM` for. macOS is not asking
+    /// again for these, which is the state §3.7's two repairs exist for.
+    pub(crate) fn denied_folders(&self) -> Vec<Folder> {
+        self.warmup_rows
+            .iter()
+            .filter(|(_, row)| *row == crate::consent_warmup::WarmupRow::Denied)
+            .map(|(folder, _)| *folder)
+            .collect()
+    }
+
+    fn reset_inputs(&self) -> ResetOfferInputs<'_> {
+        ResetOfferInputs {
+            dr: self.dr,
+            tccutil: self.tccutil,
+            bundle_id: self.bundle_id.as_deref(),
+        }
+    }
+
+    /// Whether *Ask again* may be offered, and why not when it may not.
+    pub(crate) fn reset_offer(&self) -> ResetOffer {
+        aterm_containment::consent::reset_offer(self.reset_inputs())
+    }
+
+    /// The argv set the gesture would run, for exactly the denied folders.
+    /// `None` whenever the offer is suppressed or nothing is denied — so the
+    /// button and the plan can never disagree.
+    pub(crate) fn reset_plan(&self) -> Option<ResetPlan> {
+        let denied = self.denied_folders();
+        if denied.is_empty() {
+            return None;
+        }
+        ResetPlan::for_offer(self.reset_inputs(), &denied)
+    }
+
+    /// Whether the *Ask again* button is drawn at all.
+    pub(crate) fn shows_reset_button(&self) -> bool {
+        self.reset_offer().shows_button() && self.reset_plan().is_some()
+    }
+}
+
+/// THE FENCE for this panel's two OS gestures.
+///
+/// * [`ConsentGestures::live`] — a windowed instance: the real `NSWorkspace`
+///   open and the real `tccutil` spawn.
+/// * [`ConsentGestures::inert`] — a headless instance and every unit test:
+///   answers without reaching the OS.
+///
+/// Published INTO the view rather than held on the controller, because the
+/// host can reach a view's state (`view_state_mut`) and cannot reach the
+/// process-singleton controller. The default is the inert arm, so a
+/// construction that forgets to choose gets the arms that cannot reach the OS.
+#[derive(Clone, Copy)]
+pub(crate) struct ConsentGestures {
+    /// Owner gesture, main thread. Returns what the shell actually achieved so
+    /// the panel can degrade to naming the route in words.
+    open_settings: fn(crate::menu::PrivacyPane) -> crate::menu::SettingsOpen,
+    /// Runs each invocation of a [`ResetPlan`] SEPARATELY and records one
+    /// attempt per folder. No retry, no loop: the plan carries each folder
+    /// exactly once and this walks it exactly once.
+    run_reset: fn(&ResetPlan) -> Vec<ResetAttempt>,
+    live: bool,
+}
+
+impl ConsentGestures {
+    /// The windowed instance's arms.
+    pub(crate) const fn live() -> Self {
+        Self {
+            open_settings: crate::menu::open_privacy_settings,
+            run_reset: run_tccutil_reset,
+            live: true,
+        }
+    }
+
+    /// The headless / unit-test arms: no `NSWorkspace`, no spawn.
+    pub(crate) const fn inert() -> Self {
+        Self {
+            open_settings: inert_open_settings,
+            run_reset: inert_run_reset,
+            live: false,
+        }
+    }
+
+    /// `live()` for a windowed instance, `inert()` for a headless one.
+    pub(crate) const fn for_instance(headless: bool) -> Self {
+        if headless {
+            Self::inert()
+        } else {
+            Self::live()
+        }
+    }
+
+    /// Whether these are the live arms. Read by the tests that prove an
+    /// unarmed view cannot reach the OS; production never branches on it,
+    /// because the arms themselves are the branch.
+    #[cfg(test)]
+    pub(crate) const fn is_live(self) -> bool {
+        self.live
+    }
+}
+
+impl Default for ConsentGestures {
+    fn default() -> Self {
+        Self::inert()
+    }
+}
+
+impl std::fmt::Debug for ConsentGestures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsentGestures")
+            .field("live", &self.live)
+            .finish()
+    }
+}
+
+impl PartialEq for ConsentGestures {
+    fn eq(&self, other: &Self) -> bool {
+        self.live == other.live
+    }
+}
+
+impl Eq for ConsentGestures {}
+
+/// The inert open: nothing is contacted, and the answer is the same
+/// instruction a refused anchor gives — show the route in words.
+const fn inert_open_settings(_pane: crate::menu::PrivacyPane) -> crate::menu::SettingsOpen {
+    crate::menu::SettingsOpen::Refused
+}
+
+/// The inert reset: nothing ran, and every folder says so. `ToolAbsent` is the
+/// honest value — it is NOT a decline, and `reset_outcome` folds it apart.
+fn inert_run_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
+    plan.folders()
+        .iter()
+        .map(|folder| ResetAttempt::tool_absent(*folder))
+        .collect()
+}
+
+/// How long ONE `tccutil` invocation may hold the main thread before it is
+/// killed. `tccutil reset` answers in milliseconds; this is a ceiling, not a
+/// budget to spend.
+///
+/// **Why a ceiling exists at all.** This runs on the main thread from the
+/// Settings reducer, and `tccutil` talks to `tccd`. A synchronous main-thread
+/// wait on `tccd` is the exact shape that killed WindowServer on this machine
+/// on 2026-08-17 (its main thread sat in a `tccd` preflight for forty seconds
+/// and the watchdog took the whole GUI session down — `AGENTS.md` rule 5). An
+/// owner gesture may cost a visible moment; it may never cost the event loop.
+const RESET_INVOCATION_CEILING: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// How often the bounded wait looks at the child. Small enough that the common
+/// case (a few milliseconds) returns promptly, large enough not to spin.
+const RESET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Wait for `child` for at most [`RESET_INVOCATION_CEILING`], then kill and REAP
+/// it. Returns the exit code, or `None` when the child was signalled — which is
+/// what a killed child reports, and which
+/// [`ResetAttempt::from_exit_status`] already folds to `Declined { code: None }`.
+/// A timeout is therefore reported as a decline, never as a success, and never
+/// as `ToolAbsent` (the tool DID run).
+///
+/// The returned `Option` is deliberately the same shape `Child::wait` gives, so
+/// no caller can tell a timeout apart from an ordinary signal and accidentally
+/// claim more than was observed.
+fn wait_bounded(child: &mut std::process::Child, ceiling: std::time::Duration) -> Option<i32> {
+    let deadline = std::time::Instant::now() + ceiling;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    // REAP: without this the child stays a zombie for the life
+                    // of the process.
+                    return child.wait().ok().and_then(|s| s.code());
+                }
+                std::thread::sleep(RESET_POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// THE ONLY SPAWN in this file. One `tccutil` invocation per folder, in plan
+/// order, each recorded independently — §3.7's failure handling is written for
+/// exactly this shape. A folder whose invocation could not even start is
+/// `ToolAbsent`, not a decline; the fold keeps those apart.
+///
+/// Each invocation is bounded by [`RESET_INVOCATION_CEILING`] — see its comment
+/// for why a main-thread wait on `tccd` may never be unbounded here.
+fn run_tccutil_reset(plan: &ResetPlan) -> Vec<ResetAttempt> {
+    plan.commands()
+        .into_iter()
+        .map(|(folder, argv)| {
+            let Some((program, args)) = argv.split_first() else {
+                return ResetAttempt::tool_absent(folder);
+            };
+            match std::process::Command::new(program).args(args).spawn() {
+                // The tool could not even start: not a decline.
+                Err(_) => ResetAttempt::tool_absent(folder),
+                Ok(mut child) => ResetAttempt::from_exit_status(
+                    folder,
+                    wait_bounded(&mut child, RESET_INVOCATION_CEILING),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The panel's whole string table, in render order. Built by
+/// [`macos_access_copy`] and rendered by [`macos_access_card`]; the copy tests
+/// drive it directly, which is how "no banned phrase" and "no coverage claim"
+/// are checked over the entire matrix rather than over one screenshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MacosAccessCopy {
+    /// The live state line, from the cached probe.
+    pub(crate) headline: String,
+    /// Why the probe said that — including "no syscall was performed".
+    pub(crate) probe_detail: String,
+    /// What a grant is, and what aterm has NOT measured about it.
+    pub(crate) coverage: String,
+    /// The trade, in one sentence, unsoftened.
+    pub(crate) trade: String,
+    /// Whether an interruption remains possible.
+    pub(crate) prompt: String,
+    /// The route in words. Always shown: `openURL:` reports that System
+    /// Settings took the URL, never that it scrolled to the row.
+    pub(crate) route: String,
+    /// aterm reports its own probe and never the System Settings switch.
+    pub(crate) observation: String,
+    /// The rebuild explanation, when the grant is bound to an identity that
+    /// does not survive one. `None` otherwise — it is not a general caveat.
+    pub(crate) rebuild: Option<String>,
+    /// One line per folder the warm-up has an answer for.
+    pub(crate) folders: Vec<String>,
+    /// The denied-state sentence, plus whatever the last *Ask again* did.
+    pub(crate) repair: Vec<String>,
+}
+
+impl MacosAccessCopy {
+    /// Every shipped string, in render order. The copy fence drives this
+    /// rather than a screenshot, which is how it can sweep the whole matrix.
+    #[cfg(test)]
+    pub(crate) fn strings(&self) -> Vec<&str> {
+        let mut out = vec![
+            self.headline.as_str(),
+            self.probe_detail.as_str(),
+            self.coverage.as_str(),
+            self.trade.as_str(),
+            self.prompt.as_str(),
+            self.route.as_str(),
+            self.observation.as_str(),
+        ];
+        out.extend(self.rebuild.as_deref());
+        out.extend(self.folders.iter().map(String::as_str));
+        out.extend(self.repair.iter().map(String::as_str));
+        out
+    }
+}
+
+/// The folder's display name, derived from the consent module's own token
+/// rather than typed here. `native_settings.rs` holds no protected-folder
+/// literal of any shape (`tools/grep_guard.sh` B13).
+fn macos_access_folder_label(folder: Folder) -> String {
+    let token = folder.as_str();
+    let mut chars = token.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// One warm-up row in words. `Denied` is the only one that carries a verdict,
+/// and it carries §3.7's exact sentence.
+const fn macos_access_row_label(row: crate::consent_warmup::WarmupRow) -> &'static str {
+    match row {
+        crate::consent_warmup::WarmupRow::Unknown => "not asked by this aterm process",
+        crate::consent_warmup::WarmupRow::Asking => "asking\u{2026}",
+        crate::consent_warmup::WarmupRow::Allowed => "allowed",
+        crate::consent_warmup::WarmupRow::Denied => {
+            "denied \u{2014} macOS is not asking again for this folder"
+        }
+        crate::consent_warmup::WarmupRow::Error => "could not be read",
+    }
+}
+
+/// THE WHOLE STRING TABLE, as a total function of the published facts.
+///
+/// Read the module header before changing a sentence here: the coverage line is
+/// gated on measured evidence, there is deliberately no scope sentence, and
+/// nothing promises that interruptions are eliminated.
+pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
+    let headline = if !access.enabled {
+        "File access \u{2014} not checked. aterm's privacy checks are switched off in aterm.toml."
+    } else {
+        match access.fda {
+            FdaState::Granted => "Full disk access \u{2014} granted to aterm.",
+            FdaState::Denied => "Full disk access \u{2014} not granted to aterm.",
+            FdaState::Unknown => "Full disk access \u{2014} unknown.",
+        }
+    };
+    let probe_detail = match access.probe {
+        ProbeLabel::OpenOk => "aterm's own check succeeded.".to_string(),
+        ProbeLabel::OpenEperm => "aterm's own check was refused by macOS.".to_string(),
+        ProbeLabel::OpenErrno(errno) => {
+            format!("aterm's own check failed with error {errno}, which is not a privacy verdict.")
+        }
+        ProbeLabel::RefusedOutOfBundle => {
+            "aterm did not check: this build is not running from an application bundle.".to_string()
+        }
+        ProbeLabel::RefusedNoExe => {
+            "aterm did not check: the running program could not be resolved.".to_string()
+        }
+        ProbeLabel::RefusedDisabled => {
+            "aterm did not check: the privacy check is switched off in aterm.toml.".to_string()
+        }
+        ProbeLabel::RefusedNoHome => {
+            "aterm did not check: this account has no home directory set.".to_string()
+        }
+        ProbeLabel::RefusedBadPath => {
+            "aterm did not check: the store path could not be used.".to_string()
+        }
+        ProbeLabel::UnsupportedPlatform => {
+            "There is no macOS privacy database on this system.".to_string()
+        }
+    };
+    // GATED ON MEASURED EVIDENCE (§7 S4). `fda_coverage_measured` is false
+    // everywhere on this tree, so the first arm is what ships; the second names
+    // the verb that would then hold the measured list rather than inventing one
+    // here. Neither arm names a folder.
+    let coverage = if access.evidence.fda_coverage_measured {
+        "Full Disk Access is the single grant macOS offers for this, and its reach was measured on \
+         this Mac: aterm ctl privacy lists exactly what the measurement found."
+    } else {
+        "Full Disk Access is the single grant macOS offers for this. aterm has not measured on this \
+         Mac which folders that grant covers, so it claims none."
+    };
+    let trade = "Full disk access on a terminal is broad: everything you run in aterm could then \
+                 read everything this account can read. The value is that you decide that once, \
+                 knowingly \u{2014} not quietly.";
+    let prompt = if access.prompt_possible() {
+        "A program running in aterm can still be interrupted by a macOS file-access request."
+    } else {
+        "For the services measured as covered, macOS is not expected to interrupt a program run in \
+         aterm."
+    };
+    let route = crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
+        .to_string();
+    let observation = "aterm reports only what its own check observed, never the switch in System \
+                       Settings: a switch that reads on while every check quietly fails is exactly \
+                       the failure worth seeing.";
+    // §3.7's suppression branch. It fires for the identity classes whose grants
+    // do not survive a build — and it says what actually happened, which is
+    // that a rebuild invalidated them, not that the owner refused anything.
+    let rebuild = (access.reset_offer() == ResetOffer::ExplainRebuild).then(|| {
+        "This build's saved answers were invalidated by a rebuild, not by you. macOS binds every \
+         answer to the exact code identity that asked, and this build's identity changes each time \
+         it is built \u{2014} so clearing the saved answers here would not hold. A build signed \
+         with a stable Developer ID identity keeps one identity across builds, which is what \
+         shipped aterm releases carry."
+            .to_string()
+    });
+    let folders = access
+        .warmup_rows
+        .iter()
+        .map(|(folder, row)| {
+            format!(
+                "{} \u{2014} {}",
+                macos_access_folder_label(*folder),
+                macos_access_row_label(*row)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut repair = Vec::new();
+    let denied = access.denied_folders();
+    if !denied.is_empty() {
+        repair.push(
+            "macOS is not asking again for the folders above. Both ways out of that are yours to \
+             start, and neither happens on its own."
+                .to_string(),
+        );
+    }
+    if let Some(report) = access.reset.as_ref() {
+        repair.extend(macos_access_reset_lines(report));
+    }
+    MacosAccessCopy {
+        headline: headline.to_string(),
+        probe_detail,
+        coverage: coverage.to_string(),
+        trade: trade.to_string(),
+        prompt: prompt.to_string(),
+        route,
+        observation: observation.to_string(),
+        rebuild,
+        folders,
+        repair,
+    }
+}
+
+/// What the last *Ask again* did, reported at the exact strength it earned.
+/// Only [`ResetOutcome::AllReset`] speaks for the whole set; a partial success
+/// names the folders it actually cleared, and every nonzero invocation gets its
+/// own line with the exit status.
+fn macos_access_reset_lines(report: &MacosAccessReset) -> Vec<String> {
+    let names = |folders: &[Folder]| {
+        folders
+            .iter()
+            .map(|folder| macos_access_folder_label(*folder))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = Vec::new();
+    match report.outcome {
+        ResetOutcome::AllReset => out.push(format!(
+            "macOS cleared its saved answer for every folder asked: {}. Ask for folder access now \
+             to let it ask again.",
+            names(&report.reset)
+        )),
+        ResetOutcome::Partial => out.push(format!(
+            "macOS cleared its saved answer for {} only. Ask for folder access now to let it ask \
+             again about those.",
+            names(&report.reset)
+        )),
+        ResetOutcome::NoneReset => {
+            out.push("macOS cleared no saved answer.".to_string());
+        }
+        ResetOutcome::ToolAbsent => {
+            out.push(
+                "Nothing was changed: the macOS tool that clears a saved answer could not be run."
+                    .to_string(),
+            );
+        }
+        ResetOutcome::NotAttempted => {}
+    }
+    for (folder, code) in &report.declined {
+        out.push(match code {
+            Some(code) => format!(
+                "macOS declined to clear {} (exit status {code}).",
+                macos_access_folder_label(*folder)
+            ),
+            None => format!(
+                "macOS declined to clear {} (the command was ended by a signal).",
+                macos_access_folder_label(*folder)
+            ),
+        });
+    }
+    out
+}
+
+/// The four action ids this block owns. They are the ONLY way to reach the
+/// warm-up (§3.5) and the reset (§3.7): neither is a `VERBS` row, neither has a
+/// control dispatch arm, and no config key or environment variable invokes
+/// either — a consent-raising action a program inside a session could fire
+/// would be a consent surface an agent controls.
+pub(crate) const MACOS_ACCESS_OPEN_FDA: &str = "settings/macos-access/full-disk-access";
+pub(crate) const MACOS_ACCESS_OPEN_FILES: &str = "settings/macos-access/files-and-folders";
+pub(crate) const MACOS_ACCESS_WARM_UP: &str = "settings/macos-access/warm-up";
+pub(crate) const MACOS_ACCESS_ASK_AGAIN: &str = "settings/macos-access/ask-again";
+
+/// Whether the Security page carries the block right now. It exists only when
+/// the host has PUBLISHED a posture — a headless instance, a unit test, and
+/// every non-macOS build publish nothing, so the block is simply absent rather
+/// than rendering an invented "unknown" card.
+fn prefers_macos_access(state: &SettingsViewState) -> bool {
+    state.route == SettingsRoute::Security
+        && state.search.trim().is_empty()
+        && state.macos_access.is_some()
+}
+
+/// Exact authored height, so the page budget sees the same card the renderer
+/// draws. Grows with the rows and repair lines it actually has.
+fn macos_access_height(access: &MacosAccess, compact: bool) -> f32 {
+    let scale = settings_text_scale();
+    let line_height = 24.0_f32.max(20.0 * scale);
+    let heading_height = 28.0_f32.max(22.0 * scale);
+    let copy = macos_access_copy(access);
+    let lines = if compact {
+        // Short landscape and maximum Dynamic Type keep the state line, the
+        // coverage claim and the trade; everything else is on the same page one
+        // scroll away, and clipping all three would be worse than shedding the
+        // rest.
+        3 + usize::from(copy.rebuild.is_some())
+    } else {
+        7 + usize::from(copy.rebuild.is_some()) + copy.folders.len() + copy.repair.len()
+    };
+    heading_height + lines as f32 * line_height + scaled_control_height() + 12.0 + 24.0
+}
+
+/// One button in the block. Every one of them is an owner gesture on the main
+/// thread; none of them is reachable without a press.
+fn macos_access_button(action: &str, label: &str, enabled: bool, busy: bool) -> UiNode {
+    UiNode::new(
+        action.to_string(),
+        UiContent::Button(
+            Control::new(ButtonSpec::new(label), ActionId::new(action.to_string()))
+                .state(ControlState {
+                    enabled,
+                    busy,
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Secondary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(scaled_control_height())),
+    )
+}
+
+/// The block itself.
+fn macos_access_card(access: &MacosAccess, compact: bool) -> UiNode {
+    let line_height = 24.0_f32.max(20.0 * settings_text_scale());
+    let heading_height = 28.0_f32.max(22.0 * settings_text_scale());
+    let copy = macos_access_copy(access);
+    let headline_style = match (access.enabled, access.fda) {
+        (false, _) => StyleRef::Quiet,
+        (true, FdaState::Granted) => StyleRef::Success,
+        (true, FdaState::Denied) => StyleRef::Primary,
+        (true, FdaState::Unknown) => StyleRef::Quiet,
+    };
+    let line = |key: String, text: String, role: SemanticRole, style: StyleRef| {
+        UiNode::new(key, UiContent::Text(TextSpec { text, role, style }))
+            .layout(Layout::default().height(Length::Fixed(line_height)))
+    };
+    let mut children = vec![
+        UiNode::new(
+            "settings/macos-access/heading",
+            UiContent::Text(TextSpec {
+                text: "MACOS FILE ACCESS".to_string(),
+                role: SemanticRole::Heading,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().height(Length::Fixed(heading_height))),
+        line(
+            "settings/macos-access/state".to_string(),
+            copy.headline.clone(),
+            SemanticRole::Status,
+            headline_style,
+        ),
+        line(
+            "settings/macos-access/coverage".to_string(),
+            copy.coverage.clone(),
+            SemanticRole::Status,
+            StyleRef::Primary,
+        ),
+        line(
+            "settings/macos-access/trade".to_string(),
+            copy.trade.clone(),
+            SemanticRole::Text,
+            StyleRef::Primary,
+        ),
+    ];
+    if !compact {
+        children.push(line(
+            "settings/macos-access/probe".to_string(),
+            copy.probe_detail.clone(),
+            SemanticRole::Status,
+            StyleRef::Quiet,
+        ));
+        children.push(line(
+            "settings/macos-access/prompt".to_string(),
+            copy.prompt.clone(),
+            SemanticRole::Status,
+            StyleRef::Primary,
+        ));
+        children.push(line(
+            "settings/macos-access/observation".to_string(),
+            copy.observation.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+        ));
+        children.push(line(
+            "settings/macos-access/route".to_string(),
+            copy.route.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+        ));
+    }
+    if let Some(rebuild) = copy.rebuild.clone() {
+        children.push(line(
+            "settings/macos-access/rebuild".to_string(),
+            rebuild,
+            SemanticRole::Status,
+            StyleRef::Danger,
+        ));
+    }
+    if !compact {
+        for (index, folder) in copy.folders.iter().enumerate() {
+            children.push(line(
+                format!("settings/macos-access/folder/{index}"),
+                folder.clone(),
+                SemanticRole::Status,
+                StyleRef::Primary,
+            ));
+        }
+        for (index, repair) in copy.repair.iter().enumerate() {
+            children.push(line(
+                format!("settings/macos-access/repair/{index}"),
+                repair.clone(),
+                SemanticRole::Status,
+                StyleRef::Quiet,
+            ));
+        }
+    }
+    let mut buttons = vec![macos_access_button(
+        MACOS_ACCESS_OPEN_FDA,
+        "Open Privacy & Security\u{2026}",
+        true,
+        false,
+    )];
+    if access.warmup_offered {
+        buttons.push(macos_access_button(
+            MACOS_ACCESS_WARM_UP,
+            "Ask for Folder Access Now",
+            !access.warmup_live,
+            access.warmup_live,
+        ));
+    }
+    if !access.denied_folders().is_empty() {
+        buttons.push(macos_access_button(
+            MACOS_ACCESS_OPEN_FILES,
+            "Open Files & Folders\u{2026}",
+            true,
+            false,
+        ));
+        // §3.7: absent tool, unusable bundle id, or a rebuild-invalidated
+        // identity and the button is not drawn at all. A destructive gesture is
+        // never offered on an unproven tool or an identity it cannot repair.
+        if access.shows_reset_button() {
+            buttons.push(macos_access_button(
+                MACOS_ACCESS_ASK_AGAIN,
+                "Ask Again",
+                !access.warmup_live,
+                false,
+            ));
+        }
+    }
+    children.push(
+        UiNode::new(
+            "settings/macos-access/actions",
+            UiContent::Group(GroupSpec::new("macOS access actions")),
+        )
+        .layout(
+            Layout::row()
+                .width(Length::Fill)
+                .height(Length::Fixed(scaled_control_height()))
+                .gap(8.0),
+        )
+        .children(buttons),
+    );
+    UiNode::new(
+        "settings/macos-access",
+        UiContent::Group(GroupSpec::new("macOS file access").style(StyleRef::Secondary)),
+    )
+    .layout(
+        Layout::column()
+            .height(Length::Fixed(macos_access_height(access, compact)))
             .padding(Insets::all(12.0))
             .gap(0.0)
             .clipped(),
@@ -19303,6 +20257,977 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // The macOS access block (design §3.4, §3.7)
+    // -----------------------------------------------------------------------
+
+    /// Every phrase `tools/grep_guard.sh` B12 fences, plus the shapes the
+    /// value-level guard in `status_bars.rs` enumerates. Belt and braces: the
+    /// guard reads the FILE, this reads the strings a reader actually sees,
+    /// including the ones built by `format!` that no grep can evaluate.
+    const BANNED_PANEL_PHRASES: &[&str] = &[
+        "restart",
+        "relaunch",
+        "re-launch",
+        "reopen",
+        "re-open",
+        "reboot",
+        "quit and open",
+        "quit and reopen",
+        "next launch",
+        "open aterm again",
+        "start aterm again",
+    ];
+
+    /// Vocabulary that would assert which folders a grant covers. §7 S4 has not
+    /// been run, so `fda_coverage_measured` is false and NONE of this may
+    /// appear. The one word that is allowed is "covers" inside the honest
+    /// sentence that says aterm has NOT measured coverage — checked separately.
+    const COVERAGE_CLAIM_WORDS: &[&str] = &[
+        "retires",
+        "covered",
+        "all files",
+        "every folder on",
+        "network volume",
+        "removable volume",
+        "icloud",
+        "other apps",
+        "no longer be interrupted",
+        "will not be interrupted",
+    ];
+
+    /// Words that would state how far a grant reaches. §7 S1 has not been run,
+    /// so `FdaScope` is `Unknown` and §3.4's escalation says: no scope sentence
+    /// in the UI at all. Neither pre-drafted variant may appear.
+    const SCOPE_WORDS: &[&str] = &[
+        "this process",
+        "sessions started",
+        "a newer aterm",
+        "does not yet see",
+        "already running",
+        "started since",
+    ];
+
+    fn access_fixture(
+        fda: FdaState,
+        dr: DrClass,
+        scope: aterm_containment::FdaScope,
+    ) -> MacosAccess {
+        MacosAccess {
+            enabled: true,
+            fda,
+            probe: match fda {
+                FdaState::Granted => ProbeLabel::OpenOk,
+                FdaState::Denied => ProbeLabel::OpenEperm,
+                FdaState::Unknown => ProbeLabel::RefusedOutOfBundle,
+            },
+            dr,
+            evidence: SpikeEvidence {
+                fda_scope: scope,
+                ..SpikeEvidence::UNMEASURED
+            },
+            bundle_id: Some("com.example.fixture".to_string()),
+            tccutil: TccutilPresence::Executable,
+            warmup_offered: true,
+            warmup_live: false,
+            warmup_rows: Vec::new(),
+            reset: None,
+        }
+    }
+
+    fn denied_rows() -> Vec<MacosAccessRow> {
+        Folder::ALL
+            .iter()
+            .map(|folder| (*folder, crate::consent_warmup::WarmupRow::Denied))
+            .collect()
+    }
+
+    /// THE MATRIX §3.4 asks for: `{granted, denied, unknown}` ×
+    /// `{identity, cdhash}` × `{this_process, new_processes, unknown}`, with and
+    /// without a denied folder set. Every cell must render a complete, total
+    /// string table — and the scope axis must change NOTHING, because §3.4's
+    /// escalation clause ships no scope sentence at all.
+    #[test]
+    fn the_macos_access_panel_renders_every_state_and_never_speaks_about_scope() {
+        use aterm_containment::FdaScope;
+        for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
+            for dr in [DrClass::Identity, DrClass::Cdhash] {
+                let mut baseline = None;
+                for scope in [
+                    FdaScope::ThisProcess,
+                    FdaScope::NewProcesses,
+                    FdaScope::Unknown,
+                ] {
+                    for rows in [Vec::new(), denied_rows()] {
+                        let mut access = access_fixture(fda, dr, scope);
+                        access.warmup_rows = rows.clone();
+                        let copy = macos_access_copy(&access);
+                        let context = format!("{fda:?}/{dr:?}/{scope:?}/{}", rows.len());
+
+                        assert!(!copy.headline.is_empty(), "{context}: a state line");
+                        assert!(!copy.probe_detail.is_empty(), "{context}: a probe reason");
+                        assert!(!copy.coverage.is_empty(), "{context}: a coverage sentence");
+                        assert!(!copy.trade.is_empty(), "{context}: the trade");
+                        assert!(!copy.prompt.is_empty(), "{context}: the prompt state");
+                        assert!(
+                            copy.route.contains("Full Disk Access"),
+                            "{context}: the route stays in words on every outcome"
+                        );
+                        assert_eq!(
+                            copy.folders.len(),
+                            rows.len(),
+                            "{context}: one line per observed folder, no invention"
+                        );
+
+                        // The rendered card must also compile for this cell.
+                        let card = macos_access_card(&access, false);
+                        assert_eq!(card.key, UiKey::new("settings/macos-access"));
+
+                        // THE SCOPE AXIS IS INERT. Same evidence but for
+                        // `fda_scope`, same words — which is exactly what
+                        // "ships with no scope sentence" means, expressed as a
+                        // property rather than as a grep.
+                        let strings = copy
+                            .strings()
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        match baseline.as_ref() {
+                            None => baseline = Some((rows.len(), strings)),
+                            Some((len, first)) if *len == rows.len() => assert_eq!(
+                                first, &strings,
+                                "{context}: fda_scope changed the copy; §3.4's escalation ships \
+                                 no scope sentence until §7 S1 is measured"
+                            ),
+                            Some(_) => baseline = Some((rows.len(), strings)),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// §3.4's copy fence, checked on the VALUES rather than on the file. Every
+    /// string the panel can produce, over the same matrix plus every probe
+    /// label, every reset outcome and every warm-up row.
+    #[test]
+    fn no_macos_access_string_is_fence_dirty_or_claims_coverage() {
+        use crate::consent_warmup::WarmupRow;
+        use aterm_containment::FdaScope;
+        let mut seen = Vec::new();
+        for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
+            for dr in [
+                DrClass::Identity,
+                DrClass::Cdhash,
+                DrClass::Unsigned,
+                DrClass::Unknown,
+            ] {
+                for probe in [
+                    ProbeLabel::OpenOk,
+                    ProbeLabel::OpenEperm,
+                    ProbeLabel::OpenErrno(13),
+                    ProbeLabel::RefusedOutOfBundle,
+                    ProbeLabel::RefusedNoExe,
+                    ProbeLabel::RefusedDisabled,
+                    ProbeLabel::RefusedNoHome,
+                    ProbeLabel::RefusedBadPath,
+                    ProbeLabel::UnsupportedPlatform,
+                ] {
+                    for row in [
+                        WarmupRow::Unknown,
+                        WarmupRow::Asking,
+                        WarmupRow::Allowed,
+                        WarmupRow::Denied,
+                        WarmupRow::Error,
+                    ] {
+                        for reset in [
+                            None,
+                            Some(MacosAccessReset {
+                                outcome: ResetOutcome::AllReset,
+                                reset: Folder::ALL.to_vec(),
+                                declined: Vec::new(),
+                            }),
+                            Some(MacosAccessReset {
+                                outcome: ResetOutcome::Partial,
+                                reset: vec![Folder::Documents],
+                                declined: vec![
+                                    (Folder::Desktop, Some(1)),
+                                    (Folder::Downloads, None),
+                                ],
+                            }),
+                            Some(MacosAccessReset {
+                                outcome: ResetOutcome::NoneReset,
+                                reset: Vec::new(),
+                                declined: vec![(Folder::Documents, Some(70))],
+                            }),
+                            Some(MacosAccessReset {
+                                outcome: ResetOutcome::ToolAbsent,
+                                reset: Vec::new(),
+                                declined: Vec::new(),
+                            }),
+                            Some(MacosAccessReset {
+                                outcome: ResetOutcome::NotAttempted,
+                                reset: Vec::new(),
+                                declined: Vec::new(),
+                            }),
+                        ] {
+                            for enabled in [true, false] {
+                                let mut access = access_fixture(fda, dr, FdaScope::Unknown);
+                                access.enabled = enabled;
+                                access.probe = probe;
+                                access.warmup_rows =
+                                    Folder::ALL.iter().map(|f| (*f, row)).collect();
+                                access.reset = reset.clone();
+                                seen.extend(
+                                    macos_access_copy(&access)
+                                        .strings()
+                                        .into_iter()
+                                        .map(str::to_string),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!seen.is_empty());
+        for line in &seen {
+            let lower = line.to_ascii_lowercase();
+            for banned in BANNED_PANEL_PHRASES {
+                assert!(
+                    !lower.contains(banned),
+                    "the panel says {banned:?} (owner ruling; grep_guard B12): {line}"
+                );
+            }
+            // §7 S4 is unrun, so `fda_coverage_measured` is false everywhere in
+            // this sweep and NO string may assert what a grant covers.
+            for claim in COVERAGE_CLAIM_WORDS {
+                assert!(
+                    !lower.contains(claim),
+                    "the panel claims coverage ({claim:?}) while fda_coverage_measured is \
+                     false: {line}"
+                );
+            }
+            for scope in SCOPE_WORDS {
+                assert!(
+                    !lower.contains(scope),
+                    "the panel states a grant's scope ({scope:?}) while §7 S1 is unmeasured: \
+                     {line}"
+                );
+            }
+            assert!(
+                !lower.contains("no more prompt") && !lower.contains("never be interrupted"),
+                "the panel promises elimination; the owner's ruling is that mitigating this is \
+                 acceptable: {line}"
+            );
+        }
+    }
+
+    /// The coverage sentence is selected by a NAMED FIELD, not by prose. Today
+    /// it says aterm has not measured what a grant covers; flipping
+    /// `fda_coverage_measured` is the only way a stronger sentence appears, and
+    /// even then it defers to the measurement instead of listing folders here.
+    #[test]
+    fn the_coverage_sentence_is_gated_on_measured_evidence() {
+        use aterm_containment::FdaScope;
+        let unmeasured = access_fixture(FdaState::Granted, DrClass::Identity, FdaScope::Unknown);
+        assert!(!unmeasured.evidence.fda_coverage_measured);
+        let today = macos_access_copy(&unmeasured);
+        assert!(
+            today.coverage.contains("has not measured"),
+            "today's sentence must say the measurement was not made: {}",
+            today.coverage
+        );
+        assert!(
+            today.coverage.contains("single grant macOS offers"),
+            "…while still naming Full Disk Access as the one grant on offer: {}",
+            today.coverage
+        );
+        assert!(
+            today.prompt.contains("can still be interrupted"),
+            "a held grant whose breadth is unmeasured leaves a prompt possible: {}",
+            today.prompt
+        );
+
+        let mut measured = unmeasured.clone();
+        measured.evidence.fda_coverage_measured = true;
+        let strengthened = macos_access_copy(&measured);
+        assert_ne!(
+            strengthened.coverage, today.coverage,
+            "the strengthening is a field flip, not a prose rewrite"
+        );
+        for folder in Folder::ALL {
+            assert!(
+                !strengthened
+                    .coverage
+                    .to_ascii_lowercase()
+                    .contains(folder.as_str()),
+                "even the measured sentence names no folder here; the measurement does"
+            );
+        }
+    }
+
+    /// §3.7's denied state, said exactly as the design words it, plus the two
+    /// owner-initiated repairs and nothing automatic.
+    #[test]
+    fn a_denied_folder_says_macos_is_not_asking_again_and_offers_two_repairs() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        let copy = macos_access_copy(&access);
+        for line in &copy.folders {
+            assert!(
+                line.contains("macOS is not asking again for this folder"),
+                "a denied row must say exactly that: {line}"
+            );
+        }
+        assert!(
+            copy.repair
+                .iter()
+                .any(|line| line.contains("yours to start")),
+            "neither repair is automatic: {:?}",
+            copy.repair
+        );
+
+        // Both repairs are drawn, and both are buttons — nothing runs without a
+        // press.
+        let card = macos_access_card(&access, false);
+        let actions = card
+            .children
+            .iter()
+            .find(|node| node.key == UiKey::new("settings/macos-access/actions"))
+            .expect("the action row");
+        let keys = actions
+            .children
+            .iter()
+            .map(|node| node.key.clone())
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&UiKey::new(MACOS_ACCESS_OPEN_FILES)));
+        assert!(keys.contains(&UiKey::new(MACOS_ACCESS_ASK_AGAIN)));
+        assert!(access.shows_reset_button());
+
+        // And with nothing denied, neither repair is offered at all.
+        let mut quiet = access.clone();
+        quiet.warmup_rows = Vec::new();
+        assert!(!quiet.shows_reset_button());
+        let quiet_card = macos_access_card(&quiet, false);
+        let quiet_actions = quiet_card
+            .children
+            .iter()
+            .find(|node| node.key == UiKey::new("settings/macos-access/actions"))
+            .expect("the action row");
+        assert!(
+            !quiet_actions
+                .children
+                .iter()
+                .any(|node| node.key == UiKey::new(MACOS_ACCESS_ASK_AGAIN)),
+            "a reset is offered only for folders macOS actually refused"
+        );
+    }
+
+    /// §3.7's suppression: a grant bound to a `cdhash` was invalidated by a
+    /// REBUILD, not by the owner. The button is not drawn, no plan exists, and
+    /// the panel says what happened instead of offering a repair that cannot
+    /// hold. The same holds for an unsigned build (§3.1's dev-build line).
+    #[test]
+    fn a_rebuild_invalidated_identity_suppresses_the_reset_and_explains_itself() {
+        use aterm_containment::FdaScope;
+        for dr in [DrClass::Cdhash, DrClass::Unsigned] {
+            let mut access = access_fixture(FdaState::Denied, dr, FdaScope::Unknown);
+            access.warmup_rows = denied_rows();
+            assert_eq!(access.reset_offer(), ResetOffer::ExplainRebuild, "{dr:?}");
+            assert!(!access.shows_reset_button(), "{dr:?}");
+            assert!(
+                access.reset_plan().is_none(),
+                "{dr:?}: no argv is even built"
+            );
+
+            let copy = macos_access_copy(&access);
+            let rebuild = copy.rebuild.as_deref().expect("the rebuild explanation");
+            assert!(rebuild.contains("rebuild"), "{dr:?}: {rebuild}");
+            assert!(rebuild.contains("not by you"), "{dr:?}: {rebuild}");
+            assert!(
+                rebuild.contains("Developer ID"),
+                "{dr:?}: it points at the dev-identity fix: {rebuild}"
+            );
+
+            let card = macos_access_card(&access, false);
+            let actions = card
+                .children
+                .iter()
+                .find(|node| node.key == UiKey::new("settings/macos-access/actions"))
+                .expect("the action row");
+            assert!(
+                !actions
+                    .children
+                    .iter()
+                    .any(|node| node.key == UiKey::new(MACOS_ACCESS_ASK_AGAIN)),
+                "{dr:?}: the button is not shown at all"
+            );
+            assert!(
+                actions
+                    .children
+                    .iter()
+                    .any(|node| node.key == UiKey::new(MACOS_ACCESS_OPEN_FILES)),
+                "{dr:?}: the deep link stays — it is the repair that still works"
+            );
+        }
+
+        // An UNKNOWN requirement is not a rebuild claim. It offers the repair
+        // with no durability promise rather than asserting something nobody
+        // observed.
+        let mut unknown = access_fixture(FdaState::Denied, DrClass::Unknown, FdaScope::Unknown);
+        unknown.warmup_rows = denied_rows();
+        assert_eq!(unknown.reset_offer(), ResetOffer::Offer);
+        assert!(macos_access_copy(&unknown).rebuild.is_none());
+    }
+
+    /// The other two suppressions §3.7 names: an absent or unproven `tccutil`,
+    /// and a bundle id there is no way to claim. Both hide the button entirely
+    /// rather than offering a destructive gesture that cannot work.
+    #[test]
+    fn the_reset_button_is_hidden_without_a_proven_tool_or_a_subject() {
+        use aterm_containment::FdaScope;
+        for tccutil in [
+            TccutilPresence::Missing,
+            TccutilPresence::NotExecutable,
+            TccutilPresence::Unknown,
+        ] {
+            let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+            access.warmup_rows = denied_rows();
+            access.tccutil = tccutil;
+            assert_eq!(access.reset_offer(), ResetOffer::HideNoTool, "{tccutil:?}");
+            assert!(!access.shows_reset_button(), "{tccutil:?}");
+        }
+        for bundle_id in [None, Some(String::new()), Some("  ".to_string())] {
+            let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+            access.warmup_rows = denied_rows();
+            access.bundle_id = bundle_id.clone();
+            assert_eq!(
+                access.reset_offer(),
+                ResetOffer::HideNoBundleId,
+                "{bundle_id:?}"
+            );
+            assert!(!access.shows_reset_button(), "{bundle_id:?}");
+        }
+    }
+
+    /// The plan is built from the RUNNING bundle id and from exactly the
+    /// folders macOS refused — never a literal, never a folder nobody denied,
+    /// and never the every-app form.
+    #[test]
+    fn the_reset_plan_names_the_running_bundle_and_only_the_refused_folders() {
+        use crate::consent_warmup::WarmupRow;
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.bundle_id = Some("com.example.running".to_string());
+        access.warmup_rows = vec![
+            (Folder::Documents, WarmupRow::Denied),
+            (Folder::Desktop, WarmupRow::Allowed),
+            (Folder::Downloads, WarmupRow::Denied),
+        ];
+        let plan = access.reset_plan().expect("a plan for the refused folders");
+        assert_eq!(plan.bundle_id(), "com.example.running");
+        assert_eq!(plan.folders(), &[Folder::Documents, Folder::Downloads]);
+        for (folder, argv) in plan.commands() {
+            assert_eq!(
+                argv.len(),
+                4,
+                "{folder:?}: the dangerous every-app form is unreachable"
+            );
+            assert_eq!(argv[3], "com.example.running");
+            assert!(argv.contains(&folder.tcc_service().to_string()));
+        }
+    }
+
+    /// The fold, at the exact strength each outcome earned. `AllReset` is the
+    /// only value allowed to speak for the whole set; a partial success names
+    /// what it cleared and gives every declined invocation its own line with
+    /// the exit status. No retry appears anywhere.
+    #[test]
+    fn a_partial_reset_is_reported_as_partial_with_one_line_per_failure() {
+        let all = MacosAccessReset::from_attempts(&[
+            ResetAttempt::from_exit_status(Folder::Documents, Some(0)),
+            ResetAttempt::from_exit_status(Folder::Desktop, Some(0)),
+        ]);
+        assert_eq!(all.outcome, ResetOutcome::AllReset);
+        let lines = macos_access_reset_lines(&all);
+        assert!(lines[0].contains("every folder asked"));
+        assert_eq!(lines.len(), 1, "nothing declined, so no failure line");
+
+        let partial = MacosAccessReset::from_attempts(&[
+            ResetAttempt::from_exit_status(Folder::Documents, Some(0)),
+            ResetAttempt::from_exit_status(Folder::Desktop, Some(1)),
+            ResetAttempt::from_exit_status(Folder::Downloads, None),
+        ]);
+        assert_eq!(partial.outcome, ResetOutcome::Partial);
+        let lines = macos_access_reset_lines(&partial);
+        assert!(
+            !lines[0].contains("every folder"),
+            "a partial success never speaks for the set: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("Documents"));
+        assert!(!lines[0].contains("Desktop"));
+        assert_eq!(lines.len(), 3, "one line per declined invocation");
+        assert!(lines[1].contains("Desktop") && lines[1].contains("exit status 1"));
+        assert!(lines[2].contains("Downloads") && lines[2].contains("signal"));
+
+        let none = MacosAccessReset::from_attempts(&[ResetAttempt::from_exit_status(
+            Folder::Documents,
+            Some(70),
+        )]);
+        assert_eq!(none.outcome, ResetOutcome::NoneReset);
+        assert!(macos_access_reset_lines(&none)[0].contains("cleared no saved answer"));
+
+        let absent =
+            MacosAccessReset::from_attempts(&[ResetAttempt::tool_absent(Folder::Documents)]);
+        assert_eq!(absent.outcome, ResetOutcome::ToolAbsent);
+        assert!(
+            absent.declined.is_empty(),
+            "an absent tool is not a decline"
+        );
+
+        assert_eq!(
+            MacosAccessReset::from_attempts(&[]).outcome,
+            ResetOutcome::NotAttempted
+        );
+        assert!(macos_access_reset_lines(&MacosAccessReset::from_attempts(&[])).is_empty());
+    }
+
+    /// The block is absent until the HOST publishes a posture, and the gesture
+    /// arms a view is born with cannot reach the OS. This is the §3.3 guardrail
+    /// that keeps a unit test — a headless-constructible `App` by definition —
+    /// away from `NSWorkspace` and `tccd`.
+    #[test]
+    fn an_unpublished_or_unarmed_settings_view_reaches_no_os_consent_surface() {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            assert!(
+                state.macos_access.is_none(),
+                "nothing is published until a windowed host publishes it"
+            );
+            assert!(
+                !state.consent_gestures.is_live(),
+                "a view is born with the arms that cannot reach the OS"
+            );
+            assert!(!prefers_macos_access(state));
+        }
+        let cx = view_cx_at(1_280.0, 900.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/macos-access"))
+                .is_none(),
+            "no card, and therefore no button, on an unpublished view"
+        );
+
+        // Even pressed directly, the gestures are inert: nothing opens and
+        // nothing spawns.
+        assert!(
+            !ConsentGestures::inert().is_live(),
+            "the default arms are the inert ones"
+        );
+        assert_eq!(
+            (ConsentGestures::inert().open_settings)(crate::menu::PrivacyPane::FullDiskAccess),
+            crate::menu::SettingsOpen::Refused
+        );
+        let plan = ResetPlan::new("com.example.fixture", Folder::ALL).unwrap();
+        let attempts = (ConsentGestures::inert().run_reset)(&plan);
+        assert_eq!(attempts.len(), Folder::ALL.len());
+        assert_eq!(
+            MacosAccessReset::from_attempts(&attempts).outcome,
+            ResetOutcome::ToolAbsent,
+            "the inert arm reports that nothing ran, never that a reset happened"
+        );
+    }
+
+    /// The published block renders on Security, its every hit target is whole
+    /// at each responsive width, and the route stays in words beside the button
+    /// because `openURL:` cannot promise the pane scrolled to the row.
+    #[test]
+    fn the_published_macos_access_block_paints_whole_on_the_security_page() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        for width in [360.0, 760.0, 1_280.0] {
+            let (mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                assert!(state.replace_macos_access(access.clone()));
+                assert!(
+                    !state.replace_macos_access(access.clone()),
+                    "an unchanged posture repaints nothing"
+                );
+            }
+            let cx = view_cx_at(width, 900.0);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            compiled.validate_parity().unwrap();
+            assert!(
+                compiled
+                    .semantic(&UiKey::new("settings/macos-access"))
+                    .is_some(),
+                "the block is on the Security page at width {width}"
+            );
+            assert!(
+                compiled
+                    .semantic(&UiKey::new(MACOS_ACCESS_OPEN_FDA))
+                    .is_some(),
+                "Open Privacy & Security… at width {width}"
+            );
+            for hit in &compiled.hits {
+                if !hit.key.as_str().starts_with("settings/macos-access") {
+                    continue;
+                }
+                let painted = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key == hit.key)
+                    .expect("a macOS access action is painted");
+                let delta = (painted.rect.x - hit.rect.x).abs()
+                    + (painted.rect.y - hit.rect.y).abs()
+                    + (painted.rect.width - hit.rect.width).abs()
+                    + (painted.rect.height - hit.rect.height).abs();
+                assert!(delta < 0.01, "{:?} clips at width {width}", hit.key);
+                assert!(hit.rect.width > 0.0 && hit.rect.height > 0.0);
+            }
+        }
+    }
+
+    /// The warm-up gesture: one press records one request, a second press while
+    /// a worker is live records nothing and starts nothing, and the request is
+    /// consumed exactly once by the host.
+    #[test]
+    fn the_warm_up_gesture_latches_once_and_a_second_press_starts_no_second_worker() {
+        let press = |runtime: &mut NativeRuntime, instance, view| {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(MACOS_ACCESS_WARM_UP),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+        };
+        use aterm_containment::FdaScope;
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.replace_macos_access(access_fixture(
+                FdaState::Denied,
+                DrClass::Identity,
+                FdaScope::Unknown,
+            ));
+        }
+        press(&mut runtime, instance, view);
+        press(&mut runtime, instance, view);
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.consent_warmup_requests, 1,
+            "two presses are still one request; the worker walks folders in sequence"
+        );
+        assert!(state.take_consent_warmup_request());
+        assert!(
+            !state.take_consent_warmup_request(),
+            "the host consumes the request exactly once"
+        );
+
+        // While a worker IS live the press is a stated no-op, and the button is
+        // drawn busy rather than pretending to be idle.
+        let mut live = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        live.warmup_live = true;
+        state.replace_macos_access(live.clone());
+        press(&mut runtime, instance, view);
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        assert_eq!(
+            state.consent_warmup_requests, 0,
+            "a second gesture while a worker is live starts no second worker"
+        );
+        assert!(
+            state
+                .feedback
+                .as_deref()
+                .is_some_and(|line| line.contains("already asking")),
+            "and it says so: {:?}",
+            state.feedback
+        );
+    }
+
+    /// *Ask again* runs the plan through the injected arm, folds the result at
+    /// its earned strength, and keeps it on the panel. With the inert arm
+    /// nothing ran, and the panel says exactly that.
+    #[test]
+    fn ask_again_folds_the_injected_arms_result_onto_the_panel() {
+        use aterm_containment::FdaScope;
+        let (mut runtime, instance, view) = setup();
+        let mut access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        access.warmup_rows = denied_rows();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            state.replace_macos_access(access);
+        }
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(MACOS_ACCESS_ASK_AGAIN),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+            unreachable!();
+        };
+        let report = state
+            .macos_access
+            .as_ref()
+            .and_then(|access| access.reset.clone())
+            .expect("the outcome is kept on the panel");
+        assert_eq!(
+            report.outcome,
+            ResetOutcome::ToolAbsent,
+            "the inert arm ran nothing and the panel reports nothing reset"
+        );
+        assert!(
+            state
+                .feedback
+                .as_deref()
+                .is_some_and(|line| line.contains("Nothing was changed")),
+            "{:?}",
+            state.feedback
+        );
+    }
+
+    /// The deep-link gesture always leaves the route in words on screen,
+    /// whatever the shell did with the URL — `openURL:` answers "System
+    /// Settings took it", never "it scrolled to the row".
+    #[test]
+    fn the_deep_link_gesture_always_names_the_route_in_words() {
+        use aterm_containment::FdaScope;
+        for (action, words) in [
+            (
+                MACOS_ACCESS_OPEN_FDA,
+                crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess),
+            ),
+            (
+                MACOS_ACCESS_OPEN_FILES,
+                crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FilesAndFolders),
+            ),
+        ] {
+            let (mut runtime, instance, view) = setup();
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.navigate(SettingsRoute::Security);
+                state.replace_macos_access(access_fixture(
+                    FdaState::Unknown,
+                    DrClass::Identity,
+                    FdaScope::Unknown,
+                ));
+            }
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(action),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            let feedback = state.feedback.as_deref().expect("feedback");
+            assert!(feedback.contains(words), "{action}: {feedback}");
+            let lower = feedback.to_ascii_lowercase();
+            for banned in BANNED_PANEL_PHRASES {
+                assert!(!lower.contains(banned), "{action}: {feedback}");
+            }
+        }
+    }
+
+    /// aterm never mirrors the System Settings toggle. The panel's state comes
+    /// from its own probe, and one line says so — because a row that reads ON
+    /// while every check silently fails is the failure worth surfacing (§1.2).
+    #[test]
+    fn the_panel_reports_its_own_probe_and_never_the_system_settings_toggle() {
+        use aterm_containment::FdaScope;
+        let copy = macos_access_copy(&access_fixture(
+            FdaState::Granted,
+            DrClass::Identity,
+            FdaScope::Unknown,
+        ));
+        assert!(
+            copy.observation
+                .contains("never the switch in System Settings"),
+            "{}",
+            copy.observation
+        );
+        assert!(copy.probe_detail.contains("aterm's own check"));
+        // A granted grant with a cdhash requirement is exactly the stale-`csreq`
+        // shape: the panel still reports its own probe, and never a toggle.
+        let stale = macos_access_copy(&access_fixture(
+            FdaState::Granted,
+            DrClass::Cdhash,
+            FdaScope::Unknown,
+        ));
+        assert_eq!(stale.observation, copy.observation);
+    }
+
+    /// The switched-off case is spelled as a refusal to check, never as a
+    /// denial — a probe that was deliberately not consulted is not a probe that
+    /// answered no.
+    #[test]
+    fn a_switched_off_privacy_check_is_not_rendered_as_a_denial() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Unknown, DrClass::Identity, FdaScope::Unknown);
+        access.enabled = false;
+        access.probe = ProbeLabel::RefusedDisabled;
+        let copy = macos_access_copy(&access);
+        assert!(copy.headline.contains("not checked"), "{}", copy.headline);
+        assert!(
+            !copy.headline.to_ascii_lowercase().contains("denied"),
+            "{}",
+            copy.headline
+        );
+        assert!(
+            copy.probe_detail.contains("switched off in aterm.toml"),
+            "{}",
+            copy.probe_detail
+        );
+    }
+
+    /// The main thread may never wait on `tccd` without a ceiling. A child that
+    /// never exits must be killed, reaped, and reported as a DECLINE — never as
+    /// a success, and never as `ToolAbsent` (the tool did run).
+    ///
+    /// This is the 2026-08-17 hazard class: WindowServer's main thread sat in a
+    /// `tccd` preflight for forty seconds and the watchdog took the whole GUI
+    /// session down. `run_tccutil_reset` runs on the main thread from the
+    /// Settings reducer, so its wait is bounded by construction.
+    #[test]
+    fn a_reset_invocation_can_never_hold_the_main_thread_open_ended() {
+        let ceiling = std::time::Duration::from_millis(150);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child that will not exit on its own");
+
+        let started = std::time::Instant::now();
+        let code = wait_bounded(&mut child, ceiling);
+        let waited = started.elapsed();
+
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the bounded wait returned after {waited:?}; it must give up at the ceiling"
+        );
+        assert_eq!(
+            code, None,
+            "a killed child reports no exit code, which folds to a decline"
+        );
+        // The kill must also REAP: a second wait on a reaped child cannot block.
+        assert!(
+            !ResetAttempt::from_exit_status(Folder::Documents, code).is_reset(),
+            "a timed-out invocation must never read as a successful reset"
+        );
+    }
+
+    /// A child that exits promptly is reported by its real exit code — the
+    /// ceiling is a ceiling, not a delay.
+    #[test]
+    fn a_prompt_invocation_is_reported_by_its_own_exit_code() {
+        let mut ok = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn /usr/bin/true");
+        assert_eq!(wait_bounded(&mut ok, RESET_INVOCATION_CEILING), Some(0));
+
+        let mut bad = std::process::Command::new("/usr/bin/false")
+            .spawn()
+            .expect("spawn /usr/bin/false");
+        let code = wait_bounded(&mut bad, RESET_INVOCATION_CEILING);
+        assert!(matches!(code, Some(n) if n != 0), "got {code:?}");
+        assert!(!ResetAttempt::from_exit_status(Folder::Desktop, code).is_reset());
+    }
+
+    /// §3.7's fence, which the design asks for and which no other file owns:
+    /// `tccutil reset` is a destructive mutation of the human's privacy state
+    /// and is reachable ONLY from this panel's *Ask again* button. If a program
+    /// inside a session could trigger a reset it could re-arm a prompt the human
+    /// already answered — a consent surface an agent controls, which is the same
+    /// rule that keeps the warm-up off the verb table.
+    #[test]
+    fn no_control_dispatch_arm_can_reach_the_reset() {
+        // The entry points that actually RUN the tool. The fence is about
+        // execution, not vocabulary: `consent::tccutil_reset_command` is a PURE
+        // argv builder and `control_privacy.rs` legitimately calls it to render
+        // the `remediate reset=` recipe the `privacy` verb is specified to
+        // print (design §5.1). Printing the recipe tells a human what to type;
+        // it resets nothing. Executing it from a control surface is the thing
+        // that must be impossible, so these are the tokens that matter.
+        const RESET_ENTRY_POINTS: &[&str] = &["run_tccutil_reset", "wait_bounded", "ResetPlan"];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read aterm-gui/src") {
+            let path = entry.expect("dir entry").path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if !name.starts_with("control") || !name.ends_with(".rs") {
+                continue;
+            }
+            checked += 1;
+            let src = std::fs::read_to_string(&path).expect("read a control module");
+            for token in RESET_ENTRY_POINTS {
+                assert!(
+                    !src.contains(token),
+                    "{name} references the reset entry point `{token}`: the control \
+                     surface must not be able to reset a human's privacy answers"
+                );
+            }
+        }
+        assert!(
+            checked >= 2,
+            "expected to scan several control*.rs modules, scanned {checked} — \
+             the fence is vacuous if it matched nothing"
+        );
+
+        // And the fence must be checking something real: the control surface
+        // may name the recipe (it prints it), so prove that allowance is live
+        // rather than silently unused, or the test above could pass because
+        // nothing anywhere touches reset at all.
+        let privacy = std::fs::read_to_string(dir.join("control_privacy.rs"))
+            .expect("read control_privacy.rs");
+        assert!(
+            privacy.contains("tccutil_reset_command"),
+            "the `privacy` verb is specified to print a `remediate reset=` recipe; \
+             if that call is gone, this fence is no longer proving anything"
+        );
+    }
+
     fn compile_settings_view(
         runtime: &NativeRuntime,
         instance: crate::native_app::AppInstanceId,
@@ -21346,7 +23271,6 @@ mod tests {
         let glow = crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: true,
-                style_raw: config.cursor_trail_style_raw(),
                 color: None,
                 accent: None,
                 duration_ms: 260,
@@ -21356,7 +23280,7 @@ mod tests {
                 ring: true,
                 wake_persist_s: config.cursor_trail_wake_persist_or_default(),
             },
-            crate::app_config::resolve_trail_style(
+            crate::app_config::resolve_trail_presentation(
                 config.cursor_trail_style_raw(),
                 &crate::app_config::TrailPackCatalog::default(),
             ),
@@ -21970,6 +23894,7 @@ mod tests {
             enabled: true,
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
+            seams: Vec::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -22010,6 +23935,7 @@ mod tests {
                 enabled: true,
                 index_source: "alabsystems/aterm".to_string(),
                 outcome: "up to date".to_string(),
+                seams: Vec::new(),
                 programs: std::collections::BTreeMap::new(),
             }),
             &[],
@@ -22164,6 +24090,7 @@ mod tests {
             enabled: true,
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
+            seams: Vec::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -22437,6 +24364,7 @@ mod tests {
                 enabled: true,
                 index_source: "alabsystems/aterm".to_string(),
                 outcome: "up to date".to_string(),
+                seams: Vec::new(),
                 programs,
             };
             let mut service = crate::packages_screen::PackagesService::new();
@@ -31409,6 +33337,8 @@ enabled = true
             "bell_sound",
             "sparkle_words.profanity.bonk",
             "sparkle_words.profanity.bonk_detonation",
+            // PRISM WAKE's output pip — audible, so it owes the same routing.
+            "output_streak.sound",
         ] {
             assert!(
                 prefs::SOUND_MENU_KEYS.contains(&key),
@@ -31420,7 +33350,7 @@ enabled = true
         // Nothing NON-audible smuggled itself into the routing list.
         assert_eq!(
             prefs::SOUND_MENU_KEYS.len(),
-            9,
+            10,
             "the Sound menu's membership changed: {:?}",
             prefs::SOUND_MENU_KEYS
         );

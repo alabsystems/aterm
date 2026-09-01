@@ -20,6 +20,10 @@
 //! One decoration borrows the widget wholesale: ROBI's tip bubble
 //! ([`NoticeKind::RobiTip`], anchored over the speaker).
 //!
+//! And one DISCLOSURE does: [`NoticeKind::PrivacyPrompts`] — the macOS
+//! privacy-prompt pill (design §3.4), shown at most once and never again
+//! (`privacy_notice_once`).
+//!
 //! GLOBAL (App-level), painted into every window like `config_notice` — and it borrows the
 //! SAME timed-lifecycle shape (`is_expired` + `deadline`), but renders through the SACRED
 //! `settings_card`/`badge_card` composite path as pure [`DrawPrim`]s (native chrome, NOT
@@ -117,12 +121,53 @@ pub(crate) enum NoticeKind {
     /// Held for [`ADMIN_STEP_TTL`], not the transient [`TTL`]; a body click dismisses
     /// it for now without recording anything.
     AdminStep { names: Vec<String> },
+    /// The macOS PRIVACY-PROMPT disclosure (design §3.4): programs run in a
+    /// session can be stopped by a system privacy dialog that aterm neither
+    /// raises nor can see, and the place aterm says what it knows about that is
+    /// its own Security page. Shown AT MOST ONCE (`privacy_notice_once`), gated
+    /// on `[privacy] notice`, not clickable, and carrying no payload — the copy
+    /// is fixed ([`PRIVACY_PROMPTS_CAPTION`]) precisely so it cannot grow a
+    /// claim that has not been measured.
+    PrivacyPrompts,
 }
 
 /// How long the admin card waits before it lifts away on its own — an unanswered card
 /// is re-raised by the next pass anyway (only "Not now" records a dismissal), so this
 /// is a ceiling on how long it may float over the terminal, not the offer's lifetime.
 pub(crate) const ADMIN_STEP_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// The macOS privacy-prompt pill's WHOLE copy, in this module's
+/// `"<marker> <title> — <detail>"` grammar (design §3.4).
+///
+/// # What it says, and what it deliberately does not
+///
+/// It states one measured fact — a program running in a session can be stopped
+/// by a macOS privacy dialog — and points at the page that carries the detail.
+/// It does NOT name a folder, does NOT say which folders any grant covers, and
+/// does NOT promise the interruptions go away. Coverage is §7 S4's claim to
+/// make and S4 has not been run on this machine; scope is S1's and S1 has not
+/// been run either, so no scope sentence ships at all (§3.4's own escalation).
+/// The owner's ruling is that mitigating this annoyance is acceptable — so the
+/// pill must never read as elimination.
+///
+/// # Why the wording is a const, and why it is here
+///
+/// A pill that fires once per install is a string nobody re-reads in the
+/// running app, so it is the easiest place in the product for an unmeasured
+/// claim to sit unchallenged. Pinned as one const, it is one grep away and the
+/// copy test below can hold it to the fence.
+///
+/// The gear is the badge glyph this widget already renders (the admin card and
+/// Robi's tips use it); the tone, not the glyph, is what separates them — this
+/// one is [`Tone::Quiet`] because it asks for nothing.
+pub(crate) const PRIVACY_PROMPTS_CAPTION: &str = "\u{2699} Programs run in aterm can be interrupted \
+     by macOS privacy prompts \u{2014} Settings \u{25b8} Security";
+
+/// The marker file that latches the at-most-once privacy pill, beside
+/// `aterm.toml` — the config-dir latch idiom
+/// (`connections::first_use_notice_should_show`, `packages_screen`'s
+/// `packages-admin-step-dismissed`).
+const PRIVACY_NOTICE_MARKER: &str = "privacy-prompts-notice-shown";
 
 /// A single transient, self-expiring notice.
 pub(crate) struct TransientNotice {
@@ -221,6 +266,22 @@ impl TransientNotice {
     pub(crate) fn session_connection(text: String, now: Instant) -> Self {
         Self {
             kind: NoticeKind::SessionConnection { text },
+            spawned: now,
+            anchor: None,
+            ttl: TTL,
+        }
+    }
+
+    /// The macOS privacy-prompt pill ([`PRIVACY_PROMPTS_CAPTION`]).
+    ///
+    /// Private to the at-most-once gate on purpose: [`privacy_notice_once`] is
+    /// the only way to build one, so a card that has already been shown cannot
+    /// be raised a second time by a caller that forgot to ask. It rides the
+    /// ordinary transient [`TTL`] — this is a disclosure, not an offer, and
+    /// there is nothing on it to press.
+    fn privacy_prompts(now: Instant) -> Self {
+        Self {
+            kind: NoticeKind::PrivacyPrompts,
             spawned: now,
             anchor: None,
             ttl: TTL,
@@ -393,6 +454,7 @@ impl TransientNotice {
                 5u8.hash(&mut h);
                 names.hash(&mut h);
             }
+            NoticeKind::PrivacyPrompts => 6u8.hash(&mut h),
         }
         // Quantize BOTH animated quantities so a moving card re-rasterizes on each step
         // while a held one hashes stable. 48 steps over a ≤0.8s ramp is finer than the
@@ -462,6 +524,89 @@ impl TransientNotice {
             // Authored beside the rows it describes (`packages_screen::admin_step_caption`):
             // the vendor and the admin prompt, named honestly, in the same grammar.
             NoticeKind::AdminStep { names } => crate::packages_screen::admin_step_caption(names),
+            // Fixed copy, pinned as a const so the one string this feature shows
+            // cannot drift into a claim nothing measured. See its doc.
+            NoticeKind::PrivacyPrompts => PRIVACY_PROMPTS_CAPTION.to_string(),
+        }
+    }
+}
+
+/// The macOS privacy-prompt pill — **at most once**, or `None`, which is the
+/// answer on every launch after the first.
+///
+/// # One door, because the decision and the record must not come apart
+///
+/// Deciding and latching are the SAME step: the marker is created with
+/// `create_new`, so the file system arbitrates. Two racing processes — an
+/// instance and the successor that replaces it when an in-place apply lands,
+/// or two aterm instances started together — cannot both claim the first show,
+/// and a caller cannot raise the card without recording that it did. That is
+/// why [`TransientNotice::privacy_prompts`] is private to this module: this is
+/// the only way to build one.
+///
+/// # Mirrored from the packages screen, not called
+///
+/// The design names `packages_screen::admin_step_due` /
+/// `record_admin_step_dismissal` as the pattern. Those two are `pub(crate)`
+/// but not reusable here: `admin_step_due` is keyed to an `atpkg::Status` row
+/// set and re-shows when that set CHANGES, and `record_admin_step_dismissal`
+/// writes the admin marker's own path and its own text. So the PATTERN is
+/// mirrored — a marker file beside `aterm.toml`, owner-only, never written
+/// through an occupant — while the atomic decide-and-latch shape is
+/// `connections::first_use_notice_should_show`'s, which is what "once" needs.
+/// `create_new` also does the packages reader's hardening for free: anything
+/// already at the path — a regular file, a directory, a planted symlink — is
+/// `AlreadyExists`, so nothing is followed, nothing is overwritten, and the
+/// answer is "already shown".
+///
+/// # Which way it fails, and why that is the opposite of the connections latch
+///
+/// `connections::first_use_notice_should_show` SHOWS when it cannot latch:
+/// that notice fires on a user gesture, so an unlatchable state repeats a
+/// disclosure only when the user acts. This one fires on its own. A pill that
+/// could not latch would therefore return on every launch, which is precisely
+/// the nagging the design forbids — so an absent config dir or an unwritable
+/// one is `None`. Nothing is lost by staying quiet: the same facts, in more
+/// detail, live on the Security page and on `aterm ctl privacy`, and neither
+/// needs this marker.
+///
+/// # "Per install" is really per CONFIG LIFETIME
+///
+/// The marker lives beside `aterm.toml`, so it survives an update (the pill is
+/// not re-shown after every apply — the point of the exercise) and it survives
+/// a reinstall that keeps the config. Removing the config directory re-arms
+/// it. That is the same durability the two neighbouring markers have, and it
+/// is stricter than "once per install" in the only direction that matters.
+///
+/// `allow(dead_code)`: the raise site is `lib.rs`'s, one launch-time call
+/// gated on `Config::privacy_notice()`; the allow comes off with it.
+#[allow(dead_code)]
+pub(crate) fn privacy_notice_once(
+    enabled: bool,
+    config_path: Option<&std::path::Path>,
+    now: Instant,
+) -> Option<TransientNotice> {
+    if !enabled {
+        return None;
+    }
+    let dir = config_path.and_then(std::path::Path::parent)?;
+    // Best-effort on a fresh install where the config dir does not exist yet
+    // (the connections latch's precedent): a failed create just falls through,
+    // and `create_new`'s own error decides.
+    let _ = std::fs::create_dir_all(dir);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(dir.join(PRIVACY_NOTICE_MARKER)) {
+        Ok(_) => Some(TransientNotice::privacy_prompts(now)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(e) => {
+            aterm_log::warn!("privacy notice latch not written, so the notice stays quiet: {e}");
+            None
         }
     }
 }
@@ -588,6 +733,9 @@ impl Tone {
             // The admin card asks for a press (two of them, painted as controls), so
             // it wears the actionable badge — the same accent its Install capsule uses.
             NoticeKind::AdminStep { .. } => Self::Action,
+            // A disclosure that asks for nothing: the accent badge and the
+            // chevron mean "there is something to press", and there is not.
+            NoticeKind::PrivacyPrompts => Self::Quiet,
         }
     }
 
@@ -2155,5 +2303,192 @@ mod tests {
             let c = rainbow(i as f32 / 7.0 - 1.0);
             assert!(c.iter().any(|&v| v > 0), "hue {i} produced black");
         }
+    }
+
+    // ---- the macOS privacy-prompt pill (design §3.4) ---------------------------
+
+    /// AT MOST ONCE. The first ask builds the card AND records that it did, in
+    /// one `create_new`; every later ask in the same config lifetime is `None`.
+    /// `[privacy] notice = false` is `None` and must not even latch, so turning
+    /// the setting back on still shows the pill once. And an unlatchable state —
+    /// no config dir, or a marker path already occupied by something else — is
+    /// `None` too: this pill fires on its own, so failing OPEN would put it on
+    /// screen at every launch, which is the nagging it exists to avoid.
+    #[test]
+    fn the_privacy_pill_is_shown_at_most_once() {
+        use super::{PRIVACY_NOTICE_MARKER, privacy_notice_once};
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-test-privacy-notice-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = dir.join("aterm.toml");
+        let now = Instant::now();
+
+        // Switched off: nothing shown, and nothing latched.
+        assert!(privacy_notice_once(false, Some(&cfg), now).is_none());
+        assert!(
+            !dir.join(PRIVACY_NOTICE_MARKER).exists(),
+            "a disabled notice must not spend the one showing"
+        );
+
+        // First ask: the card, and the marker beside aterm.toml.
+        let first = privacy_notice_once(true, Some(&cfg), now);
+        assert!(first.is_some(), "the first ask shows the pill");
+        assert!(dir.join(PRIVACY_NOTICE_MARKER).exists(), "…and latches it");
+
+        // Every later ask, forever.
+        assert!(privacy_notice_once(true, Some(&cfg), now).is_none());
+        assert!(privacy_notice_once(true, Some(&cfg), now).is_none());
+
+        // An occupant that is not our marker is not followed and not
+        // overwritten: it reads as "already shown".
+        let _ = std::fs::remove_file(dir.join(PRIVACY_NOTICE_MARKER));
+        std::fs::create_dir_all(dir.join(PRIVACY_NOTICE_MARKER)).unwrap();
+        assert!(
+            privacy_notice_once(true, Some(&cfg), now).is_none(),
+            "an occupied marker path fails closed"
+        );
+        assert!(
+            dir.join(PRIVACY_NOTICE_MARKER).is_dir(),
+            "…and is left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // No config dir at all: quiet, not repeated.
+        assert!(privacy_notice_once(true, None, now).is_none());
+    }
+
+    /// THE COPY. It is the one string this feature shows unprompted, so it is
+    /// held to three fences at once: the owner's restart-phrase ruling
+    /// (`tools/grep_guard.sh` B10/B12), the honesty rule that no coverage or
+    /// scope claim may ship while §7 S1 and S4 are unrun, and the ruling that
+    /// mitigating this annoyance is acceptable — so it may never read as
+    /// elimination. It also has to parse as this module's caption grammar, or
+    /// the badge would paint a word as a pictogram.
+    #[test]
+    fn the_privacy_pill_copy_is_honest_and_fence_clean() {
+        use super::{
+            NoticeKind, PRIVACY_PROMPTS_CAPTION, Tone, TransientNotice, caption_parts,
+            privacy_notice_once,
+        };
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-test-privacy-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let card = privacy_notice_once(true, Some(&dir.join("aterm.toml")), Instant::now())
+            .expect("the first ask shows the pill");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let text = card.text();
+        assert_eq!(text, PRIVACY_PROMPTS_CAPTION, "the card renders the const");
+        let lower = text.to_ascii_lowercase();
+
+        // 1. The restart-phrase fence, in the shapes B12 scans for.
+        for banned in [
+            "restart",
+            "relaunch",
+            "re-launch",
+            "reopen",
+            "re-open",
+            "quit and",
+            "next launch",
+            "reboot",
+            "launch aterm again",
+        ] {
+            assert!(
+                !lower.contains(banned),
+                "no aterm-gui string may say {banned:?}: {text:?}"
+            );
+        }
+
+        // 2. No coverage claim and no scope sentence: which folders a grant
+        //    reaches is S4's measurement and how far it reaches is S1's, and
+        //    NEITHER has been run. The pill names no folder and no grant.
+        for unmeasured in [
+            "cover",
+            "full disk",
+            "all files",
+            "documents",
+            "desktop",
+            "downloads",
+            "volume",
+            "icloud",
+            "retires",
+            "this process",
+            "new processes",
+        ] {
+            assert!(
+                !lower.contains(unmeasured),
+                "{unmeasured:?} is a claim no spike has made yet: {text:?}"
+            );
+        }
+
+        // 3. Mitigate, never eliminate (owner's ruling). The pill says prompts
+        //    CAN interrupt; it must never promise that they stop.
+        for promise in [
+            "never again",
+            "no more",
+            "eliminat",
+            "not be interrupted",
+            "never be interrupted",
+            "without interruption",
+        ] {
+            assert!(
+                !lower.contains(promise),
+                "the pill must not promise elimination ({promise:?}): {text:?}"
+            );
+        }
+
+        // 4. It parses as the caption grammar: a pictogram for the badge, the
+        //    fact as the title, the destination as the detail.
+        let parts = caption_parts(&text);
+        assert_eq!(parts.marker.as_deref(), Some("\u{2699}"));
+        assert!(
+            parts.title.starts_with("Programs run in aterm"),
+            "the fact is the title: {:?}",
+            parts.title
+        );
+        assert_eq!(
+            parts.detail.as_deref(),
+            Some("Settings \u{25b8} Security"),
+            "the detail is where aterm says what it knows"
+        );
+
+        // 5. It asks for nothing: a quiet badge, no chevron, and none of the
+        //    kinds the click paths look for.
+        assert_eq!(
+            Tone::of(&NoticeKind::PrivacyPrompts, parts.marker.as_deref()),
+            Tone::Quiet
+        );
+        assert!(
+            !card.is_update_ready(),
+            "the pill is not clickable-to-apply"
+        );
+        assert!(!card.is_admin_step(), "the pill carries no controls");
+        assert!(!card.is_robi_tip());
+
+        // 6. It is a STILL card on the ordinary transient lifetime.
+        let t0 = Instant::now();
+        let held = t0 + super::TTL - super::FADE - std::time::Duration::from_millis(200);
+        let still = TransientNotice::privacy_prompts(t0);
+        assert!(!still.animates(true), "a disclosure does not sparkle");
+        assert_eq!(
+            still.fingerprint(held, true),
+            still.fingerprint(held + std::time::Duration::from_millis(100), true),
+            "a still card must not wake the compositor through its hold"
+        );
+        assert!(still.is_expired(t0 + super::TTL));
     }
 }

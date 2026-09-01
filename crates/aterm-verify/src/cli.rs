@@ -200,8 +200,12 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             installed* (skipped-not-failed when absent — see docs/PROCESS.md).
 --scope   : restrict the targo build/test to `-p <crate>`; the guards and the
             socket smoke always run whole-tree (they are cheap and global).
---changed : THE MISSING MIDDLE — a change-scoped tier between the ~2 s pre-push
-            L0 hook and a whole-tree run. Restricts build/test/doctest/lint to
+--changed : THE MISSING MIDDLE — a change-scoped tier between a bare `targo
+            check` and a whole-tree run. (Until 2026-08-31 this line named the
+            ~2 s pre-push L0 hook as the lower end. There is no such hook:
+            `.githooks/pre-push` was demoted to ADVISORY on 2026-08-24 and its
+            whole body is one printf and `exit 0`, so the tier below this one is
+            whatever you run by hand.) Restricts build/test/doctest/lint to
             the crates this branch touches PLUS every workspace crate that
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default

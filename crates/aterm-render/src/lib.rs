@@ -25,7 +25,7 @@ use aterm_core::grid::LineSize;
 // so they come straight from the core contract crate. `LineSizeSpan` joins them
 // for the same reason: the PER-COLUMN DEC line-size seam a composed (split-pane)
 // row needs, which the row-level `RenderInput::line_sizes` cannot express.
-use aterm_core::render::{FreeSampler, FreeSprite, FreeZ, LineSizeSpan};
+use aterm_core::render::{EffectStreamDamage, FreeSampler, FreeSprite, FreeZ, LineSizeSpan};
 // Per-pane live default backgrounds: a composed row's cells can belong to panes
 // with DIFFERENT OSC 11 / DECSCNM defaults, so "is this cell the default bg?" —
 // the opacity rule, the deepest Kitty image tier, the cursor/trail fallbacks —
@@ -185,7 +185,8 @@ static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<std::sync::Arc<Vec<u8>>>> =
 /// THE ARGUMENT IS THE READER'S OWN HANDLE, and that is the whole point. This
 /// used to take a `&[u8]` and end in `bytes.to_vec()`, so from the read until the
 /// caller's buffer dropped a few microseconds later, the file was resident
-/// TWICE. On Linux that is invisible — the whole broad chain is ONE 4 MB file.
+/// TWICE. On Linux the whole broad chain is ONE file, so the doubling is bounded
+/// by that single face.
 /// On WINDOWS Microsoft splits the world's scripts across per-script faces, so
 /// [`FALLBACK_CANDIDATES`]' Windows arm is NINE files totalling 40,464 kB and
 /// `build_fallback_chain` reads all nine CONCURRENTLY on scoped workers, so ~43 MB
@@ -267,8 +268,8 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
 /// so the moment the first CJK cell (or `⏸`) drew, the face's FILE was resident
 /// TWICE, permanently, and nothing ever read the second copy: `get` keeps its
 /// own handle and discards the one it is given. MEASURED on this Linux host —
-/// means of three paired runs — as −3,907 kB of RSS on the broad tier
-/// (`DroidSansFallbackFull.ttf`, 4,033,420 B) and −647 kB on the symbol slot
+/// means of three paired runs — as −3,907 kB of RSS on a 4,033,420 B chain face
+/// (`DroidSansFallbackFull.ttf`) and −647 kB on the symbol slot
 /// (`NotoSansSymbols2-Regular.ttf`, 656,852 B): each file's own size, to within
 /// 1% (`docs/measured/memory-footprint-2026-08-24.md` §11–12).
 ///
@@ -2768,11 +2769,7 @@ pub fn embedded_symbols_font() -> &'static [u8] {
 /// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] are ADDITIVE (the scan continues past
 /// them); the first NON-additive face that loads ends the scan, so per platform
 /// exactly one broad backstop is reached and it must be listed LAST.
-/// Override with $ATERM_FALLBACK_FONT. The Linux
-/// entries lead with `DroidSansFallbackFull` (TrueType `glyf` — guaranteed
-/// fontdue-rasterizable, broad CJK) before `NotoSansCJK` (CFF) so the broad face is
-/// always one that actually renders; `fallback_has` is a cmap-only probe, so a face
-/// whose glyphs fontdue cannot draw would otherwise show blank. Any code point these
+/// Override with $ATERM_FALLBACK_FONT. Any code point these
 /// miss still reaches a real glyph via the recursive runtime fallback scan.
 const FALLBACK_CANDIDATES: &[&str] = &[
     // macOS — a NATIVE CJK design leads (W8): Hiragino Sans GB is a TrueType
@@ -2790,9 +2787,37 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Apple Symbols.ttf",
-    // Linux (Debian/Ubuntu default install)
-    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    // Linux (Debian/Ubuntu default install). NONE of these is an additive tier
+    // entry, so the first one that EXISTS ends the scan and IS the whole chain —
+    // which makes the leading entry the only Linux face a sealed GUI can reach,
+    // and therefore the one that has to carry every CJK script rather than most
+    // of them. HANGUL is the script that separates them, MEASURED from the real
+    // cmaps on this host over the 11,172 syllables U+AC00..D7A3 and the 256 jamo
+    // U+1100..11FF: `NotoSansCJK-Regular.ttc` face 0 maps 11172/11172 and
+    // 256/256, while `DroidSansFallbackFull.ttf` maps 3/11172 (U+AC00, U+D7A2,
+    // U+D7A3 — the block's endpoints, nothing between them) and 99/256. A chain
+    // led by the Han/kana face renders EVERY Korean word as `.notdef` boxes: the
+    // GUI seals its font generation, which closes the pathname-discovery runtime
+    // tier, so the built-in chain is the last line that can cover a script — the
+    // same shape as the Windows arm's Hangul gap below.
+    //
+    // Noto leads on coverage by every measure that matters here — 44,810 code
+    // points against 28,601, and Droid maps just ELEVEN that Noto does not:
+    // U+0000, U+0E3F (which the primary face carries), the four bidi controls
+    // U+202A..202D and five Deseret code points. So Droid keeps its place as
+    // backstop for a host that has it and not Noto. `fc-match` agrees with the
+    // order: `:lang=ko` and `:lang=ja` both answer this one file, because the
+    // CJK scripts share it.
+    //
+    // DEJAVU STAYS LAST, and that is a constraint rather than a taste: the broad
+    // chain is probed BEFORE the symbol and colour faces
+    // (`font_chain::resolve_chain`), so a chain face's INCIDENTAL outlines
+    // shadow the faces those code points exist for. Counted over the
+    // `Emoji_Presentation=Yes` set, DejaVu maps 98 of them (U+1F600 😀 among
+    // them) against Noto's 26 and Droid's 0 — it is the backstop for a host that
+    // has neither CJK face, never a face to reach past them.
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     // Windows. There is NO stock Windows face that is broad the way Arial
     // Unicode is on macOS — Microsoft splits the world's scripts across
@@ -12577,11 +12602,11 @@ impl Renderer {
         self.draw_cursor(&mut cache.pixels, w, h, input);
 
         // Refresh the cache to this frame's state, then borrow it back out.
-        // clone_from reuses the cached grid's per-row Vec allocations (the damaged path
+        // clone_damage_cache_from reuses the cached grid's per-row Vec allocations (the damaged path
         // guarantees matching rows/cols, so the custom clone_from's common-prefix reuse
         // fully applies) instead of input.clone() freeing + reallocating ~rows+1 Vecs
         // every committed frame — i.e. on the exact frames that gate echo latency.
-        cache.input.clone_from(input);
+        cache.input.clone_damage_cache_from(input);
         cache.cursor_blink_phase = self.cursor_blink_phase;
         cache.cursor_style_override = self.cursor_style_override;
         // `cache.font_epoch` is deliberately NOT refreshed: entry to this path
@@ -12761,7 +12786,7 @@ impl Renderer {
         // alloc+free plus a full grid deep-clone would churn the allocator on exactly
         // the frames that gate echo latency. `clear()`+`resize(.., bg)` reuses the pixel
         // buffer's allocation and reproduces the `vec![bg; w*h]` starting state
-        // byte-for-byte; `clone_from` reuses the cached grid's per-row Vec capacity.
+        // byte-for-byte; `clone_damage_cache_from` reuses the cached grid's per-row Vec capacity.
         let mut cache = wc.cache.take();
         let mut pixels = match cache.as_mut() {
             Some(c) => std::mem::take(&mut c.pixels),
@@ -12820,7 +12845,7 @@ impl Renderer {
                 c.width = w;
                 c.height = h;
                 c.grid_top = self.grid_top();
-                c.input.clone_from(input);
+                c.input.clone_damage_cache_from(input);
                 c.cursor_blink_phase = self.cursor_blink_phase;
                 c.cursor_style_override = self.cursor_style_override;
                 c.font_epoch = font_epoch;
@@ -12831,7 +12856,11 @@ impl Renderer {
                 width: w,
                 height: h,
                 grid_top: self.grid_top(),
-                input: input.clone(),
+                input: {
+                    let mut damage_input = RenderInput::empty();
+                    damage_input.clone_damage_cache_from(input);
+                    damage_input
+                },
                 cursor_blink_phase: self.cursor_blink_phase,
                 cursor_style_override: self.cursor_style_override,
                 font_epoch,
@@ -17453,6 +17482,39 @@ fn mark(dirty: &mut [bool], r: usize) {
     }
 }
 
+/// The producer-built revision is authoritative only when BOTH snapshots carry
+/// it.  Hand-built inputs intentionally retain the old exact-vector fallback.
+fn effect_stream_changed<T: PartialEq>(
+    prev: &[T],
+    current: &[T],
+    prev_damage: &EffectStreamDamage,
+    current_damage: &EffectStreamDamage,
+) -> bool {
+    prev_damage
+        .same_content(current_damage)
+        .map(|same| !same)
+        .unwrap_or_else(|| prev != current)
+}
+
+/// Mark prev∪current rows from compact metadata when possible; otherwise walk
+/// the exact payloads, preserving compatibility for producers that have not
+/// opted into the metadata contract.
+fn mark_effect_stream_rows(
+    dirty: &mut [bool],
+    prev_damage: &EffectStreamDamage,
+    current_damage: &EffectStreamDamage,
+    fallback_rows: impl Iterator<Item = usize>,
+) {
+    if prev_damage.is_valid() && current_damage.is_valid() {
+        prev_damage.mark_rows(dirty);
+        current_damage.mark_rows(dirty);
+    } else {
+        for row in fallback_rows {
+            mark(dirty, row);
+        }
+    }
+}
+
 /// Mark a row whose SELECTED-cell rendering changed, together with the row
 /// immediately above it. Glyph and combining-mark rasters are allowed to
 /// overshoot ABOVE their logical cell band (`row_scale` clips downward only), so
@@ -18217,14 +18279,28 @@ pub fn compute_dirty_rows(
     // never re-accumulates onto a preserved row), cur rows so the new light is
     // composited. Each quad is single-row, so prev∪cur covers the animation
     // exactly. An empty/unchanged aurora marks nothing (idle = byte-identical).
-    let glow_changed = prev_input.cursor_glow_add != input.cursor_glow_add;
+    let glow_changed = effect_stream_changed(
+        &prev_input.cursor_glow_add,
+        &input.cursor_glow_add,
+        &prev_input.cursor_glow_add_damage,
+        &input.cursor_glow_add_damage,
+    );
     if glow_changed {
-        for q in &prev_input.cursor_glow_add {
-            mark(dirty, q.row as usize);
-        }
-        for q in &input.cursor_glow_add {
-            mark(dirty, q.row as usize);
-        }
+        mark_effect_stream_rows(
+            dirty,
+            &prev_input.cursor_glow_add_damage,
+            &input.cursor_glow_add_damage,
+            prev_input
+                .cursor_glow_add
+                .iter()
+                .map(|quad| usize::from(quad.row))
+                .chain(
+                    input
+                        .cursor_glow_add
+                        .iter()
+                        .map(|quad| usize::from(quad.row)),
+                ),
+        );
     }
 
     // GLOW-HALO cursor-effect radial light: the aurora's radial sibling,
@@ -18233,11 +18309,23 @@ pub fn compute_dirty_rows(
     // re-accumulates onto a preserved row), cur rows so the new light lands.
     // Every halo is single-row (the RainHalo invariant; a spanning halo is
     // per-row quads). An empty/unchanged stream marks nothing (idle gate-hits).
-    let glow_halo_changed = prev_input.glow_halo != input.glow_halo;
+    let glow_halo_changed = effect_stream_changed(
+        &prev_input.glow_halo,
+        &input.glow_halo,
+        &prev_input.glow_halo_damage,
+        &input.glow_halo_damage,
+    );
     if glow_halo_changed {
-        for q in prev_input.glow_halo.iter().chain(&input.glow_halo) {
-            mark(dirty, q.row as usize);
-        }
+        mark_effect_stream_rows(
+            dirty,
+            &prev_input.glow_halo_damage,
+            &input.glow_halo_damage,
+            prev_input
+                .glow_halo
+                .iter()
+                .map(|halo| usize::from(halo.row))
+                .chain(input.glow_halo.iter().map(|halo| usize::from(halo.row))),
+        );
     }
 
     // EMBERFORGE UNDER-GLYPH light: additive flame-body quads `row_differs`
@@ -18246,11 +18334,23 @@ pub fn compute_dirty_rows(
     // light → glyphs from scratch, so the light never re-accumulates and a
     // vacated row loses it. Every quad is single-row (the GlowQuad invariant).
     // An empty/unchanged stream marks nothing (idle gate-hits).
-    let glow_under_changed = prev_input.glow_under != input.glow_under;
+    let glow_under_changed = effect_stream_changed(
+        &prev_input.glow_under,
+        &input.glow_under,
+        &prev_input.glow_under_damage,
+        &input.glow_under_damage,
+    );
     if glow_under_changed {
-        for q in prev_input.glow_under.iter().chain(&input.glow_under) {
-            mark(dirty, q.row as usize);
-        }
+        mark_effect_stream_rows(
+            dirty,
+            &prev_input.glow_under_damage,
+            &input.glow_under_damage,
+            prev_input
+                .glow_under
+                .iter()
+                .map(|quad| usize::from(quad.row))
+                .chain(input.glow_under.iter().map(|quad| usize::from(quad.row))),
+        );
     }
 
     // EMBERFORGE per-pixel FIRE FIELD patches: the glow_under discipline
@@ -18260,11 +18360,23 @@ pub fn compute_dirty_rows(
     // RainHalo invariant). An empty/unchanged stream marks nothing (idle
     // gate-hits); an animating burn's advancing `phase` compares unequal, so
     // its rows repaint every frame.
-    let fire_patch_changed = prev_input.fire_patch != input.fire_patch;
+    let fire_patch_changed = effect_stream_changed(
+        &prev_input.fire_patch,
+        &input.fire_patch,
+        &prev_input.fire_patch_damage,
+        &input.fire_patch_damage,
+    );
     if fire_patch_changed {
-        for q in prev_input.fire_patch.iter().chain(&input.fire_patch) {
-            mark(dirty, q.row as usize);
-        }
+        mark_effect_stream_rows(
+            dirty,
+            &prev_input.fire_patch_damage,
+            &input.fire_patch_damage,
+            prev_input
+                .fire_patch
+                .iter()
+                .map(|patch| usize::from(patch.row))
+                .chain(input.fire_patch.iter().map(|patch| usize::from(patch.row))),
+        );
     }
 
     // Sparkle-word decorations: another overlay invisible to `row_differs`. Same
@@ -21159,11 +21271,20 @@ pub struct RibbonVertex {
     /// Extra coverage at the spine ABOVE `cov`, `0..=255` — the strip's own
     /// strength in the leading between two rows, where there is no ink to keep
     /// legible. It rides [`ribbon_lift_profile`]: a C¹ bump that is exactly zero
-    /// one device row inside the plateau above the spine and well inside the
+    /// at [`RibbonVertex::lift_span`] above the spine and well inside the
     /// downward reach below it, so nothing behind letterforms moves and the
     /// base profile at `cov` stays byte-identical. `0.0` for a mark with no
     /// lift.
     pub lift: f32,
+    /// How far ABOVE the spine the lift's bump extends before it is exactly
+    /// zero, in device pixels — the strip's own span, named by the producer
+    /// instead of borrowed from `core_up` (2026-08-30). The tall body's
+    /// plateau spans the whole glyph band, and a lift smeared over that span
+    /// is exactly the "soft tall smear with no crisp baseline strip" the
+    /// owner rejected; the strip is a NARROW element whatever the body above
+    /// it looks like, so its span travels with the vertex. Below the spine
+    /// the lift still melts over [`RIBBON_LIFT_DN_SHARE`] of the reach.
+    pub lift_span: f32,
 }
 
 /// The share of the downward reach the spine's lift melts over — inside the
@@ -21171,20 +21292,29 @@ pub struct RibbonVertex {
 /// below the cell top; the reach is `0.25..0.29`), with zero slope at its end.
 pub const RIBBON_LIFT_DN_SHARE: f32 = 0.6;
 
+/// The share of the reach the lift's DOWNWARD melt actually spans — narrower
+/// than [`RIBBON_LIFT_DN_SHARE`] since 2026-08-31: at 0.6 the strip's
+/// \>=75%-of-peak zone measured six device rows against the 2-4 px crisp
+/// bar. 0.45 is the narrowest melt whose steeper underside still fits the
+/// composited per-row ledge budget beside the body's own melt (0.35
+/// measured a 38/255 median-column row delta against the 34 budget). Still
+/// C1 at its end, still inside the next row's ink-free top margin.
+pub const RIBBON_LIFT_DN_MELT: f32 = 0.45;
+
 /// **THE LIFT'S TRANSVERSE PROFILE** — `1.0` at the spine, exactly `0.0` at
-/// one device row inside the plateau above it (`core_up - 1`) and at
+/// the producer-named strip span above it ([`RibbonVertex::lift_span`]) and at
 /// [`RIBBON_LIFT_DN_SHARE`] of the reach below it, C¹ at all three. Total: a
 /// span that is not positive, or a non-finite `d`, is `0.0`.
 #[inline]
 #[must_use]
-pub fn ribbon_lift_profile(d: f32, core_up: f32, dn: f32) -> f32 {
+pub fn ribbon_lift_profile(d: f32, lift_span: f32, dn: f32) -> f32 {
     if d.is_nan() {
         return 0.0;
     }
     let span = if d < 0.0 {
-        core_up - 1.0
+        lift_span
     } else {
-        dn * RIBBON_LIFT_DN_SHARE
+        dn * RIBBON_LIFT_DN_MELT
     };
     if !span.is_finite() || span <= 0.0 {
         return 0.0;
@@ -21220,6 +21350,15 @@ pub fn ribbon_lift_profile(d: f32, core_up: f32, dn: f32) -> f32 {
 /// skipped; a reversed segment (`b.x < a.x`) is tiled from its own start, which
 /// is how a right-to-left run stays head-first in the vertex order.
 ///
+/// **EVERY PIXEL COLUMN HAS ONE OWNER.** Consecutive segments share their
+/// boundary vertex bit for bit, and the tiling takes it half-open at its
+/// ceiling (`[ceil(a.x), ceil(b.x))`), so a boundary landing inside a pixel
+/// gives that column to exactly one segment — the one it lands inside — never
+/// to both (which double-composites under [`GlowBlend::Over`] and double-adds
+/// under [`GlowBlend::Add`]), never to neither. Producers may therefore place
+/// vertices at fractional x freely; integer vertices tile exactly as they
+/// always have.
+///
 /// `blend` picks the compositing mode of every quad the mark emits (see
 /// [`GlowQuad::alpha`]). [`GlowBlend::Add`] is the historical additive light and
 /// is byte-identical to the pre-`blend` rasterizer. [`GlowBlend::Over`] stamps
@@ -21249,10 +21388,23 @@ pub fn ribbon_beam(
         if !span.is_finite() || span.abs() < 1e-3 {
             continue;
         }
-        // Tile the major axis in CONTIGUOUS integer slabs from the segment's own
-        // start. The producer's vertices sit on cell boundaries, so `start` is a
-        // cell edge and no slab can straddle two cells.
-        let (start, end) = (a.x.min(b.x).floor() as i32, a.x.max(b.x).ceil() as i32);
+        // Tile the major axis in CONTIGUOUS integer slabs, with every pixel
+        // column owned by EXACTLY ONE segment. The shared boundary between two
+        // segments is the same `f32` on both sides (`windows(2)`), so taking
+        // it half-open at its ceiling — `[ceil(a.x), ceil(b.x))` — hands a
+        // fractional boundary's column to exactly one of them: the segment the
+        // boundary lands INSIDE, whose trailing sliver already samples t ≈ 1
+        // there (the vertex's own colour). The old `floor(a.x)..ceil(b.x)`
+        // expansion gave that column to BOTH segments, and the bed composites
+        // source-over, so every fractional slab vertex printed a 1-px column
+        // composited twice — ~1.8× brighter, pulled toward the mark's own hue:
+        // the owner's "weird vertical line issue with the rainbow"
+        // (2026-08-31), a static comb of paired lines 5 px then 9 px apart at
+        // cell pitch (the thirds of cw = 14 at Retina). Integer vertices —
+        // every historical producer — ceil to themselves, so their tiling is
+        // unchanged byte for byte, and a fractional producer keeps every slab
+        // it had except the duplicated head column of each segment.
+        let (start, end) = (a.x.min(b.x).ceil() as i32, a.x.max(b.x).ceil() as i32);
         let mut p = start;
         while p < end {
             let len = step.min(end - p).max(1);
@@ -21267,6 +21419,7 @@ pub fn ribbon_beam(
             let core_dn = lerp(a.core_dn, b.core_dn);
             let cov = lerp(a.cov, b.cov);
             let lift = lerp(a.lift, b.lift).max(0.0);
+            let lift_span = lerp(a.lift_span, b.lift_span);
             let top = spine - up;
             let bot = spine + dn;
             if !top.is_nan() && !bot.is_nan() && bot > top && cov >= 1.0 {
@@ -21312,7 +21465,7 @@ pub fn ribbon_beam(
                     let level = if lift == 0.0 {
                         cov * across
                     } else {
-                        cov * across + lift * ribbon_lift_profile(d, core_up, dn)
+                        cov * across + lift * ribbon_lift_profile(d, lift_span, dn)
                     };
                     // THE ORDERED DITHER, at the last truncation in the whole
                     // design (see [`BAYER4`]). The offset is under one level, so
@@ -22363,7 +22516,7 @@ mod tests {
     ///
     /// `FallbackFace::from_path_bytes` used to take a SLICE and end in
     /// `bytes.to_vec()`, so from the read until the caller's buffer dropped, the
-    /// file was resident TWICE. On Linux that is one 4 MB file and invisible; on
+    /// file was resident TWICE. On Linux that is ONE chain file at a time; on
     /// WINDOWS `build_fallback_chain` reads NINE files totalling 40,464 kB on
     /// concurrent scoped workers, and every one of them was doubled at once.
     /// MEASURED on this box (`tests/win_heap_attribution.rs`): peak live heap
@@ -22444,7 +22597,7 @@ mod tests {
     /// process. [`LazyFontdue::get`] used to hand a SLICE to the parsed store,
     /// which copied it — so the first CJK cell (or `⏸`) made the file resident
     /// twice, permanently, with nothing ever reading the second copy. MEASURED on
-    /// this Linux host as 3,907 kB on the broad chain face
+    /// this Linux host as 3,907 kB on a 4 MB chain face
     /// (`DroidSansFallbackFull.ttf`) and 646 kB on the symbol slot
     /// (`NotoSansSymbols2-Regular.ttf`), the mean of three alternating
     /// before/after pairs (spread ≤ 40 kB).
@@ -22484,7 +22637,7 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&stored_bytes, &face.bytes),
             "materialising must ADOPT the face's own byte handle — a second copy \
-             of the file is 3.9 MB on this host's broad chain face"
+             of the file is megabytes on any real chain face"
         );
     }
 
@@ -25120,17 +25273,21 @@ mod tests {
             .collect()
     }
 
-    // ---- W5 (Hangul tofu): the Windows fallback chain -----------------------
+    // ---- Hangul tofu: the built-in fallback chain ---------------------------
     //
-    // `한국어` rendered as three `.notdef` boxes on Windows while `日本語` and
-    // `中文` were fine. Two facts made that inevitable, and these tests pin both.
+    // `한국어` renders as `.notdef` boxes while `日本語` and `中文` are fine
+    // whenever TWO facts hold together, and the tests below pin both — first as
+    // the law every platform owes, then as the Windows arm's specialisation.
     //
     //  1. STRUCTURE. `build_fallback_chain` stops at the first NON-additive face
-    //     that loads. Every Windows candidate used to be non-additive, so the
-    //     chain was exactly ONE face (Microsoft YaHei) and every entry behind it
-    //     — including the documented Arial backstop — was unreachable.
-    //  2. COVERAGE. None of msyh.ttc / msgothic.ttc / arial.ttf maps a Hangul
-    //     syllable to a non-zero glyph, so no reachable face could draw one.
+    //     that loads, so a candidate ahead of the Hangul face silently orphans
+    //     it. On Windows every candidate was non-additive, which made the chain
+    //     exactly ONE face (Microsoft YaHei) and the documented Arial backstop
+    //     unreachable; on Linux the leading candidate is the whole chain by
+    //     construction, so it is the ORDER that decides.
+    //  2. COVERAGE. A face that carries Han and kana need carry no Hangul at
+    //     all: none of msyh.ttc / msgothic.ttc / arial.ttf maps a syllable, and
+    //     `DroidSansFallbackFull.ttf` maps 3 of the 11,172.
     //
     // The GUI seals its font generation (`seal_admitted_font_sources`), which
     // closes the pathname-discovery runtime tier — so the built-in chain is the
@@ -25138,7 +25295,6 @@ mod tests {
 
     /// Whether ANY face in `chain` maps `ch` to a real (non-`.notdef`) glyph,
     /// read from the Unicode cmap — the same authority `fallback_has` uses.
-    #[cfg(windows)]
     fn chain_covers(chain: &[FallbackFace], ch: char) -> bool {
         chain.iter().any(|f| {
             ttf_parser::Face::parse(&f.bytes, f.index)
@@ -25146,6 +25302,64 @@ mod tests {
                 .and_then(|p| p.glyph_index(ch))
                 .is_some_and(|g| g.0 != 0)
         })
+    }
+
+    /// Whether a built-in candidate this host HAS carries `ch` in some face of
+    /// its collection, read from the FILES rather than from the chain.
+    ///
+    /// Every caller below guards on this, and the direction matters: asking the
+    /// built CHAIN would turn "the face that has Hangul is unreachable" into a
+    /// silent skip, i.e. exactly the regression the callers exist to catch. A
+    /// host that genuinely ships no such face still skips.
+    fn a_present_candidate_carries(ch: char) -> bool {
+        present_fallback_paths().iter().any(|p| {
+            std::fs::read(p).is_ok_and(|bytes| {
+                let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+                (0..faces).any(|i| {
+                    ttf_parser::Face::parse(&bytes, i)
+                        .ok()
+                        .and_then(|f| f.glyph_index(ch))
+                        .is_some_and(|g| g.0 != 0)
+                })
+            })
+        })
+    }
+
+    /// THE DEFECT AS A CROSS-PLATFORM LAW: a Hangul face this host actually has
+    /// among its built-in candidates must be REACHABLE from the built chain.
+    ///
+    /// Coverage that exists on disk and cannot be reached is indistinguishable
+    /// from coverage that does not exist — the user sees boxes either way — and
+    /// the scan rule makes unreachability the easy mistake: one candidate in
+    /// front of the Hangul face is all it takes. Hangul is the probe because it
+    /// is the script a Han+kana face is most likely to be missing while looking
+    /// complete.
+    ///
+    /// The Windows arm's twin below adds what is true only there: that its chain
+    /// really is more than one face.
+    #[test]
+    fn the_chain_reaches_a_hangul_face_this_host_has() {
+        if !a_present_candidate_carries('\u{D55C}') {
+            eprintln!("SKIP: no built-in candidate on this host carries Hangul");
+            return;
+        }
+        let paths = present_fallback_paths();
+        let chain = build_fallback_chain(&paths, 0); // all discovery: no user entries
+        assert!(!chain.is_empty(), "no fallback candidate loaded at all");
+        for ch in ['\u{D55C}', '\u{AD6D}', '\u{C5B4}', '\u{AC00}', '\u{D7A3}'] {
+            assert!(
+                chain_covers(&chain, ch),
+                "U+{:04X} has no glyph in the built chain ({} face(s): {:?}), yet a \
+                 candidate on this host carries it — the scan stopped in front of it \
+                 and every Korean word is .notdef tofu",
+                ch as u32,
+                chain.len(),
+                chain
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     /// FACT 1, as a PURE LIST LAW — no font I/O, so it holds on any machine.
@@ -25302,22 +25516,26 @@ mod tests {
         );
     }
 
-    /// The RENDER-SIDE end of the same defect: a Hangul syllable must dispatch
-    /// to the broad fallback tier and rasterize with real ink — not land on the
-    /// primary face's `.notdef`. This is what the screenshot showed.
+    /// The RENDER-SIDE end of the same defect, on whatever platform this is: a
+    /// Hangul syllable must dispatch to the broad fallback tier and rasterize
+    /// with real ink — not land on the primary face's `.notdef`. This is what
+    /// the screenshots showed, on Windows and on Linux alike.
     #[test]
-    #[cfg(windows)]
     fn hangul_dispatches_to_the_fallback_tier_with_real_ink() {
+        if !a_present_candidate_carries('\u{D55C}') {
+            eprintln!("SKIP: no built-in candidate on this host carries Hangul");
+            return;
+        }
         let Some(mut r) = renderer() else {
             eprintln!("SKIP: no system mono font found");
             return;
         };
-        if !std::path::Path::new("C:\\Windows\\Fonts\\malgun.ttf").is_file() {
-            eprintln!("SKIP: no Hangul face installed on this host");
+        let ch = '\u{D55C}'; // 한
+        if r.primary_unicode_gid(ch).is_some() {
+            eprintln!("SKIP: the primary face itself carries Hangul on this host");
             return;
         }
         r.debug_block_on_lazy_fallbacks();
-        let ch = '\u{D55C}'; // 한
         let key = r.glyph_key(ch);
         // It must be the CHAIN specifically, not merely "some tier". A GUI window
         // seals its font generation, which closes the pathname-discovery runtime
@@ -30358,6 +30576,7 @@ mod ribbon_beam_tests {
             color,
             cov,
             lift: 0.0,
+            lift_span: 0.0,
         }
     }
 
@@ -30476,6 +30695,71 @@ mod ribbon_beam_tests {
                 .filter(|w| w[0].0 >= crest)
                 .all(|w| w[1].1 <= w[0].1)
         );
+    }
+
+    /// **FRACTIONAL VERTICES NEVER DOUBLE-OWN A COLUMN.** The bed's planner
+    /// places one vertex per slab at the THIRDS of the cell (x + j·cw/3 — 4.67
+    /// and 9.33 at Retina cw = 14), and the old `floor(a.x)..ceil(b.x)` tiling
+    /// gave each fractional boundary's pixel column to BOTH neighbouring
+    /// segments. The bed composites source-over, so those columns composited
+    /// twice: a static comb of ~1.8×-bright 1-px lines in pairs 5 px apart at
+    /// cell pitch — the owner's "weird vertical line issue with the rainbow"
+    /// (2026-08-31). This walks the exact planner lattice and asserts every
+    /// pixel is owned by exactly one quad, with no column of the run skipped.
+    #[test]
+    fn fractional_slab_vertices_own_each_column_exactly_once() {
+        const CW: f32 = 14.0;
+        let mut verts = Vec::new();
+        for cell in 0..3 {
+            let x0 = 10.0 + cell as f32 * CW;
+            for j in 0..3 {
+                verts.push(vert(
+                    x0 + j as f32 * CW / 3.0,
+                    60.0,
+                    8.0,
+                    4.0,
+                    0x00FF_E93C,
+                    150.0,
+                ));
+            }
+        }
+        verts.push(vert(10.0 + 3.0 * CW, 60.0, 8.0, 4.0, 0x00FF_E93C, 150.0));
+        let mut out = Vec::new();
+        assert!(ribbon_beam(
+            &mut out,
+            clip(),
+            &verts,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        // Ownership: count covering QUADS per pixel — the composite would hide
+        // a double-draw under saturation, so read the primitives directly.
+        let mut owners = std::collections::BTreeMap::new();
+        for q in &out {
+            for y in q.y..q.y + q.h {
+                for x in q.x..q.x + q.w {
+                    *owners.entry((y, x)).or_insert(0u32) += 1;
+                }
+            }
+        }
+        assert!(!owners.is_empty(), "the beam paints");
+        let doubled: Vec<_> = owners.iter().filter(|&(_, &n)| n > 1).collect();
+        assert!(
+            doubled.is_empty(),
+            "a pixel is owned by two slabs (the comb): {doubled:?}"
+        );
+        // Continuity: the spine row covers every column of the run — half-open
+        // rounding hands a boundary column to exactly ONE side, never neither.
+        let lit: std::collections::BTreeSet<u16> = out
+            .iter()
+            .filter(|q| (q.y..q.y + q.h).contains(&60))
+            .flat_map(|q| q.x..q.x + q.w)
+            .collect();
+        for x in 10..(10 + 3 * 14) {
+            assert!(lit.contains(&(x as u16)), "column {x} has no owner (a gap)");
+        }
     }
 
     #[test]
@@ -30645,6 +30929,7 @@ mod ribbon_beam_tests {
                     color: 0x00FF_FFFF,
                     cov,
                     lift: 0.0,
+                    lift_span: 0.0,
                 },
                 RibbonVertex {
                     x: 120.0,
@@ -30658,6 +30943,7 @@ mod ribbon_beam_tests {
                         color: 0x00FF_FFFF,
                         cov,
                         lift: 0.0,
+                        lift_span: 0.0,
                     }
                 },
             ];

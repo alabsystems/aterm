@@ -556,16 +556,98 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // flat red; (4) the wrap's fresh row opens on the gated re-anchor. All
     // captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1), not
     // hand-merged.
+    // RE-DERIVED 2026-08-31 (the POLISH WAVE): index 2 (rainbow) ALONE
+    // moved, `331_874_… → 747_825_…` (captured twice: once before the wave's
+    // last two emitter edits — the five-key traverse and the flight's
+    // crossing subdivision — and re-captured after them, index 2 alone
+    // moving both times); the other EIGHT came back
+    // byte-identical — the repaint signature, not the seam one. The rainbow
+    // bytes move for the wave's deliberate visible changes, every one
+    // owner-asked and gated: the bed's glass luma floor (the cool leg stops
+    // compositing below its own ground) with the caps table re-derived
+    // against the lifted ink; the whole-mark re-grant's melt walk-back and
+    // the honest-cost stride solve (the typed line stays lit end to end);
+    // the baseline strip's presence retune; the run's tail ease; the
+    // pause-resume bloom's splice mint; the five-key traverse (unroll
+    // 18 -> 16); and the denser star shower/strike. Captured from
+    // measurement (ATERM_CAPTURE_TYPED_PARITY=1), not hand-merged.
+    // RE-DERIVED 2026-08-31 (the SONG LANE): ALL NINE entries moved, and for
+    // ONE reason that is not the seam and not the light —
+    // `cursor_glow::SoundCue` gained a `shifted` field (the capital's octave;
+    // see `trail_sound::SHIFT_GLYPH_LIFT`), and this fold hashes the cue's
+    // `Debug` TEXT (`format!("{cue:?}")`), so every cue's string grew a
+    // `, shifted: false` and every style's number moved with it.
+    //
+    // PROVEN, not argued. Folding `format!("{cue:?}").replace(", shifted:
+    // false", "")` instead reproduces the PREVIOUS nine goldens byte-exactly
+    // (measured 2026-08-31 by exactly that one-line probe, reverted): the
+    // quads, frame fingerprints, spawn counts, live spark counts, ribbon
+    // segments, momentum and every other cue field are untouched, and the
+    // `shifted` flag itself is `false` on every cue this script mints — it is a
+    // key-time-only fact and this script types through the licence seam, not
+    // the key seam. Captured from measurement (ATERM_CAPTURE_TYPED_PARITY=1),
+    // not hand-merged.
+    //
+    // INDEX 2 MOVED AGAIN after that capture, `6_424_… -> 8_200_…`, and NOT for
+    // this reason: the rainbow crossing was re-paced in the same working tree
+    // (`SPECTRUM_ROOF_STEP`) and re-derived its own entry the way this file's
+    // history shows that lane always does — index 2 alone, the repaint
+    // signature. The other eight are the song lane's capture, untouched.
+    //
+    // AND RE-DERIVED AGAIN on the crossing work: entry 2 alone moved a second
+    // time — `GlowStyle::RainbowKitty` is the one style that reads
+    // `crate::spectrum`, and `SPECTRUM_CROSSING_ROOF` stopped sagging (its six
+    // interior samples rose to the roof's own `V 235` peak). The other eight
+    // are byte-identical to the song lane's values above, which is the check
+    // that makes this a COLOUR change and not a licence-seam one.
+    //
+    // AND ONCE MORE (2026-08-31, the grey band): entry 2 alone,
+    // `4_785_… -> 2_656_…`, for two changes that are both the rainbow and
+    // nothing else — `SPECTRUM_CROSSING_ROOF` re-paced to carry the exit past
+    // the cyan window's own shoulder, and `cursor_glow::rainbow_bed_true_hue`
+    // giving the ribbon's bed back the hue the ground steals. The other eight
+    // came back byte-identical from the same capture, which is the whole point
+    // of keeping them here: a bed-colour transform that had leaked into the
+    // licence seam, or into a style that does not read the arc, would have
+    // moved them.
+    //
+    // **RE-BASELINED AGAIN, 2026-08-31, AND AGAIN ONLY ENTRY `2`.** The
+    // lead-advance ruling replaced the classic field's stretch with
+    // `rainbow_classic_walk` and closed the spectrum through
+    // `rainbow_cycle_ink`, so the rainbow kitty's typed fold necessarily moves.
+    // Re-derived from measurement (`ATERM_CAPTURE_TYPED_PARITY=1`), not
+    // hand-merged. The other EIGHT came back byte-identical a second time —
+    // which is exactly the discipline this fixture exists for: the walk and the
+    // cycle are confined to the one style that reads the arc, and neither
+    // leaked into the licence seam nor into a style that does not.
+    // **RE-BASELINED ONCE MORE, 2026-08-31 (the organic-motion pass), AND
+    // AGAIN ONLY ENTRY `2`.** Two changes, both of them the rainbow ribbon's
+    // motion and nothing else: `rainbow_live_tail` gives the mark a far-end
+    // dissolve while it is still being typed (post-cap, where the coverage the
+    // cell shows actually lives), and the exit swoosh's two linear laws — the
+    // farthest-first SELECTION schedule and the per-cell retract FADE — are
+    // eased with `smoothstep`. Re-derived from measurement
+    // (`ATERM_CAPTURE_TYPED_PARITY=1`), not hand-merged. The other EIGHT came
+    // back byte-identical, which is the discipline this fixture exists for:
+    // a dissolve applied at the wrong seam, or an easing that had leaked into
+    // the shared retract path every style uses, would have moved them.
+    // RE-DERIVED 2026-08-31 (LIVING FLOW): the standing band's travelling
+    // luminance swell moves the rainbow entry's bytes; the channel is confined
+    // to the one style that draws the ribbon, which is why the other eight
+    // came back byte-identical. Captured, not hand-merged.
+    // RE-DERIVED 2026-08-31 (EVEN PACING): the LUT is resampled so equal cell
+    // steps are equal perceived colour steps — the rainbow entry alone moves,
+    // the other eight byte-identical.
     const GOLDEN: [u64; 9] = [
-        10_317_128_623_903_768_537,
-        17_965_605_562_081_848_086,
-        331_874_870_921_564_289,
-        15_654_209_172_669_807_490,
-        3_818_617_666_977_618_171,
-        17_432_548_801_852_476_563,
-        4_382_914_939_507_566_134,
-        591_884_352_308_604_767,
-        3_259_176_104_562_415_775,
+        306_550_098_623_546_329,
+        1_297_071_605_659_407_894,
+        5_739_968_975_458_845_712,
+        11_402_529_203_733_425_666,
+        6_172_793_737_777_569_531,
+        10_228_138_411_549_286_995,
+        2_700_001_605_285_599_990,
+        2_241_811_593_972_689_823,
+        9_908_140_915_523_321_503,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];

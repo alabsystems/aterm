@@ -40,6 +40,30 @@
 //! a value disagrees with the measurement, the measurement is right and the
 //! reason for the change belongs in the commit message.
 //!
+//! # THE wasm ROWS WERE NOT A MEASUREMENT OF ANYTHING SHIPPED, until 2026-08-30
+//!
+//! Every `wasm` figure in the notes below — and the `WASM` baseline they
+//! justified, 81 packages / 1,172,582 lines — came from a cell rooted at the
+//! package `aterm`. `aterm` is a `[[bin]]`; nothing compiles it for
+//! `wasm32-unknown-unknown`. `cargo tree` resolves it for that triple regardless,
+//! so the row was a real measurement of a configuration that is never built, and
+//! it was wrong in BOTH directions: it counted `zstd` (a C library that cannot
+//! target wasm32, and which both web crates switch off), `winit`, `rustls` and
+//! the whole updater, and it MISSED `console_error_panic_hook`, which both
+//! shipped modules declare and the `aterm` root never reaches.
+//!
+//! It is two rows now, one per artifact aterm actually ships to a browser:
+//! [`WASM_CPU`] (`crates/aterm-wasm`) at 27 / 255,826 and [`WASM_GPU`]
+//! (`crates/aterm-gpu-web`) at 64 / 984,913. Those are the two crates the only
+//! two lanes that build wasm at all — `xtask gate web` and
+//! `tools/wasm-bench/run.sh` — name explicitly.
+//!
+//! THIS IS A RESTATED DENOMINATOR, NOT A RETIREMENT. Nothing left the graph on
+//! 2026-08-30; the old number measured a target that does not exist. No wasm
+//! figure in the history below is comparable to either row above, and they are
+//! left as written because they are the record of what was measured then.
+//! [`crate::resolve::default_cells`] carries the full derivation.
+//!
 //! Last measured: 2026-08-28, on the tree that activated FOUR `[patch.crates-io]`
 //! replacements at once — `log`, `cfg-if`, `profiling` and `arrayvec`, which are
 //! `crates/aterm-log-shim`, `-cfg-if`, `-profiling` and `-arrayvec`.
@@ -184,23 +208,68 @@ pub struct Baseline {
     pub duplicate_names: usize,
 }
 
+// ---------------------------------------------------------------------------
+// RE-MEASURED 2026-08-30 — a MEASUREMENT change, and ONLY the LOC rows move.
+//
+// `loc::package_dir` now resolves a patched package to the path that COMPILES,
+// before the registry is consulted. It used to prefer a pristine registry
+// checkout of the same version and fall through to `vendor/<name>` when the
+// machine had none, SILENTLY — so these pins recorded whichever the measuring
+// box's CARGO_HOME happened to hold, and the same commit read green on the
+// ratcheting machine and red on every other. Cargo cannot fetch a pristine copy
+// for a patched package at all (source-less lock entry), so that branch could
+// never have been relied on.
+//
+// The evidence that this is not dependency drift is in the shape of the diff:
+// `resolved`, `workspace`, `third_party`, `build_scripts`, `proc_macros` and
+// `duplicate_names` are UNCHANGED in every one of the five cells. Only
+// `third_party_loc` moves, by each cell's own forks' edits over upstream
+// (+811 on mac-arm, linux and win; +15 wasm-cpu; +98 wasm-gpu), and in
+// `MAC_ARM_DOMINATORS` only `wgpu` (+83) and `winit` (+713) — winit being the
+// fork itself. Recorded in `tools/forge-budget.tsv` through the tool's own
+// `--allow-regress` channel, with that reason.
+//
+// RE-PINNED 2026-08-31 (mac-arm, linux, win; the two wasm cells did not move).
+// Two causes, each accounted for exactly, and neither is dependency drift:
+//
+//   * `resolved` +1 and `workspace` +1 in all three: `crates/trust-gate` joined
+//     the workspace in ecb1d6691 and `crates/aterm` depends on it. It is the
+//     compiler gate, it has NO dependencies by construction (its build script
+//     runs among the first units precisely because nothing precedes it), so
+//     `third_party` is unchanged at 88 / 190 / 93. A new member that added a
+//     third-party edge would have moved that column too, which is the check.
+//   * `third_party_loc` +652 in all three, and the `winit` dominator with it
+//     (79,669 -> 80,321 at the SAME 12 packages): 48f847478 grew the fork by
+//     `vendor/winit/src/platform_impl/linux/headless.rs` and its wiring —
+//     `git show --stat` reports 675 insertions and 23 deletions over 6 files,
+//     and 675 - 23 = 652. Same number in three cells because the added source
+//     is target-independent as far as this counter is concerned; absent from
+//     both wasm cells because neither browser graph contains winit at all.
+//
+// The two wasm cells staying EXACTLY put is the load-bearing half of this
+// audit rather than a footnote: trust-gate is reached through `crates/aterm`,
+// a `[[bin]]` nothing compiles for wasm32, and winit is not in either browser
+// graph. A change that moved all five cells would have meant something other
+// than these two commits.
+// ---------------------------------------------------------------------------
+
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
     resolved: 156,
-    workspace: 67,
-    third_party: 89,
-    third_party_loc: 1_248_254,
+    workspace: 68,
+    third_party: 88,
+    third_party_loc: 1_224_481,
     build_scripts: 20,
     proc_macros: 6,
-    duplicate_names: 5,
+    duplicate_names: 4,
 };
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
     resolved: 259,
-    workspace: 68,
-    third_party: 191,
-    third_party_loc: 2_765_600,
+    workspace: 69,
+    third_party: 190,
+    third_party_loc: 2_741_827,
     build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
@@ -209,47 +278,98 @@ pub const LINUX: Baseline = Baseline {
 pub const WIN: Baseline = Baseline {
     cell: "win",
     resolved: 160,
-    workspace: 66,
-    third_party: 94,
-    third_party_loc: 3_612_829,
+    workspace: 67,
+    third_party: 93,
+    third_party_loc: 3_589_056,
     build_scripts: 19,
-    proc_macros: 7,
-    duplicate_names: 2,
-};
-
-pub const WASM: Baseline = Baseline {
-    cell: "wasm",
-    resolved: 147,
-    workspace: 66,
-    third_party: 81,
-    third_party_loc: 1_172_582,
-    build_scripts: 21,
     proc_macros: 7,
     duplicate_names: 1,
 };
 
-/// The four cells, in [`crate::resolve::default_cells`] order, so a test that
+/// The CPU browser module, `crates/aterm-wasm` — the engine plus the
+/// `aterm-render` rasterizer, blitted with `putImageData`.
+///
+/// SCOPE CORRECTED 2026-08-30, and this row is NOT comparable to the `wasm`
+/// row it replaces. The old row was rooted at the `aterm` BINARY, which is a
+/// `[[bin]]` nothing compiles for wasm32; it read 81 packages / 1,172,582 lines
+/// of a configuration that is never built. See
+/// [`crate::resolve::default_cells`] for what that counted and what it missed.
+///
+/// The first honest fall of this row was `getrandom` on 2026-08-30: 27 -> 25
+/// packages, 255,841 -> 246,067 lines. `getrandom 0.2` with `features = ["js"]`
+/// was declared by FOUR aterm manifests — aterm-shell-integration (a wasm32 arm
+/// of the capability-nonce mint that no browser build can call: `generate_nonce`
+/// has one caller, and it spawns a PTY) plus aterm-wasm, aterm-gpu-web and
+/// aterm-effects-web, each justified in a comment as "harmless if unused". They
+/// were the ONLY parents `cargo tree -i getrandom` found on either browser cell,
+/// so the defensive rows were the whole dependency; `js-sys` came out with it
+/// here, and stayed on wasm-gpu where web-sys and wgpu hold it.
+pub const WASM_CPU: Baseline = Baseline {
+    cell: "wasm-cpu",
+    resolved: 63,
+    workspace: 38,
+    third_party: 25,
+    third_party_loc: 246_067,
+    build_scripts: 7,
+    proc_macros: 2,
+    duplicate_names: 0,
+};
+
+/// The GPU browser module, `crates/aterm-gpu-web` — the same engine plus
+/// `aterm-gpu` over `wgpu`'s WebGL2 backend.
+///
+/// The gap to [`WASM_CPU`] is 37 third-party packages / 729,087 lines, all of
+/// it inside `wgpu`'s SUBTREE — and a subtree is not a removal price. The
+/// dominator (`blame wgpu --cell wasm-gpu`) is **33 packages / 523,700 lines**:
+/// `web-sys` (199,507 lines, the largest single package in the gap),
+/// `raw-window-handle` and `wasm-bindgen-futures` each have a direct edge from
+/// `aterm-gpu-web` and survive `wgpu`'s retirement. Outside the gap the two
+/// graphs differ by exactly one node, each module's own root.
+pub const WASM_GPU: Baseline = Baseline {
+    cell: "wasm-gpu",
+    resolved: 103,
+    workspace: 41,
+    third_party: 62,
+    third_party_loc: 957_778,
+    build_scripts: 16,
+    proc_macros: 6,
+    duplicate_names: 0,
+};
+
+/// The five cells, in [`crate::resolve::default_cells`] order, so a test that
 /// already holds a cell index can index this too.
-pub const CELLS: [Baseline; 4] = [MAC_ARM, LINUX, WIN, WASM];
+pub const CELLS: [Baseline; 5] = [MAC_ARM, LINUX, WIN, WASM_CPU, WASM_GPU];
 
 /// The names duplicated in the mac-arm cell. Pinned as NAMES rather than a
 /// count because which crate is doubled is the actionable half of the fact.
-pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] = [
-    "bitflags",
-    "block2",
-    "hashbrown",
-    "objc2",
-    "objc2-foundation",
-];
+pub const MAC_ARM_DUPLICATE_NAMES: [&str; MAC_ARM.duplicate_names] =
+    ["bitflags", "block2", "objc2", "objc2-foundation"];
 
 /// `hashbrown`'s version count, pinned separately because it was for a long
-/// time the worst duplicate in the cell at THREE live versions in one binary.
-/// It is two now, and it is no longer the worst: the biggest dedup prize on
-/// mac-arm is `objc2-foundation` at 59,492 LOC (0.2.2 beside 0.3.2), against
-/// hashbrown's 24,676. That ordering flips again the day `wgpu` leaves, because
-/// the 0.3.2 copy is wgpu's alone — which is the point of pinning the NAMES and
-/// not just the count.
-pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 2;
+/// time the worst duplicate in the cell — THREE live versions in one binary,
+/// then two.
+///
+/// **It is ONE now, and this constant is redundant with the NAMES assert, which is the actual tooth: a second hashbrown version is by definition a duplicate NAME, so `MAC_ARM_DUPLICATE_NAMES` fires first and this constant can never be the failing assertion. Kept as documentation of the count, credited honestly.** The
+/// second copy was `hashbrown 0.17.1`, held by exactly one requirement in the
+/// whole graph: upstream `indexmap 2.14`'s `hashbrown = "0.17"`. Nothing else
+/// on any cell asked for 0.17, and every other `hashbrown` parent — `naga`,
+/// `wgpu`, `wgpu-core`, `wgpu-hal` — was already on 0.16.1, so aterm shipped
+/// the whole of hashbrown twice to satisfy one vendored manifest line.
+/// `vendor/indexmap/Cargo.toml` now asks for `"0.16"` and the duplicate is
+/// gone: −1 package / −25,236 LOC / −496 unsafe tokens on mac-arm, linux, win
+/// and wasm-gpu alike (wasm-cpu never had indexmap).
+///
+/// Pinned as a COUNT OF RESOLVED VERSIONS rather than as a lookup into the
+/// duplicate map, because the duplicate map no longer has a `hashbrown` key at
+/// all — a lookup would panic on the fix rather than assert it. The version
+/// that survives is the shared one, which is why this dedup cost a version
+/// string and not a port.
+///
+/// hashbrown is also no longer the biggest dedup prize on mac-arm; that is
+/// `objc2-foundation` at 59,492 LOC (0.2.2 beside 0.3.2). That ordering flips
+/// again the day `wgpu` leaves, because the 0.3.2 copy is wgpu's alone — which
+/// is the point of pinning the NAMES and not just the count.
+pub const MAC_ARM_HASHBROWN_VERSIONS: usize = 1;
 
 // --------------------------------------------------------- dominator anchors
 
@@ -346,12 +466,22 @@ pub struct Dom {
 /// for a first-party replacement — it measured our 1,541-line crate as
 /// upstream's 72,271-line one, and the win read as 12,212 lines. Workspace
 /// members now win, by manifest name.
+/// `wgpu` SHRANK here for the first time, and by a row that is not its own:
+/// 38 packages / 660,280 LOC → **37 / 635,044** when `vendor/indexmap` moved
+/// its `hashbrown` requirement from `"0.17"` to `"0.16"`. `hashbrown 0.17.1`
+/// was a leaf whose only parent was `indexmap`, and `indexmap`'s only parents
+/// on this cell are `naga` and `wgpu-core` — both inside wgpu's cost — so the
+/// dedup came off wgpu's dominator to the line, 25,236 for 25,236, and off no
+/// other anchor. `wgpu-hal` and `naga` do not move: neither dominated
+/// `indexmap` alone, which is the same two-parents-bill-neither shape this
+/// list keeps recording, running for once in the direction of a shrink.
+///
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
     Dom {
         name: "wgpu",
         version: None,
-        pkgs: 38,
-        loc: 660_197,
+        pkgs: 37,
+        loc: 635_044,
     },
     Dom {
         name: "wgpu-hal",
@@ -375,7 +505,7 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         name: "winit",
         version: None,
         pkgs: 12,
-        loc: 78_956,
+        loc: 80_321,
     },
 ];
 
@@ -522,41 +652,86 @@ mod ratchet_agreement {
             return;
         }
 
-        let triples = [
-            ("mac-arm", "aarch64-apple-darwin"),
-            ("linux", "x86_64-unknown-linux-gnu"),
-            ("win", "x86_64-pc-windows-msvc"),
-            ("wasm", "wasm32-unknown-unknown"),
+        // The ratchet's scope strings, in CELLS order. Not derived from the
+        // triple: wasm32-unknown-unknown carries two cells, so the triple stopped
+        // being a unique key for a cell on 2026-08-30 and the two browser modules
+        // append their handle (`budget::scope_of`). Spelled out here rather than
+        // recomputed so that a change to either side of the pairing is a diff.
+        let scopes = [
+            ("mac-arm", "shipped.aarch64-apple-darwin"),
+            ("linux", "shipped.x86_64-unknown-linux-gnu"),
+            ("win", "shipped.x86_64-pc-windows-msvc"),
+            ("wasm-cpu", "shipped.wasm32-unknown-unknown.wasm-cpu"),
+            ("wasm-gpu", "shipped.wasm32-unknown-unknown.wasm-gpu"),
         ];
-        for (base, (cell, triple)) in CELLS.iter().zip(triples) {
+        for (base, (cell, scope)) in CELLS.iter().zip(scopes) {
             assert_eq!(base.cell, cell, "CELLS order changed");
-            let scope = format!("shipped.{triple}");
+            let scope = scope.to_string();
             let ceiling = |metric: &str| -> Option<u64> {
                 rows.iter()
                     .find(|r| r.scope == scope && r.metric == metric)
                     .map(|r| r.ceiling)
             };
-            if let Some(pkgs) = ceiling("third_party_packages") {
+            // EVERY metric, and the row must EXIST. Two judged escapes forced
+            // both halves: with `if let Some` arms, deleting a cell's rows from
+            // the TSV outright left the gate GREEN (the figures fell to an
+            // advisory "UNRATCHETED" list) and this suite at 149/0 — the whole
+            // `wasm-gpu` scope could vanish unbounded; and the three metrics the
+            // arms did not cover (`build_scripts`, `proc_macros`,
+            // `duplicate_names`) could be hand-raised in the TSV alone,
+            // bypassing the >=80-char-reason rule, with nothing going red.
+            let require = |metric: &str, want: u64| {
+                let got = ceiling(metric).unwrap_or_else(|| {
+                    panic!(
+                        "{cell}: tools/forge-budget.tsv has NO `{metric}` row for scope \
+                         `{scope}`. A measured cell with no ratchet row is a SILENT GREEN — \
+                         the gate lists its figures as advisory and moves on — and \
+                         `--update` cannot add rows, so nothing but this assertion holds \
+                         the scope in the file. Write the row."
+                    )
+                });
                 assert_eq!(
-                    pkgs,
-                    base.third_party as u64,
-                    "{cell}: tools/forge-budget.tsv says {pkgs} third-party packages but \
-                     measured::{} says {}. These are one measurement in two files — ratchet \
-                     BOTH, in the same change.",
+                    got,
+                    want,
+                    "{cell}: tools/forge-budget.tsv says {got} for `{metric}` but \
+                     measured::{} says {want}. One measurement, two files — ratchet BOTH \
+                     in the same change.",
                     cell.to_uppercase().replace('-', "_"),
-                    base.third_party
                 );
-            }
-            if let Some(loc) = ceiling("third_party_loc") {
-                assert_eq!(
-                    loc,
-                    base.third_party_loc,
-                    "{cell}: tools/forge-budget.tsv says {loc} third-party LOC but \
-                     measured::{} says {}. Ratchet BOTH, in the same change.",
-                    cell.to_uppercase().replace('-', "_"),
-                    base.third_party_loc
-                );
-            }
+            };
+            require("third_party_packages", base.third_party as u64);
+            require("third_party_loc", base.third_party_loc);
+            require("build_scripts", base.build_scripts as u64);
+            require("proc_macros", base.proc_macros as u64);
+            require("duplicate_names", base.duplicate_names as u64);
         }
+    }
+
+    /// `vendor/forge.toml`'s `[forge] cells` block is a GENERATED record of
+    /// [`crate::resolve::default_cells`] — `policy::seed_from_vendor` emits it
+    /// and nothing reads it back for measurement. A judge proved the gap:
+    /// replacing a ledger row with `{ name = "TOTALLY-BOGUS", triple =
+    /// "sparc64-unknown-none", package = "does-not-exist" }` left `check`
+    /// GREEN across "5 cell(s)" and this suite at 149/0, because the two were
+    /// kept in sync only by an author's diligence. This is the comparison.
+    #[test]
+    fn the_ledger_header_and_default_cells_are_the_same_matrix() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-forge sits two levels under the workspace root")
+            .to_path_buf();
+        let policy = crate::policy::load(&root).expect("vendor/forge.toml loads");
+        let row = |c: &crate::model::Cell| (c.name.clone(), c.triple.clone(), c.package.clone());
+        let ledger: Vec<_> = policy.forge.cells.iter().map(row).collect();
+        let live: Vec<_> = crate::resolve::default_cells().iter().map(row).collect();
+        assert_eq!(
+            ledger, live,
+            "vendor/forge.toml's [forge] cells has drifted from \
+             resolve::default_cells(). The ledger block is generated FROM the \
+             function — regenerate it (its own header says how) or fix \
+             default_cells; a ledger row nothing measures reads as an audited \
+             cell and is not one."
+        );
     }
 }

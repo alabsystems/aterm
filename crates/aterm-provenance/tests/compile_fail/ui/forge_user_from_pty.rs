@@ -6,7 +6,7 @@
 //! `Provenance<_, User>`. User-origin data only enters the system through
 //! `Provenance::<_, User>::from_user` at input-controller boundaries.
 
-use aterm_provenance::{Provenance, User, Pty};
+use aterm_provenance::{Provenance, Pty, User};
 
 fn main() {
     let pty = Provenance::<_, Pty>::from_pty(String::from("sudo"));

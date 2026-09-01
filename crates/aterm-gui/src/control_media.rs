@@ -7,6 +7,7 @@
 //! verbatim from `control.rs` (behavior-preserving). The `ImageReq`/`ImageQueue`
 //! types and the `AUDIT_SUBSYSTEM` name stay in `control.rs`, reached via `super::`.
 
+use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
 use aterm_containment::log_denial;
@@ -364,19 +365,41 @@ pub(crate) fn cmd_image(
             _ => (false, t),
         }
     };
+    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+        return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+    };
+    let admission_refused = std::cell::Cell::new(false);
     let target = if rest.is_empty() {
         let stem = if clean {
             "aterm-clean"
         } else {
             "aterm-control"
         };
-        let Some(target) = control_auth::confine_automatic_image_path(sock_dir, stem) else {
+        let Some(target) =
+            control_auth::confine_automatic_image_path_with_admission(sock_dir, stem, |path| {
+                let admitted = handoff.try_reconcile_for_resolved_path(path);
+                admission_refused.set(!admitted);
+                admitted
+            })
+        else {
+            if admission_refused.get() {
+                return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+            }
             return "ERR image: could not create the automatic capture path\n".into();
         };
         target
     } else {
         let requested = rest.to_string();
-        let Some(target) = control_auth::confine_image_path(sock_dir, &requested) else {
+        let Some(target) =
+            control_auth::confine_image_path_with_admission(sock_dir, &requested, |path| {
+                let admitted = handoff.try_reconcile_for_resolved_path(path);
+                admission_refused.set(!admitted);
+                admitted
+            })
+        else {
+            if admission_refused.get() {
+                return format!("ERR image: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+            }
             log_denial(
                 AUDIT_SUBSYSTEM,
                 &format!("image write '{requested}'"),
@@ -396,7 +419,11 @@ pub(crate) fn cmd_image(
     let cancel = crate::control::CaptureCancellation::new();
     let mut cancel_on_drop = CancelCaptureRequestOnDrop(Some(cancel.clone()));
     let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
-    queue.lock().unwrap().push_back(ImageReq {
+    let mut pending = queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    pending.push_back(ImageReq {
+        handoff,
         target,
         clean,
         session,
@@ -407,8 +434,12 @@ pub(crate) fn cmd_image(
         reply: tx,
     });
     if proxy.send_event(Wake::Control).is_err() {
+        pending
+            .pop_back()
+            .expect("queue lock keeps the just-pushed image request last");
         return "ERR event loop gone\n".into();
     }
+    drop(pending);
     // Generous ceiling: the render + encode is tens of ms; the deadline only fires
     // when the event loop or worker is wedged, where blocking the control thread for
     // the client's whole 900 s exchange window would wedge the verb too.
@@ -430,12 +461,19 @@ pub(crate) fn cmd_image(
         // driver base64-decodes to get the exact pixels, with no server-local file
         // path. Dims are on the line so the driver need not parse the PNG header.
         Ok(retained) => {
-            let ((w, h, png), retention) = retained.into_parts();
+            let parts = retained.into_parts();
+            let retention = parts.1;
+            let (w, h, png) = parts.0;
             let body = match png {
-                Some(png) => image_bytes_reply(w, h, &png, want_metadata, frame_metadata.get()),
+                Some(png) => {
+                    match image_bytes_reply(w, h, &png, want_metadata, frame_metadata.get()) {
+                        Ok(body) => body,
+                        Err(error) => return error.into(),
+                    }
+                }
                 None => image_file_reply(w, h, &path, want_metadata, frame_metadata.get()),
             };
-            crate::control::ControlReply::guarded(body, retention)
+            crate::control::ControlReply::with_handoff(body, retention)
         }
         // The encode/write failed AFTER a successful render: no file on disk.
         Err(e) => format!("ERR {e}\n").into(),
@@ -452,21 +490,43 @@ fn image_metadata_fields(metadata: Option<&crate::control::ImageFrameMetadata>) 
     )
 }
 
+// Width, height, byte-count fields, separators, and newline occupy at most 44
+// bytes on supported targets. Reserve 64 so a padded base64 row at this raw PNG
+// ceiling is always below the shared 8 MiB protocol-line limit.
+const IMAGE_BYTE_ROW_OVERHEAD: usize = 64;
+const MAX_IMAGE_BYTE_REPLY_PNG_BYTES: usize =
+    ((aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES - IMAGE_BYTE_ROW_OVERHEAD) / 4) * 3;
+
+fn image_byte_reply_png_fits(png_len: usize) -> bool {
+    png_len <= MAX_IMAGE_BYTE_REPLY_PNG_BYTES
+}
+
 fn image_bytes_reply(
     width: u32,
     height: u32,
     png: &[u8],
     want_metadata: bool,
     metadata: Option<&crate::control::ImageFrameMetadata>,
-) -> String {
-    match aterm_codec::base64::encode(png) {
-        Ok(base64) if want_metadata => format!(
+) -> Result<String, String> {
+    if !image_byte_reply_png_fits(png.len()) {
+        return Err("ERR image: PNG too large to return as bytes\n".to_string());
+    }
+    let base64 = aterm_codec::base64::encode(png)
+        .map_err(|_| "ERR image: PNG too large to return as bytes\n".to_string())?;
+    if want_metadata {
+        let metadata = image_metadata_fields(metadata);
+        if metadata.len().saturating_add("image-meta \n".len())
+            > aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES
+        {
+            return Err("ERR image: metadata too large to return as bytes\n".to_string());
+        }
+        Ok(format!(
             "OK 2\nimage-meta {}\n{width} {height} {} {base64}\n",
-            image_metadata_fields(metadata),
+            metadata,
             png.len(),
-        ),
-        Ok(base64) => format!("OK 1\n{width} {height} {} {base64}\n", png.len()),
-        Err(_) => "ERR image: PNG too large to return as bytes\n".to_string(),
+        ))
+    } else {
+        Ok(format!("OK 1\n{width} {height} {} {base64}\n", png.len()))
     }
 }
 
@@ -533,6 +593,13 @@ pub(crate) fn cmd_window(
         Some(t) if !first.is_empty() => (t, it.next().unwrap_or("")),
         _ => (AuxTarget::Front, rest.trim()),
     };
+    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+        return format!(
+            "ERR window capture: {}\n",
+            crate::control::ARTIFACT_HANDOFF_BUSY
+        )
+        .into();
+    };
     let default_stem = match aux {
         AuxTarget::Front => "aterm-window",
         AuxTarget::Prefs => "aterm-prefs",
@@ -545,15 +612,43 @@ pub(crate) fn cmd_window(
         AuxTarget::Update => "aterm-update",
     };
     let p = path_arg.trim();
+    let admission_refused = std::cell::Cell::new(false);
     let confined = if p.is_empty() {
-        let Some(target) = control_auth::confine_automatic_image_path(sock_dir, default_stem)
-        else {
+        let Some(target) = control_auth::confine_automatic_image_path_with_admission(
+            sock_dir,
+            default_stem,
+            |path| {
+                let admitted = handoff.try_reconcile_for_resolved_path(path);
+                admission_refused.set(!admitted);
+                admitted
+            },
+        ) else {
+            if admission_refused.get() {
+                return format!(
+                    "ERR window capture: {}\n",
+                    crate::control::ARTIFACT_HANDOFF_BUSY
+                )
+                .into();
+            }
             return "ERR window: could not create the automatic capture path\n".into();
         };
         target
     } else {
         let requested = p.to_string();
-        let Some(target) = control_auth::confine_image_path(sock_dir, &requested) else {
+        let Some(target) =
+            control_auth::confine_image_path_with_admission(sock_dir, &requested, |path| {
+                let admitted = handoff.try_reconcile_for_resolved_path(path);
+                admission_refused.set(!admitted);
+                admitted
+            })
+        else {
+            if admission_refused.get() {
+                return format!(
+                    "ERR window capture: {}\n",
+                    crate::control::ARTIFACT_HANDOFF_BUSY
+                )
+                .into();
+            }
             log_denial(
                 AUDIT_SUBSYSTEM,
                 &format!("window write '{requested}'"),
@@ -577,12 +672,14 @@ pub(crate) fn cmd_window(
     let wake = match aux {
         AuxTarget::Front => Wake::CaptureWindow {
             path: confined,
+            handoff,
             cancel,
             reply: tx,
         },
         _ => Wake::CaptureAuxWindow {
             target: aux,
             path: confined,
+            handoff,
             cancel,
             reply: tx,
         },
@@ -600,7 +697,7 @@ pub(crate) fn cmd_window(
     ) {
         Ok(retained) => {
             let ((w, h), retention) = retained.into_parts();
-            crate::control::ControlReply::guarded(format!("OK {w} {h} {path}\n"), retention)
+            crate::control::ControlReply::with_handoff(format!("OK {w} {h} {path}\n"), retention)
         }
         // The main thread's clear, actionable message (missing permission / headless /
         // window not open / off-macOS / capture failure) is surfaced as a single `ERR`.
@@ -678,38 +775,168 @@ struct VideoFrameCandidate {
     file: String,
 }
 
-fn video_frame_candidates(index: &aterm_json::Value) -> Vec<VideoFrameCandidate> {
+#[derive(Clone, Copy, Debug)]
+struct BorrowedVideoFrameCandidate<'a> {
+    delta: u64,
+    n: u64,
+    seq: u64,
+    t_us: u64,
+    file: &'a str,
+    ordinal: usize,
+}
+
+impl BorrowedVideoFrameCandidate<'_> {
+    fn into_owned(self) -> VideoFrameCandidate {
+        VideoFrameCandidate {
+            delta: self.delta,
+            n: self.n,
+            seq: self.seq,
+            t_us: self.t_us,
+            file: self.file.to_string(),
+        }
+    }
+}
+
+fn video_frame_candidate(
+    frame: &aterm_json::Value,
+    ordinal: usize,
+) -> Option<BorrowedVideoFrameCandidate<'_>> {
+    let file = frame.get("file")?.as_str()?;
+    if !valid_frame_file_name(file) {
+        return None;
+    }
+    Some(BorrowedVideoFrameCandidate {
+        delta: frame.get("delta")?.as_u64()?,
+        n: frame.get("n")?.as_u64()?,
+        seq: frame.get("seq")?.as_u64()?,
+        t_us: frame.get("t_us")?.as_u64()?,
+        file,
+        ordinal,
+    })
+}
+
+fn video_frame_rank(
+    left: &BorrowedVideoFrameCandidate<'_>,
+    right: &BorrowedVideoFrameCandidate<'_>,
+) -> std::cmp::Ordering {
+    right
+        .delta
+        .cmp(&left.delta)
+        .then(left.n.cmp(&right.n))
+        .then(left.ordinal.cmp(&right.ordinal))
+}
+
+/// Select the highest-ranked manifest entries while allocating only `limit`
+/// borrowed records. The full borrowed sort is reserved for damaged recordings
+/// whose highest-ranked files cannot be opened.
+fn video_frame_candidates(
+    index: &aterm_json::Value,
+    limit: usize,
+) -> Vec<BorrowedVideoFrameCandidate<'_>> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let Some(frames) = index.get("frames").and_then(aterm_json::Value::as_array) else {
         return Vec::new();
     };
-    let mut candidates = frames
-        .iter()
-        .filter_map(|frame| {
-            let file = frame.get("file")?.as_str()?;
-            if !valid_frame_file_name(file) {
-                return None;
+    let mut candidates = Vec::with_capacity(limit.min(frames.len()));
+    for (ordinal, frame) in frames.iter().enumerate() {
+        let Some(candidate) = video_frame_candidate(frame, ordinal) else {
+            continue;
+        };
+        let position = candidates.partition_point(|existing| {
+            video_frame_rank(existing, &candidate) != std::cmp::Ordering::Greater
+        });
+        if position < limit {
+            candidates.insert(position, candidate);
+            if candidates.len() > limit {
+                candidates.pop();
             }
-            Some(VideoFrameCandidate {
-                delta: frame.get("delta")?.as_u64()?,
-                n: frame.get("n")?.as_u64()?,
-                seq: frame.get("seq")?.as_u64()?,
-                t_us: frame.get("t_us")?.as_u64()?,
-                file: file.to_string(),
-            })
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| b.delta.cmp(&a.delta).then(a.n.cmp(&b.n)));
+        }
+    }
     candidates
 }
 
-struct PinnedVideoFrame<P> {
+struct PinnedVideoFrame {
     candidate: VideoFrameCandidate,
     path: std::path::PathBuf,
-    _pin: P,
+    identity: crate::pinned_dir::PinnedFileIdentity,
 }
 
-fn format_video_frame_rows<P>(rows: &[PinnedVideoFrame<P>]) -> String {
-    let mut out = format!("OK {}\n", rows.len());
+fn pin_video_frame_candidate(
+    recording: &crate::pinned_dir::PinnedDir,
+    recording_path: &std::path::Path,
+    candidate: BorrowedVideoFrameCandidate<'_>,
+    after_pin: &mut impl FnMut(),
+) -> Option<PinnedVideoFrame> {
+    let identity = recording
+        .private_file_identity_at_retained(std::ffi::OsStr::new(candidate.file))
+        .ok()?;
+    after_pin();
+    let path = recording_path.join(candidate.file);
+    Some(PinnedVideoFrame {
+        candidate: candidate.into_owned(),
+        path,
+        identity,
+    })
+}
+
+fn collect_video_frame_rows(
+    recording: &crate::pinned_dir::PinnedDir,
+    recording_path: &std::path::Path,
+    index: &aterm_json::Value,
+    count: usize,
+    mut after_pin: impl FnMut(),
+) -> Option<Vec<PinnedVideoFrame>> {
+    recording.validate_path_identity().ok()?;
+    let mut rows = Vec::with_capacity(count.min(64));
+    let candidates = video_frame_candidates(index, count);
+    let attempted = candidates.len();
+    for candidate in candidates {
+        if let Some(row) =
+            pin_video_frame_candidate(recording, recording_path, candidate, &mut after_pin)
+        {
+            rows.push(row);
+        }
+    }
+
+    if rows.len() < count && attempted == count {
+        let frames = index
+            .get("frames")
+            .and_then(aterm_json::Value::as_array)
+            .expect("bounded selection found candidates only in a frames array");
+        let mut fallback = frames
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, frame)| video_frame_candidate(frame, ordinal))
+            .collect::<Vec<_>>();
+        fallback.sort_unstable_by(video_frame_rank);
+        for candidate in fallback.into_iter().skip(attempted) {
+            if let Some(row) =
+                pin_video_frame_candidate(recording, recording_path, candidate, &mut after_pin)
+            {
+                rows.push(row);
+                if rows.len() == count {
+                    break;
+                }
+            }
+        }
+    }
+    recording.validate_path_identity().ok()?;
+    Some(rows)
+}
+
+fn format_video_frame_rows(rows: &[PinnedVideoFrame]) -> String {
+    // Four maximum-width u64 fields plus labels/newline need at most 108 bytes.
+    // Add the path's encoded length and a fixed-width header so the common case
+    // performs one response allocation and writes directly into it.
+    let capacity = rows.iter().fold(24usize, |capacity, row| {
+        capacity
+            .saturating_add(108)
+            .saturating_add(row.path.as_os_str().len())
+    });
+    let mut out = String::with_capacity(capacity);
+    writeln!(&mut out, "OK {}", rows.len()).expect("writing to a String cannot fail");
     for row in rows {
         let VideoFrameCandidate {
             delta,
@@ -722,28 +949,27 @@ fn format_video_frame_rows<P>(rows: &[PinnedVideoFrame<P>]) -> String {
         // convention as `image <path>`). A dial/TLS reply still names the remote
         // host's filesystem; use `image --bytes` when pixels must cross the relay.
         //
-        // The retained handles below make this path name the validated inode at
-        // the response commit point. As with every filesystem-path API, a
-        // same-user process can mutate it after the reply reaches the caller.
-        out.push_str(&format!(
-            "frame n={n} delta={delta} t_us={t_us} seq={seq} {}\n",
+        // The identity checkpoint below makes this path name the validated file
+        // at the response commit point. As with every filesystem-path API, a
+        // same-user process can mutate it immediately after that checkpoint,
+        // including before the caller receives the bytes.
+        writeln!(
+            &mut out,
+            "frame n={n} delta={delta} t_us={t_us} seq={seq} {}",
             row.path.display()
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     out
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod confined_video_reader {
-    use std::io::Read as _;
-
-    use aterm_dirfd::OwnedFd;
-    use aterm_dirfd::{CWD, Dir, FileType, Mode, OFlags, fstat, openat};
-
     use super::{
-        PinnedVideoFrame, VIDEO_INDEX_MAX_BYTES, VIDEO_RECORDING_SCAN_MAX, control_auth,
-        format_video_frame_rows, valid_recording_name, video_frame_candidates,
+        PinnedVideoFrame, VIDEO_INDEX_MAX_BYTES, VIDEO_RECORDING_SCAN_MAX,
+        collect_video_frame_rows, control_auth, format_video_frame_rows, valid_recording_name,
     };
+    use crate::pinned_dir::{PinnedDir, PinnedFile};
 
     const INDEX_NAME: &str = "index.json";
 
@@ -755,6 +981,7 @@ mod confined_video_reader {
         RecordingPinned,
         IndexPinned,
         FramePinned,
+        SelectionValidated,
     }
 
     #[cfg(not(test))]
@@ -765,388 +992,105 @@ mod confined_video_reader {
         RecordingPinned,
         IndexPinned,
         FramePinned,
-    }
-
-    fn directory_flags() -> OFlags {
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
-    }
-
-    fn file_flags() -> OFlags {
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC
-    }
-
-    fn open_directory_at<Fd: aterm_dirfd::AsFd>(
-        parent: Fd,
-        name: impl aterm_dirfd::Arg,
-    ) -> Option<OwnedFd> {
-        openat(parent, name, directory_flags(), Mode::empty()).ok()
-    }
-
-    fn open_file_at<Fd: aterm_dirfd::AsFd>(
-        parent: Fd,
-        name: impl aterm_dirfd::Arg,
-    ) -> Option<OwnedFd> {
-        openat(parent, name, file_flags(), Mode::empty()).ok()
-    }
-
-    fn is_directory(fd: &impl aterm_dirfd::AsFd) -> bool {
-        fstat(fd)
-            .ok()
-            .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_dir())
-    }
-
-    fn is_regular_file(fd: &impl aterm_dirfd::AsFd) -> bool {
-        fstat(fd)
-            .ok()
-            .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file())
-    }
-
-    fn same_identity(left: &impl aterm_dirfd::AsFd, right: &impl aterm_dirfd::AsFd) -> bool {
-        let (Ok(left), Ok(right)) = (fstat(left), fstat(right)) else {
-            return false;
-        };
-        left.st_dev == right.st_dev && left.st_ino == right.st_ino
-    }
-
-    fn current_directory_matches<Fd: aterm_dirfd::AsFd>(
-        parent: Fd,
-        name: impl aterm_dirfd::Arg,
-        expected: &impl aterm_dirfd::AsFd,
-    ) -> bool {
-        open_directory_at(parent, name).is_some_and(|current| same_identity(&current, expected))
-    }
-
-    fn current_file_matches<Fd: aterm_dirfd::AsFd>(
-        parent: Fd,
-        name: impl aterm_dirfd::Arg,
-        expected: &impl aterm_dirfd::AsFd,
-    ) -> bool {
-        open_file_at(parent, name)
-            .is_some_and(|current| is_regular_file(&current) && same_identity(&current, expected))
-    }
-
-    fn read_index(
-        recording: &OwnedFd,
-        hook: &mut impl FnMut(ReadStage),
-    ) -> Option<(std::fs::File, aterm_json::Value)> {
-        let index_fd = open_file_at(recording, INDEX_NAME)?;
-        hook(ReadStage::IndexPinned);
-        if !is_regular_file(&index_fd) {
-            return None;
-        }
-        let mut file = std::fs::File::from(index_fd);
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take((VIDEO_INDEX_MAX_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() > VIDEO_INDEX_MAX_BYTES {
-            return None;
-        }
-        let value = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
-        value
-            .get("frames")
-            .is_some_and(aterm_json::Value::is_array)
-            .then_some((file, value))
-    }
-
-    fn recording_names(instance: &OwnedFd) -> Result<Vec<String>, &'static str> {
-        let mut directory =
-            Dir::read_from(instance).map_err(|_| "could not read recording namespace")?;
-        let mut scanned = 0_usize;
-        let mut names = Vec::new();
-        for result in &mut directory {
-            let entry = result.map_err(|_| "could not inspect recording namespace")?;
-            let bytes = entry.file_name().to_bytes();
-            if bytes == b"." || bytes == b".." {
-                continue;
-            }
-            if scanned >= VIDEO_RECORDING_SCAN_MAX {
-                return Err("recording namespace has too many entries");
-            }
-            scanned += 1;
-            let Ok(name) = std::str::from_utf8(bytes) else {
-                continue;
-            };
-            if valid_recording_name(name) {
-                names.push(name.to_string());
-            }
-        }
-        names.sort();
-        Ok(names)
-    }
-
-    /// One canonical absolute directory path, retained component-by-component
-    /// from `/`. `O_NOFOLLOW` only applies to the final component of one open;
-    /// this chain makes it apply to every ancestor and keeps each exact inode
-    /// alive until the response is committed.
-    struct AbsoluteDirectory {
-        root: OwnedFd,
-        components: Vec<(std::ffi::OsString, OwnedFd)>,
-    }
-
-    impl AbsoluteDirectory {
-        fn leaf(&self) -> &OwnedFd {
-            self.components
-                .last()
-                .map_or(&self.root, |(_, directory)| directory)
-        }
-
-        fn still_matches(&self) -> bool {
-            let Some(mut current) =
-                open_directory_at(CWD, std::path::Path::new("/")).filter(is_directory)
-            else {
-                return false;
-            };
-            if !same_identity(&current, &self.root) {
-                return false;
-            }
-            for (name, expected) in &self.components {
-                let Some(next) = open_directory_at(&current, name.as_os_str()).filter(is_directory)
-                else {
-                    return false;
-                };
-                if !same_identity(&next, expected) {
-                    return false;
-                }
-                current = next;
-            }
-            true
-        }
-    }
-
-    fn open_absolute_directory(path: std::path::PathBuf) -> Option<AbsoluteDirectory> {
-        if !path.is_absolute() {
-            return None;
-        }
-        let root = open_directory_at(CWD, std::path::Path::new("/")).filter(is_directory)?;
-        let mut components = Vec::new();
-        for component in path.components() {
-            let name = match component {
-                std::path::Component::RootDir => continue,
-                std::path::Component::Normal(name) => name,
-                // `canonicalize` must eliminate `.`/`..`; Unix has no prefix.
-                _ => return None,
-            };
-            let parent = components.last().map_or(&root, |(_, directory)| directory);
-            let directory = open_directory_at(parent, name).filter(is_directory)?;
-            components.push((name.to_os_string(), directory));
-        }
-        Some(AbsoluteDirectory { root, components })
-    }
-
-    struct Namespace {
-        socket: AbsoluteDirectory,
-        video: OwnedFd,
-        instance: OwnedFd,
-        instance_path: std::path::PathBuf,
+        SelectionValidated,
     }
 
     fn open_namespace(
         sock_dir: &std::path::Path,
         instance: &str,
+        admit: impl FnOnce(&std::path::Path) -> bool,
         hook: &mut impl FnMut(ReadStage),
-    ) -> Result<Namespace, &'static str> {
+    ) -> Result<PinnedDir, &'static str> {
         if control_auth::video_instance_root_for(sock_dir, instance).is_none() {
             return Err("recording namespace is not confined");
         }
-        let socket_path =
-            std::fs::canonicalize(sock_dir).map_err(|_| "recording namespace is not confined")?;
-        hook(ReadStage::SocketPathResolved);
-        let socket = open_absolute_directory(socket_path.clone())
-            .ok_or("recording namespace is not confined")?;
-        let video = open_directory_at(socket.leaf(), control_auth::VIDEO_DIR)
-            .filter(is_directory)
-            .ok_or("recording namespace is not confined")?;
-        let instance_fd = open_directory_at(&video, instance)
-            .filter(is_directory)
-            .ok_or("recording namespace is not confined")?;
-        let instance_path = socket_path.join(control_auth::VIDEO_DIR).join(instance);
-        Ok(Namespace {
-            socket,
-            video,
-            instance: instance_fd,
-            instance_path,
+        let socket = PinnedDir::open_resolved_with_admission(sock_dir, |canonical_socket| {
+            admit(
+                &canonical_socket
+                    .join(control_auth::VIDEO_DIR)
+                    .join(instance),
+            )
         })
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                crate::control::ARTIFACT_HANDOFF_BUSY
+            } else {
+                "recording namespace is not confined"
+            }
+        })?;
+        hook(ReadStage::SocketPathResolved);
+        socket
+            .validate_path_identity()
+            .map_err(|_| "recording namespace is not confined")?;
+        let video = socket
+            .child(std::ffi::OsStr::new(control_auth::VIDEO_DIR))
+            .map_err(|_| "recording namespace is not confined")?;
+        video
+            .child(std::ffi::OsStr::new(instance))
+            .map_err(|_| "recording namespace is not confined")
     }
 
-    fn namespace_still_matches(
-        namespace: &Namespace,
-        recording_name: &str,
-        recording: &OwnedFd,
-        published_marker: &std::fs::File,
-        index: &std::fs::File,
-        rows: &[PinnedVideoFrame<OwnedFd>],
+    fn recording_names(instance: &PinnedDir) -> Result<Vec<String>, &'static str> {
+        let names = instance
+            .names_up_to(VIDEO_RECORDING_SCAN_MAX.saturating_add(1))
+            .map_err(|_| "could not read recording namespace")?;
+        if names.len() > VIDEO_RECORDING_SCAN_MAX {
+            return Err("recording namespace has too many entries");
+        }
+        let mut recordings = names
+            .into_iter()
+            .filter_map(|name| name.into_string().ok())
+            .filter(|name| valid_recording_name(name))
+            .collect::<Vec<_>>();
+        recordings.sort();
+        Ok(recordings)
+    }
+
+    fn read_index(
+        recording: &PinnedDir,
+        hook: &mut impl FnMut(ReadStage),
+    ) -> Option<(PinnedFile, aterm_json::Value)> {
+        let (bytes, index_file) = recording
+            .read_private_at_retained(std::ffi::OsStr::new(INDEX_NAME), VIDEO_INDEX_MAX_BYTES)
+            .ok()?;
+        hook(ReadStage::IndexPinned);
+        let value = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
+        value
+            .get("frames")
+            .is_some_and(aterm_json::Value::is_array)
+            .then_some((index_file, value))
+    }
+
+    fn selection_still_matches(
+        recording: &PinnedDir,
+        published_marker: &PinnedFile,
+        index_file: &PinnedFile,
+        rows: &[PinnedVideoFrame],
     ) -> bool {
-        namespace.socket.still_matches()
-            && current_directory_matches(
-                namespace.socket.leaf(),
-                control_auth::VIDEO_DIR,
-                &namespace.video,
-            )
-            && current_directory_matches(
-                &namespace.video,
-                namespace
-                    .instance_path
-                    .file_name()
-                    .expect("validated instance component"),
-                &namespace.instance,
-            )
-            && current_directory_matches(&namespace.instance, recording_name, recording)
-            && current_file_matches(
-                recording,
-                control_auth::VIDEO_PUBLISHED_FILE,
-                published_marker,
-            )
-            && current_file_matches(recording, INDEX_NAME, index)
-            && rows
-                .iter()
-                .all(|row| current_file_matches(recording, row.candidate.file.as_str(), &row._pin))
-    }
-
-    fn read_with_hook(
-        sock_dir: &std::path::Path,
-        instance: &str,
-        count: usize,
-        mut hook: impl FnMut(ReadStage),
-    ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        let namespace = open_namespace(sock_dir, instance, &mut hook)?;
-        hook(ReadStage::NamespacePinned);
-        let names = recording_names(&namespace.instance)?;
-
-        // A still-encoding or torn newest recording is skipped. Walk newest to
-        // oldest until a completion index parses from the exact retained handle.
-        let mut selected = None;
-        for name in names.into_iter().rev() {
-            let Some(recording) =
-                open_directory_at(&namespace.instance, name.as_str()).filter(is_directory)
-            else {
-                continue;
-            };
-            hook(ReadStage::RecordingPinned);
-            let Some(published_marker) =
-                open_file_at(&recording, control_auth::VIDEO_PUBLISHED_FILE)
-                    .filter(is_regular_file)
-                    .map(std::fs::File::from)
-            else {
-                continue;
-            };
-            let Some((index_file, index)) = read_index(&recording, &mut hook) else {
-                continue;
-            };
-            selected = Some((name, recording, published_marker, index_file, index));
-            break;
-        }
-        let Some((recording_name, recording, published_marker, index_file, index)) = selected
-        else {
-            return Ok(None);
-        };
-
-        // Sort manifest metadata first, then retain only the selected safe frame
-        // handles. This preserves valid-frame backfill without holding thousands
-        // of descriptors for a 60 s / 120 fps recording.
-        let recording_path = namespace.instance_path.join(&recording_name);
-        let Some(lease) = control_auth::retain_video_artifact_path(&recording_path) else {
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(namespace);
-            return Err("recording retention sweep is in progress");
-        };
-        let sweep_root = match crate::pinned_dir::PinnedDir::open_resolved(&namespace.instance_path)
-        {
-            Ok(root) => root,
-            Err(_) => {
-                drop(index_file);
-                drop(published_marker);
-                drop(recording);
-                drop(namespace);
-                drop(lease);
-                return Err("recording namespace changed during read");
-            }
-        };
-        let mut rows = Vec::new();
-        for candidate in video_frame_candidates(&index) {
-            let Some(frame) = open_file_at(&recording, candidate.file.as_str()) else {
-                continue;
-            };
-            hook(ReadStage::FramePinned);
-            if !is_regular_file(&frame) {
-                continue;
-            }
-            let path = recording_path.join(&candidate.file);
-            rows.push(PinnedVideoFrame {
-                candidate,
-                path,
-                _pin: frame,
-            });
-            if rows.len() == count {
-                break;
-            }
-        }
-
-        if !namespace_still_matches(
-            &namespace,
-            &recording_name,
-            &recording,
-            &published_marker,
-            &index_file,
-            &rows,
-        ) {
-            // Lease release may trigger retention. Drop every exact reader
-            // handle first (especially Windows deny-delete handles), then let
-            // the final lease run its callback.
-            drop(rows);
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(namespace);
-            drop(sweep_root);
-            drop(lease);
-            return Err("recording namespace changed during read");
-        }
-        if sweep_root.validate_path_identity().is_err()
-            || !sweep_root.same_directory_fd(&namespace.instance)
-            || lease
-                .arm_video_reader_sweep(sweep_root, std::ffi::OsString::from(&recording_name))
-                .is_err()
-        {
-            drop(rows);
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(namespace);
-            drop(lease);
-            return Err("recording namespace changed while arming retention");
-        }
-        let output = format_video_frame_rows(&rows);
-        let retention = crate::control::ReplyRetention::new(VideoFramesRetention {
-            namespace,
-            recording_name,
-            recording,
-            published_marker,
-            index_file,
-            rows,
-            _lease: lease,
-        });
-        Ok(Some(crate::control::Retained::guarded(output, retention)))
+        recording.validate_path_identity().is_ok()
+            && published_marker
+                .validate_entry_identity_at_retained()
+                .is_ok()
+            && index_file.validate_entry_identity_at_retained().is_ok()
+            && rows.iter().all(|row| {
+                row.identity
+                    .validate_at_retained(recording, std::ffi::OsStr::new(&row.candidate.file))
+                    .is_ok()
+            })
+            && recording.validate_path_identity().is_ok()
     }
 
     struct VideoFramesRetention {
-        namespace: Namespace,
-        recording_name: String,
-        recording: OwnedFd,
-        published_marker: std::fs::File,
-        index_file: std::fs::File,
-        rows: Vec<PinnedVideoFrame<OwnedFd>>,
+        recording: PinnedDir,
+        published_marker: PinnedFile,
+        index_file: PinnedFile,
+        rows: Vec<PinnedVideoFrame>,
         _lease: control_auth::ArtifactPathLease,
     }
 
     impl crate::control::WireRetention for VideoFramesRetention {
         fn prepare_write(&mut self) -> Result<(), String> {
-            namespace_still_matches(
-                &self.namespace,
-                &self.recording_name,
+            selection_still_matches(
                 &self.recording,
                 &self.published_marker,
                 &self.index_file,
@@ -1155,6 +1099,100 @@ mod confined_video_reader {
             .then_some(())
             .ok_or_else(|| "video frame identity changed before wire reply".to_string())
         }
+    }
+
+    fn read_with_permit_and_hook(
+        sock_dir: &std::path::Path,
+        instance: &str,
+        count: usize,
+        mut permit: crate::control::ReplyRetentionPermit,
+        mut hook: impl FnMut(ReadStage),
+    ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
+        let instance_dir = open_namespace(
+            sock_dir,
+            instance,
+            |path| permit.try_reconcile_for_resolved_path(path),
+            &mut hook,
+        )?;
+        hook(ReadStage::NamespacePinned);
+        let names = recording_names(&instance_dir)?;
+
+        // A still-encoding or torn newest recording is skipped. Walk newest to
+        // oldest until both the publication marker and bounded completion index
+        // are pinned through the one retained namespace chain.
+        let mut selected = None;
+        for recording_name in names.into_iter().rev() {
+            let Ok(recording) = instance_dir.child(std::ffi::OsStr::new(&recording_name)) else {
+                continue;
+            };
+            hook(ReadStage::RecordingPinned);
+            let Ok(published_marker) = recording.pin_private_file_at_retained(
+                std::ffi::OsStr::new(control_auth::VIDEO_PUBLISHED_FILE),
+            ) else {
+                continue;
+            };
+            let Some((index_file, index)) = read_index(&recording, &mut hook) else {
+                continue;
+            };
+            selected = Some((
+                std::ffi::OsString::from(recording_name),
+                recording,
+                published_marker,
+                index_file,
+                index,
+            ));
+            break;
+        }
+        let Some((recording_name, recording, published_marker, index_file, index)) = selected
+        else {
+            return Ok(None);
+        };
+
+        let Some(lease) =
+            control_auth::retain_video_artifact_path(instance_dir, recording_name, &recording)
+                .map_err(|_| "recording namespace changed while acquiring retention")?
+        else {
+            return Err("recording retention sweep is in progress");
+        };
+        let Some(rows) =
+            collect_video_frame_rows(&recording, recording.path(), &index, count, || {
+                hook(ReadStage::FramePinned)
+            })
+        else {
+            return Err("recording namespace changed during read");
+        };
+        if !selection_still_matches(&recording, &published_marker, &index_file, &rows) {
+            return Err("recording namespace changed during read");
+        }
+        hook(ReadStage::SelectionValidated);
+
+        lease
+            .arm_video_retention_sweep(&recording)
+            .map_err(|_| "recording namespace changed while arming retention")?;
+        let guard = VideoFramesRetention {
+            recording,
+            published_marker,
+            index_file,
+            rows,
+            _lease: lease,
+        };
+        let output = format_video_frame_rows(&guard.rows);
+        let retention = permit.retain(guard);
+        Ok(Some(crate::control::Retained::guarded(output, retention)))
+    }
+
+    fn read_with_hook(
+        sock_dir: &std::path::Path,
+        instance: &str,
+        count: usize,
+        hook: impl FnMut(ReadStage),
+    ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
+        #[cfg(test)]
+        let permit = crate::control::ReplyRetentionPermit::unmetered_for_test();
+        #[cfg(not(test))]
+        let permit = crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
+            .ok_or(crate::control::ARTIFACT_HANDOFF_BUSY)?;
+        read_with_permit_and_hook(sock_dir, instance, count, permit, hook)
     }
 
     pub(super) fn read(
@@ -1174,388 +1212,16 @@ mod confined_video_reader {
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
         read_with_hook(sock_dir, instance, count, hook)
     }
-}
 
-#[cfg(windows)]
-mod confined_video_reader {
-    use std::io::Read as _;
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-
-    use super::{
-        PinnedVideoFrame, VIDEO_INDEX_MAX_BYTES, VIDEO_RECORDING_SCAN_MAX, control_auth,
-        format_video_frame_rows, valid_recording_name, video_frame_candidates,
-    };
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    const FILE_SHARE_READ: u32 = 0x0000_0001;
-    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const INDEX_NAME: &str = "index.json";
-
-    struct PinnedDirectory {
-        _file: std::fs::File,
-        path: std::path::PathBuf,
-    }
-
-    struct PinnedFile {
-        file: std::fs::File,
-        path: std::path::PathBuf,
-    }
-
-    fn is_reparse(metadata: &std::fs::Metadata) -> bool {
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-
-    fn open_directory_path(
-        path: &std::path::Path,
-        expected_parent: Option<&std::path::Path>,
-    ) -> Option<PinnedDirectory> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-            .ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_dir() || is_reparse(&metadata) {
-            return None;
-        }
-        // This handle denies FILE_SHARE_DELETE, so after open succeeds neither
-        // this component nor any pinned ancestor can be renamed/replaced while
-        // the request is in flight.
-        let canonical = std::fs::canonicalize(path).ok()?;
-        if expected_parent.is_some_and(|parent| canonical.parent() != Some(parent)) {
-            return None;
-        }
-        Some(PinnedDirectory {
-            _file: file,
-            path: canonical,
-        })
-    }
-
-    fn open_directory_child(
-        parent: &PinnedDirectory,
-        name: impl AsRef<std::path::Path>,
-    ) -> Option<PinnedDirectory> {
-        open_directory_path(&parent.path.join(name), Some(&parent.path))
-    }
-
-    fn open_file_child(parent: &PinnedDirectory, name: &str) -> Option<PinnedFile> {
-        let path = parent.path.join(name);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            // A completion index/frame has no live writer. Denying WRITE as well
-            // as DELETE makes the bytes stable for the whole bounded read.
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&path)
-            .ok()?;
-        let metadata = file.metadata().ok()?;
-        if !metadata.is_file() || is_reparse(&metadata) {
-            return None;
-        }
-        let canonical = std::fs::canonicalize(&path).ok()?;
-        if canonical.parent() != Some(parent.path.as_path()) {
-            return None;
-        }
-        Some(PinnedFile {
-            file,
-            path: canonical,
-        })
-    }
-
-    fn path_still_pinned(path: &std::path::Path, directory: bool) -> bool {
-        let Ok(metadata) = std::fs::symlink_metadata(path) else {
-            return false;
-        };
-        !is_reparse(&metadata)
-            && (if directory {
-                metadata.is_dir()
-            } else {
-                metadata.is_file()
-            })
-            && std::fs::canonicalize(path).is_ok_and(|current| current == path)
-    }
-
-    /// Retain the volume root and every canonical absolute path component. A
-    /// single Windows open with OPEN_REPARSE_POINT protects only its leaf; this
-    /// chain rejects a reparse at every level and the no-DELETE share mode keeps
-    /// all opened ancestors from being renamed or replaced.
-    struct AbsoluteDirectory {
-        root: PinnedDirectory,
-        components: Vec<(std::ffi::OsString, PinnedDirectory)>,
-    }
-
-    impl AbsoluteDirectory {
-        fn leaf(&self) -> &PinnedDirectory {
-            self.components
-                .last()
-                .map_or(&self.root, |(_, directory)| directory)
-        }
-
-        fn still_matches(&self) -> bool {
-            let Some(mut current) = open_directory_path(&self.root.path, None) else {
-                return false;
-            };
-            if current.path != self.root.path {
-                return false;
-            }
-            for (name, expected) in &self.components {
-                let Some(next) = open_directory_child(&current, name) else {
-                    return false;
-                };
-                if next.path != expected.path {
-                    return false;
-                }
-                current = next;
-            }
-            true
-        }
-    }
-
-    fn open_absolute_directory(path: &std::path::Path) -> Option<AbsoluteDirectory> {
-        let mut parts = path.components();
-        let std::path::Component::Prefix(prefix) = parts.next()? else {
-            return None;
-        };
-        if !matches!(parts.next(), Some(std::path::Component::RootDir)) {
-            return None;
-        }
-        let mut volume_root = std::path::PathBuf::from(prefix.as_os_str());
-        volume_root.push("\\");
-        let root = open_directory_path(&volume_root, None)?;
-        let mut components = Vec::new();
-        for component in parts {
-            let std::path::Component::Normal(name) = component else {
-                return None;
-            };
-            let parent = components.last().map_or(&root, |(_, directory)| directory);
-            let directory = open_directory_child(parent, name)?;
-            components.push((name.to_os_string(), directory));
-        }
-        Some(AbsoluteDirectory { root, components })
-    }
-
-    fn read_index(recording: &PinnedDirectory) -> Option<(PinnedFile, aterm_json::Value)> {
-        let mut pinned = open_file_child(recording, INDEX_NAME)?;
-        let mut bytes = Vec::new();
-        (&mut pinned.file)
-            .take((VIDEO_INDEX_MAX_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() > VIDEO_INDEX_MAX_BYTES {
-            return None;
-        }
-        let value = aterm_json::from_slice::<aterm_json::Value>(&bytes).ok()?;
-        value
-            .get("frames")
-            .is_some_and(aterm_json::Value::is_array)
-            .then_some((pinned, value))
-    }
-
-    fn recording_names(instance: &PinnedDirectory) -> Result<Vec<String>, &'static str> {
-        let entries =
-            std::fs::read_dir(&instance.path).map_err(|_| "could not read recording namespace")?;
-        let mut names = Vec::new();
-        for (scanned, result) in entries.enumerate() {
-            if scanned >= VIDEO_RECORDING_SCAN_MAX {
-                return Err("recording namespace has too many entries");
-            }
-            let entry = result.map_err(|_| "could not inspect recording namespace")?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if valid_recording_name(&name) {
-                names.push(name);
-            }
-        }
-        names.sort();
-        Ok(names)
-    }
-
-    fn selection_still_matches(
-        socket: &AbsoluteDirectory,
-        video: &PinnedDirectory,
-        instance: &PinnedDirectory,
-        recording: &PinnedDirectory,
-        published_marker: &PinnedFile,
-        index_file: &PinnedFile,
-        rows: &[PinnedVideoFrame<PinnedFile>],
-    ) -> bool {
-        socket.still_matches()
-            && [&video.path, &instance.path, &recording.path]
-                .into_iter()
-                .all(|path| path_still_pinned(path, true))
-            && path_still_pinned(&published_marker.path, false)
-            && path_still_pinned(&index_file.path, false)
-            && rows.iter().all(|row| path_still_pinned(&row.path, false))
-    }
-
-    struct VideoFramesRetention {
-        socket: AbsoluteDirectory,
-        video: PinnedDirectory,
-        instance: PinnedDirectory,
-        recording: PinnedDirectory,
-        published_marker: PinnedFile,
-        index_file: PinnedFile,
-        rows: Vec<PinnedVideoFrame<PinnedFile>>,
-        _lease: control_auth::ArtifactPathLease,
-    }
-
-    impl crate::control::WireRetention for VideoFramesRetention {
-        fn prepare_write(&mut self) -> Result<(), String> {
-            selection_still_matches(
-                &self.socket,
-                &self.video,
-                &self.instance,
-                &self.recording,
-                &self.published_marker,
-                &self.index_file,
-                &self.rows,
-            )
-            .then_some(())
-            .ok_or_else(|| "video frame identity changed before wire reply".to_string())
-        }
-    }
-
-    pub(super) fn read(
+    #[cfg(test)]
+    pub(super) fn read_metered_for_test(
         sock_dir: &std::path::Path,
         instance: &str,
         count: usize,
     ) -> Result<Option<crate::control::Retained<String>>, &'static str> {
-        if control_auth::video_instance_root_for(sock_dir, instance).is_none() {
-            return Err("recording namespace is not confined");
-        }
-        let socket_metadata = std::fs::symlink_metadata(sock_dir)
-            .map_err(|_| "recording namespace is not confined")?;
-        if is_reparse(&socket_metadata) {
-            return Err("recording namespace is not confined");
-        }
-        let socket_path =
-            std::fs::canonicalize(sock_dir).map_err(|_| "recording namespace is not confined")?;
-        let socket =
-            open_absolute_directory(&socket_path).ok_or("recording namespace is not confined")?;
-        let video = open_directory_child(socket.leaf(), control_auth::VIDEO_DIR)
-            .ok_or("recording namespace is not confined")?;
-        let instance =
-            open_directory_child(&video, instance).ok_or("recording namespace is not confined")?;
-        let names = recording_names(&instance)?;
-
-        let mut selected = None;
-        for name in names.into_iter().rev() {
-            let Some(recording) = open_directory_child(&instance, &name) else {
-                continue;
-            };
-            let Some(published_marker) =
-                open_file_child(&recording, control_auth::VIDEO_PUBLISHED_FILE)
-            else {
-                continue;
-            };
-            let Some((index_file, index)) = read_index(&recording) else {
-                continue;
-            };
-            selected = Some((recording, published_marker, index_file, index));
-            break;
-        }
-        let Some((recording, published_marker, index_file, index)) = selected else {
-            return Ok(None);
-        };
-        let Some(lease) = control_auth::retain_video_artifact_path(&recording.path) else {
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(instance);
-            drop(video);
-            drop(socket);
-            return Err("recording retention sweep is in progress");
-        };
-        let sweep_root = match crate::pinned_dir::PinnedDir::open_resolved(&instance.path) {
-            Ok(root) => root,
-            Err(_) => {
-                drop(index_file);
-                drop(published_marker);
-                drop(recording);
-                drop(instance);
-                drop(video);
-                drop(socket);
-                drop(lease);
-                return Err("recording namespace changed during read");
-            }
-        };
-
-        let mut rows = Vec::new();
-        for candidate in video_frame_candidates(&index) {
-            let Some(frame) = open_file_child(&recording, &candidate.file) else {
-                continue;
-            };
-            let path = frame.path.clone();
-            rows.push(PinnedVideoFrame {
-                candidate,
-                path,
-                _pin: frame,
-            });
-            if rows.len() == count {
-                break;
-            }
-        }
-
-        // Every handle above omits FILE_SHARE_DELETE. Revalidating its canonical
-        // path + type while all ancestor handles remain live therefore proves the
-        // path still denotes the opened direct child at this commit point.
-        if !selection_still_matches(
-            &socket,
-            &video,
-            &instance,
-            &recording,
-            &published_marker,
-            &index_file,
-            &rows,
-        ) {
-            drop(rows);
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(instance);
-            drop(video);
-            drop(socket);
-            drop(sweep_root);
-            drop(lease);
-            return Err("recording namespace changed during read");
-        }
-        let recording_name = recording
-            .path
-            .file_name()
-            .expect("validated recording component")
-            .to_os_string();
-        if sweep_root.validate_path_identity().is_err()
-            || !sweep_root.same_directory_file(&instance._file)
-            || lease
-                .arm_video_reader_sweep(sweep_root, recording_name)
-                .is_err()
-        {
-            drop(rows);
-            drop(index_file);
-            drop(published_marker);
-            drop(recording);
-            drop(instance);
-            drop(video);
-            drop(socket);
-            drop(lease);
-            return Err("recording namespace changed while arming retention");
-        }
-        let output = format_video_frame_rows(&rows);
-        let retention = crate::control::ReplyRetention::new(VideoFramesRetention {
-            socket,
-            video,
-            instance,
-            recording,
-            published_marker,
-            index_file,
-            rows,
-            _lease: lease,
-        });
-        Ok(Some(crate::control::Retained::guarded(output, retention)))
+        let permit = crate::control::ReplyRetention::try_reserve_for_path(sock_dir)
+            .ok_or(crate::control::ARTIFACT_HANDOFF_BUSY)?;
+        read_with_permit_and_hook(sock_dir, instance, count, permit, |_| {})
     }
 }
 
@@ -1607,7 +1273,7 @@ fn video_frames_for_instance<'a>(
     match confined_video_reader::read(sock_dir, instance, count) {
         Ok(Some(output)) => {
             let (body, retention) = output.into_parts();
-            crate::control::ControlReply::guarded(body, retention)
+            crate::control::ControlReply::with_handoff(body, retention)
         }
         Ok(None) => {
             "ERR video frames: no finished recording found (run `video <seconds>` first)\n".into()
@@ -1788,7 +1454,18 @@ pub(crate) fn cmd_video(
         return "ERR video: keys requires owner scope (a keystroke log is not a screen-read)\n"
             .into();
     }
-    let Some(dir) = control_auth::confine_video_dir(sock_dir) else {
+    let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
+        return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+    };
+    let admission_refused = std::cell::Cell::new(false);
+    let Some(dir) = control_auth::confine_video_dir_with_admission(sock_dir, |path| {
+        let admitted = handoff.try_reconcile_for_resolved_path(path);
+        admission_refused.set(!admitted);
+        admitted
+    }) else {
+        if admission_refused.get() {
+            return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
+        }
         return "ERR video: could not create the recording dir\n".into();
     };
     let cancel = crate::VideoCancellation::new();
@@ -1802,6 +1479,7 @@ pub(crate) fn cmd_video(
             pace: args.pace,
             fps: args.fps,
             budget_bytes: args.budget_bytes,
+            handoff,
             dir,
             cancel,
             reply: tx,
@@ -1822,7 +1500,7 @@ pub(crate) fn cmd_video(
     ) {
         Ok(reply) => {
             let (body, retention) = reply.into_parts();
-            crate::control::ControlReply::guarded(body, retention)
+            crate::control::ControlReply::with_handoff(body, retention)
         }
         Err(error) => format!("ERR video: {error}\n").into(),
     }
@@ -2176,6 +1854,27 @@ pub(crate) fn cmd_rain(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         }
     };
     match call_main(proxy, |tx| Wake::RainControl { op, reply: tx }) {
+        Ok(Ok(msg)) => format!("OK {msg}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// `streak [status]` -> one status line for the FRONT window's PRISM WAKE
+/// output streak ([`crate::App::streak_status`]): every gate that decides
+/// whether program output earns a comet, plus the live engine facts.
+///
+/// Read-only, and for the same reason `tone` is: the streak's knobs are
+/// durable config (`settings set output_streak.…`), so there is no `on`/`off`
+/// form here — this verb only ever OBSERVES. It exists because the effect is
+/// deliberately subtle, which makes "off", "demoted", "suppressed" and
+/// "resting" look identical on glass. Main-thread hop like `rain`/`tone`.
+pub(crate) fn cmd_streak(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    match rest.trim() {
+        "" | "status" => {}
+        other => return format!("ERR usage: streak [status] (got {other:?})\n"),
+    }
+    match call_main(proxy, |tx| Wake::StreakStatus { reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -3524,16 +3223,21 @@ mod video_parse_tests {
 
         let png = [0x89, b'P', b'N', b'G'];
         assert_eq!(
-            image_bytes_reply(2, 3, &png, false, Some(&metadata)),
+            image_bytes_reply(2, 3, &png, false, Some(&metadata)).unwrap(),
             "OK 1\n2 3 4 iVBORw==\n",
         );
-        let bytes = image_bytes_reply(2, 3, &png, true, Some(&metadata));
+        let bytes = image_bytes_reply(2, 3, &png, true, Some(&metadata)).unwrap();
         let lines = bytes.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "OK 2");
         assert!(lines[1].starts_with("image-meta image-meta-version=2 frame-kind=native "));
         assert!(lines[1].contains("capture-serial=23"));
         assert_eq!(lines[2], "2 3 4 iVBORw==");
+        assert!(image_byte_reply_png_fits(MAX_IMAGE_BYTE_REPLY_PNG_BYTES));
+        assert!(
+            !image_byte_reply_png_fits(MAX_IMAGE_BYTE_REPLY_PNG_BYTES.saturating_add(1)),
+            "the server never emits a row its shipping client must reject",
+        );
 
         let unavailable = image_file_reply(4, 5, "/tmp/unknown.png", true, None);
         assert!(unavailable.contains(
@@ -3725,6 +3429,49 @@ mod video_parse_tests {
         .unwrap();
     }
 
+    #[test]
+    fn video_frame_row_formatter_preserves_wire_shape_with_preallocated_capacity() {
+        let temp = aterm_tempfile::tempdir().expect("temporary frame directory");
+        let recording = crate::pinned_dir::PinnedDir::open_resolved(temp.path())
+            .expect("pinned frame directory");
+        let name = std::ffi::OsStr::new("frame_0001.png");
+        let identity = recording
+            .write_new_private(name, b"png")
+            .expect("private frame")
+            .into_identity()
+            .expect("frame identity");
+        let path = recording.path().join(name);
+        let reserved = 24 + 108 + path.as_os_str().len();
+        let rows = [PinnedVideoFrame {
+            candidate: VideoFrameCandidate {
+                delta: u64::MAX,
+                n: u64::MAX,
+                seq: u64::MAX,
+                t_us: u64::MAX,
+                file: "frame_0001.png".to_string(),
+            },
+            path: path.clone(),
+            identity,
+        }];
+
+        let output = format_video_frame_rows(&rows);
+        assert_eq!(
+            output,
+            format!(
+                "OK 1\nframe n={} delta={} t_us={} seq={} {}\n",
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                u64::MAX,
+                path.display()
+            )
+        );
+        assert!(
+            output.len() <= reserved && output.capacity() >= reserved,
+            "the initial capacity covers the maximum-width row"
+        );
+    }
+
     /// `video frames` returns the highest-`delta` frames of the NEWEST finished
     /// recording, ordered most-changed first, framed `OK <n>` + n rows — and honors
     /// `count=`. A recording DIR with no index.json (still encoding) and every
@@ -3788,6 +3535,122 @@ mod video_parse_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// The bounded healthy-path selection may discover unusable high ranks.
+    /// Backfill must make one borrowed-metadata fallback pass and continue in
+    /// rank order without following a symlink or returning fewer valid rows.
+    #[cfg(unix)]
+    #[test]
+    fn video_frames_backfills_past_missing_and_symlinked_high_ranks() {
+        use std::os::unix::fs::symlink;
+
+        const INSTANCE: &str = "p707-backfill";
+        const RECORDING: &str = "rec-1000000000-000";
+        let tmp = video_test_dir("backfill");
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_fake_recording(
+            &tmp,
+            INSTANCE,
+            RECORDING,
+            &[(100, 10), (90, 20), (80, 30), (70, 40)],
+        );
+        let recording = instance_root(&tmp, INSTANCE).join(RECORDING);
+        let missing = recording.join("frame_0001.png");
+        std::fs::remove_file(&missing).unwrap();
+        let linked = recording.join("frame_0002.png");
+        std::fs::remove_file(&linked).unwrap();
+        symlink("frame_0003.png", &linked).unwrap();
+        assert!(
+            !missing.exists(),
+            "the highest-ranked frame is genuinely absent"
+        );
+        assert!(
+            std::fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the second rank is genuinely an untrusted symlink"
+        );
+
+        let out = video_frames_for_instance(&tmp, INSTANCE, "count=2".split_whitespace());
+        assert!(out.starts_with("OK 2\n"), "backfill result: {out:?}");
+        let body = out.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(body.len(), 2, "backfill rows: {out:?}");
+        assert!(
+            body[0].contains("delta=80") && body[0].contains("n=3"),
+            "first usable rank: {out:?}"
+        );
+        assert!(
+            body[1].contains("delta=70") && body[1].contains("n=4"),
+            "second usable rank: {out:?}"
+        );
+        assert!(!out.contains("delta=100") && !out.contains("delta=90"));
+
+        drop(body);
+        drop(out);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn video_frame_reply_handles_stay_bounded() {
+        const CHILD: &str = "ATERM_TEST_VIDEO_FRAMES_NOFILE";
+        if !super::control_auth::enter_low_nofile_test_child(
+            CHILD,
+            "control::control_media::video_parse_tests::video_frame_reply_handles_stay_bounded",
+            128,
+        ) {
+            return;
+        }
+
+        const INSTANCE: &str = "p606-bounded";
+        let temp = aterm_tempfile::tempdir().expect("temporary video root");
+        let frames = (0..64).map(|n| (n, n)).collect::<Vec<_>>();
+        write_fake_recording(temp.path(), INSTANCE, "rec-1000000000-000", &frames);
+        let socket_depth = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .components()
+            .count();
+        let units_per_reply = socket_depth
+            .saturating_add(2) // `video/<instance>` initial pinned-chain suffix.
+            .saturating_add(crate::pinned_dir::PINNED_DIR_OPERATION_DESCRIPTOR_UNITS);
+        let expected = super::super::ARTIFACT_HANDOFF_LIMIT
+            .min(super::super::ARTIFACT_HANDOFF_DESCRIPTOR_LIMIT / units_per_reply);
+        assert!(expected > 0, "the fixture path must fit one admitted reply");
+
+        let mut replies = Vec::new();
+        while replies.len() < super::super::ARTIFACT_HANDOFF_LIMIT {
+            let mut retained = match super::confined_video_reader::read_metered_for_test(
+                temp.path(),
+                INSTANCE,
+                64,
+            ) {
+                Ok(Some(retained)) => retained,
+                Err(error) if error == super::super::ARTIFACT_HANDOFF_BUSY => break,
+                result => panic!("unexpected confined read result: {result:?}"),
+            };
+            assert!(retained.value.starts_with("OK 64\n"), "{}", retained.value);
+            retained
+                .retention
+                .as_mut()
+                .expect("frame reply owns publication retention")
+                .prepare_write()
+                .expect("closed frame identities revalidate at the wire edge");
+            replies.push(retained);
+        }
+        assert_eq!(
+            replies.len(),
+            expected,
+            "admission must spend the exact canonical-depth charge"
+        );
+        assert!(
+            matches!(
+                super::confined_video_reader::read_metered_for_test(temp.path(), INSTANCE, 64),
+                Err(error) if error == super::super::ARTIFACT_HANDOFF_BUSY
+            ),
+            "one more read must fail before doing descriptor-heavy work"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn video_frames_revalidates_selected_handles_at_wire_edge() {
@@ -3821,7 +3684,7 @@ mod video_parse_tests {
         let mut oldest = super::control_auth::confine_video_dir(&tmp).unwrap();
         let oldest_path = oldest.path().to_path_buf();
         let frame = oldest
-            .write_new_private(std::ffi::OsStr::new("frame_0001.png"), b"png")
+            .write_sealed_frame(std::ffi::OsStr::new("frame_0001.png"), b"png")
             .unwrap();
         let index = oldest
             .write_new_private(
@@ -3852,7 +3715,6 @@ mod video_parse_tests {
                 .unwrap();
             later.publish(&[], &later_index).unwrap();
             drop(later.publish_marker().unwrap());
-            later.prune_after_publish();
             drop(later_index);
             drop(later);
         }
@@ -3872,7 +3734,6 @@ mod video_parse_tests {
             .unwrap();
         next.publish(&[], &next_index).unwrap();
         drop(next.publish_marker().unwrap());
-        next.prune_after_publish();
         drop(next_index);
         drop(next);
         assert!(
@@ -3988,6 +3849,59 @@ mod video_parse_tests {
         assert_eq!(
             remaining, RECORDINGS,
             "dropping an unarmed failed-read lease performs no retention sweep"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_frames_arm_revalidates_the_selected_recording_identity() {
+        use super::confined_video_reader::{ReadStage, read_for_test};
+
+        const INSTANCE: &str = "p306-arm-identity";
+        const RECORDINGS: usize = 12;
+        let tmp = video_test_dir("arm-identity");
+        let _ = std::fs::remove_dir_all(&tmp);
+        for sequence in 0..RECORDINGS {
+            write_fake_recording(
+                &tmp,
+                INSTANCE,
+                &format!("rec-{sequence:020}-000"),
+                &[(sequence as u64 + 1, 10)],
+            );
+        }
+
+        let root = instance_root(&tmp, INSTANCE);
+        let newest_name = format!("rec-{:020}-000", RECORDINGS - 1);
+        let newest = root.join(&newest_name);
+        let original = root.join(".selected-original");
+        let oldest = root.join("rec-00000000000000000000-000");
+        let mut replaced = false;
+        let result = read_for_test(&tmp, INSTANCE, VIDEO_FRAMES_DEFAULT, |stage| {
+            if replaced || stage != ReadStage::SelectionValidated {
+                return;
+            }
+            replaced = true;
+            std::fs::rename(&newest, &original).unwrap();
+            write_fake_recording(&tmp, INSTANCE, &newest_name, &[(999, 99)]);
+            std::fs::write(newest.join("sentinel"), b"replacement").unwrap();
+        });
+
+        assert!(replaced, "the final pre-Arm hook was reached");
+        assert_eq!(
+            result,
+            Err("recording namespace changed while arming retention"),
+            "Arm itself rejects a recording replaced after selection validation"
+        );
+        assert!(
+            oldest.is_dir(),
+            "a rejected Arm cannot request retention on final lease drop"
+        );
+        assert_eq!(
+            std::fs::read(newest.join("sentinel")).unwrap(),
+            b"replacement",
+            "the replacement at the old lexical path is untouched"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -4244,6 +4158,9 @@ mod video_parse_tests {
                 ReadStage::RecordingPinned => "recording",
                 ReadStage::IndexPinned => "index",
                 ReadStage::FramePinned => "frame",
+                ReadStage::SelectionValidated => {
+                    unreachable!("covered by the final Arm race test")
+                }
             };
             let tmp = video_test_dir(&format!("race-{tag}"));
             let moved = video_test_dir(&format!("race-{tag}-moved"));
@@ -4282,6 +4199,9 @@ mod video_parse_tests {
                         let frame = recording.join("frame_0001.png");
                         std::fs::rename(&frame, recording.join("frame.original")).unwrap();
                         symlink(outside_recording.join("frame_0001.png"), frame).unwrap();
+                    }
+                    ReadStage::SelectionValidated => {
+                        unreachable!("covered by the final Arm race test")
                     }
                 }
             });
@@ -4356,6 +4276,48 @@ mod video_parse_tests {
 
         let _ = std::fs::remove_file(&ancestor);
         for dir in [outer, outside] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The socket itself is pinned before the resolution hook. Replacing its
+    /// name with another ordinary directory (not merely a symlink) must still
+    /// fail the identity checkpoint before any child is inspected.
+    #[cfg(unix)]
+    #[test]
+    fn video_frames_rejects_socket_directory_replacement_after_pin() {
+        use super::confined_video_reader::{ReadStage, read_for_test};
+
+        const INSTANCE: &str = "p910-socket-replacement";
+        const RECORDING: &str = "rec-1000000000-000";
+
+        let socket = video_test_dir("socket-replacement");
+        let moved = video_test_dir("socket-replacement-original");
+        let attacker = video_test_dir("socket-replacement-attacker");
+        for dir in [&socket, &moved, &attacker] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        write_fake_recording(&socket, INSTANCE, RECORDING, &[(17, 10)]);
+        write_fake_recording(&attacker, INSTANCE, RECORDING, &[(999, 99)]);
+
+        let mut swapped = false;
+        let result = read_for_test(&socket, INSTANCE, VIDEO_FRAMES_DEFAULT, |stage| {
+            if swapped || stage != ReadStage::SocketPathResolved {
+                return;
+            }
+            swapped = true;
+            std::fs::rename(&socket, &moved).unwrap();
+            std::fs::rename(&attacker, &socket).unwrap();
+        });
+
+        assert!(swapped, "post-pin hook was reached");
+        assert_eq!(result, Err("recording namespace is not confined"));
+        assert!(
+            !format!("{result:?}").contains("999"),
+            "the replacement recording was not inspected"
+        );
+
+        for dir in [socket, moved, attacker] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

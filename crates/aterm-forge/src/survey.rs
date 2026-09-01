@@ -54,7 +54,7 @@ const W_LINE: usize = 96;
 /// Emit the survey. `cells` empty means every cell; `top` 0 means every row.
 ///
 /// A cell that cannot be resolved is NAMED and the outcome is not `ok` — a
-/// survey that silently measured three of four cells would understate the
+/// survey that silently measured four of five cells would understate the
 /// surface, which is the exact failure mode this tool exists to prevent.
 pub fn run(
     root: &Path,
@@ -597,6 +597,31 @@ pub(crate) fn fit(s: &str, width: usize) -> String {
     out
 }
 
+/// One filesystem path, bounded to `width` CHARACTERS without discarding the
+/// part the reader came for.
+///
+/// [`fit`] cuts the TAIL, which on a path is precisely the package directory
+/// that identifies it — `…/registry/src/index.crates.io-1949cf8…` names
+/// nothing. This drops whole LEADING components instead and marks the cut with
+/// `…/`, so what remains is still a true suffix of the real path: enough to
+/// recognise the package, and honest about being shortened. A single component
+/// too long to fit on its own falls back to [`fit`], since there is nothing
+/// left to drop.
+pub(crate) fn fit_path(path: &str, width: usize) -> String {
+    if path.chars().count() <= width {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    // Widest suffix that still fits once the "…/" marker is charged for.
+    for start in 1..parts.len() {
+        let tail = parts[start..].join("/");
+        if tail.chars().count() + 2 <= width {
+            return format!("…/{tail}");
+        }
+    }
+    fit(path, width)
+}
+
 /// The `also` list, largest package first, packed into `width` columns with a
 /// trailing `+N more` so the count is never lost to truncation.
 fn also_column(s: &CellSurvey, also: &[PkgId], target: &PkgId, width: usize) -> String {
@@ -889,6 +914,47 @@ mod tests {
         assert_eq!(commas(1_000), "1,000");
         assert_eq!(commas(1_234_567), "1,234,567");
         assert_eq!(commas(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    /// A PATH KEEPS ITS NAME WHEN IT IS SHORTENED.
+    ///
+    /// The registry dir blame prints is absolute, and its width is set by
+    /// `$CARGO_HOME`'s depth plus the package's own name — so on THIS machine,
+    /// in a SHORT checkout, `wgpu-core-deps-windows-linux-android` measured 126
+    /// columns against a 100-column budget. Cutting the tail (what [`fit`]
+    /// does) would drop exactly the package directory the line exists to name,
+    /// so `fit_path` drops leading components instead.
+    #[test]
+    fn fit_path_keeps_the_tail_that_names_the_package() {
+        let long = "/Users//example/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/\
+                    wgpu-core-deps-windows-linux-android-29.0.3"
+            .replace(' ', "");
+        // NON-VACUOUS: the real input really does break the budget.
+        assert!(long.chars().count() > 80, "the fixture must be over-long");
+
+        let shown = fit_path(&long, 80);
+        assert!(
+            shown.chars().count() <= 80,
+            "{} cols: {shown:?}",
+            shown.chars().count()
+        );
+        assert!(
+            shown.ends_with("wgpu-core-deps-windows-linux-android-29.0.3"),
+            "the package dir is the part worth keeping: {shown:?}"
+        );
+        assert!(shown.starts_with("…/"), "and the cut is visible: {shown:?}");
+        assert!(
+            long.ends_with(shown.trim_start_matches("…/")),
+            "what is shown is a REAL suffix of the path, not a paraphrase"
+        );
+
+        // A path that fits is returned verbatim — no gratuitous ellipsis.
+        assert_eq!(fit_path("vendor/indexmap", 80), "vendor/indexmap");
+
+        // Nothing left to drop: one component longer than the budget falls
+        // back to a tail cut rather than looping or panicking.
+        let one = "a".repeat(120);
+        assert_eq!(fit_path(&one, 10).chars().count(), 10);
     }
 
     #[test]

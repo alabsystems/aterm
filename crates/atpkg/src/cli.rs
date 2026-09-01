@@ -13,7 +13,9 @@
 //! (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`) — the SAME root the app updater uses
 //! — and nothing else: no env var or build-time
 //! variable can supply or swap it (see [`effective_anchor`]); a tree whose master keyset
-//! is empty — which is this tree — builds a manager that is INERT and says so.
+//! is empty builds a manager that is INERT and says so. THIS tree is ARMED
+//! (2026-08-15), so every verb below is live — as this module's own test
+//! `no_environment_variable_can_supply_the_verification_anchor` asserts.
 
 use std::process::ExitCode;
 
@@ -35,6 +37,7 @@ const VERBS: &[&str] = &[
     "status",
     "which",
     "list",
+    "repair",
     "uninstall",
     "tree-root",
     "verify-index",
@@ -53,6 +56,94 @@ const VERBS: &[&str] = &[
     "run",
     "relocate",
 ];
+
+/// One usage line per verb — what `atpkg <verb> --help` prints.
+///
+/// These strings already existed, one `eprintln!` at a time, on each verb's
+/// arity/positional failure path: the binary always knew every verb's grammar and
+/// would only say it if you got the call wrong. `--help` answered with the top-level
+/// banner instead, so the one command the flag error itself recommends
+/// (``aterm pkg <verb> --help``) was circular, and 35 of 55 audited verbs across the
+/// CLI could not answer "what do you accept"
+/// (docs/AUDIT-cli-per-verb-help-2026-08-31.md).
+///
+/// That is how an audit of this project concluded atpkg "structurally requires sudo":
+/// `install --help` gave the banner, every flag probe answered `is not a program name`,
+/// and `--elevate` — a real flag, documented only in `aterm help pkg` — was invisible.
+///
+/// Every entry in [`VERBS`] must appear here; `tests::every_verb_has_a_usage_line`
+/// fails the build otherwise, so a new verb cannot land helpless.
+const VERB_USAGE: &[(&str, &str)] = &[
+    (
+        "doctor",
+        "atpkg doctor            (alias: status) — full health report",
+    ),
+    (
+        "status",
+        "atpkg status            (alias of doctor) — full health report",
+    ),
+    ("which", "atpkg which <tool>"),
+    ("list", "atpkg list [--porcelain]"),
+    (
+        "uninstall",
+        "atpkg uninstall <program> | atpkg uninstall --all",
+    ),
+    ("tree-root", "atpkg tree-root <dir>"),
+    (
+        "verify-index",
+        "atpkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig>",
+    ),
+    (
+        "verify-pkg",
+        "atpkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig>",
+    ),
+    (
+        "install",
+        "atpkg install <program> [--elevate=sudo|osascript|never]\n\
+         atpkg install --default-set    — the whole ALab toolset",
+    ),
+    ("seed", "atpkg seed"),
+    ("update", "atpkg update [program]"),
+    ("rollback", "atpkg rollback <program>"),
+    ("pin", "atpkg pin <program>"),
+    ("unpin", "atpkg unpin <program>"),
+    ("gc", "atpkg gc                — reclaim superseded builds"),
+    ("verify", "atpkg verify [program]"),
+    ("link", "atpkg link <program> <checkout> [rel-bin…]"),
+    ("unlink", "atpkg unlink <program>"),
+    ("refresh", "atpkg refresh <program>"),
+    ("run", "atpkg run <tool> [args…]"),
+    (
+        "relocate",
+        "atpkg relocate <stage-root> [--sign <identity>] [--advisory]",
+    ),
+    (
+        "repair",
+        "atpkg repair            — re-lay shims and shell integration after a broken install",
+    ),
+];
+
+/// The usage line for `verb`, if it has one.
+fn usage_of(verb: &str) -> Option<&'static str> {
+    VERB_USAGE
+        .iter()
+        .find(|(name, _)| *name == verb)
+        .map(|(_, usage)| *usage)
+}
+
+/// Answer `<verb> --help` from [`VERB_USAGE`]: the verb's own grammar, then the one
+/// pointer to the long-form manual. Exit 0 — asking a question is not an error.
+fn cmd_verb_help(verb: &str) -> ExitCode {
+    match usage_of(verb) {
+        Some(usage) => {
+            println!("usage: {usage}");
+            println!("atpkg: full manual for this verb: aterm help pkg");
+            ExitCode::SUCCESS
+        }
+        // Not a verb we know — fall back to the roster rather than inventing one.
+        None => cmd_help(),
+    }
+}
 
 /// The advertised roster, grouped the way a person meets it. PRESENTATION ONLY:
 /// dispatch order stays [`VERBS`] (pinned by [`tests::verb_hint_matches_dispatch`]);
@@ -76,7 +167,15 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
     ),
     (
         "occasional",
-        &["uninstall", "rollback", "pin", "unpin", "verify", "gc"],
+        &[
+            "uninstall",
+            "rollback",
+            "pin",
+            "unpin",
+            "verify",
+            "gc",
+            "repair",
+        ],
     ),
     (
         "plumbing",
@@ -201,7 +300,28 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     // the first thing a shell (or an AI) tries. Handled BEFORE the verb match so the
     // dispatch-coherence test's arm extraction sees only real verbs.
     if matches!(verb, Some("help" | "-h" | "--help")) {
+        // `atpkg help <verb>` answers for THAT verb, matching `aterm help <topic>`;
+        // bare `help` keeps the roster.
+        if let Some(topic) = args.get(1)
+            && usage_of(topic).is_some()
+        {
+            return cmd_verb_help(topic);
+        }
         return cmd_help();
+    }
+    // `<verb> --help` ANYWHERE in the argv answers for that verb and does nothing else.
+    //
+    // Placed before the store lock and before every verb body on purpose. Asking a
+    // mutating verb how it works must never mutate: `atpkg gc --help` used to reclaim
+    // the rollback window, and a third of the audited CLI surface DID something when
+    // handed `--help` (docs/AUDIT-cli-per-verb-help-2026-08-31.md). Intercepting at the
+    // one dispatch edge closes that class for every verb at once, including ones nobody
+    // thought to probe.
+    if let Some(v) = verb
+        && usage_of(v).is_some()
+        && args[1..].iter().any(|a| a == "-h" || a == "--help")
+    {
+        return cmd_verb_help(v);
     }
     // A FLAG IS NEVER A PROGRAM NAME. The verbs below read `args[1]` as a program and hand
     // it to the signed index, so `atpkg install --help` used to RESOLVE `"--help"`, fail,
@@ -218,13 +338,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         && let Some((_, allowed)) = NAME_TAKING_VERBS.iter().find(|(name, _)| *name == v)
         && !allowed.contains(&operand.as_str())
     {
-        // A flag straight after a verb is nearly always someone asking how the verb works.
-        // Answering is strictly better than refusing the one spelling they guessed.
-        if matches!(operand.as_str(), "-h" | "--help") {
-            return cmd_help();
+        // (`-h`/`--help` never reaches here — the dispatch edge above answers it with
+        // this verb's own usage.)
+        //
+        // Name the verb's grammar HERE rather than pointing at another command. The
+        // old pair said `"--prefix" is not a program name — it is a flag` and then
+        // `aterm pkg install --help shows what install accepts`, which printed the
+        // top-level banner — so the reader learned nothing and could reasonably
+        // conclude the flag did not exist. One of this project's own audits concluded
+        // exactly that and wrote it down.
+        eprintln!("atpkg {v}: unknown option {operand:?} for `atpkg {v}`");
+        if let Some(usage) = usage_of(v) {
+            eprintln!("usage: {usage}");
         }
-        eprintln!("atpkg {v}: {operand:?} is not a program name — it is a flag");
-        eprintln!("atpkg:   `aterm pkg {v} --help` shows what {v} accepts");
+        if !allowed.is_empty() {
+            eprintln!("atpkg:   {v} accepts: {}", allowed.join(", "));
+        }
         return ExitCode::from(2);
     }
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
@@ -246,6 +375,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("status") => return doctor("status"),
         Some("which") => return cmd_which(args.get(1)),
         Some("list") => return cmd_list(args.get(1..).unwrap_or(&[])),
+        Some("repair") => return run_repair(layout()),
         Some("uninstall") => return cmd_uninstall(args.get(1)),
         Some("tree-root") => return cmd_tree_root(args.get(1)),
         Some("verify-index") => return cmd_verify_index(args.get(1..).unwrap_or(&[])),
@@ -872,6 +1002,7 @@ fn verb_mutates_store(verb: &str) -> bool {
             | "refresh"
             | "pin"
             | "unpin"
+            | "repair"
     )
 }
 
@@ -1311,6 +1442,88 @@ fn cmd_list(args: &[String]) -> ExitCode {
     }
     let human = !porcelain && std::io::stdout().is_terminal();
     run_list(layout(), human)
+}
+
+/// `atpkg repair` — put a half-installed store back into a state the rest of the CLI
+/// can describe honestly.
+///
+/// atpkg could already diagnose this precisely and could not fix it: `doctor` named 22
+/// broken shims, and the only advice available was to reinstall by hand
+/// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md, B6). Repair is deliberately made
+/// of the same steps an install already runs, so there is one code path for laying
+/// shims and one for shell integration:
+///
+/// 1. rewrite the shell hooks and wire them into the user's rc (PATH in every shell);
+/// 2. re-lay each installed program's shims from its newest complete build;
+/// 3. name — and do not silently paper over — programs whose build is GONE, which no
+///    local operation can fix and only a reinstall can.
+///
+/// Exits 1 when something remains that repair cannot do locally, so a script can tell
+/// "fixed" from "needs the network".
+fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
+    let Some(layout) = layout else {
+        return ExitCode::from(1);
+    };
+    // Shell integration first: it is the half that needs no store at all, so a machine
+    // with nothing installed still leaves repair better wired than it arrived.
+    crate::hooks::refresh(&layout);
+    println!("repair: shell integration rewritten (~/.aterm/shell.d + rc wiring)");
+
+    let installed = crate::list_installed(&layout);
+    if installed.is_empty() {
+        println!(
+            "repair: no programs installed — `aterm pkg install --default-set` installs the toolset"
+        );
+        return ExitCode::SUCCESS;
+    }
+    // Newest complete build per program: the one a repair should make live.
+    let mut newest: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (program, build) in &installed {
+        let e = newest.entry(program.clone()).or_insert(*build);
+        if *build > *e {
+            *e = *build;
+        }
+    }
+    let (mut relaid, mut missing) = (0usize, Vec::new());
+    for (program, build) in &newest {
+        let build_dir = layout.build_dir(program, *build);
+        if !build_dir.exists() {
+            missing.push(format!("{program}@{build}"));
+            continue;
+        }
+        // What this program exposes, recovered from its own shims where they survive
+        // (they resolve even when their TARGET is gone, which is the audited shape) and
+        // falling back to the program's own name, which is the overwhelmingly common
+        // single-tool case.
+        let exposes =
+            crate::installed_exposes(&layout, program).unwrap_or_else(|| vec![program.clone()]);
+        match crate::activate::install_shims(
+            &layout,
+            &build_dir,
+            &exposes,
+            crate::activate::Aliases::laid_for(&layout, program),
+        ) {
+            Ok(refused) => {
+                relaid = relaid.saturating_add(1);
+                for name in refused {
+                    println!("repair: {program}: refused shim {name:?} (not an allowed tool name)");
+                }
+            }
+            Err(e) => println!("repair: {program}: could not re-lay shims: {e}"),
+        }
+    }
+    println!("repair: re-laid shims for {relaid} program(s)");
+    if missing.is_empty() {
+        println!("repair: done — `aterm pkg doctor` confirms");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "repair: {} program(s) have no build on disk and need a reinstall: {}",
+        missing.len(),
+        missing.join(", ")
+    );
+    println!("repair: `aterm pkg install --default-set` refetches them");
+    ExitCode::from(1)
 }
 
 /// [`cmd_list`] under an already-resolved layout — split so the exit codes and both
@@ -2213,12 +2426,14 @@ fn record_status(
     state: crate::ProgramStatus,
     outcome: String,
 ) {
-    // Seed the per-program map from the EXISTING record so updating ONE program does
-    // not clobber every OTHER program's last-known state. The silent update loop
-    // calls this once per program, and status.toml is the per-program observability
-    // surface (§5/§9) — a fresh single-entry map would erase the rest each pass.
-    let mut programs = crate::status::read(layout)
-        .map(|s| s.programs)
+    // Seed the per-program map (and the seam record) from the EXISTING record so
+    // updating ONE program does not clobber every OTHER program's last-known state.
+    // The silent update loop calls this once per program, and status.toml is the
+    // per-program observability surface (§5/§9) — a fresh single-entry map would
+    // erase the rest each pass, and dropping `seams` would silently disown the
+    // rustup seam ([`crate::seam`]) on every install.
+    let (mut programs, seams) = crate::status::read(layout)
+        .map(|s| (s.programs, s.seams))
         .unwrap_or_default();
     programs.insert(program.to_string(), state);
     let status = crate::Status {
@@ -2227,6 +2442,7 @@ fn record_status(
         enabled: manager_enabled(),
         index_source: crate::resolve_account(crate::config::cached().account()).slug(),
         outcome,
+        seams,
         programs,
     };
     let _ = crate::status::write(layout, &status);
@@ -2550,7 +2766,7 @@ fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet
 /// this machine opted in to by name ([`crate::store::Layout::optins`]). ONE reader for the
 /// three lanes that plan a set (the network pass, the seed prescan, the seed offer), so
 /// an opt-in recorded at the explicit door is honoured by every unattended pass after it.
-fn wanted_programs(
+pub(crate) fn wanted_programs(
     layout: &crate::store::Layout,
     index: &crate::manifest::Index,
     cfg: &crate::config::PackagesConfig,
@@ -2791,7 +3007,7 @@ fn dependents_of(index: &crate::manifest::Index, program: &str) -> Vec<String> {
 /// The last index this machine VERIFIED, from the §14 cache — offline, no network, no
 /// floor or ratchet written. `None` when nothing is cached (or nothing cached verifies):
 /// the advisory surfaces that read it (the uninstall warning) then say nothing.
-fn cached_index(layout: &crate::store::Layout) -> Option<crate::TrustedIndex> {
+pub(crate) fn cached_index(layout: &crate::store::Layout) -> Option<crate::TrustedIndex> {
     let slug = crate::resolve_account(crate::config::cached().account()).slug();
     let cache = crate::IndexCache::new(layout.prefix.join("index-cache.toml"));
     let candidates = cache.load(&format!("github:{slug}"))?;
@@ -8686,6 +8902,75 @@ mod tests {
     /// store (stage/activate/discard, shims, links, pins, gc) takes the store-wide
     /// lock at the dispatch edge; every read-only verb stays lock-free. Exhaustive
     /// over the dispatch table so a new verb must be classified deliberately.
+    /// Every dispatchable verb must be able to say what it accepts.
+    ///
+    /// The audit that prompted this found 35 of 55 CLI verbs unable to answer
+    /// "what do you take", and the gap cost a wrong conclusion in a written
+    /// document — `install --help` printed the roster, so a real `--elevate` flag
+    /// read as nonexistent. A new verb must not be able to land in that state.
+    #[test]
+    /// HELP AND ENFORCEMENT MUST NOT DRIFT. [`VERB_USAGE`] is hand-written prose and
+    /// [`NAME_TAKING_VERBS`] is what the dispatch edge actually accepts — two independent
+    /// tables. A flag added to the second without the first is accepted-but-undocumented,
+    /// which is precisely the state `--elevate` was in when an audit of this project
+    /// concluded atpkg "structurally requires sudo" and spent three weeks on it.
+    ///
+    /// Checks the option NAME, not the whole spelling: `install`'s usage collapses three
+    /// values into `--elevate=sudo|osascript|never`, so `--elevate=never` is deliberately
+    /// not a substring of it. Naming the option is what makes it discoverable; the values
+    /// are the usage line's own business.
+    #[test]
+    fn usage_names_every_flag_the_edge_accepts() {
+        for (verb, allowed) in NAME_TAKING_VERBS {
+            let Some(usage) = usage_of(verb) else {
+                panic!("{verb} takes flags but has no usage line");
+            };
+            for flag in *allowed {
+                let name = flag.split('=').next().unwrap_or(flag);
+                assert!(
+                    usage.contains(name),
+                    "`atpkg {verb}` accepts {flag} but its usage never names {name}:\n  {usage}"
+                );
+            }
+        }
+    }
+
+    fn every_verb_has_a_usage_line() {
+        for verb in VERBS {
+            assert!(
+                usage_of(verb).is_some(),
+                "verb `{verb}` has no VERB_USAGE entry, so `atpkg {verb} --help` \
+                 cannot say what it accepts"
+            );
+        }
+        // And nothing in the table names a verb that does not dispatch.
+        for (name, _) in VERB_USAGE {
+            assert!(
+                VERBS.contains(name),
+                "VERB_USAGE names `{name}`, which is not a dispatchable verb"
+            );
+        }
+    }
+
+    /// `--help` must ANSWER, never act. `gc --help` used to reclaim the rollback
+    /// window; a third of the audited surface did something when handed `--help`.
+    #[test]
+    fn help_flag_is_answered_for_every_verb_and_never_dispatches() {
+        for verb in VERBS {
+            for spelling in ["--help", "-h"] {
+                let argv: Vec<std::ffi::OsString> = vec![(*verb).into(), spelling.into()];
+                // Reaching a verb body would need the store lock or the network;
+                // returning SUCCESS here is the observable proof it short-circuited.
+                let code = main_entry(argv);
+                assert_eq!(
+                    format!("{code:?}"),
+                    format!("{:?}", ExitCode::SUCCESS),
+                    "`atpkg {verb} {spelling}` must answer with usage and exit 0"
+                );
+            }
+        }
+    }
+
     #[test]
     fn store_lock_verb_roster_is_exact() {
         // EXHAUSTIVE over VERBS: a verb added to the dispatch without a place in
@@ -8706,6 +8991,8 @@ mod tests {
             "refresh",
             "pin",
             "unpin",
+            // `repair` re-lays shims, so it writes the store and must hold the lock.
+            "repair",
         ] {
             classified.insert(mutator);
             assert!(
@@ -9153,8 +9440,10 @@ mod tests {
     #[test]
     fn enablement_follows_the_compiled_anchor_and_the_kill_switch_only() {
         // No compiled anchor ⇒ inert. There is no longer any way to supply one
-        // at runtime, so this state can only be changed by a commit. THIS is the
-        // shipped state: `PKG_TRUST_ANCHORS` is empty.
+        // at runtime, so this state can only be changed by a commit. The empty
+        // slice below is a FIXTURE, not the shipped state: this tree ships ARMED
+        // (2026-08-15) — see `no_environment_variable_can_supply_the_verification_anchor`,
+        // which asserts the live anchor a few lines up.
         assert!(!crate::manager_enabled_with(&[], false));
         assert!(!crate::manager_enabled_with(&[], true));
         // A compiled keyset ⇒ enabled...

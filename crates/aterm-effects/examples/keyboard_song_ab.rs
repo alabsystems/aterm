@@ -47,8 +47,17 @@ const SEED: u32 = 0x50_4F_4F_46; // "POOF"
 /// so the render's cue quantisation matches the shipping one.
 const BLOCK: usize = 512;
 
-/// One scripted cue: (time s, gesture, pan, heat).
-type Cue = (f32, SoundGesture, f32, f32);
+/// One scripted cue: (time s, gesture, pan, heat, shifted).
+///
+/// `shifted` is [`SoundEvent::shifted`] — the host-priced "this glyph was
+/// typed with Shift held". The scripts below set it exactly where a person's
+/// hand would: capitals and shifted symbols.
+type Cue = (f32, SoundGesture, f32, f32, bool);
+
+/// The glyphs a US layout cannot produce without Shift.
+fn needs_shift(ch: char) -> bool {
+    ch.is_uppercase() || "~!@#$%^&*()_+{}|:\"<>?".contains(ch)
+}
 
 // ---------------------------------------------------------------------------
 // The scripts — real text, real spaces
@@ -87,7 +96,7 @@ fn type_text(cues: &mut Vec<Cue>, t0: f32, cps: f32, text: &str, heat: f32) -> f
             '\n' => SoundKind::Jump,
             _ => SoundKind::Typed,
         };
-        cues.push((t, SoundGesture::Trail(kind), pan, heat));
+        cues.push((t, SoundGesture::Trail(kind), pan, heat, needs_shift(ch)));
         t += dt;
         if ch == '\n' {
             col = 0.0;
@@ -129,7 +138,7 @@ fn scenario_edit() -> Scenario {
     let mut cues = Vec::new();
     let mut t = 0.5f32;
     let push = |cues: &mut Vec<Cue>, t: f32, k: SoundKind, pan: f32| {
-        cues.push((t, SoundGesture::Trail(k), pan, 0.5));
+        cues.push((t, SoundGesture::Trail(k), pan, 0.5, false));
     };
     for _ in 0..3 {
         for i in 0..12 {
@@ -195,6 +204,75 @@ fn scenario_space() -> Scenario {
     }
 }
 
+/// THE SHIFT SCENARIO — the owner's "when doing a shift-key press (not the
+/// shift, but the shifted key) make it higher pitched", as an A/B you can hear
+/// inside one file.
+///
+/// Three passes over the SAME words: all lower case, then Capitalised, then
+/// SHOUTED. The pitch difference is the whole point, so the words, the cadence
+/// and the pans are identical across the three — only `shifted` moves.
+fn scenario_shift() -> Scenario {
+    let mut cues = Vec::new();
+    let mut t = 0.5f32;
+    for text in [
+        "the quick brown fox jumps\n",
+        "The Quick Brown Fox Jumps\n",
+        "THE QUICK BROWN FOX JUMPS\n",
+    ] {
+        t = type_text(&mut cues, t, 9.0, text, 0.5);
+        t += 0.9;
+    }
+    // …and the mixed case a person actually types: a sentence with one capital
+    // and a shifted symbol.
+    t = type_text(&mut cues, t, 9.0, "Hello, World! (a test)\n", 0.5);
+    Scenario {
+        name: "shift".into(),
+        cues,
+        seconds: t + 1.5,
+        window: (0.4, t + 0.8),
+    }
+}
+
+/// THE ROTATION SCENARIO — the owner's 2026-08-31 ask, as a take you can hear:
+/// "when pressing shift, the tone should rotate, same for space."
+///
+/// Two halves, deliberately sparse so every gesture is separable and can be
+/// PITCHED from the render rather than argued about:
+///
+/// - A. THE DRONE CASE. Twenty BARE [`SoundKind::Shift`] presses, 0.45 s
+///   apart, with nothing else sounding and the pan held at centre — so the
+///   column nudge is constant and the melody never steps. Whatever pitch
+///   variety is here is the lift's OWN, which is exactly the thing the owner
+///   says is missing. Every other scenario in this bench sets `shifted` on
+///   capitals and cues no bare modifier at all, so this case has never been
+///   measured before.
+/// - B. THE WORD CLOCK. Twenty-four words of prose at 9 cps — two laps of an
+///   eight-step bass walk, two of a twelve — so a walk that returns to its
+///   root too soon shows up as a repeat inside the take.
+fn scenario_rotate() -> Scenario {
+    let mut cues = Vec::new();
+    let mut t = 0.5f32;
+    for _ in 0..20 {
+        cues.push((t, SoundGesture::Trail(SoundKind::Shift), 0.0, 0.5, false));
+        t += 0.45;
+    }
+    t += 1.2;
+    t = type_text(
+        &mut cues,
+        t,
+        9.0,
+        "the renderer keeps one atlas per face and never uploads a glyph twice \
+         because a cache that is wrong is worse than no cache at all here\n",
+        0.5,
+    );
+    Scenario {
+        name: "rotate".into(),
+        cues,
+        seconds: t + 1.5,
+        window: (0.4, t + 0.8),
+    }
+}
+
 /// A 20 cps BURST — twice the sustained rate the governor is tuned for, six
 /// seconds of it, with spaces at real word cadence.
 fn scenario_burst() -> Scenario {
@@ -213,6 +291,7 @@ fn scenario_burst() -> Scenario {
             SoundGesture::Trail(kind),
             ((i % 60) as f32 / 30.0) - 1.0,
             0.9,
+            false,
         ));
         t += 0.05;
         i += 1;
@@ -257,7 +336,7 @@ fn render(sc: &Scenario, voice: SoundVoice, style: GlowStyle, volume: f32) -> Re
         let n = BLOCK.min(frames - f);
         let t = f as f32 / SR as f32;
         while cue_i < sc.cues.len() && sc.cues[cue_i].0 <= t {
-            let (ct, kind, pan, heat) = sc.cues[cue_i];
+            let (ct, kind, pan, heat, shifted) = sc.cues[cue_i];
             synth.push(SoundEvent {
                 style,
                 voice,
@@ -268,6 +347,7 @@ fn render(sc: &Scenario, voice: SoundVoice, style: GlowStyle, volume: f32) -> Re
                 gain: volume,
                 tone: Tone::Technical,
                 bed: false, // the KEYSTROKE is what is on trial
+                shifted,
             });
             cue_i += 1;
         }
@@ -515,6 +595,12 @@ struct Row {
     rms_db: f64,
     crest_db: f64,
     centroid_hz: f64,
+    /// The NOTE RANGE the melody actually used, in semitones between its
+    /// lowest and highest pitched onset — "how wide is the tune", which is the
+    /// number the owner's "a greater range of notes" ask lives in.
+    range_st: f64,
+    note_lo_hz: f64,
+    note_hi_hz: f64,
     max_voices: usize,
     steals: u32,
     rt_factor: f64,
@@ -548,6 +634,13 @@ fn analyze(name: &str, volume: f32, r: &Rendered, window: (f32, f32)) -> Row {
     let pre = seg.iter().fold(0.0f32, |m, &v| m.max(pre_clip(v).abs()));
     let rms_v = rms(seg);
     let (centroid, _) = spectrum(&r.mono, from, to);
+    // The melodic SPAN: the extremes of the pitched onsets. Percussive
+    // outliers cannot enter — `notes` is already tonality-gated.
+    let (lo, hi) = notes
+        .iter()
+        .filter(|&&f| f > 0.0)
+        .fold((f64::MAX, 0.0f64), |(a, b), &f| (a.min(f), b.max(f)));
+    let (lo, hi) = if lo > hi { (0.0, 0.0) } else { (lo, hi) };
     let audio_s = f64::from(r.mono.len() as f32 / SR as f32);
     Row {
         name: name.into(),
@@ -565,6 +658,13 @@ fn analyze(name: &str, volume: f32, r: &Rendered, window: (f32, f32)) -> Row {
         rms_db: db(rms_v),
         crest_db: db(f64::from(peak)) - db(rms_v),
         centroid_hz: centroid,
+        range_st: if lo > 0.0 && hi > lo {
+            12.0 * (hi / lo).log2()
+        } else {
+            0.0
+        },
+        note_lo_hz: lo,
+        note_hi_hz: hi,
         max_voices: r.max_voices,
         steals: r.steals,
         rt_factor: audio_s / r.render_s.max(1e-9),
@@ -602,6 +702,7 @@ fn probe(
         gain: volume,
         tone: Tone::Technical,
         bed: false,
+        shifted: false,
     };
     // THREE settling keystrokes, ~340 ms apart: enough that the previous
     // note's tail is dead, and — since the bar's accents fall every third
@@ -665,6 +766,98 @@ const PROBE_KINDS: [SoundKind; 8] = [
     SoundKind::Land,
     SoundKind::Jump,
 ];
+
+// ---------------------------------------------------------------------------
+// The ROTATION table — does a repeated gesture repeat its NOTE?
+// ---------------------------------------------------------------------------
+//
+// The scene table above cannot answer this. `pitch/s` and `rept%` are computed
+// over EVERY pitched onset in the mix, so a drone underneath a moving melody
+// reads as a moving melody; and the gesture probe fires each gesture exactly
+// ONCE, which is the one number of presses at which nothing can be shown to
+// repeat. The owner's ask is about the SECOND press and the eighth, so the
+// measurement has to follow one gesture across a take.
+//
+// Pitched at the SCRIPT'S OWN CUE TIMES rather than by onset detection: the
+// script knows when every Shift and every Space was pressed, so there is no
+// question of which onset belongs to which gesture, and a gesture that fell
+// under the governor's min-gap simply reads as its neighbour's tail (and is
+// dropped by the prominence test below) instead of shifting every later
+// reading by one.
+
+/// Two pitches are THE SAME NOTE within this many cents. A quarter tone: wider
+/// than the FFT's own resolution at these frequencies, far narrower than the
+/// smallest step the pentatonic lattice can make (~2 semitones).
+const SAME_NOTE_CENTS: f64 = 50.0;
+
+struct Rotation {
+    name: String,
+    hz: Vec<f64>,
+    /// Distinct notes sounded, at [`SAME_NOTE_CENTS`] resolution.
+    distinct: usize,
+    /// The CLOSEST recurrence: the fewest events between two soundings of one
+    /// note. `None` when no note recurred in the take at all. THIS is the
+    /// number the ask lives in — "rotate" means this is large, not merely that
+    /// `distinct > 1`.
+    min_repeat: Option<usize>,
+}
+
+/// Pitch one gesture at each of `cues` (seconds), reading the loudest partial
+/// in `lo..hi` — the register the gesture is known to live in, which is what
+/// keeps a bass root from being read as the letter over it and vice versa.
+fn rotation_of(name: &str, mono: &[f32], cues: &[f32], lo: f32, hi: f32) -> Rotation {
+    // Past the family's ~12 ms contour bend, so the reading is the note the
+    // gesture LANDS on rather than the one it scoops through — the same
+    // settle the scene table's pitch reads use.
+    const SETTLE: usize = SR as usize / 40;
+    let mut hz = Vec::new();
+    for &t in cues {
+        let s = (t * SR as f32) as usize + SETTLE;
+        if s + FFT_N >= mono.len() {
+            continue;
+        }
+        let m = mag_at(mono, s);
+        // PROMINENCE, not tonality: the band is already narrow, so the test
+        // that matters is whether this gesture actually spoke here or whether
+        // the window holds nothing but a neighbour's decay.
+        let band_peak = peak_hz(&m, lo, hi);
+        if band_peak <= 0.0 || tonality(&m) < 8.0 {
+            continue;
+        }
+        hz.push(band_peak);
+    }
+    let cents = |a: f64, b: f64| (1200.0 * (a / b).log2()).abs();
+    let mut distinct: Vec<f64> = Vec::new();
+    for &f in &hz {
+        if !distinct.iter().any(|&d| cents(f, d) < SAME_NOTE_CENTS) {
+            distinct.push(f);
+        }
+    }
+    let mut min_repeat = None;
+    for i in 0..hz.len() {
+        for j in i + 1..hz.len() {
+            if cents(hz[i], hz[j]) < SAME_NOTE_CENTS {
+                min_repeat = Some(min_repeat.map_or(j - i, |m: usize| m.min(j - i)));
+                break;
+            }
+        }
+    }
+    Rotation {
+        name: name.into(),
+        hz,
+        distinct: distinct.len(),
+        min_repeat,
+    }
+}
+
+/// Every cue time in `sc` whose gesture is `kind`.
+fn cue_times(sc: &Scenario, kind: SoundKind) -> Vec<f32> {
+    sc.cues
+        .iter()
+        .filter(|c| c.1 == SoundGesture::Trail(kind))
+        .map(|c| c.0)
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // WAV
@@ -732,15 +925,44 @@ fn main() {
         scenario_prose(),
         scenario_edit(),
         scenario_space(),
+        scenario_shift(),
         scenario_burst(),
+        scenario_rotate(),
     ];
     let mut rows: Vec<Row> = Vec::new();
+    let mut rots: Vec<Rotation> = Vec::new();
     for sc in &scenarios {
         for volume in [0.4f32, 1.0] {
             let r = render(sc, voice, style, volume);
             let path = out.join(format!("{tag}-{}-v{volume:.1}.wav", sc.name));
             let mut f = std::fs::File::create(&path).expect("wav");
             f.write_all(&wav_bytes(&r.mono)).expect("write");
+            if volume == 0.4 {
+                // THE LIFT is read in the melody's register, THE BASS in its
+                // own [220, 440) band — the register map's two bands are
+                // disjoint, which is the whole reason a space can be pitched
+                // out of a take that is otherwise made of letters.
+                let shifts = cue_times(sc, SoundKind::Shift);
+                if !shifts.is_empty() {
+                    rots.push(rotation_of(
+                        &format!("Shift/{}", sc.name),
+                        &r.mono,
+                        &shifts,
+                        450.0,
+                        4000.0,
+                    ));
+                }
+                let spaces = cue_times(sc, SoundKind::Space);
+                if !spaces.is_empty() {
+                    rots.push(rotation_of(
+                        &format!("Space/{}", sc.name),
+                        &r.mono,
+                        &spaces,
+                        200.0,
+                        470.0,
+                    ));
+                }
+            }
             rows.push(analyze(&sc.name, volume, &r, sc.window));
             println!("wrote {}", path.display());
         }
@@ -748,7 +970,7 @@ fn main() {
 
     println!("\n== {tag}: {} / {style:?} ==", voice.name());
     println!(
-        "{:<8} {:>4} {:>7} {:>7} {:>7} {:>6} {:>9} {:>8} {:>8} {:>6} {:>8} {:>5} {:>5} {:>6}",
+        "{:<8} {:>4} {:>7} {:>7} {:>7} {:>6} {:>9} {:>8} {:>8} {:>6} {:>8} {:>7} {:>6} {:>6} {:>5} {:>5} {:>6}",
         "scene",
         "vol",
         "ons/s",
@@ -760,13 +982,16 @@ fn main() {
         "rms dB",
         "crest",
         "centroid",
+        "range st",
+        "lo Hz",
+        "hi Hz",
         "vmax",
         "steal",
         "xRT"
     );
     for r in &rows {
         println!(
-            "{:<8} {:>4.1} {:>7.2} {:>7.2} {:>7.2} {:>6.0} {:>9.2} {:>8.2} {:>8.2} {:>6.1} {:>8.0} {:>5} {:>5} {:>6.0}",
+            "{:<8} {:>4.1} {:>7.2} {:>7.2} {:>7.2} {:>6.0} {:>9.2} {:>8.2} {:>8.2} {:>6.1} {:>8.0} {:>7.1} {:>6.0} {:>6.0} {:>5} {:>5} {:>6.0}",
             r.name,
             r.volume,
             r.onsets_hz,
@@ -778,9 +1003,31 @@ fn main() {
             r.rms_db,
             r.crest_db,
             r.centroid_hz,
+            r.range_st,
+            r.note_lo_hz,
+            r.note_hi_hz,
             r.max_voices,
             r.steals,
             r.rt_factor
+        );
+    }
+
+    println!("\n== rotation (vol 0.4) — does a repeated gesture repeat its NOTE? ==");
+    println!(
+        "{:<16} {:>6} {:>9} {:>11}  notes sounded (Hz)",
+        "gesture/scene", "events", "distinct", "min-repeat"
+    );
+    for r in &rots {
+        let notes: Vec<String> = r.hz.iter().take(14).map(|f| format!("{f:.0}")).collect();
+        let heard = notes.join(" ");
+        let more = if r.hz.len() > 14 { " …" } else { "" };
+        println!(
+            "{:<16} {:>6} {:>9} {:>11}  {heard}{more}",
+            r.name,
+            r.hz.len(),
+            r.distinct,
+            r.min_repeat
+                .map_or_else(|| "never".into(), |m| format!("{m} events")),
         );
     }
 

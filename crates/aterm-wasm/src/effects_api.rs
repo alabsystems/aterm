@@ -259,7 +259,9 @@ impl AtermTerminal {
         );
     }
 
-    /// Accessibility motion gate for PHOSPHOR.
+    /// Accessibility motion gate for PHOSPHOR — an ALIAS of
+    /// [`Self::set_reduced_motion`] (one host fact, every effect): it pins
+    /// the pet and statics sparkle words too.
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
         // WF-1 frame gate: an effects CONFIG/ignition change can light up
         // pixels on the NEXT render while `is_active()` still reads false at
@@ -305,6 +307,121 @@ impl AtermTerminal {
         // lets the pipeline seed itself (same rule as `note_keystroke`).
         self.note_host_visual_change();
         self.effects.note_matrix_rain_signal(code, weight);
+    }
+
+    /// Configure PRISM WAKE — the output streak. Program OUTPUT (not typing) is
+    /// answered with a short spectrum comet on the row that just took ink,
+    /// metered so a burst gets one comet and a flood degrades to a single
+    /// constant-cost ribbon. `intensity` 0..=1 (0 is a RESET, not a dim),
+    /// `tail` (cells) 4..=14, `max_streaks` 1..=4, `idle_secs` 2..=120, `seed`
+    /// fixes the per-comet genome so a host that pins it replays identical
+    /// frames. Every band is re-clamped inside the engine: the ceiling is
+    /// STRUCTURAL, so no argument an embedder can reach makes this loud, fast,
+    /// or flashy.
+    ///
+    /// Constructed OFF, like every effect on this binding — until this runs
+    /// with `enabled = true` the pipeline holds no streak state at all and the
+    /// render output stays byte-identical to a build without the effect.
+    /// Toggling back off DROPS the engine while keeping the knobs, so
+    /// re-enabling restores this same configuration (the rain off/on posture).
+    ///
+    /// `sound` is carried for contract parity with the native host and is
+    /// VISUALS-ONLY here: the web has no audio host, so the shared pipeline
+    /// drops the episode cue at the point it is produced rather than queueing
+    /// it forever against a listener that will never exist. Passing `true`
+    /// records the intent and changes nothing you can hear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_output_streak(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        tail: u32,
+        max_streaks: u32,
+        idle_secs: u32,
+        sound: bool,
+        seed: u64,
+    ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
+        self.effects.set_output_streak(
+            enabled,
+            intensity,
+            tail,
+            max_streaks,
+            idle_secs,
+            sound,
+            seed,
+        );
+    }
+
+    /// Fold the resolved theme into PRISM WAKE. `dark_theme` is the one fact
+    /// the colour triple cannot supply on its own: it picks the POLARITY —
+    /// additive spectrum light on a dark ground, a tinted shadow-shimmer on a
+    /// light one, because additive light cannot darken pale paper and would
+    /// simply not exist there. The bg/fg/cursor colours are read from THIS
+    /// binding's own [`Self::set_theme`] state rather than re-passed by the
+    /// host, exactly as [`Self::set_matrix_rain`] sources its ramp, so the
+    /// streak can never disagree with the grid about what the theme is.
+    ///
+    /// Call it per frame. The fold deliberately does NOT reset the engine, so
+    /// an OSC 11/12 recolour re-tints the comets already in flight instead of
+    /// killing them; a host that calls this once at boot and later runs
+    /// `set_theme` keeps flying the old palette.
+    pub fn set_output_streak_theme(&mut self, dark_theme: bool) {
+        // NO WF-1 bump, and this is the one CONFIG mutator here that must not
+        // have one — the documented contract is a PER-FRAME call, so a bump
+        // would reopen the settled-frame gate every single frame and delete the
+        // optimization outright (the exact reason `advance_effects` abstains).
+        // Soundness is the same argument: re-tinting can only change pixels
+        // while comets are resident, and a resident comet is precisely what
+        // `is_active()` — a gate term — already reports. With the streak
+        // settled there is nothing on the glass to re-tint, and the next
+        // spawn reads this config at `apply` time.
+        self.effects.set_output_streak_theme(
+            dark_theme,
+            self.theme_bg,
+            self.theme_fg,
+            self.theme_cursor,
+        );
+    }
+
+    /// Accessibility motion gate for PRISM WAKE. On, amplitude is pinned to
+    /// zero, which the engine treats as a full RESET rather than a dim: no
+    /// quads, no cue, fingerprint 0 — so `is_effects_active` settles and the
+    /// host's rAF loop parks instead of spinning on an invisible effect.
+    /// Turning it back OFF restores FULL amplitude, so a host running a custom
+    /// `intensity` must re-apply [`Self::set_output_streak`] afterwards.
+    pub fn set_output_streak_reduced_motion(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
+        self.effects.set_output_streak_reduced_motion(on);
+    }
+
+    /// Stamp one keystroke against PRISM WAKE's ECHO DISCOUNT: output arriving
+    /// within the discount window of a stamp is the user's own echo coming back
+    /// and mints NOTHING. Deliberately not folded into [`Self::note_keystroke`]
+    /// — the streak keeps its own stamp — so call BOTH from the same JS keydown
+    /// handler. On web this is effectively required rather than a refinement:
+    /// the embedder pipeline reports `input_hot = false`, so the stamp is the
+    /// only echo defence a browser host has, and a binding that skips it will
+    /// answer the user's own typing with comets.
+    pub fn note_output_streak_keystroke(&mut self) {
+        // WF-1 frame gate: this stamp SUPPRESSES rather than ignites, but the
+        // gate cannot tell the two apart — the licence is judged inside `apply`
+        // against damage a gated frame never delivers, so a swallowed stamp
+        // would be re-judged as fresh output on the next real frame. One render
+        // per keystroke is right regardless: the echo damages the grid in the
+        // same beat (the `note_keystroke` rule).
+        self.note_host_visual_change();
+        self.effects.note_output_streak_keystroke();
     }
 
     /// MASTER sparkle-words switch (native `[sparkle_words] enabled` +
@@ -367,7 +484,9 @@ impl AtermTerminal {
 
     /// Force the static, non-animating path (no twinkle/jitter/sweep; novas
     /// collapse to a static glint) — the accessibility `reduced_motion`
-    /// override. The engine's flash-limiter floors apply regardless.
+    /// override. The engine's flash-limiter floors apply regardless. An
+    /// ALIAS of [`Self::set_reduced_motion`] (one host fact, every effect):
+    /// it pins the pet and freezes PHOSPHOR too.
     pub fn set_sparkle_reduced_motion(&mut self, on: bool) {
         // WF-1 frame gate: an effects CONFIG/ignition change can light up
         // pixels on the NEXT render while `is_active()` still reads false at
@@ -542,5 +661,114 @@ impl AtermTerminal {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
     pub fn sparkle_lexicon_warnings(&self) -> String {
         self.effects.sparkle_lexicon_warnings().join("\n")
+    }
+
+    // ---- The resident pet (design 2026-08-30, Phase 1) -------------------
+    //
+    // The rainbow kitty pet's brain, art and driver all live in the engine
+    // (`aterm_effects::companion::CompanionOwner`, driven by the shared
+    // pipeline); these exports are the JS host's door to it. Every one of
+    // them is O(1) — a field write, a value-shadowed compare, or a rect test
+    // — so the wasm-process census (OB-10) sees no unbounded reach behind a
+    // synchronous entry point. Defaults are OFF: a host that never calls
+    // `set_cursor_pet` renders byte-identically to the pre-pet binding.
+
+    /// Enable the resident pet beside the caret, dressed by `seed`
+    /// (`KittyLook::for_launch` — the coat and iris a page load is born
+    /// with). The seed is MINTED BY THE HOST (`crypto.getRandomValues` over
+    /// a `BigUint64Array`; it crosses as a JS BigInt like `set_matrix_rain`'s
+    /// seed) because the engine is clockless and dieless: same seed + same
+    /// bytes + same `dt` stream ⇒ the same cat, pixel for pixel. The pet
+    /// draws only while the cursor glow is on with a style that names it
+    /// (`rainbow kitty`, `kitty`, `kitty pet`, `dog pet`, …); `false`
+    /// retires it outright and the next render is byte-identical to a
+    /// binding that never enabled it. The seed is read on enable only.
+    pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — the pet fades in inside `apply`, which a gated frame
+        // never runs. Bump so the gate opens for one frame and lets the
+        // pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
+        self.effects.set_cursor_pet(enabled, seed);
+    }
+
+    /// Whether the resident pet is enabled (the host's opt-in as last set —
+    /// not whether it is drawn this frame; see `cursor_pet_alpha`).
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
+    pub fn cursor_pet_enabled(&self) -> bool {
+        self.effects.cursor_pet_enabled()
+    }
+
+    /// The alpha the last `render` put the pet on glass with: `0` = nothing
+    /// drawn (off, retired, unfocused, in history, or faded out), up to `255`
+    /// for a fully present cat. The observability twin of the hit target —
+    /// a page can tell "no cat" from "cat asleep" without reading pixels.
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter))]
+    pub fn cursor_pet_alpha(&self) -> u8 {
+        self.effects.cursor_pet_alpha()
+    }
+
+    /// The pointer's position in FRAME px (the canvas's own device pixels,
+    /// chrome included — the same space `selection_start` speaks). The pet
+    /// watches a moving pointer and pounces on a fast one; feed every
+    /// `mousemove`. Value-shadowed: a sample equal to the last one changes
+    /// nothing and costs no render, so an idle hover cannot delete the frame
+    /// gate. A non-finite coordinate is dropped.
+    pub fn note_pointer_px(&mut self, x: f32, y: f32) {
+        // WF-1 frame gate: bump ONLY when the pointer actually moved — the
+        // pipeline reports the value-shadowed edge, and an unconditional bump
+        // here would reopen the gate on every mousemove event.
+        if self.effects.note_pointer_px(x, y) {
+            self.note_host_visual_change();
+        }
+    }
+
+    /// The pointer left the surface (`mouseleave`): the pet stops watching
+    /// and settles. Value-shadowed like `note_pointer_px` — a second leave
+    /// changes nothing and costs no render.
+    pub fn note_pointer_leave(&mut self) {
+        // WF-1 frame gate: bump ONLY on the real edge (see `note_pointer_px`).
+        if self.effects.note_pointer_leave() {
+            self.note_host_visual_change();
+        }
+    }
+
+    /// A left press at FRAME px `(x, y)`. Returns the engine's verdict as a
+    /// small integer: `0` = pass (nothing of the engine's was under the
+    /// pointer — start your selection as usual), `1` = the pet was petted
+    /// and the press is CONSUMED (chrome wins: do not start a selection, do
+    /// not encode a mouse report). Higher codes are reserved for later
+    /// companions. Ask this BEFORE `selection_start`, exactly like the
+    /// native app asks its chrome first. The body is padded by a 4 px slop
+    /// so a near miss still strokes the cat.
+    pub fn pet_press_px(&mut self, x: f32, y: f32) -> u8 {
+        let outcome = self.effects.press_px(x, y);
+        // WF-1 frame gate: bump ONLY on a hit — a petted cat purrs on the
+        // NEXT render (the press latches; the tick acts), while a pass
+        // changed nothing the gate cannot already see.
+        if outcome != aterm_effects::host::PressOutcome::Pass {
+            self.note_host_visual_change();
+        }
+        outcome as u8
+    }
+
+    /// The accessibility motion preference for EVERY effect at once (the
+    /// page's `prefers-reduced-motion: reduce`): the pet is drawn but pinned
+    /// at its station (no arc, no gait), sparkle words take the static path
+    /// and PHOSPHOR freezes. The per-engine spellings
+    /// `set_sparkle_reduced_motion` and `set_matrix_rain_reduced_motion` are
+    /// ALIASES of this setter — one host fact, every effect, whichever name
+    /// the page calls — NOT narrower knobs: calling either pins the pet too.
+    /// A stable preference only, never a load term: the engine's own load
+    /// shed is a separate post-tick alpha envelope.
+    pub fn set_reduced_motion(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
+        self.effects.set_reduced_motion(on);
     }
 }

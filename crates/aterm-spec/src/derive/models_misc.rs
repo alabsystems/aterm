@@ -4199,8 +4199,8 @@ pub fn anchored_artifact_transaction_model() -> Model {
 /// A filesystem artifact reply is a transaction that spans two threads, the
 /// complete control-socket write, and a nonce-bound peer acknowledgement. Timeout
 /// cancellation and final-name authorization have one winner. A successful
-/// worker queues exact handles; the socket thread revalidates them before any OK
-/// byte, then writes and flushes the complete frame plus a fresh nonce challenge.
+/// worker queues a publication guard; the socket thread revalidates it before
+/// any OK byte, then writes and flushes the complete frame plus a fresh nonce challenge.
 /// Only the matching post-challenge echo permits immediate release. A failed or
 /// abandoned ACK enters an additional central nonblocking quarantine; its two
 /// bounded ticks abstract the shipping 30-second delay, and the guard survives
@@ -4210,7 +4210,7 @@ pub fn anchored_artifact_transaction_model() -> Model {
 /// only direct cleanup path because it removes an unpublished artifact.
 ///
 /// `Buggy=1` exposes six independently audited failures: publishing after timeout
-/// won, dropping a queued handle before the reply reaches the wire, pruning a
+/// won, dropping a queued guard before the reply reaches the wire, pruning a
 /// leased artifact, releasing without a valid ACK, accepting a pre-pipelined ACK
 /// before the server's causal challenge, or releasing quarantine before expiry.
 #[must_use]
@@ -4497,12 +4497,225 @@ pub fn artifact_reply_publication_model() -> Model {
     }
 }
 
-/// Refcounted `video frames` retention is a separate bounded lifecycle from
-/// publication. Multiple readers may share one exact recording. Final identity
-/// validation arms one capability-bound convergence sweep. A non-final release
-/// cannot start maintenance; the last release schedules it, new acquisitions
-/// fail closed while that schedule/sweep is live, and only completion reopens
-/// acquisition.
+/// Aggregate admission bound for queued, in-flight, and quarantined artifact
+/// handoffs. A failed acknowledgement releases its worker immediately but not
+/// its filesystem guard, so worker count alone cannot bound retained resources.
+/// Admission stops at either the object cap or the aggregate descriptor-unit
+/// cap; any release returns both charges atomically. The three charge buckets
+/// are a bounded multiset of live permits (one, two, or three units). `Select*`
+/// are ghost scheduler choices that let the checker explore every release and
+/// reconciliation order without collapsing heterogeneous permits into one
+/// unsound "last charge" scalar. `Charge` is the representative acquisition
+/// cost, chosen so descriptor saturation occurs while the count still has room.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn artifact_handoff_capacity_model() -> Model {
+    crate::ty_model! {
+        ArtifactHandoffCapacity {
+            const Cap = 4;
+            const DescriptorCap = 6;
+            const Charge = 2;
+            const ReconcileDelta = 1;
+            const RequestedCharge = 3;
+            const Buggy = 0;
+            var live = 0;
+            var descriptor_units = 0;
+            var charge_one = 0;
+            var charge_two = 0;
+            var charge_three = 0;
+            var selected = 2;
+
+            action Acquire when (live <= Cap - 1 && descriptor_units <= DescriptorCap - Charge) {
+                live = live + 1;
+                descriptor_units = descriptor_units + Charge;
+                charge_one = charge_one;
+                charge_two = charge_two + 1;
+                charge_three = charge_three;
+                selected = Charge;
+            }
+            action RefuseAtCap when (live == Cap || descriptor_units > DescriptorCap - Charge) {
+                live = live;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = selected;
+            }
+            action SelectOne when (charge_one > 0) {
+                live = live;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = 1;
+            }
+            action SelectTwo when (charge_two > 0) {
+                live = live;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = 2;
+            }
+            action SelectThree when (charge_three > 0) {
+                live = live;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = 3;
+            }
+            action Release when (
+                if selected == 1 {
+                    charge_one > 0
+                } else {
+                    if selected == 2 { charge_two > 0 } else { charge_three > 0 }
+                }
+            ) {
+                live = live - 1;
+                descriptor_units = descriptor_units - selected;
+                charge_one = if selected == 1 { charge_one - 1 } else { charge_one };
+                charge_two = if selected == 2 { charge_two - 1 } else { charge_two };
+                charge_three = if selected == 3 { charge_three - 1 } else { charge_three };
+                selected = selected;
+            }
+            action ReconcileGrow when (
+                selected <= 2 &&
+                descriptor_units <= DescriptorCap - ReconcileDelta &&
+                (if selected == 1 { charge_one > 0 } else { charge_two > 0 })
+            ) {
+                live = live;
+                descriptor_units = descriptor_units + ReconcileDelta;
+                charge_one = if selected == 1 { charge_one - 1 } else { charge_one };
+                charge_two =
+                    if selected == 1 { charge_two + 1 } else { charge_two - 1 };
+                charge_three =
+                    if selected == 2 { charge_three + 1 } else { charge_three };
+                selected = selected + ReconcileDelta;
+            }
+            action ReconcileShrink when (
+                selected > 1 &&
+                (if selected == 2 { charge_two > 0 } else { charge_three > 0 })
+            ) {
+                live = live;
+                descriptor_units = descriptor_units - ReconcileDelta;
+                charge_one = if selected == 2 { charge_one + 1 } else { charge_one };
+                charge_two =
+                    if selected == 2 { charge_two - 1 } else { charge_two + 1 };
+                charge_three =
+                    if selected == 3 { charge_three - 1 } else { charge_three };
+                selected = selected - ReconcileDelta;
+            }
+            action RefuseReconcile when (
+                selected <= RequestedCharge - 1 &&
+                descriptor_units - selected > DescriptorCap - RequestedCharge &&
+                (if selected == 1 { charge_one > 0 } else { charge_two > 0 })
+            ) {
+                live = live;
+                descriptor_units = descriptor_units;
+                charge_one = charge_one;
+                charge_two = charge_two;
+                charge_three = charge_three;
+                selected = selected;
+            }
+            action BuggyOverbook when (
+                Buggy == 1 && live <= Cap &&
+                (live == Cap || descriptor_units > DescriptorCap - Charge)
+            ) {
+                live = live + 1;
+                descriptor_units = descriptor_units + Charge;
+                charge_one = charge_one;
+                charge_two = charge_two + 1;
+                charge_three = charge_three;
+                selected = Charge;
+            }
+            action BuggyReconcileOverbook when (
+                Buggy == 1 &&
+                selected <= RequestedCharge - 1 &&
+                descriptor_units - selected > DescriptorCap - RequestedCharge &&
+                (if selected == 1 { charge_one > 0 } else { charge_two > 0 })
+            ) {
+                live = live;
+                descriptor_units = descriptor_units + RequestedCharge - selected;
+                charge_one = if selected == 1 { charge_one - 1 } else { charge_one };
+                charge_two = if selected == 2 { charge_two - 1 } else { charge_two };
+                charge_three = charge_three + 1;
+                selected = RequestedCharge;
+            }
+
+            invariant Bounded:
+                live <= Cap && descriptor_units <= DescriptorCap &&
+                selected > 0 && selected <= 3;
+            invariant CountMatchesCharges:
+                live == charge_one + charge_two + charge_three;
+            invariant UnitsMatchCharges:
+                descriptor_units ==
+                    charge_one + charge_two + charge_two +
+                    charge_three + charge_three + charge_three;
+            invariant LiveOwnsCharge:
+                if live == 0 { descriptor_units == 0 } else { descriptor_units > live - 1 };
+        }
+    }
+}
+
+/// Durability ordering for one published video batch. Each `WriteMember`
+/// abstracts a member whose file contents have already been synced. `SyncBatch`
+/// records the directory barrier covering every member written so far, and a
+/// later member invalidates that coverage until another barrier completes. The
+/// reader-visible marker may be published only while the barrier covers the
+/// complete current batch.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn video_batch_publication_durability_model() -> Model {
+    crate::ty_model! {
+        VideoBatchPublicationDurability {
+            const MaxMembers = 2;
+            const Buggy = 0;
+            var members = 0;
+            var synced_members = 0;
+            var marker = 0;
+
+            action WriteMember when (
+                marker == 0 && members <= MaxMembers - 1
+            ) {
+                members = members + 1;
+            }
+            action SyncBatch when (
+                marker == 0 && members > 0
+            ) {
+                synced_members = members;
+            }
+            action PublishMarker when (
+                marker == 0 && members > 0 && synced_members == members
+            ) {
+                marker = 1;
+            }
+            action BuggyPublishBeforeSync when (
+                Buggy == 1 && marker == 0 && members > synced_members
+            ) {
+                marker = 1;
+            }
+
+            invariant Bounds:
+                members <= MaxMembers && synced_members <= members && marker <= 1;
+            invariant MarkerCoversEveryMember:
+                if marker == 1 {
+                    members > 0 && synced_members == members
+                } else {
+                    marker == 0
+                };
+        }
+    }
+}
+
+/// Refcounted video retention is a separate bounded lifecycle from publication.
+/// The producer and multiple `video frames` readers may share one exact
+/// recording identity. Marker publication or final reader validation requests
+/// one capability-bound convergence sweep. A non-final release cannot start
+/// maintenance; the last release schedules it, new acquisitions fail closed
+/// while that schedule/sweep is live, and only completion reopens acquisition.
+/// A replacement recording at the same lexical name is also refused while any
+/// original-identity lease remains.
 ///
 /// `pending` is the abstract seam between the last count decrement and
 /// `StartSweep`. Shipping code performs both under one registry mutex, so no
@@ -4515,28 +4728,46 @@ pub fn artifact_reader_lease_model() -> Model {
         ArtifactReaderLease {
             const Cap = 2;
             const Buggy = 0;
-            var readers = 0;
+            var leases = 0;
             var armed = 0;
             var pending = 0;
             var sweeping = 0;
             var swept = 0;
+            var identity_mismatch = 0;
+            var replacement_joined = 0;
 
             action Acquire when (
-                readers <= Cap - 1 && pending == 0 && sweeping == 0
+                leases <= Cap - 1 && pending == 0 && sweeping == 0 &&
+                identity_mismatch == 0
             ) {
-                readers = readers + 1;
+                leases = leases + 1;
             }
             action Arm when (
-                readers > 0 && pending == 0 && sweeping == 0
+                leases > 0 && pending == 0 && sweeping == 0 &&
+                identity_mismatch == 0
             ) {
                 armed = 1;
             }
-            action Release when (readers > 0) {
-                pending = if readers == 1 && armed == 1 { 1 } else { pending };
-                readers = readers - 1;
+            action ReplaceIdentity when (
+                leases > 0 && identity_mismatch == 0 &&
+                pending == 0 && sweeping == 0
+            ) {
+                identity_mismatch = 1;
+            }
+            action RejectReplacedIdentity when (
+                leases > 0 && identity_mismatch == 1 &&
+                pending == 0 && sweeping == 0
+            ) {
+                leases = leases;
+            }
+            action Release when (leases > 0) {
+                pending = if leases == 1 && armed == 1 { 1 } else { pending };
+                identity_mismatch =
+                    if leases == 1 && armed == 0 { 0 } else { identity_mismatch };
+                leases = leases - 1;
             }
             action StartSweep when (
-                readers == 0 && armed == 1 && pending == 1 && sweeping == 0
+                leases == 0 && armed == 1 && pending == 1 && sweeping == 0
             ) {
                 pending = 0;
                 sweeping = 1;
@@ -4544,50 +4775,61 @@ pub fn artifact_reader_lease_model() -> Model {
             action RejectAcquireWhileSweeping when (
                 pending + sweeping > 0
             ) {
-                readers = readers;
+                leases = leases;
             }
             action FinishSweep when (
-                readers == 0 && armed == 1 && pending == 0 && sweeping == 1
+                leases == 0 && armed == 1 && pending == 0 && sweeping == 1
             ) {
                 armed = 0;
                 sweeping = 0;
                 swept = 1;
+                identity_mismatch = 0;
             }
             action BuggyStartSweepEarly when (
-                Buggy == 1 && readers > 0 && armed == 1 &&
+                Buggy == 1 && leases > 0 && armed == 1 &&
                 pending == 0 && sweeping == 0
             ) {
                 sweeping = 1;
             }
             action BuggyAcquireDuringSweep when (
                 Buggy == 1 && pending + sweeping > 0 &&
-                readers <= Cap - 1
+                leases <= Cap - 1
             ) {
-                readers = readers + 1;
+                leases = leases + 1;
+            }
+            action BuggyAcquireReplacedIdentity when (
+                Buggy == 1 && leases <= Cap - 1 && identity_mismatch == 1 &&
+                pending == 0 && sweeping == 0
+            ) {
+                leases = leases + 1;
+                replacement_joined = 1;
             }
 
             invariant Bounds:
-                readers <= Cap && armed <= 1 && pending <= 1 &&
-                sweeping <= 1 && swept <= 1;
+                leases <= Cap && armed <= 1 && pending <= 1 &&
+                sweeping <= 1 && swept <= 1 && identity_mismatch <= 1 &&
+                replacement_joined <= 1;
             invariant OneMaintenancePhase:
                 pending + sweeping <= 1;
-            invariant MaintenanceExcludesReaders:
-                if pending + sweeping > 0 { readers == 0 } else { readers <= Cap };
+            invariant MaintenanceExcludesLeases:
+                if pending + sweeping > 0 { leases == 0 } else { leases <= Cap };
             invariant MaintenanceRequiresArm:
                 if pending + sweeping > 0 { armed == 1 } else { armed <= 1 };
             invariant ArmedLastReleaseSchedulesSweep:
-                if readers == 0 && armed == 1 {
+                if leases == 0 && armed == 1 {
                     pending + sweeping == 1
                 } else {
                     pending + sweeping <= 1
                 };
             invariant FinishedSweepReopensIdle:
-                if swept == 1 && readers == 0 &&
+                if swept == 1 && leases == 0 &&
                     pending == 0 && sweeping == 0 {
-                    armed == 0
+                    armed == 0 && identity_mismatch == 0
                 } else {
                     armed <= 1
                 };
+            invariant ReplacementNeverJoinsLeaseGroup:
+                replacement_joined == 0;
         }
     }
 }

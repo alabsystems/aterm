@@ -40,11 +40,14 @@
 //! origin keeps sub-microsecond resolution instead of spending the mantissa on
 //! the integer part.
 //!
-//! # How the wasm arm is tested without a wasm target
+//! # How the wasm arm is tested without running a browser
 //!
-//! The Trust toolchain has no `wasm32` std, so `cargo xtask gate web` skips on
-//! an aterm dev box and nothing local can compile a browser-only module. The
-//! shim is therefore written so that everything except two `extern`
+//! The Trust toolchain has no `wasm32` std, so the wasm arm is cross-compiled
+//! on upstream stable: `cargo xtask gate web` does exactly that, and since
+//! 2026-08-31 it FAILS when these crates stop building instead of reading its
+//! own `can't find crate for std` back as a skip. What a cross-compile still
+//! cannot do is RUN the module, and that is what the rest of this section is
+//! about. The shim is written so that everything except two `extern`
 //! declarations and the two one-line `now()` bodies is target-independent, and
 //! it is compiled into the NATIVE test build: the millisecond conversion, the
 //! saturating differences, the checked arithmetic and the backwards-clock error
@@ -81,9 +84,9 @@ mod native {
 pub use native::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 // The browser clock. Compiled into the NATIVE test build as well
-// (`cfg(test)`), because the Trust toolchain ships no `wasm32` std — so
-// `cargo xtask gate web` SKIPS on an aterm dev box and a browser-only module
-// would be code no local test could reach. See `shim`'s own docs.
+// (`cfg(test)`): `cargo xtask gate web` cross-compiles this module on upstream
+// stable, but a compile check executes nothing, so a browser-only module would
+// still be code no local TEST could reach. See `shim`'s own docs.
 #[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
 mod shim;
 

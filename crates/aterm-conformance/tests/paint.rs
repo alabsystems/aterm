@@ -106,8 +106,7 @@
 //! under every healthy arm on both axes, and the controls still measure 0-766
 //! total with 0-3 hue buckets (the pet's coat, when one is minted saturated).
 //!
-//! WIRING: the pre-push gate covers this matrix through the `guards` lane of
-//! `xtask gate lint` (which `.githooks/pre-push` runs on every push) —
+//! WIRING: the `guards` lane of `xtask gate lint` covers this matrix —
 //! `tools/paint_guard.sh` nonce-relinks this test and the release app, then runs
 //! a private copy directly whenever Cargo's derived artifact/test source closure
 //! or this gate's own machinery differs from the last take it proved green.

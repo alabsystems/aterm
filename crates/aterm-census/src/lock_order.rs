@@ -5104,9 +5104,24 @@ mod tests {
             "the vendored identities must be namespaced in the ledger:\n{}",
             out.log
         );
+        // RE-AUDITED 2026-08-31, linux 107 -> 110. The three new sites arrived
+        // with 48f847478 ("--headless no longer requires the display server it
+        // exists to do without"), which added
+        // `vendor/winit/src/platform_impl/linux/headless.rs` — a 546-line
+        // headless backend whose event queue is one `Arc<Mutex<VecDeque<T>>>`
+        // with exactly three `.lock()` sites (push, is-empty, pop). No other
+        // slice moved, which is itself part of the audit: a change that touched
+        // several slices would mean something other than this commit.
+        //
+        // THEY STAY LABEL-ONLY, and that is the finding rather than the number.
+        // The linux slice is counted and never graphed (macOS is the graphed
+        // one), so these cannot enter the lock graph or form an ordered pair
+        // with any aterm identity — they are unreachable from the artifact this
+        // census judges. Bumping the pin without saying that would make the next
+        // reader think a count was rubber-stamped.
         assert!(
             out.log
-                .contains("linux 107, windows 47, web 4, android 0, ios 1, orbital 7"),
+                .contains("linux 110, windows 47, web 4, android 0, ios 1, orbital 7"),
             "the per-platform slice counts must be reported (never silent); a \
              changed count means the vendored winit tree changed — re-audit:\n{}",
             out.log

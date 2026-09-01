@@ -1383,6 +1383,7 @@ mod tests {
             // Bed ON in the queue tests: the idle-pause policy proofs cover
             // the WORST-case (bed-breathing) exhale window.
             bed: true,
+            shifted: false,
         }
     }
 
@@ -1436,6 +1437,7 @@ mod tests {
                     gain: 0.4,
                     tone: aterm_effects::tone::Tone::Technical,
                     bed: true,
+                    shifted: false,
                 });
                 let mut samples = [0.0; super::BUFFER_FRAMES * CHANNELS];
                 synth.render(&mut samples);
@@ -2271,6 +2273,7 @@ mod tests {
                 gain: 0.4,
                 tone: aterm_effects::tone::Tone::Technical,
                 bed: true, // the hand-run smoke audits the full palette
+                shifted: false,
             });
             assert_ne!(audio.state(), STATE_FAILED, "AudioQueue failed to open");
             std::thread::sleep(std::time::Duration::from_millis(150));
@@ -2285,6 +2288,7 @@ mod tests {
             gain: 0.4,
             tone: aterm_effects::tone::Tone::Technical,
             bed: true,
+            shifted: false,
         });
         std::thread::sleep(std::time::Duration::from_millis(1200));
         // Worker-owned housekeeping eventually pauses without any render tick.

@@ -56,6 +56,10 @@ pub mod process;
 pub mod rand;
 /// trust-mc proofs for [`rand::hex_encode`] (compiled only under `cfg(kani)`).
 mod rand_kani_proofs;
+/// Unix-only: inherit two descriptors into a child at fixed numbers — the fabric
+/// bridge's launch. See [`spawnfd`].
+#[cfg(unix)]
+pub mod spawnfd;
 
 /// The per-user base directory holding aterm's control socket + token, resolved
 /// IDENTICALLY for the server (`aterm-gui`) and every client (`aterm-ctl`) so the

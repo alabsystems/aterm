@@ -20,6 +20,7 @@ use aterm_render::Frame;
 use aterm_spec::derive::{
     Model, anchored_artifact_transaction_model, artifact_reader_lease_model,
     artifact_reply_publication_model, snapshot_generation_commit_model,
+    video_batch_publication_durability_model,
 };
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
@@ -105,19 +106,68 @@ pub(crate) fn project_artifact_reply(model: &Model, observed: ArtifactReplyObser
     state
 }
 
-/// Test-visible projection of the refcounted recording-reader registry.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ArtifactHandoffCapacityObservation {
+    pub(crate) live: i64,
+    pub(crate) descriptor_units: i64,
+    pub(crate) charge_one: i64,
+    pub(crate) charge_two: i64,
+    pub(crate) charge_three: i64,
+    pub(crate) selected: i64,
+}
+
+pub(crate) fn project_artifact_handoff_capacity(
+    model: &Model,
+    observed: ArtifactHandoffCapacityObservation,
+) -> State {
+    let mut state = model.init_state();
+    state.insert("live", observed.live);
+    state.insert("descriptor_units", observed.descriptor_units);
+    state.insert("charge_one", observed.charge_one);
+    state.insert("charge_two", observed.charge_two);
+    state.insert("charge_three", observed.charge_three);
+    state.insert("selected", observed.selected);
+    state
+}
+
+/// Test-visible projection of the durable video-batch publication boundary.
+/// A counted member has completed its per-file sync; `synced_members` is the
+/// prefix covered by the most recent recording-directory barrier.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VideoBatchPublicationObservation {
+    pub(crate) members: i64,
+    pub(crate) synced_members: i64,
+    pub(crate) marker: bool,
+}
+
+pub(crate) fn project_video_batch_publication_durability(
+    model: &Model,
+    observed: VideoBatchPublicationObservation,
+) -> State {
+    let mut state = model.init_state();
+    state.insert("members", observed.members);
+    state.insert("synced_members", observed.synced_members);
+    state.insert("marker", i64::from(observed.marker));
+    state
+}
+
+/// Test-visible projection of the refcounted recording-lease registry.
 ///
 /// Production anchors intentionally name this exact function. Their concrete
-/// observations are: registry `count` -> `readers`, installed callback ->
-/// `armed`, the last-release handoff -> `pending`, callback execution ->
-/// `sweeping`, and completed callback -> `swept`.
+/// observations are: registry `count` -> `leases`, requested callback ->
+/// `armed`, retained recording-identity disagreement -> `identity_mismatch`, the
+/// last-release handoff -> `pending`, callback execution -> `sweeping`, and
+/// completed callback -> `swept`. `replacement_joined` is a negative-control
+/// witness and is always false for shipping code.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ArtifactReaderObservation {
-    readers: i64,
+    leases: i64,
     armed: bool,
     pending: bool,
     sweeping: bool,
     swept: bool,
+    identity_mismatch: bool,
+    replacement_joined: bool,
 }
 
 pub(crate) fn project_artifact_reader_lease(
@@ -125,11 +175,13 @@ pub(crate) fn project_artifact_reader_lease(
     observed: ArtifactReaderObservation,
 ) -> State {
     let mut state = model.init_state();
-    state.insert("readers", observed.readers);
+    state.insert("leases", observed.leases);
     state.insert("armed", i64::from(observed.armed));
     state.insert("pending", i64::from(observed.pending));
     state.insert("sweeping", i64::from(observed.sweeping));
     state.insert("swept", i64::from(observed.swept));
+    state.insert("identity_mismatch", i64::from(observed.identity_mismatch));
+    state.insert("replacement_joined", i64::from(observed.replacement_joined));
     state
 }
 
@@ -301,8 +353,41 @@ fn marker_generation(path: &Path) -> i64 {
 #[aterm_spec::spec_unmodeled(
     machine = "ArtifactReplyPublication",
     action = "BuggyReleaseQuarantineEarly",
-    reason = "Buggy=1 negative control only; failed or half-closed clients retain the exact guard \
+    reason = "Buggy=1 negative control only; failed or half-closed clients retain the publication guard \
               through the additional 30-second central-quarantine expiry"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyOverbook",
+    reason = "Buggy=1 negative control only; the real locked admission update refuses when the \
+              process-wide handoff count or descriptor-unit budget reaches its fixed limit"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "BuggyReconcileOverbook",
+    reason = "Buggy=1 negative control only; exact-path reconciliation uses the same locked \
+              aggregate descriptor budget and leaves the provisional charge intact on refusal"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectOne",
+    reason = "ghost scheduler choice selecting a one-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectTwo",
+    reason = "ghost scheduler choice selecting a two-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactHandoffCapacity",
+    action = "SelectThree",
+    reason = "ghost scheduler choice selecting a three-unit permit from the bounded charge multiset"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "VideoBatchPublicationDurability",
+    action = "BuggyPublishBeforeSync",
+    reason = "Buggy=1 negative control only; the real marker write is reachable only after \
+              ConfinedVideoDir::publish completes the recording-directory batch barrier"
 )]
 #[aterm_spec::spec_unmodeled(
     machine = "ArtifactReaderLease",
@@ -315,6 +400,18 @@ fn marker_generation(path: &Path) -> i64 {
     action = "BuggyAcquireDuringSweep",
     reason = "Buggy=1 negative control only; retain_video_artifact_path fails closed while the \
               last-release callback owns the registry's sweeping state"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "ReplaceIdentity",
+    reason = "external same-uid recording replacement is an environment transition; the concrete \
+              registry compares the retained child identity before incrementing its lease count"
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "ArtifactReaderLease",
+    action = "BuggyAcquireReplacedIdentity",
+    reason = "Buggy=1 negative control only; a mismatched retained recording identity is rejected \
+              without joining the existing lexical-path lease group"
 )]
 fn explicit_environment_and_mutant_scope() {}
 
@@ -420,6 +517,64 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
         ])
     );
 
+    let handoff_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
+        .filter(|anchor| anchor.machine == "ArtifactHandoffCapacity")
+        .map(|anchor| {
+            assert!(
+                !anchor.project.is_empty(),
+                "{} needs a concrete handoff-capacity projection",
+                anchor.action
+            );
+            anchor.action
+        })
+        .collect();
+    assert_eq!(
+        handoff_refinements,
+        BTreeSet::from([
+            "Acquire",
+            "ReconcileGrow",
+            "ReconcileShrink",
+            "RefuseAtCap",
+            "RefuseReconcile",
+            "Release",
+        ])
+    );
+    let handoff_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
+        .filter(|waiver| waiver.machine == "ArtifactHandoffCapacity")
+        .map(|waiver| waiver.action)
+        .collect();
+    assert_eq!(
+        handoff_waivers,
+        BTreeSet::from([
+            "BuggyOverbook",
+            "BuggyReconcileOverbook",
+            "SelectOne",
+            "SelectThree",
+            "SelectTwo",
+        ])
+    );
+
+    let batch_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
+        .filter(|anchor| anchor.machine == "VideoBatchPublicationDurability")
+        .map(|anchor| {
+            assert!(
+                !anchor.project.is_empty(),
+                "{} needs a concrete batch-durability projection",
+                anchor.action
+            );
+            anchor.action
+        })
+        .collect();
+    assert_eq!(
+        batch_refinements,
+        BTreeSet::from(["PublishMarker", "SyncBatch", "WriteMember"])
+    );
+    let batch_waivers: BTreeSet<_> = aterm_spec::xref::waivers()
+        .filter(|waiver| waiver.machine == "VideoBatchPublicationDurability")
+        .map(|waiver| waiver.action)
+        .collect();
+    assert_eq!(batch_waivers, BTreeSet::from(["BuggyPublishBeforeSync"]));
+
     let reader_refinements: BTreeSet<_> = aterm_spec::xref::refinements()
         .filter(|anchor| anchor.machine == "ArtifactReaderLease")
         .map(|anchor| {
@@ -438,6 +593,7 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
             "Arm",
             "FinishSweep",
             "RejectAcquireWhileSweeping",
+            "RejectReplacedIdentity",
             "Release",
             "StartSweep",
         ])
@@ -448,8 +604,342 @@ fn artifact_reply_and_reader_xrefs_cover_every_shipping_transition() {
         .collect();
     assert_eq!(
         reader_waivers,
-        BTreeSet::from(["BuggyAcquireDuringSweep", "BuggyStartSweepEarly"])
+        BTreeSet::from([
+            "BuggyAcquireDuringSweep",
+            "BuggyAcquireReplacedIdentity",
+            "BuggyStartSweepEarly",
+            "ReplaceIdentity",
+        ])
     );
+}
+
+#[test]
+fn real_video_batch_publication_conforms_to_directory_barrier_ordering() {
+    let root = unique_dir("video-batch-durability");
+    let _ = std::fs::remove_dir_all(&root);
+    crate::control_auth::ensure_private_dir(&root).expect("create private control root");
+    let mut recording =
+        crate::control_auth::confine_video_dir(&root).expect("confine fresh video recording");
+    let recording_path = recording.path().to_path_buf();
+    let model = video_batch_publication_durability_model();
+    let initial = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation::default(),
+    );
+    assert!(!recording.batch_synced_for_test());
+
+    let frame = recording
+        .write_sealed_frame(OsStr::new("frame_0001.png"), b"png")
+        .expect("file-sync frame member");
+    assert!(
+        !recording.batch_synced_for_test(),
+        "a member write leaves the directory batch unsynced"
+    );
+    let one_member = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 1,
+            ..VideoBatchPublicationObservation::default()
+        },
+    );
+    assert_transition(
+        &model,
+        "WriteMember",
+        &initial,
+        &one_member,
+        "sealed frame completes its per-file durability boundary",
+    );
+
+    let index = recording
+        .write_batch_member_authorized(
+            OsStr::new("index.json"),
+            br#"{"frames":[{"file":"frame_0001.png"}]}"#,
+            || true,
+        )
+        .expect("file-sync index member");
+    assert!(
+        !recording.batch_synced_for_test(),
+        "the complete member set still needs its directory barrier"
+    );
+    let complete_members = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 2,
+            ..VideoBatchPublicationObservation::default()
+        },
+    );
+    assert_transition(
+        &model,
+        "WriteMember",
+        &one_member,
+        &complete_members,
+        "index completes the second per-file durability boundary",
+    );
+
+    let premature_marker = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 2,
+            marker: true,
+            ..VideoBatchPublicationObservation::default()
+        },
+    );
+    reject_transition(
+        &model,
+        "PublishMarker",
+        &complete_members,
+        &premature_marker,
+        "publication marker cannot precede the directory batch barrier",
+    );
+    assert!(!model.check_invariant("MarkerCoversEveryMember", &premature_marker));
+    recording
+        .publish_marker()
+        .expect_err("shipping marker guard rejects a batch with no directory barrier");
+    assert!(!recording.batch_synced_for_test());
+    assert!(
+        !recording_path
+            .join(crate::control_auth::VIDEO_PUBLISHED_FILE)
+            .exists(),
+        "shipping writes leave the reader-visible marker absent before the barrier"
+    );
+
+    let published_path = recording
+        .publish(std::slice::from_ref(&frame), &index)
+        .expect("sync complete batch directory");
+    assert_eq!(published_path, recording_path);
+    assert!(
+        recording.batch_synced_for_test(),
+        "successful publish records the concrete directory barrier"
+    );
+    let batch_synced = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 2,
+            synced_members: 2,
+            marker: false,
+        },
+    );
+    assert_transition(
+        &model,
+        "SyncBatch",
+        &complete_members,
+        &batch_synced,
+        "recording publish completes the directory batch barrier",
+    );
+
+    let marker_guard = recording
+        .publish_marker()
+        .expect("publish reader-visible marker after barrier");
+    let marker_visible = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 2,
+            synced_members: 2,
+            marker: true,
+        },
+    );
+    assert_transition(
+        &model,
+        "PublishMarker",
+        &batch_synced,
+        &marker_visible,
+        "marker publication follows the complete batch barrier",
+    );
+    assert!(
+        recording_path
+            .join(crate::control_auth::VIDEO_PUBLISHED_FILE)
+            .is_file()
+    );
+
+    drop(marker_guard);
+    drop(index);
+    drop(recording);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn published_video_batch_rejects_every_late_mutation() {
+    let root = unique_dir("video-batch-immutable");
+    let _ = std::fs::remove_dir_all(&root);
+    crate::control_auth::ensure_private_dir(&root).expect("create private control root");
+    let mut recording =
+        crate::control_auth::confine_video_dir(&root).expect("confine fresh video recording");
+    let recording_path = recording.path().to_path_buf();
+    let index_path = recording_path.join("index.json");
+    let marker_path = recording_path.join(crate::control_auth::VIDEO_PUBLISHED_FILE);
+    let model = video_batch_publication_durability_model();
+    let initial = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation::default(),
+    );
+
+    let index = recording
+        .write_batch_member_authorized(OsStr::new("index.json"), br#"{"frames":[]}"#, || true)
+        .expect("write the sole batch member");
+    let one_member = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 1,
+            ..VideoBatchPublicationObservation::default()
+        },
+    );
+    assert_transition(
+        &model,
+        "WriteMember",
+        &initial,
+        &one_member,
+        "index completes its per-file durability boundary",
+    );
+
+    recording
+        .publish(&[], &index)
+        .expect("sync batch directory");
+    let batch_synced = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 1,
+            synced_members: 1,
+            marker: false,
+        },
+    );
+    assert_transition(
+        &model,
+        "SyncBatch",
+        &one_member,
+        &batch_synced,
+        "publish completes the directory batch barrier",
+    );
+
+    let marker_guard = recording
+        .publish_marker()
+        .expect("publish marker after the batch barrier");
+    let marker_visible = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 1,
+            synced_members: 1,
+            marker: true,
+        },
+    );
+    assert_transition(
+        &model,
+        "PublishMarker",
+        &batch_synced,
+        &marker_visible,
+        "marker publication makes the batch immutable",
+    );
+
+    let index_before = std::fs::read(&index_path).expect("read published index");
+    let marker_before = std::fs::read(&marker_path).expect("read publication marker");
+    let late_member = project_video_batch_publication_durability(
+        &model,
+        VideoBatchPublicationObservation {
+            members: 2,
+            synced_members: 1,
+            marker: true,
+        },
+    );
+    assert!(
+        model.action_enabled("WriteMember", &batch_synced),
+        "negative control: capacity remains for a second member before the marker"
+    );
+    reject_transition(
+        &model,
+        "WriteMember",
+        &marker_visible,
+        &late_member,
+        "a marker-visible batch rejects a later member",
+    );
+    reject_transition(
+        &model,
+        "SyncBatch",
+        &marker_visible,
+        &marker_visible,
+        "a marker-visible batch rejects a repeated barrier",
+    );
+    reject_transition(
+        &model,
+        "PublishMarker",
+        &marker_visible,
+        &marker_visible,
+        "a marker-visible batch rejects a repeated marker",
+    );
+
+    let authorized = std::cell::Cell::new(false);
+    let late_batch =
+        recording.write_batch_member_authorized(OsStr::new("late-index.json"), b"late", || {
+            authorized.set(true);
+            true
+        });
+    assert_eq!(
+        late_batch
+            .expect_err("published batch rejects an authorized member")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(
+        !authorized.get(),
+        "immutability rejects before invoking commit authorization"
+    );
+    assert_eq!(
+        recording
+            .write_sealed_frame(OsStr::new("late-frame.png"), b"late")
+            .expect_err("published batch rejects a sealed frame")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        recording
+            .write_new_private(OsStr::new("late-test-member"), b"late")
+            .expect_err("published batch rejects the test-only member writer")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    for name in ["index.json", crate::control_auth::VIDEO_PUBLISHED_FILE] {
+        assert_eq!(
+            recording
+                .remove_file_if_exists(OsStr::new(name))
+                .expect_err("published batch rejects member removal")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(
+        recording
+            .publish(&[], &index)
+            .expect_err("published batch rejects a repeated barrier")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        recording
+            .publish_marker()
+            .expect_err("published batch rejects a repeated marker")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert!(
+        recording.batch_synced_for_test(),
+        "rejected mutations leave the published projection unchanged"
+    );
+    assert_eq!(
+        recording
+            .abort()
+            .expect_err("published batch is permanently non-abortable")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+
+    assert_eq!(std::fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(std::fs::read(&marker_path).unwrap(), marker_before);
+    assert!(!recording_path.join("late-index.json").exists());
+    assert!(!recording_path.join("late-frame.png").exists());
+    assert!(!recording_path.join("late-test-member").exists());
+    assert!(recording_path.is_dir());
+
+    drop(marker_guard);
+    drop(index);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -875,21 +1365,29 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
     let reader_one = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 1,
+            leases: 1,
             ..ArtifactReaderObservation::default()
         },
     );
     let reader_two = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 2,
+            leases: 2,
+            ..ArtifactReaderObservation::default()
+        },
+    );
+    let replaced_one = project_artifact_reader_lease(
+        &model,
+        ArtifactReaderObservation {
+            leases: 1,
+            identity_mismatch: true,
             ..ArtifactReaderObservation::default()
         },
     );
     let armed_two = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 2,
+            leases: 2,
             armed: true,
             ..ArtifactReaderObservation::default()
         },
@@ -897,7 +1395,7 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
     let armed_one = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 1,
+            leases: 1,
             armed: true,
             ..ArtifactReaderObservation::default()
         },
@@ -928,32 +1426,42 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
     let reacquired = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 1,
+            leases: 1,
             swept: true,
             ..ArtifactReaderObservation::default()
         },
     );
 
     for (action, before, after, label) in [
-        ("Acquire", &idle, &reader_one, "first reader acquisition"),
+        (
+            "Acquire",
+            &idle,
+            &reader_one,
+            "first producer-or-reader lease acquisition",
+        ),
         (
             "Acquire",
             &reader_one,
             &reader_two,
-            "shared reader acquisition",
+            "shared producer-or-reader lease acquisition",
         ),
-        ("Arm", &reader_two, &armed_two, "final identity validation"),
+        (
+            "Arm",
+            &reader_two,
+            &armed_two,
+            "marker publication or final reader identity validation",
+        ),
         (
             "Release",
             &armed_two,
             &armed_one,
-            "non-final reader release",
+            "non-final producer-or-reader lease release",
         ),
         (
             "Release",
             &armed_one,
             &pending,
-            "last reader schedules convergence",
+            "final producer-or-reader lease schedules convergence",
         ),
         (
             "StartSweep",
@@ -971,7 +1479,7 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
             "Acquire",
             &swept,
             &reacquired,
-            "reader acquisition after completed convergence",
+            "producer-or-reader lease acquisition after completed convergence",
         ),
     ] {
         assert_transition(&model, action, before, after, label);
@@ -990,11 +1498,25 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
         &sweeping,
         "acquisition fails closed while the sweep owns the registry",
     );
+    assert_transition(
+        &model,
+        "ReplaceIdentity",
+        &reader_one,
+        &replaced_one,
+        "an external same-name replacement changes only the candidate identity",
+    );
+    assert_transition(
+        &model,
+        "RejectReplacedIdentity",
+        &replaced_one,
+        &replaced_one,
+        "a replacement cannot join the live recording lease group",
+    );
 
     let early_sweep = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 1,
+            leases: 1,
             armed: true,
             sweeping: true,
             ..ArtifactReaderObservation::default()
@@ -1010,7 +1532,7 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
     let acquired_during_pending = project_artifact_reader_lease(
         &model,
         ArtifactReaderObservation {
-            readers: 1,
+            leases: 1,
             armed: true,
             pending: true,
             ..ArtifactReaderObservation::default()
@@ -1021,7 +1543,23 @@ fn artifact_reader_projection_conforms_to_last_release_sweep_lifecycle() {
         "Acquire",
         &pending,
         &acquired_during_pending,
-        "no reader may enter the last-release/sweep interval",
+        "no producer-or-reader lease may enter the last-release/sweep interval",
+    );
+    let joined_replacement = project_artifact_reader_lease(
+        &model,
+        ArtifactReaderObservation {
+            leases: 2,
+            identity_mismatch: true,
+            replacement_joined: true,
+            ..ArtifactReaderObservation::default()
+        },
+    );
+    reject_transition(
+        &model,
+        "Acquire",
+        &replaced_one,
+        &joined_replacement,
+        "ordinary acquisition cannot admit a replaced recording identity",
     );
 }
 

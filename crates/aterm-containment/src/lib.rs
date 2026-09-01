@@ -131,6 +131,7 @@
 pub mod actuator;
 pub(crate) mod allowlist;
 pub(crate) mod capability;
+pub mod consent;
 #[cfg(kani)]
 mod kani_proofs;
 pub(crate) mod mode;
@@ -162,6 +163,24 @@ pub use audit::{log_denial, log_posture};
 pub use capability::{
     CommandCapability, FsCapability, InputCapability, McpCapability, NetworkCapability,
     OutputCapability, PluginCapability, ProcessCapability,
+};
+// The consent tier's types and its three FDA/responsibility OS entry points.
+// Every PURE helper — `classify_probe`, `classify_responsible`,
+// `probe_fda_with`, `display_name`, `readable_info_plist`,
+// `is_under_protected_root`, `protected_roots_in`, `folder_paths`,
+// `tccutil_reset_command`, `classify_tccutil`, `bundle_id_is_usable`,
+// `reset_offer`, `reset_outcome`, `folders_reset`, `folders_declined`,
+// `cache_bundle_for` — stays behind `aterm_containment::consent::` rather than
+// being hoisted into the crate root, where names like `display_name` would read
+// as the crate's own. So does `tccutil_presence`, the §3.7 stat: a destructive
+// repair's entry points are found by reading the consent module, not by tab
+// completion on the crate root.
+pub use consent::{
+    Attribution, CachedProbe, ConsentCache, ConsentKey, ConsentPosture, DrClass, FdaProbe,
+    FdaScope, FdaState, Folder, FsConsent, PostureInputs, ProbeGate, ProbeLabel, ProbeOutcome,
+    ResetAttempt, ResetOffer, ResetOfferInputs, ResetOutcome, ResetPlan, ResetStatus, Responsible,
+    ResponsibleApp, ResponsibleError, SpikeEvidence, TccutilPresence, classify_dr, probe_fda,
+    protected_roots, responsible_app, responsible_pid,
 };
 pub use mode::{ContainmentMode, ParseModeError};
 pub use output_filter::OutputSanitizer;

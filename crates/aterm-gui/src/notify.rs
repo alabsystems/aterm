@@ -151,17 +151,26 @@ pub fn deliver(title: Option<&str>, body: &str, _silent: bool) {
     // child) and tells us whether the binary exists — `Err` means not installed,
     // so we fall through to osascript. A non-zero exit means it IS installed but
     // failed; we do NOT double-notify via osascript in that case.
-    let tn = Command::new("terminal-notifier")
-        .arg("-title")
+    let mut tn = Command::new("terminal-notifier");
+    tn.arg("-title")
         .arg(title)
         .arg("-message")
         .arg(body)
-        .arg("-sender")
-        .arg("com.aterm.aterm")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    // `-sender` claims an identity, so it is read from the RUNNING bundle
+    // rather than written as the release channel's literal: a dev build stamped
+    // `com.aterm.aterm.dev` would otherwise post notifications that click
+    // through to the release copy (design §3.1 blast radius). When there is no
+    // bundle to read — a bare `target/debug` binary, or a bundle whose
+    // `Info.plist` the consent guard refuses — the flag is OMITTED entirely:
+    // terminal-notifier then speaks as itself, which is true, instead of aterm
+    // claiming an identity this process does not have.
+    if let Some(sender) = crate::control_privacy::running_bundle_id() {
+        tn.arg("-sender").arg(sender);
+    }
+    let tn = tn.status();
     if tn.is_ok() {
         return;
     }

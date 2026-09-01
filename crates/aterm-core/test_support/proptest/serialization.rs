@@ -93,4 +93,3 @@ proptest! {
         prop_assert_eq!(state.end_col, end_col);
     }
 }
-

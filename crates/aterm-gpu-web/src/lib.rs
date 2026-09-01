@@ -1159,6 +1159,10 @@ impl AtermGpuTerminal {
         self.theme_bg = bg & 0x00FF_FFFF;
         self.effects
             .set_matrix_rain_theme(self.theme_bg, self.theme_fg);
+        // The pet's frozen contrast sample is keyed to the theme it was taken
+        // against; a new theme retires it (the native palette-authority edge)
+        // while the cat's behaviour, position and breed carry on.
+        self.effects.invalidate_companion_colors();
         let theme = Theme {
             fg,
             bg,

@@ -1267,8 +1267,11 @@ pub fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
 /// end of the tab list.
 ///
 /// Read back OUT OF THE SEGMENTS, exactly as [`hit_test`] is, and by both
-/// painters: the cell lane draws the glyph and the pixel band punches its
-/// column through to it. The layout reserved these columns
+/// painters: the cell lane draws the glyph on the cell baseline, and the pixel
+/// band draws the same sign as strokes on the band's own furniture centre
+/// (`pixel_band` — a mark on the cell baseline sits below every other piece of
+/// strip furniture, because the band centres in the whole optical band and the
+/// cell can only centre in itself). The layout reserved these columns
 /// ([`layout_segments`]); this function only names them, and only ever names a
 /// column NO segment covers — so a mark can never land on a hit target, and
 /// the strip's one column→[`TabHit`] map stays the whole truth about what a
@@ -2680,9 +2683,12 @@ fn paint_strip_impl(
     }
     // THE WINDOW'S EDGES ([`strip_overflow`]). Painted after the segments, on
     // columns no segment covers, in the band's own dim ink — furniture, like
-    // the gutter it sits in, not a chip and not a button. The pixel band leaves
-    // these columns to this lane ([`pixel_band`]), so the mark is one glyph in
-    // one place on both.
+    // the gutter it sits in, not a chip and not a button. This is the mark for
+    // every lane the pixel band does not reach (no UI face installed yet,
+    // macOS); where that band draws it covers this column and strokes the same
+    // sign on its own furniture centre ([`pixel_band`]), because a cell can
+    // only centre a glyph in itself and the band's furniture is centred in the
+    // whole optical band.
     for (col, mark) in strip_overflow(segments, titles.len()).columns() {
         if let Some(slot) = row.get_mut(usize::from(col)) {
             *slot = strip_cell(mark, &colors, StripRole::Inactive);
@@ -4242,7 +4248,8 @@ pub(crate) mod pixel_band {
                     // repair that keeps the two from cancelling out. This loop
                     // draws that string; it never re-cuts it (the ACTIVE chip's
                     // glyph-level fit is the one exception, and the repair
-                    // exempts the active label anyway — [`fit_labels_distinctly`]).
+                    // moves the active label for no other chip's sake —
+                    // [`fit_labels_distinctly`]).
                     let label: String =
                         labels.get_mut(i).and_then(Option::take).unwrap_or_default();
                     if !crate::tray_raster::strip_band_run_coverable(&label) {
@@ -4549,15 +4556,47 @@ pub(crate) mod pixel_band {
                 TabHit::Close(_) => {}
             }
         }
-        // THE WINDOW'S EDGE MARKS ([`strip_overflow`]) go to the CELL painter,
-        // the same way the rename well's own `‹`/`›` do: one glyph, one lane,
-        // no second drawing of it to drift. The band is opaque edge to edge, so
-        // the mark's column has to be uncovered for the cell glyph underneath
-        // to show at all — and `StripRole::Inactive` paints it on `band_bg`,
-        // the very tone this raster fills that column with, so the punched
-        // column is invisible as a seam.
-        for (col, _) in strip_overflow(input.segments, input.titles.len()).columns() {
-            fallback.push((col, col.saturating_add(1)));
+        // THE WINDOW'S EDGE MARKS ([`strip_overflow`]) — drawn HERE, seated on
+        // the SAME optical centre every other piece of furniture reads.
+        //
+        // A mark left to the cell painter cannot be: that lane's unit of
+        // vertical placement is the CELL, so the glyph lands on the cell
+        // baseline while the cards, labels, icons, `✕` and `+` are centred in
+        // the whole OPTICAL band — the canvas that starts at the window's top
+        // edge and reaches the seam. The two centres differ by half the
+        // off-grid lip (11.5 px at font_px 15 on a 1× display, measured), which
+        // reads as the one sign saying "there are more tabs" having fallen off
+        // the row it belongs to. Reading `cy` is what keeps that from drifting:
+        // there is no second number here to hold in step.
+        //
+        // Code-native strokes, for the reason the `✕` and the `+` are: chrome
+        // that never depends on a face covering U+2039/U+203A, crisp at every
+        // DPI. The cell lane still writes its glyph on these columns for the
+        // lanes this raster does not reach (no UI face yet, macOS); where the
+        // band draws, it covers that glyph exactly as it covers every chip's.
+        for (col, mark) in strip_overflow(input.segments, input.titles.len()).columns() {
+            let center = (f32::from(col) + 0.5) * cw;
+            let arm_y = (label_px * 0.30).max(2.5);
+            // The apex points AT the edge the strip continues past: `‹` left,
+            // `›` right. Angle-quotation proportions — the arms reach about
+            // half as far across as they do down.
+            let apex = if mark == STRIP_OVERFLOW_LEFT {
+                -arm_y * 0.5
+            } else {
+                arm_y * 0.5
+            };
+            let ink = rgba(colors.inactive_fg, 255);
+            let width = (label_px / 9.0).max(1.0);
+            for dy in [-arm_y, arm_y] {
+                prims.push(DrawPrim::Line {
+                    x1: center + apex,
+                    y1: cy,
+                    x2: center - apex,
+                    y2: cy + dy,
+                    width,
+                    color: ink,
+                });
+            }
         }
         if !drew_any {
             return None;
@@ -4799,8 +4838,9 @@ pub(crate) mod pixel_band {
     /// second fit of its own, because a fit applied per chip at paint time is
     /// the very thing this pass replaces. (The one string the paint loop can
     /// still shorten is the ACTIVE label, through the variable instance's
-    /// glyph-level [`VariablePen::fit`]; that chip is exempt from the repair
-    /// either way, so the distinctness this pass proves cannot turn on it.)
+    /// glyph-level [`VariablePen::fit`]; that chip is exempt from the
+    /// COLLISION repair either way — it claims its string first — so the
+    /// distinctness this pass proves cannot turn on it.)
     /// `active` is the band's ONE reading of the selection
     /// ([`BandInput::selected`]), passed in rather than re-read so the
     /// exemption, the measuring face and the painted chip cannot disagree.
@@ -4867,9 +4907,9 @@ pub(crate) mod pixel_band {
         // disagree about what fits. The active label may additionally go
         // through the variable instance's own glyph-level fit
         // ([`VariablePen::fit`]) — same candidate order, marginally different
-        // advances — but the repair below never rewrites the ACTIVE label, so
-        // that lane's measure only ever decides which string the OTHER chips
-        // must stay clear of.
+        // advances — and the repair below rewrites the ACTIVE label only when
+        // the fit left it naming nothing, so that lane's measure otherwise only
+        // decides which string the OTHER chips must stay clear of.
         let measure = |tab: usize, s: &str| {
             let face = if tab == active && wants_semibold {
                 TextFace::UiBold
@@ -4899,11 +4939,22 @@ pub(crate) mod pixel_band {
     ///
     /// `entries` are in strip order; `reserved` are labels already resolved for
     /// this strip (the cell painter's fallback segments) that a fitted label
-    /// must not collide with. The ACTIVE chip is exempt from the repair for the
-    /// cell pass's reason — it is the tab being READ, its window is the reserved
-    /// wide one, and it keeps as much of the real title as fits — so it claims
-    /// its fitted string first and every collision is repaired on the other
-    /// member.
+    /// must not collide with. The ACTIVE chip is exempt from the COLLISION
+    /// repair for the cell pass's reason — it is the tab being READ, its window
+    /// is the reserved wide one, and it keeps as much of the real title as fits
+    /// — so it claims its fitted string first and every collision is repaired
+    /// on the other member.
+    ///
+    /// EXEMPT FROM THE COLLISION, NOT FROM NAMING NOTHING. The two halves of
+    /// the repair answer different questions: a collision is about the OTHER
+    /// chips (whose claim is weaker, so they move), while a label that says
+    /// nothing ([`label_says_nothing`]) is about this chip alone and no other
+    /// chip's move can fix it. "Keeps as much of the real title as fits" is a
+    /// promise only while something fits; past that an unqualified exemption
+    /// hands the one tab the user most needs named the one cut that names no
+    /// tab at all — measured on glass at eighteen columns with twelve tabs, the
+    /// quiet chip beside it reading `11`. So the selection takes the ordinal
+    /// there too, and takes it FIRST, before `taken` is seeded from it.
     fn fit_labels_distinctly(
         entries: &[BandLabel],
         active: usize,
@@ -4919,6 +4970,29 @@ pub(crate) mod pixel_band {
                 )
             })
             .collect();
+        // One chip's position, spelled as far as its own span affords — the
+        // repair's only replacement, the SELECTION's floor below, and the
+        // impostor's way out further down.
+        let ordinal = |n: usize| {
+            let tab = entries[n].tab;
+            pixel_ordinal_label(tab, &entries[n].text, entries[n].span_px, &|s| {
+                measure(tab, s)
+            })
+        };
+        // THE SELECTION'S FLOOR, resolved before anything is claimed. Its
+        // exemption below is from being MOVED for another chip's sake; it was
+        // never a licence to paint a cut that names nothing (see this
+        // function's doc). An empty ordinal means the window seats not even the
+        // number — then the mark is the only true statement left, exactly as it
+        // is for every other chip.
+        if let Some(n) = fitted.iter().position(|(tab, _)| *tab == active)
+            && label_says_nothing(&fitted[n].1)
+        {
+            let recut = ordinal(n);
+            if !recut.is_empty() {
+                fitted[n].1 = recut;
+            }
+        }
         let mut taken: Vec<String> = reserved.iter().map(|s| (*s).to_string()).collect();
         taken.extend(
             fitted
@@ -4926,14 +5000,6 @@ pub(crate) mod pixel_band {
                 .filter(|(tab, _)| *tab == active)
                 .map(|(_, text)| text.clone()),
         );
-        // One chip's position, spelled as far as its own span affords — the
-        // repair's only replacement, and the impostor's way out below.
-        let ordinal = |n: usize| {
-            let tab = entries[n].tab;
-            pixel_ordinal_label(tab, &entries[n].text, entries[n].span_px, &|s| {
-                measure(tab, s)
-            })
-        };
         for n in 0..fitted.len() {
             let tab = fitted[n].0;
             if tab == active {
@@ -5605,13 +5671,15 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
-        /// THE WINDOW'S EDGE MARKS REACH THE LANE THE USER SEES. The band is an
-        /// opaque bar edge to edge, so a `‹` the cell painter wrote under it is
-        /// invisible unless the band leaves that column alone — and a window
-        /// that hides three tabs while showing no mark is worse than the
-        /// compression it replaced. The mark columns are therefore FALLBACK
-        /// columns, the same escape the rename well's own `‹`/`›` take, and
-        /// every other column stays covered.
+        /// THE WINDOW'S EDGE MARKS SIT ON THE STRIP'S ONE LINE. Every other
+        /// piece of furniture — cards, labels, icons, the `✕`, the `+` — is
+        /// centred in the OPTICAL band, the canvas from the window's top edge
+        /// down to the seam. A mark left to the cell painter can only be
+        /// centred in its CELL, which is that band minus the off-grid lip, so
+        /// it lands half a lip low: the one sign that says "there are more
+        /// tabs" reading as a stray below the row it belongs to. The band
+        /// therefore strokes it here, off the same `cy`, and the two ink
+        /// centres agree.
         ///
         /// TWENTY TABS, AND A SELECTION ON AN INTERIOR PAGE. The strip pages
         /// ([`strip_window`]) rather than centring a run on the selection, so
@@ -5620,7 +5688,7 @@ pub(crate) mod pixel_band {
         /// chips, which pages twenty tabs into four fives, and tab 7 is on the
         /// second of them — tabs before it and tabs after it, so both marks.
         #[test]
-        fn the_overflow_marks_are_punched_through_to_the_cell_painter() {
+        fn the_overflow_marks_share_the_strip_furniture_centre() {
             if !with_ui_faces() {
                 return;
             }
@@ -5634,30 +5702,61 @@ pub(crate) mod pixel_band {
                 "twenty tabs on eighty columns, selected on an interior page: \
                  both edges clip"
             );
-            let input = band(
+            let mut input = band(
                 &segments,
                 &titles,
                 &metadata,
                 StripPaint::default(),
                 geometry(80, 1),
             );
+            input.active = 7;
             let rows = raster_band(&input, &[]).expect("UI faces installed ⇒ a band");
+            let (rgba, w, h) = image_of(&rows);
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let surfaces = [colors.band_bg, colors.active_bg, colors.chip_bg];
+            let ink_mid_y = |px0: usize, px1: usize, what: &str| {
+                let (_, y0, _, y1) = ink_bbox_off_surfaces(&rgba, w, h, px0, px1, &surfaces)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{what} leaves no ink on the band — a mark handed to \
+                             the cell painter is drawn on the CELL baseline, \
+                             which is the very placement this asserts against"
+                        )
+                    });
+                (y0 + y1) as f32 / 2.0
+            };
+            // The `+` button's glyph — code-native strokes on `cy`, and the
+            // reference every other mark is judged against because it is the
+            // furniture farthest from any label's own metrics.
+            let plus = segments
+                .iter()
+                .find(|seg| matches!(seg.kind, TabHit::NewTab))
+                .expect("the strip ends with a `+`");
+            let plus_mid = ink_mid_y(
+                usize::from(plus.start_col) * CELL_W,
+                usize::from(plus.end_col) * CELL_W,
+                "the `+`",
+            );
+            for (col, mark) in marks.columns() {
+                let mid = ink_mid_y(
+                    usize::from(col) * CELL_W,
+                    usize::from(col + 1) * CELL_W,
+                    "the overflow mark",
+                );
+                assert!(
+                    (mid - plus_mid).abs() <= 1.0,
+                    "{mark:?} at column {col} inks around y {mid}, the `+` around \
+                     y {plus_mid} — the mark is off the strip's line"
+                );
+            }
+            // …and it is the BAND that owns those columns now: a punched-through
+            // column would paint the mark on the cell baseline again.
             let covered: Vec<usize> = rows[0].iter().map(|(c, _)| *c).collect();
-            for (col, _) in marks.columns() {
-                assert!(
-                    !covered.contains(&usize::from(col)),
-                    "the band covered the mark at {col}, so nothing is painted there"
-                );
-            }
-            for col in 0..80usize {
-                if marks.columns().any(|(mark, _)| usize::from(mark) == col) {
-                    continue;
-                }
-                assert!(
-                    covered.contains(&col),
-                    "column {col} is neither band nor mark"
-                );
-            }
+            assert_eq!(
+                covered,
+                (0..80).collect::<Vec<_>>(),
+                "the band owns every column, marks included"
+            );
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
@@ -6212,6 +6311,82 @@ pub(crate) mod pixel_band {
                     );
                 }
             }
+        }
+
+        /// THE ONE TAB THE USER MOST NEEDS NAMED IS NOT THE ONE THAT MAY GO
+        /// NAMELESS. The selection is exempt from the COLLISION repair — it
+        /// claims its fitted string first and the other member moves — and an
+        /// exemption that also skipped the "says nothing" test would spend the
+        /// strip's one guaranteed name on elision marks while the quiet chip
+        /// beside it, on the identical window, took its ordinal and stayed
+        /// addressable. Measured on glass: twelve tabs at eighteen columns, the
+        /// quiet chip reading `11` beside a selected card reading `…`.
+        #[test]
+        fn the_selection_takes_its_ordinal_rather_than_paint_nothing() {
+            // A window that seats the number and not a character more — the
+            // pressure the strip's own layout reaches, stated as a span.
+            let squeeze = wide_face(0, "……");
+            let entries = vec![
+                BandLabel {
+                    tab: 0,
+                    span_px: squeeze,
+                    text: "…-676-2".to_string(),
+                },
+                BandLabel {
+                    tab: 1,
+                    span_px: squeeze,
+                    text: "…-676-2".to_string(),
+                },
+            ];
+            // FIXTURE GUARD: the per-chip fit really does leave the selection
+            // saying nothing — without this the law below could pass on a
+            // strip that was never in trouble.
+            let naive = fit_label(entries[0].text.clone(), squeeze, |s| wide_face(0, s));
+            assert!(
+                label_says_nothing(&naive),
+                "fixture: the fit must strand the selection, not merely shorten \
+                 it — {naive:?}"
+            );
+            let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+            assert_eq!(
+                fitted[0].1, "1",
+                "the selected chip carries its position: {fitted:?}"
+            );
+            assert!(
+                !label_says_nothing(&fitted[0].1),
+                "the selection names something: {fitted:?}"
+            );
+            for (n, (tab, text)) in fitted.iter().enumerate() {
+                for (m, (_, other)) in fitted.iter().enumerate() {
+                    assert!(
+                        n == m || text != other,
+                        "tab {tab} doubles another chip's label: {fitted:?}"
+                    );
+                }
+                assert!(
+                    wide_face(*tab, text) <= entries[n].span_px,
+                    "{text:?} would need a SECOND fit at paint time"
+                );
+            }
+        }
+
+        /// …AND THE MARK IS STILL THE FLOOR. A window too small to seat even
+        /// the digits has no true statement left but "this chip has a title and
+        /// no room to show it" ([`ordinal_chip_label`]), and that holds for the
+        /// selection exactly as it does for every other chip — a clipped `10`
+        /// naming tab 1 would be worse than the mark.
+        #[test]
+        fn a_selection_whose_window_seats_no_number_keeps_the_mark() {
+            let entries = vec![BandLabel {
+                tab: 9,
+                span_px: wide_face(9, "1") * 0.5,
+                text: "…-676-2".to_string(),
+            }];
+            let fitted = fit_labels_distinctly(&entries, 9, &[], &wide_face);
+            assert!(
+                label_says_nothing(&fitted[0].1),
+                "not even `10` fits, so the mark stands: {fitted:?}"
+            );
         }
 
         /// A LABEL THAT SAYS NOTHING IS NOT ALWAYS THE STRING `…`. The cell

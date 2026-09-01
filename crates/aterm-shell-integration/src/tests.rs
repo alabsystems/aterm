@@ -29,10 +29,7 @@ fn run_urlencode_via_shell(
     script_name: &str,
     input: &str,
 ) -> String {
-    let script = format!(
-        "{}/src/scripts/{script_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     let command = format!(
         "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; printf '%s' \"$(__aterm_urlencode \"$ATERM_TEST_CWD\")\""
     );
@@ -119,7 +116,12 @@ fn zsh_shell() -> Option<&'static str> {
     ZSH.get_or_init(|| {
         resolve_test_shell(
             "ATERM_TEST_ZSH",
-            &["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh", "/opt/homebrew/bin/zsh"],
+            &[
+                "/bin/zsh",
+                "/usr/bin/zsh",
+                "/usr/local/bin/zsh",
+                "/opt/homebrew/bin/zsh",
+            ],
             "zsh",
         )
     })
@@ -140,8 +142,8 @@ fn zsh_shell() -> Option<&'static str> {
 fn hermetic_home() -> &'static std::path::Path {
     static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
-        let home = std::env::temp_dir()
-            .join(format!("aterm-si-hermetic-home-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("aterm-si-hermetic-home-{}", std::process::id()));
         for sub in ["config/fish/conf.d", "data/fish", "state", "cache"] {
             std::fs::create_dir_all(home.join(sub))
                 .expect("create hermetic HOME for shell integration tests");
@@ -260,10 +262,7 @@ fn run_report_cwd_via_shell(
     script_name: &str,
     cwd: &std::path::Path,
 ) -> String {
-    let script = format!(
-        "{}/src/scripts/{script_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     let command = format!(
         "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; builtin cd -- \"$ATERM_TEST_CWD\"; __aterm_report_cwd"
     );
@@ -367,17 +366,25 @@ fn test_zsh_survives_shell_d_with_only_zsh_dropins() {
     let home = std::env::temp_dir().join(format!("aterm-shd-{}", std::process::id()));
     let shd = home.join(".aterm/shell.d");
     std::fs::create_dir_all(&shd).expect("mk shell.d");
-    std::fs::write(shd.join("00-atpkg.zsh"), "export ATERM_TEST_DROPIN=loaded\n")
-        .expect("write dropin");
-    let script = format!("{}/src/scripts/aterm_shell_integration.zsh", env!("CARGO_MANIFEST_DIR"));
+    std::fs::write(
+        shd.join("00-atpkg.zsh"),
+        "export ATERM_TEST_DROPIN=loaded\n",
+    )
+    .expect("write dropin");
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.zsh",
+        env!("CARGO_MANIFEST_DIR")
+    );
     // Interactive (`-i`) so the `[[ -o interactive ]] || return` guard doesn't
     // short-circuit; hermetic HOME so ONLY our drop-in is present.
     let out = shell_command(zsh)
         .arg("-i")
         .arg("-c")
-        .arg("source \"$ATERM_TEST_SCRIPT\"; \
+        .arg(
+            "source \"$ATERM_TEST_SCRIPT\"; \
               print -r -- \"URLENC=$(whence -w __aterm_urlencode)\"; \
-              print -r -- \"DROPIN=${ATERM_TEST_DROPIN:-UNSET}\"")
+              print -r -- \"DROPIN=${ATERM_TEST_DROPIN:-UNSET}\"",
+        )
         .env("HOME", &home)
         .env("ZDOTDIR", &home)
         .env("ATERM_TEST_SCRIPT", &script)
@@ -679,9 +686,8 @@ fn test_cwd_tab_title_strips_control_chars() {
     // could drift apart — and the emission is pinned to the STRIPPED local, so
     // a future edit cannot route the raw title around the guard.
     assert!(
-        scripts::FISH.contains(
-            r#"set -l safe_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$title")"#
-        ),
+        scripts::FISH
+            .contains(r#"set -l safe_title (string replace -ra '[\x00-\x1f\x7f]' '' -- "$title")"#),
         "fish CWD tab title must strip control characters"
     );
     assert!(
@@ -825,16 +831,8 @@ const OSC_PROBE_EXPECTED_TITLE: &str =
 /// substitution as `$(…)` and control-stripping as `${v//[[:cntrl:]]/}` — so
 /// the same source line is exercised in both shells.
 #[cfg(unix)]
-fn run_osc_wire_probe(
-    shell: &str,
-    args: &[&str],
-    cleanup: &str,
-    script_name: &str,
-) -> Vec<u8> {
-    let script = format!(
-        "{}/src/scripts/{script_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+fn run_osc_wire_probe(shell: &str, args: &[&str], cleanup: &str, script_name: &str) -> Vec<u8> {
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     let command = format!(
         "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
          __aterm_osc \"633;E;$(__aterm_encode_cmd \"$ATERM_TEST_INPUT\")\"; \
@@ -1416,7 +1414,10 @@ fn test_fish_mark_functions_invoke_id_suffix() {
 /// `test_fish_integration_loads_under_an_empty_guard_override`.
 #[test]
 fn test_fish_loaded_guard_survives_an_empty_override() {
-    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+    for (label, script) in [
+        ("embedded", scripts::FISH),
+        ("app-bundle", APP_FISH_RESOURCE),
+    ] {
         assert!(
             script.contains(r#"if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED""#),
             "{label} fish script must guard on NON-EMPTINESS, matching the \
@@ -1625,7 +1626,10 @@ fn test_fish_marks_carry_the_nonce_when_set() {
 /// `ATERM_SHELL_NONCE` from being inherited by every child process.
 #[test]
 fn test_fish_never_tests_definedness_of_an_aterm_variable() {
-    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+    for (label, script) in [
+        ("embedded", scripts::FISH),
+        ("app-bundle", APP_FISH_RESOURCE),
+    ] {
         let offenders: Vec<&str> = script
             .lines()
             .map(str::trim)
@@ -1668,7 +1672,11 @@ fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
     let body = "function __aterm_custom_prompt; printf 'CUSTOM'; end; \
                 function __aterm_original_fish_prompt; printf 'ORIGINAL'; end; \
                 fish_prompt";
-    for (style, expected) in [("", "ORIGINAL"), ("none", "ORIGINAL"), ("minimal", "CUSTOM")] {
+    for (style, expected) in [
+        ("", "ORIGINAL"),
+        ("none", "ORIGINAL"),
+        ("minimal", "CUSTOM"),
+    ] {
         let stdout = run_fish_integration(
             fish,
             &[
@@ -1844,11 +1852,15 @@ fn test_bash_ps1_mark_b_includes_nonce_when_set() {
     // `$__aterm_shell_nonce` (not the env var). The env var is unset at
     // source time to stop the 64-hex secret from leaking into subprocesses.
     assert!(
-        script.contains(r#"[[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}""#),
+        script.contains(
+            r#"[[ -n "$__aterm_shell_nonce" ]] && __aterm_b_suffix=";id=${__aterm_shell_nonce}""#
+        ),
         "bash default-mode PS1 must append ;id= from the captured shell-local"
     );
     assert!(
-        script.contains(r#"[[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce}""#),
+        script.contains(
+            r#"[[ -n "$__aterm_shell_nonce" ]] && mark_b_id=";id=${__aterm_shell_nonce}""#
+        ),
         "bash custom-prompt builder must append ;id= from the captured shell-local"
     );
 }
@@ -1861,10 +1873,7 @@ fn run_id_suffix_via_shell(
     script_name: &str,
     nonce: Option<&str>,
 ) -> String {
-    let script = format!(
-        "{}/src/scripts/{script_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     // Guard definedness before reading the suffix: an UNDEFINED __aterm_id_suffix
     // also yields empty stdout inside $(...) with a zero outer exit, so the
     // nonce-unset case ("" expected) could pass even if the script never loaded.
@@ -1909,7 +1918,11 @@ fn fish_shell() -> Option<&'static str> {
     FISH.get_or_init(|| {
         resolve_test_shell(
             "ATERM_TEST_FISH",
-            &["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish"],
+            &[
+                "/opt/homebrew/bin/fish",
+                "/usr/local/bin/fish",
+                "/usr/bin/fish",
+            ],
             "fish",
         )
     })
@@ -2089,10 +2102,7 @@ fn run_env_check_after_source(
     script_name: &str,
     nonce: &str,
 ) -> (String, String) {
-    let script = format!(
-        "{}/src/scripts/{script_name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
     // After sourcing, query whether ATERM_SHELL_NONCE still exists in the
     // environment (it MUST NOT — #8015) and whether __aterm_id_suffix still
     // produces the expected output (it MUST — the shell captured the env
@@ -2117,7 +2127,11 @@ fn run_env_check_after_source(
     );
     let stdout = String::from_utf8(output.stdout).expect("env-leak output should be UTF-8");
     let parts: Vec<&str> = stdout.splitn(2, '|').collect();
-    assert_eq!(parts.len(), 2, "env-leak output must have env=/suffix= pair: {stdout:?}");
+    assert_eq!(
+        parts.len(),
+        2,
+        "env-leak output must have env=/suffix= pair: {stdout:?}"
+    );
     let env = parts[0]
         .strip_prefix("env=")
         .expect("env-leak stdout must start with env=")
@@ -2661,10 +2675,7 @@ fn test_merge_wslenv_is_append_safe_and_idempotent() {
 
     // An empty inherited value must not produce an empty trailing entry.
     let empty = merge_wslenv("");
-    assert!(
-        !empty.ends_with(':') && !empty.contains("::"),
-        "{empty}"
-    );
+    assert!(!empty.ends_with(':') && !empty.contains("::"), "{empty}");
 
     // Nesting (aterm inside aterm inside …) must not grow duplicates, and must
     // not keep a STALE flag spelling for one of our own variables.
@@ -3005,7 +3016,10 @@ fn fish_strip_string_contents(line: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn test_fish_never_glues_a_command_substitution() {
-    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+    for (label, script) in [
+        ("embedded", scripts::FISH),
+        ("app-bundle", APP_FISH_RESOURCE),
+    ] {
         let offenders: Vec<(usize, &str)> = script
             .lines()
             .enumerate()
@@ -3037,7 +3051,10 @@ fn test_fish_never_glues_a_command_substitution() {
 /// which is also the canonical RFC 8089 `file://` authority.
 #[test]
 fn test_fish_osc7_resolves_the_host_without_a_substitution() {
-    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+    for (label, script) in [
+        ("embedded", scripts::FISH),
+        ("app-bundle", APP_FISH_RESOURCE),
+    ] {
         assert!(
             script.contains(r#"__aterm_osc "7;file://$__aterm_report_host$cwd""#),
             "{label} fish OSC 7 must be ONE interpolated argument"
@@ -3081,7 +3098,10 @@ fn test_fish_osc7_resolves_the_host_without_a_substitution() {
 /// operands.
 #[test]
 fn test_fish_prompt_never_passes_a_palette_index_to_set_color() {
-    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+    for (label, script) in [
+        ("embedded", scripts::FISH),
+        ("app-bundle", APP_FISH_RESOURCE),
+    ] {
         assert!(
             script.contains(r#"printf '\e[38;5;%sm' "$argv[1]""#),
             "{label} fish must format the SGR 256-colour escape itself — the same \
@@ -3154,7 +3174,9 @@ fn test_prompt_color_defaults_agree_across_shells() {
 #[test]
 fn test_fish_osc7_is_well_formed_for_every_host_value() {
     let Some(fish) = fish_shell() else {
-        eprintln!("fish not installed; skipping test_fish_osc7_is_well_formed_for_every_host_value");
+        eprintln!(
+            "fish not installed; skipping test_fish_osc7_is_well_formed_for_every_host_value"
+        );
         return;
     };
     let (_dir, cwd) = create_special_cwd();
@@ -3222,8 +3244,7 @@ fn test_fish_fallback_prompt_survives_a_missing_hostname() {
                 fish_prompt";
     let out = run_fish_integration(fish, &[("ATERM_DISABLE_PROMPT_TITLES", "1")], body);
     assert_eq!(
-        out,
-        "\u{1b}]133;A\u{7}tester@localhost ~/x $ \u{1b}]133;B\u{7}",
+        out, "\u{1b}]133;A\u{7}tester@localhost ~/x $ \u{1b}]133;B\u{7}",
         "the fallback prompt must render every segment it can, between the marks"
     );
 }
@@ -3359,12 +3380,36 @@ fn test_fish_prompt_colors_are_sgr_indices_like_bash() {
 #[test]
 fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
     for (label, script, guard) in [
-        ("bash", scripts::BASH, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
-        ("zsh", scripts::ZSH, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
-        ("fish", scripts::FISH, "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\""),
-        ("app-bash", APP_BASH_RESOURCE, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
-        ("app-zsh", APP_ZSH_RESOURCE, "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then"),
-        ("app-fish", APP_FISH_RESOURCE, "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\""),
+        (
+            "bash",
+            scripts::BASH,
+            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+        ),
+        (
+            "zsh",
+            scripts::ZSH,
+            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+        ),
+        (
+            "fish",
+            scripts::FISH,
+            "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\"",
+        ),
+        (
+            "app-bash",
+            APP_BASH_RESOURCE,
+            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+        ),
+        (
+            "app-zsh",
+            APP_ZSH_RESOURCE,
+            "if [[ -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\" ]]; then",
+        ),
+        (
+            "app-fish",
+            APP_FISH_RESOURCE,
+            "if test -n \"$ATERM_SHELL_INTEGRATION_INSTALLED\"",
+        ),
     ] {
         let guard_at = script
             .find(guard)
@@ -3388,7 +3433,11 @@ fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
             tmux_at < sty_at && sty_at < term_at,
             "{label}: check $TMUX, then $STY, then TERM"
         );
-        for marker in ["ATERM_MUX", "ATERM_MUX_OUTER_SESSION_ID", "ATERM_MUX_NOTICE"] {
+        for marker in [
+            "ATERM_MUX",
+            "ATERM_MUX_OUTER_SESSION_ID",
+            "ATERM_MUX_NOTICE",
+        ] {
             assert!(
                 script.contains(marker),
                 "{label}: the boundary must export/honour {marker}"
@@ -3397,7 +3446,8 @@ fn test_scripts_mark_the_multiplexer_boundary_before_the_loader_guard() {
         // Past the guard this shell IS an aterm session shell, so a marker
         // inherited from the pane it was launched out of is a stale lie.
         let clears = script.contains("unset ATERM_MUX ATERM_MUX_OUTER_SESSION_ID")
-            || (script.contains("set -e ATERM_MUX\n") && script.contains("set -e ATERM_MUX_OUTER_SESSION_ID"));
+            || (script.contains("set -e ATERM_MUX\n")
+                && script.contains("set -e ATERM_MUX_OUTER_SESSION_ID"));
         assert!(
             clears,
             "{label}: a shell that gets PAST the guard must clear an inherited \

@@ -241,6 +241,7 @@ impl<T: 'static> EventLoop<T> {
                     },
                     #[cfg(x11_platform)]
                     PlatformActiveEventLoop::X(_) => unreachable!(),
+                    PlatformActiveEventLoop::Headless(_) => unreachable!(),
                 };
 
                 self.pump_event_notifier =
@@ -547,6 +548,7 @@ impl<T: 'static> EventLoop<T> {
                 },
                 #[cfg(x11_platform)]
                 PlatformActiveEventLoop::X(_) => unreachable!(),
+                PlatformActiveEventLoop::Headless(_) => unreachable!(),
             }
         }
 

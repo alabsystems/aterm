@@ -609,8 +609,15 @@ against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
 test named, bounded contracts — not the whole emulator, renderer, or OS. Run
 `cargo run -q -p xtask -- gate counts` for the live inventory; totals are
 computed from source, never maintained in prose. Every gate is a local command —
-a pinned pre-push hook runs the temporal-safety and lint gates, the full ladder
-runs by hand and at a gated release cut, and there is no hosted CI.
+`tools/verify.sh --fast` is the merge contract and runs the L0 temporal-safety
+gate as one of its unconditional stages, the release cutter re-runs those six
+obligations itself before it claims a build number, the full ladder runs by
+hand, and there is no hosted CI. The pinned pre-push hook is ADVISORY: its whole
+body is one printf and `exit 0`. It was a blocking gate until 2026-08-24 and was
+demoted on its own stated rule — a hook slow enough to be bypassed teaches the
+bypass — once the pixel guard took it to twelve minutes. So the release cut is
+the only thing that mechanically enforces L0; before that, running the contract
+is a discipline, not a mechanism.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via

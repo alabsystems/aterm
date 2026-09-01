@@ -75,6 +75,62 @@ fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> 
     }
 }
 
+/// The programs this machine WANTS but does not have, split by whether the removed
+/// ledger explains the absence: `(unexplained, on_purpose)`, each alphabetical.
+///
+/// "Wants" is [`crate::cli::wanted_programs`] — the signed default set narrowed by
+/// `[packages].include`/`exclude` plus opted-in extras — so this asks the same question
+/// the install lanes ask, and cannot drift from them into a second opinion.
+///
+/// The split is the whole point. A program on the removed ledger is a decision, and
+/// reporting it as a problem would be the manager arguing with the user. A program
+/// missing with NO ledger entry is the state nothing else in this report can see: no
+/// shim, no `status.toml` row, no recorded fault — invisible to every check that reads
+/// the record rather than the index.
+///
+/// Offline and fail-quiet: with no cached index there is no trustworthy answer about
+/// what SHOULD be installed, and inventing one would turn an unreachable network into a
+/// pile of phantom missing programs.
+fn missing_against_index(
+    layout: &Layout,
+    installed: &std::collections::BTreeMap<String, u64>,
+) -> (Vec<String>, Vec<String>) {
+    let Some(index) = crate::cli::cached_index(layout) else {
+        return (Vec::new(), Vec::new());
+    };
+    split_missing(
+        &crate::cli::wanted_programs(layout, &index, crate::config::cached()),
+        installed,
+        &layout.removed_programs(),
+    )
+}
+
+/// The decision [`missing_against_index`] makes, without the I/O: which wanted programs
+/// are absent, and which of those the removed ledger accounts for.
+///
+/// Pure so it can be tested against the exact shape of the incident that motivated it,
+/// which is otherwise reachable only by standing up a signed index, a registry and a
+/// store.
+fn split_missing(
+    wanted: &std::collections::BTreeSet<String>,
+    installed: &std::collections::BTreeMap<String, u64>,
+    removed: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut unexplained = Vec::new();
+    let mut on_purpose = Vec::new();
+    for program in wanted {
+        if installed.contains_key(program) {
+            continue;
+        }
+        if removed.contains(program) {
+            on_purpose.push(program.clone());
+        } else {
+            unexplained.push(program.clone());
+        }
+    }
+    (unexplained, on_purpose)
+}
+
 /// EVERY recorded fault, formatted `"<program>: <state>"`, in program order — `BTreeMap`
 /// order, i.e. alphabetical by program name.
 ///
@@ -713,6 +769,23 @@ pub fn run_with(
     // is a `BTreeMap` so which one won was alphabetical accident.
     let recorded_problems = recorded_problems(status.as_ref());
     let declined = layout.declined().is_file();
+    // (11) COMPLETENESS AGAINST THE SIGNED INDEX — the check that was missing.
+    //
+    // Everything above audits what the RECORD mentions: shims for installed programs,
+    // rows in `status.toml`, faults the last pass wrote down. A program the machine
+    // wants and never attempted has none of those — no shim, no row, no fault — so it
+    // was invisible to every check, and `doctor` reported "healthy" while counting the
+    // programs that DID arrive. That is not a hypothetical: a leaky test wrote `trust`
+    // (the compiler) into a real machine's removed ledger, which suppressed its stub and
+    // — because a coherence group only activates once one member is installed — took the
+    // whole `rustc` tuple with it. Ten programs were served, six were installed, and this
+    // report said "healthy — 6 ALab program(s) active" for eight days while every ALab
+    // repo on that machine failed to compile.
+    //
+    // The index is the only thing that knows what SHOULD be here, so ask it. Offline and
+    // best-effort by construction (`cached_index`): an unreachable index must never
+    // invent a missing program.
+    let (missing_unexplained, missing_on_purpose) = missing_against_index(layout, &installed);
     let mut toolset_problem = false;
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
@@ -767,8 +840,32 @@ pub fn run_with(
             "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
             installed.len()
         );
+    } else if !missing_unexplained.is_empty() {
+        // The machine wants these, does not have them, and NOTHING recorded a reason.
+        // Distinct from the branch above: that one reports failures the record already
+        // names, this one reports absences the record is silent about.
+        toolset_problem = true;
+        let _ = writeln!(
+            out,
+            "{p}: PROBLEM — the toolset is incomplete: {} of {} program(s) the signed \
+             index serves are not installed ({})",
+            missing_unexplained.len(),
+            installed.len() + missing_unexplained.len() + missing_on_purpose.len(),
+            missing_unexplained.join(", ")
+        );
     } else {
         let _ = writeln!(out, "{p}: {} ALab program(s) active", installed.len());
+    }
+    // A DELIBERATE removal is not a fault — but it must be VISIBLE. The ledger that
+    // records it is a file no user reads, and its effect (no stub, no unattended
+    // reinstall, and a coherence group that never activates) is indistinguishable from
+    // the program never having existed. Say it plainly, and name the way back.
+    for program in &missing_on_purpose {
+        let _ = writeln!(
+            out,
+            "{p}: ok — {program}: removed on purpose — no unattended pass reinstalls it \
+             (aterm pkg install {program} brings it back)"
+        );
     }
     if let Some(start) =
         problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
@@ -1064,6 +1161,101 @@ mod tests {
         .unwrap();
         activate_channel(layout, "stable", &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
+    }
+
+    fn names(list: &[&str]) -> std::collections::BTreeSet<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn builds(list: &[&str]) -> std::collections::BTreeMap<String, u64> {
+        list.iter().map(|s| ((*s).to_string(), 1u64)).collect()
+    }
+
+    /// A program the machine wants, does not have, and has NO ledger entry for is the
+    /// state no other check in this report can see: no shim, no `status.toml` row, no
+    /// recorded fault. It must be named.
+    #[test]
+    fn a_wanted_program_that_never_arrived_is_unexplained() {
+        let (unexplained, on_purpose) = split_missing(
+            &names(&["ay", "trust"]),
+            &builds(&["ay"]),
+            &names(&[]),
+        );
+        assert_eq!(unexplained, vec!["trust".to_string()]);
+        assert!(on_purpose.is_empty());
+    }
+
+    /// A deliberate removal is a DECISION, not a fault — reporting it as a problem would
+    /// be the manager arguing with the user. It still has to be visible, which is the
+    /// other half of what went wrong: the ledger is a file nobody reads.
+    #[test]
+    fn a_removed_program_is_explained_never_a_fault() {
+        let (unexplained, on_purpose) = split_missing(
+            &names(&["ay", "trust"]),
+            &builds(&["ay"]),
+            &names(&["trust"]),
+        );
+        assert!(unexplained.is_empty(), "a recorded decision is not a fault");
+        assert_eq!(on_purpose, vec!["trust".to_string()]);
+    }
+
+    #[test]
+    fn a_complete_machine_reports_nothing() {
+        let (unexplained, on_purpose) = split_missing(
+            &names(&["ay", "trust"]),
+            &builds(&["ay", "trust"]),
+            &names(&[]),
+        );
+        assert!(unexplained.is_empty() && on_purpose.is_empty());
+    }
+
+    /// THE INCIDENT, in the shape it actually had (2026-08-23 → 2026-08-31).
+    ///
+    /// A leaky unit test wrote `trust` into a real machine's removed ledger. That
+    /// suppressed the compiler's stub, and because a coherence group only activates once
+    /// one of its members is installed, the whole `rustc` tuple — trust, trust-ir,
+    /// trust-cg, trust-vc — never arrived. The signed index served ten programs; six were
+    /// installed; `doctor` said "healthy — 6 ALab program(s) active" for eight days while
+    /// every ALab repo on that machine failed to compile.
+    ///
+    /// Note what this asserts: the ledger explains `trust` ONLY. The three siblings it
+    /// took down with it are unexplained, and naming them is what turns "healthy" into a
+    /// report that points at the real state.
+    #[test]
+    fn the_suppressed_compiler_tuple_is_reported() {
+        let (unexplained, on_purpose) = split_missing(
+            &names(&[
+                "ay", "clean", "nn", "ny", "trust", "trust-cg", "trust-ir", "trust-mc",
+                "trust-vc", "ty",
+            ]),
+            &builds(&["ay", "clean", "nn", "ny", "trust-mc", "ty"]),
+            &names(&["trust"]),
+        );
+        assert_eq!(
+            unexplained,
+            vec![
+                "trust-cg".to_string(),
+                "trust-ir".to_string(),
+                "trust-vc".to_string()
+            ],
+            "the siblings the suppressed compiler took with it must be named"
+        );
+        assert_eq!(
+            on_purpose,
+            vec!["trust".to_string()],
+            "the ledger accounts for the compiler itself, and that must be said out loud"
+        );
+    }
+
+    /// Fail-quiet: with no cached index there is no trustworthy answer about what SHOULD
+    /// be installed, and inventing one would turn an unreachable network into a pile of
+    /// phantom missing programs.
+    #[test]
+    fn no_cached_index_invents_no_missing_programs() {
+        let l = layout("no-index");
+        let (unexplained, on_purpose) = missing_against_index(&l, &builds(&["ay"]));
+        assert!(unexplained.is_empty() && on_purpose.is_empty());
+        let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
     #[test]
@@ -1595,6 +1787,7 @@ mod tests {
                 enabled: true,
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
+                seams: Vec::new(),
                 programs,
             },
         )
@@ -1679,6 +1872,7 @@ mod tests {
                 enabled: true,
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
+                seams: Vec::new(),
                 programs,
             },
         )
@@ -1767,6 +1961,7 @@ mod tests {
             enabled: true,
             index_source: "x/y".into(),
             outcome: "up to date".into(),
+            seams: Vec::new(),
             programs,
         };
         crate::status::write(&layout, &status).unwrap();
@@ -1904,6 +2099,7 @@ mod tests {
                 enabled: true,
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
+                seams: Vec::new(),
                 programs,
             },
         )

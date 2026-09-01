@@ -199,7 +199,7 @@ fn image_and_window_remain_disjoint_capture_apis() {
         "Wake::CaptureAuxWindow {",
     );
     assert!(
-        window_dispatch.contains("self.capture_window(path, cancel, reply);"),
+        window_dispatch.contains("self.capture_window(handoff, path, cancel, reply);"),
         "Wake::CaptureWindow must close over App::capture_window"
     );
 

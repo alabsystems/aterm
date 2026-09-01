@@ -128,6 +128,7 @@ fn render(script: &Script, voice: SoundVoice, secs: f32) -> Vec<f32> {
                 gain: 0.4,
                 tone: Tone::Technical,
                 bed: false,
+                shifted: false,
             });
             next += 1;
         }

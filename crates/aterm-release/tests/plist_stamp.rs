@@ -110,6 +110,89 @@ fn untouched_template_keys_survive_verbatim() {
     assert!(out.contains("<key>NSHighResolutionCapable</key>"), "{out}");
 }
 
+/// The seven TCC usage strings (design §3.2). They are static template keys —
+/// `stamp_info_plist` never names them — so the only way they can be lost is
+/// template drift or a stamp that rewrites the wrong `<string>`.
+const USAGE_KEYS: [&str; 7] = [
+    "NSDocumentsFolderUsageDescription",
+    "NSDesktopFolderUsageDescription",
+    "NSDownloadsFolderUsageDescription",
+    "NSNetworkVolumesUsageDescription",
+    "NSRemovableVolumesUsageDescription",
+    "NSFileProviderDomainUsageDescription",
+    "NSAppDataUsageDescription",
+];
+
+#[test]
+fn tcc_usage_strings_are_present_in_the_committed_template() {
+    let template = real_template();
+    for key in USAGE_KEYS {
+        assert!(
+            template.contains(&format!("<key>{key}</key>")),
+            "apps/aterm-mac/Info.plist lost {key}"
+        );
+    }
+}
+
+#[test]
+fn tcc_usage_strings_survive_stamping() {
+    // The stamp is textual replace-or-insert, so a drifted template could in
+    // principle rewrite a NEIGHBOURING <string>. Assert each key still carries
+    // a non-empty sentence, once, after a full stamp.
+    let out = stamp_real(Some("aterm"));
+    for key in USAGE_KEYS {
+        let key_tag = format!("<key>{key}</key>");
+        assert_eq!(
+            out.matches(&key_tag).count(),
+            1,
+            "{key} duplicated or lost: {out}"
+        );
+        let after = out.find(&key_tag).expect("key present") + key_tag.len();
+        let rest = &out[after..];
+        let sstart = rest.find("<string>").expect("a <string> follows") + "<string>".len();
+        let send = rest.find("</string>").expect("terminated <string>");
+        let sentence = &rest[sstart..send];
+        assert!(
+            !rest[..sstart].contains("<key>"),
+            "{key}'s <string> belongs to a later key: {out}"
+        );
+        // aterm's voice: it names the real cause rather than leaving Apple's
+        // bare default. If this ever shrinks to a stub the dialog silently
+        // loses the only sentence that explains who is actually asking.
+        assert!(
+            sentence.contains("inside aterm"),
+            "{key} no longer names aterm as the cause: {sentence}"
+        );
+        assert!(
+            sentence.ends_with('.'),
+            "{key} is not a sentence: {sentence}"
+        );
+    }
+}
+
+#[test]
+fn tcc_usage_strings_survive_a_re_stamp() {
+    // A --resume re-entry stamps an already-stamped plist; the second pass must
+    // not disturb the static keys either.
+    let once = stamp_real(Some("aterm"));
+    let twice = bundle::stamp_info_plist(
+        &once,
+        "0.3.0",
+        1_783_918_102,
+        "com.aterm.aterm.dev",
+        "bbbbbbbbbbbb",
+        Some("aterm"),
+    )
+    .expect("re-stamp");
+    for key in USAGE_KEYS {
+        assert_eq!(
+            twice.matches(&format!("<key>{key}</key>")).count(),
+            1,
+            "{key} lost or duplicated on re-stamp: {twice}"
+        );
+    }
+}
+
 #[test]
 fn stamping_twice_replaces_instead_of_duplicating() {
     // A --resume re-entry may stamp an already-stamped plist: the second pass

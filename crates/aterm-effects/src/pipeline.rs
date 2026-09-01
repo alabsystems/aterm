@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The **web-embedder effects pipeline**: one struct that owns every effect
-//! state machine (cursor aurora + comet trail + sparkle words + PHOSPHOR
-//! matrix rain) plus their
-//! resolved configs and per-frame scratch buffers, and applies them onto a
-//! [`RenderInput`] — the exact wiring `aterm-gui`'s `redraw_window` performs,
-//! packaged for hosts without an event loop (`aterm-wasm`, `aterm-gpu-web`).
+//! The **effects pipeline** — THE ONE DRIVER of the effect engines: one struct
+//! that owns every effect state machine (cursor aurora + comet trail + sparkle
+//! words + PHOSPHOR matrix rain + the resident rainbow kitty PET through
+//! [`CompanionOwner`]) plus their resolved configs and per-frame scratch
+//! buffers, and applies them onto a [`RenderInput`] — the exact wiring
+//! `aterm-gui`'s `redraw_window` performs, packaged for hosts without an event
+//! loop (`aterm-wasm`, `aterm-gpu-web`).
+//!
+//! Owner, 2026-08-30: *"first, you need to migrate the pet from the app and
+//! move it into the engine"*. The pet's driver lives in `companion.rs`; this
+//! pipeline SENSES for it before the word engine ticks and EMITS it after
+//! (`docs/DESIGN-host-boundary-2026-08-30.md` §3, Phase 1), so the website's
+//! `/terminal` and — from Phase 4 — the native window run the same code.
 //!
 //! ## Animation-drive contract (host rAF, engine idle-to-zero)
 //!
@@ -40,13 +47,67 @@ use aterm_render::{
     GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
 };
 
+use crate::companion::{CompanionOwner, CompanionRung, ContrastFallback, GlowOwnership, PetFacts};
 use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST};
 use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
+use crate::host::{
+    CaptureMode, ChromeGeom, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts,
+    Visibility, Wake,
+};
+use crate::kitty_pet::{PetArrival, PetSpecies};
+use crate::kitty_registry::KittyLook;
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
     RainVisibility,
 };
+use crate::output_streak::{MAX_COMETS, OutputStreak, StreakConfig, TAIL_MAX, TAIL_MIN};
 use crate::word_decorations::{DecoConfig, EffectGeom, Resolved, SelView, WordDecorations};
+
+/// The COHERENT cold-start ground pair for `dark_theme: true` — the
+/// documented default palette. What `new()` seeds the glow fold with, and what
+/// an UNSET host ground (`COLOR_UNSET`) masks back to wherever a resolved
+/// colour is required: never `0`/`0`, which is `fg == bg`, the conceal-shaped
+/// pair the glyph tint stands down on.
+const COLD_THEME_FG: u32 = 0x00C8_D3F5;
+const COLD_THEME_BG: u32 = 0x001A_1B26;
+
+/// The CURSOR colour the pet's contrast sampler falls back to over blank
+/// glass — the native `cursor_color_u32` (`terminal_frame_colors` →
+/// `terminal_cursor_rgb`, aterm-gui `app_render.rs:12457-12467`). A host
+/// stamps that same fact into `RenderInput::cursor_color`, but the engine
+/// snapshot leaves the `COLOR_UNSET` sentinel there whenever the frame is
+/// not cursor-authoritative (aterm-core `render_cells.rs:1383-1392`), and a
+/// sentinel is not a colour: its high byte read as ink is pure noise.
+///
+/// Owner ruling, 2026-08-31: the fallback is the TERMINAL's own resolution —
+/// `term.cursor_color().unwrap_or_else(|| term.default_foreground())`, the
+/// exact expression both native call sites use — not the glow's resolved
+/// cursor colour, which is an EFFECT config (a pinned hue, or the live
+/// cursor only while `glow_color_from_cursor` holds) and would tint the cat
+/// with the wake's palette on any frame the terminal declined to stamp.
+/// Masked to `0x00RRGGBB`.
+#[inline]
+#[must_use]
+fn pet_contrast_cursor(input_cursor_color: u32, term_cursor_color: u32) -> u32 {
+    if input_cursor_color == aterm_core::render::COLOR_UNSET {
+        term_cursor_color & 0x00FF_FFFF
+    } else {
+        input_cursor_color & 0x00FF_FFFF
+    }
+}
+
+/// The terminal's own cursor colour, packed — the native
+/// `terminal_cursor_rgb`/`terminal_cursor_color` pair (aterm-gui
+/// `app_render.rs:12457-12467`), verbatim: the OSC 12 / configured cursor
+/// colour, else the default foreground.
+#[inline]
+#[must_use]
+fn terminal_cursor_color(term: &Terminal) -> u32 {
+    let c = term
+        .cursor_color()
+        .unwrap_or_else(|| term.default_foreground());
+    aterm_render::rgb_to_u32([c.r, c.g, c.b])
+}
 
 /// Brighten a packed `0x00RRGGBB` by `f` (the native accent derivation).
 fn brighten(c: u32, f: f32) -> u32 {
@@ -125,8 +186,16 @@ pub struct EffectsPipeline {
     /// pipeline. `None` is a silent baseline, never a synthetic scroll.
     cursor_scroll_state: Option<ContentScrollState>,
     /// Last frame geometry bound to the retained cursor engines. First sample
-    /// baselines silently; every later difference retires both engines.
+    /// baselines silently; every later difference retires both engines and
+    /// the pet's SURFACE — never its session-keyed latches (a resize is not
+    /// a new terminal).
     cursor_coordinate_space: Option<CursorCoordinateSpace>,
+    /// The native `WindowState::cursor_effect_coordinate_space`: `(terminal
+    /// identity, alternate screen)` — WHO the retained light belongs to, as
+    /// distinct from the geometry it was measured in. First sample baselines
+    /// silently; every later difference is the OWNER edge
+    /// ([`Self::sync_cursor_owner_space`]).
+    cursor_owner_space: Option<(u64, bool)>,
 
     glow: CursorGlow,
     glow_cfg: GlowConfig,
@@ -203,6 +272,24 @@ pub struct EffectsPipeline {
     free_scratch: Vec<aterm_core::render::FreeSprite>,
     nova_scratch: Vec<GlowQuad>,
 
+    /// THE RESIDENT PET's one driver (`companion.rs`): the brain, the look
+    /// verdict, the session-keyed latches, the pointer shadow and this
+    /// frame's hit rect. Disabled at construction — the byte-identical-off
+    /// posture — and opted in through [`Self::set_cursor_pet`].
+    companion: CompanionOwner,
+    /// The RAW glow style string named a pet at the last
+    /// [`Self::set_cursor_glow`] (`GlowStyle::style_names_any_pet`), captured
+    /// beside `ribbon_tall` because the parsed enum cannot tell
+    /// `rainbow kitty` (the resident) from `rainbow kitty flying` (the earned
+    /// head): the pet's ownership law reads the spelling, not the variant.
+    pet_style_named: bool,
+    /// PRISM WAKE output-streak engine; `None` while disabled so an off
+    /// pipeline carries zero streak state (rain's zero-cost-off posture).
+    streak: Option<Box<OutputStreak>>,
+    /// The streak knobs, kept across off/on toggles (`enabled` mirrors
+    /// `streak.is_some()` — the `rain_cfg` posture).
+    streak_cfg: StreakConfig,
+
     /// PHOSPHOR rain engine; `None` while disabled so an off pipeline carries
     /// zero rain state (the zero-cost-off posture).
     rain: Option<Box<MatrixRain>>,
@@ -240,6 +327,7 @@ impl EffectsPipeline {
             focused: true,
             cursor_scroll_state: None,
             cursor_coordinate_space: None,
+            cursor_owner_space: None,
             glow: CursorGlow::default(),
             glow_cfg: GlowConfig {
                 // The cold-start style is Lumen, which has no ribbon at all,
@@ -252,8 +340,8 @@ impl EffectsPipeline {
                 // suppresses on, silently killing the layer in every fixture
                 // that never folds a real ground in. Overwritten each frame by
                 // the fold in `apply`.
-                theme_fg: 0x00C8_D3F5,
-                theme_bg: 0x001A_1B26,
+                theme_fg: COLD_THEME_FG,
+                theme_bg: COLD_THEME_BG,
                 dark_theme: true,
                 enabled: false,
                 style: GlowStyle::Lumen,
@@ -304,6 +392,10 @@ impl EffectsPipeline {
             ink_scratch: Vec::new(),
             free_scratch: Vec::new(),
             nova_scratch: Vec::new(),
+            companion: CompanionOwner::default(),
+            pet_style_named: false,
+            streak: None,
+            streak_cfg: StreakConfig::default(),
             rain: None,
             rain_cfg: RainConfig::default(),
             rain_visibility: RainVisibility::Focused,
@@ -407,12 +499,18 @@ impl EffectsPipeline {
     /// `true` while any effect is animating. Hosts must also consult
     /// [`Self::next_deadline_ms`]: rain is active at its own 12/30 Hz cadence,
     /// not at the display's 60/120 Hz rAF rate.
+    ///
+    /// THE CADENCE LAW for the pet: it is a resident, so its term is
+    /// `needs_frames()` (something is moving), never the brain's `is_active`
+    /// (a cat exists) — a sleeping cat pins no frame lane.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.trail.is_active()
             || self.glow.is_active()
             || self.decos.is_active(self.now())
+            || self.companion.needs_frames()
             || self.rain.as_ref().is_some_and(|r| r.is_active())
+            || self.streak.as_ref().is_some_and(|s| s.is_active())
     }
 
     /// Milliseconds until the next scheduled engine wake, or `None` when an
@@ -427,7 +525,7 @@ impl EffectsPipeline {
     #[must_use]
     pub fn next_deadline_ms(&self) -> Option<f64> {
         let now = self.now();
-        if self.trail.is_active() || self.decos.is_active(now) {
+        if self.trail.is_active() || self.decos.is_active(now) || self.companion.needs_frames() {
             return None;
         }
         // Glow: MOVING light needs display-rAF; the ember/kill-hint-only tail
@@ -447,6 +545,20 @@ impl EffectsPipeline {
         match (glow_ms, rain_ms) {
             (Some(g), Some(r)) => Some(g.min(r)),
             (g, r) => g.or(r),
+        }
+    }
+
+    /// One scheduling verdict ([`Wake`]) for the winit deadline fold and the
+    /// wasm WF-1 gate — the two predicates above as a single value:
+    /// `Frames` while a frame-cadence lane is live (`is_active` with no exact
+    /// deadline), `At` for an exact engine wake (`next_deadline_ms`), `Idle`
+    /// once everything has settled (0% idle).
+    #[must_use]
+    pub fn wake(&self) -> Wake {
+        match self.next_deadline_ms() {
+            Some(ms) => Wake::At(self.now() + Duration::from_secs_f64(ms / 1000.0)),
+            None if self.is_active() => Wake::Frames,
+            None => Wake::Idle,
         }
     }
 
@@ -498,6 +610,12 @@ impl EffectsPipeline {
             self.trail_scratch.clear();
             self.pending_keys = 0;
             self.typing_cadence = TypingCadence::default();
+            // The resident pet retires its coordinate space on the same edge
+            // (the native presentability edge, `lib.rs` Focused(false) —
+            // SURFACE ONLY: the terminal under it is the same one, so the
+            // command it was watching finish is still its news) and returns
+            // as a fresh sighting wearing the same coat.
+            self.companion.retire_coordinate_space();
         }
         self.rain_visibility = v;
         if let Some(rain) = self.rain.as_deref_mut() {
@@ -571,11 +689,13 @@ impl EffectsPipeline {
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT
-    /// hue-ramp (gated by the `bell_alert` knob engine-side).
+    /// hue-ramp (gated by the `bell_alert` knob engine-side), and the resident
+    /// pet's startle.
     pub fn note_bell(&mut self) {
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.note_bell();
         }
+        self.companion.note_bell(self.now());
     }
 
     /// Embedded host observed wheel/PgUp while an alternate-screen TUI is
@@ -599,13 +719,19 @@ impl EffectsPipeline {
     }
 
     /// Whether any effect surface is enabled (sparkle and rain count even
-    /// while quiescent — the master switches are the honest gates).
+    /// while quiescent — the master switches are the honest gates). The pet
+    /// has no master of its own: it is OWNED through the trail master and the
+    /// pet spelling, so its term here is the brain still owing frames — the
+    /// one frame it needs to feel its owner go away before the all-off arm
+    /// retires it.
     #[must_use]
     pub fn enabled_any(&self) -> bool {
         self.glow_cfg.enabled
             || self.trail_cfg.enabled
             || self.sparkle.is_some()
             || self.rain.is_some()
+            || self.companion.needs_frames()
+            || self.streak.is_some()
     }
 
     // --- cursor wake ------------------------------------------------------
@@ -655,6 +781,19 @@ impl EffectsPipeline {
         let accent = accent.map_or_else(|| brighten(color, 1.5), |a| a & 0x00FF_FFFF);
         self.glow_color_from_cursor = color_from_cursor;
         self.glow_accent_from_cursor = accent_from_cursor;
+        // The PET is a SPELLING of the style, exactly like `ribbon_tall`
+        // below: captured from the raw string on every reconfigure, because
+        // the parsed enum cannot tell `rainbow kitty` (the resident) from
+        // `rainbow kitty flying` (the earned head). The species is a spelling
+        // too (`rainbow dog pet`) — the dog is a skin of the pet, never an
+        // eleventh trail — and is applied at the owner's next sense.
+        self.pet_style_named = GlowStyle::style_names_any_pet(style);
+        self.companion
+            .set_species(if GlowStyle::style_names_dog_pet(style) {
+                PetSpecies::Dog
+            } else {
+                PetSpecies::Cat
+            });
         self.glow_cfg = GlowConfig {
             // The ribbon's presentation is a SPELLING of the style (like the pet
             // companions), so it re-derives from the raw string on every
@@ -767,6 +906,98 @@ impl EffectsPipeline {
         }
     }
 
+    // --- the resident pet ---------------------------------------------------
+
+    /// THE SEED DOOR: opt the resident pet in (or out). The look is
+    /// `KittyLook::for_launch(seed)` over a seed the HOST mints (`aterm_uds::
+    /// rand` natively, `crypto.getRandomValues` on the page) — the engine
+    /// stays clockless and dieless. `enabled = false` retires the body, the
+    /// hit rect and the frame lane at once. Off at construction. Resets the
+    /// look to the launch rung: a native host that holds a stronger verdict
+    /// calls [`Self::set_companion_look`] after it.
+    pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
+        self.companion.set_enabled_seed(enabled, seed);
+    }
+
+    /// The NATIVE look verdict dresses the pet until Phase 5: the `(coat,
+    /// iris)` pair the precedence law chose, the tenure gate's authorised
+    /// arrival, and the rung that won. The web never calls this.
+    pub fn set_companion_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
+        self.companion.set_look(pair, arrival, rung);
+    }
+
+    /// The pinned favourite (the Kitty Log's, host-side) — the precedence
+    /// law's top rung, always quiet. `None` on the web.
+    pub fn set_favourite(&mut self, look: Option<KittyLook>) {
+        self.companion.set_favourite(look);
+    }
+
+    /// THE MOTION POLICY, general: the host's STABLE reduce-motion preference
+    /// for every effect — sparkle words go static, rain stands down, the pet
+    /// is pinned at its station (drawn, but no chase, no gait, no arc). Never
+    /// a load-shed term: a shed is a request to spend less time drawing, and
+    /// raising this on a walking cat welds it to the caret.
+    /// [`Self::set_sparkle_reduced_motion`] and
+    /// [`Self::set_matrix_rain_reduced_motion`] are aliases of this setter.
+    pub fn set_reduced_motion(&mut self, on: bool) {
+        self.deco_cfg.reduced_motion = on;
+        self.refresh_sparkle_cfg();
+        self.rain_reduced_motion = on;
+        if let Some(rain) = self.rain.as_deref_mut() {
+            rain.set_reduced_motion(on);
+        }
+    }
+
+    /// The theme or palette authority changed (`set_theme` on the web hosts):
+    /// retire the pet's frozen contrast sample so its next appearance
+    /// re-samples the glass; behaviour, position and breed handoff continue.
+    pub fn invalidate_companion_colors(&mut self) {
+        self.companion.invalidate_colors();
+    }
+
+    /// The pointer moved to `(x, y)` in FRAME px (the canvas / window pixel
+    /// the host already has). Value-shadowed: returns `true` iff the stored
+    /// pointer changed, so the host bumps its frame gate only then and an
+    /// idle hover costs no render. A non-finite sample is dropped.
+    pub fn note_pointer_px(&mut self, x: f32, y: f32) -> bool {
+        self.companion.set_pointer(Some((x, y)))
+    }
+
+    /// The pointer left the surface. Returns `true` iff there was one.
+    pub fn note_pointer_leave(&mut self) -> bool {
+        self.companion.set_pointer(None)
+    }
+
+    /// A left press at `(x, y)` in FRAME px, asked FIRST (chrome-wins order):
+    /// [`PressOutcome::Pet`] means the press landed on the drawn cat and is
+    /// CONSUMED — it strokes the cat and never starts a selection;
+    /// [`PressOutcome::Pass`] means the host keeps routing. The stroke only
+    /// latches; the next `apply` acts on it (and the latch re-arms the frame
+    /// lane, so ask for that frame).
+    pub fn press_px(&mut self, x: f32, y: f32) -> PressOutcome {
+        self.companion.press(self.now(), (x, y))
+    }
+
+    /// The host's pet opt-in as last set.
+    #[must_use]
+    pub fn cursor_pet_enabled(&self) -> bool {
+        self.companion.enabled()
+    }
+
+    /// The alpha the last `apply` put on glass (`0` = no pet drawn) — the
+    /// observability twin of the hit rect.
+    #[must_use]
+    pub fn cursor_pet_alpha(&self) -> u8 {
+        self.companion.alpha()
+    }
+
+    /// The pet's drawn body this frame in FRAME px `(x0, x1, y0, y1)`, `None`
+    /// when nothing is drawn.
+    #[must_use]
+    pub fn companion_hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        self.companion.hit_rect()
+    }
+
     // --- sparkle words ----------------------------------------------------
 
     /// Master sparkle-words switch. Enabling compiles the lexicon (languages +
@@ -828,10 +1059,12 @@ impl EffectsPipeline {
 
     /// Force the static, non-animating path (no twinkle/jitter/pulse; novas
     /// collapse to the static glint) — the accessibility override the native
-    /// `reduced_motion` config flag drives.
+    /// `reduced_motion` config flag drives. An alias of
+    /// [`Self::set_reduced_motion`]: the preference is ONE host fact, so it
+    /// reaches every effect (the pet's station pin included) whichever
+    /// spelling the host uses.
     pub fn set_sparkle_reduced_motion(&mut self, on: bool) {
-        self.deco_cfg.reduced_motion = on;
-        self.refresh_sparkle_cfg();
+        self.set_reduced_motion(on);
     }
 
     /// Alt-screen suppression (native `[sparkle_words] suppress_in_alt_screen`,
@@ -1060,6 +1293,85 @@ impl EffectsPipeline {
         self.rain.is_some()
     }
 
+    /// Configure PRISM WAKE — the output streak (`crate::output_streak`). All
+    /// bands are clamped HERE as well as in the engine: an embedder must not be
+    /// able to reach past the ceiling ruling, and a clamp at only one of the two
+    /// layers is a clamp someone will eventually route around. `intensity`
+    /// 0..=1 (0 ⇒ reduced motion: reset, not dimmed), `tail` 4..=14,
+    /// `max_streaks` 1..=4, `idle_secs` 2..=120.
+    ///
+    /// Toggling `enabled` off drops the engine entirely (the rain D-1 posture),
+    /// so an off pipeline carries no streak state at all; the knobs survive the
+    /// round trip so re-enabling restores the same configuration.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call mirrors the native StreakConfig resolution; a builder would relocate the list"
+    )]
+    pub fn set_output_streak(
+        &mut self,
+        enabled: bool,
+        intensity: f32,
+        tail: u32,
+        max_streaks: u32,
+        idle_secs: u32,
+        sound: bool,
+        seed: u64,
+    ) {
+        self.streak_cfg = StreakConfig {
+            enabled,
+            intensity: if intensity.is_finite() {
+                intensity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            tail: tail.clamp(u32::from(TAIL_MIN), u32::from(TAIL_MAX)) as u16,
+            max_streaks: max_streaks.clamp(1, MAX_COMETS as u32) as u8,
+            idle_secs: idle_secs.clamp(2, 120) as f32,
+            sound,
+            ..self.streak_cfg
+        };
+        if enabled {
+            if self.streak.is_none() {
+                self.streak = Some(Box::new(OutputStreak::new(seed)));
+            }
+        } else {
+            self.streak = None;
+        }
+    }
+
+    /// Fold the resolved theme into the streak. Called per frame by the host so
+    /// OSC 11/12 recolors are honoured automatically, and deliberately WITHOUT
+    /// resetting the engine: a theme switch re-tints the comets already in
+    /// flight rather than killing them (the nord-regression law).
+    pub fn set_output_streak_theme(
+        &mut self,
+        dark_theme: bool,
+        theme_bg: u32,
+        theme_fg: u32,
+        theme_cursor: u32,
+    ) {
+        self.streak_cfg.dark_theme = dark_theme;
+        self.streak_cfg.theme_bg = theme_bg & 0x00FF_FFFF;
+        self.streak_cfg.theme_fg = theme_fg & 0x00FF_FFFF;
+        self.streak_cfg.theme_cursor = theme_cursor & 0x00FF_FFFF;
+    }
+
+    /// Reduced motion for the streak: amplitude zero, which the engine treats
+    /// as a full RESET (pin, not ease) — no quads, no cue, fingerprint 0.
+    pub fn set_output_streak_reduced_motion(&mut self, reduced: bool) {
+        self.streak_cfg.intensity = if reduced { 0.0 } else { 1.0 };
+    }
+
+    /// Forward one keystroke to the streak's ECHO DISCOUNT. A host that never
+    /// calls this still gets the `input_hot` arm, but loses the sharper
+    /// keystroke-stamp arm — so call it wherever the host stamps typing.
+    pub fn note_output_streak_keystroke(&mut self) {
+        let now = self.now();
+        if let Some(s) = self.streak.as_deref_mut() {
+            s.note_keystroke(now);
+        }
+    }
+
     /// Configure the rain knobs (native `[matrix_rain]`), kept across off/on
     /// toggles. Clamps mirror the native resolver (the engine re-clamps
     /// defensively): `fps` 12..=60, `density` 1..=12, `speed`/`trail` 1..=10,
@@ -1148,12 +1460,10 @@ impl EffectsPipeline {
     }
 
     /// OS/config reduce-motion for rain: the engine emits nothing, fp 0,
-    /// inactive (the sparkle `reduced_motion` twin).
+    /// inactive. An alias of [`Self::set_reduced_motion`] (the sparkle
+    /// setter's twin): one host fact, every effect.
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
-        self.rain_reduced_motion = on;
-        if let Some(rain) = self.rain.as_deref_mut() {
-            rain.set_reduced_motion(on);
-        }
+        self.set_reduced_motion(on);
     }
 
     /// Apply one cumulative terminal scroll snapshot to both cursor engines.
@@ -1201,6 +1511,57 @@ impl EffectsPipeline {
             self.trail.reset();
             self.glow.reset();
             self.cursor_scroll_state = Some(scroll);
+            // SURFACE ONLY. The pet's `(col, row)` is pane-local to the OLD
+            // grid, so its coordinate space — body, hit rect — retires; the
+            // session-keyed COMMAND/CONTENT latches do NOT.
+            //
+            // Owner ruling, 2026-08-31: this called `retire_owner()`, whose
+            // native warrant (`app_render.rs`
+            // `sync_cursor_effect_coordinate_space`, which nulls
+            // `pet_last_cmd` / `pet_content_seq` beside its retire) is keyed
+            // on `(terminal_id, alternate_screen)` — the OWNER, not the
+            // geometry. Wired to this GEOMETRY fence it swallowed a pending
+            // completion whenever the browser resized or the font size
+            // changed between a command finishing and the next frame: the
+            // probe re-baselined silently and the cat never drooped or
+            // cheered for the command that had just ended. A resize replaces
+            // no terminal and invents no command stream. The owner edge has
+            // its own fence now ([`Self::sync_cursor_owner_space`]).
+            self.companion.retire_coordinate_space();
+        }
+        changed
+    }
+
+    /// THE OWNER FENCE — the native `sync_cursor_effect_coordinate_space`
+    /// (`app_render.rs`), keyed exactly as native keys it: `(terminal_id,
+    /// alternate_screen)`. The terminal under this surface was REPLACED, or
+    /// it swapped between its main and alternate screen, so the retained
+    /// light is anchored in a plane that no longer exists AND the
+    /// command/content probes describe the OLD stream — they re-baseline
+    /// silently ([`CompanionOwner::retire_owner`]) so the previous owner's
+    /// last completion cannot replay as the new one's news. The first
+    /// observation is a silent baseline; the scroll snapshot is re-baselined
+    /// with it so one edge cannot also replay as content motion.
+    fn sync_cursor_owner_space(
+        &mut self,
+        current: (u64, bool),
+        scroll: ContentScrollState,
+    ) -> bool {
+        let changed = self
+            .cursor_owner_space
+            .is_some_and(|previous| previous != current);
+        self.cursor_owner_space = Some(current);
+        if changed {
+            // The native `retire_torn_cursor_fx` half of the same edge. The
+            // alt-screen swap also invalidates `Terminal`'s host-coordinate
+            // scroll clock, which would retire both engines through
+            // [`Self::sync_content_scroll`]; a bare identity change would
+            // not, and both engines' cells are equally meaningless on the
+            // replacement owner.
+            self.trail.reset();
+            self.glow.reset();
+            self.cursor_scroll_state = Some(scroll);
+            self.companion.retire_owner();
         }
         changed
     }
@@ -1239,6 +1600,11 @@ impl EffectsPipeline {
             // historical scroll as current-frame motion.
             self.cursor_scroll_state = Some(content_scroll_state);
             self.cursor_coordinate_space = Some(coordinate_space);
+            self.cursor_owner_space = Some((term.render_identity(), term.is_alternate_screen()));
+            // An opted-in pet with no owner (the trail master off) is retired
+            // here — idempotent, and the last frame it owed is the one that
+            // brought us here — so an off pipeline carries no pet state.
+            self.companion.retire();
             input.cursor_trail.clear();
             input.cursor_glow_add.clear();
             input.glow_halo.clear();
@@ -1264,14 +1630,27 @@ impl EffectsPipeline {
         // space for the entire frame.
         let coordinate_changed =
             self.sync_cursor_coordinate_space(coordinate_space, content_scroll_state);
-        if !coordinate_changed {
-            let _ = self.sync_content_scroll(content_scroll_state);
-        }
+        let alt = term.is_alternate_screen();
+        // …AND THE OWNER FENCE BESIDE IT, on the fact the native fence
+        // actually keys on. Two fences, two retires: the geometry above is a
+        // surface fact (the pet keeps feeling the command stream across a
+        // resize), this one is the stream itself changing hands.
+        let owner_changed =
+            self.sync_cursor_owner_space((term.render_identity(), alt), content_scroll_state);
+        // The decision is KEPT, not discarded: `Translate` (new scrollback
+        // rows) is the `scrolled` term of the pet's perk-and-watch burst law.
+        // A changed coordinate space or owner re-baselined the snapshot above
+        // and takes no scroll reading this frame.
+        let scrolled = !coordinate_changed
+            && !owner_changed
+            && matches!(
+                self.sync_content_scroll(content_scroll_state),
+                ContentScrollDecision::Translate(_)
+            );
         // Invalidation resets both engines, including their cached screen
         // context. Re-feed the current terminal context after that fence and
         // before any hint replay/tick so an alt-screen TUI never falls through
         // the more permissive main-screen re-anchor classifier for one frame.
-        let alt = term.is_alternate_screen();
         self.glow.note_context(alt);
         self.trail.note_context(alt);
         let now = self.now();
@@ -1475,6 +1854,111 @@ impl EffectsPipeline {
         .then(|| self.glow.forge_fill())
         .flatten();
 
+        // ── THE RESIDENT PET, SENSED BEFORE THE WORD ENGINE TICKS ─────────
+        // Open the host FRAME first (the one-body law's door, the per-frame
+        // bake budget), then let the owner run its level rules and tick the
+        // brain UNCONDITIONALLY — its yield box must be THIS frame's body
+        // when the word engine below decides what an ambient cat may stack
+        // on. The facts are read from the terminal ONCE, here, by the one
+        // reader every host shares; the caret and viewport are then
+        // overwritten with the pipeline's own snapshot-coherence rule (the
+        // cell plane and the caret the pet chases agree, or the pet chases
+        // nothing this frame).
+        self.decos.begin_host_frame();
+        let geom = EffectGeom {
+            cell_w: cell_w as u16,
+            cell_h: cell_h as u16,
+            rows: rows as u16,
+            cols: cols as u16,
+        };
+        let mut facts = TerminalFacts::read(term, term.render_identity(), scrolled);
+        facts.caret = cur;
+        facts.cursor_visible = cur.is_some();
+        facts.live_viewport = live_viewport;
+        facts.display_offset = if cursor_snapshot_coherent {
+            input.display_offset
+        } else {
+            facts.display_offset
+        };
+        let host = HostFrameInput {
+            now,
+            visibility: match self.rain_visibility {
+                RainVisibility::Focused => Visibility::Focused,
+                RainVisibility::VisibleUnfocused => Visibility::VisibleUnfocused,
+                RainVisibility::Hidden => Visibility::Hidden,
+            },
+            // THE MOTION POLICY ONLY — the host's stable preference; the
+            // owner folds focus in itself. Never a load term.
+            reduced_motion: self.deco_cfg.reduced_motion,
+            serious: false,
+            shed_envelope: 1.0,
+            chrome: ChromeGeom {
+                pad: self.chrome_pad,
+                head: self.chrome_head,
+                ..ChromeGeom::default()
+            },
+            // The owner holds the pointer it was handed through
+            // `note_pointer_px`; the per-frame field is for hosts that feed
+            // it with the frame.
+            pointer_px: None,
+            capture: CaptureMode::Present,
+            sound_allowed: false,
+            geometry: FrameGeom {
+                rows: geom.rows,
+                cols: geom.cols,
+                cell_w: geom.cell_w,
+                cell_h: geom.cell_h,
+                origin_px: (
+                    i32::from(self.chrome_pad),
+                    i32::from(self.chrome_pad) + i32::from(self.chrome_head),
+                ),
+            },
+        };
+        let pet = self.companion.sense(
+            PetFacts {
+                facts: &facts,
+                host: &host,
+                glow: GlowOwnership {
+                    enabled: self.glow_cfg.enabled,
+                    style: self.glow_cfg.style,
+                    style_raw_names_pet: self.pet_style_named,
+                },
+                // The web has no song and no flying head: the pet owns every
+                // frame it is admitted to.
+                sing: SingFacts::default(),
+                focused: self.focused,
+            },
+            &mut self.decos,
+        );
+        // THE GRIEF GATE (gauntlet F4a; the native single-pane block's
+        // `if ws.cursor_pet.grieving() { ws.cursor_glow.hush_fanfare(..) }`):
+        // a failed command's droop window hushes the caret-jump fanfare —
+        // no party ring at a failure. Every frame the brain grieves the
+        // rainbow momentum is zeroed. The glow ticked ABOVE, as it does
+        // natively (its tick precedes the pet block there too), so the hush
+        // lands on the next tick's momentum read — the one-tick latency the
+        // native frame has too, and the droop lasts many frames.
+        //
+        // WHERE THIS READ SITS, exactly (owner ruling, 2026-08-31 — the
+        // comment above used to claim the native ordering and had it
+        // inverted). Native reads `grieving()` BETWEEN the completion note
+        // (`app_render.rs:26190-26197`) and the brain tick (`:26254`); this
+        // pipeline reads it AFTER [`CompanionOwner::sense`], which FUSES
+        // those two — the latch and the unconditional tick are one call, and
+        // native's read point is not reachable from outside it. The LEADING
+        // edge is therefore identical: `note_command_done` sets
+        // `pending_sulk` inside `sense`, so the failure's own frame hushes
+        // in both, which is the whole of F4a (the fanfare fires on the
+        // failure prompt). Only the TRAILING edge differs, and this side is
+        // one frame EARLY, never late: the tick that ends the droop is
+        // already applied when this reads, so the hush is released on the
+        // frame native spends hushing its last. Moving the read above
+        // `sense` would trade that harmless frame for a harmful one — the
+        // hush would then miss the failure frame itself.
+        if self.companion.grieving() {
+            self.glow.hush_fanfare(now);
+        }
+
         // Sparkle words: rescan only when the grid changed (damage epoch),
         // animate every applied frame. Alt-screen handling mirrors native:
         // decorated by default, suppressed only when the knob opts back in.
@@ -1530,12 +2014,6 @@ impl EffectsPipeline {
                 // without this the epoch freezes and stale occurrences stick).
                 term.take_damage();
                 damage_consumed = true;
-                let geom = EffectGeom {
-                    cell_w: cell_w as u16,
-                    cell_h: cell_h as u16,
-                    rows: rows as u16,
-                    cols: cols as u16,
-                };
                 let sel_view = SelView {
                     sel: term.text_selection(),
                     display_offset: term.grid().display_offset() as i32,
@@ -1544,10 +2022,11 @@ impl EffectsPipeline {
                     now,
                     &rs.cfg,
                     geom,
-                    // The web pipeline draws no cursor companion, so no word is
-                    // ever answered by one — every feline occurrence keeps its
-                    // ambient peek.
-                    None,
+                    // The companion's body rect, handed here by CompanionOwner
+                    // (DESIGN-host-boundary-2026-08-30 Phase 1): the feline word
+                    // under the pet's body yields to it; every other occurrence
+                    // keeps its ambient peek.
+                    pet.companion,
                     Some(sel_view),
                     self.focused,
                     &mut self.deco_scratch,
@@ -1563,6 +2042,45 @@ impl EffectsPipeline {
             self.nova_scratch.clear();
             0
         };
+        // WORD-CAT BAT: the word engine's positioned peek landings, drained
+        // PROMPTLY after its tick (they clear at the next tick's start),
+        // reach the brain as fractional cells. Forwarded unconditionally —
+        // the brain range-checks and its TTL retires them.
+        self.companion.note_peeks(
+            now,
+            self.decos.drain_peek_cues(),
+            (geom.cell_w, geom.cell_h),
+        );
+        // THE PET'S EMISSION — OUTSIDE the sparkle branch (Sparkle Words does
+        // not own this lifecycle), into the SAME scratch the swap below
+        // publishes, after the sparkle-off and alt-suppressed arms have
+        // cleared it. The contrast fallbacks are RESOLVED colours: an unset
+        // host ground (`COLOR_UNSET`, which the glow fold passes through
+        // unmasked on purpose) is a sentinel, not a colour, and masks back to
+        // the cold-start ground instead of reading as pure black; the ink
+        // slot is the terminal's CURSOR colour, resolved from the terminal
+        // exactly as native resolves `cursor_color_u32` when the snapshot
+        // declined to stamp one (`pet_contrast_cursor`).
+        let term_cursor_color = terminal_cursor_color(term);
+        let (pet_fp, _sync) = self.companion.emit(
+            &pet,
+            &input.cells,
+            ContrastFallback {
+                bg: if input.default_bg == aterm_core::render::COLOR_UNSET {
+                    COLD_THEME_BG
+                } else {
+                    input.default_bg & 0x00FF_FFFF
+                },
+                cursor: pet_contrast_cursor(input.cursor_color, term_cursor_color),
+                accent: self.glow_cfg.accent,
+            },
+            &mut self.decos,
+            &mut self.free_scratch,
+        );
+        // `emit` already rotates its pet-cursor term; the brain's own frame
+        // fingerprint rides beside it so a frame that moved the pet without
+        // drawing it (a fade's last step) still moves the repaint key.
+        let deco_fp = deco_fp ^ pet_fp ^ pet.fp.rotate_left(53);
         std::mem::swap(&mut input.word_decorations, &mut self.deco_scratch);
         std::mem::swap(&mut input.ink, &mut self.ink_scratch);
         // Overlay Phase 4: the engine no longer produces legacy cat quads —
@@ -1632,12 +2150,6 @@ impl EffectsPipeline {
                 self.rain_add_scratch.clear();
                 0
             } else {
-                let geom = EffectGeom {
-                    cell_w: cell_w as u16,
-                    cell_h: cell_h as u16,
-                    rows: rows as u16,
-                    cols: cols as u16,
-                };
                 let tick_input = RainTickInput {
                     cursor: cur,
                     // No damage-recency tracking on the web path (v1): a
@@ -1673,15 +2185,55 @@ impl EffectsPipeline {
             self.rain.as_mut().and_then(|r| r.rain_atlas())
         };
 
+        // PRISM WAKE. Appended to `nova_add` AFTER the word-decoration swap
+        // above, which is the whole co-residency discipline: the decorations
+        // keep sole ownership of `nova_scratch` and its clear, the streak only
+        // ever APPENDS to the channel already handed to `input`, and the two
+        // fingerprints fold independently — so disabling either engine can
+        // neither strand nor clear the other's quads. Order is fixed
+        // (decorations, then streak); the blend is additive, so it does not
+        // matter visually, but a fixed order keeps the frames byte-reproducible.
+        // Read every immutable term BEFORE borrowing the engine (`StreakConfig`
+        // is `Copy` precisely so the host can do this).
+        let streak_now = self.now();
+        let streak_geom = self.chrome_geom(rows, cols, cell_w, cell_h);
+        let streak_cfg = self.streak_cfg;
+        let streak_fp = if let Some(streak) = self.streak.as_deref_mut() {
+            let now = streak_now;
+            // `content_seq` advances on content mutation only — never on
+            // viewport scroll — which is what makes it an honest "something was
+            // written" clock rather than a "something moved" one.
+            streak.note_output_cells(
+                &input.cells,
+                input.cursor_row,
+                input.cursor_col,
+                rows,
+                now,
+                false,
+            );
+            let frame = streak.tick(now, streak_geom, &streak_cfg, &mut input.nova_add);
+            // Web hosts have no audio host at all; the cue is dropped here by
+            // design and disclosed, rather than silently queued forever.
+            let _ = frame.cue;
+            frame.fp
+        } else {
+            0
+        };
+
         // One folded fingerprint (rotations keep equal per-engine fps from
         // cancelling); host repaint keys only need "changed vs stable".
-        trail_fp ^ glow_fp.rotate_left(21) ^ deco_fp.rotate_left(42) ^ rain_fp.rotate_left(11)
+        trail_fp
+            ^ glow_fp.rotate_left(21)
+            ^ deco_fp.rotate_left(42)
+            ^ rain_fp.rotate_left(11)
+            ^ streak_fp.rotate_left(33)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_core::render::FreeSprite;
     use aterm_core::terminal::TerminalBuilder;
 
     const SYNTHWAVE: &str = include_str!("../assets/trail-packs/synthwave.toml");
@@ -1825,21 +2377,18 @@ mod tests {
             .ring_buffer_size(32)
             .build();
         let mut pipeline = EffectsPipeline::new();
-        pipeline.set_cursor_glow(
-            true,
-            "lumen",
-            None,
-            None,
-            400,
-            24,
-            0.9,
-            0.8,
-            true,
-            0x0050_FA7B,
-        );
+        // The pet's owner: the trail master on a pet spelling, plus the seed
+        // door — so the Tier-1 bind below projects the REAL resident.
+        rainbow_kitty_glow(&mut pipeline, "rainbow kitty");
+        pipeline.set_cursor_pet(true, 0x5EED);
         let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
         assert!(pipeline.trail.is_active(), "fixture owns classic geometry");
         assert!(pipeline.glow.is_active(), "fixture owns Glow geometry");
+        materialize_pet(&mut pipeline, &mut term, &mut input);
+        // The brain OWES a tick as history is entered — the model's
+        // `pet_brain_pending`, read from the real resident, not assumed.
+        let pet_brain_pending = pipeline.companion.brain().is_active();
+        assert!(pet_brain_pending, "fixture owns a live resident");
 
         term.process(&b"history\r\n".repeat(12));
         term.scroll_display(1);
@@ -1855,6 +2404,7 @@ mod tests {
         // A deliberately stale raw bit still cannot bypass the pipeline's
         // independent coordinate-class gate.
         input.cursor_visible = true;
+        pipeline.advance(33.0);
         pipeline.apply(&mut term, &mut input, 10, 19);
         assert!(
             !pipeline.trail.is_active()
@@ -1868,21 +2418,60 @@ mod tests {
                 && !input.cursor_visible,
             "history hard-clears every pipeline-owned cursor channel"
         );
+        assert!(
+            pipeline.cursor_pet_alpha() == 0
+                && pipeline.companion_hit_rect().is_none()
+                && input.free_sprites.is_empty(),
+            "history takes the pet off glass on the very first frame"
+        );
+        assert!(
+            pipeline.companion.brain().is_active(),
+            "…while its brain is still fading: the pet hides, it is not retired"
+        );
+        // THE BRAIN TICKS UNCONDITIONALLY: fed `caret: None` on every history
+        // frame it fades to zero and RELEASES the frame lane on its own. Only
+        // a ticked brain can get here — a brain nobody ticks keeps the alpha
+        // it had (the negative control below).
+        for _ in 0..40 {
+            if !pipeline.companion.needs_frames() {
+                break;
+            }
+            pipeline.advance(100.0);
+            term.cell_frame_into(&mut input, 5, 16);
+            pipeline.apply(&mut term, &mut input, 10, 19);
+            assert!(input.free_sprites.is_empty(), "history never draws the pet");
+        }
+        assert!(
+            !pipeline.companion.needs_frames() && !pipeline.companion.brain().is_active(),
+            "hidden-caret ticks let the resident fade out and release the scheduler"
+        );
 
         // Tier 1 for the pipeline-owned projection of the shared cursor
-        // viewport lifecycle. The GUI companion test binds the pet variables;
-        // this host binds Glow, classic trail, body/fill and DEC cursor.
+        // viewport lifecycle: Glow, classic trail, body/fill, DEC cursor —
+        // and the pet, projected from the real companion (alpha on glass,
+        // the brain's fade-out as the tick witness, `needs_frames` as the
+        // scheduler), not hard-coded.
         let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
         let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
         let mut history = charged.clone();
         history.insert("live_viewport", 0);
-        history.insert("glow_visible", 0);
-        history.insert("trail_visible", 0);
-        history.insert("cursor_body_visible", 0);
-        history.insert("pet_visible", 0);
-        history.insert("base_cursor_visible", 0);
-        history.insert("pet_brain_ticked", 1);
-        history.insert("scheduler_stuck", 0);
+        history.insert("glow_visible", i64::from(pipeline.glow.is_active()));
+        history.insert("trail_visible", i64::from(pipeline.trail.is_active()));
+        history.insert(
+            "cursor_body_visible",
+            i64::from(input.cursor_fill_override.is_some()),
+        );
+        history.insert("pet_visible", i64::from(pipeline.cursor_pet_alpha() > 0));
+        history.insert("pet_brain_pending", i64::from(pet_brain_pending));
+        history.insert("base_cursor_visible", i64::from(input.cursor_visible));
+        history.insert(
+            "pet_brain_ticked",
+            i64::from(!pipeline.companion.brain().is_active()),
+        );
+        history.insert(
+            "scheduler_stuck",
+            i64::from(pipeline.companion.needs_frames()),
+        );
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
@@ -1892,7 +2481,7 @@ mod tests {
             "EffectsPipeline exact history snapshot",
         );
         assert!(ok, "pipeline history projection rejected: {why}");
-        let mut forged_fill = history;
+        let mut forged_fill = history.clone();
         forged_fill.insert("cursor_body_visible", 1);
         let (ok, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
@@ -1903,6 +2492,877 @@ mod tests {
             "EffectsPipeline forged-fill negative control",
         );
         assert!(!ok, "a forged cursor fill cannot survive history");
+        // Pet negative controls: a body retained on glass in history, and a
+        // brain nobody ticked (still opaque, the lane pinned) — the two
+        // defects the wiring exists to make unreachable.
+        let mut retained_pet = history.clone();
+        retained_pet.insert("pet_visible", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &retained_pet,
+            Some("EnterHistory"),
+            "EffectsPipeline retained-pet negative control",
+        );
+        assert!(!ok, "a pet body cannot survive history");
+        let mut frozen_brain = history;
+        frozen_brain.insert("pet_brain_ticked", 0);
+        frozen_brain.insert("scheduler_stuck", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &frozen_brain,
+            Some("EnterHistory"),
+            "EffectsPipeline frozen-brain negative control",
+        );
+        assert!(
+            !ok,
+            "a brain that was not ticked in history pins the scheduler"
+        );
+    }
+
+    // ── the resident pet ────────────────────────────────────────────────────
+
+    /// The rainbow-kitty trail with the pet spelling `style` — the owner's
+    /// two terms besides the opt-in.
+    fn rainbow_kitty_glow(p: &mut EffectsPipeline, style: &str) {
+        p.set_cursor_glow(
+            true,
+            style,
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.8,
+            true,
+            0x0050_FA7B,
+        );
+    }
+
+    /// The page's boot posture: a `rainbow kitty` trail and the pet opted in
+    /// with `seed`.
+    fn pet_pipeline(seed: u64) -> EffectsPipeline {
+        let mut p = EffectsPipeline::new();
+        rainbow_kitty_glow(&mut p, "rainbow kitty");
+        p.set_cursor_pet(true, seed);
+        p
+    }
+
+    /// A fresh `rows`×`cols` glass with its first coherent frame extracted.
+    fn glass(rows: u16, cols: u16) -> (Terminal, RenderInput) {
+        let mut term = Terminal::new(rows, cols);
+        let input = term.cell_frame(usize::from(rows), usize::from(cols));
+        (term, input)
+    }
+
+    /// Type `text` through the committed-scalar seam, one byte per `dt_ms`
+    /// frame; returns the last fold.
+    fn type_line(
+        p: &mut EffectsPipeline,
+        term: &mut Terminal,
+        input: &mut RenderInput,
+        text: &[u8],
+        dt_ms: f64,
+    ) -> u64 {
+        let mut fp = 0;
+        for b in text {
+            fp = commit_ascii(p, term, input, &[*b], dt_ms);
+        }
+        fp
+    }
+
+    /// `frames` quiet frames of `dt_ms` each — no input, a fresh coherent
+    /// snapshot per frame; returns the last fold.
+    fn idle(
+        p: &mut EffectsPipeline,
+        term: &mut Terminal,
+        input: &mut RenderInput,
+        frames: usize,
+        dt_ms: f64,
+    ) -> u64 {
+        let (rows, cols) = (input.rows, input.cols);
+        let mut fp = 0;
+        for _ in 0..frames {
+            p.advance(dt_ms);
+            term.cell_frame_into(input, rows, cols);
+            fp = p.apply(term, input, 10, 19);
+        }
+        fp
+    }
+
+    /// The fixtures' cell height (`commit_ascii` applies at 10×19).
+    const CELL_H: u16 = 19;
+
+    /// The pet's natural tile at `cell_h` — `ART_ROWS` tall, `ART_ASPECT`
+    /// wide, the exact size `pet_cursor` bakes the body at.
+    fn pet_natural_size(cell_h: u16) -> (u16, u16) {
+        let nat_h = (crate::kitty_pet::ART_ROWS * f32::from(cell_h)).round();
+        let nat_w = (nat_h * crate::kitty_pet::ART_ASPECT).round();
+        (nat_w as u16, nat_h as u16)
+    }
+
+    /// The pet's BODY sprite in `free`: the one whose atlas tile is the
+    /// natural body size (motes are `0.55·cell_h` squares, word-cats bake at
+    /// their own dest size).
+    fn pet_body_sprite(free: &[FreeSprite], cell_h: u16) -> Option<FreeSprite> {
+        let nat = pet_natural_size(cell_h);
+        free.iter().copied().find(|s| (s.aw, s.ah) == nat)
+    }
+
+    /// One OSC 133 prompt → command → output → `D;<exit>` → prompt round
+    /// trip, then one frame: the completion lands in the pet's latch and the
+    /// fresh prompt's caret jump lands in the glow.
+    fn run_command_block(
+        p: &mut EffectsPipeline,
+        term: &mut Terminal,
+        input: &mut RenderInput,
+        exit: i32,
+    ) -> u64 {
+        term.process(b"\r\n\x1b]133;C\x07out\r\n");
+        term.process(format!("\x1b]133;D;{exit}\x07").as_bytes());
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        idle(p, term, input, 1, 33.0)
+    }
+
+    /// THE GRIEF GATE (gauntlet F4a), ported from the native single-pane
+    /// block: a FAILED command's droop window hushes the caret-jump fanfare
+    /// every frame — the rainbow momentum the run had earned is zeroed, so
+    /// the failure's own prompt jump cannot re-arm the party ring. The
+    /// control is the identical round trip with `D;0`: no grief, and the
+    /// momentum the typing earned rides through the same jump.
+    #[test]
+    fn a_failed_command_hushes_the_caret_jump_fanfare_while_the_pet_grieves() {
+        for exit in [0, 1] {
+            let mut p = pet_pipeline(7);
+            let (mut term, mut input) = glass(24, 80);
+            term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            materialize_pet(&mut p, &mut term, &mut input);
+            type_line(&mut p, &mut term, &mut input, b"kkkkkkkk", 60.0);
+            assert!(
+                p.glow.typing_momentum(p.now()) > 0.0,
+                "fixture: the run earned momentum before the command ran"
+            );
+
+            run_command_block(&mut p, &mut term, &mut input, exit);
+            assert_eq!(
+                p.companion.grieving(),
+                exit != 0,
+                "exit {exit}: the droop is owed exactly on a failure"
+            );
+            // The fresh prompt's caret jump, then a frame.
+            term.process(b"\r\n$ ");
+            let momentum = {
+                idle(&mut p, &mut term, &mut input, 1, 33.0);
+                p.glow.typing_momentum(p.now())
+            };
+            if exit == 0 {
+                assert!(
+                    momentum > 0.0,
+                    "control: a success keeps the earned momentum through the jump"
+                );
+            } else {
+                assert!(p.companion.grieving(), "the droop outlasts one frame");
+                assert_eq!(
+                    momentum, 0.0,
+                    "a grieving pet hushes the fanfare: no momentum for the jump meteor"
+                );
+                // …and every frame of the droop, not just its first.
+                for _ in 0..6 {
+                    idle(&mut p, &mut term, &mut input, 1, 33.0);
+                    if !p.companion.grieving() {
+                        break;
+                    }
+                    assert_eq!(p.glow.typing_momentum(p.now()), 0.0);
+                }
+            }
+        }
+    }
+
+    /// The contrast sampler's CURSOR slot: a stamped cursor colour is masked
+    /// to `0x00RRGGBB`; the `COLOR_UNSET` sentinel (a frame the engine did
+    /// not stamp a cursor colour into) falls back to the TERMINAL's own
+    /// resolution — `cursor_color().unwrap_or_else(default_foreground)`, the
+    /// native `terminal_cursor_rgb` — never to the glow's cursor colour,
+    /// which is an effect config and would tint the cat with the wake's
+    /// palette (owner ruling, 2026-08-31).
+    #[test]
+    fn the_pets_contrast_cursor_is_the_stamped_cursor_colour_or_the_terminals() {
+        assert_eq!(pet_contrast_cursor(0x0011_2233, 0x00AA_BBCC), 0x0011_2233);
+        assert_eq!(
+            pet_contrast_cursor(0xFF11_2233, 0x00AA_BBCC),
+            0x0011_2233,
+            "a stamped colour's high byte is not ink"
+        );
+        assert_eq!(
+            pet_contrast_cursor(aterm_core::render::COLOR_UNSET, 0x00AA_BBCC),
+            0x00AA_BBCC,
+            "the sentinel falls back to the resolved colour it was handed"
+        );
+
+        // …and that colour is the terminal's, resolved native's way.
+        let (mut term, _input) = glass(24, 80);
+        let fg = term.default_foreground();
+        assert_eq!(
+            terminal_cursor_color(&term),
+            aterm_render::rgb_to_u32([fg.r, fg.g, fg.b]),
+            "no OSC 12: the terminal's default foreground, as native resolves it"
+        );
+        term.process(b"\x1b]12;#00ff00\x07");
+        assert_eq!(
+            terminal_cursor_color(&term),
+            0x0000_FF00,
+            "a live OSC 12 is the cursor colour the pet contrasts against"
+        );
+    }
+
+    /// THE THREE EDGES at the pipeline's fences, and which of them may touch
+    /// the session-keyed command probe.
+    ///
+    /// * the Hidden edge — the native presentability edge — is SURFACE ONLY,
+    ///   so a command that finishes across a hide/refocus is still FELT;
+    /// * the GEOMETRY fence (a browser resize, a font-size change) is surface
+    ///   only for the same reason: a resize replaces no terminal;
+    /// * the OWNER fence — the native `sync_cursor_effect_coordinate_space`,
+    ///   keyed on `(terminal identity, alternate screen)` — is the ONE edge
+    ///   that nulls the probe, so the old stream's last completion is a
+    ///   silent baseline on the replacement owner and never grieves.
+    ///
+    /// Owner ruling, 2026-08-31: the middle case is a REGRESSION PIN. This
+    /// test used to assert the opposite of its resize arm, because the
+    /// geometry fence was wired to `retire_owner()` — so a resize between a
+    /// command completion and the next frame swallowed the completion edge
+    /// and the cat neither drooped nor cheered for the command that had just
+    /// ended.
+    #[test]
+    fn only_the_owner_fence_rebaselines_the_command_probe_not_a_hide_or_a_resize() {
+        // Across the Hidden edge: felt.
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(24, 80);
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        idle(&mut p, &mut term, &mut input, 1, 33.0);
+        p.set_effects_visibility("hidden");
+        p.set_effects_visibility("focused");
+        run_command_block(&mut p, &mut term, &mut input, 1);
+        assert!(
+            p.companion.grieving(),
+            "a presentability edge keeps the latch: the failure is felt"
+        );
+
+        // Across the GEOMETRY fence — a resize landing on the very frame that
+        // would have carried the completion: still felt.
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(24, 80);
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        idle(&mut p, &mut term, &mut input, 1, 33.0);
+        term.process(b"\r\n\x1b]133;C\x07out\r\n\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        p.advance(33.0);
+        term.cell_frame_into(&mut input, 24, 80);
+        // New cell metrics commit a new coordinate space in this very apply.
+        p.apply(&mut term, &mut input, 12, 24);
+        assert!(
+            p.companion.grieving(),
+            "a resize retires the pet's SURFACE, never its command stream: \
+             the failure that just landed is still the pet's news"
+        );
+
+        // Across the OWNER fence — the same completion, with the terminal
+        // swapping to its alternate screen instead: baselined.
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(24, 80);
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        idle(&mut p, &mut term, &mut input, 1, 33.0);
+        term.process(b"\r\n\x1b]133;C\x07out\r\n\x1b]133;D;1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        term.process(b"\x1b[?1049h");
+        p.advance(33.0);
+        term.cell_frame_into(&mut input, 24, 80);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            !p.companion.grieving(),
+            "the owner fence re-baselines the probe: the old screen's \
+             completion is not the new owner's news"
+        );
+    }
+
+    /// Type until the resident is on glass (bounded: it fades in over 0.30 s).
+    fn materialize_pet(p: &mut EffectsPipeline, term: &mut Terminal, input: &mut RenderInput) {
+        for _ in 0..40 {
+            commit_ascii(p, term, input, b"k", 33.0);
+            if p.cursor_pet_alpha() > 0 {
+                break;
+            }
+        }
+        assert!(
+            p.cursor_pet_alpha() > 0,
+            "fixture: the resident reached the glass"
+        );
+        assert!(
+            pet_body_sprite(&input.free_sprites, CELL_H).is_some(),
+            "fixture: its body rides free_sprites"
+        );
+        assert!(p.companion_hit_rect().is_some(), "fixture: it is clickable");
+    }
+
+    /// EMPTY == BYTE-IDENTICAL OFF. With the pet never opted in — or opted
+    /// OUT explicitly, pointer and press included — the free channel and the
+    /// fold are byte-identical to a twin that has never heard of the pet,
+    /// frame for frame; the all-off pipeline is fingerprint `0` with every
+    /// channel clear, and an opt-in with no owner costs it nothing.
+    #[test]
+    fn cursor_pet_off_leaves_every_channel_and_fingerprint_untouched() {
+        let mut plain = EffectsPipeline::new();
+        rainbow_kitty_glow(&mut plain, "rainbow kitty");
+        let mut off = EffectsPipeline::new();
+        rainbow_kitty_glow(&mut off, "rainbow kitty");
+        off.set_cursor_pet(false, 7);
+        assert!(!off.cursor_pet_enabled());
+        assert!(!off.note_pointer_px(f32::NAN, 1.0), "poison is dropped");
+        assert!(
+            off.note_pointer_px(30.0, 40.0),
+            "the pointer is a host fact, pet or no pet"
+        );
+        let (mut ta, mut ia) = glass(8, 40);
+        let (mut tb, mut ib) = glass(8, 40);
+        for step in 0..40u32 {
+            let fa = commit_ascii(&mut plain, &mut ta, &mut ia, b"k", 33.0);
+            let fb = commit_ascii(&mut off, &mut tb, &mut ib, b"k", 33.0);
+            assert_eq!(
+                fa, fb,
+                "step {step}: the fold never learns of a pet that is off"
+            );
+            assert!(ia.free_sprites.is_empty() && ib.free_sprites.is_empty());
+            assert!(ia.free_atlas.is_none() && ib.free_atlas.is_none());
+            assert_eq!(off.cursor_pet_alpha(), 0);
+            assert_eq!(off.companion_hit_rect(), None);
+            assert_eq!(off.press_px(30.0, 40.0), PressOutcome::Pass);
+            assert_eq!(plain.is_active(), off.is_active());
+        }
+        assert!(
+            plain.is_active(),
+            "non-vacuous: the trail is live while the pet is off"
+        );
+
+        // The all-off pipeline with the opt-in set: fingerprint 0, every
+        // channel clear, no lane — the opt-in waits for an owner.
+        let mut none = EffectsPipeline::new();
+        none.set_cursor_pet(true, 7);
+        let (mut term, mut input) = glass(8, 40);
+        assert_eq!(none.apply(&mut term, &mut input, 10, 19), 0);
+        assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
+        assert!(!none.is_active() && !none.enabled_any());
+        assert_eq!(none.cursor_pet_alpha(), 0);
+        assert!(matches!(none.wake(), Wake::Idle));
+        assert!(
+            none.cursor_pet_enabled(),
+            "the opt-in is remembered for when an owner arrives"
+        );
+    }
+
+    /// THE RESIDENT ON THE WEB: within its 0.30 s fade-in of the first caret
+    /// a body rides `free_sprites` (with the atlas) and claims the frame
+    /// lane; it walks right with the caret as the line grows; and after 35 s
+    /// of quiet it sleeps ON glass and RELEASES the lane — idle-to-zero —
+    /// with byte-stable sprites and a fixed fold.
+    #[test]
+    fn cursor_pet_walks_beside_the_caret_then_sleeps_and_releases_cadence() {
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(8, 40);
+        let mut on_glass_at = None;
+        for frame in 1..=12u32 {
+            commit_ascii(&mut p, &mut term, &mut input, b"k", 33.0);
+            if pet_body_sprite(&input.free_sprites, CELL_H).is_some() {
+                on_glass_at = Some(frame);
+                break;
+            }
+        }
+        let frame = on_glass_at.expect("the resident fades in beside the first caret");
+        assert!(
+            f64::from(frame) * 33.0 <= 400.0,
+            "…within its 0.30 s fade-in"
+        );
+        assert!(input.free_atlas.is_some(), "the atlas rides with the body");
+        assert!(p.cursor_pet_alpha() > 0 && p.companion_hit_rect().is_some());
+        assert!(
+            p.is_active() && p.companion.needs_frames(),
+            "a fading-in cat claims the frame lane"
+        );
+        assert!(matches!(p.wake(), Wake::Frames));
+        let x_before = pet_body_sprite(&input.free_sprites, CELL_H)
+            .expect("on glass")
+            .x;
+
+        type_line(&mut p, &mut term, &mut input, b"itty walks with me", 33.0);
+        idle(&mut p, &mut term, &mut input, 45, 33.0);
+        let x_after = pet_body_sprite(&input.free_sprites, CELL_H)
+            .expect("still on glass")
+            .x;
+        assert!(
+            x_after > x_before,
+            "the pet followed the caret to the right"
+        );
+
+        // 35 s of quiet: SLEEP_AFTER + BREATH_WINDOW have passed. Asleep on
+        // glass, and the lane is released.
+        let fp = idle(&mut p, &mut term, &mut input, 350, 100.0);
+        assert!(
+            !p.companion.needs_frames(),
+            "the resident released the lane"
+        );
+        assert!(!p.is_active(), "…and nothing else holds it");
+        assert_eq!(p.next_deadline_ms(), None);
+        assert!(matches!(p.wake(), Wake::Idle));
+        let body =
+            pet_body_sprite(&input.free_sprites, CELL_H).expect("a sleeping cat is still drawn");
+        assert_eq!(body.alpha, 255, "opaque, at rest");
+        assert_eq!(p.cursor_pet_alpha(), 255);
+        let sprites = input.free_sprites.clone();
+        assert_ne!(fp, 0, "a drawn resident folds a non-zero key");
+        for _ in 0..3 {
+            assert_eq!(
+                p.apply(&mut term, &mut input, 10, 19),
+                fp,
+                "no advance ⇒ the same fold"
+            );
+            assert_eq!(input.free_sprites, sprites, "byte-stable sprites");
+        }
+    }
+
+    /// THE OWNER IS A LEVEL: the moment the raw style stops naming the pet
+    /// (`lumen`; `rainbow kitty flying` — the same ribbon, the earned head
+    /// instead) the resident is RETIRED outright on the next frame — no
+    /// body, no rect, no fade, no owed frames — the opt-in survives, and
+    /// naming it again brings it back in the seed's coat. The trail master
+    /// itself is an owner term too, honoured through the all-off arm.
+    #[test]
+    fn cursor_pet_retires_when_the_style_stops_naming_it() {
+        for other in ["lumen", "rainbow kitty flying"] {
+            let mut p = pet_pipeline(7);
+            let (mut term, mut input) = glass(8, 40);
+            materialize_pet(&mut p, &mut term, &mut input);
+            let worn = p.companion.brain().worn_pair().expect("dressed");
+            rainbow_kitty_glow(&mut p, other);
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            assert!(
+                pet_body_sprite(&input.free_sprites, CELL_H).is_none(),
+                "{other}: nothing drawn on the very next frame"
+            );
+            assert_eq!(p.cursor_pet_alpha(), 0);
+            assert_eq!(p.companion_hit_rect(), None);
+            assert!(
+                !p.companion.brain().is_active(),
+                "{other}: retired (a switch), not fading (an exit)"
+            );
+            assert!(!p.companion.needs_frames(), "{other}: no owed frames");
+            assert!(
+                p.cursor_pet_enabled(),
+                "the opt-in survives; only the owner went"
+            );
+            rainbow_kitty_glow(&mut p, "rainbow kitty");
+            materialize_pet(&mut p, &mut term, &mut input);
+            assert_eq!(
+                p.companion.brain().worn_pair(),
+                Some(worn),
+                "{other}: back wearing the seed's coat"
+            );
+        }
+
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        p.set_cursor_glow(
+            false,
+            "rainbow kitty",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.8,
+            true,
+            0x0050_FA7B,
+        );
+        idle(&mut p, &mut term, &mut input, 2, 33.0);
+        assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
+        assert!(!p.companion.brain().is_active() && !p.companion.needs_frames());
+        assert!(
+            !p.is_active() && !p.enabled_any(),
+            "the trail master off is all-off again"
+        );
+    }
+
+    /// HIDING IS NOT RETIRING. History takes the pet off glass at once while
+    /// its brain fades and releases the lane; an unfocused surface retires the
+    /// body at once; hidden is the hard coordinate boundary — and on the far
+    /// side of each the resident returns wearing the SAME coat.
+    #[test]
+    fn cursor_pet_hides_in_history_and_when_unfocused_but_keeps_its_identity() {
+        let mut p = pet_pipeline(7);
+        let mut term = TerminalBuilder::new()
+            .size(8, 40)
+            .ring_buffer_size(64)
+            .build();
+        let mut input = term.cell_frame(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        let worn = p.companion.brain().worn_pair().expect("dressed");
+
+        // HISTORY.
+        term.process(&b"history\r\n".repeat(20));
+        term.scroll_display(1);
+        term.cell_frame_into(&mut input, 8, 40);
+        assert!(input.display_offset > 0, "fixture: scrolled into history");
+        p.advance(33.0);
+        p.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(
+            p.cursor_pet_alpha(),
+            0,
+            "off glass on the first history frame"
+        );
+        assert_eq!(p.companion_hit_rect(), None);
+        assert!(input.free_sprites.is_empty(), "history draws no pet");
+        assert!(
+            p.companion.brain().is_active(),
+            "…but the brain is only fading"
+        );
+        let mut released = false;
+        for _ in 0..40 {
+            idle(&mut p, &mut term, &mut input, 1, 100.0);
+            assert!(input.free_sprites.is_empty());
+            if !p.companion.needs_frames() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released && !p.companion.brain().is_active(),
+            "the hidden brain faded to zero and released the lane"
+        );
+        assert_eq!(
+            p.companion.brain().worn_pair(),
+            Some(worn),
+            "identity survives history"
+        );
+        term.scroll_to_bottom();
+        materialize_pet(&mut p, &mut term, &mut input);
+        assert_eq!(
+            p.companion.brain().worn_pair(),
+            Some(worn),
+            "back in the same coat"
+        );
+
+        // UNFOCUSED: the surface retires the body at once (no fade).
+        p.set_focused(false);
+        idle(&mut p, &mut term, &mut input, 1, 33.0);
+        assert_eq!(p.cursor_pet_alpha(), 0);
+        assert!(input.free_sprites.is_empty());
+        assert!(
+            !p.companion.brain().is_active() && !p.companion.needs_frames(),
+            "an unfocused surface retires the body at once and owes no frames"
+        );
+        assert_eq!(p.companion.brain().worn_pair(), Some(worn));
+        p.set_focused(true);
+        materialize_pet(&mut p, &mut term, &mut input);
+        assert_eq!(
+            p.companion.brain().worn_pair(),
+            Some(worn),
+            "refocus: the same coat"
+        );
+
+        // HIDDEN: the hard coordinate boundary, without an intervening apply.
+        p.set_effects_visibility("hidden");
+        assert!(!p.companion.brain().is_active() && !p.companion.needs_frames());
+        assert_eq!(p.companion_hit_rect(), None);
+        p.set_effects_visibility("focused");
+        materialize_pet(&mut p, &mut term, &mut input);
+        assert_eq!(
+            p.companion.brain().worn_pair(),
+            Some(worn),
+            "a fresh sighting, same cat"
+        );
+    }
+
+    /// ONE CAT PER CARET, through the pipeline: the word engine's tick
+    /// receives the pet's live body and caret (`CompanionOnGlass::at_body`),
+    /// so the feline word the pet is answering never grows an ambient twin
+    /// and no ambient animal stacks on the body. Control: the same glass with
+    /// the pet off grows its word-cat inside the peek window.
+    #[test]
+    fn cursor_pet_body_rect_is_handed_to_the_word_engine() {
+        let drive = |with_pet: bool| -> (bool, bool) {
+            let mut p = EffectsPipeline::new();
+            rainbow_kitty_glow(&mut p, "rainbow kitty");
+            p.set_sparkle_enabled(true);
+            p.set_sparkle_feline("cat", true, true, false);
+            if with_pet {
+                p.set_cursor_pet(true, 7);
+            }
+            let (mut term, mut input) = glass(8, 40);
+            term.process(b"\r\n\r\na nice ");
+            type_line(&mut p, &mut term, &mut input, b"kitty", 33.0);
+            let nat = pet_natural_size(CELL_H);
+            let (mut saw_pet, mut saw_other_animal, mut stacked) = (false, false, false);
+            for _ in 0..90 {
+                idle(&mut p, &mut term, &mut input, 1, 100.0);
+                let body = pet_body_sprite(&input.free_sprites, CELL_H);
+                saw_pet |= body.is_some();
+                for s in &input.free_sprites {
+                    // An ANIMAL: at least a cell tall (motes are smaller)
+                    // and not the pet's own tile.
+                    if s.ah < CELL_H || (s.aw, s.ah) == nat {
+                        continue;
+                    }
+                    saw_other_animal = true;
+                    if let Some(b) = body {
+                        let ox = (s.x + i32::from(s.w)).min(b.x + i32::from(b.w)) - s.x.max(b.x);
+                        let oy = (s.y + i32::from(s.h)).min(b.y + i32::from(b.h)) - s.y.max(b.y);
+                        stacked |=
+                            ox > 0 && oy > 0 && ox * oy * 3 >= i32::from(s.w) * i32::from(s.h);
+                    }
+                }
+            }
+            assert_eq!(saw_pet, with_pet, "the pet is drawn exactly when opted in");
+            (saw_other_animal, stacked)
+        };
+        let (other_animal, stacked) = drive(true);
+        assert!(
+            !other_animal,
+            "the word the pet answers grows no ambient twin"
+        );
+        assert!(!stacked, "nothing stacks on the pet's body");
+        let (control, _) = drive(false);
+        assert!(control, "control: with no companion the word-cat peeks");
+    }
+
+    /// THE SEED DOOR IS THE ONLY ENTROPY: two pipelines fed one seed, the
+    /// same bytes and the same `dt` stream draw identical sprites and fold
+    /// identical keys frame for frame; another seed dresses another cat
+    /// (found through `KittyLook::for_launch`, not assumed).
+    #[test]
+    fn cursor_pet_same_seed_same_pixels() {
+        let script = b"same seed same cat";
+        let run = |seed: u64| {
+            let mut p = pet_pipeline(seed);
+            let (mut term, mut input) = glass(8, 40);
+            let mut sprites = Vec::new();
+            let mut fps = Vec::new();
+            for b in script {
+                fps.push(commit_ascii(&mut p, &mut term, &mut input, &[*b], 33.0));
+                sprites.push(input.free_sprites.clone());
+            }
+            for _ in 0..30 {
+                fps.push(idle(&mut p, &mut term, &mut input, 1, 50.0));
+                sprites.push(input.free_sprites.clone());
+            }
+            (sprites, fps, p.companion.brain().worn_pair())
+        };
+        let (sprites_a, fps_a, worn_a) = run(7);
+        let (sprites_b, fps_b, worn_b) = run(7);
+        assert_eq!(sprites_a, sprites_b, "same seed, same sprites, every frame");
+        assert_eq!(fps_a, fps_b, "…and the same fold");
+        assert_eq!(worn_a, worn_b);
+        assert!(
+            sprites_a
+                .iter()
+                .any(|f| pet_body_sprite(f, CELL_H).is_some()),
+            "non-vacuous: the cat was drawn"
+        );
+        let worn = worn_a.expect("dressed");
+        let other_seed = (1u64..)
+            .find(|s| {
+                let look = KittyLook::for_launch(*s);
+                (look.coat, look.iris) != worn
+            })
+            .expect("some seed dresses another coat");
+        let (_, _, worn_other) = run(other_seed);
+        assert_ne!(worn_other, Some(worn), "another seed is another cat");
+    }
+
+    /// The pet is a SPELLING of the style, resolved from the raw string the
+    /// way `ribbon_tall` is: every pet alias names it (cat or dog by species),
+    /// the flying-head alias and the non-kitty styles do not.
+    #[test]
+    fn web_pipeline_resolves_pet_spelling_and_species() {
+        let mut p = EffectsPipeline::new();
+        for (style, named, species) in [
+            ("rainbow kitty", true, PetSpecies::Cat),
+            ("kitty", true, PetSpecies::Cat),
+            ("rainbow kitty pet", true, PetSpecies::Cat),
+            ("Rainbow Kitty Underline", true, PetSpecies::Cat),
+            ("rainbow dog pet", true, PetSpecies::Dog),
+            ("pet dog", true, PetSpecies::Dog),
+            ("rainbow kitty flying", false, PetSpecies::Cat),
+            ("rainbow", false, PetSpecies::Cat),
+            ("lumen", false, PetSpecies::Cat),
+        ] {
+            rainbow_kitty_glow(&mut p, style);
+            assert_eq!(p.pet_style_named, named, "{style:?}: names the pet?");
+            assert_eq!(p.companion.species(), species, "{style:?}: which animal");
+        }
+    }
+
+    /// THE POINTER AND THE STROKE ONLY LATCH. The pointer is value-shadowed
+    /// (a still pointer reports no change, poison is dropped, leaving is a
+    /// change once); a press outside the body passes, one inside is CONSUMED
+    /// and queues a stroke that re-arms the lane — and nothing on glass moves
+    /// until the tick that consumes it.
+    #[test]
+    fn pointer_and_petting_latch_only_and_need_a_tick() {
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        idle(&mut p, &mut term, &mut input, 350, 100.0);
+        assert!(
+            !p.companion.needs_frames(),
+            "fixture: asleep, lane released"
+        );
+
+        assert!(p.note_pointer_px(100.0, 50.0));
+        assert!(
+            !p.note_pointer_px(100.0, 50.0),
+            "a still pointer costs no render"
+        );
+        assert!(!p.note_pointer_px(f32::NAN, 50.0), "poison is dropped");
+        assert!(p.note_pointer_leave());
+        assert!(!p.note_pointer_leave());
+
+        let rect @ (x0, x1, y0, y1) = p.companion_hit_rect().expect("a sleeping cat is clickable");
+        assert_eq!(
+            p.press_px((x1 + 40) as f32, (y1 + 40) as f32),
+            PressOutcome::Pass,
+            "outside the body the host keeps routing"
+        );
+        assert_eq!(p.companion.brain().pending_pets(), 0);
+        let sprites = input.free_sprites.clone();
+        let alpha = p.cursor_pet_alpha();
+        assert_eq!(
+            p.press_px((x0 + x1) as f32 / 2.0, (y0 + y1) as f32 / 2.0),
+            PressOutcome::Pet,
+            "inside the body the press is consumed"
+        );
+        assert_eq!(p.companion.brain().pending_pets(), 1, "one stroke queued");
+        assert!(
+            p.companion.needs_frames() && p.is_active(),
+            "the latch asks for the frame that consumes it"
+        );
+        assert!(matches!(p.wake(), Wake::Frames));
+        assert_eq!(p.cursor_pet_alpha(), alpha, "nothing moved without a tick");
+        assert_eq!(p.companion_hit_rect(), Some(rect));
+        assert_eq!(input.free_sprites, sprites);
+        // Only ticks consume it — a sleeping cat stretches awake first, then
+        // takes the stroke on the ground (the brain's own 6 s bound).
+        let mut consumed_after = None;
+        for frame in 1..=180u32 {
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            if p.companion.brain().pending_pets() == 0 {
+                consumed_after = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            consumed_after.is_some_and(|f| f >= 1),
+            "the stroke is consumed by a tick, on the ground"
+        );
+    }
+
+    /// REDUCED MOTION IS A STATION PIN: the pet is drawn, and a program-owned
+    /// caret jump moves it to its new station in ONE frame — no walk, no arc
+    /// (feet on the new baseline) — where full motion walks there over many.
+    /// The two legacy setters are aliases of the one preference.
+    #[test]
+    fn reduced_motion_pins_the_web_pet_at_its_station() {
+        let jump = |reduced: bool| {
+            let mut p = pet_pipeline(7);
+            if reduced {
+                p.set_reduced_motion(true);
+            }
+            let (mut term, mut input) = glass(12, 60);
+            materialize_pet(&mut p, &mut term, &mut input);
+            idle(&mut p, &mut term, &mut input, 60, 33.0);
+            let before = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            term.process(b"\x1b[10;40H");
+            idle(&mut p, &mut term, &mut input, 1, 33.0);
+            let first = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            idle(&mut p, &mut term, &mut input, 60, 33.0);
+            let later = pet_body_sprite(&input.free_sprites, CELL_H).expect("drawn");
+            (before, first, later)
+        };
+        let (before, first, later) = jump(true);
+        assert_ne!(
+            (first.x, first.y),
+            (before.x, before.y),
+            "the station moved"
+        );
+        assert_eq!(
+            (first.x, first.y),
+            (later.x, later.y),
+            "…in ONE frame: pinned, no walk"
+        );
+        assert_eq!(
+            first.y + i32::from(first.h),
+            10 * i32::from(CELL_H),
+            "feet on the new baseline: no arc"
+        );
+        let (_, first, later) = jump(false);
+        assert_ne!(
+            (first.x, first.y),
+            (later.x, later.y),
+            "control: full motion is still travelling one frame after the jump"
+        );
+
+        let mut p = EffectsPipeline::new();
+        p.set_sparkle_reduced_motion(true);
+        assert!(p.deco_cfg.reduced_motion && p.rain_reduced_motion);
+        p.set_matrix_rain_reduced_motion(false);
+        assert!(!p.deco_cfg.reduced_motion && !p.rain_reduced_motion);
+    }
+
+    /// THE CADENCE LAW in the scheduler: while the resident owes frames
+    /// (`needs_frames`) there is no exact deadline — display-rAF cadence —
+    /// even with rain's 12 Hz engine wake armed and every other frame lane
+    /// settled; once it sleeps the pet forces nothing.
+    #[test]
+    fn next_deadline_ms_is_none_while_the_pet_needs_frames() {
+        let mut p = pet_pipeline(7);
+        enable_classic_rain(&mut p);
+        assert_eq!(
+            p.next_deadline_ms(),
+            Some(83.0),
+            "rain alone: an exact wake"
+        );
+        assert!(!p.companion.needs_frames());
+        let (mut term, mut input) = glass(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        // Let every other frame-cadence lane settle: the wake, the comet,
+        // the word engine. The resident is still in its settle-in window.
+        idle(&mut p, &mut term, &mut input, 60, 50.0);
+        assert!(
+            !p.trail.is_active() && !p.glow.is_active() && !p.decos.is_active(p.now()),
+            "fixture: only the pet holds a frame lane"
+        );
+        assert!(
+            p.companion.needs_frames(),
+            "fixture: the resident owes frames"
+        );
+        assert_eq!(
+            p.next_deadline_ms(),
+            None,
+            "a moving pet needs display-rAF cadence"
+        );
+        assert!(p.is_active());
+        assert!(matches!(p.wake(), Wake::Frames));
+
+        idle(&mut p, &mut term, &mut input, 350, 100.0);
+        assert!(
+            !p.companion.needs_frames(),
+            "asleep: the pet forces nothing"
+        );
+        assert!(
+            p.next_deadline_ms().is_some() || !p.is_active(),
+            "what remains is rain's own verdict — an exact wake or idle"
+        );
+        assert!(!matches!(p.wake(), Wake::Frames));
     }
 
     #[test]
@@ -3466,6 +4926,69 @@ mod tests {
             }
         }
         panic!("rain never appeared on an empty 24x80 grid");
+    }
+
+    /// PRISM WAKE zero-cost-off: with the streak disabled `apply` leaves
+    /// `nova_add` exactly as `clear_overlays` does, contributes nothing to
+    /// `is_active`/`enabled_any`, and folds fingerprint 0.
+    #[test]
+    fn output_streak_disabled_leaves_nova_clear_and_is_active_unaffected() {
+        let mut p = EffectsPipeline::new();
+        assert!(!p.enabled_any());
+        let mut term = Terminal::new(24, 80);
+        let mut input = RenderInput::default();
+        term.cell_frame_into(&mut input, 24, 80);
+        let fp = p.apply(&mut term, &mut input, 10, 20);
+        assert_eq!(fp, 0, "all-off apply is fingerprint 0");
+        assert!(input.nova_add.is_empty());
+        assert!(!p.is_active());
+    }
+
+    /// THE CO-RESIDENCY DISCIPLINE (the shared `nova_add` channel). The
+    /// word-decoration engine owns `nova_scratch` and its clear; the streak
+    /// only ever APPENDS to the channel already swapped into `input`. So a
+    /// frame with the streak enabled must never LOSE decoration quads, and a
+    /// frame with the streak disabled must leave the channel exactly as the
+    /// decorations left it — neither engine can strand or clear the other's
+    /// light, and neither can be silently starved by the other's absence.
+    #[test]
+    fn the_streak_appends_to_nova_and_never_clears_a_co_resident_producer() {
+        let mut term = Terminal::new(24, 80);
+        let mut input = RenderInput::default();
+
+        // A frame with ONLY the streak: whatever it draws, it drew by
+        // appending — the channel it appended to started empty.
+        let mut p = EffectsPipeline::new();
+        p.set_output_streak(true, 1.0, 9, 3, 10, false, 7);
+        p.set_output_streak_theme(true, 0x0000_0000, 0x00FF_FFFF, 0x0088_C0D0);
+        let mut streak_only = 0usize;
+        for i in 0..40 {
+            p.advance(40.0);
+            term.process(format!("line {i}\r\n").as_bytes());
+            term.cell_frame_into(&mut input, 24, 80);
+            p.apply(&mut term, &mut input, 10, 20);
+            streak_only = streak_only.max(input.nova_add.len());
+        }
+        assert!(
+            streak_only > 0,
+            "NON-VACUITY: the streak must actually put light in nova_add"
+        );
+
+        // The same script with the streak OFF leaves the channel empty — so
+        // the quads above were the streak's, and disabling it strands nothing.
+        let mut q = EffectsPipeline::new();
+        let mut term2 = Terminal::new(24, 80);
+        let mut input2 = RenderInput::default();
+        for i in 0..40 {
+            q.advance(40.0);
+            term2.process(format!("line {i}\r\n").as_bytes());
+            term2.cell_frame_into(&mut input2, 24, 80);
+            q.apply(&mut term2, &mut input2, 10, 20);
+            assert!(
+                input2.nova_add.is_empty(),
+                "a disabled streak contributes no quads at all"
+            );
+        }
     }
 
     /// PHOSPHOR zero-cost-off: with rain disabled (the default) `apply` leaves

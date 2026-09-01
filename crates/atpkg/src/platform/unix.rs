@@ -163,6 +163,29 @@ pub fn dir_meta_is_private(meta: &Metadata) -> bool {
     dir_safe_for_private_write(our_uid(), meta.uid(), meta.mode())
 }
 
+/// Whether the CALLING user can write into `dir`.
+///
+/// This answers the question [`dir_meta_is_system`] does not. That a prefix chain is
+/// *trusted* — every component root-owned and not group/other-writable — says nothing
+/// about whether the caller can *use* it. A non-root user with a root-owned prefix
+/// configured passes the trust check and then fails on `store.lock` for every verb,
+/// forever.
+///
+/// Uses `access(2)` rather than re-deriving permission from the mode bits, so group
+/// membership and ACLs are honoured by the kernel instead of approximated here. It
+/// tests the REAL uid, which is what we want: atpkg is not setuid, and the question is
+/// "can this user install", not "can this process momentarily write".
+#[must_use]
+pub fn dir_writable_by_caller(dir: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        // An interior NUL cannot name a real directory.
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated C string that outlives the call, and
+    // `access` only reads it.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
 /// Whether `meta` (from `symlink_metadata`) is a link-like indirection that must NOT be
 /// trusted as a real directory in the fail-closed prefix chain check. On Unix that is
 /// exactly a symlink; the Windows backend also treats a directory **junction** (a reparse

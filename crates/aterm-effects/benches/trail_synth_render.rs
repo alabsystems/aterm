@@ -267,6 +267,7 @@ fn event(style: GlowStyle, voice: SoundVoice, kind: SoundGesture, bed: bool) -> 
         gain: VOLUME,
         tone: Tone::Technical,
         bed,
+        shifted: false,
     }
 }
 

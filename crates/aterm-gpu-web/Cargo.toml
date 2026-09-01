@@ -76,15 +76,20 @@ wasm-bindgen = "=0.2.108"
 # declares wasm-bindgen, web-sys and js-sys directly, with defaults on, right here.
 wasm-bindgen-futures = { version = "0.4", default-features = false }
 console_error_panic_hook = "0.1"
-# The browser DOM types the WebGL init path needs: the <canvas> handed in from JS,
-# and (TODO, present loop) the window/raf bindings. wgpu's `webgl` feature already
-# enables HtmlCanvasElement + WebGl2RenderingContext; declared here too so this
-# crate's own code can name the canvas type.
-web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Window", "Document"] }
-js-sys = "0.3"
-# Transitive deps may pull getrandom; on wasm32-unknown-unknown it needs the JS
-# backend. Harmless if unused.
-getrandom = { version = "0.2", features = ["js"] }
+# The browser DOM types THIS CRATE'S OWN SIGNATURES NAME, and only those: the
+# <canvas> handed in from JS (`init`, src/lib.rs:2793 `web_sys::HtmlCanvasElement`)
+# and the worker-side surface (`init_offscreen`, :2803 `web_sys::OffscreenCanvas`).
+# `OffscreenCanvas` was NOT declared here before and compiled only because wgpu's
+# `webgl` feature table happens to activate it — a borrowed activation that would
+# vanish silently with a wgpu backend change. It is stated in aterm's own manifest
+# now. `Window` and `Document` went the other way: declared, never named (no
+# `web_sys::Window` or `web_sys::Document` occurs in this crate), reserved for a
+# window/raf present loop that is driven from JS. Deleted.
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas"] }
+# NO getrandom ROW — see crates/aterm-wasm/Cargo.toml for the measurement. Its
+# only parents on this cell were aterm's own manifests, so the defensive line
+# was the dependency: -1 package / -1,997 lines here (js-sys stays, held by
+# web-sys and wgpu). Guarded by tools/grep_guard.sh B13.
 
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm

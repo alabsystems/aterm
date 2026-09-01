@@ -145,6 +145,21 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
         let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
             continue;
         };
+        // A shim that NAMES a build is not the same as a build that is there.
+        // `resolve_shim` reads the stub's target, and `program_build_of_target`
+        // parses the program and build out of that PATH — neither touches the
+        // filesystem, so a shim pointing into a store that has been deleted still
+        // parsed cleanly and this map still called it `live`. That is what let
+        // `atpkg list` report four programs `live` while every one of 22 shims
+        // dangled into a `/Library/aterm` that was gone, on a machine `doctor`
+        // simultaneously and correctly called FAIL
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        //
+        // `list`, `which` and `doctor` must not disagree about whether the product
+        // is installed, and the honest answer is the one that stats the target.
+        if !target.exists() {
+            continue;
+        }
         if let Some((program, build)) = program_build_of_target(&target) {
             // Last write wins. The tools of one program USUALLY agree, and where they do not
             // the winner is `read_dir` order — see the doc comment: never make a destructive
@@ -442,6 +457,37 @@ mod tests {
     /// `active_builds` reports the LIVE build (what the shim points at), even when a newer
     /// build is staged + marked complete on disk but never activated — so the update decision
     /// re-flips it instead of mistaking the staged build for the running one (#19).
+    /// A shim whose target is GONE is not a live build.
+    ///
+    /// `resolve_shim` reads the stub's target and `program_build_of_target` parses
+    /// the program/build out of that path — both are pure string work, so a shim
+    /// pointing into a deleted store used to parse cleanly and report `live`. A real
+    /// machine shipped 22 such shims and `atpkg list` called four programs live while
+    /// `doctor` called the same state FAIL
+    /// (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+    #[test]
+    fn a_shim_pointing_at_a_deleted_build_is_not_live() {
+        let l = layout("dangling");
+        install(&l, "ay", 17);
+        assert_eq!(
+            active_builds(&l).get("ay").copied(),
+            Some(17),
+            "precondition: a real install is live"
+        );
+        // Remove the store build the shim points at, leaving the shim in place —
+        // exactly the audited shape.
+        std::fs::remove_dir_all(l.build_dir("ay", 17)).unwrap();
+        assert!(
+            crate::platform::resolve_shim(&l.bin_dir().join("ay")).is_some(),
+            "the shim itself must still resolve — otherwise this test proves nothing"
+        );
+        assert!(
+            !active_builds(&l).contains_key("ay"),
+            "a shim whose target no longer exists must not be reported live"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn active_builds_reflects_the_shim_not_a_staged_inactive_build() {
         let l = layout("active");

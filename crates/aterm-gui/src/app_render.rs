@@ -3650,6 +3650,10 @@ pub(crate) fn trail_sound_event(
         gain,
         tone: policy.tone,
         bed: policy.bed,
+        // Rides the CUE, so the key-time seam and the frame drain agree by
+        // construction: only `cue_keystroke_shifted` can set it, and every
+        // echo-born cue carries `false`.
+        shifted: cue.shifted,
     }
 }
 
@@ -3786,6 +3790,7 @@ pub(crate) fn drain_curse_bonk_cues(
             // the ambience) — carried OFF so the event states the policy it
             // actually gets, independent of the `trail_sound_bed` knob.
             bed: false,
+            shifted: false, // a bonk is punctuation over the text, not a typed glyph
         });
         result.emitted += 1;
     }
@@ -10498,6 +10503,7 @@ fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound:
         // Tone-blind like the bonk, and it never feeds the bed.
         tone: aterm_effects::tone::Tone::Technical,
         bed: false,
+        shifted: false, // an authored riff bar, not a keystroke
     }
 }
 
@@ -11285,6 +11291,11 @@ pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) win_focused: bool,
     /// Whether the MOTION POLICY (W11) still animates word sparkles.
     pub(crate) animate_sparkles: bool,
+    /// Whether the motion policy still animates PRISM WAKE's output streak.
+    /// Deliberately its own term rather than a reuse of `animate_sparkles`:
+    /// the streak is not a Sparkle Words feature and must not inherit that
+    /// family's gate (it paints whether or not sparkle words are configured).
+    pub(crate) animate_streak: bool,
     /// Whether the independent cursor-companion motion policy is animated.
     /// This is deliberately not derived from Sparkle Words config.
     pub(crate) animate_cat: bool,
@@ -19235,6 +19246,7 @@ mod motion_policy_tests {
             next_frame: None,
             presented: None,
             dir,
+            handoff: None,
             cancel: crate::VideoCancellation::new(),
             reply,
         });
@@ -21449,16 +21461,27 @@ impl App {
     /// [`trail_config`] cadence-comet body (best-of-both). "off" leaves it disabled
     /// (empty quads → byte-identical to no aurora).
     pub(crate) fn glow_config(&self) -> crate::cursor_glow::GlowConfig {
+        self.glow_config_for(self.trail_presentation())
+    }
+
+    /// The immutable config-generation presentation. Production hits the
+    /// catalog's pre-parsed value; the fallback is only for direct test/preview
+    /// mutation that intentionally bypasses config publication.
+    pub(crate) fn trail_presentation(&self) -> crate::app_config::ResolvedTrailPresentation {
         let style_raw = self.config.cursor_trail_style_raw();
-        let style =
-            crate::app_config::resolve_trail_style(style_raw, &self.config_assets.trail_packs);
+        self.config_assets.trail_packs.presentation_for(style_raw)
+    }
+
+    pub(crate) fn glow_config_for(
+        &self,
+        presentation: crate::app_config::ResolvedTrailPresentation,
+    ) -> crate::cursor_glow::GlowConfig {
         crate::app_config::resolve_cursor_glow(
             crate::app_config::CursorGlowInputs {
                 enabled: self.config.cursor_trail_or_default()
                     && self
                         .serious_mode_policy()
                         .allows(crate::motion::SeriousEffect::CursorGlow),
-                style_raw,
                 color: self.config.cursor_trail_color_u32(),
                 accent: self.config.cursor_trail_accent_u32(),
                 duration_ms: self.config.cursor_trail_ms_or_default(),
@@ -21468,7 +21491,7 @@ impl App {
                 ring: self.config.cursor_trail_ring_or_default(),
                 wake_persist_s: self.config.cursor_trail_wake_persist_or_default(),
             },
-            style,
+            presentation,
             self.theme.cursor,
             // Folded to the live theme each frame in `tick_cursor_fx`.
             true,
@@ -21489,12 +21512,10 @@ impl App {
     /// get it. `glow_style_matches_glow_config` pins the two together: the
     /// click must name the same instrument the frame drain would have.
     pub(crate) fn glow_style(&self) -> crate::cursor_glow::GlowStyle {
-        crate::app_config::resolve_trail_style(
-            self.config.cursor_trail_style_raw(),
-            &self.config_assets.trail_packs,
-        )
-        .style
-        .unwrap_or(crate::cursor_glow::GlowStyle::Lumen)
+        self.trail_presentation()
+            .style
+            .style
+            .unwrap_or(crate::cursor_glow::GlowStyle::Lumen)
     }
 
     /// Whether the ACTIVE trail style is the native cadence-comet — the one style
@@ -21502,38 +21523,22 @@ impl App {
     /// [`aterm_render::TrailCell`] comet body (the other additive styles are the
     /// LIGHT crown only). Case-insensitive, trimmed, and asked of the RESOLVED
     /// spelling — mirrors `glow_config`.
+    #[cfg(test)]
     pub(crate) fn trail_is_comet(&self) -> bool {
-        self.config
-            .cursor_trail_style_effective()
-            .eq_ignore_ascii_case("comet")
+        self.trail_presentation().comet
     }
 
     /// Whether the active trail style asks for the full-body PET companion
     /// (`cursor_trail_style = "rainbow kitty pet"` or `"rainbow dog pet"`)
     /// instead of the flying kitty. Every spelling resolves to the same
-    /// `GlowStyle::RainbowKitty` trail — mirrors `trail_is_comet`'s
-    /// style-string idiom.
+    /// `GlowStyle::RainbowKitty` trail. Both decisions come from the same
+    /// cached [`crate::app_config::ResolvedTrailPresentation`].
     ///
     /// SPECIES-BLIND BY DESIGN: this answers "is the pet drawn at all", which
-    /// is the only question the draw path's gating needs. Which animal is
-    /// [`Self::trail_pet_species`], asked once when the brain is fed.
+    /// is the only question the draw path's gating needs. The presentation's
+    /// `pet_species` field selects the animal when the brain is fed.
     pub(crate) fn trail_is_kitty_pet(&self) -> bool {
-        crate::cursor_glow::GlowStyle::style_names_any_pet(
-            self.config.cursor_trail_style_effective(),
-        )
-    }
-
-    /// Which animal the full-body pet is drawn as. Meaningless unless
-    /// [`Self::trail_is_kitty_pet`] — defaults to the cat, so a style string
-    /// that names no pet at all can never select the dog by accident.
-    pub(crate) fn trail_pet_species(&self) -> aterm_effects::kitty_pet::PetSpecies {
-        if crate::cursor_glow::GlowStyle::style_names_dog_pet(
-            self.config.cursor_trail_style_effective(),
-        ) {
-            aterm_effects::kitty_pet::PetSpecies::Dog
-        } else {
-            aterm_effects::kitty_pet::PetSpecies::Cat
-        }
+        self.trail_presentation().pet_species.is_some()
     }
 
     /// Resolve the cadence-comet MOTION-TRAIL config for this frame: the directional
@@ -21545,7 +21550,15 @@ impl App {
     /// [`crate::cursor_trail::ignite`] just before the tick. Reduced-motion (W11) is
     /// applied by the caller (it forces `enabled` off), so an unfocused / reduced
     /// window emits ZERO comet cells (byte-identical to no trail).
+    #[cfg(test)]
     pub(crate) fn trail_config(&self) -> crate::cursor_trail::TrailConfig {
+        self.trail_config_for(self.trail_presentation())
+    }
+
+    fn trail_config_for(
+        &self,
+        presentation: crate::app_config::ResolvedTrailPresentation,
+    ) -> crate::cursor_trail::TrailConfig {
         // The cadence-comet body exists ONLY for the "comet" style, whose whole
         // palette (beam, glitter, nucleus) defaults to GLACIAL BLUE — the body
         // must match or the streak splits into two hues. An explicit
@@ -21557,7 +21570,7 @@ impl App {
             .unwrap_or(crate::cursor_glow::COMET_DEFAULT_COLOR);
         crate::cursor_trail::TrailConfig {
             enabled: self.config.cursor_trail_or_default()
-                && self.trail_is_comet()
+                && presentation.comet
                 && self
                     .serious_mode_policy()
                     .allows(crate::motion::SeriousEffect::CursorTrail),
@@ -21684,6 +21697,7 @@ impl App {
             speed: ws.cursor_glow.glide_speed(),
             resume_grant: ws.cursor_glow.resume_grant(),
             woken: ws.cursor_glow.woken_cells(),
+            bloom: ws.cursor_glow.bloom_cells(),
             glow_active: ws.cursor_glow.is_active(),
             pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
             cat_active: ws.cursor_cat.is_active(),
@@ -21791,7 +21805,8 @@ impl App {
         // captured by the caller). The aurora needs the cell geometry to map
         // cells → grid-interior pixels; read it before borrowing windows. `mut`
         // so the cursor WAKE colour can follow a live OSC-12 cursor colour below.
-        let mut glow_cfg = self.glow_config();
+        let trail_presentation = self.trail_presentation();
+        let mut glow_cfg = self.glow_config_for(trail_presentation);
         // Reduced motion ⇒ amplitude EXACTLY 0: the animator then clears its
         // state and emits nothing (proven zero, not merely dimmed). Load shed
         // rides in as the soft envelope instead (0 only after the fade-out).
@@ -21809,10 +21824,10 @@ impl App {
         // shares the CursorGlow motion seam, so an unfocused / reduced window emits no
         // comet cells at all (not merely a dimmer one). `mut` so the OSC-12 live cursor
         // colour recolours the comet body, exactly like the aurora.
-        let mut trail_cfg = self.trail_config();
+        let mut trail_cfg = self.trail_config_for(trail_presentation);
         trail_cfg.enabled &=
             cursor_motion.animate(crate::motion::MotionEffect::CursorGlow) && shed_env > 0.0;
-        let pet_mode = self.trail_is_kitty_pet();
+        let pet_mode = trail_presentation.pet_species.is_some();
         let (glow_cw, glow_ch) = self.win_cell_size(id);
         // Cursor WAKE follows the effective live cursor colour (OSC 12 when set,
         // otherwise OSC 10): when the user did NOT pin an explicit
@@ -25199,6 +25214,20 @@ impl App {
         // glass of an unfocused window (he simply freezes — unfocused windows
         // stop presenting on their own); only a real reduced-motion verdict
         // (config or OS) removes him.
+        // PRISM WAKE knobs, resolved from config BEFORE any window borrow (the
+        // theme terms are folded in at tick time, under the frame's own
+        // colours, so OSC 11/12 recolors are honoured without a reset).
+        let streak_knobs = (
+            self.config.output_streak_enabled_or_default(),
+            self.config.output_streak_intensity_or_default(),
+            self.config.output_streak_tail_or_default(),
+            self.config.output_streak_max_streaks_or_default(),
+            self.config.output_streak_idle_secs_or_default(),
+            self.config.output_streak_sound_or_default(),
+        );
+        let streak_sound_allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::TerminalSound);
         let robi_serious_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::Robi);
@@ -25869,10 +25898,13 @@ impl App {
             let companion_verdict = self.companion_verdict(id, front_session, frame_started);
             // Likewise a pure config read, hoisted above the window borrow: it
             // selects WHICH companion the draw block below emits.
-            let pet_mode = self.trail_is_kitty_pet();
+            let trail_presentation = self.trail_presentation();
+            let pet_mode = trail_presentation.pet_species.is_some();
             // …and WHICH animal it draws, hoisted for the same reason (a `Copy`
             // enum, so the borrow below is unaffected).
-            let pet_species = self.trail_pet_species();
+            let pet_species = trail_presentation
+                .pet_species
+                .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
             // Serious Mode owns the whole companion family, including a song
             // detector re-armed by input after the transition drain. Fold the
             // policy into presentation and consumption on this same frame so
@@ -27070,6 +27102,132 @@ impl App {
                 // instead, until `is_active` self-disarms.
                 0
             };
+
+            // The episode's one sound cue, if this frame crossed a sounding
+            // edge; drained into the audio host below, after the borrow ends.
+            let mut streak_cue: Option<crate::output_streak::StreakCue> = None;
+            // ============================ PRISM WAKE ============================
+            // The terminal's answer to PROGRAM OUTPUT: a thin per-theme rainbow
+            // comet on the newest written row, plus one soft pip per EPISODE.
+            //
+            // Placed here on purpose — AFTER the word-decoration nova filled
+            // `ws.nova_scratch` and after rain — because the streak only ever
+            // APPENDS to that scratch. The decorations keep sole ownership of
+            // the channel's clear, so disabling either engine can neither
+            // strand nor clear the other's quads; the order (decorations, then
+            // streak) is fixed so frames stay byte-reproducible even though the
+            // blend itself is additive and order-free.
+            let streak_fp = {
+                let (s_enabled, s_intensity, s_tail, s_max, s_idle, s_sound) = streak_knobs;
+                // SUPPRESSED where the effect would be wrong rather than merely
+                // unwanted: the alt screen is a TUI's own canvas (its redraws
+                // are not "new output" in the sense the licence means), and a
+                // scrolled-back viewport is history, not arrival.
+                let suppressed = is_alt || display_offset != 0;
+                if !s_enabled || suppressed {
+                    // Fully off: no engine is ever constructed on the disabled
+                    // path (the D-1 zero-cost pin), and a lingering one is
+                    // dropped so nothing animates or holds a wake.
+                    ws.output_streak = None;
+                    0
+                } else {
+                    let engine = ws.output_streak.get_or_insert_with(|| {
+                        Box::new(crate::output_streak::OutputStreak::new(
+                            // splitmix64 finalizer over the window id (never a
+                            // wall clock), salted so window 0 is not the raw
+                            // zero input — the `rain_config_for_window` idiom.
+                            aterm_effects::genome::mix(id.0 ^ 0x5052_4953_4D5F_574B),
+                        ))
+                    });
+                    // W11 REDUCED MOTION IS A PIN, NOT AN EASE: amplitude 0
+                    // makes the engine RESET — no quads, no cue, fp 0, inactive
+                    // — rather than animating a gentler comet.
+                    let animate = motion.animate(crate::motion::MotionEffect::OutputStreak);
+                    let cfg = crate::output_streak::StreakConfig {
+                        enabled: true,
+                        intensity: if animate { s_intensity } else { 0.0 },
+                        tail: s_tail,
+                        max_streaks: s_max,
+                        idle_secs: s_idle,
+                        // PER-THEME CHARACTER, folded every frame from the
+                        // frame's OWN resolved colours (never a theme name), so
+                        // a live OSC 11/12 recolor re-tints the comets already
+                        // in flight instead of resetting them.
+                        dark_theme: aterm_render::theme_is_dark(default_bg_u32),
+                        theme_bg: default_bg_u32,
+                        theme_fg: default_fg_u32,
+                        theme_cursor: cursor_color_u32,
+                        // The pip rides the whole existing sound ladder: raw
+                        // window focus x the trail master x volume, plus
+                        // serious mode. A background window may ANIMATE but
+                        // must never SPEAK.
+                        sound: s_sound && streak_sound_allowed && ws.focused,
+                    };
+                    // THE LICENCE. `content_seq` advances on content mutation
+                    // only, never on viewport scroll, which is what makes it an
+                    // honest "something was written" clock; the anchor and the
+                    // empty-damage clause are the engine's own shared law.
+                    engine.note_output_cells(
+                        &ws.input_scratch.cells,
+                        cpos.row as usize,
+                        cpos.col as usize,
+                        rows,
+                        frame_started,
+                        false,
+                    );
+                    let frame = engine.tick(frame_started, glow_geom, &cfg, &mut ws.nova_scratch);
+                    if let Some(cue) = frame.cue {
+                        streak_cue = Some(cue);
+                    }
+                    // A live comet needs frame cadence; reuse the decoration
+                    // animation lane rather than arming a second deadline
+                    // train (there is nothing about a streak that wants its own
+                    // clock, and one lane is one place to reason about idle).
+                    if engine.is_active() {
+                        ws.note_deco_animating(frame_started);
+                    }
+                    frame.fp
+                }
+            };
+            // PRISM WAKE's voice. Pushed on the same edge that minted the
+            // light (the one-event law), through the ONE focus x master x
+            // volume law every other voice delegates to — with the streak's
+            // own opt-out folded in, so quieting the pip never quiets typing.
+            if let Some(cue) = streak_cue
+                && let Some(gain) = trail_sound_gain(
+                    ws.focused,
+                    self.config.trail_sounds_or_default()
+                        && self.config.output_streak_sound_or_default(),
+                    self.config.trail_sound_volume(),
+                )
+            {
+                self.trail_audio
+                    .push(aterm_effects::trail_sound::SoundEvent {
+                        style: glow_cfg.style,
+                        voice: self.config.trail_sound_voice(),
+                        kind: aterm_effects::trail_sound::SoundGesture::Output(match cue.sound {
+                            crate::output_streak::StreakSound::Shimmer => {
+                                aterm_effects::trail_sound::OutputGesture::Shimmer
+                            }
+                            crate::output_streak::StreakSound::Settle => {
+                                aterm_effects::trail_sound::OutputGesture::Settle
+                            }
+                        }),
+                        pan: cue.pan,
+                        // Output is NOT authorship: it must not read the typing
+                        // heat, or a busy hand would make the machine louder.
+                        heat: 0.0,
+                        hue: cue.hue,
+                        gain,
+                        // No key is in hand at all — the machine spoke, not a hand —
+                        // which is the field's own "every non-Typed gesture carries
+                        // false" identity.
+                        shifted: false,
+                        tone: aterm_effects::tone::Tone::Technical,
+                        // Never feeds the ambient bed — punctuation, not weather.
+                        bed: false,
+                    });
+            }
             // M1 SCROLL PILL (single-pane path): the iOS-style auto-fading
             // position indicator at the grid's right edge, emitted as
             // `GlowQuad`s (premultiplied additive light) — the SAME
@@ -27188,6 +27346,7 @@ impl App {
                 trail_fp,
                 deco_fp,
                 rain_fp,
+                streak_fp,
                 selection: SelectionFingerprint::of(&selection),
                 // One pane, so the fold is over exactly that selection.
                 pane_selection_fp: crate::fold_pane_selection_fp(0, 0, &selection),
@@ -27477,10 +27636,7 @@ impl App {
                 };
             // …and this frame's RADIAL halos (fire embers / crown / impact
             // flash — EMBERFORGE round light), same coords, same splice rules.
-            ws.input_scratch.glow_halo.clear();
-            ws.input_scratch
-                .glow_halo
-                .extend_from_slice(ws.cursor_glow.halos());
+            ws.cursor_glow.swap_halos(&mut ws.input_scratch.glow_halo);
             // The cat's fade-out FLOURISH (heart meow / star wink) rides the same
             // frame streams, emitted HERE so its theme arms land correctly: the
             // LIGHT-theme SOURCE-OVER veil appends to `glow_halo` (just refilled
@@ -27510,26 +27666,17 @@ impl App {
             }
             // …and the PER-PIXEL FIRE (campaign 2): the flame body evaluated at
             // every device pixel by the shared field.
-            ws.input_scratch.fire_patch.clear();
-            ws.input_scratch
-                .fire_patch
-                .extend_from_slice(ws.cursor_glow.patches());
+            ws.cursor_glow
+                .swap_patches(&mut ws.input_scratch.fire_patch);
             // …and the UNDER-INK flame body + CHARRED ink (P6 dark cores).
-            ws.input_scratch.glow_under.clear();
-            ws.input_scratch
-                .glow_under
-                .extend_from_slice(ws.cursor_glow.under_quads());
-            ws.input_scratch.char_fg.clear();
-            ws.input_scratch
-                .char_fg
-                .extend_from_slice(ws.cursor_glow.charred());
+            ws.cursor_glow
+                .swap_under_quads(&mut ws.input_scratch.glow_under);
+            ws.cursor_glow.swap_charred(&mut ws.input_scratch.char_fg);
             // …and the fire CONTRAST-HALO strengths (the colour-free
             // legibility stream — a GRID stream; the tab-strip splice below
             // shifts its rows down with the glyphs, like char_fg).
-            ws.input_scratch.fire_halo.clear();
-            ws.input_scratch
-                .fire_halo
-                .extend_from_slice(ws.cursor_glow.halo_cells());
+            ws.cursor_glow
+                .swap_halo_cells(&mut ws.input_scratch.fire_halo);
             // The block-fill override: the rainbow (rainbow kitty) fill, else the fire
             // FORGE fill, else the phaser EMITTER fill, else the laser BOLT
             // fill, else the comet NUCLEUS fill, else the water DROPLET fill,
@@ -28245,8 +28392,19 @@ impl App {
         if !self.use_gpu {
             return GpuRecoveryOutcome::BackendUnavailable;
         }
+        // W6 flip-drill: surface the LATCH'S OWN classification (read before
+        // the backend slot is replaced below). `None` for a wgpu-path loss —
+        // its callback already printed `(reason, msg)` at latch time.
+        let loss_reason = self
+            .backend
+            .gpu_mut()
+            .and_then(|gpu| gpu.device_loss_reason());
         eprintln!(
-            "aterm-gui: GPU device lost — downgrading to the CPU renderer so windows keep rendering"
+            "aterm-gui: GPU device lost{} — downgrading to the CPU renderer so windows keep rendering",
+            loss_reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
         );
         // H1 (Windows Mica/Acrylic): a window created for the DirectComposition
         // visual path carries `WS_EX_NOREDIRECTIONBITMAP`, which strips the GDI
@@ -28541,6 +28699,12 @@ impl App {
         let ws = windows
             .get_mut(&id)
             .ok_or(metrics::PresentDropReason::TargetMismatch)?;
+        // This is the FINAL cursor-effect composition seam: all strip shifts,
+        // clipping, and chrome suppression have already settled the four
+        // window-absolute streams.  Build their compact content revisions and
+        // occupied-row sets once here, so CPU/GPU prior-frame caches need not
+        // clone or rescan an 8k ribbon merely to decide dirty rows.
+        ws.input_scratch.refresh_cursor_effect_damage();
         if backend.is_gpu() {
             // GPU application present: render the offscreen frame and BLIT it
             // straight into the swapchain — no Frame, no softbuffer copy, no
@@ -29668,6 +29832,191 @@ impl App {
     /// changed pays a scan plus one extraction. The two safety budgets — the
     /// §6.4 flash limiter and the §3.2 supernova mutex — and the single 2 MiB
     /// cat atlas stay window-wide because all the panes drive ONE engine.
+    /// PRISM WAKE in the COMPOSED path — one comet per PANE, so a split shows
+    /// arrival where it actually happened rather than going silently dark in
+    /// half the layouts (design Q5; the single-pane present ticks its own
+    /// engine in `redraw_window_with_layout`).
+    ///
+    /// Deliberately its OWN pass rather than a block inside
+    /// [`Self::compose_word_decorations`]: that function early-returns whenever
+    /// Sparkle Words is unconfigured, and the streak is not a Sparkle Words
+    /// feature — hanging it there would have made "rainbow streak on output"
+    /// silently depend on an unrelated toy being enabled. It runs AFTER the
+    /// decoration pass and only ever APPENDS to `nova_scratch`, which is the
+    /// same co-residency discipline the single-pane path keeps: the decorations
+    /// own the channel's clear, the streak owns nothing.
+    ///
+    /// TWO honest differences from the single-pane path, both forced by what a
+    /// composed frame can see:
+    ///
+    /// * **The licence clock is the pane snapshot's `snapshot_seq`** (the damage
+    ///   epoch), not `Terminal::content_seq` — a composed pass reads resident
+    ///   snapshots under the frame's authorization fence and never re-locks the
+    ///   terminals, and `RenderInput` carries no content clock. The epoch
+    ///   advances on net-new grid damage, which for a live-bottom pane IS output
+    ///   arriving; the scrolled-back case that would otherwise differ is already
+    ///   suppressed below, and the empty-damage and echo clauses still apply.
+    /// * **Only the FOCUSED pane may speak.** Every visible pane animates —
+    ///   they are all on glass — but one pip per pane per episode would turn a
+    ///   four-way split into a chord.
+    pub(crate) fn compose_output_streak(
+        &mut self,
+        wid: WindowId,
+        ctx: &ComposeDecoCtx<'_>,
+    ) -> u64 {
+        // Knobs first: every one is an `&self` method, so they must resolve
+        // before the `self.windows` borrow (the `compose_word_decorations`
+        // prologue's rule).
+        let enabled = self.config.output_streak_enabled_or_default();
+        let intensity = self.config.output_streak_intensity_or_default();
+        let tail = self.config.output_streak_tail_or_default();
+        let max_streaks = self.config.output_streak_max_streaks_or_default();
+        let idle_secs = self.config.output_streak_idle_secs_or_default();
+        let sound_key = self.config.output_streak_sound_or_default();
+        let sound_gain = trail_sound_gain(
+            ctx.win_focused,
+            self.config.trail_sounds_or_default()
+                && sound_key
+                && self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::TerminalSound),
+            self.config.trail_sound_volume(),
+        );
+        let style = self.glow_config().style;
+        let voice = self.config.trail_sound_voice();
+        let load_shed = self.load_shed_active();
+        let trail_audio = &mut self.trail_audio;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        // Panes this window stopped showing take their engines with them — the
+        // `retain_panes` discipline applied to streak state, so a closed pane
+        // can neither leak an engine nor replay its arrival history if the
+        // session id is ever reused.
+        ws.output_streak_panes
+            .retain(|s, _| ctx.panes.iter().any(|(r, _)| r.session == *s));
+        if !enabled {
+            // Fully off: no engine survives, none is ever built, and the
+            // channel is untouched (the D-1 zero-cost pin, composed side).
+            ws.output_streak_panes.clear();
+            return 0;
+        }
+
+        let mut fp: u64 = 0;
+        for (index, (r, _)) in ctx.panes.iter().enumerate() {
+            let place = PanePlace {
+                row_off: r.row_off,
+                col_off: r.col_off,
+                rows: r.rows,
+                cols: r.cols,
+                win_rows: ctx.win_rows,
+                win_cols: ctx.win_cols,
+                cell_w: ctx.cell_w,
+                cell_h: ctx.cell_h,
+            };
+            let focused_pane = r.session == ctx.focus;
+            let snapshot = if focused_pane {
+                &ws.composed_focus_scratch
+            } else {
+                let Some(snapshot) = ws.unfocused_pane_scratch.get(&r.session) else {
+                    continue;
+                };
+                snapshot
+            };
+            // SUPPRESSED where the effect would be wrong rather than merely
+            // unwanted, exactly as the single-pane path rules it: the alt
+            // screen is a TUI's own canvas, and a scrolled-back viewport is
+            // history, not arrival. Load shed drops it like every other
+            // decoration.
+            if load_shed || snapshot.engine_alt || snapshot.display_offset != 0 {
+                ws.output_streak_panes.remove(&r.session);
+                continue;
+            }
+            // Pane-LOCAL geometry: the emitter draws in this pane's own grid
+            // pixels and `translate_nova_into_pane` below shifts and clips them
+            // into the window, so the origin is 0 and the "window" is the pane.
+            let geom = crate::cursor_glow::Geom {
+                cw: ctx.cell_w as usize,
+                ch: ctx.cell_h as usize,
+                rows: usize::from(r.rows),
+                cols: usize::from(r.cols),
+                origin_x: 0,
+                origin_y: 0,
+                win_w: u16::try_from(usize::from(r.cols) * ctx.cell_w as usize)
+                    .unwrap_or(u16::MAX),
+                win_h: u16::try_from(usize::from(r.rows) * ctx.cell_h as usize)
+                    .unwrap_or(u16::MAX),
+                head: 0,
+            };
+            let cfg = crate::output_streak::StreakConfig {
+                enabled: true,
+                // W11 is a PIN, not an ease: amplitude 0 resets the engine.
+                intensity: if ctx.animate_streak { intensity } else { 0.0 },
+                tail,
+                max_streaks,
+                idle_secs,
+                dark_theme: aterm_render::theme_is_dark(snapshot.default_bg),
+                theme_bg: snapshot.default_bg,
+                theme_fg: snapshot.default_fg,
+                theme_cursor: snapshot.cursor_color,
+                // Only the focused pane speaks (see the fn doc), and only
+                // through the one focus x master x volume law.
+                sound: focused_pane && sound_gain.is_some(),
+            };
+            let engine = ws
+                .output_streak_panes
+                .entry(r.session)
+                .or_insert_with(|| {
+                    crate::output_streak::OutputStreak::new(aterm_effects::genome::mix(
+                        r.session ^ 0x5052_4953_4D5F_5057,
+                    ))
+                });
+            engine.note_output_cells(
+                &snapshot.cells,
+                snapshot.cursor_row,
+                snapshot.cursor_col,
+                usize::from(r.rows),
+                ctx.now,
+                false,
+            );
+            ws.pane_nova.clear();
+            let frame = engine.tick(ctx.now, geom, &cfg, &mut ws.pane_nova);
+            if let Some(cue) = frame.cue
+                && let Some(gain) = sound_gain
+            {
+                trail_audio.push(aterm_effects::trail_sound::SoundEvent {
+                    style,
+                    voice,
+                    kind: aterm_effects::trail_sound::SoundGesture::Output(match cue.sound {
+                        crate::output_streak::StreakSound::Shimmer => {
+                            aterm_effects::trail_sound::OutputGesture::Shimmer
+                        }
+                        crate::output_streak::StreakSound::Settle => {
+                            aterm_effects::trail_sound::OutputGesture::Settle
+                        }
+                    }),
+                    pan: cue.pan,
+                    // Output is not authorship: it never reads typing heat.
+                    heat: 0.0,
+                    hue: cue.hue,
+                    gain,
+                    // No key is in hand at all — the machine spoke, not a hand —
+                    // which is the field's own "every non-Typed gesture carries
+                    // false" identity.
+                    shifted: false,
+                    tone: aterm_effects::tone::Tone::Technical,
+                    bed: false,
+                });
+            }
+            translate_nova_into_pane(&mut ws.pane_nova, place);
+            ws.nova_scratch.extend_from_slice(&ws.pane_nova);
+            // ORDER-SENSITIVE, the deco fold's rule: two panes streaming
+            // identical output must not cancel each other out of the RepaintKey.
+            fp ^= frame.fp.rotate_left((index % 64) as u32);
+        }
+        fp
+    }
+
     pub(crate) fn compose_word_decorations(
         &mut self,
         wid: WindowId,
@@ -30744,16 +31093,17 @@ impl App {
                     };
                     // ECHO ANCHOR from the same lock hold, same live-bottom
                     // guard and window translation as the probe/cursor.
-                    focus_print_anchor = (d_off == 0)
-                        .then(|| term.print_anchor())
-                        .flatten()
-                        .map(|(ar, ac, seq)| {
-                            (
-                                ar.saturating_add(r.row_off),
-                                ac.saturating_add(r.col_off),
-                                seq,
-                            )
-                        });
+                    focus_print_anchor =
+                        (d_off == 0)
+                            .then(|| term.print_anchor())
+                            .flatten()
+                            .map(|(ar, ac, seq)| {
+                                (
+                                    ar.saturating_add(r.row_off),
+                                    ac.saturating_add(r.col_off),
+                                    seq,
+                                )
+                            });
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
                         + usize::from(scroll_change.invalidated);
                     // VI-1: the pane-local vi cursor (see the declaration) —
@@ -31017,7 +31367,8 @@ impl App {
             // constructed (the D-1 zero-cost pin, compose edition).
             0
         };
-        let pet_mode = self.trail_is_kitty_pet();
+        let trail_presentation = self.trail_presentation();
+        let pet_mode = trail_presentation.pet_species.is_some();
         // The composed path has the same Serious Mode owner as the single-pane
         // path. This term gates input-fed song state as well as ordinary pet/
         // kitty presentation, so a split cannot resurrect a drained companion.
@@ -31119,7 +31470,9 @@ impl App {
         // (a pure config read, hoisted above the `ws` borrow) — and drawable
         // under the same presentation gate the flying kitty takes here.
         // …and WHICH animal it draws, hoisted for the same reason.
-        let pet_species = self.trail_pet_species();
+        let pet_species = trail_presentation
+            .pet_species
+            .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
         let pet_visible = resident_pet_presentation_enabled(
             pet_mode,
             cursor_companion_presentable,
@@ -31395,6 +31748,7 @@ impl App {
                 focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
                 win_focused: focused,
                 animate_sparkles,
+                animate_streak: policy.animate(crate::motion::MotionEffect::OutputStreak),
                 animate_cat,
                 kitty_alpha,
                 cat_frame,
@@ -31409,6 +31763,34 @@ impl App {
                 now,
             },
         ) ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
+        // PRISM WAKE, per pane — its own pass so it does not inherit Sparkle
+        // Words' enable gate, and placed after the decorations so it only ever
+        // APPENDS to the nova channel they own.
+        let streak_fp = self.compose_output_streak(
+            wid,
+            &ComposeDecoCtx {
+                panes: &panes,
+                focus,
+                win_rows: rows.min(u16::MAX as usize) as u16,
+                win_cols: cols.min(u16::MAX as usize) as u16,
+                cell_w: glow_cw as u32,
+                cell_h: glow_ch as u32,
+                focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
+                win_focused: focused,
+                animate_sparkles,
+                animate_streak: policy.animate(crate::motion::MotionEffect::OutputStreak),
+                animate_cat,
+                kitty_alpha,
+                cat_frame,
+                pet: pet_frame,
+                pet_visible,
+                present: true,
+                accent: glow_cfg.accent,
+                cursor_color: focus_cursor_rgb
+                    .map_or(aterm_core::render::COLOR_UNSET, aterm_render::rgb_to_u32),
+                now,
+            },
+        );
         // Keep the IME candidate/compose window anchored at the caret (only re-reports
         // to winit when the cursor cell actually moves). While the FIND or RENAME
         // well owns an in-flight composition, ITS splice in the shared redraw tail
@@ -31530,6 +31912,7 @@ impl App {
             // mixed — see the engine block above); 0 when off/suspended/drained,
             // byte-identical to the pre-rain compose.
             rain_fp,
+            streak_fp,
             selection: focus_selection,
             pane_selection_fp,
             active_pane_mark: ActivePaneMark::key_term(active_pane_mark),
@@ -40131,6 +40514,7 @@ mod key_time_click_tests {
             heat: 0.42,
             hue: 0.7,
             dir: 0,
+            shifted: false,
         }
     }
 
@@ -40455,6 +40839,16 @@ mod settled_compose_early_out_tests {
         // so the engines stay dark and `glow_fp`/`trail_fp` stay exactly 0.
         app.config.cursor_trail = Some(false);
         app.config.cursor_trail_style = Some("off".into());
+        // PRISM WAKE joins that list for the identical reason, and this fixture
+        // is the exact shape that trips it: every step below WRITES OUTPUT, and
+        // output is what the streak animates. A live comet is a real presenter
+        // (`settle`'s strictness note, applied to a second engine), so leaving
+        // it on would pin comet physics here instead of the RepaintKey
+        // early-out this test is about.
+        app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
         app.kitty_cursor_enabled_cache = None;
         app.recompute_sparkle();
         // Focused NEW pane `sid`; session 0 stays visible in the background.

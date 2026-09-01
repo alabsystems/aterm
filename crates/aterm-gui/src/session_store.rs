@@ -1092,6 +1092,7 @@ fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
+        fabric: crate::fabric::SessionFabric::default(),
     });
     SessionHandle {
         sid,

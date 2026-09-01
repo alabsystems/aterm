@@ -95,6 +95,11 @@ mod wasm_census;
 pub use lazy_init::{LAZY_INIT_PRECISION_NOTE, run_lazy_init_census};
 pub use lock_order::run_lock_order_census;
 pub use scope_census::{SCOPE_PRECISION_NOTE, run_scope_census};
+/// The roster of browser cdylib roots, re-exported for exactly one consumer:
+/// `aterm-forge`'s `the_wasm_cells_cover_every_shipped_web_crate`, which holds
+/// every crate on this list inside a measured, ratcheted cell. A new entry here
+/// with no cell fails THAT test, loudly, instead of shipping unbounded.
+pub use wasm_census::WASM_ROOT_CRATES;
 pub use wasm_census::run_wasm_census;
 
 /// The census verdict plus its full human/AI-readable transcript. The log is

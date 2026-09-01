@@ -582,11 +582,29 @@ impl DraftJournalHost {
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(1);
+            // A RECYCLED PID MUST NEVER RESOLVE TO A DEAD RUN'S ROOT. These
+            // roots are draft-recovery journals and they are never cleaned up,
+            // so a pid+ordinal name alone let macOS pid recycling hand a fresh
+            // test process a prior run's unsaved draft — which crash recovery
+            // then dutifully replayed into the new test's document (the proven
+            // six-tests-at-once app_documents flake: one Enter on "abc" landed
+            // on a resurrected "abc\n" and read back "abc\n\n"). Stamp the
+            // root with a per-process boot nonce so the name is unique per
+            // process INSTANCE, and remove any same-named corpse: a live
+            // process cannot share our pid AND our stamp.
+            static STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+            let stamp = *STAMP.get_or_init(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            });
             let root = std::env::temp_dir().join(format!(
-                "aterm-test-drafts-{}-{}",
+                "aterm-test-drafts-{}-{stamp:x}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+            let _ = std::fs::remove_dir_all(&root);
             Self::new(root)
         }
         #[cfg(not(test))]

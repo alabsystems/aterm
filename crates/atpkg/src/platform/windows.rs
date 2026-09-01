@@ -18,6 +18,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Whether the calling user can write into `dir`. Best-effort `true` on Windows,
+/// matching [`dir_meta_is_private`]: writability rests on the per-user ACL, which this
+/// layer does not evaluate. The Unix backend answers this with `access(2)`.
+#[must_use]
+pub fn dir_writable_by_caller(_dir: &Path) -> bool {
+    true
+}
+
 /// Appended to a tool name to form the concrete executable name. Applied ONLY by
 /// [`crate::store::ToolName::exe_file`]: here the two suffixes name two DIFFERENT files, so
 /// every hand-written append was a chance to build `bin/ay.cmd` when `bin\ay.exe` was meant.

@@ -106,7 +106,23 @@ version = "1.0"
 default-features = false
 
 [dependencies.hashbrown]
-version = "0.17"
+# FORK TRIM (aterm): 0.17 -> 0.16, a DEDUP, not a downgrade.
+# hashbrown 0.16.1 is ALREADY in every cell that carries indexmap, pulled by
+# naga, wgpu, wgpu-core and wgpu-hal. Upstream indexmap 2.14 asks for "0.17" and
+# nothing else in aterm's graph does, so the two versions were resolved side by
+# side and aterm shipped the hashbrown source TWICE.
+# COST: -1 package / -25,236 lines on mac-arm, linux, win and wasm-gpu — the
+# whole of hashbrown 0.17.1, which is a leaf (its only child, foldhash, is
+# shared with 0.16 and stays).
+# WHY IT IS SAFE: indexmap names exactly two hashbrown items — the `hash_table`
+# module (src/inner.rs:16 (`hash_table::HashTable<usize>`), src/lib.rs:226-234 (`TryReserveError`)) and `hashbrown::TryReserveError`'s two
+# variants (src/lib.rs) — and both exist unchanged in 0.16.1. `hash_table`
+# landed in hashbrown 0.15. The floor is enforced by compilation, not by this
+# comment: indexmap is a normal build unit in every cell above.
+# HONEST CAVEAT: this pin now has to move when indexmap next takes a hashbrown
+# API that only 0.17 has. That shows up as a compile error in indexmap itself,
+# which is the loudest place it could show up.
+version = "0.16"
 default-features = false
 
 [dependencies.quickcheck]

@@ -1241,6 +1241,7 @@ mod tests {
             enabled: true,
             index_source: "alabsystems/aterm".to_string(),
             outcome: outcome.to_string(),
+            seams: Vec::new(),
             programs,
         }
     }
@@ -1595,6 +1596,7 @@ mod tests {
             enabled: true,
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
+            seams: Vec::new(),
             programs,
         };
         let text = status.to_toml().unwrap();

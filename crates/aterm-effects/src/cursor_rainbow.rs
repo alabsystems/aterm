@@ -1483,6 +1483,53 @@ mod tests {
         assert!(!cr.is_active());
     }
 
+    /// A hot rainbow caret repeatedly solves the active rim's glass ceiling.
+    /// Its output and bisection buffers are resident scratch, so a warmed frame
+    /// must not grow either allocation even as the rim hue advances.
+    #[test]
+    fn active_rim_reuses_its_warmed_scratch() {
+        let g = geom();
+        let c = cfg();
+        let mut cursor = CursorRainbow::default();
+        let mut out = Vec::new();
+        let mut now = Instant::now();
+        for step in 0..64 {
+            out.clear();
+            now += Duration::from_millis(8);
+            let _ = cursor.tick(
+                Some((1, (step % 8) as u16)),
+                now,
+                1.0,
+                step % 2 == 0,
+                true,
+                g,
+                &c,
+                &mut out,
+            );
+        }
+        let before = (
+            out.capacity(),
+            cursor.rim_scratch.capacity(),
+            cursor.rim_emitted.capacity(),
+        );
+        assert!(
+            before.1 > 0 && before.2 > 0,
+            "fixture must exercise the active rim"
+        );
+        out.clear();
+        now += Duration::from_millis(8);
+        let _ = cursor.tick(Some((1, 0)), now, 1.0, true, true, g, &c, &mut out);
+        assert_eq!(
+            before,
+            (
+                out.capacity(),
+                cursor.rim_scratch.capacity(),
+                cursor.rim_emitted.capacity(),
+            ),
+            "a warmed active rim frame must not grow scratch storage"
+        );
+    }
+
     /// The block fill starts NEAR the base (white on dark) at rest and moves markedly
     /// toward a saturated rainbow under full energy — the "white → rainbow" bloom.
     #[test]
@@ -2877,7 +2924,9 @@ mod tests {
         // crossing at the same coverages: if THAT does not read cyan through this
         // predicate, the clause above is measuring nothing and should be deleted
         // rather than believed.
-        let crossing = crate::spectrum::spectrum(0.5843);
+        // WHERE THE CROSSING IS, ASKED OF THE ARC rather than transcribed —
+        // the 2026-08-31 re-pace moves the position, not the colour.
+        let crossing = crate::spectrum::spectrum(crate::spectrum::spectrum_crossing_position());
         let control_cyan = [0x0011_1318u32, 0x001A_1B26].into_iter().any(|ground| {
             (1..=255u8).any(|cov| {
                 cyan(crate::spectrum::compose_on_glass(
@@ -3109,8 +3158,14 @@ mod tests {
         // adjacent sweep colours, at this emitter's own coverage scale, through no
         // law at all — rasterized by the very same `raster` above. If this comes
         // out clean the zero below is the predicate's and not the mark's.
-        let a = crate::spectrum::spectrum(0.52);
-        let b = crate::spectrum::spectrum(0.62);
+        // THE CROSSING'S TWO FLANKS, asked of the arc: one exempt span either
+        // side of the window's own centre, which is where the green and the blue
+        // that blend into cyan actually live. Transcribed positions (`0.52`,
+        // `0.62`) stopped naming them at the 2026-08-31 re-pace.
+        let mid = crate::spectrum::spectrum_crossing_position();
+        let half = crate::spectrum::spectrum_crossing_width() * 0.5;
+        let a = crate::spectrum::spectrum(mid - half);
+        let b = crate::spectrum::spectrum(mid + half);
         let control = GROUNDS.into_iter().any(|ground| {
             (8..=HALO_BASE_COV as u8).any(|cov| {
                 let mk = |rgb: u32| GlowQuad {
@@ -3177,7 +3232,7 @@ mod tests {
     #[test]
     fn the_caret_cools_with_its_trail_and_not_with_the_ignition_heat() {
         use crate::cursor_trail::TypingCadence;
-        use crate::typing_momentum::{TYPING_MOMENTUM_TAU, TypingMomentum};
+        use crate::typing_momentum::TypingMomentum;
 
         /// The shipped Default theme's `cursor_color`, which is what
         /// `app_render` hands the block as `base`.
@@ -3277,20 +3332,41 @@ mod tests {
 
         // ── the release: one continuous walk down the spine ─────────────────
         //
-        // THE CEILING IS DERIVED, not chosen. The spine is exponential with
-        // `TYPING_MOMENTUM_TAU`, so it moves at most `1/τ` per second; the
-        // colour terms it drives span `MIX_MAX - MIX_IDLE` (the mix),
+        // THE CEILING IS DERIVED, not chosen — and since 2026-08-31 it is
+        // derived against the spine's OWN step rather than against the fastest
+        // step an exponential with `TYPING_MOMENTUM_TAU` could take.
+        //
+        // The colour terms the spine drives span `MIX_MAX - MIX_IDLE` (the mix),
         // `SAT_MAX - SAT_IDLE` and `VAL_MAX - VAL_IDLE`, each of which can move
-        // a channel by at most 255; plus two levels for the `f32 -> u8`
-        // rounding at each end of a step.
+        // a channel by at most 255. The four flat levels beside them are priced
+        // below.
+        //
+        // **WHY THE `1/τ` FORM RETIRED (2026-08-31).** It bounded the spine's
+        // rate by the decay's asymptote instead of by the step the spine
+        // actually takes, and then leaned on the difference to cover a term it
+        // never named: [`lift_to_light_floor`], which re-solves a bisection
+        // toward white every frame and moves the caret's DIMMEST channel
+        // fastest as the block cools through the floor. This form bounds each
+        // step by the spine's OWN motion and carries that term openly.
+        //
+        // The four levels are `2` of `f32 -> u8` rounding (`shade` rounds, then
+        // `mix_rgb` rounds again, at each end of a step) plus `2` for the
+        // floor's re-solve, and that second pair is a REGRESSION PIN on the
+        // shipped caret rather than a derivation — the lift's gain is the
+        // inverse of the sRGB transfer at the blue channel's `0.0722` weight,
+        // which is not a number this fixture can state honestly in one line.
+        // Measured worst step on the shipped caret: `7` at frame `6`, where the
+        // perceptual re-pace of the arc ([`crate::spectrum::SPECTRUM_ANCHOR_AT`])
+        // put a colour `7` levels of blue from this fixture's base at the same
+        // sweep the retired arc put one `6` levels away.
+        //
+        // It still refutes what it exists to catch: a caret that SNAPPED to its
+        // base moves tens of levels across a step the spine barely moved at all.
         const STEP: Duration = Duration::from_millis(16);
-        let step_s = STEP.as_secs_f32();
-        let ceiling =
-            (((MIX_MAX - MIX_IDLE) + (SAT_MAX - SAT_IDLE) + (VAL_MAX - VAL_IDLE)) * 255.0 * step_s
-                / TYPING_MOMENTUM_TAU)
-                .ceil() as u32
-                + 2;
-        let mut previous: Option<(u32, u32)> = None;
+        let colour_span =
+            ((MIX_MAX - MIX_IDLE) + (SAT_MAX - SAT_IDLE) + (VAL_MAX - VAL_IDLE)) * 255.0;
+        let ceiling_for = |dpaint: f32| (colour_span * dpaint.abs()).ceil() as u32 + 4;
+        let mut previous: Option<(u32, u32, f32)> = None;
         let mut worst_step = 0u32;
         let mut cooled = 0usize;
         let mut frames = 0usize;
@@ -3305,9 +3381,10 @@ mod tests {
             // deliberately short ramp with its own contract, and folding it in
             // here would measure two laws with one bound.
             if paint >= CARET_LIGHT_KNEE
-                && let Some((prev_fill, prev_base_delta)) = previous
+                && let Some((prev_fill, prev_base_delta, prev_paint)) = previous
             {
                 let step = rgb_max_delta(prev_fill, fill);
+                let ceiling = ceiling_for(paint - prev_paint);
                 worst_step = worst_step.max(step);
                 assert!(
                     step <= ceiling,
@@ -3324,7 +3401,7 @@ mod tests {
                 cooled += usize::from(toward_base < prev_base_delta);
             }
             frames += 1;
-            previous = Some((fill, toward_base));
+            previous = Some((fill, toward_base, paint));
         }
         assert!(
             frames > 180 && cooled > 40,

@@ -67,7 +67,7 @@ pub struct CutOptions {
     pub rehearse: Option<String>,
     /// Ship a single-arch build (explicit opt-out of universal, decision 18).
     pub arm64_only: bool,
-    /// `--no-paint-smoke`: skip the self-check's paint smoke (the ten-keystroke
+    /// `--no-paint-smoke`: skip the self-check's paint smoke (the 29-keystroke
     /// pixel proof against the just-built bundle). An EMERGENCY escape, refused
     /// on a notarized real cut unless [`NO_PAINT_SMOKE_ACK_VAR`] carries the
     /// exact acknowledgement — see [`paint_smoke_policy`].
@@ -1460,7 +1460,8 @@ pub struct Journal {
     pub verify_pubkey: Option<String>,
     /// WHICH MACHINE signed, when the machine-roster tier is armed — the id the
     /// master-signed roster maps [`Self::signature_pubkey`] to. `None` with an
-    /// unpinned paper master, which is every journal this tree writes.
+    /// unpinned paper master — a fork or a pre-v0.21.0 build, NOT this tree, whose
+    /// master has been armed since 2026-08-15.
     ///
     /// It rides beside the public key rather than replacing it because the two
     /// answer different questions on resume: the key is what the published
@@ -2267,7 +2268,8 @@ pub fn channel_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) 
 ///
 /// # Shape
 ///
-/// `None` on either side means "no roster in play", which is every cut this tree makes
+/// `None` on either side means "no roster in play" — a cut on an unarmed build, or by a
+/// machine the roster does not name; not this tree, armed since 2026-08-15
 /// and must therefore be `Ok`. An unattributed cut against a rostered head is NOT
 /// silently allowed: dropping the tier is a downgrade the client would refuse
 /// structurally, so it is named here while naming it is free.
@@ -3824,10 +3826,11 @@ fn load_signing_material(
 /// the purpose of deciding anything (`step_build` also names it, but only to copy
 /// it verbatim into the manifest), and they pass it inward from there. That is
 /// what makes every decision below this line drivable by a test with a
-/// placeholder team: a resolver that read the constant itself would be inert in
-/// this tree — the anchor is empty — and its rules would be untestable for
-/// exactly as long as they are unused, which is exactly as long as nobody would
-/// notice them breaking.
+/// placeholder team: a resolver that read the constant itself could not be driven by
+/// a test with a placeholder team at all, because the anchor is ARMED
+/// (`APPLE_TEAM_ID` = the real team since 2026-08-15) — every such test would either
+/// sign for real or skip. Passing it inward is what keeps these rules drivable now
+/// that they are live.
 ///
 /// Note that this deliberately does NOT vary by [`CutKind`]. A dry run or a
 /// rehearsal with the anchor set signs and notarizes for real, which costs a
@@ -5377,9 +5380,11 @@ pub fn signing_verdict(
     // and `channel_signature_policy` stays a pure decision a test can drive with a
     // synthetic master.
     //
-    // With `PAPER_MASTER_PUBKEYS` empty (this tree) the roster document is not even
-    // READ: an unarmed anchor must cost nothing and must not fail a cut because a
-    // profile mentions a file that has since moved.
+    // With `PAPER_MASTER_PUBKEYS` empty the roster document is not even READ: an
+    // unarmed anchor must cost nothing and must not fail a cut because a profile
+    // mentions a file that has since moved. THIS tree is ARMED (2026-08-15), so a
+    // `Sign` duty DOES read it — a moved or unreadable `machine_roster` path is a
+    // real cut failure here, not the impossibility this comment used to describe.
     //
     // A `Finish` duty does not read it either, and for a related reason: the roster it
     // would read is not the roster the cut is publishing (that one is frozen in
@@ -9540,7 +9545,12 @@ pub fn selfcheck_paint_then_signing(
     let paint_note = match paint_smoke_policy(kind, !team.is_empty(), skip_requested, ack)? {
         Some(skip_words) => skip_words,
         None => match probe.paint(&app.join("Contents/MacOS/aterm")) {
-            Ok(report) => format!("10 keys, fake-Claude shape, ink asserted \u{2014} {report}"),
+            // 29, not 10: the key list at [`ScriptPaintProbe::paint`] is 29
+            // long, and it was lengthened on purpose — a 10-key take sat on the
+            // `ribbon_hue_bands >= 4` cliff and measured 0 and 12 across runs of
+            // the SAME binary. This line is printed into the cut's own record,
+            // so a stale count here is a false entry in the release ledger.
+            Ok(report) => format!("29 keys, fake-Claude shape, ink asserted \u{2014} {report}"),
             Err(why) => {
                 return Err(Error::new(format!(
                     "self-check failed: the shipped artifact does not paint its flagship \

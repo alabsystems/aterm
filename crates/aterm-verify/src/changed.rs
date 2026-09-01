@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CHANGE-SCOPED SELECTION (`--changed`): the missing middle between the ~2 s
-//! pre-push L0 hook and a whole-tree run.
+//! CHANGE-SCOPED SELECTION (`--changed`): the missing middle between a bare
+//! `targo check` and a whole-tree run.
+//!
+//! This header named "the ~2 s pre-push L0 hook" as the lower end until
+//! 2026-08-31. No such hook runs: `.githooks/pre-push` was demoted to ADVISORY
+//! on 2026-08-24 and its entire body is one printf and `exit 0`. Nothing
+//! between an ungated commit and `origin/main` executes this tier or any other,
+//! which is precisely why the tier has to be cheap enough to be run by hand.
 //!
 //! The set is "crates whose own files changed" CLOSED UNDER `depends on` — a
 //! change to `aterm-grid` must re-test `aterm-gui`, or the tier is a trap rather

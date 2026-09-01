@@ -137,6 +137,29 @@ pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
 /// must never change), but they are SFX in the UI.
 pub(crate) const EDIT_SPARKLE_BONK: &str = "sparkle_words.profanity.bonk";
 pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.bonk_detonation";
+/// PRISM WAKE's pip (`[output_streak] sound`, default ON —
+/// `docs/DESIGN-output-streak-2026-08-30.md` §7's "sound opt-out ladder").
+///
+/// The output streak answers fresh PROGRAM output with a small per-theme comet
+/// and, once per episode, one soft pentatonic pip plus a closing exhale. The
+/// visual half and the aural half are ONE feature by the owner's 2026-08-31
+/// ruling, so both ship ON; this key is the ear's own opt-out, the way
+/// [`EDIT_TRAIL_SOUND_RIFF`] is the riff's — turning it off leaves every comet
+/// flying and every other voice at its configured level.
+///
+/// A `[output_streak]` LEAF in the file (that is where the feature's table
+/// lives, and a config key has no alias seam — renaming it would orphan every
+/// line already authored), but SFX in the UI, exactly like the two bonk keys
+/// above it. [`section_of`] and [`group_of`] both consult [`SOUND_MENU_KEYS`]
+/// ahead of their nested-table prefix rules, so this leaf routes to the Sound
+/// box on that membership alone and needs no `output_streak.` prefix arm.
+///
+/// SUBORDINATE, and only ever subtractive: `trail_sounds` × `trail_sound_volume`
+/// × raw window focus × `SeriousEffect::TerminalSound` all apply first, and a
+/// pip is recorded only on an edge that also minted light — so with
+/// `output_streak.enabled` off this key cannot make a sound at all
+/// (`Config::output_streak_warning` says so at `--validate-config` time).
+pub(crate) const EDIT_OUTPUT_STREAK_SOUND: &str = "output_streak.sound";
 
 /// THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
 ///
@@ -178,6 +201,7 @@ pub(crate) const SOUND_MENU_KEYS: &[&str] = &[
     EDIT_BELL_SOUND,
     EDIT_SPARKLE_BONK,
     EDIT_SPARKLE_BONK_DETONATION,
+    EDIT_OUTPUT_STREAK_SOUND,
 ];
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
@@ -895,6 +919,26 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Rain field seed",
         kind: EditKind::Integer,
     },
+    // [output_streak] — PRISM WAKE. ONE leaf is registered, on purpose: the
+    // pip, because design §7 owes it a Sound-menu row in the same commit that
+    // adds the key. The table's five VISUAL keys (`enabled`, `intensity`,
+    // `tail`, `max_streaks`, `idle_secs`) are config-file surface for now and
+    // are NOT registered here — they need an Appearance group box and a
+    // preview-or-exemption ruling apiece, which is the settings rung of the
+    // design §10 ladder, not this one. That deferral is SAFE rather than
+    // silent: registering one of them without also giving `output_streak.` a
+    // `section_of`/`group_of` prefix arm fails
+    // `nested_leaves_have_agreeing_rows_and_serde_round_trip` loudly on the
+    // General catch-all, so the next hand cannot land half of it.
+    //
+    // The label is written for the SOUND MENU the row appears in, not for the
+    // table it lives in — the bonk keys' law: a row two boxes away from the
+    // volume slider has to say what it sounds like.
+    NestedLeaf {
+        key: EDIT_OUTPUT_STREAK_SOUND,
+        label: "Output streak pip",
+        kind: EditKind::Bool,
+    },
 ];
 
 /// Registry lookup for a dotted nested key — `None` for top-level keys and
@@ -912,10 +956,33 @@ pub(crate) fn nested_leaf(key: &str) -> Option<&'static NestedLeaf> {
 #[cfg_attr(not(test), allow(dead_code))] // consumed by the exhaustiveness gate
 pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
+        "privacy",
+        "the macOS consent posture ([privacy] enabled/check/notice/warmup/observer/…). It has \
+         its OWN purpose-built surface — the \"macOS file access\" block on Settings > Security, \
+         which renders the live probe state, the System Settings route, the warm-up gesture and \
+         the denied-state repair together. Registering the raw keys here would create a second, \
+         competing surface for the same facts, and two of them cannot be scalar rows at all: \
+         `protected_roots` and `warmup_folders` are lists (the same no-lossy-encoding rationale \
+         as keybindings). `auto_accept` is RESERVED and refused on purpose — an editable toggle \
+         would advertise a capability aterm deliberately does not have (it emits a \
+         --validate-config warning saying so). See docs/DESIGN-macos-tcc-prompts-2026-08-30.md",
+    ),
+    (
         "agents_auto_prime",
         "the coding-agent auto-prime opt-out, read off the UI thread by the spawn seam \
          (spawn.rs `prime_agents_if_due`); a Settings row belongs with an Agents section \
          that does not exist yet — `aterm agents status` names the key and what it stops",
+    ),
+    (
+        "fabric",
+        "the `aterm-link serve …` child this instance launches with `Scope::Bridge` over two \
+         inherited descriptors — a LAUNCHER INTENT (which program gets the bridge authority), \
+         not a preference, and deliberately not one click away in a Settings page that an \
+         Owner-scope client can drive through `settings set`: the whole point of putting \
+         `deliver`/`hold` behind a descriptor is that no token unlocks them, and a writable \
+         `fabric.command` would hand that authority to whatever a prompt-injected agent named. \
+         Edit `[fabric] command` in aterm.toml (validated by --validate-config), or set \
+         $ATERM_FABRIC_COMMAND",
     ),
     (
         "keybindings",
@@ -1113,6 +1180,14 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
+    // PRISM WAKE's pip: aural like the six above, and doubly unprojectable —
+    // the workbench scene has no PTY, so it produces no program output for a
+    // streak to answer in the first place. Listed BY NAME rather than covered
+    // by a prefix: this leaf routes to the Sound box, not to an
+    // `output_streak.` table box, and the coverage gate's prefix escape hatch
+    // names only the two decorative tables. Whoever registers the table's
+    // visual keys owes them the same choice, one by one.
+    EDIT_OUTPUT_STREAK_SOUND,
     EDIT_PALETTE,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
@@ -2231,6 +2306,12 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
         "matrix_rain.ink_text" => boolean(mr.and_then(|m| m.ink_text), false),
         "matrix_rain.phosphor" => boolean(mr.and_then(|m| m.phosphor), false),
         "matrix_rain.seed" => num(mr.and_then(|m| m.seed), "0 (stable per-window)"),
+        // PRISM WAKE's pip seeds its RESOLVED state through the resolver that
+        // owns the default, never a literal `true` re-typed here: the owner's
+        // 2026-08-31 "default on" ruling has exactly one home
+        // (`Config::output_streak_sound_or_default`), so the switch and the
+        // engine can never start in different positions.
+        EDIT_OUTPUT_STREAK_SOUND => boolean(Some(cfg.output_streak_sound_or_default()), true),
         // Unreachable for registered leaves — the conformance test fails any
         // NESTED_LEAVES entry that lands here (blank seed AND blank placeholder).
         _ => (None, String::new()),
@@ -2340,7 +2421,9 @@ pub(crate) fn section_of(key: &str) -> Section {
     // `[sparkle_words.profanity]` in the file, but it is an SFX, so it is
     // routed here BEFORE the decorative-table prefix rule below — otherwise the
     // single loudest sparkle-words gesture would sit two panes away from the
-    // volume slider that scales it.
+    // volume slider that scales it. PRISM WAKE's pip
+    // ([`EDIT_OUTPUT_STREAK_SOUND`]) is the same shape and rides the same
+    // early return: an `[output_streak]` leaf in the file, an SFX on screen.
     if SOUND_MENU_KEYS.contains(&key) {
         return Section::Cursor;
     }
@@ -3107,6 +3190,14 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "loud",
             "sound",
             "sfx",
+        ],
+        // PRISM WAKE's pip. A user hunting this row knows it by WHAT MADE IT
+        // HAPPEN ("output", "streak", "comet") or by what it sounds like
+        // ("pip", "chime"), never by the design's code name — and "rainbow"
+        // earns its place because that is the word the owner used for the
+        // effect ("a rainbow streak when in terminal there is output").
+        EDIT_OUTPUT_STREAK_SOUND => &[
+            "streak", "output", "prism", "comet", "rainbow", "pip", "chime", "sound", "sfx",
         ],
         // Likewise the bell: "beep" and "alert" are what the sound is called
         // outside this codebase.
@@ -5967,6 +6058,87 @@ mod edit_tests {
             .find(|f| f.key == key)
             .unwrap();
         assert_eq!(row_on.seed.as_deref(), Some("true"), "resolved ON");
+    }
+
+    /// PRISM WAKE's pip joins EVERY list a sound key must join — enumerated by
+    /// name here rather than derived, because the known failure mode for this
+    /// repo's audible knobs is joining one list and being forgotten in the
+    /// others (the exact drift that once left `tone_melody`, `trail_sound_bed`
+    /// and both bonk keys reachable only by hand-editing `aterm.toml`). A
+    /// derived check would let a missed list vanish from both sides of its own
+    /// comparison; these six assertions cannot.
+    ///
+    /// The routing claims are the interesting half: an `[output_streak]` LEAF
+    /// still lands in the Cursor pane's Sound box, because [`section_of`] and
+    /// [`group_of`] consult the Sound menu ahead of their nested-table prefix
+    /// rules — the bonk keys' law, applied to a second table.
+    #[test]
+    fn the_output_streak_pip_joins_every_list_a_sound_key_must_join() {
+        let key = super::EDIT_OUTPUT_STREAK_SOUND;
+        assert_eq!(key, "output_streak.sound", "the FILE spelling is the key");
+        assert!(
+            super::SOUND_MENU_KEYS.contains(&key),
+            "the pip is audible and must be on the Sound menu"
+        );
+        assert_eq!(super::section_of(key), super::Section::Cursor);
+        assert_eq!(super::group_of(key), ("Sound", 2));
+        assert!(super::group_footnote("Sound").is_some());
+        assert!(!keywords_of(key).is_empty(), "searchable by intent");
+        assert!(
+            super::nested_leaf(key).is_some(),
+            "the row is registered ONCE, via NESTED_LEAVES (no duplicate EditField)"
+        );
+        assert_eq!(
+            super::edit_kind(key),
+            EditKind::Bool,
+            "the writer types Bool"
+        );
+        assert!(
+            super::VISUAL_PREVIEW_EXEMPT_KEYS.contains(&key)
+                && !super::VISUAL_PREVIEW_KEYS.contains(&key),
+            "a sound has no workbench projection, and owes a documented exemption"
+        );
+    }
+
+    /// The pip's Settings ROW, seeded from the RESOLVED default so the switch
+    /// starts where the engine does. DEFAULT ON — owner ruling 2026-08-31,
+    /// *"default on"*, which makes this an opt-OUT — and platform-independently
+    /// so, unlike the streak's visual master: the decorative platform family
+    /// exists for decoration painted over content, and a pip covers no pixel.
+    #[test]
+    fn the_output_streak_pip_row_seeds_on_because_the_sound_is_an_opt_out() {
+        let key = super::EDIT_OUTPUT_STREAK_SOUND;
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == key)
+            .expect("the row exists on an unconfigured install");
+        assert_eq!(row.label, "Output streak pip");
+        assert_eq!(row.kind, EditKind::Bool);
+        assert_eq!(
+            row.seed.as_deref(),
+            Some("true"),
+            "resolved default ON, on every platform"
+        );
+        assert!(
+            row.placeholder.is_empty(),
+            "a Bool seeds its state; the checkbox convention leaves the placeholder blank"
+        );
+
+        let off: Config = aterm_toml::from_str("[output_streak]\nsound = false").unwrap();
+        let row_off = editable_fields(&off)
+            .into_iter()
+            .find(|f| f.key == key)
+            .unwrap();
+        assert_eq!(row_off.seed.as_deref(), Some("false"), "resolved OFF");
+
+        // The writer creates the table chain non-destructively and what it
+        // writes re-parses as `Config` — the reload contract, without which a
+        // mis-typed leaf would corrupt a table `app_config` also reads.
+        let written = apply_prefs_edits("font_px = 14\n", &[(key, set("false"))])
+            .expect("the nested writer creates [output_streak]");
+        assert!(written.contains("[output_streak]"), "{written}");
+        let reparsed: Config = aterm_toml::from_str(&written).expect("re-parses as Config");
+        assert!(!reparsed.output_streak_sound_or_default());
     }
 
     /// The split's focus mark is a SETTING, not a compile-time constant: a real

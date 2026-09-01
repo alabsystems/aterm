@@ -9,7 +9,7 @@
 //!
 //! This fixture tries to bypass both and fails to compile.
 
-use aterm_provenance::{Provenance, Host, Pty};
+use aterm_provenance::{Host, Provenance, Pty};
 
 fn main() {
     let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());

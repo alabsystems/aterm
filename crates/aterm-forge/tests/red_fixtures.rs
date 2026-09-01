@@ -14,10 +14,20 @@
 //!
 //! Every test constructs a MINIATURE ATERM WORKSPACE in its own directory under
 //! the cargo target tmpdir (never in the repository, never in `/tmp`): a
-//! `crates/aterm` root package so the four cells have something to resolve, a
+//! `crates/aterm` root package plus the two web modules `crates/aterm-wasm` and
+//! `crates/aterm-gpu-web`, so that all FIVE cells have something to resolve, a
 //! REAL copy of `vendor/indexmap` so the provenance obligations have real
 //! provenance files to find, the repository's own `deny.toml`, a `NOTICE`
 //! naming exactly the forks present, and a generated `Cargo.lock`.
+//!
+//! THE WEB MODULES ARE NOT DECORATION. The matrix roots its two `wasm32` cells
+//! at `aterm-wasm` and `aterm-gpu-web`, because `aterm` is a `[[bin]]` nothing
+//! compiles for wasm32 (see `aterm_forge::resolve::default_cells`). A fixture
+//! carrying only `crates/aterm` would leave both of those cells UNRESOLVABLE,
+//! and `[OB-12]` refuses a cell it cannot resolve — so every test here would go
+//! red for the wrong reason and each one would "prove" its obligation
+//! vacuously. They carry the same `indexmap` edge the root does, so the patch
+//! is live in all five cells and the liveness fixture can assert all five.
 //!
 //! Two details of that construction are load-bearing rather than incidental:
 //!
@@ -72,7 +82,7 @@ impl Fixture {
         fx.write(
             "Cargo.toml",
             "[workspace]\n\
-             members = [\"crates/aterm\"]\n\
+             members = [\"crates/aterm\", \"crates/aterm-wasm\", \"crates/aterm-gpu-web\"]\n\
              exclude = [\"vendor\", \"other\"]\n\
              resolver = \"2\"\n\
              \n\
@@ -94,6 +104,29 @@ impl Fixture {
             "crates/aterm/src/lib.rs",
             "// SPDX-License-Identifier: Apache-2.0\n",
         );
+        // The two wasm cells are rooted at the web modules, not at `aterm`.
+        for web in ["aterm-wasm", "aterm-gpu-web"] {
+            fx.write(
+                &format!("crates/{web}/Cargo.toml"),
+                &format!(
+                    "[package]\n\
+                     name = \"{web}\"\n\
+                     version = \"0.47.0\"\n\
+                     edition = \"2021\"\n\
+                     publish = false\n\
+                     \n\
+                     [lib]\n\
+                     crate-type = [\"cdylib\", \"rlib\"]\n\
+                     \n\
+                     [dependencies]\n\
+                     indexmap = {{ path = \"../../vendor/indexmap\" }}\n"
+                ),
+            );
+            fx.write(
+                &format!("crates/{web}/src/lib.rs"),
+                "// SPDX-License-Identifier: Apache-2.0\n",
+            );
+        }
         fx.write_notice(&[("indexmap", "2.14.0", "Apache-2.0 OR MIT")]);
 
         // See the module docs: without its own repository, this fixture lives
@@ -324,7 +357,7 @@ fn an_unreviewed_patch_entry_reds_the_forge_verb() {
     fx.write(
         "Cargo.toml",
         "[workspace]\n\
-         members = [\"crates/aterm\"]\n\
+         members = [\"crates/aterm\", \"crates/aterm-wasm\", \"crates/aterm-gpu-web\"]\n\
          exclude = [\"vendor\", \"other\"]\n\
          resolver = \"2\"\n\
          \n\
@@ -421,7 +454,7 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         ok,
         "the baseline fixture must be GREEN or this test proves nothing:\n{log}"
     );
-    assert!(log.contains("✓ indexmap live in all 4 cell(s)"), "{log}");
+    assert!(log.contains("✓ indexmap live in all 5 cell(s)"), "{log}");
 
     // Plant the violation: an intermediate dependency drags in a second
     // `indexmap` at another major, exactly as toml_edit 0.25 did for winnow.
@@ -466,10 +499,33 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
          indexmap = { path = \"../../vendor/indexmap\" }\n\
          dep_b = { path = \"../dep_b\" }\n",
     );
+    // The two wasm cells are rooted at the web modules, so the planted sibling
+    // has to reach THEM to be in their graphs at all. Without this the closing
+    // assertion — every cell is scored — would be asserted over two cells the
+    // violation never touched, which is the vacuity this file exists to refuse.
+    for web in ["aterm-wasm", "aterm-gpu-web"] {
+        fx.write(
+            &format!("crates/{web}/Cargo.toml"),
+            &format!(
+                "[package]\n\
+                 name = \"{web}\"\n\
+                 version = \"0.47.0\"\n\
+                 edition = \"2021\"\n\
+                 publish = false\n\
+                 \n\
+                 [lib]\n\
+                 crate-type = [\"cdylib\", \"rlib\"]\n\
+                 \n\
+                 [dependencies]\n\
+                 indexmap = {{ path = \"../../vendor/indexmap\" }}\n\
+                 dep_b = {{ path = \"../dep_b\" }}\n"
+            ),
+        );
+    }
     fx.write(
         "Cargo.toml",
         "[workspace]\n\
-         members = [\"crates/aterm\", \"crates/dep_b\"]\n\
+         members = [\"crates/aterm\", \"crates/aterm-wasm\", \"crates/aterm-gpu-web\", \"crates/dep_b\"]\n\
          exclude = [\"vendor\", \"other\"]\n\
          resolver = \"2\"\n\
          \n\
@@ -495,8 +551,8 @@ fn an_unpatched_sibling_version_reds_the_forge_verb() {
         log.contains("cargo tree --target") && log.contains("-i indexmap@3.0.0"),
         "the refusal must name the command that finds the requiring edge:\n{log}"
     );
-    // Every cell, not just one: the fork is patched for all four.
-    for cell in ["mac-arm", "linux", "win", "wasm"] {
+    // Every cell, not just one: the fork is patched for all five.
+    for cell in ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"] {
         assert!(
             log.contains(&format!("cell `{cell}`")),
             "cell `{cell}` must be scored:\n{log}"

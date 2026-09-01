@@ -15,6 +15,10 @@ struct HdrVsOut {
 };
 
 // Uint16x4 arrives as ushort4; widened to uint4 to mirror the WGSL vec4<u32>.
+//
+// BINDING LAW: vs_hdr_glow's uniform says [[buffer(0)]]; safe ONLY because the
+// instance stream for this [[stage_in]] sits at vertex-buffer index 30
+// (ffi.rs::INSTANCE_STREAM_SLOT) — see cell.metal's fuller statement.
 struct HdrVsIn {
     ushort4 rect_u [[attribute(0)]];
     float4 color   [[attribute(1)]];

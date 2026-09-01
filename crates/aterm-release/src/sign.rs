@@ -1014,6 +1014,28 @@ impl NotaryAuth {
 ///      CodeDirectory flags) — notarization requires `--options runtime`, so
 ///      reject early instead of burning an Apple round-trip on a build that
 ///      will come back rejected.
+///
+/// And one refusal notarization does not care about, added for macOS privacy
+/// consent (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.1):
+///
+///   4. a **cdhash-class designated requirement**. `tccd` stores every access
+///      grant beside the client's designated requirement as computed at grant
+///      time, and re-checks the running code against it. An identity-class DR
+///      (`identifier "…" and anchor apple generic …`) names no bytes, so a
+///      grant survives a rebuild and an in-place update; a cdhash-class DR
+///      (`cdhash H"…"`, what ad-hoc signing produces even when `--identifier`
+///      is passed) pins the exact bytes, so the next build is a different
+///      client and the grant is silently dead. Shipping one would mean every
+///      release re-asks the human for consent it was already given.
+///
+/// The DR is not in `codesign -dv --verbose=2` output; [`check_devid_signed`]
+/// appends a `codesign -d -r-` probe to the same text, and this function reads
+/// whichever `designated =>` line it finds. Only a positively identified
+/// [`DrClass::Cdhash`] refuses: text with no requirement in it classifies
+/// [`DrClass::Unsigned`] or [`DrClass::Unknown`] and is left alone, because an
+/// artifact carrying no requirement at all is already rejected by rule 2's
+/// missing Authority line, and the pure fixtures in tests/signconf.rs predate
+/// the probe.
 pub fn devid_preflight(codesign_info: &str, is_app: bool) -> Result<(), String> {
     if codesign_info.contains("Signature=adhoc") {
         return Err(
@@ -1038,7 +1060,109 @@ pub fn devid_preflight(codesign_info: &str, is_app: bool) -> Result<(), String> 
                 .into(),
         );
     }
+    if classify_dr(codesign_info) == DrClass::Cdhash {
+        return Err(
+            "artifact's designated requirement is cdhash-class (it pins the exact bytes, \
+                    with no identifier clause) — a macOS privacy grant recorded against it \
+                    dies on the next build, so every release would re-ask the human for \
+                    consent already given. Sign with the Developer-ID identity resolved from \
+                    pins::APPLE_TEAM_ID, which yields an identity-class requirement"
+                .into(),
+        );
+    }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Designated-requirement class (macOS privacy consent, design §3.1)
+// ---------------------------------------------------------------------------
+
+/// What a designated requirement is keyed on, and therefore whether a macOS
+/// privacy (TCC) access grant recorded against it can outlive a rebuild.
+///
+/// aterm-release deliberately does NOT depend on `aterm-containment`, where the
+/// runtime consent module keeps the same classification: the release cutter is
+/// an owner-only binary and its dependency graph is kept minimal on purpose
+/// (see this crate's Cargo.toml — every edge there is justified in a comment).
+/// The two are therefore held to the SAME variant names and the same
+/// precedence, so they can be unified in one move if that edge is ever added.
+/// They differ only in what they are handed: `aterm_containment::consent`
+/// classifies a requirement STRING, while this one classifies the whole
+/// `codesign` output [`check_devid_signed`] already has in hand, and finds the
+/// `designated =>` line itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DrClass {
+    /// `identifier "com.aterm.aterm" and anchor apple generic and …` — names an
+    /// identity and pins a certificate, no bytes. A grant against it survives
+    /// every rebuild and every in-place update.
+    Identity,
+    /// The requirement pins a `cdhash` — the shape ad-hoc signing produces (with
+    /// no identifier clause, even when `--identifier` is passed). Every rebuild
+    /// is a different identity, so the grant is silently dead.
+    Cdhash,
+    /// The code object is not signed at all.
+    Unsigned,
+    /// Not recognised, or no requirement in the text at all. Never treated as
+    /// stable, and never a refusal on its own.
+    #[default]
+    Unknown,
+}
+
+/// Classify the designated requirement in `codesign -d -r-` output.
+///
+/// Recorded shapes this is written against (captured on macOS 26.6.2):
+///
+/// ```text
+/// designated => identifier "com.mitchellh.ghostty" and anchor apple generic and …
+/// # designated => cdhash H"240c6c45…" or cdhash H"458a3ae8…"
+/// code object is not signed at all
+/// ```
+///
+/// The leading `# ` marks a requirement codesign DERIVED rather than read from
+/// the signature — ad-hoc signatures always take that path — so it is stripped
+/// before matching.
+///
+/// Precedence matches `aterm_containment::consent::classify_dr` and fails
+/// toward "unstable": a `cdhash` clause wins even beside an identifier, because
+/// a requirement that pins a code-directory hash is invalidated by the next
+/// build whatever else it says.
+#[must_use]
+pub fn classify_dr(codesign_output: &str) -> DrClass {
+    let Some(requirement) = designated_requirement(codesign_output) else {
+        // No requirement line. An unsigned object is the one case worth naming;
+        // anything else is simply not something this gate can reason about.
+        let lower = codesign_output.to_ascii_lowercase();
+        return if lower.contains("code object is not signed") {
+            DrClass::Unsigned
+        } else {
+            DrClass::Unknown
+        };
+    };
+    let lower = requirement.to_ascii_lowercase();
+    if lower.contains("cdhash") {
+        return DrClass::Cdhash;
+    }
+    let has_identifier = lower.contains("identifier ") || lower.contains("identifier\"");
+    let has_anchor = lower.contains("anchor apple")
+        || lower.contains("certificate leaf")
+        || lower.contains("certificate root")
+        || lower.contains("subject.ou");
+    if has_identifier && has_anchor {
+        return DrClass::Identity;
+    }
+    DrClass::Unknown
+}
+
+/// The text after `designated =>` on the one line that carries it, if any.
+fn designated_requirement(codesign_output: &str) -> Option<&str> {
+    const MARKER: &str = "designated =>";
+    codesign_output.lines().find_map(|line| {
+        // Strip codesign's derived-requirement comment marker, then require the
+        // line to START with the marker: `host => …` and `library => …` lines
+        // must not be mistaken for it.
+        let line = line.trim_start().trim_start_matches('#').trim_start();
+        line.strip_prefix(MARKER).map(str::trim)
+    })
 }
 
 /// Run the preflight against a real on-disk artifact (`codesign -dv` prints
@@ -1059,6 +1183,19 @@ pub fn check_devid_signed(target: &Path) -> Result<(), String> {
         .map_err(|e| format!("spawn codesign -dv: {e}"))?;
     let mut info = String::from_utf8_lossy(&out.stderr).to_string();
     info.push_str(&String::from_utf8_lossy(&out.stdout));
+    // The designated requirement is a SEPARATE probe — `-dv` never prints it —
+    // and it is what rule 4 reads. A failure to spawn or a codesign error is
+    // left as absent text: the DR rule is written to refuse only a positively
+    // identified cdhash requirement, so a missing probe cannot invent a
+    // refusal, and rules 1-3 still run on the `-dv` output above.
+    if let Ok(dr) = Command::new(CODESIGN)
+        .args(["-d", "-r-"])
+        .arg(target)
+        .output()
+    {
+        info.push_str(&String::from_utf8_lossy(&dr.stderr));
+        info.push_str(&String::from_utf8_lossy(&dr.stdout));
+    }
     let is_app = target.extension().is_some_and(|e| e == "app");
     devid_preflight(&info, is_app).map_err(|e| format!("{}: {e}", target.display()))
 }
@@ -1521,5 +1658,138 @@ fn run_streamed(cmd: &mut Command, what: &str, timeout: Duration) -> Result<(), 
             ));
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Designated-requirement classification, over RECORDED codesign output
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod dr_tests {
+    use super::{DrClass, classify_dr, devid_preflight};
+
+    /// Captured on macOS 26.6.2 from a Developer-ID signed app in
+    /// /Applications. This is the shape a shipped aterm.app must have: an
+    /// identifier clause plus an anchor, and no cdhash anywhere.
+    const DEVID_DR: &str = "Executable=/Applications/Ghostty.app/Contents/MacOS/ghostty\n\
+         designated => identifier \"com.mitchellh.ghostty\" and anchor apple generic and \
+         certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and \
+         certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and \
+         certificate leaf[subject.OU] = \"24VZTF6M5V\"\n";
+
+    /// The other real Developer-ID spelling: anchor first, unquoted team OU.
+    const DEVID_DR_ANCHOR_FIRST: &str = "Executable=/Applications/iTerm.app/Contents/MacOS/iTerm2\n\
+         designated => anchor apple generic and identifier \"com.googlecode.iterm2\" and \
+         (certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or \
+         certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and \
+         certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and \
+         certificate leaf[subject.OU] = H7V7XYVQ7D)\n";
+
+    /// Captured from `codesign --force --sign - <binary>` — what tools/dev-app.sh
+    /// produces without $ATERM_SIGN_ID. Note the `# ` comment marker (codesign
+    /// DERIVED this requirement; it is not stored in the signature) and the
+    /// total absence of an identifier clause.
+    const ADHOC_DR: &str = "Executable=/tmp/adhoc-probe\n\
+         # designated => cdhash H\"240c6c45749cff92effe2dbe2782cd3ac8bee253\" or \
+         cdhash H\"458a3ae87054006e9463429282897dfafa67e862\"\n";
+
+    /// Same, but signed with `--identifier com.aterm.aterm.dev`. The identifier
+    /// is NOT reflected into the requirement — this is the measurement behind
+    /// design §1.2, and the reason a dev bundle id alone does not buy a durable
+    /// grant.
+    const ADHOC_DR_WITH_IDENTIFIER: &str = "Executable=/tmp/adhoc-probe2\n\
+         # designated => cdhash H\"291d5a2ba2302d7e67699538f48684c2a1e3babf\" or \
+         cdhash H\"bcbfaab1440e2f97f26f0d7b31b9e4710f647918\"\n";
+
+    /// `codesign -d -r-` on an unsigned Mach-O: one stderr line, no requirement.
+    const UNSIGNED_DR: &str = "/tmp/unsigned-probe: code object is not signed at all\n";
+
+    #[test]
+    fn classifies_the_recorded_shapes() {
+        assert_eq!(classify_dr(DEVID_DR), DrClass::Identity);
+        assert_eq!(classify_dr(DEVID_DR_ANCHOR_FIRST), DrClass::Identity);
+        assert_eq!(classify_dr(ADHOC_DR), DrClass::Cdhash);
+        assert_eq!(classify_dr(ADHOC_DR_WITH_IDENTIFIER), DrClass::Cdhash);
+        assert_eq!(classify_dr(UNSIGNED_DR), DrClass::Unsigned);
+        assert_eq!(classify_dr(""), DrClass::Unknown);
+        // An identifier with nothing pinning WHO signed it vouches for nothing,
+        // so it is Unknown rather than Identity — same precedence as
+        // aterm_containment::consent::classify_dr, and it fails toward
+        // "unstable" without ever becoming a refusal of its own.
+        assert_eq!(
+            classify_dr("designated => identifier \"com.aterm.aterm\"\n"),
+            DrClass::Unknown
+        );
+    }
+
+    #[test]
+    fn a_byte_pinned_requirement_is_cdhash_even_with_an_identifier() {
+        // Explicit `-r` requirements can mix clauses. Anything naming a cdhash
+        // dies on the next build, so the identifier clause does not redeem it.
+        let mixed = "designated => identifier \"com.aterm.aterm\" and anchor apple generic \
+             and cdhash H\"deadbeef\"\n";
+        assert_eq!(classify_dr(mixed), DrClass::Cdhash);
+    }
+
+    #[test]
+    fn only_the_designated_line_is_read() {
+        // `host =>` / `library =>` requirements share the file and must not be
+        // mistaken for the designated one.
+        let other = "host => cdhash H\"deadbeef\"\nlibrary => cdhash H\"feedface\"\n";
+        assert_eq!(classify_dr(other), DrClass::Unknown);
+        let both = "host => cdhash H\"deadbeef\"\n\
+             designated => identifier \"x\" and anchor apple generic\n";
+        assert_eq!(classify_dr(both), DrClass::Identity);
+    }
+
+    #[test]
+    fn preflight_refuses_a_cdhash_designated_requirement() {
+        // A Developer-ID .app whose DR somehow came back cdhash-class: every
+        // other rule passes, and this one still stops the cut.
+        let info = format!(
+            "Identifier=com.aterm.aterm\n\
+             CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=38+7 location=embedded\n\
+             Signature size=8980\n\
+             Authority=Developer ID Application: Jane Doe (TEAMID)\n\
+             {ADHOC_DR}"
+        );
+        let err = devid_preflight(&info, true).unwrap_err();
+        assert!(err.contains("cdhash-class"), "{err}");
+        assert!(
+            err.contains("privacy grant"),
+            "the refusal must say WHY it matters: {err}"
+        );
+        // The same requirement on a DMG is refused too: a cdhash DR can only
+        // come from ad-hoc signing, which nothing in the release tier may do.
+        assert!(devid_preflight(&info, false).is_err());
+    }
+
+    #[test]
+    fn preflight_accepts_an_identity_designated_requirement() {
+        let info = format!(
+            "Identifier=com.aterm.aterm\n\
+             CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=38+7 location=embedded\n\
+             Signature size=8980\n\
+             Authority=Developer ID Application: Jane Doe (TEAMID)\n\
+             {DEVID_DR}"
+        );
+        devid_preflight(&info, true).expect("identity-class DR ships");
+        devid_preflight(&info, false).expect("identity-class DR ships (dmg)");
+    }
+
+    #[test]
+    fn requirement_free_text_does_not_invent_a_refusal() {
+        // Rule 4 is a positive test. Output with no probe (the pre-existing
+        // fixtures in tests/signconf.rs) must keep its old verdict, and an
+        // UNSIGNED artifact is already caught by the Authority rule — with that
+        // message, not this one.
+        let no_probe = "Identifier=com.aterm.aterm\n\
+             CodeDirectory v=20500 size=1234 flags=0x10000(runtime) hashes=38+7 location=embedded\n\
+             Signature size=8980\n\
+             Authority=Developer ID Application: Jane Doe (TEAMID)\n";
+        devid_preflight(no_probe, true).expect("no DR probe in the text is not a refusal");
+        let err = devid_preflight(UNSIGNED_DR, true).unwrap_err();
+        assert!(err.contains("not Developer-ID signed"), "{err}");
     }
 }

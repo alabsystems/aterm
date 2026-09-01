@@ -31,8 +31,10 @@ use crate::mirror;
 pub const MIN_FREE_DISK_GIB: u64 = 10;
 
 /// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …).
-/// `TRUST_STAGE2_BIN` overrides (same contract as tools/verify.sh); the default
-/// is `$HOME/trust/build/host/stage2/bin`. Resolved to the PHYSICAL path: Trust's
+/// `TRUST_STAGE2_BIN` overrides (same contract as tools/verify.sh); the atpkg
+/// store's `store/trust/current/bin` (`aterm pkg install trust`) is the default,
+/// with `$HOME/trust/build/host/stage2/bin` — a from-source build — behind it.
+/// Resolved to the PHYSICAL path: Trust's
 /// `build/host` is commonly a target-triple symlink and the protected Trust
 /// drivers refuse a symlinked toolchain path. The gates resolve the trust-named
 /// binaries directly rather than a PATH `cargo` — correctness does not depend
@@ -51,7 +53,8 @@ pub fn trust_stage2_bin() -> Result<PathBuf> {
     //      only where the compiler is found.
     //   2. the atpkg store, resolved exactly as atpkg resolves it (so a configured
     //      `[packages].prefix` — e.g. a root-owned system prefix — is honoured).
-    //   3. $HOME/trust/build/host/stage2/bin — a toolchain built from source with x.py.
+    //   3. $HOME/trust/build/host/stage2/bin — a toolchain built from source with x.py,
+    //      the developer alternative to the store.
     let candidates = trust_stage2_candidates();
     let mut tried = Vec::new();
     for dir in candidates {
@@ -83,9 +86,11 @@ pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-dar
 /// The three ways to get a Trust toolchain, for a caller to append VERBATIM.
 ///
 /// One text, appended where the caller's layout wants it, because two spellings of one
-/// remedy is the drift this crate has already paid for once.
-pub const TRUST_TOOLCHAIN_REMEDIES: &str = "atpkg install trust\n\
-     or build one: python3 x.py build --stage 2, in $HOME/trust\n\
+/// remedy is the drift this crate has already paid for once. The package manager
+/// leads: it is the ordinary source of the pinned toolchain, and `aterm pkg doctor`
+/// names the store it filled. Building from source is the developer alternative.
+pub const TRUST_TOOLCHAIN_REMEDIES: &str = "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
+     or, from source: python3 x.py build --stage 2, in $HOME/trust\n\
      or point TRUST_STAGE2_BIN at an existing stage2 bin dir";
 
 /// The ordered places a Trust toolchain may live. Split out so the order is readable
@@ -116,8 +121,9 @@ pub fn resolve_targo() -> Result<PathBuf> {
         Ok(targo)
     } else {
         Err(Error::new(format!(
-            "targo missing at {} — the stage2 toolchain is incomplete; rebuild it \
-             (`python3 x.py build --stage 2` in $HOME/trust) or point TRUST_STAGE2_BIN at a \
+            "targo missing at {} — the stage2 toolchain is incomplete; reinstall it \
+             (`aterm pkg install trust`, then `aterm pkg doctor`), or from source rebuild it \
+             (`python3 x.py build --stage 2` in $HOME/trust), or point TRUST_STAGE2_BIN at a \
              stage2 bin dir that carries targo",
             targo.display()
         )))
@@ -662,7 +668,8 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         Err(e) => {
             return Err(Error::new(format!(
                 "trustc not runnable at {} ({e}) — the repo compiles with Trust always. \
-                 Rebuild the stage2 toolchain (`python3 x.py build --stage 2` in $HOME/trust) \
+                 Reinstall the toolchain (`aterm pkg install trust`, then `aterm pkg doctor`), \
+                 or from source rebuild the stage2 (`python3 x.py build --stage 2` in $HOME/trust), \
                  or point TRUST_STAGE2_BIN at a stage2 bin dir that carries trustc",
                 trustc.display()
             )));
@@ -685,9 +692,10 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
         Ok(o) if o.status.success() => Ok(trustc),
         Ok(o) => Err(Error::new(format!(
             "trustc at {} runs but cannot COMPILE under the native-lane rustflags {flags:?} \
-             (stage2 library missing/stale — rebuild with `python3 x.py build --stage 2` in \
-             $HOME/trust — or the config's off-switch spelling does not match this trustc; \
-             `trustc -Z help | grep trust-verify` decides): {}",
+             (stage2 library missing/stale — reinstall with `aterm pkg install trust`, or from \
+             source rebuild with `python3 x.py build --stage 2` in $HOME/trust — or the config's \
+             off-switch spelling does not match this trustc; `trustc -Z help | grep \
+             trust-verify` decides): {}",
             trustc.display(),
             String::from_utf8_lossy(&o.stderr)
                 .lines()

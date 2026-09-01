@@ -27,9 +27,55 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The four measurement cells, in report order. All rooted at the shipped
-/// binary package `aterm`, because the question is "what does the terminal
-/// ship", not "what does the workspace resolve".
+/// The five measurement cells, in report order.
+///
+/// # Every cell is rooted at something aterm actually SHIPS
+///
+/// The three native cells are rooted at the binary package `aterm`, because on
+/// those targets the question is "what does the terminal ship" and the terminal
+/// is one binary.
+///
+/// THERE IS NO SUCH BINARY ON `wasm32`, and pretending there was is the bug this
+/// matrix carried until 2026-08-30. `aterm` is a `[[bin]]` (`crates/aterm/Cargo.toml`)
+/// and nothing ever compiles it for `wasm32-unknown-unknown`; `cargo tree` will
+/// still RESOLVE it for that triple, and so a cell rooted there reported a
+/// configuration that is never built. It was wrong in BOTH directions, measured:
+///
+/// * it counted what the browser never loads — `zstd` (via `aterm-scrollback`,
+///   a C library that cannot target wasm32 and is default-features'd OUT of both
+///   web crates), plus `winit`, `rustls` and the whole updater;
+/// * and it MISSED `console_error_panic_hook`, which both shipped modules
+///   declare under `[target.'cfg(target_arch = "wasm32")'.dependencies]` and the
+///   `aterm` root does not reach at all.
+///
+/// # Why TWO wasm cells and not one
+///
+/// aterm ships two separate `.wasm` artifacts into the Electron renderer, and
+/// both are built by name in the two lanes that build wasm at all —
+/// `xtask gate web` and `tools/wasm-bench/run.sh`, each `-p aterm-wasm -p
+/// aterm-gpu-web`:
+///
+/// * `aterm-wasm` — the CPU/`putImageData` path (`aterm-render` rasterizer);
+/// * `aterm-gpu-web` — the GPU path (`aterm-gpu` over `wgpu` -> WebGL2/WebGPU).
+///
+/// They are not the same download and they are not the same surface: measured on
+/// this checkout the CPU module is 27 third-party packages / 255,826 lines and
+/// the GPU module is 64 / 984,913, a 3.85x difference that is `wgpu` and its
+/// subtree almost exactly. One cell cannot report both honestly — rooted at the
+/// GPU module it bills the CPU path for a renderer it does not contain, and
+/// rooted at the CPU module it hides the biggest third-party dependency aterm
+/// has left. So there are two rows, and the ratchet bounds each.
+///
+/// # The third web crate is covered, and it is checked rather than assumed
+///
+/// `aterm-effects-web` (the PHOSPHOR-rain overlay adapter, and the third entry in
+/// [`aterm_census::wasm_census::WASM_ROOT_CRATES`]) has no cell. It does not need
+/// one: MEASURED, its `wasm32` closure is a strict subset of `aterm-wasm`'s —
+/// the two graphs differ by exactly one node, `aterm-effects-web` itself — so
+/// every third-party package it ships is already inside the `wasm-cpu` row. That
+/// containment is enforced by `loc::tests::the_wasm_cells_cover_every_shipped_web_crate`,
+/// not left to this comment: the day it gains a dependency of its own, that test
+/// fails and names it.
 pub fn default_cells() -> Vec<Cell> {
     vec![
         Cell {
@@ -47,10 +93,19 @@ pub fn default_cells() -> Vec<Cell> {
             triple: "x86_64-pc-windows-msvc".to_string(),
             package: "aterm".to_string(),
         },
+        // The CPU renderer module: `aterm-render`'s rasterizer to an RGBA
+        // buffer, blitted with `putImageData`. The smallest cell in the matrix.
         Cell {
-            name: "wasm".to_string(),
+            name: "wasm-cpu".to_string(),
             triple: "wasm32-unknown-unknown".to_string(),
-            package: "aterm".to_string(),
+            package: "aterm-wasm".to_string(),
+        },
+        // The GPU renderer module: the same engine plus `aterm-gpu` over `wgpu`,
+        // which is the entire difference between this row and `wasm-cpu`.
+        Cell {
+            name: "wasm-gpu".to_string(),
+            triple: "wasm32-unknown-unknown".to_string(),
+            package: "aterm-gpu-web".to_string(),
         },
     ]
 }
@@ -388,15 +443,25 @@ mod tests {
     }
 
     #[test]
-    fn the_matrix_is_four_cells_in_report_order() {
+    fn the_matrix_is_five_cells_in_report_order() {
         let cells = default_cells();
-        assert_eq!(names(&cells), ["mac-arm", "linux", "win", "wasm"]);
-        assert!(
-            cells.iter().all(|c| c.package == "aterm"),
-            "every cell measures the binary"
+        assert_eq!(
+            names(&cells),
+            ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"]
+        );
+        // THE ROOTS ARE THE POINT. The three native cells measure the one
+        // binary; the two wasm cells measure the two cdylib modules the
+        // browser actually loads, because `aterm` is a `[[bin]]` that is never
+        // compiled for wasm32 and a cell rooted there measured a configuration
+        // nothing builds.
+        assert_eq!(
+            cells.iter().map(|c| c.package.as_str()).collect::<Vec<_>>(),
+            ["aterm", "aterm", "aterm", "aterm-wasm", "aterm-gpu-web"],
+            "a cell must be rooted at something aterm ships for that target"
         );
         assert_eq!(cells[0].triple, "aarch64-apple-darwin");
         assert_eq!(cells[3].triple, "wasm32-unknown-unknown");
+        assert_eq!(cells[4].triple, "wasm32-unknown-unknown");
     }
 
     #[test]
@@ -408,14 +473,17 @@ mod tests {
     #[test]
     fn selection_keeps_request_order_and_collapses_repeats() {
         let cells = default_cells();
-        let want = ["wasm", "linux", "wasm"].map(String::from);
-        assert_eq!(names(&select(&cells, &want).unwrap()), ["wasm", "linux"]);
+        let want = ["wasm-gpu", "linux", "wasm-gpu"].map(String::from);
+        assert_eq!(
+            names(&select(&cells, &want).unwrap()),
+            ["wasm-gpu", "linux"]
+        );
     }
 
     #[test]
     fn an_unknown_cell_names_every_valid_cell() {
         let err = select(&default_cells(), &["macos".to_string()]).unwrap_err();
-        for good in ["mac-arm", "linux", "win", "wasm"] {
+        for good in ["mac-arm", "linux", "win", "wasm-cpu", "wasm-gpu"] {
             assert!(err.contains(good), "refusal must list `{good}`: {err}");
         }
         assert!(err.contains("--cell"), "refusal must name the fix: {err}");
@@ -583,7 +651,7 @@ mod tests {
     /// spelling resolves the identical graph as the absolute one.
     #[test]
     fn a_relative_root_resolves_the_same_graph_as_an_absolute_one() {
-        let cell = &default_cells()[3]; // wasm — the smallest cell.
+        let cell = &default_cells()[3]; // wasm-cpu — the smallest cell.
         let absolute = graph(&repo_root(), cell).expect("absolute root must resolve");
         let relative = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         assert!(relative.is_relative() || relative.components().count() > 3);

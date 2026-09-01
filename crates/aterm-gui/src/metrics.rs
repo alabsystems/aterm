@@ -1128,7 +1128,10 @@ pub(crate) struct StartupWorkerLegs {
     /// `apply_font_config_to_backend`.
     pub(crate) font_apply_ns: u64,
     /// `seal_admitted_font_sources` — the worker-only broad fallback/symbol/
-    /// emoji admission.
+    /// emoji admission. Effectively ZERO on a headless launch, which defers that
+    /// admission to its first pixel demand (`defer_font_seal`) and so does not
+    /// perform it on this worker at all; the leg names the work this worker did,
+    /// never the work the generation will eventually cost.
     pub(crate) font_seal_ns: u64,
 }
 

@@ -467,12 +467,19 @@ pub(crate) fn write_session_meta(
     Ok(apply_meta_value(ctx, field, value))
 }
 
-/// One recorded lifecycle event. `kind` is a closed vocabulary (`spawned`,
-/// `state-change`, `title-change`, `cwd-change`, `meta-change`, `closing`);
-/// `payload` is a short space-separated `k=v` token string whose free-text
-/// values are ALREADY pct-encoded at record time, so the `timeline` verb and the
-/// events digest can print it verbatim as the line tail (one line per event,
-/// always).
+/// One recorded lifecycle event. `kind` is a closed vocabulary, in three groups:
+/// the LIFECYCLE kinds this module's own recorders write (`spawned`,
+/// `state-change`, `title-change`, `cwd-change`, `meta-change`, `closing`); the
+/// FABRIC kinds (`inbox`, `inbox-seen`, `post`, `post-landed`, `hold` —
+/// `crate::fabric::FABRIC_EVENT_KINDS`, which is also their wire spelling on the
+/// digest); and `in-doubt`, which `crate::pty_idem` writes when an input verb
+/// carrying an `id=` key failed in a way that says nothing about whether its
+/// bytes reached the PTY. That last one has NO wire form on purpose: it is a
+/// per-session record of one driver's unresolved write, not a fabric message,
+/// and §11.2's five `EVENT` names are pinned. `payload` is a short
+/// space-separated `k=v` token string whose free-text values are ALREADY
+/// pct-encoded at record time, so the `timeline` verb and the events digest can
+/// print it verbatim as the line tail (one line per event, always).
 ///
 /// WHO CAN READ WHICH. The `timeline` verb lists every kind a LIVE session has
 /// recorded. The last two rows a session ever records — `closing reason= by=`

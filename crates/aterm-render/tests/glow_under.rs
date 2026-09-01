@@ -26,7 +26,7 @@
 //   * damaged path: animating quad + charring sweep re-render with no
 //     ghosting (cached == fresh, byte-for-byte) — the aurora discipline.
 
-use aterm_core::render::{CharFg, GlowQuad};
+use aterm_core::render::{CharFg, EffectStreamDamage, GlowQuad, RenderInput};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, DirtyDecision, Renderer, Theme, WindowCpu, compute_dirty_rows};
 
@@ -48,6 +48,88 @@ fn under(row: u16, x: u16, y: u16, w: u16, h: u16, color: u32) -> GlowQuad {
         // ADDITIVE light (see `GlowQuad::alpha`).
         alpha: 0,
     }
+}
+
+/// A producer-stamped 8k ribbon must produce the SAME row-damage decision as
+/// the exact vector fallback, while the retained prior input releases the
+/// dominant payload.  The moved row is intentionally different so this also
+/// proves the vacated band is rebuilt (no additive ghost).
+#[test]
+fn compact_effect_damage_matches_exact_fallback_and_marks_vacated_rows() {
+    let mut term = Terminal::new(4, 8);
+    let mut prev = term.cell_frame(4, 8);
+    prev.cursor_visible = false;
+    prev.glow_under = (0..8191)
+        .map(|index| under(1, (index % 32) as u16, 16, 1, 16, 0x0030_1004))
+        .collect();
+    let mut current = prev.clone();
+    current.glow_under[0].row = 2;
+    current.glow_under[0].y = 32;
+
+    let mut exact_prev = prev.clone();
+    let mut exact_current = current.clone();
+    exact_prev.glow_under_damage = EffectStreamDamage::default();
+    exact_current.glow_under_damage = EffectStreamDamage::default();
+    let mut exact_dirty = Vec::new();
+    let exact = compute_dirty_rows(
+        &exact_prev,
+        &exact_current,
+        false,
+        None,
+        false,
+        None,
+        16,
+        &mut exact_dirty,
+    );
+
+    prev.refresh_cursor_effect_damage();
+    current.refresh_cursor_effect_damage();
+    let mut cached_prev = RenderInput::empty();
+    cached_prev.clone_damage_cache_from(&prev);
+    assert!(
+        cached_prev.glow_under.is_empty(),
+        "cache must not clone 8k quads"
+    );
+    assert_eq!(
+        cached_prev
+            .cursor_glow_add_damage
+            .same_content(&current.cursor_glow_add_damage),
+        Some(true),
+        "empty glow metadata must stay stable"
+    );
+    assert_eq!(
+        cached_prev
+            .glow_halo_damage
+            .same_content(&current.glow_halo_damage),
+        Some(true),
+        "empty halo metadata must stay stable"
+    );
+    assert_eq!(
+        cached_prev
+            .fire_patch_damage
+            .same_content(&current.fire_patch_damage),
+        Some(true),
+        "empty fire metadata must stay stable"
+    );
+    let mut compact_dirty = Vec::new();
+    let compact = compute_dirty_rows(
+        &cached_prev,
+        &current,
+        false,
+        None,
+        false,
+        None,
+        16,
+        &mut compact_dirty,
+    );
+
+    assert_eq!(compact, exact, "metadata must preserve the exact verdict");
+    assert_eq!(
+        compact_dirty, exact_dirty,
+        "metadata must preserve dirty rows"
+    );
+    assert!(compact_dirty[1], "the previous, vacated row must repaint");
+    assert!(compact_dirty[2], "the current row must repaint");
 }
 
 /// The luminance proxy: summed RGB channels (monotone in every channel under
@@ -370,6 +452,7 @@ fn glow_under_and_char_fg_dirty_gate_marks_prev_and_cur_rows() {
         let mut input = term.cell_frame(6, 8);
         input.glow_under = quads.to_vec();
         input.char_fg = chars.to_vec();
+        input.refresh_cursor_effect_damage();
         input
     };
     let marked = |dirty: &[bool]| -> Vec<usize> {

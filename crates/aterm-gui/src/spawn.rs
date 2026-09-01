@@ -956,6 +956,7 @@ pub(crate) fn spawn_session(
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
+        fabric: crate::fabric::SessionFabric::default(),
     });
     // ROOT session only: record the edges the OUTER aterm preminted for us (from
     // our injected env), so it holds the read/write/signal authority it granted.

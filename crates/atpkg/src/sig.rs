@@ -52,8 +52,11 @@
 //!
 //! # Empty means unpinned means INERT — and inert installs NOTHING
 //!
-//! An empty [`Anchor`] (the shipped default, because `pins::PAPER_MASTER_PUBKEYS` is
-//! `&[]`) authorizes no machine at all: [`admit_roster`] returns [`Reject::Disabled`]
+//! An empty [`Anchor`] — the fail-closed state a fork starts from, and what shipped
+//! before v0.21.0; THIS build is ARMED, `pins::PAPER_MASTER_PUBKEYS` carrying one
+//! master key since 2026-08-15 (pinned by
+//! `this_build_ships_armed_and_the_pinned_anchor_is_live`) — authorizes no machine at
+//! all: [`admit_roster`] returns [`Reject::Disabled`]
 //! before any crypto, [`crate::select_index`] returns `None`, and every install path
 //! ends in `FlowError::NoIndex`. It never means "accept anything". This is the single
 //! most dangerous property in the module and it is asserted from both directions in the
@@ -235,8 +238,10 @@ pub struct Anchor {
 
 impl Anchor {
     /// The anchor this binary ships with: the committed paper-master keyset, plus the
-    /// caller's durable roster floor. In THIS tree the keyset is empty, so the anchor is
-    /// inert and atpkg installs nothing until an operator arms it in a reviewed commit.
+    /// caller's durable roster floor. In THIS tree the keyset is ARMED (one master,
+    /// 2026-08-15), so the anchor this returns verifies for real; an empty keyset — a
+    /// fork's starting point — makes it inert and atpkg installs nothing until an
+    /// operator arms it in a reviewed commit.
     #[must_use]
     pub fn pinned(roster_floor: u64) -> Self {
         Self::of(
@@ -673,7 +678,7 @@ pub fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(), Rejec
 }
 
 /// A durable, anti-rollback high-water mark over the index's monotonic `index_build`
-/// (gate 3, §8). The highest seen build is persisted to a `0600`, owned-by-uid file
+/// (gate 3, §8). The highest seen build is persisted to a `0644`, owned-by-uid file
 /// under a private directory; any index with a *lower* `index_build` is rejected, so an
 /// attacker who can pin a client to an older signed index cannot roll it back below what
 /// it has already durably seen.
@@ -683,7 +688,8 @@ pub struct Floor {
 
 impl Floor {
     /// A floor backed by `path`. The parent directory must be private (0700,
-    /// owned-by-uid) at write time; the file itself is written `0600` via temp+rename.
+    /// owned-by-uid) at write time; the file itself is published `0644` via temp+rename
+    /// — readable by design, since a reader who cannot read the floor cannot enforce it.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
         Self { path }
@@ -842,7 +848,8 @@ impl Floor {
 
     /// Atomically publish `value` to the floor file: refuse a non-private parent dir
     /// (CWE-379 — a foreign-owned or group/other-writable dir lets another local user
-    /// pre-create or swap the file), then write a sibling `0600` temp and `rename` it
+    /// pre-create or swap the file), then write a sibling `0600` temp, publish it `0644`
+    /// and `rename` it
     /// over the target so a reader never sees a half-written floor.
     fn write(&self, value: u64) -> io::Result<()> {
         use std::io::Write as _;
@@ -878,8 +885,20 @@ impl Floor {
             // window the write existed to close.
             f.sync_all()?;
         }
-        // Force 0600 even if the temp pre-existed with looser bits, then publish.
-        crate::platform::harden_file(&tmp)?;
+        // Publish the floor WORLD-READABLE (0644), not 0600.
+        //
+        // This value is an anti-rollback high-water mark, not a secret — it says
+        // which index build was last trusted. Every reader must be able to check it,
+        // and under a SYSTEM prefix the file is owned by root: at 0600 no ordinary
+        // user could read it, so `read_floor` took the unreadable branch and
+        // downgraded to "first contact (0)" on every single non-root invocation,
+        // silently reopening the window the floor exists to close
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). A ratchet that
+        // disengages for every normal user is not a ratchet.
+        //
+        // WRITE authority is unchanged: it rests on ownership of this file and on the
+        // `dir_meta_is_private` check above, neither of which 0644 touches.
+        crate::platform::set_mode(&tmp, 0o644)?;
         std::fs::rename(&tmp, &self.path)?;
         // Best-effort directory sync so the rename itself survives a power loss. The
         // floor value is already safe either way (old value or new, never torn).
@@ -1428,7 +1447,7 @@ mod tests {
     }
 
     /// index_build below the recorded Floor ⇒ Rollback; a higher build advances the
-    /// durable floor (and the file is 0600).
+    /// durable floor (and the file is 0644, readable).
     #[test]
     fn high_water_floor_blocks_rollback_and_advances() {
         let dir = private_tmp_dir("floor");
@@ -1450,11 +1469,20 @@ mod tests {
             Floor::new(path.clone()).check_and_record(49),
             Err(Reject::Rollback)
         );
-        // The floor file is 0600 — Unix-only mode check.
+        // The floor file is 0644 — Unix-only mode check.
+        //
+        // READABLE on purpose, and this assertion is the contract. The value is an
+        // anti-rollback high-water mark, not a secret. At 0600 under a root-owned
+        // SYSTEM prefix no ordinary user could read it, so every non-root invocation
+        // took `read_floor`'s unreadable branch and downgraded to "first contact (0)",
+        // silently reopening the very window the floor closes
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Write authority is
+        // unchanged: it rests on ownership and on the owned-by-uid parent-directory
+        // check in `write`, neither of which the read bit touches.
         #[cfg(unix)]
         {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "floor file must be 0600");
+            assert_eq!(mode & 0o777, 0o644, "floor file must be readable (0644)");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

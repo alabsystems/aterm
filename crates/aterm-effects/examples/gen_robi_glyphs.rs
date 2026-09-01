@@ -17,14 +17,25 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_effects::cat_glyphs_codegen::generate_robi_from_dir;
+use aterm_effects::cat_glyphs_codegen::generate_robi_from_assets;
+
+/// The shared asset-dir reader: the engine reads no file, the generator does.
+#[path = "support/asset_dir.rs"]
+mod asset_dir;
 
 fn main() -> ExitCode {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let robi_dir = root.join("art/robi");
     let out = root.join("src/robi_glyphs_gen.rs");
 
-    let source = match generate_robi_from_dir(&robi_dir) {
+    let assets = match asset_dir::read_toml_dir(&robi_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("gen_robi_glyphs: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match generate_robi_from_assets(&assets) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("gen_robi_glyphs: {e}");

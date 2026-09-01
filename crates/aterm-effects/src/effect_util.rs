@@ -28,6 +28,34 @@ pub(crate) fn push_grid_rect(
     h: i32,
     premul: u32,
 ) {
+    // ADDITIVE light — the historical contract of every grid-anchored emitter
+    // (see [`GlowQuad::alpha`]); `push_grid_quad` carries the same splitting
+    // logic for the one emitter that also needs source-over.
+    push_grid_quad(out, geom, x, y, w, h, premul, 0);
+}
+
+/// [`push_grid_rect`] with the blend mode left to the caller: `alpha == 0` is
+/// the additive light every legacy grid emitter pushes (and this function is
+/// then byte-identical to it), while `alpha > 0` selects premultiplied
+/// source-over (`src + dst·(1 − a)`) — the mode a light-theme emitter needs,
+/// because additive light can only BRIGHTEN and so cannot darken a pale ground.
+/// Split out rather than duplicated so the per-cell-row band walk (the renderer
+/// row-gate + CPU/GPU parity invariant) keeps exactly ONE copy.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the rect + blend mode IS the call; a struct would relocate the same list and cost \
+              every existing caller a construction"
+)]
+pub(crate) fn push_grid_quad(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    premul: u32,
+    alpha: u8,
+) {
     if w <= 0 || h <= 0 || premul == 0 {
         return;
     }
@@ -52,9 +80,7 @@ pub(crate) fn push_grid_rect(
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color: premul,
-            // ADDITIVE light — this emitter has no other mode (see
-            // [`GlowQuad::alpha`]).
-            alpha: 0,
+            alpha,
         });
         yy = band_end;
     }

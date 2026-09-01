@@ -334,6 +334,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         SessionHandle {
             sid,

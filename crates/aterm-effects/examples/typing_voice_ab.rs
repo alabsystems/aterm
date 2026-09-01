@@ -367,6 +367,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
                 gain: 0.4,
                 tone: Tone::Technical,
                 bed: false, // the KEYSTROKE is what is on trial
+                shifted: false,
             });
             cue_i += 1;
         }
@@ -740,6 +741,7 @@ fn probe(kind: SoundGesture, voice: SoundVoice) -> Vec<f32> {
         gain: 0.4,
         tone: Tone::Technical,
         bed: false,
+        shifted: false,
     };
     // One keystroke settles the phrase generator out of its opening cadence.
     synth.push(ev(SoundGesture::Trail(SoundKind::Typed)));
@@ -973,6 +975,7 @@ fn render_all_voices(out: &std::path::Path) {
                 gain: 0.4,
                 tone: Tone::Technical,
                 bed: false,
+                shifted: false,
             });
             let mut stereo = vec![0.0f32; (SR as f32 * 2.4) as usize * CHANNELS];
             synth.render(&mut stereo);

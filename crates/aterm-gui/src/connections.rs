@@ -720,6 +720,7 @@ mod tests {
             timeline: Arc::new(Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         SessionHandle {
             sid,

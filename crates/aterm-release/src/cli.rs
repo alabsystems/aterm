@@ -49,7 +49,7 @@ USAGE
                            (provisional number, no ledger push, no tag)
         --arm64-only       ship a single-arch build (explicit opt-out)
         --no-paint-smoke   EMERGENCY ONLY: skip the self-check's paint smoke
-                           (the ten-keystroke pixel proof that the just-built
+                           (the 29-keystroke pixel proof that the just-built
                            bundle actually paints its flagship effect — the
                            check born from v0.48.0/v0.49.0 shipping the rainbow
                            trail dark, docs/RELEASE-PROOF-DISCIPLINE.md).

@@ -305,6 +305,183 @@ pub struct FirePatch {
     pub mode: FireMode,
 }
 
+/// Compact, producer-built damage identity for a window-absolute cursor-effect
+/// stream.
+///
+/// The four high-frequency cursor streams can contain thousands of single-row
+/// quads.  Their render payload must stay owned by the frame that draws it, but
+/// a prior-frame damage cache only needs two facts about it: whether the stream
+/// changed, and which rows its previous pixels occupied.  Carrying those facts
+/// here avoids cloning (and later re-walking) the payload merely to decide a
+/// scissor band.
+///
+/// This is deliberately opt-in.  Direct `RenderInput` builders may leave it at
+/// [`Default`], in which case consumers retain the exact vector comparison and
+/// scan.  The GUI calls [`RenderInput::refresh_cursor_effect_damage`] after its
+/// final effect composition, so the metadata always describes the exact payload
+/// presented to the renderer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EffectStreamDamage {
+    /// A deterministic two-lane content fingerprint.  The lanes use distinct
+    /// update equations, so equal-length streams do not merely carry two
+    /// affine transforms of the same Fx hash. The explicit length prevents an
+    /// empty/non-empty alias.
+    fingerprint: u128,
+    len: usize,
+    /// One bit per grid row touched by the stream.  It is compact even for a
+    /// hot 8k-quad ribbon (normally one or a handful of words), and it retains
+    /// vacated rows after the render cache drops the expensive payload.
+    rows: Vec<u64>,
+    valid: bool,
+}
+
+impl EffectStreamDamage {
+    /// Whether this metadata was built from its stream's final render payload.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.valid
+    }
+
+    /// Returns a content verdict only when both producers supplied trusted
+    /// metadata.  `None` is the compatibility path for hand-built inputs.
+    #[must_use]
+    pub fn same_content(&self, other: &Self) -> Option<bool> {
+        (self.valid && other.valid)
+            .then_some(self.len == other.len && self.fingerprint == other.fingerprint)
+    }
+
+    /// Mark the compact previous/current row set into a renderer's reusable
+    /// dirty scratch.  A stale or malformed row bit is harmless: the target
+    /// bounds check simply ignores it.
+    pub fn mark_rows(&self, dirty: &mut [bool]) {
+        if !self.valid {
+            return;
+        }
+        for (word_index, &word) in self.rows.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                if let Some(mark) = dirty.get_mut(word_index * u64::BITS as usize + bit) {
+                    *mark = true;
+                }
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    fn refresh<T>(
+        &mut self,
+        values: &[T],
+        grid_rows: usize,
+        row_of: impl Fn(&T) -> u16,
+        hash_one: impl Fn(&T, &mut EffectStreamFingerprint),
+    ) {
+        let mut fingerprint = EffectStreamFingerprint::new(values.len());
+        self.rows.clear();
+        self.rows.resize(grid_rows.div_ceil(u64::BITS as usize), 0);
+        for value in values {
+            hash_one(value, &mut fingerprint);
+            let row = usize::from(row_of(value));
+            if let Some(word) = self.rows.get_mut(row / u64::BITS as usize) {
+                *word |= 1_u64 << (row % u64::BITS as usize);
+            }
+        }
+        self.fingerprint = fingerprint.finish();
+        self.len = values.len();
+        self.valid = true;
+    }
+}
+
+/// A small, fixed-shape fingerprint for effect records.  It is intentionally
+/// not a general-purpose or untrusted-input hash table hasher: the producer
+/// writes a known sequence of scalar fields.  Its two lanes differ in both
+/// input combination and update constants, avoiding the fixed affine relation
+/// produced by using `FxHasher::with_seed` twice on equal-length records.
+struct EffectStreamFingerprint {
+    first: u64,
+    second: u64,
+}
+
+impl EffectStreamFingerprint {
+    const FIRST_SEED: u64 = 0x243f_6a88_85a3_08d3;
+    const SECOND_SEED: u64 = 0x1319_8a2e_0370_7344;
+    const FIRST_MUL: u64 = 0x9e37_79b1_85eb_ca87;
+    const SECOND_MUL: u64 = 0xc2b2_ae3d_27d4_eb4f;
+
+    fn new(len: usize) -> Self {
+        let mut fingerprint = Self {
+            first: Self::FIRST_SEED,
+            second: Self::SECOND_SEED,
+        };
+        fingerprint.write_pair(
+            u64::try_from(len).unwrap_or(u64::MAX),
+            0x6c65_6e67_7468_0001,
+        );
+        fingerprint
+    }
+
+    #[inline]
+    fn write_pair(&mut self, first_word: u64, second_word: u64) {
+        // Both independent recurrences consume both packed words. Keeping the
+        // lanes dependency-free lets the CPU issue their multiplies together;
+        // the previous cross-lane chain measured slower than the exact work it
+        // replaced on an 8k ribbon.
+        self.first =
+            (self.first ^ first_word ^ second_word.rotate_left(23)).wrapping_mul(Self::FIRST_MUL);
+        self.second = (self.second ^ second_word ^ first_word.rotate_right(17))
+            .wrapping_mul(Self::SECOND_MUL);
+    }
+
+    fn finish(self) -> u128 {
+        (u128::from(self.first) << 64) | u128::from(self.second)
+    }
+}
+
+#[inline]
+fn pack_u16x4(a: u16, b: u16, c: u16, d: u16) -> u64 {
+    u64::from(a) | (u64::from(b) << 16) | (u64::from(c) << 32) | (u64::from(d) << 48)
+}
+
+fn hash_glow_quad(quad: &GlowQuad, hasher: &mut EffectStreamFingerprint) {
+    hasher.write_pair(
+        pack_u16x4(quad.row, quad.x, quad.y, quad.w),
+        u64::from(quad.h) | (u64::from(quad.color) << 16) | (u64::from(quad.alpha) << 48),
+    );
+}
+
+fn hash_rain_halo(halo: &RainHalo, hasher: &mut EffectStreamFingerprint) {
+    let mode = match halo.mode {
+        HaloMode::Add => 0,
+        HaloMode::Over => 1,
+    };
+    hasher.write_pair(
+        pack_u16x4(halo.row, halo.x, halo.y, halo.w),
+        u64::from(halo.h) | (u64::from(halo.color) << 16) | (u64::from(halo.cx) << 48),
+    );
+    hasher.write_pair(
+        pack_u16x4(halo.cy, halo.rx, halo.ry, mode),
+        0x7261_696e_6861_6c6f,
+    );
+}
+
+fn hash_fire_patch(patch: &FirePatch, hasher: &mut EffectStreamFingerprint) {
+    let mode = match patch.mode {
+        FireMode::Add => 0,
+        FireMode::Over => 1,
+    };
+    let envelope = u64::from(patch.h)
+        | (u64::from(patch.base_y) << 16)
+        | (u64::from(patch.peak_h) << 32)
+        | (u64::from(patch.temp) << 48)
+        | (u64::from(patch.strength) << 56);
+    let field = u64::from(patch.phase)
+        | (u64::from(patch.lean.to_ne_bytes()[0]) << 32)
+        | (u64::from(patch.cov_cap) << 40)
+        | (u64::from(patch.cell_h) << 48);
+    hasher.write_pair(pack_u16x4(patch.row, patch.x, patch.y, patch.w), envelope);
+    hasher.write_pair(field, 0x6669_7265_0000_0000 | mode);
+}
+
 /// One textured sprite quad for a renderer-owned animated overlay. A `SpriteQuad` is a rectangle
 /// sampled from an RGBA8 sprite atlas (procedurally baked, or supplied by a sprite
 /// sheet) and composited SOURCE-OVER (straight alpha) onto the frame — the SAME blend
@@ -982,6 +1159,16 @@ pub struct RenderInput {
     /// animation; the engine leaves it untouched. EMPTY in the common case →
     /// byte-identical to the pre-fire render path.
     pub fire_patch: Vec<FirePatch>,
+    /// Producer-built compact damage metadata for
+    /// [`cursor_glow_add`](Self::cursor_glow_add).  Pure transport metadata:
+    /// it is deliberately excluded from whole-frame content equality.
+    pub cursor_glow_add_damage: EffectStreamDamage,
+    /// Producer-built compact damage metadata for [`glow_halo`](Self::glow_halo).
+    pub glow_halo_damage: EffectStreamDamage,
+    /// Producer-built compact damage metadata for [`glow_under`](Self::glow_under).
+    pub glow_under_damage: EffectStreamDamage,
+    /// Producer-built compact damage metadata for [`fire_patch`](Self::fire_patch).
+    pub fire_patch_damage: EffectStreamDamage,
     /// Host-resolved cursor FILL override (`0x00RRGGBB`), or `None` for the ordinary
     /// theme/OSC-12 cursor colour. The override applies to the live cursor shape:
     /// block, hollow, bar, underline, and Bolt all use it. Block glyph cut-outs and
@@ -1714,6 +1901,10 @@ impl Clone for RenderInput {
             glow_halo: self.glow_halo.clone(),
             glow_under: self.glow_under.clone(),
             fire_patch: self.fire_patch.clone(),
+            cursor_glow_add_damage: self.cursor_glow_add_damage.clone(),
+            glow_halo_damage: self.glow_halo_damage.clone(),
+            glow_under_damage: self.glow_under_damage.clone(),
+            fire_patch_damage: self.fire_patch_damage.clone(),
             cursor_fill_override: self.cursor_fill_override,
             word_decorations: self.word_decorations.clone(),
             ink: self.ink.clone(),
@@ -1765,8 +1956,8 @@ impl Clone for RenderInput {
         }
     }
 
-    /// CAPACITY-REUSING in-place update — the persistent-snapshot path the GPU
-    /// present + CPU damage caches use to store the prior frame each changed frame.
+    /// CAPACITY-REUSING in-place update for a full semantic snapshot (the GPU
+    /// present/introspection model, and ordinary callers that need every payload).
     /// The derived `clone_from` falls back to `*self = source.clone()`, which
     /// deep-clones a fresh grid and drops the old one every call; this override
     /// delegates to each field's `clone_from` so `Vec::clone_from` reuses the
@@ -1776,72 +1967,7 @@ impl Clone for RenderInput {
     /// allocation lifetime changes, so the same dirty sets follow from the same
     /// stored snapshot. (Ported from the prior render-api location under A-3.)
     fn clone_from(&mut self, source: &Self) {
-        self.rows = source.rows;
-        self.cols = source.cols;
-        self.cells.clone_from(&source.cells);
-        self.cursor_row = source.cursor_row;
-        self.cursor_col = source.cursor_col;
-        self.cursor_visible = source.cursor_visible;
-        self.cursor_style = source.cursor_style;
-        self.cursor_effect_style_override = source.cursor_effect_style_override;
-        self.cursor_trail.clone_from(&source.cursor_trail);
-        self.cursor_trail_color = source.cursor_trail_color;
-        // (split-pane audit) `cursor_fill_override` was missing here — the
-        // one field `clone` copied that this override didn't, violating the
-        // byte-for-byte contract above with a stale forge fill in the stored
-        // prior frame.
-        self.cursor_fill_override = source.cursor_fill_override;
-        self.cursor_glow_add.clone_from(&source.cursor_glow_add);
-        self.glow_halo.clone_from(&source.glow_halo);
-        self.glow_under.clone_from(&source.glow_under);
-        self.fire_patch.clone_from(&source.fire_patch);
-        self.word_decorations.clone_from(&source.word_decorations);
-        self.ink.clone_from(&source.ink);
-        self.char_fg.clone_from(&source.char_fg);
-        self.fire_halo.clone_from(&source.fire_halo);
-        self.cat_quads.clone_from(&source.cat_quads);
-        self.cat_atlas.clone_from(&source.cat_atlas);
-        self.free_sprites.clone_from(&source.free_sprites);
-        self.free_atlas.clone_from(&source.free_atlas);
-        self.nova_add.clone_from(&source.nova_add);
-        self.rain_quads.clone_from(&source.rain_quads);
-        self.rain_atlas.clone_from(&source.rain_atlas);
-        self.rain_add.clone_from(&source.rain_add);
-        self.display_offset = source.display_offset;
-        self.base_y = source.base_y;
-        self.absolute_row_revision = source.absolute_row_revision;
-        self.scroll_frac_px = source.scroll_frac_px;
-        self.grid_top_row = source.grid_top_row;
-        self.grid_bot_row = source.grid_bot_row;
-        self.fx_clip = source.fx_clip;
-        self.selection.clone_from(&source.selection);
-        self.selection_clip = source.selection_clip;
-        self.selection_bg = source.selection_bg;
-        self.selection_fg = source.selection_fg;
-        self.selections.clone_from(&source.selections);
-        self.clusters.clone_from(&source.clusters);
-        self.combining.clone_from(&source.combining);
-        self.line_sizes.clone_from(&source.line_sizes);
-        self.line_size_spans.clone_from(&source.line_size_spans);
-        self.default_bg_spans.clone_from(&source.default_bg_spans);
-        self.images.clone_from(&source.images);
-        self.wallpaper.clone_from(&source.wallpaper);
-        self.default_bg = source.default_bg;
-        self.default_fg = source.default_fg;
-        self.cursor_color = source.cursor_color;
-        self.snapshot_seq = source.snapshot_seq;
-        self.process_sequence = source.process_sequence;
-        self.input_hot = source.input_hot;
-        self.terminal_id = source.terminal_id;
-        self.extract_gen = source.extract_gen;
-        self.engine_fill_seq = source.engine_fill_seq;
-        self.engine_alt = source.engine_alt;
-        self.engine_row_order = source.engine_row_order;
-        self.row_rev.clone_from(&source.row_rev);
-        self.row_rev_lane = source.row_rev_lane;
-        self.row_shift = source.row_shift;
-        self.shifted_fill_seq = source.shifted_fill_seq;
-        self.composed_fill_seq = source.composed_fill_seq;
+        self.copy_from(source, true);
     }
 }
 
@@ -2008,6 +2134,114 @@ impl Default for RenderInput {
 }
 
 impl RenderInput {
+    /// Update a damage-cache snapshot without retaining the four large
+    /// cursor-effect payloads when their producer supplied compact metadata.
+    ///
+    /// A cached frame is never drawn again: it is read only by the dirty-row
+    /// decision.  For these streams the metadata is therefore a complete prior
+    /// representation (content revision plus occupied rows).  Hand-built input
+    /// without metadata remains fully cloned, preserving the public fallback.
+    pub fn clone_damage_cache_from(&mut self, source: &Self) {
+        self.copy_from(source, false);
+    }
+
+    fn copy_from(&mut self, source: &Self, retain_effect_payloads: bool) {
+        self.rows = source.rows;
+        self.cols = source.cols;
+        self.cells.clone_from(&source.cells);
+        self.cursor_row = source.cursor_row;
+        self.cursor_col = source.cursor_col;
+        self.cursor_visible = source.cursor_visible;
+        self.cursor_style = source.cursor_style;
+        self.cursor_effect_style_override = source.cursor_effect_style_override;
+        self.cursor_trail.clone_from(&source.cursor_trail);
+        self.cursor_trail_color = source.cursor_trail_color;
+        self.cursor_fill_override = source.cursor_fill_override;
+
+        macro_rules! copy_effect_stream {
+            ($field:ident, $damage:ident) => {
+                if retain_effect_payloads || !source.$damage.is_valid() {
+                    self.$field.clone_from(&source.$field);
+                } else {
+                    self.$field.clear();
+                }
+                self.$damage.clone_from(&source.$damage);
+            };
+        }
+        copy_effect_stream!(cursor_glow_add, cursor_glow_add_damage);
+        copy_effect_stream!(glow_halo, glow_halo_damage);
+        copy_effect_stream!(glow_under, glow_under_damage);
+        copy_effect_stream!(fire_patch, fire_patch_damage);
+
+        self.word_decorations.clone_from(&source.word_decorations);
+        self.ink.clone_from(&source.ink);
+        self.char_fg.clone_from(&source.char_fg);
+        self.fire_halo.clone_from(&source.fire_halo);
+        self.cat_quads.clone_from(&source.cat_quads);
+        self.cat_atlas.clone_from(&source.cat_atlas);
+        self.free_sprites.clone_from(&source.free_sprites);
+        self.free_atlas.clone_from(&source.free_atlas);
+        self.nova_add.clone_from(&source.nova_add);
+        self.rain_quads.clone_from(&source.rain_quads);
+        self.rain_atlas.clone_from(&source.rain_atlas);
+        self.rain_add.clone_from(&source.rain_add);
+        self.display_offset = source.display_offset;
+        self.base_y = source.base_y;
+        self.absolute_row_revision = source.absolute_row_revision;
+        self.scroll_frac_px = source.scroll_frac_px;
+        self.grid_top_row = source.grid_top_row;
+        self.grid_bot_row = source.grid_bot_row;
+        self.fx_clip = source.fx_clip;
+        self.selection.clone_from(&source.selection);
+        self.selection_clip = source.selection_clip;
+        self.selection_bg = source.selection_bg;
+        self.selection_fg = source.selection_fg;
+        self.selections.clone_from(&source.selections);
+        self.clusters.clone_from(&source.clusters);
+        self.combining.clone_from(&source.combining);
+        self.line_sizes.clone_from(&source.line_sizes);
+        self.line_size_spans.clone_from(&source.line_size_spans);
+        self.default_bg_spans.clone_from(&source.default_bg_spans);
+        self.images.clone_from(&source.images);
+        self.wallpaper.clone_from(&source.wallpaper);
+        self.default_bg = source.default_bg;
+        self.default_fg = source.default_fg;
+        self.cursor_color = source.cursor_color;
+        self.snapshot_seq = source.snapshot_seq;
+        self.process_sequence = source.process_sequence;
+        self.input_hot = source.input_hot;
+        self.terminal_id = source.terminal_id;
+        self.extract_gen = source.extract_gen;
+        self.engine_fill_seq = source.engine_fill_seq;
+        self.engine_alt = source.engine_alt;
+        self.engine_row_order = source.engine_row_order;
+        self.row_rev.clone_from(&source.row_rev);
+        self.row_rev_lane = source.row_rev_lane;
+        self.row_shift = source.row_shift;
+        self.shifted_fill_seq = source.shifted_fill_seq;
+        self.composed_fill_seq = source.composed_fill_seq;
+    }
+
+    /// Rebuild the four compact cursor-effect damage records after the FINAL
+    /// frontend composition (splices, clipping, and chrome suppression all
+    /// precede this call).  This is the one producer-side walk replacing the
+    /// prior cache's clone plus prev/current compare-and-row scans.
+    pub fn refresh_cursor_effect_damage(&mut self) {
+        let rows = self.rows;
+        self.cursor_glow_add_damage.refresh(
+            &self.cursor_glow_add,
+            rows,
+            |quad| quad.row,
+            hash_glow_quad,
+        );
+        self.glow_halo_damage
+            .refresh(&self.glow_halo, rows, |halo| halo.row, hash_rain_halo);
+        self.glow_under_damage
+            .refresh(&self.glow_under, rows, |quad| quad.row, hash_glow_quad);
+        self.fire_patch_damage
+            .refresh(&self.fire_patch, rows, |patch| patch.row, hash_fire_patch);
+    }
+
     /// An empty 0×0 snapshot with no allocations — the seed for a persistent
     /// scratch buffer that [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into)
     /// refills in place each frame (C-1). Cursor scalars default to off/origin and
@@ -2032,6 +2266,10 @@ impl RenderInput {
             glow_halo: Vec::new(),
             glow_under: Vec::new(),
             fire_patch: Vec::new(),
+            cursor_glow_add_damage: EffectStreamDamage::default(),
+            glow_halo_damage: EffectStreamDamage::default(),
+            glow_under_damage: EffectStreamDamage::default(),
+            fire_patch_damage: EffectStreamDamage::default(),
             cursor_fill_override: None,
             word_decorations: Vec::new(),
             ink: Vec::new(),
@@ -2484,6 +2722,13 @@ impl RenderInput {
         self.glow_halo.clear();
         self.glow_under.clear();
         self.fire_patch.clear();
+        // These records describe the vectors above, so a plain-image capture
+        // must fail closed to exact vector comparison until a producer rebuilds
+        // them for a later decorated frame.
+        self.cursor_glow_add_damage = EffectStreamDamage::default();
+        self.glow_halo_damage = EffectStreamDamage::default();
+        self.glow_under_damage = EffectStreamDamage::default();
+        self.fire_patch_damage = EffectStreamDamage::default();
         self.cursor_fill_override = None;
         self.word_decorations.clear();
         self.ink.clear();
@@ -4540,5 +4785,191 @@ mod rain_channel_tests {
         assert_eq!(dst.char_fg, source.char_fg);
         assert_eq!(dst.fire_halo, source.fire_halo);
         assert_eq!(dst, source, "clone_from == clone, byte-for-byte");
+    }
+
+    #[test]
+    fn damage_cache_keeps_effect_revisions_and_drops_large_payloads() {
+        let mut source = populated();
+        source.rows = 4;
+        source.refresh_cursor_effect_damage();
+
+        let mut cached = RenderInput::empty();
+        cached.cursor_glow_add = vec![under_quad(3); 64];
+        cached.glow_halo = vec![rain_halo(3); 64];
+        cached.glow_under = vec![under_quad(3); 64];
+        cached.fire_patch = vec![fire_patch(3); 64];
+        cached.clone_damage_cache_from(&source);
+
+        assert!(cached.cursor_glow_add.is_empty());
+        assert!(cached.glow_halo.is_empty());
+        assert!(cached.glow_under.is_empty());
+        assert!(cached.fire_patch.is_empty());
+        assert!(cached.cursor_glow_add_damage.is_valid());
+        assert!(cached.glow_halo_damage.is_valid());
+        assert!(cached.glow_under_damage.is_valid());
+        assert!(cached.fire_patch_damage.is_valid());
+
+        let mut dirty = vec![false; source.rows];
+        cached.glow_under_damage.mark_rows(&mut dirty);
+        assert_eq!(dirty, [false, true, true, false]);
+        assert_eq!(
+            source
+                .glow_under_damage
+                .same_content(&cached.glow_under_damage),
+            Some(true),
+            "the cache carries the exact producer revision"
+        );
+    }
+
+    /// The producer record must cover every rendered `GlowQuad` field while
+    /// retaining only a row bitmap in the prior-frame cache.  This is a
+    /// deterministic guard for the hot 8k `glow_under` shape: timing belongs
+    /// to the ignored microbenchmark below, while payload coverage and memory
+    /// shape must stay true on every test run.
+    #[test]
+    fn damage_record_covers_8k_glow_under_without_retaining_its_payload() {
+        const QUADS: usize = 8_191;
+        const ROWS: usize = 128;
+
+        let mut source = RenderInput::empty();
+        source.rows = ROWS;
+        source.glow_under = (0..QUADS)
+            .map(|index| GlowQuad {
+                row: (index % ROWS) as u16,
+                x: index as u16,
+                y: (index % ROWS * 16) as u16,
+                w: 12,
+                h: 10,
+                color: 0x0060_2008,
+                alpha: 0,
+            })
+            .collect();
+        source.refresh_cursor_effect_damage();
+
+        let mut cache = RenderInput::empty();
+        cache.clone_damage_cache_from(&source);
+        assert!(cache.glow_under.is_empty(), "the cache retained 8k quads");
+        assert_eq!(
+            cache.glow_under_damage.rows.len(),
+            ROWS.div_ceil(u64::BITS as usize),
+            "one bit per grid row, not one entry per quad"
+        );
+        assert!(
+            cache.glow_under_damage.rows.len() * std::mem::size_of::<u64>()
+                < source.glow_under.len() * std::mem::size_of::<GlowQuad>(),
+            "the compact cache must be smaller than the payload it replaces"
+        );
+
+        for mutate in [
+            |quad: &mut GlowQuad| quad.row ^= 1,
+            |quad: &mut GlowQuad| quad.x ^= 1,
+            |quad: &mut GlowQuad| quad.y ^= 1,
+            |quad: &mut GlowQuad| quad.w ^= 1,
+            |quad: &mut GlowQuad| quad.h ^= 1,
+            |quad: &mut GlowQuad| quad.color ^= 1,
+            |quad: &mut GlowQuad| quad.alpha ^= 1,
+        ] {
+            let mut changed = source.clone();
+            mutate(&mut changed.glow_under[QUADS - 1]);
+            changed.refresh_cursor_effect_damage();
+            assert_eq!(
+                source
+                    .glow_under_damage
+                    .same_content(&changed.glow_under_damage),
+                Some(false),
+                "a rendered GlowQuad field was omitted from its damage revision"
+            );
+        }
+    }
+
+    /// Manual release-mode yardstick for the producer metadata path and the
+    /// exact work it supersedes.  It deliberately prints measurements without
+    /// asserting a wall-clock threshold: CPU frequency and thermal state make
+    /// such thresholds flaky.  Run with
+    /// `cargo test -p aterm-core --release --lib measure_8k_glow_under_damage_work -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual release microbenchmark"]
+    fn measure_8k_glow_under_damage_work() {
+        use std::{hint::black_box, time::Instant};
+
+        const QUADS: usize = 8_191;
+        const ROWS: usize = 128;
+        const SAMPLES: usize = 10_000;
+
+        let payload: Vec<GlowQuad> = (0..QUADS)
+            .map(|index| GlowQuad {
+                row: (index % ROWS) as u16,
+                x: index as u16,
+                y: (index % ROWS * 16) as u16,
+                w: 12,
+                h: 10,
+                color: 0x0060_2008,
+                alpha: 0,
+            })
+            .collect();
+        let mut source = RenderInput::empty();
+        source.rows = ROWS;
+        source.glow_under.clone_from(&payload);
+        source.refresh_cursor_effect_damage();
+        let mut changed = source.clone();
+        changed.glow_under[QUADS - 1].color ^= 1;
+        changed.refresh_cursor_effect_damage();
+
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            let input = black_box(&mut source);
+            input.refresh_cursor_effect_damage();
+            black_box(
+                input
+                    .glow_under_damage
+                    .same_content(&changed.glow_under_damage),
+            );
+        }
+        let metadata_refresh = start.elapsed();
+
+        let mut exact_prev = Vec::new();
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            let current = black_box(&payload);
+            exact_prev.clone_from(current);
+            black_box(exact_prev == *current);
+        }
+        let exact_clone_compare = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            let previous = black_box(&payload);
+            let current = black_box(&changed.glow_under);
+            black_box(
+                previous
+                    .iter()
+                    .chain(current.iter())
+                    .fold(0_u32, |rows, quad| rows | (1 << (quad.row % 32))),
+            );
+        }
+        let exact_changed_row_scan = start.elapsed();
+
+        let mut dirty = vec![false; ROWS];
+        let start = Instant::now();
+        for _ in 0..SAMPLES {
+            dirty.fill(false);
+            source.glow_under_damage.mark_rows(&mut dirty);
+            changed.glow_under_damage.mark_rows(&mut dirty);
+            black_box(dirty.iter().filter(|&&row| row).count());
+        }
+        let metadata_row_mark = start.elapsed();
+
+        let ns_per = |duration: std::time::Duration| duration.as_nanos() / SAMPLES as u128;
+        eprintln!(
+            "8k glow_under, {QUADS} quads / {ROWS} rows: metadata refresh={} ns, \
+             exact clone+equal-compare={} ns, exact changed-row scan={} ns, \
+             metadata prev+current row mark={} ns ({} B bitmap vs {} B payload)",
+            ns_per(metadata_refresh),
+            ns_per(exact_clone_compare),
+            ns_per(exact_changed_row_scan),
+            ns_per(metadata_row_mark),
+            source.glow_under_damage.rows.len() * std::mem::size_of::<u64>(),
+            payload.len() * std::mem::size_of::<GlowQuad>(),
+        );
     }
 }

@@ -86,7 +86,66 @@ fn identity_changed() -> io::Error {
 }
 
 const REMOVE_MAX_ENTRIES: usize = 16_384;
-const REMOVE_MAX_DEPTH: usize = 32;
+/// Descriptor allowance left beside an initial pinned chain by artifact
+/// admission. Keep this shared with `control` so cleanup cannot silently grow
+/// beyond the capacity it is charged for.
+pub(crate) const PINNED_DIR_OPERATION_DESCRIPTOR_UNITS: usize = 8;
+/// A wire-published video prune can already own the fresh recording, index,
+/// marker, and candidate recording (four handles). Recursive cleanup opens one
+/// additional child before checking its depth, so a limit of three consumes the
+/// remaining four units exactly. Shipping artifact layouts are flat; deeper
+/// owner-namespace trees are treated as interference and fail closed.
+const REMOVE_LIVE_FIXED_UNITS: usize = 4;
+const REMOVE_MAX_DEPTH: usize = PINNED_DIR_OPERATION_DESCRIPTOR_UNITS - REMOVE_LIVE_FIXED_UNITS - 1;
+
+/// Maximum absolute-path depth an initial pin may retain. Artifact admission
+/// reserves additional units for children, files, validation, and bounded
+/// cleanup handles; together they fit the artifact handoff descriptor budget.
+pub(crate) const PINNED_DIR_OPEN_COMPONENT_LIMIT: usize =
+    64 - PINNED_DIR_OPERATION_DESCRIPTOR_UNITS;
+
+fn validate_open_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pinned directory must be absolute",
+        ));
+    }
+    if path.components().count() > PINNED_DIR_OPEN_COMPONENT_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pinned directory exceeds the artifact descriptor budget",
+        ));
+    }
+    Ok(())
+}
+
+fn admission_refused() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "pinned directory descriptor admission refused",
+    )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static PINNED_CHAIN_OPEN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_pinned_chain_open() {
+    PINNED_CHAIN_OPEN_COUNT.set(PINNED_CHAIN_OPEN_COUNT.get() + 1);
+}
+
+#[cfg(test)]
+fn reset_pinned_chain_open_count() {
+    PINNED_CHAIN_OPEN_COUNT.set(0);
+}
+
+#[cfg(test)]
+fn pinned_chain_open_count() -> usize {
+    PINNED_CHAIN_OPEN_COUNT.get()
+}
 
 #[cfg(unix)]
 mod imp {
@@ -105,6 +164,7 @@ mod imp {
 
     use super::{
         Component, OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
+        validate_open_path,
     };
 
     fn directory_flags() -> OFlags {
@@ -221,7 +281,60 @@ mod imp {
         file: std::fs::File,
     }
 
+    /// Copyable directory identity used by registries without retaining an
+    /// extra descriptor beyond the admitted owner that supplied it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PinnedDirIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    /// Recorded kernel identity for checkpoint revalidation after a descriptor closes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PinnedFileIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    impl PinnedFileIdentity {
+        fn from_file(file: &std::fs::File) -> io::Result<Self> {
+            let stat = fstat(file).map_err(io::Error::from)?;
+            if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_nlink != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "artifact source is not a singly-linked regular file",
+                ));
+            }
+            Ok(Self {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+            })
+        }
+
+        /// Reopen one name through an already-validated retained directory and
+        /// compare its current device/inode. The temporary descriptor closes on
+        /// return.
+        pub(crate) fn validate_at_retained(self, dir: &PinnedDir, name: &OsStr) -> io::Result<()> {
+            if dir.private_file_identity_at_retained(name)? != self {
+                return Err(identity_changed());
+            }
+            Ok(())
+        }
+    }
+
     impl PinnedFile {
+        fn identity(&self) -> io::Result<PinnedFileIdentity> {
+            PinnedFileIdentity::from_file(&self.file)
+        }
+
+        /// Record this open file's identity and close it. A later checkpoint can
+        /// detect an ordinary replacement without retaining one descriptor per
+        /// entry; it is not continuous exclusion and kernel IDs may be reused
+        /// after the file is deleted.
+        pub(crate) fn into_identity(self) -> io::Result<PinnedFileIdentity> {
+            self.identity()
+        }
+
         fn current_name_matches(&self) -> bool {
             openat(
                 self.dir.leaf(),
@@ -236,7 +349,7 @@ mod imp {
         /// Revalidate this entry against its already-retained parent directory.
         /// This intentionally says nothing about whether the parent's original
         /// lexical ancestor chain still names that directory.
-        fn validate_entry_identity(&self) -> io::Result<()> {
+        pub(crate) fn validate_entry_identity_at_retained(&self) -> io::Result<()> {
             let fd = openat(
                 self.dir.leaf(),
                 &self.name,
@@ -259,7 +372,7 @@ mod imp {
 
         pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
             self.dir.validate_path_identity()?;
-            self.validate_entry_identity()
+            self.validate_entry_identity_at_retained()
         }
 
         /// Remove through the retained parent and certify success only when the
@@ -304,12 +417,39 @@ mod imp {
         /// `RENAME_NOREPLACE` never expose either partial bytes or a transient
         /// second hard link at the final component.
         fn publish_as_new_with_hook(
-            mut self,
+            self,
             name: &OsStr,
             after_publish: impl FnOnce(),
         ) -> io::Result<Self> {
+            self.publish_as_new_with_validation(name, after_publish, true)
+        }
+
+        /// Publish through the retained parent capability while checking only
+        /// the temporary/final entry. The batch caller validates the lexical
+        /// ancestor chain around its one directory durability barrier.
+        fn publish_as_new_at_retained_with_hook(
+            self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+        ) -> io::Result<Self> {
+            self.publish_as_new_with_validation(name, after_publish, false)
+        }
+
+        fn publish_as_new_with_validation(
+            mut self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+            validate_path: bool,
+        ) -> io::Result<Self> {
             validate_component(name)?;
-            if let Err(error) = self.validate_path_identity() {
+            let validate = |file: &Self| {
+                if validate_path {
+                    file.validate_path_identity()
+                } else {
+                    file.validate_entry_identity_at_retained()
+                }
+            };
+            if let Err(error) = validate(&self) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -320,7 +460,7 @@ mod imp {
                 return Err(error);
             }
             self.name = name.to_os_string();
-            if let Err(error) = self.validate_path_identity() {
+            if let Err(error) = validate(&self) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -333,6 +473,15 @@ mod imp {
         /// directory, then no-follow pin its canonical ancestor chain and
         /// require both opens to identify the same inode.
         pub(crate) fn open_resolved(path: &Path) -> io::Result<Self> {
+            Self::open_resolved_with_admission(path, |_| true)
+        }
+
+        /// Resolve the exact target, then let descriptor admission run against
+        /// that canonical depth before any retained ancestor chain is opened.
+        pub(crate) fn open_resolved_with_admission(
+            path: &Path,
+            admit: impl FnOnce(&Path) -> bool,
+        ) -> io::Result<Self> {
             let expected = open_directory_at(CWD, path)?;
             if !is_directory(&expected) {
                 return Err(io::Error::new(
@@ -341,7 +490,7 @@ mod imp {
                 ));
             }
             let canonical = std::fs::canonicalize(path)?;
-            let pinned = Self::open(&canonical)?;
+            let pinned = Self::open_with_admission(&canonical, admit)?;
             if !same_identity(&expected, pinned.leaf()) {
                 return Err(identity_changed());
             }
@@ -357,13 +506,10 @@ mod imp {
             )
         )]
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
+            validate_open_path(path)?;
             let path = path.to_path_buf();
-            if !path.is_absolute() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pinned directory must be absolute",
-                ));
-            }
+            #[cfg(test)]
+            super::note_pinned_chain_open();
             let root = open_directory_at(CWD, Path::new("/"))?;
             if !is_directory(&root) {
                 return Err(io::Error::new(
@@ -387,6 +533,8 @@ mod imp {
                 let parent = components
                     .last()
                     .map_or(root.as_ref(), |(_, directory)| directory.as_ref());
+                #[cfg(test)]
+                super::note_pinned_chain_open();
                 let directory = open_directory_at(parent, name)?;
                 if !is_directory(&directory) {
                     return Err(io::Error::new(
@@ -418,12 +566,12 @@ mod imp {
             &self.path
         }
 
-        pub(crate) fn same_directory_identity(&self, other: &Self) -> bool {
-            same_identity(self.leaf(), other.leaf())
-        }
-
-        pub(crate) fn same_directory_fd(&self, other: &impl aterm_dirfd::AsFd) -> bool {
-            same_identity(self.leaf(), other)
+        pub(crate) fn retained_identity(&self) -> io::Result<PinnedDirIdentity> {
+            let stat = fstat(self.leaf()).map_err(io::Error::from)?;
+            Ok(PinnedDirIdentity {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+            })
         }
 
         /// Reopen the exact retained directory inode for a cross-process
@@ -526,7 +674,6 @@ mod imp {
                 after_create();
             }
             let result = (|| {
-                file.file.set_len(0)?;
                 (&file.file).write_all(bytes)?;
                 file.file.sync_all()
             })();
@@ -622,7 +769,33 @@ mod imp {
             bytes: &[u8],
             authorize: impl FnOnce() -> bool,
         ) -> io::Result<PinnedFile> {
-            self.write_new_private_with_authorizer_and_hooks(name, bytes, authorize, || {}, || {})
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                authorize,
+                || {},
+                || {},
+                true,
+            )
+        }
+
+        /// Publish one durable file as part of a private batch whose caller
+        /// supplies the parent-directory sync barrier before any visibility
+        /// marker. The file itself is still fsynced and identity-checked.
+        pub(crate) fn write_new_private_deferred_dir_sync_authorized(
+            &self,
+            name: &OsStr,
+            bytes: &[u8],
+            authorize: impl FnOnce() -> bool,
+        ) -> io::Result<PinnedFile> {
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                authorize,
+                || {},
+                || {},
+                false,
+            )
         }
 
         /// Create and fsync an invisible temporary file, then atomically
@@ -640,6 +813,7 @@ mod imp {
                 || true,
                 after_temp_create,
                 after_publish,
+                true,
             )
         }
 
@@ -650,6 +824,7 @@ mod imp {
             authorize: impl FnOnce() -> bool,
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
+            sync_parent: bool,
         ) -> io::Result<PinnedFile> {
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -672,13 +847,17 @@ mod imp {
                                 "artifact publication cancelled",
                             ));
                         }
-                        let file = file.publish_as_new_with_hook(
-                            name,
-                            after_publish
-                                .take()
-                                .expect("publication hook runs exactly once"),
-                        )?;
-                        if let Err(error) = self.sync().and_then(|()| file.validate_path_identity())
+                        let after_publish = after_publish
+                            .take()
+                            .expect("publication hook runs exactly once");
+                        let file = if sync_parent {
+                            file.publish_as_new_with_hook(name, after_publish)?
+                        } else {
+                            file.publish_as_new_at_retained_with_hook(name, after_publish)?
+                        };
+                        if sync_parent
+                            && let Err(error) =
+                                self.sync().and_then(|()| file.validate_path_identity())
                         {
                             let _ = file.remove_exact();
                             return Err(error);
@@ -729,7 +908,7 @@ mod imp {
                 name: name.to_os_string(),
                 file,
             };
-            guard.validate_entry_identity()?;
+            guard.validate_entry_identity_at_retained()?;
             Ok((bytes, guard))
         }
 
@@ -769,8 +948,21 @@ mod imp {
                 name: name.to_os_string(),
                 file: std::fs::File::from(fd),
             };
-            guard.validate_entry_identity()?;
+            guard.validate_entry_identity_at_retained()?;
             Ok(guard)
+        }
+
+        /// Open one direct child through this retained directory, record its
+        /// identity, and close it. This intentionally performs one entry open
+        /// and no lexical ancestor walk.
+        pub(crate) fn private_file_identity_at_retained(
+            &self,
+            name: &OsStr,
+        ) -> io::Result<PinnedFileIdentity> {
+            validate_component(name)?;
+            let fd = openat(self.leaf(), name, file_read_flags(), Mode::empty())
+                .map_err(io::Error::from)?;
+            PinnedFileIdentity::from_file(&std::fs::File::from(fd))
         }
 
         pub(crate) fn pin_private_file(&self, name: &OsStr) -> io::Result<PinnedFile> {
@@ -1006,7 +1198,10 @@ mod imp {
     use std::os::windows::io::AsRawHandle as _;
     use std::sync::Arc;
 
-    use super::{OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component};
+    use super::{
+        OsStr, OsString, Path, PathBuf, identity_changed, io, validate_component,
+        validate_open_path,
+    };
 
     const FILE_SHARE_READ: u32 = 0x0000_0001;
     const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -1161,9 +1356,8 @@ mod imp {
     /// writer's WRITE but not its DELETE, so reading an artifact this very
     /// process had written and was still holding failed with
     /// ERROR_SHARING_VIOLATION (os error 32). That is not a test-only corner:
-    /// the video prune probe reads `index.json` and pins every frame through
-    /// here while `VideoPublication` still retains the write guards for the wire
-    /// reply, so a perfectly complete recording scored `Invalid`.
+    /// the video prune probe originally exposed it while reading artifacts whose
+    /// publisher still retained write guards.
     ///
     /// Re-opening the write handle without DELETE once publication finished was
     /// tried on paper and rejected. `remove_exact` on a still-retained guard is
@@ -1191,47 +1385,37 @@ mod imp {
     ///
     /// Retained WRITE guards and retained DIRECTORY guards keep their denials
     /// unchanged; only this read path relaxed.
-    fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+    fn open_regular_file_with_identity(path: &Path) -> io::Result<(std::fs::File, FileIdentity)> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let metadata = file.metadata()?;
+        let identity = file_identity(&file)?;
         if !metadata.is_file()
             || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || file_identity(&file)?.links != 1
+            || identity.links != 1
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "artifact is not a singly-linked regular file",
             ));
         }
-        Ok(file)
+        Ok((file, identity))
+    }
+
+    fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
+        open_regular_file_with_identity(path).map(|(file, _)| file)
     }
 
     fn probe_regular_file(path: &Path) -> io::Result<std::fs::File> {
-        let file = std::fs::OpenOptions::new()
-            .access_mode(GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || file_identity(&file)?.links != 1
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "artifact is not a singly-linked regular file",
-            ));
-        }
-        Ok(file)
+        open_regular_file(path)
     }
 
     #[derive(Debug)]
     struct WindowsPinned {
-        components: Vec<(PathBuf, std::fs::File)>,
+        components: Vec<(PathBuf, Arc<std::fs::File>)>,
     }
 
     #[derive(Clone, Debug)]
@@ -1247,14 +1431,70 @@ mod imp {
         file: std::fs::File,
     }
 
+    /// Copyable directory identity used by registries without retaining an
+    /// extra handle beyond the admitted owner that supplied it.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PinnedDirIdentity {
+        volume: u32,
+        index: u64,
+    }
+
+    /// Recorded kernel identity for checkpoint revalidation after a handle closes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct PinnedFileIdentity {
+        volume: u32,
+        index: u64,
+    }
+
+    impl PinnedFileIdentity {
+        fn from_raw(identity: FileIdentity) -> io::Result<Self> {
+            if identity.links != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "artifact source is not a singly-linked regular file",
+                ));
+            }
+            Ok(Self {
+                volume: identity.volume,
+                index: identity.index,
+            })
+        }
+
+        /// Reopen one name through an already-validated retained directory and
+        /// compare its current volume/file-index. The temporary handle closes
+        /// on return.
+        pub(crate) fn validate_at_retained(self, dir: &PinnedDir, name: &OsStr) -> io::Result<()> {
+            if dir.private_file_identity_at_retained(name)? != self {
+                return Err(identity_changed());
+            }
+            Ok(())
+        }
+    }
+
     impl PinnedFile {
-        pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
-            self.dir.validate_path_identity()?;
+        fn identity(&self) -> io::Result<PinnedFileIdentity> {
+            PinnedFileIdentity::from_raw(file_identity(&self.file)?)
+        }
+
+        /// Record this open file's identity and close it. A later checkpoint can
+        /// detect an ordinary replacement without retaining one handle per
+        /// entry; it is not continuous exclusion and kernel IDs may be reused
+        /// after the file is deleted.
+        pub(crate) fn into_identity(self) -> io::Result<PinnedFileIdentity> {
+            self.identity()
+        }
+
+        pub(crate) fn validate_entry_identity_at_retained(&self) -> io::Result<()> {
             let current = probe_regular_file(&self.dir.path.join(&self.name))?;
             if !same_identity(&current, &self.file) {
                 return Err(identity_changed());
             }
             Ok(())
+        }
+
+        pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
+            self.dir.validate_path_identity()?;
+            self.validate_entry_identity_at_retained()
         }
 
         pub(crate) fn remove_exact(self) -> io::Result<()> {
@@ -1280,12 +1520,39 @@ mod imp {
         }
 
         fn publish_as_new_with_hook(
-            mut self,
+            self,
             name: &OsStr,
             after_publish: impl FnOnce(),
         ) -> io::Result<Self> {
+            self.publish_as_new_with_validation(name, after_publish, true)
+        }
+
+        /// Publish through the retained parent capability while checking only
+        /// the temporary/final entry. Retained Windows directory handles deny
+        /// ancestor replacement; the batch caller performs the full path checks.
+        fn publish_as_new_at_retained_with_hook(
+            self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+        ) -> io::Result<Self> {
+            self.publish_as_new_with_validation(name, after_publish, false)
+        }
+
+        fn publish_as_new_with_validation(
+            mut self,
+            name: &OsStr,
+            after_publish: impl FnOnce(),
+            validate_path: bool,
+        ) -> io::Result<Self> {
             validate_component(name)?;
-            if let Err(error) = self.validate_path_identity() {
+            let validate = |file: &Self| {
+                if validate_path {
+                    file.validate_path_identity()
+                } else {
+                    file.validate_entry_identity_at_retained()
+                }
+            };
+            if let Err(error) = validate(&self) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -1295,7 +1562,7 @@ mod imp {
             }
             self.name = name.to_os_string();
             after_publish();
-            if let Err(error) = self.validate_path_identity() {
+            if let Err(error) = validate(&self) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -1307,9 +1574,18 @@ mod imp {
         /// Resolve a caller path while retaining the exact final directory,
         /// then pin and compare the canonical no-reparse chain.
         pub(crate) fn open_resolved(path: &Path) -> io::Result<Self> {
+            Self::open_resolved_with_admission(path, |_| true)
+        }
+
+        /// Resolve the exact target, then let descriptor admission run against
+        /// that canonical depth before any retained ancestor chain is opened.
+        pub(crate) fn open_resolved_with_admission(
+            path: &Path,
+            admit: impl FnOnce(&Path) -> bool,
+        ) -> io::Result<Self> {
             let expected = open_directory(path)?;
             let canonical = std::fs::canonicalize(path)?;
-            let pinned = Self::open(&canonical)?;
+            let pinned = Self::open_with_admission(&canonical, admit)?;
             if !same_identity(&expected, pinned.leaf()) {
                 return Err(identity_changed());
             }
@@ -1325,24 +1601,21 @@ mod imp {
             )
         )]
         pub(crate) fn open(path: &Path) -> io::Result<Self> {
+            validate_open_path(path)?;
             let path = path.to_path_buf();
-            if !path.is_absolute() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pinned directory must be absolute",
-                ));
-            }
             let mut prefixes = path.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
             prefixes.reverse();
             let mut components = Vec::with_capacity(prefixes.len());
             let last = prefixes.len().saturating_sub(1);
             for (index, prefix) in prefixes.into_iter().enumerate() {
+                #[cfg(test)]
+                super::note_pinned_chain_open();
                 let file = if index == last {
                     open_mutable_directory(&prefix, false)?
                 } else {
                     open_directory(&prefix)?
                 };
-                components.push((prefix, file));
+                components.push((prefix, Arc::new(file)));
             }
             let result = Self {
                 path,
@@ -1357,27 +1630,27 @@ mod imp {
             &self.path
         }
 
-        pub(crate) fn same_directory_identity(&self, other: &Self) -> bool {
-            same_identity(self.leaf(), other.leaf())
-        }
-
-        pub(crate) fn same_directory_file(&self, other: &std::fs::File) -> bool {
-            same_identity(self.leaf(), other)
+        pub(crate) fn retained_identity(&self) -> io::Result<PinnedDirIdentity> {
+            let identity = file_identity(self.leaf())?;
+            Ok(PinnedDirIdentity {
+                volume: identity.volume,
+                index: identity.index,
+            })
         }
 
         fn leaf(&self) -> &std::fs::File {
-            &self
-                .pinned
+            self.pinned
                 .components
                 .last()
                 .expect("an absolute Windows directory has a root component")
                 .1
+                .as_ref()
         }
 
         pub(crate) fn validate_path_identity(&self) -> io::Result<()> {
             for (path, expected) in &self.pinned.components {
                 let current = probe_directory(path)?;
-                if !same_identity(&current, expected) {
+                if !same_identity(&current, expected.as_ref()) {
                     return Err(identity_changed());
                 }
             }
@@ -1393,13 +1666,8 @@ mod imp {
             self.validate_path_identity()?;
             let path = self.path.join(name);
             let child = open_mutable_directory(&path, true)?;
-            let mut components = self
-                .pinned
-                .components
-                .iter()
-                .map(|(path, file)| Ok((path.clone(), file.try_clone()?)))
-                .collect::<io::Result<Vec<_>>>()?;
-            components.push((path.clone(), child));
+            let mut components = self.pinned.components.clone();
+            components.push((path.clone(), Arc::new(child)));
             Ok(Self {
                 path,
                 pinned: Arc::new(WindowsPinned { components }),
@@ -1468,9 +1736,12 @@ mod imp {
             name: &OsStr,
             bytes: &[u8],
             after_create: &mut Option<F>,
+            validate_path: bool,
         ) -> io::Result<PinnedFile> {
             validate_component(name)?;
-            self.validate_path_identity()?;
+            if validate_path {
+                self.validate_path_identity()?;
+            }
             let path = self.path.join(name);
             let mut options = std::fs::OpenOptions::new();
             options
@@ -1518,7 +1789,6 @@ mod imp {
                 after_create();
             }
             let result = (|| {
-                file.file.set_len(0)?;
                 (&file.file).write_all(bytes)?;
                 file.file.sync_all()
             })();
@@ -1531,7 +1801,7 @@ mod imp {
 
         fn write_private_inner(&self, name: &OsStr, bytes: &[u8]) -> io::Result<PinnedFile> {
             let mut after_create = Some(|| {});
-            self.write_private_inner_with_hook(name, bytes, &mut after_create)
+            self.write_private_inner_with_hook(name, bytes, &mut after_create, true)
         }
 
         fn temporary_name(sequence: u64) -> OsString {
@@ -1614,7 +1884,33 @@ mod imp {
             bytes: &[u8],
             authorize: impl FnOnce() -> bool,
         ) -> io::Result<PinnedFile> {
-            self.write_new_private_with_authorizer_and_hooks(name, bytes, authorize, || {}, || {})
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                authorize,
+                || {},
+                || {},
+                true,
+            )
+        }
+
+        /// Publish one durable file as part of a private batch whose caller
+        /// supplies the parent-directory sync barrier before any visibility
+        /// marker. The file itself is still fsynced and identity-checked.
+        pub(crate) fn write_new_private_deferred_dir_sync_authorized(
+            &self,
+            name: &OsStr,
+            bytes: &[u8],
+            authorize: impl FnOnce() -> bool,
+        ) -> io::Result<PinnedFile> {
+            self.write_new_private_with_authorizer_and_hooks(
+                name,
+                bytes,
+                authorize,
+                || {},
+                || {},
+                false,
+            )
         }
 
         pub(crate) fn write_new_private_with_hooks(
@@ -1630,6 +1926,7 @@ mod imp {
                 || true,
                 after_temp_create,
                 after_publish,
+                true,
             )
         }
 
@@ -1640,6 +1937,7 @@ mod imp {
             authorize: impl FnOnce() -> bool,
             after_temp_create: impl FnOnce(),
             after_publish: impl FnOnce(),
+            sync_parent: bool,
         ) -> io::Result<PinnedFile> {
             validate_component(name)?;
             static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1649,8 +1947,12 @@ mod imp {
             for _ in 0..32 {
                 let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let temporary = Self::temporary_name(sequence);
-                match self.write_private_inner_with_hook(&temporary, bytes, &mut after_temp_create)
-                {
+                match self.write_private_inner_with_hook(
+                    &temporary,
+                    bytes,
+                    &mut after_temp_create,
+                    sync_parent,
+                ) {
                     Ok(file) => {
                         if !authorize
                             .take()
@@ -1662,13 +1964,17 @@ mod imp {
                                 "artifact publication cancelled",
                             ));
                         }
-                        let file = file.publish_as_new_with_hook(
-                            name,
-                            after_publish
-                                .take()
-                                .expect("publication hook runs exactly once"),
-                        )?;
-                        if let Err(error) = self.sync().and_then(|()| file.validate_path_identity())
+                        let after_publish = after_publish
+                            .take()
+                            .expect("publication hook runs exactly once");
+                        let file = if sync_parent {
+                            file.publish_as_new_with_hook(name, after_publish)?
+                        } else {
+                            file.publish_as_new_at_retained_with_hook(name, after_publish)?
+                        };
+                        if sync_parent
+                            && let Err(error) =
+                                self.sync().and_then(|()| file.validate_path_identity())
                         {
                             let _ = file.remove_exact();
                             return Err(error);
@@ -1730,20 +2036,34 @@ mod imp {
         }
 
         pub(crate) fn pin_private_file(&self, name: &OsStr) -> io::Result<PinnedFile> {
-            validate_component(name)?;
             self.validate_path_identity()?;
+            let guard = self.pin_private_file_at_retained(name)?;
+            guard.validate_path_identity()?;
+            Ok(guard)
+        }
+
+        pub(crate) fn pin_private_file_at_retained(&self, name: &OsStr) -> io::Result<PinnedFile> {
+            validate_component(name)?;
             let file = open_regular_file(&self.path.join(name))?;
             let guard = PinnedFile {
                 dir: self.clone(),
                 name: name.to_os_string(),
                 file,
             };
-            guard.validate_path_identity()?;
+            guard.validate_entry_identity_at_retained()?;
             Ok(guard)
         }
 
-        pub(crate) fn pin_private_file_at_retained(&self, name: &OsStr) -> io::Result<PinnedFile> {
-            self.pin_private_file(name)
+        /// Open one direct child through this retained directory, record its
+        /// identity, and close it. This intentionally performs one entry open
+        /// and no lexical ancestor walk.
+        pub(crate) fn private_file_identity_at_retained(
+            &self,
+            name: &OsStr,
+        ) -> io::Result<PinnedFileIdentity> {
+            validate_component(name)?;
+            let (_file, identity) = open_regular_file_with_identity(&self.path.join(name))?;
+            PinnedFileIdentity::from_raw(identity)
         }
 
         pub(crate) fn remove_file_if_exists(&self, name: &OsStr) -> io::Result<()> {
@@ -2127,7 +2447,23 @@ mod imp {
     }
 }
 
-pub(crate) use imp::{PinnedDir, PinnedFile};
+pub(crate) use imp::{PinnedDir, PinnedDirIdentity, PinnedFile, PinnedFileIdentity};
+
+impl PinnedDir {
+    /// Admit one already-resolved path before constructing its retained
+    /// ancestor chain. The ordinary [`Self::open`] remains the common,
+    /// refinement-anchored implementation after admission succeeds.
+    pub(crate) fn open_with_admission(
+        path: &Path,
+        admit: impl FnOnce(&Path) -> bool,
+    ) -> io::Result<Self> {
+        validate_open_path(path)?;
+        if !admit(path) {
+            return Err(admission_refused());
+        }
+        Self::open(path)
+    }
+}
 
 /// Contracts BOTH backends owe, asserted with one body so they cannot drift.
 #[cfg(test)]
@@ -2181,6 +2517,38 @@ mod shared_backend_contract_tests {
         assert!(!root.join(file).exists());
         pinned.remove_file_if_exists(file).unwrap();
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_file_identity_revalidates_and_rejects_a_replacement() {
+        let root = unique_dir("closed-file-identity");
+        std::fs::create_dir_all(&root).unwrap();
+        let pinned = PinnedDir::open(&root).unwrap();
+        let name = std::ffi::OsStr::new("frame.png");
+        let identity = pinned
+            .write_new_private(name, b"original")
+            .unwrap()
+            .into_identity()
+            .unwrap();
+        assert_eq!(
+            pinned.private_file_identity_at_retained(name).unwrap(),
+            identity,
+            "the retained-entry probe returns the open file's identity"
+        );
+        identity.validate_at_retained(&pinned, name).unwrap();
+
+        // Keep the original object allocated so this test cannot accidentally
+        // pass an immediately reused inode/file-index as the replacement.
+        std::fs::rename(root.join(name), root.join("original.png")).unwrap();
+        let replacement = pinned.write_new_private(name, b"replacement").unwrap();
+        assert!(
+            identity.validate_at_retained(&pinned, name).is_err(),
+            "the checkpoint must reject a different object at the same name"
+        );
+
+        drop(replacement);
+        drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }
 }
@@ -2278,7 +2646,7 @@ mod windows_tests {
         // work. The write guard holds DELETE_ACCESS for its whole life (rename
         // publication and `remove_exact` both need it), so a read mask without
         // FILE_SHARE_DELETE answered ERROR_SHARING_VIOLATION here — which is
-        // what the video prune probe hit against a live `VideoPublication`.
+        // what the video prune probe originally hit against a live publisher.
         let (bytes, read) = pinned
             .read_private(std::ffi::OsStr::new("index.json"), 32)
             .unwrap();
@@ -2448,7 +2816,11 @@ mod windows_tests {
 mod tests {
     use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-    use super::PinnedDir;
+    use super::{
+        PINNED_DIR_OPEN_COMPONENT_LIMIT, PINNED_DIR_OPERATION_DESCRIPTOR_UNITS, PinnedDir,
+        REMOVE_LIVE_FIXED_UNITS, REMOVE_MAX_DEPTH, pinned_chain_open_count,
+        reset_pinned_chain_open_count,
+    };
 
     fn unique_dir(stem: &str) -> std::path::PathBuf {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2459,6 +2831,88 @@ mod tests {
                 std::process::id(),
                 SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ))
+    }
+
+    /// REGRESSION: admission charges the caller's canonical path before an
+    /// artifact job starts, but a same-uid actor can retarget a short symlink
+    /// before confinement resolves it again. Reconcile against that exact
+    /// target before constructing its retained ancestor chain. The hard depth
+    /// ceiling is the second backstop and must also fire before chain opening.
+    #[test]
+    fn deep_resolved_path_is_rejected_before_ancestor_chain_open() {
+        let root = unique_dir("deep-resolved-budget");
+        let mut deep_parent = root.join("target");
+        while deep_parent.components().count() + 1 < PINNED_DIR_OPEN_COMPONENT_LIMIT {
+            deep_parent.push("d");
+        }
+        let deep = deep_parent.join("leaf");
+        std::fs::create_dir_all(&deep).unwrap();
+        let alias = root.join("alias");
+        symlink(&deep_parent, &alias).unwrap();
+        let resolved_alias = alias.join("leaf");
+
+        reset_pinned_chain_open_count();
+        let mut admission_ran = false;
+        let error = PinnedDir::open_resolved_with_admission(&resolved_alias, |canonical| {
+            admission_ran = true;
+            assert_eq!(
+                canonical.components().count(),
+                PINNED_DIR_OPEN_COMPONENT_LIMIT
+            );
+            assert_eq!(pinned_chain_open_count(), 0);
+            false
+        })
+        .expect_err("aggregate admission must be able to refuse the exact resolved depth");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(admission_ran);
+        assert_eq!(
+            pinned_chain_open_count(),
+            0,
+            "admission refusal must occur before any retained ancestor handle opens"
+        );
+
+        let too_deep = deep.join("d");
+        std::fs::create_dir(&too_deep).unwrap();
+        reset_pinned_chain_open_count();
+        let error = PinnedDir::open_resolved(&resolved_alias.join("d"))
+            .expect_err("a resolved path deeper than the descriptor budget must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            pinned_chain_open_count(),
+            0,
+            "the depth check must run before any retained ancestor handle opens"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recursive_cleanup_depth_fits_the_charged_suffix() {
+        assert_eq!(
+            REMOVE_LIVE_FIXED_UNITS + REMOVE_MAX_DEPTH + 1,
+            PINNED_DIR_OPERATION_DESCRIPTOR_UNITS,
+            "fixed publication handles plus the deepest opened child must fit admission"
+        );
+
+        let root = unique_dir("cleanup-depth-budget");
+        let recording = root.join("instance/recording");
+        let mut nested = recording.clone();
+        for depth in 0..=REMOVE_MAX_DEPTH {
+            nested.push(format!("d{depth}"));
+        }
+        std::fs::create_dir_all(&nested).unwrap();
+        let instance = PinnedDir::open(&root.join("instance")).unwrap();
+        let error = instance
+            .remove_child_tree(std::ffi::OsStr::new("recording"))
+            .expect_err("a deeper owner-namespace tree must fail before exceeding its charge");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            recording.is_dir(),
+            "fail-closed cleanup leaves the interfered exact tree for a later bounded sweep"
+        );
+
+        drop(instance);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2476,9 +2930,27 @@ mod tests {
             Err(std::fs::TryLockError::WouldBlock)
         ));
         drop(first_lock);
-        second_lock
-            .try_lock()
-            .expect("dropping the lease handle must release its directory lock");
+        // The property under test IS drop-release, so the drop stays — but
+        // `flock` rides the open-file-description, and a concurrent test's
+        // `fork()`ed child (any `pre_exec` Command or raw fork) that arrived
+        // between our open and this drop holds a duplicate of `first_lock`'s
+        // descriptor and keeps the lock alive until its execve/_exit —
+        // measured up to ~523 ms under pathological load. Wait that transient
+        // out. A real regression — a duplicate tied to the still-open
+        // `first_pin`, or a descriptor stashed in a static — never releases
+        // and still fails the budget.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match second_lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => {
+                    panic!("dropping the lease handle must release its directory lock: {error:?}")
+                }
+            }
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2511,6 +2983,44 @@ mod tests {
         assert!(pinned.validate_path_identity().is_err());
 
         let _ = std::fs::remove_file(root.join("images"));
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[test]
+    fn deferred_batch_write_uses_only_the_retained_directory_capability() {
+        let root = unique_dir("deferred-batch-swap");
+        let outside = unique_dir("deferred-batch-outside");
+        let original = root.join("recording");
+        let moved = root.join("recording-moved");
+        std::fs::create_dir_all(&original).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let pinned = PinnedDir::open(&original).unwrap();
+
+        std::fs::rename(&original, &moved).unwrap();
+        symlink(&outside, &original).unwrap();
+
+        let frame = pinned
+            .write_new_private_deferred_dir_sync_authorized(
+                std::ffi::OsStr::new("frame.png"),
+                b"retained",
+                || true,
+            )
+            .expect("batch members use the already-authorized retained directory");
+        frame.validate_entry_identity_at_retained().unwrap();
+        assert!(
+            frame.validate_path_identity().is_err(),
+            "ordinary exact-path validation remains fail-closed after replacement"
+        );
+        assert_eq!(std::fs::read(moved.join("frame.png")).unwrap(), b"retained");
+        assert!(
+            !outside.join("frame.png").exists(),
+            "the replacement namespace never receives batch bytes"
+        );
+
+        drop(frame);
+        drop(pinned);
+        let _ = std::fs::remove_file(original);
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
     }

@@ -8426,7 +8426,7 @@ mod tests {
         // THE CENSUS IS SPELLED OUT, NOT DERIVED. Deriving it from
         // `SOUND_MENU_KEYS` (filtered through the very `section_of` under test)
         // would let a misrouted key vanish from both sides of the comparison and
-        // pass. These are the nine audible keys by name; the box holds exactly
+        // pass. These are the ten audible keys by name; the box holds exactly
         // them, in this exact painted order.
         assert_eq!(
             in_sound,
@@ -8446,8 +8446,11 @@ mod tests {
                 // registered after the top-level rows and keep build order.
                 "sparkle_words.profanity.bonk",
                 "sparkle_words.profanity.bonk_detonation",
+                // PRISM WAKE's pip — the newest voice and, by the loudness
+                // ladder, the quietest; it paints last as the newest row.
+                "output_streak.sound",
             ],
-            "the Sound box holds exactly the nine audible keys, in painted order"
+            "the Sound box holds exactly the ten audible keys, in painted order"
         );
         // A duplicate would survive the set-shaped checks above, so compare
         // lengths against the deduplicated view explicitly.

@@ -39,6 +39,14 @@
 
 use aterm_core::terminal::Terminal;
 
+// The macOS consent tier (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.3): the
+// ONE module that owns the prompt-free Full Disk Access probe, the in-bundle
+// fence that keeps a headless-constructible path away from `tccd`, and every
+// protected-folder path literal. `doctor` reads its verdict and threads it into
+// the pure report; nothing here types a protected path of its own (grep_guard
+// B13).
+use aterm_containment::consent::{DrClass, FdaState, ProbeGate, ProbeLabel};
+
 // The platform console driver behind a shared four-function surface
 // (host_winsize / stdout_is_tty / shell_is_executable / run): termios + poll
 // on POSIX (moved verbatim from this file), ConPTY console events on Windows.
@@ -583,8 +591,49 @@ fn explain_config_report() -> String {
         "  ATERM_SESSION_MODEL     arm the in-process VT model of the session; default OFF,\n",
     );
     out.push_str("                          and 0/off/empty do not arm it.\n");
+    out.push_str(PRIVACY_CONFIG_PARAGRAPH);
     out
 }
+
+/// The `[privacy]` paragraph of `explain-config` (design §4). Hand-written, like
+/// the rest of this page.
+///
+/// Three things it must say, because each is otherwise guessed wrong:
+///
+/// * the probe reads state that already exists and raises no dialog — a reader
+///   who thinks otherwise turns it off and loses the only honest report;
+/// * the warm-up DELIBERATELY raises the prompts, so it is an owner gesture and
+///   nothing else — never first launch, never a timer, never a program inside a
+///   session;
+/// * no key here is deferred: saving the file is the whole of it.
+///
+/// What it must NOT say is that the grant ends macOS consent dialogs. Which
+/// services a grant covers is unmeasured (design §7 S4), so this text describes
+/// the grant by what it is and stops there.
+const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
+     [privacy] — macOS consent (aterm.toml; the window reads it, the passthrough CLI does not):\n\
+     \x20 enabled / check         the silent Full Disk Access probe. It reads state that already\n\
+     \x20                         exists and raises NO dialog. Off, every field reads `unknown` —\n\
+     \x20                         which is not `denied`, and the report says which it is.\n\
+     \x20 notice                  the at-most-once transient pill when a session may be waiting\n\
+     \x20                         on a consent dialog.\n\
+     \x20 warmup                  \"never\" | \"on-request\". The warm-up asks macOS for the folders\n\
+     \x20                         up front, which RAISES the dialogs on purpose, so it happens\n\
+     \x20                         only when the owner presses the button in Settings — never at\n\
+     \x20                         first launch, never on a timer, and never because a program\n\
+     \x20                         inside a session asked for it.\n\
+     \x20 warmup_folders          which folders that gesture asks for; warmup_hold_ms caps how\n\
+     \x20                         long an in-place apply will wait for it.\n\
+     \x20 probe_interval_ms       floor on re-probing (also the worst-case lag of\n\
+     \x20                         `aterm ctl @<sid> await consent`).\n\
+     \x20 protected_roots         the sensitive set; empty = the containment tier's own list, so\n\
+     \x20                         the two tiers cannot disagree about which paths are sensitive.\n\
+     \x20 auto_accept             RESERVED, and not implemented: aterm does not answer macOS\n\
+     \x20                         consent dialogs. Granting Full Disk Access in Settings is the\n\
+     \x20                         supported answer, and only a human can do it.\n\
+     \x20 Clearing a grant (`tccutil reset`) is offered as a command to run from the Settings\n\
+     \x20 panel; nothing in aterm runs it for you. No key in this section needs anything\n\
+     \x20 beyond saving the file.\n";
 
 /// `aterm list-fonts` — available font families (file stems), one per line, sorted
 /// and deduplicated for scriptable output. Data: [`aterm_render::list_fonts`].
@@ -633,10 +682,224 @@ fn list_themes_report() -> String {
     out
 }
 
+/// A doctor row's verdict. Three-valued since the macOS consent work
+/// (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.8): `Note` reports something
+/// the operator may want to act on WITHOUT moving the exit code, so
+/// `aterm doctor && aterm` keeps working on a machine that has simply not
+/// granted Full Disk Access. Only [`Mark::Fail`] fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// The check passed.
+    Ok,
+    /// A fact worth reporting that is NOT a failure — nothing to fix, or
+    /// nothing aterm can fix, and never a reason to refuse to launch.
+    Note,
+    /// The check failed: `health: FAIL` and exit 1.
+    Fail,
+}
+
+impl Mark {
+    /// The mark column's text.
+    const fn render(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Note => "note",
+            Self::Fail => "FAIL",
+        }
+    }
+
+    /// `true` for the ONE mark that moves the exit code.
+    const fn is_fail(self) -> bool {
+        matches!(self, Self::Fail)
+    }
+
+    /// The mark for a two-valued check (containment / shell / tty), whose
+    /// Ok/Fail semantics are unchanged.
+    const fn from_ok(ok: bool) -> Self {
+        if ok { Self::Ok } else { Self::Fail }
+    }
+}
+
+/// One `doctor` row: the label as it appears in the mark block, its verdict, and
+/// the detail line. `detail` carries its own `key: …` prefix, so the detail block
+/// stays greppable as a single uniform shape.
+struct DoctorRow {
+    /// The mark block's left column, e.g. `containment:`.
+    label: &'static str,
+    /// The verdict; only [`Mark::Fail`] moves the exit code.
+    mark: Mark,
+    /// The full detail line, prefix included (`shell: /bin/sh (executable)`).
+    detail: String,
+}
+
+/// The macOS consent facts behind the `privacy:` row, gathered by
+/// [`privacy_facts`] and consumed by the pure [`doctor_checks`] — passed in
+/// exactly as `shell_executable` and `is_tty` are, so the report stays a
+/// deterministic function of its inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrivacyFacts {
+    /// The instance's Full Disk Access state, from ONE prompt-free probe.
+    fda: FdaState,
+    /// WHY `fda` reads as it does. `label.refused()` means NO syscall ran, so
+    /// the row names the configuration rather than implying a denial.
+    fda_label: ProbeLabel,
+    /// The class of this build's designated requirement — whether a grant made
+    /// today survives the next build. [`DrClass::Unknown`] asserts nothing.
+    dr: DrClass,
+    /// The display name of the process macOS holds RESPONSIBLE for this one.
+    /// The verdict belongs to it: a probe run from a shell under another
+    /// terminal reports THAT terminal's access, not aterm's.
+    responsible: Option<String>,
+}
+
+impl PrivacyFacts {
+    /// What every host that measured nothing reports: no state, no claim.
+    fn not_measured(label: ProbeLabel) -> Self {
+        Self {
+            fda: FdaState::Unknown,
+            fda_label: label,
+            dr: DrClass::Unknown,
+            responsible: None,
+        }
+    }
+}
+
+/// Gather the consent facts for the `privacy:` row — the impure half, alongside
+/// `$SHELL` and the tty check.
+///
+/// The FENCE is `aterm_containment`'s in-bundle guard, not a flag here:
+/// [`aterm_containment::probe_fda`] performs its one `open()` only when the
+/// running executable resolves inside a `.app` (design §3.3 guardrail 1, and
+/// AGENTS.md rule 5 — the 2026-08-17 incident), and `ProbeLabel::refused()`
+/// reports whether a syscall happened at all. `aterm doctor` run from
+/// `target/debug/…`, or from a test binary — which
+/// `diag_commands_advertised_and_dispatchable` really does — takes the refused
+/// arm: no probe, no responsible-app lookup, no `codesign`.
+fn privacy_facts() -> PrivacyFacts {
+    let probe = aterm_containment::probe_fda(ProbeGate::on());
+    if probe.label.refused() {
+        return PrivacyFacts::not_measured(probe.label);
+    }
+    // Past the fence: this is the bundled CLI, so naming the responsible app and
+    // reading the signature are both in bounds.
+    let responsible = i32::try_from(std::process::id())
+        .ok()
+        .and_then(aterm_containment::responsible_app)
+        .map(|app| app.display_name);
+    PrivacyFacts {
+        fda: probe.state,
+        fda_label: probe.label,
+        dr: designated_requirement_class(),
+        responsible,
+    }
+}
+
+/// The class of the running bundle's designated requirement — what `tccd` stores
+/// beside a grant and re-validates against, i.e. whether a grant made today
+/// survives the next build.
+///
+/// `codesign -d -r-` is the only unprivileged way to read it, and it is spawned
+/// ONLY from inside a resolved `.app` (the same fence as the probe). Any failure
+/// — no bundle, no `codesign`, unparseable output — is [`DrClass::Unknown`],
+/// which claims nothing: the `privacy:` row names a dev build only on a
+/// positively identified cdhash/unsigned requirement.
+#[cfg(target_os = "macos")]
+fn designated_requirement_class() -> DrClass {
+    let Ok(exe) = std::env::current_exe() else {
+        return DrClass::Unknown;
+    };
+    let Some(app_root) = aterm_containment::consent::app_bundle_root(&exe) else {
+        return DrClass::Unknown;
+    };
+    let Ok(out) = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "-r-"])
+        .arg(&app_root)
+        .output()
+    else {
+        return DrClass::Unknown;
+    };
+    // codesign writes the requirement to stderr; read both streams so the
+    // classifier sees whatever it printed.
+    let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stdout));
+    aterm_containment::classify_dr(&text)
+}
+
+/// Off macOS there is no TCC and no designated requirement to read.
+#[cfg(not(target_os = "macos"))]
+fn designated_requirement_class() -> DrClass {
+    DrClass::Unknown
+}
+
+/// Why a probe reports what it does, in a sentence a human can act on. Only the
+/// `not measured` arms are ever rendered, but every label is spelled so a new
+/// variant cannot silently render as an empty reason.
+fn probe_reason(label: ProbeLabel) -> String {
+    match label {
+        ProbeLabel::OpenOk => "the probe succeeded".to_string(),
+        ProbeLabel::OpenEperm => "the probe was refused by macOS".to_string(),
+        ProbeLabel::OpenErrno(errno) => format!("the probe could not complete (errno {errno})"),
+        ProbeLabel::RefusedOutOfBundle => "running outside the app bundle".to_string(),
+        ProbeLabel::RefusedNoExe => "this program's own path could not be resolved".to_string(),
+        ProbeLabel::RefusedDisabled => {
+            "the privacy probe is switched off in the config".to_string()
+        }
+        ProbeLabel::RefusedNoHome => "$HOME is not set".to_string(),
+        ProbeLabel::RefusedBadPath => "the store path is not usable".to_string(),
+        ProbeLabel::UnsupportedPlatform => {
+            "this is not macOS, which has no such consent".to_string()
+        }
+    }
+}
+
+/// The `privacy:` row: mark + detail, pure over [`PrivacyFacts`].
+///
+/// Never [`Mark::Fail`] — a machine that has not granted Full Disk Access is a
+/// normal machine, and nothing here is a reason to refuse to launch. The grant
+/// is described by what it is (access held by the responsible app), never as
+/// something that removes every consent dialog: which services it covers is not
+/// measured, and this row does not claim it.
+fn privacy_row(facts: &PrivacyFacts) -> (Mark, String) {
+    let who = facts.responsible.as_deref().unwrap_or("unknown");
+    // A build whose grants die on the next build is worth saying whatever the
+    // access state is — but ONLY on a positively classified requirement:
+    // `DrClass::Unknown` is not evidence of a dev build.
+    let churns = matches!(facts.dr, DrClass::Cdhash | DrClass::Unsigned);
+    let dev = if churns {
+        "; dev build: identity changes on every build, so grants do not persist"
+    } else {
+        ""
+    };
+    if facts.fda_label.refused() || facts.fda == FdaState::Unknown {
+        return (
+            Mark::Note,
+            format!("privacy: not measured ({})", probe_reason(facts.fda_label)),
+        );
+    }
+    match facts.fda {
+        FdaState::Granted if churns => (
+            Mark::Note,
+            format!("privacy: full disk access for the responsible app ({who}){dev}"),
+        ),
+        FdaState::Granted => (
+            Mark::Ok,
+            format!("privacy: full disk access for the responsible app ({who})"),
+        ),
+        FdaState::Denied | FdaState::Unknown => (
+            Mark::Note,
+            format!(
+                "privacy: no full disk access for the responsible app ({who}); \
+                 programs run here can be interrupted by macOS consent dialogs{dev}"
+            ),
+        ),
+    }
+}
+
 /// `aterm doctor` — an aggregate pre-flight health check (containment validity,
-/// $SHELL set+executable, stdout is a tty, plus version/size). Reads env/fs/tty,
-/// then delegates to the pure [`doctor_checks`]. Exit 0 = all pass; non-zero = a
-/// problem. Scriptable: `aterm doctor && aterm`.
+/// $SHELL set+executable, stdout is a tty, the macOS consent posture, plus
+/// version/size). Reads env/fs/tty + the consent tier, then delegates to the
+/// pure [`doctor_checks`]. Exit 0 = nothing FAILED; non-zero = a problem.
+/// Scriptable: `aterm doctor && aterm`.
 fn doctor_report() -> (String, i32) {
     let shell = std::env::var("SHELL").ok();
     // Windows: $SHELL is rarely set outside MSYS shells; %COMSPEC% (cmd.exe)
@@ -655,13 +918,18 @@ fn doctor_report() -> (String, i32) {
         is_tty,
         rows,
         cols,
+        &privacy_facts(),
     )
 }
 
 /// Pure core of `doctor` (all state is an input, so it is deterministically
 /// testable): aggregate the pre-flight checks into a stable report + exit code
-/// (0 = all pass, 1 = any fail). Containment validity reuses
+/// (0 = nothing failed, 1 = any [`Mark::Fail`]). Containment validity reuses
 /// [`validate_containment_value`], so `doctor` can't disagree with the launcher.
+///
+/// The verdict is three-valued: `health`/the exit code are computed from `Fail`
+/// ALONE, so a `Note` row — the macOS consent posture is the first — reports a
+/// fact without making `aterm doctor && aterm` refuse to launch.
 fn doctor_checks(
     shell: Option<&str>,
     shell_executable: bool,
@@ -669,9 +937,9 @@ fn doctor_checks(
     is_tty: bool,
     rows: u16,
     cols: u16,
+    privacy: &PrivacyFacts,
 ) -> (String, i32) {
     let (cont_detail, cont_code) = validate_containment_value(containment);
-    let cont_ok = cont_code == 0;
 
     let (shell_ok, shell_detail) = match shell {
         None => (false, "shell: $SHELL unset".to_string()),
@@ -689,14 +957,6 @@ fn doctor_checks(
         )
     };
 
-    let all_ok = cont_ok && shell_ok && tty_ok;
-    let mark = |ok: bool| if ok { "ok" } else { "FAIL" };
-
-    let mut out = String::new();
-    out.push_str(&format!("containment: {}\n", mark(cont_ok)));
-    out.push_str(&format!("shell:       {}\n", mark(shell_ok)));
-    out.push_str(&format!("tty:         {}\n", mark(tty_ok)));
-    out.push('\n');
     // Strip validate-config's `OK:`/`ERR:` prefix so every detail line shares the
     // uniform `key: …` shape (a single `^key:` grep then matches all of them).
     let cont_trim = cont_detail.trim_end();
@@ -704,11 +964,42 @@ fn doctor_checks(
         .strip_prefix("OK: ")
         .or_else(|| cont_trim.strip_prefix("ERR: "))
         .unwrap_or(cont_trim);
-    out.push_str(&format!("containment: {cont_body}\n"));
-    out.push_str(&shell_detail);
+
+    let (privacy_mark, privacy_detail) = privacy_row(privacy);
+    let checks = [
+        DoctorRow {
+            label: "containment:",
+            mark: Mark::from_ok(cont_code == 0),
+            detail: format!("containment: {cont_body}"),
+        },
+        DoctorRow {
+            label: "shell:",
+            mark: Mark::from_ok(shell_ok),
+            detail: shell_detail,
+        },
+        DoctorRow {
+            label: "tty:",
+            mark: Mark::from_ok(tty_ok),
+            detail: tty_detail,
+        },
+        DoctorRow {
+            label: "privacy:",
+            mark: privacy_mark,
+            detail: privacy_detail,
+        },
+    ];
+
+    let all_ok = !checks.iter().any(|row| row.mark.is_fail());
+
+    let mut out = String::new();
+    for row in &checks {
+        out.push_str(&format!("{:<12} {}\n", row.label, row.mark.render()));
+    }
     out.push('\n');
-    out.push_str(&tty_detail);
-    out.push('\n');
+    for row in &checks {
+        out.push_str(&row.detail);
+        out.push('\n');
+    }
     out.push_str(&format!(
         "version: {} ({cols}x{rows})\n\n",
         aterm_types::version::APP_VERSION
@@ -1244,14 +1535,36 @@ pub fn session_main(quiet: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, DIAG_COMMANDS, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args,
-        diag_report, doctor_checks, explain_config_report, help_text, is_tool_candidate,
-        list_fonts_report, list_themes_report, prepend_path, session_model_armed, show_face_report,
+        CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, PrivacyFacts, ProbeLabel,
+        SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args, diag_report, doctor_checks,
+        doctor_report, explain_config_report, help_text, is_tool_candidate, list_fonts_report,
+        list_themes_report, prepend_path, session_model_armed, show_face_report,
         validate_containment_value, verb_help_block, version_text,
     };
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
+    }
+
+    /// The privacy facts a test binary really produces: nothing measured, because
+    /// the in-bundle fence refused the probe. The default for every doctor test
+    /// that is not about the `privacy:` row itself.
+    fn unmeasured() -> PrivacyFacts {
+        PrivacyFacts::not_measured(ProbeLabel::RefusedOutOfBundle)
+    }
+
+    /// A measured posture, for the rows that only exist on a real install.
+    fn measured(fda: FdaState, dr: DrClass, who: &str) -> PrivacyFacts {
+        PrivacyFacts {
+            fda,
+            fda_label: match fda {
+                FdaState::Granted => ProbeLabel::OpenOk,
+                FdaState::Denied => ProbeLabel::OpenEperm,
+                FdaState::Unknown => ProbeLabel::OpenErrno(2),
+            },
+            dr,
+            responsible: Some(who.to_string()),
+        }
     }
 
     /// THE default: an unset `$ATERM_SESSION_MODEL` leaves the session model
@@ -1598,6 +1911,39 @@ mod tests {
         }
     }
 
+    /// The `[privacy]` paragraph (design §4). Each needle is a claim somebody
+    /// would otherwise have to read the source to check — above all that the
+    /// probe is silent and that the warm-up, which deliberately raises the
+    /// dialogs, is an owner gesture and nothing else.
+    #[test]
+    fn explain_config_explains_the_privacy_section() {
+        let r = explain_config_report();
+        for needle in [
+            "[privacy]",
+            "raises NO dialog",
+            "auto_accept",
+            "does not answer macOS",
+            "only when the owner presses the button",
+            "never on a timer",
+            "protected_roots",
+            "probe_interval_ms",
+            "beyond saving the file",
+        ] {
+            assert!(r.contains(needle), "explain-config missing {needle:?}\n{r}");
+        }
+        // The standing ruling (grep_guard B10/B12): no CLI string asks for a
+        // fresh launch — and the `[privacy]` keys genuinely do not need one.
+        for banned in ["restart", "relaunch", "reopen", "next launch"] {
+            assert!(
+                !r.to_ascii_lowercase().contains(banned),
+                "explain-config says {banned:?}\n{r}"
+            );
+        }
+        // Nothing here may promise the grant ends consent dialogs: which
+        // services it covers is unmeasured (design §7 S4).
+        assert!(!r.contains("no more prompts"), "{r}");
+    }
+
     #[test]
     fn show_face_requires_and_validates_family() {
         // No family → usage error, exit 1.
@@ -1613,8 +1959,16 @@ mod tests {
 
     #[test]
     fn doctor_checks_pass_and_flag_each_failure() {
-        // /bin/sh is executable on every POSIX host; all checks pass.
-        let (r, code) = doctor_checks(Some("/bin/sh"), true, Some("user"), true, 24, 80);
+        // /bin/sh is executable on every POSIX host; all three legacy checks pass.
+        let (r, code) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("user"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+        );
         assert_eq!(code, 0, "{r}");
         assert!(r.contains("health: OK"), "{r}");
         assert!(
@@ -1624,7 +1978,15 @@ mod tests {
         assert!(r.contains("version: ") && r.contains("80x24"), "{r}");
 
         // Shell not executable → fail.
-        let (r, code) = doctor_checks(Some("/no/such/shell"), false, Some("user"), true, 24, 80);
+        let (r, code) = doctor_checks(
+            Some("/no/such/shell"),
+            false,
+            Some("user"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+        );
         assert_eq!(code, 1);
         assert!(
             r.contains("health: FAIL") && r.contains("not executable or missing"),
@@ -1632,17 +1994,25 @@ mod tests {
         );
 
         // $SHELL unset → fail.
-        let (r, code) = doctor_checks(None, false, Some("user"), true, 24, 80);
+        let (r, code) = doctor_checks(None, false, Some("user"), true, 24, 80, &unmeasured());
         assert_eq!(code, 1);
         assert!(r.contains("$SHELL unset"), "{r}");
 
         // No tty (headless/piped) → fail.
-        let (r, code) = doctor_checks(Some("/bin/sh"), true, None, false, 24, 80);
+        let (r, code) = doctor_checks(Some("/bin/sh"), true, None, false, 24, 80, &unmeasured());
         assert_eq!(code, 1);
         assert!(r.contains("health: FAIL") && r.contains("headless"), "{r}");
 
         // Bad containment mode → fail (reuses validate-config's verdict).
-        let (r, code) = doctor_checks(Some("/bin/sh"), true, Some("bogus"), true, 24, 80);
+        let (r, code) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("bogus"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+        );
         assert_eq!(code, 1);
         assert!(
             r.contains("health: FAIL") && r.contains("invalid containment mode"),
@@ -1650,13 +2020,170 @@ mod tests {
         );
 
         // The detail block is uniform `key: …` lines (no stray `OK:`/`ERR:` prefix).
-        let (r, _) = doctor_checks(Some("/bin/sh"), true, Some("user"), true, 24, 80);
-        for key in ["containment: ", "shell: ", "tty: ", "version: "] {
+        let (r, _) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("user"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+        );
+        for key in [
+            "containment: ",
+            "shell: ",
+            "tty: ",
+            "privacy: ",
+            "version: ",
+        ] {
             assert!(
                 r.lines().any(|l| l.starts_with(key)),
                 "doctor detail missing a {key:?} line\n{r}"
             );
         }
+    }
+
+    /// The three legacy rows keep their EXACT two-valued semantics: `ok` when
+    /// they pass, `FAIL` — the same spelling scripts grep for — when they do not.
+    /// The mark column is still the aligned block it was.
+    #[test]
+    fn the_legacy_doctor_rows_are_unchanged_by_the_third_mark() {
+        let (r, _) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("user"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+        );
+        for line in ["containment: ok", "shell:       ok", "tty:         ok"] {
+            assert!(r.lines().any(|l| l == line), "missing {line:?}\n{r}");
+        }
+        let (r, _) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("bogus"),
+            false,
+            24,
+            80,
+            &unmeasured(),
+        );
+        for line in ["containment: FAIL", "tty:         FAIL"] {
+            assert!(r.lines().any(|l| l == line), "missing {line:?}\n{r}");
+        }
+    }
+
+    /// §3.8's four `privacy:` states, and the property the whole three-valued
+    /// change exists for: a `note` NEVER moves the exit code, so
+    /// `aterm doctor && aterm` still launches on a machine that has simply not
+    /// granted Full Disk Access — while a real `Fail` elsewhere still exits 1.
+    #[test]
+    fn the_privacy_row_is_a_note_and_never_moves_the_exit_code() {
+        let ok = |privacy: &PrivacyFacts| {
+            doctor_checks(Some("/bin/sh"), true, Some("user"), true, 24, 80, privacy)
+        };
+
+        // 1. granted, on a build whose identity is stable → the one `ok` arm.
+        let (r, code) = ok(&measured(FdaState::Granted, DrClass::Identity, "aterm"));
+        assert_eq!(code, 0, "{r}");
+        assert!(r.lines().any(|l| l == "privacy:     ok"), "{r}");
+        assert!(
+            r.contains("privacy: full disk access for the responsible app (aterm)"),
+            "{r}"
+        );
+        // The grant is described by what it IS, never as the end of every dialog
+        // (which services it covers is unmeasured — design §7 S4).
+        assert!(
+            !r.contains("no more prompts") && !r.contains("removes all"),
+            "{r}"
+        );
+
+        // 2. denied → a note naming the RESPONSIBLE app, not aterm.
+        let (r, code) = ok(&measured(FdaState::Denied, DrClass::Identity, "iTerm2"));
+        assert_eq!(code, 0, "a missing grant is not a doctor failure\n{r}");
+        assert!(r.contains("health: OK"), "{r}");
+        assert!(r.lines().any(|l| l == "privacy:     note"), "{r}");
+        assert!(
+            r.contains("no full disk access for the responsible app (iTerm2)")
+                && r.contains("can be interrupted by macOS consent dialogs"),
+            "{r}"
+        );
+
+        // 3. a dev build: the grant may be real today and dead after the next build.
+        let (r, code) = ok(&measured(FdaState::Granted, DrClass::Cdhash, "aterm (dev)"));
+        assert_eq!(code, 0, "{r}");
+        assert!(r.lines().any(|l| l == "privacy:     note"), "{r}");
+        assert!(
+            r.contains("dev build: identity changes on every build, so grants do not persist"),
+            "{r}"
+        );
+
+        // 4. out of the bundle: not measured, and it says WHY.
+        let (r, code) = ok(&unmeasured());
+        assert_eq!(code, 0, "{r}");
+        assert!(
+            r.contains("privacy: not measured (running outside the app bundle)"),
+            "{r}"
+        );
+
+        // And a genuine Fail still fails, with the note alongside it.
+        let (r, code) = doctor_checks(None, false, Some("user"), true, 24, 80, &unmeasured());
+        assert_eq!(code, 1, "{r}");
+        assert!(
+            r.contains("health: FAIL") && r.contains("privacy:     note"),
+            "{r}"
+        );
+    }
+
+    /// An unclassified requirement asserts NOTHING. `DrClass::Unknown` is the
+    /// default the gatherer falls back to whenever `codesign` could not be read,
+    /// and `grant_stable()` is false for it — so keying the dev-build sentence on
+    /// "not stable" would have printed it on every machine where the probe simply
+    /// did not run.
+    #[test]
+    fn an_unclassified_requirement_never_claims_a_dev_build() {
+        let (r, _) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            Some("user"),
+            true,
+            24,
+            80,
+            &measured(FdaState::Denied, DrClass::Unknown, "Terminal"),
+        );
+        assert!(!r.contains("dev build"), "{r}");
+    }
+
+    /// THE FENCE, end to end, from the binary that is most at risk of tripping
+    /// it. `doctor_report` is dispatchable (`aterm doctor`) and really is called
+    /// from this test binary by `diag_commands_advertised_and_dispatchable` — a
+    /// path under `target/debug/deps`, which is exactly the shape that made
+    /// `tccd` walk a million-entry directory on 2026-08-17. It must report `not
+    /// measured` with no syscall behind it.
+    #[test]
+    fn doctor_run_from_a_test_binary_measures_nothing() {
+        let (r, _) = doctor_report();
+        assert!(
+            r.contains("privacy: not measured ("),
+            "a test binary must never report a measured consent state\n{r}"
+        );
+        assert!(
+            !r.contains("full disk access for the responsible app"),
+            "the fence let a verdict through\n{r}"
+        );
+    }
+
+    /// `Note` renders as its own word and is not a failure; the other two keep
+    /// the spellings every script and screenshot already knows.
+    #[test]
+    fn the_three_marks_render_and_only_one_fails() {
+        assert_eq!(Mark::Ok.render(), "ok");
+        assert_eq!(Mark::Note.render(), "note");
+        assert_eq!(Mark::Fail.render(), "FAIL");
+        assert!(!Mark::Ok.is_fail() && !Mark::Note.is_fail() && Mark::Fail.is_fail());
+        assert_eq!(Mark::from_ok(true), Mark::Ok);
+        assert_eq!(Mark::from_ok(false), Mark::Fail);
     }
 
     #[test]

@@ -75,10 +75,16 @@
 //! infinitely above a healthy reading of zero, 79x below the measured
 //! regression, and far enough off both to survive a loaded machine.
 //!
-//! WIRING: `tools/spin_guard.sh`, in the `guards` lane of `xtask gate lint`
-//! (which `.githooks/pre-push` runs on every push) — beside `paint_guard`, and
-//! fingerprinted the same way, so a push that does not touch the event loop
-//! costs one content hash.
+//! WIRING: `tools/spin_guard.sh`, in the `guards` lane of `xtask gate lint` —
+//! beside `paint_guard`, and fingerprinted the same way, so a run that does not
+//! touch the event loop costs one content hash. NOTHING RUNS THAT LANE
+//! AUTOMATICALLY: `.githooks/pre-push` was demoted to advisory on 2026-08-24
+//! (its body is one printf and `exit 0`), and `tools/verify.sh --fast` — the
+//! merge contract — runs `grep_guard.sh` and the license sweep as stages of its
+//! own but never `run_repo_guards`, so it never reaches this script or
+//! `paint_guard`. So this guard runs when a human runs
+//! `cargo run -p xtask -- gate lint`, and at no other time. The fingerprint is
+//! still worth having, because that is the run it makes cheap.
 //!
 //! The binary under test is RELEASE profile. Without an override, the shared
 //! conformance helper freshens `target/conformance-release/release/aterm`, a

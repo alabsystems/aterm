@@ -64,6 +64,25 @@ impl std::fmt::Display for StoreLockError {
                  the store concurrently (retry when it exits)",
                 path.display()
             ),
+            // A PERMISSION failure and an ordinary I/O failure have opposite
+            // remedies and used to share one message. The permission case is the
+            // common one and it has a name: the configured prefix belongs to
+            // somebody else. Saying only "Operation not permitted (os error 1)"
+            // left a reader to guess, and the guess that got written down was
+            // "atpkg structurally requires sudo" — it does not; the default prefix
+            // is $HOME-owned and needs no privilege
+            // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+            StoreLockError::Io(path, e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                write!(
+                    f,
+                    "cannot take the store lock at {}: {e} — refusing to mutate the \
+                     store without it. This prefix is not writable by you; atpkg's \
+                     default prefix is under $HOME and needs no privilege, so remove \
+                     `[packages].prefix` from ~/.config/aterm/aterm.toml unless you \
+                     really want a shared multi-user store (then install as its owner)",
+                    path.display()
+                )
+            }
             StoreLockError::Io(path, e) => write!(
                 f,
                 "cannot take the store lock at {}: {e} — refusing to mutate the store \

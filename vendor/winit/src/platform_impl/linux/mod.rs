@@ -38,6 +38,7 @@ pub(crate) use crate::icon::RgbaIcon as PlatformIcon;
 pub(crate) use crate::platform_impl::Fullscreen;
 
 pub(crate) mod common;
+pub(crate) mod headless;
 #[cfg(wayland_platform)]
 pub(crate) mod wayland;
 #[cfg(x11_platform)]
@@ -49,6 +50,11 @@ pub(crate) enum Backend {
     X,
     #[cfg(wayland_platform)]
     Wayland,
+    /// No display server at all — see [`headless`]. Only ever selected by an explicit
+    /// `EventLoopBuilderExtHeadless::with_headless`, never by probing the environment:
+    /// a windowed run that has lost its display must still FAIL rather than silently
+    /// come up invisible.
+    Headless,
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
@@ -200,6 +206,31 @@ pub enum MonitorHandle {
 /// }
 /// ```
 /// The result can be converted to another enum by adding `; as AnotherEnum`
+/// Dispatch over the THREE loop backends. `x11_or_wayland!` stays as it is for the
+/// window/monitor/device types, which a headless run never produces and which therefore
+/// have no headless variant to dispatch to; only the loop trio (`EventLoop`,
+/// `EventLoopProxy`, `ActiveEventLoop`) gained one, and only these sites may use this.
+macro_rules! any_backend {
+    (match $what:expr; $enum:ident ( $($c1:tt)* ) => $x:expr; as $enum2:ident ) => {
+        match $what {
+            #[cfg(x11_platform)]
+            $enum::X($($c1)*) => $enum2::X($x),
+            #[cfg(wayland_platform)]
+            $enum::Wayland($($c1)*) => $enum2::Wayland($x),
+            $enum::Headless($($c1)*) => $enum2::Headless($x),
+        }
+    };
+    (match $what:expr; $enum:ident ( $($c1:tt)* ) => $x:expr) => {
+        match $what {
+            #[cfg(x11_platform)]
+            $enum::X($($c1)*) => $x,
+            #[cfg(wayland_platform)]
+            $enum::Wayland($($c1)*) => $x,
+            $enum::Headless($($c1)*) => $x,
+        }
+    };
+}
+
 macro_rules! x11_or_wayland {
     (match $what:expr; $enum:ident ( $($c1:tt)* ) => $x:expr; as $enum2:ident ) => {
         match $what {
@@ -293,6 +324,12 @@ impl Window {
         attribs: WindowAttributes,
     ) -> Result<Self, RootOsError> {
         match *window_target {
+            // A window needs a surface, and a surface needs a display. Refusing is the
+            // whole contract of the headless backend: better a caller-visible error here
+            // than a window handle that can never be shown.
+            ActiveEventLoop::Headless(_) => Err(os_error!(OsError::Misc(
+                "cannot create a window on a headless event loop: it has no display"
+            ))),
             #[cfg(wayland_platform)]
             ActiveEventLoop::Wayland(ref window_target) => {
                 wayland::Window::new(window_target, attribs).map(Window::Wayland)
@@ -702,6 +739,7 @@ pub enum EventLoop<T: 'static> {
     Wayland(Box<wayland::EventLoop<T>>),
     #[cfg(x11_platform)]
     X(x11::EventLoop<T>),
+    Headless(headless::EventLoop<T>),
 }
 
 pub enum EventLoopProxy<T: 'static> {
@@ -709,11 +747,12 @@ pub enum EventLoopProxy<T: 'static> {
     X(x11::EventLoopProxy<T>),
     #[cfg(wayland_platform)]
     Wayland(wayland::EventLoopProxy<T>),
+    Headless(headless::EventLoopProxy<T>),
 }
 
 impl<T: 'static> Clone for EventLoopProxy<T> {
     fn clone(&self) -> Self {
-        x11_or_wayland!(match self; EventLoopProxy(proxy) => proxy.clone(); as EventLoopProxy)
+        any_backend!(match self; EventLoopProxy(proxy) => proxy.clone(); as EventLoopProxy)
     }
 }
 
@@ -768,6 +807,7 @@ impl<T: 'static> EventLoop<T> {
 
         // Create the display based on the backend.
         match backend {
+            Backend::Headless => Ok(EventLoop::Headless(headless::EventLoop::new()?)),
             #[cfg(wayland_platform)]
             Backend::Wayland => EventLoop::new_wayland_any_thread(),
             #[cfg(x11_platform)]
@@ -803,7 +843,7 @@ impl<T: 'static> EventLoop<T> {
     }
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.create_proxy(); as EventLoopProxy)
+        any_backend!(match self; EventLoop(evlp) => evlp.create_proxy(); as EventLoopProxy)
     }
 
     pub fn run<F>(mut self, callback: F) -> Result<(), EventLoopError>
@@ -817,36 +857,36 @@ impl<T: 'static> EventLoop<T> {
     where
         F: FnMut(crate::event::Event<T>, &RootELW),
     {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.run_on_demand(callback))
+        any_backend!(match self; EventLoop(evlp) => evlp.run_on_demand(callback))
     }
 
     pub fn pump_events<F>(&mut self, timeout: Option<Duration>, callback: F) -> PumpStatus
     where
         F: FnMut(crate::event::Event<T>, &RootELW),
     {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.pump_events(timeout, callback))
+        any_backend!(match self; EventLoop(evlp) => evlp.pump_events(timeout, callback))
     }
 
     pub fn window_target(&self) -> &crate::event_loop::ActiveEventLoop {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.window_target())
+        any_backend!(match self; EventLoop(evlp) => evlp.window_target())
     }
 }
 
 impl<T> AsFd for EventLoop<T> {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.as_fd())
+        any_backend!(match self; EventLoop(evlp) => evlp.as_fd())
     }
 }
 
 impl<T> AsRawFd for EventLoop<T> {
     fn as_raw_fd(&self) -> RawFd {
-        x11_or_wayland!(match self; EventLoop(evlp) => evlp.as_raw_fd())
+        any_backend!(match self; EventLoop(evlp) => evlp.as_raw_fd())
     }
 }
 
 impl<T: 'static> EventLoopProxy<T> {
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
-        x11_or_wayland!(match self; EventLoopProxy(proxy) => proxy.send_event(event))
+        any_backend!(match self; EventLoopProxy(proxy) => proxy.send_event(event))
     }
 }
 
@@ -856,6 +896,7 @@ pub enum ActiveEventLoop {
     Wayland(wayland::ActiveEventLoop),
     #[cfg(x11_platform)]
     X(x11::ActiveEventLoop),
+    Headless(headless::ActiveEventLoop),
 }
 
 impl ActiveEventLoop {
@@ -864,18 +905,18 @@ impl ActiveEventLoop {
         match *self {
             #[cfg(wayland_platform)]
             ActiveEventLoop::Wayland(_) => true,
-            #[cfg(x11_platform)]
             _ => false,
         }
     }
 
     pub fn create_custom_cursor(&self, cursor: CustomCursorSource) -> CustomCursor {
-        x11_or_wayland!(match self; ActiveEventLoop(evlp) => evlp.create_custom_cursor(cursor))
+        any_backend!(match self; ActiveEventLoop(evlp) => evlp.create_custom_cursor(cursor))
     }
 
     #[inline]
     pub fn available_monitors(&self) -> VecDeque<MonitorHandle> {
         match *self {
+            ActiveEventLoop::Headless(ref evlp) => evlp.available_monitors(),
             #[cfg(wayland_platform)]
             ActiveEventLoop::Wayland(ref evlp) => {
                 evlp.available_monitors().map(MonitorHandle::Wayland).collect()
@@ -889,20 +930,27 @@ impl ActiveEventLoop {
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        Some(
-            x11_or_wayland!(match self; ActiveEventLoop(evlp) => evlp.primary_monitor()?; as MonitorHandle),
-        )
+        match self {
+            // A headless run enumerates no monitors, so it has no primary one either.
+            ActiveEventLoop::Headless(evlp) => evlp.primary_monitor(),
+            #[cfg(x11_platform)]
+            ActiveEventLoop::X(evlp) => Some(MonitorHandle::X(evlp.primary_monitor()?)),
+            #[cfg(wayland_platform)]
+            ActiveEventLoop::Wayland(evlp) => {
+                Some(MonitorHandle::Wayland(evlp.primary_monitor()?))
+            },
+        }
     }
 
     #[inline]
     pub fn listen_device_events(&self, allowed: DeviceEvents) {
-        x11_or_wayland!(match self; Self(evlp) => evlp.listen_device_events(allowed))
+        any_backend!(match self; Self(evlp) => evlp.listen_device_events(allowed))
     }
 
     #[cfg(feature = "rwh_05")]
     #[inline]
     pub fn raw_display_handle_rwh_05(&self) -> rwh_05::RawDisplayHandle {
-        x11_or_wayland!(match self; Self(evlp) => evlp.raw_display_handle_rwh_05())
+        any_backend!(match self; Self(evlp) => evlp.raw_display_handle_rwh_05())
     }
 
     #[inline]
@@ -915,31 +963,32 @@ impl ActiveEventLoop {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
-        x11_or_wayland!(match self; Self(evlp) => evlp.raw_display_handle_rwh_06())
+        any_backend!(match self; Self(evlp) => evlp.raw_display_handle_rwh_06())
     }
 
     pub(crate) fn set_control_flow(&self, control_flow: ControlFlow) {
-        x11_or_wayland!(match self; Self(evlp) => evlp.set_control_flow(control_flow))
+        any_backend!(match self; Self(evlp) => evlp.set_control_flow(control_flow))
     }
 
     pub(crate) fn control_flow(&self) -> ControlFlow {
-        x11_or_wayland!(match self; Self(evlp) => evlp.control_flow())
+        any_backend!(match self; Self(evlp) => evlp.control_flow())
     }
 
     pub(crate) fn clear_exit(&self) {
-        x11_or_wayland!(match self; Self(evlp) => evlp.clear_exit())
+        any_backend!(match self; Self(evlp) => evlp.clear_exit())
     }
 
     pub(crate) fn exit(&self) {
-        x11_or_wayland!(match self; Self(evlp) => evlp.exit())
+        any_backend!(match self; Self(evlp) => evlp.exit())
     }
 
     pub(crate) fn exiting(&self) -> bool {
-        x11_or_wayland!(match self; Self(evlp) => evlp.exiting())
+        any_backend!(match self; Self(evlp) => evlp.exiting())
     }
 
     pub(crate) fn owned_display_handle(&self) -> OwnedDisplayHandle {
         match self {
+            Self::Headless(evlp) => evlp.owned_display_handle(),
             #[cfg(x11_platform)]
             Self::X(conn) => OwnedDisplayHandle::X(conn.x_connection().clone()),
             #[cfg(wayland_platform)]
@@ -949,12 +998,12 @@ impl ActiveEventLoop {
 
     #[allow(dead_code)]
     fn set_exit_code(&self, code: i32) {
-        x11_or_wayland!(match self; Self(evlp) => evlp.set_exit_code(code))
+        any_backend!(match self; Self(evlp) => evlp.set_exit_code(code))
     }
 
     #[allow(dead_code)]
     fn exit_code(&self) -> Option<i32> {
-        x11_or_wayland!(match self; Self(evlp) => evlp.exit_code())
+        any_backend!(match self; Self(evlp) => evlp.exit_code())
     }
 }
 
@@ -965,6 +1014,9 @@ pub(crate) enum OwnedDisplayHandle {
     X(Arc<XConnection>),
     #[cfg(wayland_platform)]
     Wayland(wayland_client::Connection),
+    /// A headless run owns no display connection. Nothing that could ask for a raw
+    /// handle exists without a surface, so the variant carries nothing.
+    Headless,
 }
 
 impl OwnedDisplayHandle {
@@ -972,6 +1024,12 @@ impl OwnedDisplayHandle {
     #[inline]
     pub fn raw_display_handle_rwh_05(&self) -> rwh_05::RawDisplayHandle {
         match self {
+            // rwh 0.5 has no error path, and a fabricated null display handle would be
+            // dereferenced by whoever asked. A headless run reaches this only by trying
+            // to present without a surface.
+            Self::Headless => unimplemented!(
+                "a headless event loop has no display handle to hand to rwh 0.5"
+            ),
             #[cfg(x11_platform)]
             Self::X(xconn) => {
                 let mut xlib_handle = rwh_05::XlibDisplayHandle::empty();
@@ -996,9 +1054,13 @@ impl OwnedDisplayHandle {
     pub fn raw_display_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawDisplayHandle, rwh_06::HandleError> {
+        #[allow(unused_imports)]
         use std::ptr::NonNull;
 
         match self {
+            // No display, so no handle. `NotSupported` is the honest answer and one a
+            // graphics backend already knows how to act on.
+            Self::Headless => Err(rwh_06::HandleError::NotSupported),
             #[cfg(x11_platform)]
             Self::X(xconn) => Ok(rwh_06::XlibDisplayHandle::new(
                 NonNull::new(xconn.display.cast()),

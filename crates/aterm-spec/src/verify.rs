@@ -34,7 +34,18 @@
 //! ```sh
 //! cargo build --release -p tla-cli   # in $HOME/trust/first-party/ty       -> ty
 //! cargo build --release              # in $HOME/trust/first-party/trust-ir -> trust-ir
+//! cargo build --release -p ay --bin ay --features cli
+//!                                    # in $HOME/trust/first-party/ay       -> ay
 //! ```
+//!
+//! `ay` needs its own line because a plain `cargo build --release` DOES NOT BUILD
+//! IT: the binary carries `required-features = ["cli"]` and `cli` is not a default
+//! feature, so the workspace build compiles every sibling crate, reports
+//! "Finished", and leaves whatever `ay` was already at `target/release/ay`
+//! untouched — including a stale one that discovery then prefers over every newer
+//! build on the machine (measured 2026-08-31: a 0.10.0 artifact from a plain
+//! `cargo build --release` reddened `sparkle_v2_ay_certificates` with
+//! `got=unknown` while 0.5.0, 0.13.0 and 0.22.0 elsewhere all discharged it).
 //!
 //! [`find_ty`]/[`find_trust_ir`] then discover them automatically at their canonical
 //! release paths — or anywhere the full-toolchain bootstrap (`build/<triple>/…`)
@@ -331,7 +342,7 @@ pub fn trust_ir(label: &str) -> PathBuf {
 pub fn ay(label: &str) -> PathBuf {
     require(
         "ay",
-        "cargo build --release   (in $HOME/trust/first-party/ay)",
+        "cargo build --release -p ay --bin ay --features cli   (in $HOME/trust/first-party/ay)",
         find_ay(),
         label,
     )
@@ -416,7 +427,7 @@ pub fn trust_ir_escalation(label: &str) -> Option<PathBuf> {
 pub fn ay_escalation(label: &str) -> Option<PathBuf> {
     escalation(
         "ay",
-        "cargo build --release   (in $HOME/trust/first-party/ay)",
+        "cargo build --release -p ay --bin ay --features cli   (in $HOME/trust/first-party/ay)",
         find_ay(),
         label,
     )

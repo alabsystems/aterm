@@ -38,6 +38,13 @@ pub(crate) struct DiagInfo {
     /// — the F1 diagnosable fact ("every agent row absent") beside the knob
     /// that governs it, on one line.
     pub agent_primer: String,
+    /// The RESOLVED `[privacy]` posture — the macOS consent lane's switches,
+    /// warm-up mode and protected-root count — plus the full-disk-access state
+    /// ONLY when a probe was injected. `--diagnose` is headless-constructible,
+    /// so [`collect`] passes the inert arm and this reads `probe=none
+    /// full_disk_access=unknown`: no report may reach tccd from a path a test
+    /// can construct. See [`privacy_line`].
+    pub privacy: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     pub config_path: String,
@@ -70,6 +77,7 @@ impl DiagInfo {
         let _ = writeln!(s, "renderer:  {}", self.renderer_default);
         let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
         let _ = writeln!(s, "primer:    {}", self.agent_primer);
+        let _ = writeln!(s, "privacy:   {}", self.privacy);
         let _ = writeln!(
             s,
             "config:    {} [{}]",
@@ -198,6 +206,61 @@ fn agent_primer_line(config: &crate::app_config::Config) -> String {
     format!("{status} — auto-prime: {auto} (agents_auto_prime)")
 }
 
+/// The `privacy:` line: this build's RESOLVED `[privacy]` posture, plus the
+/// full-disk-access state — and only if a probe was handed in.
+///
+/// THE PROBE IS A PARAMETER, and that is the whole safety argument. `--diagnose`
+/// is headless-constructible and runs in test binaries, and the FDA probe opens
+/// a file macOS guards; a report that reached for it on its own would put a
+/// consent-gated syscall on a path no guardrail watches (AGENTS.md rule 5, the
+/// 2026-08-17 incident). So [`collect`] passes the INERT arm — `None`, which
+/// renders `probe=none full_disk_access=unknown` — and only a windowed `App`,
+/// which has already decided it is running from inside the bundle, ever passes
+/// `Some`. The same shape as `lock_modifiers` / `user_input_recent`.
+///
+/// `unknown` here means aterm did not look. It is never a claim of denial, and
+/// a `granted` state is never a claim that no prompt can appear: `fda_scope`
+/// stays `unknown` by construction until that coverage is actually measured.
+pub(crate) fn privacy_line(
+    config: &crate::app_config::Config,
+    probe: Option<aterm_containment::FdaProbe>,
+) -> String {
+    if !config.privacy_enabled() {
+        return "off ([privacy] enabled = false) — every consent field reads unknown".to_string();
+    }
+    let (fda, probe_label) = match (config.privacy_probe_gate().permits(), probe) {
+        // The config said not to probe, so nothing did. Named as configuration
+        // rather than reported as a state, because "denied" would be a lie and
+        // a bare "unknown" would look like a failure.
+        (false, _) => (aterm_containment::FdaState::Unknown, "off"),
+        (true, None) => (aterm_containment::FdaState::Unknown, "none"),
+        (true, Some(probe)) => (probe.state, probe.label.as_str()),
+    };
+    let folders = config.privacy_warmup_folders();
+    let folders = if folders.is_empty() {
+        "-".to_string()
+    } else {
+        folders.join(",")
+    };
+    let switch = |on: bool| if on { "on" } else { "off" };
+    format!(
+        "full_disk_access={fda} probe={probe_label} fda_scope={scope} warmup={warmup} \
+         folders={folders} hold_ms={hold} probe_interval_ms={interval} protected_roots={roots} \
+         notice={notice} report_attribution={attribution}",
+        fda = fda.as_str(),
+        // Pinned to `unknown`: which services a grant actually covers has not
+        // been measured, and per-folder state is unknown by construction —
+        // testing a folder to find out is what raises the dialog.
+        scope = aterm_containment::FdaScope::Unknown.as_str(),
+        warmup = config.privacy_warmup().as_str(),
+        hold = config.privacy_warmup_hold_ms(),
+        interval = config.privacy_probe_interval_ms(),
+        roots = config.privacy_protected_roots().len(),
+        notice = switch(config.privacy_notice()),
+        attribution = switch(config.privacy_report_attribution()),
+    )
+}
+
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
     let config = crate::app_config::load_config();
@@ -237,6 +300,7 @@ pub(crate) fn collect() -> DiagInfo {
         renderer_default,
         shell_integration_runtime: shell_integration_runtime(&config),
         agent_primer: agent_primer_line(&config),
+        privacy: privacy_line(&config, None),
         features: vec![
             ("sixel", cfg!(feature = "sixel")),
             ("a11y-appkit", cfg!(feature = "a11y-appkit")),
@@ -418,6 +482,131 @@ pub(crate) fn config_semantic_warnings(
                 key: "packages.channel",
                 message: "packages.channel is blank and is treated as unset; atpkg uses the stable channel"
                     .to_string(),
+            });
+        }
+    }
+    if let Some(privacy) = config.privacy.as_ref() {
+        // RESERVED AND UNIMPLEMENTED, said out loud. aterm has no supported way
+        // to answer a macOS consent dialog and would not want one — a terminal
+        // that clicked "Allow" for a person is worse than the interruption it
+        // removed. The key exists ONLY so this sentence has somewhere to attach:
+        // an unknown key says nothing, and a key that quietly does nothing is
+        // the exact failure `--validate-config` exists to catch. The message
+        // names the grant that DOES work, and stops there — it does not promise
+        // the grant removes every prompt.
+        if privacy.auto_accept == Some(true) {
+            warnings.push(ConfigSemanticWarning {
+                key: "privacy.auto_accept",
+                message: "privacy.auto_accept is reserved and not implemented: aterm does not \
+                          answer macOS consent dialogs; grant Full Disk Access instead \
+                          (Settings \u{25b8} Security)"
+                    .to_string(),
+            });
+        }
+        // The master switch outranks both features below. Only an AUTHORED key
+        // is flagged: an absent `notice`/`warmup` resolves to the same value,
+        // but the author wrote no token to underline and stated no expectation
+        // for the master switch to contradict — the same rule the environment
+        // -override walk follows.
+        if privacy.enabled == Some(false) {
+            if privacy.notice == Some(true) {
+                warnings.push(ConfigSemanticWarning {
+                    key: "privacy.notice",
+                    message: "privacy.notice = true has no effect while privacy.enabled = false; \
+                              the consent notice can never fire"
+                        .to_string(),
+                });
+            }
+            if privacy
+                .warmup
+                .as_deref()
+                .and_then(crate::app_config::PrivacyWarmup::parse)
+                == Some(crate::app_config::PrivacyWarmup::OnRequest)
+            {
+                warnings.push(ConfigSemanticWarning {
+                    key: "privacy.warmup",
+                    message: "privacy.warmup = \"on-request\" has no effect while \
+                              privacy.enabled = false; the folder-access gesture is never offered"
+                        .to_string(),
+                });
+            }
+        }
+        // An unrecognized `warmup` spelling resolves to the default instead of
+        // failing the parse (which would discard the whole file), so this is
+        // the only place the author hears about the typo.
+        if let Some(warmup) = privacy.warmup.as_deref()
+            && crate::app_config::PrivacyWarmup::parse(warmup).is_none()
+        {
+            let accepted = crate::app_config::PrivacyWarmup::ALL
+                .iter()
+                .map(|mode| format!("{:?}", mode.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(ConfigSemanticWarning {
+                key: "privacy.warmup",
+                message: format!(
+                    "privacy.warmup value {warmup:?} is not one of {accepted}; {:?} is used",
+                    crate::app_config::PrivacyWarmup::default().as_str()
+                ),
+            });
+        }
+        // The folder vocabulary is the consent module's, so a name this build
+        // does not know is skipped when the warm-up resolves names to paths.
+        if let Some(folders) = privacy.warmup_folders.as_ref() {
+            let known = aterm_containment::Folder::ALL
+                .iter()
+                .map(|folder| folder.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (index, name) in folders.iter().enumerate() {
+                if aterm_containment::Folder::parse(name).is_none() {
+                    warnings.push(ConfigSemanticWarning {
+                        key: "privacy.warmup_folders",
+                        message: format!(
+                            "privacy.warmup_folders[{index}]: unknown folder {name:?} is skipped \
+                             by the warm-up; known names are {known}"
+                        ),
+                    });
+                }
+            }
+        }
+        // A relative root is dropped rather than guessed at: the consent tier
+        // refuses to pick a base for it, and a root that silently resolves
+        // nowhere is a protected set with a hole in it.
+        if let Some(roots) = privacy.protected_roots.as_ref() {
+            for (index, entry) in roots.iter().enumerate() {
+                let trimmed = entry.trim();
+                let usable = trimmed == "~"
+                    || trimmed.starts_with("~/")
+                    || std::path::Path::new(trimmed).is_absolute();
+                if !usable {
+                    warnings.push(ConfigSemanticWarning {
+                        key: "privacy.protected_roots",
+                        message: format!(
+                            "privacy.protected_roots[{index}]: {entry:?} is neither an absolute \
+                             path nor ~-prefixed and is ignored; the consent tier will not guess \
+                             a base for it"
+                        ),
+                    });
+                }
+            }
+        }
+        // The hold exists so an owner-initiated system dialog is not cut off
+        // mid-answer by the automatic in-place apply. Past the ceiling it stops
+        // being that and becomes a way to pin a build to one instance, which
+        // the design refuses — so the resolver clamps, and this states the
+        // effective number rather than letting the authored one read as honored.
+        if let Some(hold_ms) = privacy.warmup_hold_ms
+            && hold_ms > crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX
+        {
+            warnings.push(ConfigSemanticWarning {
+                key: "privacy.warmup_hold_ms",
+                message: format!(
+                    "privacy.warmup_hold_ms is configured as {hold_ms} ms but is effectively {} \
+                     ms; a hold longer than that is indistinguishable from pinning a build to \
+                     one instance",
+                    crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX
+                ),
             });
         }
     }
@@ -2542,6 +2731,185 @@ expect_nonce = "launch-pin"
         assert!(package_capability_warnings(&packages, false, true).is_empty());
     }
 
+    /// Every `[privacy]` key this build refuses or ignores says so, once, in the
+    /// author's own vocabulary — and a `[privacy]` section that is entirely
+    /// valid says nothing at all. The `auto_accept` line is the load-bearing
+    /// one: the key is RESERVED, and a reserved key that stayed silent would be
+    /// indistinguishable from a key that worked.
+    #[test]
+    fn privacy_auto_accept_is_refused_and_names_the_grant_that_works() {
+        let warnings = config_semantic_warnings(&parsed("[privacy]\nauto_accept = true\n"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].key, "privacy.auto_accept");
+        assert!(
+            warnings[0].message.contains("reserved and not implemented")
+                && warnings[0]
+                    .message
+                    .contains("aterm does not answer macOS consent dialogs")
+                && warnings[0]
+                    .message
+                    .contains("grant Full Disk Access instead"),
+            "{}",
+            warnings[0].message
+        );
+        // The refusal must not turn into a promise: nothing here may claim the
+        // grant removes prompts (owner ruling — mitigate, do not claim to
+        // eliminate).
+        let lowered = warnings[0].message.to_ascii_lowercase();
+        assert!(
+            !lowered.contains("no more prompts")
+                && !lowered.contains("never prompt")
+                && !lowered.contains("eliminat"),
+            "{}",
+            warnings[0].message
+        );
+        // `false` is the default and is not worth a word.
+        assert!(config_semantic_warnings(&parsed("[privacy]\nauto_accept = false\n")).is_empty());
+    }
+
+    /// The master switch silences the notice and the warm-up gesture, so an
+    /// author who wrote both gets told which of their keys cannot fire. Only
+    /// AUTHORED keys are flagged — an absent `notice` resolves to the same
+    /// value but expresses no expectation to contradict.
+    #[test]
+    fn privacy_master_switch_off_flags_the_features_it_silences() {
+        let warnings = config_semantic_warnings(&parsed(
+            "[privacy]\nenabled = false\nnotice = true\nwarmup = \"on-request\"\n",
+        ));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.key == "privacy.notice" && w.message.contains("can never fire")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.key == "privacy.warmup" && w.message.contains("is never offered")),
+            "{warnings:?}"
+        );
+        // Off with nothing else authored: no token to underline, nothing said.
+        assert!(config_semantic_warnings(&parsed("[privacy]\nenabled = false\n")).is_empty());
+        // On with both: they work, so there is nothing to warn about.
+        assert!(
+            config_semantic_warnings(&parsed(
+                "[privacy]\nenabled = true\nnotice = true\nwarmup = \"never\"\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// A `warmup` spelling this build does not accept resolves to the default
+    /// rather than failing the whole file, and an unknown `warmup_folders` name
+    /// is skipped when names become paths — both are silent at runtime, so both
+    /// are named here.
+    #[test]
+    fn privacy_flags_an_unknown_warmup_spelling_and_folder_name() {
+        let warnings = config_semantic_warnings(&parsed(
+            "[privacy]\nwarmup = \"first-launch\"\nwarmup_folders = [\"desktop\", \"keychain\"]\n",
+        ));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        let warmup = warnings
+            .iter()
+            .find(|w| w.key == "privacy.warmup")
+            .expect("warmup warning");
+        assert!(
+            warmup.message.contains("\"first-launch\"")
+                && warmup.message.contains("\"never\"")
+                && warmup.message.contains("\"on-request\""),
+            "the accepted vocabulary is listed: {}",
+            warmup.message
+        );
+        let folder = warnings
+            .iter()
+            .find(|w| w.key == "privacy.warmup_folders")
+            .expect("folder warning");
+        assert!(
+            folder.message.contains("warmup_folders[1]") && folder.message.contains("\"keychain\""),
+            "the index and the name are both named: {}",
+            folder.message
+        );
+    }
+
+    /// A protected root that is neither absolute nor `~`-prefixed is dropped by
+    /// the consent tier rather than resolved against a guessed base — which
+    /// would leave the protected set with a hole in it and nothing said.
+    #[test]
+    fn privacy_flags_a_protected_root_it_cannot_resolve() {
+        let warnings = config_semantic_warnings(&parsed(
+            "[privacy]\nprotected_roots = [\"~/vault\", \"/tmp/vault\", \"vault\", \"\"]\n",
+        ));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.key == "privacy.protected_roots"
+                && w.message
+                    .contains("neither an absolute path nor ~-prefixed")),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].message.contains("protected_roots[2]"));
+        assert!(
+            warnings[1].message.contains("protected_roots[3]"),
+            "a blank entry is dropped just as silently: {}",
+            warnings[1].message
+        );
+    }
+
+    /// The apply hold is a bounded courtesy to an owner-initiated dialog. Past
+    /// the ceiling it becomes a way to pin a build to one instance, so the
+    /// resolver clamps and the validator states the number that actually
+    /// applies rather than letting the authored one read as honored.
+    #[test]
+    fn privacy_flags_an_apply_hold_that_could_pin_a_build() {
+        let warnings = config_semantic_warnings(&parsed("[privacy]\nwarmup_hold_ms = 3600000\n"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].key, "privacy.warmup_hold_ms");
+        assert!(
+            warnings[0].message.contains("effectively 600000 ms")
+                && warnings[0].message.contains("pinning a build"),
+            "{}",
+            warnings[0].message
+        );
+        assert_eq!(
+            parsed("[privacy]\nwarmup_hold_ms = 3600000\n").privacy_warmup_hold_ms(),
+            crate::app_config::PRIVACY_WARMUP_HOLD_MS_MAX,
+            "the warning and the resolver agree on the effective value"
+        );
+        // Exactly at the ceiling is honored and unremarked.
+        assert!(
+            config_semantic_warnings(&parsed("[privacy]\nwarmup_hold_ms = 600000\n")).is_empty()
+        );
+    }
+
+    /// A fully-authored, entirely valid `[privacy]` section is silent. Without
+    /// this the six warnings above could each be firing on a correct config and
+    /// nothing would notice.
+    #[test]
+    fn a_valid_privacy_section_emits_no_semantic_warning() {
+        let clean = parsed(concat!(
+            "[privacy]\n",
+            "enabled = true\n",
+            "check = true\n",
+            "notice = true\n",
+            "report_attribution = true\n",
+            "warmup = \"on-request\"\n",
+            "warmup_folders = [\"documents\", \"desktop\", \"downloads\"]\n",
+            "warmup_hold_ms = 120000\n",
+            "probe_interval_ms = 5000\n",
+            "protected_roots = [\"~/vault\", \"/tmp/vault\"]\n",
+            "auto_accept = false\n",
+        ));
+        let warnings = config_semantic_warnings(&clean);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // And so is an empty table, and an absent one.
+        assert!(config_semantic_warnings(&parsed("[privacy]")).is_empty());
+        assert!(
+            config_semantic_warnings(&crate::app_config::Config::default())
+                .iter()
+                .all(|w| !w.key.starts_with("privacy"))
+        );
+    }
+
     #[test]
     fn host_semantics_accept_valid_lexicon_and_report_missing_or_rejected_layers() {
         // libtest names each test thread after the test's FULL PATH — here
@@ -3320,6 +3688,10 @@ ink = "rainbow"
             agent_primer: "claude installed, codex not detected — auto-prime: on \
                            (agents_auto_prime)"
                 .into(),
+            privacy: "full_disk_access=unknown probe=none fda_scope=unknown \
+                      warmup=on-request folders=documents,desktop,downloads hold_ms=120000 \
+                      probe_interval_ms=5000 protected_roots=17 notice=on report_attribution=on"
+                .into(),
             features: vec![("sixel", true), ("accessibility", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
@@ -3354,6 +3726,86 @@ ink = "rainbow"
         assert!(
             r.contains("primer:    claude installed, codex not detected — auto-prime: on"),
             "agent primer state + knob line"
+        );
+    }
+
+    /// The `privacy:` line renders the RESOLVED consent posture, and the
+    /// headless report never probes.
+    ///
+    /// The inert arm (`None`) is what [`collect`] passes, and it is the only
+    /// arm a test binary can reach: the FDA probe opens a file macOS guards, so
+    /// a `--diagnose` that reached for it on its own would put a consent-gated
+    /// syscall on a headless-constructible path. `unknown` here means aterm did
+    /// not look — never that access was denied.
+    #[test]
+    fn the_privacy_line_reports_unknown_from_the_inert_arm_and_never_probes() {
+        use aterm_containment::{FdaProbe, FdaState, ProbeLabel};
+
+        let config = parsed("[privacy]\nprotected_roots = [\"/tmp/one\", \"/tmp/two\"]\n");
+        let inert = privacy_line(&config, None);
+        for token in [
+            "full_disk_access=unknown",
+            "probe=none",
+            "fda_scope=unknown",
+            "warmup=on-request",
+            "hold_ms=120000",
+            "probe_interval_ms=5000",
+            "protected_roots=2",
+            "notice=on",
+            "report_attribution=on",
+        ] {
+            assert!(inert.contains(token), "{token} missing from {inert}");
+        }
+
+        // The live arm renders what it was handed, and nothing more: a grant
+        // does not become a claim about coverage.
+        let granted = FdaProbe {
+            state: FdaState::Granted,
+            label: ProbeLabel::OpenOk,
+        };
+        let live = privacy_line(&config, Some(granted));
+        assert!(
+            live.contains("full_disk_access=granted probe=open_ok"),
+            "{live}"
+        );
+        assert!(
+            live.contains("fda_scope=unknown"),
+            "granted or not, the scope of the grant stays unmeasured: {live}"
+        );
+
+        // `check = false` names the CONFIGURATION rather than implying denial,
+        // and the injected probe is ignored because the gate refuses first.
+        let unchecked = privacy_line(&parsed("[privacy]\ncheck = false\n"), Some(granted));
+        assert!(
+            unchecked.contains("full_disk_access=unknown probe=off"),
+            "{unchecked}"
+        );
+
+        // The master switch collapses the whole line to one honest sentence.
+        let disabled = privacy_line(&parsed("[privacy]\nenabled = false\n"), Some(granted));
+        assert!(
+            disabled.starts_with("off ([privacy] enabled = false)")
+                && disabled.contains("reads unknown"),
+            "{disabled}"
+        );
+
+        // The rendered report carries the line, and the REAL collection — the
+        // headless `--diagnose` entry point — never carries a probe outcome.
+        assert!(
+            sample()
+                .render()
+                .contains("privacy:   full_disk_access=unknown probe=none"),
+            "the section is rendered under its own label"
+        );
+        let live_collect = collect().privacy;
+        assert!(
+            !live_collect.contains("probe=open_"),
+            "collect() must never perform the probe: {live_collect}"
+        );
+        assert!(
+            live_collect.starts_with("off ([privacy]")
+                || live_collect.contains("full_disk_access=unknown"),
+            "{live_collect}"
         );
     }
 

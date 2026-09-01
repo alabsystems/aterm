@@ -59,6 +59,7 @@ fn peak_of(voice: SoundVoice, style: GlowStyle, kind: SoundGesture, gain: f32, h
         gain,
         tone: Tone::Technical,
         bed: false,
+        shifted: false,
     });
     let frames = (SR * TAIL_S) as usize;
     let mut buf = vec![0.0f32; frames * CHANNELS];

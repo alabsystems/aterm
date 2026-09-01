@@ -8,7 +8,11 @@
 impl TerminalHandler<'_> {
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetApplicationCursorKeys", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetApplicationCursorKeys",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_application_cursor_keys(&mut self) {
         self.modes.application_cursor_keys = true;
@@ -16,7 +20,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetApplicationCursorKeys", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetApplicationCursorKeys",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_application_cursor_keys(&mut self) {
         self.modes.application_cursor_keys = false;
@@ -24,7 +32,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetOriginMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetOriginMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_origin_mode(&mut self) {
         self.modes.origin_mode = true;
@@ -39,7 +51,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetOriginMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetOriginMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_origin_mode(&mut self) {
         self.modes.origin_mode = false;
@@ -48,7 +64,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetAutoWrap", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetAutoWrap",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_auto_wrap(&mut self) {
         self.modes.auto_wrap = true;
@@ -61,7 +81,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetAutoWrap", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetAutoWrap",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_auto_wrap(&mut self) {
         self.modes.auto_wrap = false;
@@ -72,7 +96,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetCursorVisible", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetCursorVisible",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn show_cursor(&mut self) {
         if !self.modes.cursor_visible {
@@ -88,7 +116,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetCursorVisible", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetCursorVisible",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn hide_cursor(&mut self) {
         if self.modes.cursor_visible {
@@ -99,7 +131,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetFocusReporting", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetFocusReporting",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_focus_reporting(&mut self) {
         self.modes.focus_reporting = true;
@@ -107,7 +143,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetFocusReporting", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetFocusReporting",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_focus_reporting(&mut self) {
         self.modes.focus_reporting = false;
@@ -181,7 +221,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetSynchronizedOutput", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetSynchronizedOutput",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_synchronized_output(&mut self) {
         let opening = !self.modes.synchronized_output;
@@ -199,7 +243,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetSynchronizedOutput", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetSynchronizedOutput",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_synchronized_output(&mut self) {
         self.modes.synchronized_output = false;
@@ -214,7 +262,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetInsertMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetInsertMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_insert_mode(&mut self) {
         self.modes.insert_mode = true;
@@ -222,7 +274,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetInsertMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetInsertMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_insert_mode(&mut self) {
         self.modes.insert_mode = false;
@@ -230,7 +286,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "SetNewLineMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "SetNewLineMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn enable_new_line_mode(&mut self) {
         self.modes.new_line_mode = true;
@@ -238,7 +298,11 @@ impl TerminalHandler<'_> {
 
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
-        aterm_spec::refines(machine = "terminal_modes", action = "ResetNewLineMode", project = "aterm_core::terminal::project_modes")
+        aterm_spec::refines(
+            machine = "terminal_modes",
+            action = "ResetNewLineMode",
+            project = "aterm_core::terminal::project_modes"
+        )
     )]
     fn disable_new_line_mode(&mut self) {
         self.modes.new_line_mode = false;

@@ -45,6 +45,20 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// `/usr/bin/tccutil`'s presence, read at most once per process.
+///
+/// One `metadata()` of a file in `/usr/bin`: no `tccd`, no `WindowServer`,
+/// nothing protected — but the Security page republishes on every event-loop
+/// park while it is visible, and a stat per park buys nothing. The file cannot
+/// meaningfully change under a running process, and `TccutilPresence::Unknown`
+/// fails CLOSED inside `reset_offer`, so a destructive button is never offered
+/// on an unproven tool.
+fn tccutil_presence_once() -> aterm_containment::TccutilPresence {
+    static PRESENCE: std::sync::OnceLock<aterm_containment::TccutilPresence> =
+        std::sync::OnceLock::new();
+    *PRESENCE.get_or_init(aterm_containment::consent::tccutil_presence)
+}
+
 impl App {
     /// Enumerate every live Settings presentation in `wid`, including leaves
     /// that are not currently focused. Generic split/restore operations may
@@ -210,11 +224,35 @@ impl App {
             .any(|wid| self.settings_tab_in_window(wid).is_some())
     }
 
+    /// THE PER-PARK SETTINGS OBSERVATION HOP.
+    ///
+    /// `retry_title_observations` calls this once per event-loop park, which
+    /// makes it the process's only regular "publish live runtime observations
+    /// into Settings" moment. Two things ride it, and both are equality-gated
+    /// no-ops when nothing changed:
+    ///
+    /// 1. the Smart Titles runtime observation
+    ///    ([`Self::publish_settings_title_summary_health`]);
+    /// 2. the macOS file-access posture (design §3.4), which the Security page
+    ///    is specified to re-poll *while it is visible* — and which also drains
+    ///    that page's *Ask for folder access now* press, because the warm-up
+    ///    worker is `App`-owned and a Settings reducer cannot reach `App`.
+    ///
+    /// The NAME is still the Smart Titles one, for the benefit of its five
+    /// existing call sites in `title_summary.rs`. The honest long-term shape is
+    /// one line in `about_to_wait` calling each publisher by its own name; that
+    /// is a `lib.rs` edit this change deliberately does not make, and it is
+    /// recorded rather than hidden.
+    pub(crate) fn sync_settings_title_summary_health(&mut self) {
+        self.publish_settings_title_summary_health();
+        self.sync_settings_consent_posture();
+    }
+
     /// Publish the process-global Smart Titles runtime observation into every
     /// open Settings view. Configuration remains the durable source of intent;
     /// this is the live provider/locality/readiness/error projection. The update
     /// is equality-gated and only redraws windows whose view actually changed.
-    pub(crate) fn sync_settings_title_summary_health(&mut self) {
+    fn publish_settings_title_summary_health(&mut self) {
         // This runs once per event-loop park (`retry_title_observations`), and
         // the common case is that no Settings view exists anywhere. Settings is
         // a process-singleton controller, so NO live instance proves no window
@@ -270,6 +308,129 @@ impl App {
                     os_window.request_redraw();
                 }
             }
+        }
+    }
+
+    /// Publish the macOS file-access posture into every open Settings view and
+    /// perform any outstanding *Ask for folder access now* press (design §3.4,
+    /// §3.5, §3.7).
+    ///
+    /// Shaped exactly like [`Self::sync_settings_title_summary_health`], for the
+    /// same reasons: Settings is a process singleton, so NO live instance proves
+    /// no window presents it and the cheap `instance_by_kind` guard comes first;
+    /// the projection is equality-gated so an unchanged posture repaints
+    /// nothing.
+    ///
+    /// Two properties this function is responsible for:
+    ///
+    /// * **It never reaches the OS on a headless instance.** It returns before
+    ///   touching the probe, and the gesture arms it installs are chosen by
+    ///   `ConsentGestures::for_instance`, whose headless arm cannot contact
+    ///   `NSWorkspace` or spawn anything.
+    /// * **The warm-up gesture is drained BEFORE the projection is built**, so
+    ///   the rows published in the same pass already read *asking…* rather than
+    ///   showing a press that appears to have done nothing.
+    pub(crate) fn sync_settings_consent_posture(&mut self) {
+        // There is no TCC off macOS and no consent surface to describe, so the
+        // block is simply absent there rather than rendering an empty card.
+        if !cfg!(target_os = "macos") || self.headless {
+            return;
+        }
+        if self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .is_none()
+        {
+            return;
+        }
+        // Only a view actually ON the Security page carries the block, and this
+        // runs on every event-loop park. Reading the route first keeps the cost
+        // of an open-but-elsewhere Settings tab at one enum compare per window
+        // instead of a probe read and a row clone.
+        let targets = self
+            .windows
+            .keys()
+            .copied()
+            .filter_map(|wid| {
+                self.settings_tab_in_window(wid)
+                    .map(|(_, _, _, view)| (wid, view))
+            })
+            .filter(|(_, view)| {
+                matches!(
+                    self.native_runtime.view_state(*view),
+                    Some(crate::native_app::AppViewState::Settings(state))
+                        if state.route == crate::native_settings::SettingsRoute::Security
+                )
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        // THE GESTURE DRAIN. `WarmupState` and its bounded automatic-apply hold
+        // are `App`-owned (§3.5) and a Settings reducer cannot reach `App`, so
+        // the press is recorded on the view and performed here. `begin_consent_
+        // warmup` re-checks every gate itself — the master switch, the mode, and
+        // headless — so a stale request cannot smuggle a worker past config.
+        let mut requested = false;
+        for (_, view) in &targets {
+            if let Some(crate::native_app::AppViewState::Settings(state)) =
+                self.native_runtime.view_state_mut(*view)
+            {
+                requested |= state.take_consent_warmup_request();
+            }
+        }
+        if requested {
+            let _ = self.begin_consent_warmup();
+        }
+        let access = self.macos_access_projection();
+        let gestures = crate::native_settings::ConsentGestures::for_instance(self.headless);
+        for (wid, view) in targets {
+            let changed = match self.native_runtime.view_state_mut(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => {
+                    state.arm_consent_gestures(gestures);
+                    state.replace_macos_access(access.clone())
+                }
+                Some(
+                    crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::Editor(_)
+                    | crate::native_app::AppViewState::Recovery(_),
+                )
+                | None => false,
+            };
+            if changed && let Some(window) = self.windows.get_mut(&wid) {
+                window.last_present = None;
+                if let Some(os_window) = window.os_window.as_ref() {
+                    os_window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Assemble what the Security page renders. Pure over `App` state plus the
+    /// CACHED probe — no syscall of its own, and `SpikeEvidence::UNMEASURED` is
+    /// what it publishes, so the panel's coverage claim stays gated on a named
+    /// field rather than on prose.
+    fn macos_access_projection(&mut self) -> crate::native_settings::MacosAccess {
+        let facts = self.consent_panel_facts();
+        let warmup_offered = self.config.privacy_enabled()
+            && self.config.privacy_warmup() == crate::app_config::PrivacyWarmup::OnRequest;
+        let tccutil = tccutil_presence_once();
+        let warmup_live = self.consent_warmup_live();
+        let warmup_rows = self.consent_warmup_rows().to_vec();
+        crate::native_settings::MacosAccess {
+            enabled: facts.enabled,
+            fda: facts.fda,
+            probe: facts.probe,
+            dr: facts.dr,
+            evidence: aterm_containment::SpikeEvidence::UNMEASURED,
+            bundle_id: facts.bundle_id,
+            tccutil,
+            warmup_offered,
+            warmup_live,
+            warmup_rows,
+            // A reset is reported only by the gesture that ran it; the host
+            // never invents one, and a successor process inherits none.
+            reset: None,
         }
     }
 
@@ -515,6 +676,11 @@ impl App {
         if self.dispatch_native_view_event(wid, view, action).is_err() {
             return false;
         }
+        // AFTER the route action, not before it: the block only exists on the
+        // Security page, and an already-open tab reaches that page through the
+        // dispatch above. Publishing here means opening Settings ▸ Security
+        // shows a live posture immediately instead of on the next park.
+        self.sync_settings_consent_posture();
         self.sync_active_session();
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             window.focus_window();
@@ -1188,6 +1354,10 @@ impl App {
             gain: volume,
             tone: aterm_effects::tone::Tone::Technical,
             bed: false,
+            // The picker's audition is the PLAIN keystroke — the tier-1 floor
+            // the roster is compared on. A shifted probe would audition every
+            // voice an octave up.
+            shifted: false,
         });
     }
 
@@ -2862,6 +3032,43 @@ mod tests {
             ws.next_trail_tick,
             Some(deadline),
             "ordinary terminal bookkeeping preserves the armed cadence"
+        );
+    }
+
+    /// THE HEADLESS FENCE for the macOS access block (design §3.3 guardrail 2,
+    /// `AGENTS.md` rule 5). A headless instance — which is what every unit test
+    /// is — opens the Security page, the per-park observation hop runs, and NO
+    /// posture is published: no probe is read, no `NSWorkspace` is touched, and
+    /// the page carries no block to press. The 2026-08-17 incident is exactly
+    /// the shape this forbids.
+    #[test]
+    fn a_headless_security_page_publishes_no_consent_posture_and_touches_no_probe() {
+        let mut app = App::headless_for_test();
+        assert!(app.headless, "the guard under test is the headless one");
+        assert!(
+            app.open_settings_tab(crate::native_settings::SettingsRoute::Security),
+            "the Security page opens headless like any other route"
+        );
+        // The per-park hop, run explicitly. Both halves must stay silent.
+        app.sync_settings_title_summary_health();
+        app.sync_settings_consent_posture();
+
+        let (_, _, view, _) = app
+            .native_settings_view_target()
+            .expect("the Security view is live");
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            state.route,
+            crate::native_settings::SettingsRoute::Security,
+            "the view really is on the page that carries the block"
+        );
+        assert!(
+            state.macos_access_for_test().is_none(),
+            "a headless instance publishes no posture, so there is nothing to press"
         );
     }
 

@@ -215,6 +215,10 @@ impl ShellNonce {
 ///    (see [`augment_with_nonce`]).
 /// 3. Flipping `TerminalModes::require_shell_integration_nonce` on after
 ///    (1) and (2) are wired.
+///
+/// # Availability
+/// `unix` and `windows` ONLY — exactly the targets that have the audited
+/// entropy surface. See [`fill_nonce_entropy`] for why there is no third arm.
 #[must_use]
 // Trust: the fill bottoms out in an out-of-bundle syscall wrapper whose only panic
 // path is an UNRECOVERABLE OS-entropy failure — a deliberate, documented fail-loud
@@ -224,6 +228,7 @@ impl ShellNonce {
 // nonce-constructor takes `#[trust::skip]` responsibility for it — the same
 // documented-external-assumption tier as the workspace's other skips.
 #[cfg_attr(trust_verify, trust::skip)]
+#[cfg(any(unix, windows))]
 pub fn generate_nonce() -> ShellNonce {
     let mut raw = [0u8; SHELL_NONCE_BYTES];
     fill_nonce_entropy(&mut raw);
@@ -234,16 +239,38 @@ pub fn generate_nonce() -> ShellNonce {
 /// Fill `buf` from the OS CSPRNG, on the ONE audited entropy surface for this
 /// platform.
 ///
-/// Native (unix and Windows) goes through [`aterm_uds::rand::fill`] —
-/// `getentropy(2)` with a bounded `read_exact` fallback, `BCryptGenRandom` on
-/// Windows. That is the rule `tools/grep_guard.sh` B4 enforces after the
-/// 2026-07-04/05 unbounded-`/dev/urandom` kernel panic, and routing here is
-/// what let `rand_core` leave the shipped graph.
+/// Unix and Windows go through [`aterm_uds::rand::fill`] — `getentropy(2)` with
+/// a bounded `read_exact` fallback, `BCryptGenRandom` on Windows. That is the
+/// rule `tools/grep_guard.sh` B4 enforces after the 2026-07-04/05
+/// unbounded-`/dev/urandom` kernel panic, and routing here is what let
+/// `rand_core` leave the shipped graph.
 ///
-/// `wasm32-unknown-unknown` has no OS entropy syscall and no `aterm-uds`
-/// (there are no Unix-domain sockets in a browser), so it calls the JS
-/// `crypto.getRandomValues` bridge directly — the same source `OsRng` reached
-/// there, one indirection fewer.
+/// # There is no `wasm32` arm, and that is the design
+/// There used to be one: a `getrandom::getrandom` call behind a
+/// `cfg(all(target_arch = "wasm32", target_os = "unknown"))` dependency table,
+/// with a `compile_error!` for every other target. It bought a JS
+/// `crypto.getRandomValues` bridge that NOTHING IN A BROWSER CAN REACH.
+/// `generate_nonce` has exactly one caller in the workspace —
+/// `crates/aterm-gui/src/spawn.rs`, minting the `ATERM_SHELL_NONCE` a spawned
+/// shell will echo back — and there is no PTY, no spawned shell, and no child
+/// environment in a browser. The mint compiled for wasm32 and was never called
+/// there.
+///
+/// So the arm was not an entropy source; it was a dependency. `getrandom 0.2`
+/// with `features = ["js"]` was the only thing holding `getrandom` (and, on the
+/// CPU module, `js-sys`) in the shipped browser graph: −2 packages / −9,774 LOC
+/// on `wasm-cpu` and −1 / −1,997 on `wasm-gpu` when it and the three
+/// "harmless if unused" sibling rows went. It was also the workspace's ONLY
+/// entropy path that B4's audited-helper rule did not cover, since it never
+/// touched `aterm-uds`.
+///
+/// The mint now exists exactly where the audited surface exists. A target with
+/// no `aterm_uds::rand` gets no `generate_nonce` at all, so reaching for one is
+/// a name error at the call site that names this function — deliberate, and
+/// strictly louder than a nonce minted from an unaudited source. Adding a
+/// target means adding its CSPRNG here first. `tools/grep_guard.sh` B13 keeps
+/// the shortcut closed: no shipped manifest may declare a third-party entropy
+/// crate.
 ///
 /// # Panics
 /// When the OS CSPRNG is unavailable. Deliberate and documented: a weaker
@@ -253,37 +280,6 @@ fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
     aterm_uds::rand::fill(buf)
         .expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
 }
-
-/// `wasm32-unknown-unknown` arm of [`fill_nonce_entropy`].
-///
-/// The predicate matches the manifest's
-/// `[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]`
-/// section EXACTLY, not `not(any(unix, windows))`. The two must partition the
-/// target space identically: a `not(any(unix, windows))` arm also selects
-/// `wasm32-wasip1`, whose manifest section does not apply, so `getrandom` would
-/// not be in the graph and the crate would fail to build on an unresolved path
-/// rather than on a sentence.
-///
-/// # Panics
-/// As the native arm: an unavailable CSPRNG fails loud rather than weakening
-/// the nonce.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
-    getrandom::getrandom(buf)
-        .expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
-}
-
-// Any target that is neither unix, nor windows, nor wasm32-unknown-unknown has
-// no entropy source declared in this crate's manifest. Say so in one sentence
-// at compile time instead of leaving a reader to decode an unresolved
-// `getrandom::` path — and make adding such a target a deliberate act that
-// names its CSPRNG, since the alternative is a silently weaker nonce.
-#[cfg(not(any(unix, windows, all(target_arch = "wasm32", target_os = "unknown"))))]
-compile_error!(
-    "aterm-shell-integration has no OS entropy source for this target: the capability-nonce \
-     mint routes through aterm-uds on unix/windows and getrandom on wasm32-unknown-unknown. \
-     Add a target section to Cargo.toml and an arm to fill_nonce_entropy before building here."
-);
 
 /// Lowercase hex-encode a 32-byte nonce. Exposed for host-side helpers
 /// that wire a caller-provided nonce (e.g. test fixtures that want

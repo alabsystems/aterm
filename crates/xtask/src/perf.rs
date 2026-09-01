@@ -323,6 +323,7 @@ fn compare_pathological_against_baseline(path: &Path, medians: &[(&'static str, 
         for (name, med) in medians {
             eprintln!("    {name}: {med:.1} MB/s");
         }
+        note_unmeasured("pathological (no baseline)");
         return true;
     };
     let Some(base) = parse_pathological(&text) else {
@@ -330,6 +331,7 @@ fn compare_pathological_against_baseline(path: &Path, medians: &[(&'static str, 
             "  pathological: baseline {} is unparseable — REPORT-ONLY, PASS.",
             path.display()
         );
+        note_unmeasured("pathological (unparseable baseline)");
         return true;
     };
     let mut ok = true;
@@ -503,6 +505,7 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
         for (name, med) in medians {
             eprintln!("    {name}: {med:.0}/s");
         }
+        note_unmeasured("scroll-scrub (no baseline)");
         return true;
     };
     let Some(base) = parse_scroll(&text) else {
@@ -510,6 +513,7 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
             "  scroll-scrub: baseline {} is unparseable — REPORT-ONLY, PASS.",
             path.display()
         );
+        note_unmeasured("scroll-scrub (unparseable baseline)");
         return true;
     };
     let mut ok = true;
@@ -608,6 +612,7 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> bool {
             report.median_mbps,
             report.n,
         );
+        note_unmeasured("throughput (no baseline)");
         return true;
     };
     let Some(base) = parse_report(&text) else {
@@ -617,6 +622,7 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> bool {
             path.display(),
             report.median_mbps,
         );
+        note_unmeasured("throughput (unparseable baseline)");
         return true;
     };
 
@@ -627,6 +633,7 @@ fn compare_against_baseline(path: &Path, report: &PerfReport) -> bool {
                 "  throughput: baseline median non-positive — REPORT-ONLY: {:.1} MB/s. PASS.",
                 report.median_mbps
             );
+            note_unmeasured("throughput (non-positive baseline)");
             true
         }
         Verdict::Pass => {
@@ -877,14 +884,19 @@ fn compare_keyed_against_baseline(
         for (key, v) in values {
             eprintln!("    {key}: {v:.1}");
         }
+        note_unmeasured(format!("{} (no baseline)", lane.lane));
         return true;
     };
     let Some(base) = parse_keyed(lane, &text) else {
+        // `parse_keyed` returns None when ANY key is missing, so this also covers a
+        // baseline that exists but is INCOMPLETE — a partial file must not read as
+        // a judged lane.
         eprintln!(
-            "  {}: baseline {} is unparseable — REPORT-ONLY, PASS.",
+            "  {}: baseline {} is unparseable or incomplete — REPORT-ONLY, PASS.",
             lane.lane,
             path.display()
         );
+        note_unmeasured(format!("{} (unusable baseline)", lane.lane));
         return true;
     };
     let mut ok = true;
@@ -892,7 +904,18 @@ fn compare_keyed_against_baseline(
         debug_assert_eq!(key, bkey, "key order is the lane const");
         let (verdict, floor) = compare(*bv, *v, PASS_RATIO);
         match verdict {
-            Verdict::NoBaseline | Verdict::Pass => {
+            // NoBaseline here means `compare` found the recorded baseline
+            // non-finite or <= 0 — i.e. this metric has NO floor. Printing
+            // "GREEN — v >= floor 0.0" for it asserted a comparison that never
+            // happened; every positive number clears a zero floor.
+            Verdict::NoBaseline => {
+                eprintln!(
+                    "    {key}: NOT JUDGED — recorded baseline is non-positive ({bv}); \
+                     this metric has no floor. Re-record the lane."
+                );
+                note_unmeasured(format!("{}/{key} (non-positive baseline)", lane.lane));
+            }
+            Verdict::Pass => {
                 eprintln!("    {key}: GREEN — {v:.1} >= floor {floor:.1}");
             }
             Verdict::Fail => {
@@ -996,6 +1019,38 @@ pub(crate) fn resize_fences(json: &str) -> bool {
 /// (pass) when the box lacks node or a wasm32-capable stable toolchain — a
 /// notice is printed, never a silent false "ok" — but a harness FAILURE on an
 /// equipped box fails the gate.
+/// The wasm-bindgen CLI version this lane requires. It MUST equal `WB_VERSION` in
+/// `tools/wasm-bench/run.sh` and the `wasm-bindgen = "=<v>"` pin in
+/// `crates/aterm-wasm/Cargo.toml`: the CLI refuses a crate it does not match, so a
+/// drifted pin turns the lane into a network install of the wrong tool. Pinned in
+/// both directions by `wasm_bindgen_pin_matches_the_crate_and_the_harness`.
+pub(crate) const WASM_BINDGEN_PIN: &str = "0.2.108";
+
+// Lanes that RAN but MEASURED NOTHING this pass — a missing tool, no committed
+// baseline, a seed run with no same-box history. Each lane already says so on its
+// own line; this is how the VERDICT line gets to say it too.
+//
+// `gate perf`'s verdict used to assert that all ten floors held whenever `ok` was
+// true, and eight of the ten lanes return `true` without measuring anything. That
+// is the same untruth `gate web` told until 2026-08-31, in the gate that IS in
+// ALL_ROSTER — so it was the last word `gate all` printed about performance.
+// (The tidier shape is gate.rs's three-valued `LaneVerdict`, which the lint lanes
+// already use; this channel buys the honesty without re-signing ten lanes.)
+thread_local! {
+    static UNMEASURED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record that `lane` produced no measurement, and why.
+pub(crate) fn note_unmeasured(what: impl Into<String>) {
+    UNMEASURED.with(|u| u.borrow_mut().push(what.into()));
+}
+
+/// Take the accumulated "did not measure" notes (clearing them).
+pub(crate) fn take_unmeasured() -> Vec<String> {
+    UNMEASURED.with(|u| std::mem::take(&mut *u.borrow_mut()))
+}
+
 pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
     let have = |cmd: &str, args: &[&str]| {
         Command::new(cmd)
@@ -1008,18 +1063,27 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         eprintln!(
             "  wasm: SKIP — node not found; the wasm lane needs node (notice, not a pass of the floors)."
         );
+        note_unmeasured("wasm (no node)");
         return true;
     }
+    // Line-exact: `.contains()` would also read this target out of
+    // `wasm32-unknown-unknown-nightly`, and would accept `wasm32-wasip1` for a
+    // prefix search. Same rule as gate.rs's `toolchain_lists_target`.
     let wasm_target = Command::new("rustup")
         .args(["target", "list", "--installed", "--toolchain", "stable"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("wasm32-unknown-unknown"))
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == "wasm32-unknown-unknown")
+        })
         .unwrap_or(false);
     if !wasm_target {
         eprintln!(
             "  wasm: SKIP — no stable wasm32-unknown-unknown target (rustup target add \
              wasm32-unknown-unknown --toolchain stable); floors not evaluated on this box."
         );
+        note_unmeasured("wasm (no stable wasm32 target)");
         return true;
     }
     // The bench pipeline mirrors the SHIPPING wasm-opt -O3 pass (bench
@@ -1032,10 +1096,50 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
              shipping wasm-opt -O3 pass and refuses pre-opt numbers (brew/apt install \
              binaryen); floors not evaluated on this box."
         );
+        note_unmeasured("wasm (no wasm-opt)");
+        return true;
+    }
+    // The FOURTH tool the harness needs, and the only one that had no probe: without
+    // it run.sh reaches its `cargo install wasm-bindgen-cli` bootstrap and fetches
+    // from crates.io mid-gate, and because Command::output() blocks the operator is
+    // only told after the fetch-and-compile finished — no probe, no prompt, no way to
+    // decline. A missing build tool is a box fact: skip, like the other three.
+    let wb_version = WASM_BINDGEN_PIN;
+    let wasm_bindgen_ok = Command::new("wasm-bindgen")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(wb_version))
+        .unwrap_or(false)
+        || workspace_root()
+            .join(format!(
+                "target/tooling/wasm-bindgen-{wb_version}/bin/wasm-bindgen"
+            ))
+            .exists();
+    if !wasm_bindgen_ok {
+        eprintln!(
+            "  wasm: SKIP — wasm-bindgen {wb_version} not found on PATH or in \
+             target/tooling; the harness would network-install it mid-gate \
+             (cargo +stable install wasm-bindgen-cli --version {wb_version} --locked); \
+             floors not evaluated on this box."
+        );
+        note_unmeasured("wasm (no wasm-bindgen)");
+        return true;
+    }
+    let script = workspace_root().join("tools/wasm-bench/run.sh");
+    // The PUBLIC snapshot ships crates/xtask but NOT tools/wasm-bench
+    // (publish/manifest.txt exports exactly one path from tools/, install.sh), so
+    // there `bash <missing>` exits 127 and this lane fails with a message that names
+    // no cause. Absent harness is a box fact, not a regression.
+    if !script.exists() {
+        eprintln!(
+            "  wasm: SKIP — {} is not in this tree (the public snapshot does not \
+             export tools/wasm-bench); floors not evaluated.",
+            script.display()
+        );
+        note_unmeasured("wasm (harness not in tree)");
         return true;
     }
     eprintln!("  $ tools/wasm-bench/run.sh");
-    let script = workspace_root().join("tools/wasm-bench/run.sh");
     let out = Command::new("bash")
         .arg(&script)
         .current_dir(workspace_root())
@@ -1711,6 +1815,7 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
             "  trend: SKIP — no metric had same-box history on {bx}; nothing was \
              judged (seed run, not a pass)."
         );
+        note_unmeasured("trend (seed run, no same-box history)");
     } else if trend_ok {
         eprintln!(
             "  trend: GREEN — {judged} metric(s) within same-box trend bounds of this \
@@ -2670,5 +2775,44 @@ mod tests {
         assert_eq!(d.as_bytes()[4], b'-');
         assert_eq!(d.as_bytes()[7], b'-');
         assert!(d.starts_with("20"), "sane century: {d}");
+    }
+    /// THE THREE PINS MUST AGREE, or the lane network-installs the wrong tool.
+    ///
+    /// wasm-bindgen's CLI refuses a crate whose version it does not match, so
+    /// `WASM_BINDGEN_PIN`, `WB_VERSION` in tools/wasm-bench/run.sh and the
+    /// `wasm-bindgen = "=<v>"` pin in crates/aterm-wasm/Cargo.toml are one number
+    /// wearing three hats. Bumping one and not the others used to be invisible
+    /// until a box without the tool reached the harness's crates.io bootstrap.
+    #[test]
+    fn wasm_bindgen_pin_matches_the_crate_and_the_harness() {
+        let root = super::workspace_root();
+
+        let manifest = std::fs::read_to_string(root.join("crates/aterm-wasm/Cargo.toml"))
+            .expect("crates/aterm-wasm/Cargo.toml is readable");
+        let crate_pin = manifest
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("wasm-bindgen = \"="))
+            .and_then(|v| v.strip_suffix('"'))
+            .expect("aterm-wasm pins wasm-bindgen with an exact `=` requirement");
+        assert_eq!(
+            crate_pin,
+            super::WASM_BINDGEN_PIN,
+            "crates/aterm-wasm/Cargo.toml pins wasm-bindgen {crate_pin}, perf.rs probes for {}",
+            super::WASM_BINDGEN_PIN
+        );
+
+        let harness = std::fs::read_to_string(root.join("tools/wasm-bench/run.sh"))
+            .expect("tools/wasm-bench/run.sh is readable");
+        let harness_pin = harness
+            .lines()
+            .find_map(|l| l.strip_prefix("WB_VERSION="))
+            .map(|v| v.split_whitespace().next().unwrap_or_default())
+            .expect("run.sh sets WB_VERSION");
+        assert_eq!(
+            harness_pin,
+            super::WASM_BINDGEN_PIN,
+            "tools/wasm-bench/run.sh pins {harness_pin}, perf.rs probes for {}",
+            super::WASM_BINDGEN_PIN
+        );
     }
 }

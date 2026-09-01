@@ -1379,6 +1379,163 @@ pub fn open_help_url() {
 /// its input.
 const HELP_URL: &str = "https://github.com/alabsystems/aterm";
 
+// ---------------------------------------------------------------------------
+// System Settings deep links — the macOS privacy panes (design §3.4, §3.7)
+// ---------------------------------------------------------------------------
+
+/// Which section of Privacy & Security a deep link aims at.
+///
+/// Only two sections are spellable, and both are REGISTERED anchors in the
+/// Settings extension's own `searchTerms` index (design Appendix A.2). The
+/// per-folder strings that also appear in the extension's Mach-O
+/// (`Privacy_DocumentsFolder` and its siblings) are NOT anchors — they name
+/// sub-rows of one combined Files-and-Folders section — so they are not
+/// offered here and cannot be reached by mistake.
+///
+/// `allow(dead_code)`: nothing CONSTRUCTS a pane yet — the Security block that
+/// presses [`open_privacy_settings`] is Phase 2's, and the allow comes off with
+/// it, exactly as that function's own note says.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PrivacyPane {
+    /// Full Disk Access — the single grant macOS offers for this class.
+    ///
+    /// Which folders HOLDING it covers has not been measured on this machine
+    /// (design §7 S4 is unrun), so neither this module nor its callers may say
+    /// that the grant covers any particular one. Nothing in this block names a
+    /// folder; the route strings below name only the pane.
+    FullDiskAccess,
+    /// The per-app Files & Folders list — §3.7's repair route, where a folder
+    /// row that was already answered can be turned back on.
+    FilesAndFolders,
+}
+
+/// Full Disk Access, through the modern Settings extension.
+///
+/// The scheme is `x-apple.systempreferences` — **with a dot**. The hyphenated
+/// `x-apple-systempreferences` spelling is a different string, and it is the
+/// one `crate::is_safe_url`'s rejection test names; keeping the two apart is
+/// why [`open_privacy_settings`] documents its own call site rather than
+/// borrowing the link allowlist.
+pub(crate) const SETTINGS_FULL_DISK_ACCESS: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles";
+
+/// Full Disk Access, through the legacy pane id the extension still declares
+/// for itself (`legacyBundleIdentifier`). Tried only if the modern id is
+/// refused outright.
+const SETTINGS_FULL_DISK_ACCESS_LEGACY: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
+
+/// The per-app Files & Folders list, through the modern Settings extension.
+pub(crate) const SETTINGS_FILES_AND_FOLDERS: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders";
+
+/// Files & Folders, through the legacy pane id.
+const SETTINGS_FILES_AND_FOLDERS_LEGACY: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
+
+/// The Privacy & Security page with NO anchor — the degradation target. It
+/// carries no `?`, which is the invariant
+/// `the_last_candidate_is_the_unanchored_pane_root` pins: the last entry of
+/// [`privacy_settings_urls`] must always be an anchor-free page that opens
+/// even if every anchor stops resolving.
+const SETTINGS_PRIVACY_ROOT: &str =
+    "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension";
+
+/// Every URL that may be tried for `pane`, best first: the modern extension
+/// id, the legacy alias, then the un-anchored pane root.
+///
+/// The last entry is why this can never be a dead end. None of the three is
+/// Apple-documented; if the anchors stop resolving, the Privacy & Security
+/// page still opens and the caller shows [`privacy_settings_path_words`] so
+/// the rest of the route is in words.
+pub(crate) const fn privacy_settings_urls(pane: PrivacyPane) -> [&'static str; 3] {
+    match pane {
+        PrivacyPane::FullDiskAccess => [
+            SETTINGS_FULL_DISK_ACCESS,
+            SETTINGS_FULL_DISK_ACCESS_LEGACY,
+            SETTINGS_PRIVACY_ROOT,
+        ],
+        PrivacyPane::FilesAndFolders => [
+            SETTINGS_FILES_AND_FOLDERS,
+            SETTINGS_FILES_AND_FOLDERS_LEGACY,
+            SETTINGS_PRIVACY_ROOT,
+        ],
+    }
+}
+
+/// The route to `pane` in words — what a person reads when the anchor did not
+/// land them on the section.
+///
+/// Always available to the caller, not only on the degraded path: an accepted
+/// anchor is not a HONOURED anchor (`openURL:` answers "System Settings took
+/// the URL", never "it scrolled to the row"), so the surface that opens the
+/// pane can always say where to look. It names the pane and nothing else — no
+/// folder, and no claim about what a grant there covers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const fn privacy_settings_path_words(pane: PrivacyPane) -> &'static str {
+    match pane {
+        PrivacyPane::FullDiskAccess => {
+            "System Settings \u{25b8} Privacy & Security \u{25b8} Full Disk Access"
+        }
+        PrivacyPane::FilesAndFolders => {
+            "System Settings \u{25b8} Privacy & Security \u{25b8} Files & Folders"
+        }
+    }
+}
+
+/// What [`macos::open_privacy_settings`] actually achieved.
+///
+/// The caller needs the difference because the degraded outcomes change what
+/// it must SAY, not merely what it logs: on anything but [`Self::Anchored`]
+/// the words are the only route the person has.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SettingsOpen {
+    /// An anchored URL was accepted. System Settings opened; whether it
+    /// scrolled to the section is not observable from here, which is why the
+    /// second open exists and why the words stay on screen.
+    Anchored,
+    /// Both anchors were refused; the un-anchored Privacy & Security page
+    /// opened instead. The caller must show [`privacy_settings_path_words`].
+    PaneRoot,
+    /// Nothing opened — off the main thread, off macOS, or the shell refused
+    /// every candidate. The caller must show the words and must not claim a
+    /// pane is up.
+    Refused,
+}
+
+/// Open System Settings at `pane` — the owner-gesture entry point the Security
+/// page presses (design §3.4's FDA button, §3.7's repair link).
+///
+/// macOS does the work in [`macos::open_privacy_settings`], which documents why
+/// a Settings URL may be opened from here and never from a hyperlink. Off macOS
+/// there is no System Settings and no TCC, so nothing opens and the answer is
+/// [`SettingsOpen::Refused`] — the same instruction to the caller as a refused
+/// anchor: show the route in words.
+///
+/// A degraded outcome is logged with that route, because a windowed launch has
+/// no stderr and "the button did nothing visible" is otherwise unexplainable
+/// after the fact. The caller still has to SHOW the words; the log is the
+/// diagnostic copy, not the user-facing one.
+///
+/// `allow(dead_code)`: this is the seam Phase 2's Security block presses, and
+/// `native_settings.rs` is the only caller it will ever have. The allow comes
+/// off with that call site.
+#[allow(dead_code)]
+pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
+    #[cfg(target_os = "macos")]
+    let outcome = macos::open_privacy_settings(pane);
+    #[cfg(not(target_os = "macos"))]
+    let outcome = SettingsOpen::Refused;
+    if outcome != SettingsOpen::Anchored {
+        aterm_log::warn!(
+            "System Settings deep link did not take ({outcome:?}); the route is {}",
+            privacy_settings_path_words(pane)
+        );
+    }
+    outcome
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use objc2::rc::Retained;
@@ -1393,7 +1550,10 @@ mod macos {
     use objc2_foundation::{MainThreadMarker, NSString};
     use winit::event_loop::EventLoopProxy;
 
-    use super::{MenuAction, NativeTerminateArbiter, NativeTerminateDecision};
+    use super::{
+        MenuAction, NativeTerminateArbiter, NativeTerminateDecision, PrivacyPane, SettingsOpen,
+        privacy_settings_urls,
+    };
     use crate::Wake;
 
     /// Installed before the AppKit terminate hook. `EventLoopProxy` is the only
@@ -2345,13 +2505,21 @@ mod macos {
     /// Open `s` via `NSWorkspace openURL:` — a file path (`is_file`) becomes a
     /// `file://` URL, otherwise it is parsed as an absolute URL. Best-effort; main
     /// thread only.
-    fn open_in_workspace(s: &str, is_file: bool) {
+    ///
+    /// Returns what `openURL:` answered: whether the shell ACCEPTED the URL —
+    /// which is not the same as "the app did what the URL asked", and for the
+    /// Settings anchors is emphatically not the same (see
+    /// [`open_privacy_settings`]). Help ignores it; the deep link needs it to
+    /// walk its fallback chain. `false` also covers the off-main-thread refusal,
+    /// so a caller that reads the answer cannot mistake "not attempted" for
+    /// "opened".
+    fn open_in_workspace(s: &str, is_file: bool) -> bool {
         if MainThreadMarker::new().is_none() {
-            return;
+            return false;
         }
         let ns = NSString::from_str(s);
         // SAFETY: `NSURL`/`NSWorkspace` are standard AppKit; the string is valid and
-        // retained for the call. `openURL:` returns BOOL, which we ignore.
+        // retained for the call. `openURL:` returns BOOL, handed straight back.
         unsafe {
             let url: Retained<AnyObject> = if is_file {
                 msg_send_id![class!(NSURL), fileURLWithPath: &*ns]
@@ -2359,7 +2527,109 @@ mod macos {
                 msg_send_id![class!(NSURL), URLWithString: &*ns]
             };
             let ws: Retained<AnyObject> = msg_send_id![class!(NSWorkspace), sharedWorkspace];
-            let _: bool = msg_send![&ws, openURL: &*url];
+            msg_send![&ws, openURL: &*url]
+        }
+    }
+
+    /// How long after the first open the same URL is issued again. The anchor
+    /// after `?` is not Apple-documented and is not always honoured on the
+    /// first open (design Appendix A.2); a second issue about a second later is
+    /// the shipped workaround. Long enough that System Settings has finished
+    /// launching cold, short enough that it is one gesture rather than two.
+    const SECOND_OPEN_DELAY_SECS: f64 = 1.0;
+
+    /// Open System Settings at `pane` — twice, roughly [`SECOND_OPEN_DELAY_SECS`]
+    /// apart — and report how far it got.
+    ///
+    /// # Why a Settings URL may be opened here, and never from a link
+    ///
+    /// `crate::is_safe_url` is the allowlist a Cmd-clicked hyperlink from
+    /// PROGRAM OUTPUT must pass, and it admits only `http`/`https`/`mailto`. Its
+    /// rejection test names an `x-apple-systempreferences:` URL on purpose:
+    /// output that a program printed must never be able to open a privacy pane,
+    /// because a pane a program can raise is a consent surface that program
+    /// controls — the same rule that keeps the warm-up and the `tccutil` repair
+    /// off the control verbs (design §3.5, §3.7). **Nothing here widens that
+    /// allowlist, and it must not be widened to accommodate this path.**
+    ///
+    /// This URL is a different kind of thing: a `&'static str` compiled into
+    /// aterm, reached only from a button on aterm's own Security page — an owner
+    /// gesture, at a moment the owner chose, with no untrusted bytes anywhere in
+    /// it. It goes to `NSWorkspace` directly rather than through the link path,
+    /// so the two never share a gate and the allowlist stays closed.
+    ///
+    /// # Twice, without blocking
+    ///
+    /// The second issue is a delayed perform on the main run loop, NOT a sleep:
+    /// this function returns to the event loop immediately and the second open
+    /// arrives later as an ordinary run-loop callback (see
+    /// [`open_in_workspace_after_delay`]).
+    ///
+    /// # Never a dead end
+    ///
+    /// Candidates are tried best-first from [`privacy_settings_urls`], whose last
+    /// entry carries no anchor at all. If both anchored URLs are refused, the
+    /// Privacy & Security page still opens and the answer is
+    /// [`SettingsOpen::PaneRoot`], which tells the caller to show
+    /// [`privacy_settings_path_words`] — the route in words. Off the main thread
+    /// nothing is attempted and the answer is [`SettingsOpen::Refused`], which is
+    /// the same instruction to the caller.
+    pub fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
+        if MainThreadMarker::new().is_none() {
+            return SettingsOpen::Refused;
+        }
+        let urls = privacy_settings_urls(pane);
+        for (i, url) in urls.iter().enumerate() {
+            if !open_in_workspace(url, false) {
+                continue;
+            }
+            // The last candidate is the un-anchored pane root, and re-issuing a
+            // URL with no anchor buys nothing but a second activation.
+            if i + 1 < urls.len() {
+                open_in_workspace_after_delay(url, SECOND_OPEN_DELAY_SECS);
+                return SettingsOpen::Anchored;
+            }
+            return SettingsOpen::PaneRoot;
+        }
+        SettingsOpen::Refused
+    }
+
+    /// Issue `s` through `NSWorkspace openURL:` again after `secs`.
+    ///
+    /// `performSelector:withObject:afterDelay:` schedules on the CALLING thread's
+    /// run loop, and the only way in is from the main thread
+    /// ([`open_privacy_settings`] has already checked, and this re-checks), so the
+    /// second open runs on the main thread while the main thread stays free in the
+    /// meantime. No worker, no timer object to own, and nothing to cancel: the
+    /// worst case is one extra `openURL:` for a pane the owner asked for a second
+    /// earlier.
+    ///
+    /// Best-effort in one respect worth naming: a delayed perform is scheduled in
+    /// the default run-loop mode, so if the main thread is inside a tracking loop
+    /// (a drag, an open menu) when the second open comes due, it lands when
+    /// tracking ends rather than on the second. That only ever makes the second
+    /// issue LATE; it cannot lose it, and the first open has already happened.
+    fn open_in_workspace_after_delay(s: &str, secs: f64) {
+        if MainThreadMarker::new().is_none() {
+            return;
+        }
+        let ns = NSString::from_str(s);
+        // SAFETY: standard AppKit. Every `s` reaching here is one of this module's
+        // own `&'static str` URL constants, so `URLWithString:` is non-nil.
+        // `NSWorkspace` retains both the receiver and the argument until the
+        // perform fires, so nothing here has to outlive this frame. The scheduled
+        // selector is `openURL:`, whose real return is `BOOL` while the delayed
+        // perform invokes it as `id`-returning; the value lands in the same return
+        // register on every target aterm builds for and is discarded either way.
+        unsafe {
+            let url: Retained<AnyObject> = msg_send_id![class!(NSURL), URLWithString: &*ns];
+            let ws: Retained<AnyObject> = msg_send_id![class!(NSWorkspace), sharedWorkspace];
+            let _: () = msg_send![
+                &ws,
+                performSelector: sel!(openURL:),
+                withObject: &*url,
+                afterDelay: secs,
+            ];
         }
     }
 }
@@ -3016,5 +3286,117 @@ mod tests {
             "{} must satisfy the same allowlist a clicked link does",
             super::HELP_URL
         );
+    }
+
+    // ---- the System Settings deep link (design §3.4, §3.7, Appendix A.2) --------
+
+    /// THE SCHEME HAS A DOT. `x-apple.systempreferences` is the real scheme;
+    /// `x-apple-systempreferences` (hyphen) is a different string, and it is the
+    /// one the link allowlist's rejection list names. A one-character slip here
+    /// is invisible on screen and turns every deep link into a no-op, so every
+    /// candidate is pinned — modern id, legacy alias and the un-anchored root
+    /// alike.
+    #[test]
+    fn every_settings_deep_link_uses_the_dotted_scheme() {
+        for pane in [
+            super::PrivacyPane::FullDiskAccess,
+            super::PrivacyPane::FilesAndFolders,
+        ] {
+            for url in super::privacy_settings_urls(pane) {
+                assert!(
+                    url.starts_with("x-apple.systempreferences:"),
+                    "the scheme is dotted: {url:?}"
+                );
+                assert!(
+                    !url.contains("x-apple-systempreferences"),
+                    "the hyphenated spelling is a different scheme: {url:?}"
+                );
+            }
+        }
+        assert!(
+            super::SETTINGS_FULL_DISK_ACCESS.ends_with("?Privacy_AllFiles"),
+            "Full Disk Access is anchored at Privacy_AllFiles"
+        );
+        assert!(
+            super::SETTINGS_FILES_AND_FOLDERS.ends_with("?Privacy_FilesAndFolders"),
+            "the per-app repair route is anchored at Privacy_FilesAndFolders"
+        );
+    }
+
+    /// NEVER A DEAD END. None of these URLs is Apple-documented, so the last
+    /// candidate must be a page with NO anchor at all: if both anchors stop
+    /// resolving, Privacy & Security still opens and the caller falls back to
+    /// the route in words. Both panes must degrade to the SAME root — the
+    /// combined Files-and-Folders section lives on the one page — and only the
+    /// two registered anchors may ever appear, never a per-folder pseudo-anchor
+    /// (`Privacy_DocumentsFolder` and its siblings are not anchors; Appendix
+    /// A.2).
+    #[test]
+    fn the_last_candidate_is_the_unanchored_pane_root() {
+        let fda = super::privacy_settings_urls(super::PrivacyPane::FullDiskAccess);
+        let files = super::privacy_settings_urls(super::PrivacyPane::FilesAndFolders);
+        for urls in [&fda, &files] {
+            let (root, anchored) = urls.split_last().expect("three candidates");
+            assert!(
+                !root.contains('?'),
+                "the degradation target carries no anchor: {root:?}"
+            );
+            for url in anchored {
+                assert!(
+                    url.contains('?'),
+                    "the first candidates are anchored: {url:?}"
+                );
+            }
+        }
+        assert_eq!(fda[2], files[2], "both panes degrade to the same page");
+        for url in fda.iter().chain(files.iter()) {
+            let anchor = url.split_once('?').map(|(_, a)| a);
+            assert!(
+                matches!(
+                    anchor,
+                    None | Some("Privacy_AllFiles" | "Privacy_FilesAndFolders")
+                ),
+                "only a REGISTERED anchor may ship: {url:?}"
+            );
+        }
+        // The words never claim a folder, and never claim what a grant covers —
+        // that claim belongs to S4, which has not been run.
+        for pane in [
+            super::PrivacyPane::FullDiskAccess,
+            super::PrivacyPane::FilesAndFolders,
+        ] {
+            let words = super::privacy_settings_path_words(pane);
+            assert!(
+                words.starts_with("System Settings"),
+                "the words are a route, not a sentence: {words:?}"
+            );
+            assert!(
+                !words.to_ascii_lowercase().contains("cover"),
+                "coverage is S4's claim to make, not this route's: {words:?}"
+            );
+        }
+    }
+
+    /// THE ALLOWLIST STAYS CLOSED. `is_safe_url` decides what a Cmd-clicked
+    /// hyperlink out of PROGRAM OUTPUT may open, and it must keep rejecting
+    /// every one of these: a Settings pane a program can raise is a consent
+    /// surface that program controls. The deep link is safe for the opposite
+    /// reason — it is a compiled-in constant behind an owner gesture in aterm's
+    /// own UI — and it reaches `NSWorkspace` on its own path, so widening the
+    /// allowlist is never the way to make it work. This test fails the moment
+    /// someone tries.
+    #[test]
+    fn program_output_still_cannot_open_a_settings_pane() {
+        for pane in [
+            super::PrivacyPane::FullDiskAccess,
+            super::PrivacyPane::FilesAndFolders,
+        ] {
+            for url in super::privacy_settings_urls(pane) {
+                assert!(
+                    !crate::is_safe_url(url),
+                    "a clicked link must never be able to open Settings: {url:?}"
+                );
+            }
+        }
     }
 }

@@ -47,7 +47,7 @@
 //!   the file is left untouched — never a destructive guess.
 //! * Per-agent ADDENDA: an agent whose runtime needs one extra paragraph (Codex's
 //!   sandbox refuses the control socket) gets it inside ITS block only; the
-//!   generic block stays three lines.
+//!   generic block stays inside its own budget.
 //!
 //! Pure string transforms ([`upsert_block`] / [`remove_block`] / [`block_state`])
 //! carry the logic so every edge is unit-testable; the two public entry points are
@@ -76,9 +76,13 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// read-only unless you use send/turn/key/spawn/close", an allow-list that was
 /// already false (paste, feed, ctrl, mouse, signal, meta set, settings, tab and
 /// resize all write) and would drift further with every verb added; v4 states
-/// the rule by what a verb DOES instead.
+/// the rule by what a verb DOES instead. v5 (2026-08-30): the macOS privacy
+/// sentence — on macOS an `Operation not permitted` can arrive with NO dialog,
+/// and an agent that reads it as a broken tool retries in a loop, reaches for
+/// `sudo`, or quietly rewrites the path, all three of which are wrong and none
+/// of which anything else in an agent's context file tells it.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v4 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v5 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 /// The end marker closing the managed block.
 const MARK_END: &str = "<!-- /aterm primer -->";
@@ -101,7 +105,10 @@ is already on PATH inside aterm sessions). First moves: `aterm ctl windows` and 
 list every window and session; read a peer's `status` (detail= names the program it is running)
 before typing into it. aterm deliberately STRIPS `CLAUDE*`, `ANTHROPIC_*`, `COPILOT_*`,
 `CODEX_*`, `CURSOR_*`, and `AI_*` env vars from the shells it spawns — `aterm help` explains
-why. If neither variable is set, you are not inside aterm; ignore this section.";
+why. On macOS, `Operation not permitted` on a file is usually privacy consent, not a broken
+tool, and it can arrive with NO dialog: run `aterm ctl privacy` before retrying — never in a
+loop, never `sudo`, never by rewriting the path; `aterm help permissions` says what to do.
+If neither variable is set, you are not inside aterm; ignore this section.";
 
 /// Codex CLI's addendum (docs/AGENT-EXPERIENCE-2026-08-26.md §3 S8). Measured on
 /// 2026-08-26: Codex's default macOS sandbox refuses AF_UNIX `connect()` outside
@@ -1104,26 +1111,64 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         // Marked + versioned, so installs are idempotent and updatable.
         assert!(block.starts_with(MARK_BEGIN) && block.trim_end().ends_with(MARK_END));
         assert!(
-            MARK_BEGIN.contains(" v4 "),
-            "the Codex escalation sentence bumped the version"
+            MARK_BEGIN.contains(" v5 "),
+            "the macOS privacy sentence bumped the version"
         );
     }
 
     /// The body is a POINTER, not the manual. A sentence that earns its place in
     /// every agent's context file in every project is rare; the budget makes the
     /// next author argue for one rather than drift the block into a page.
+    ///
+    /// Raised once, from 1 000/12 to 1 150/13, for v5's macOS privacy sentence
+    /// (2026-08-30) — and the argument is the one the budget asks for: an
+    /// `Operation not permitted` that no dialog announced is indistinguishable
+    /// from a broken tool from inside the session, the three reflexes it
+    /// provokes (retry in a loop, `sudo`, rewrite the path) are all wrong, and
+    /// nothing else in an agent's context file will ever say so. The depth still
+    /// lives behind `aterm help permissions`; what is here is the pointer plus
+    /// the three refusals, which are useless if the agent has to already suspect
+    /// a permissions wall to go looking for them.
     #[test]
     fn primer_body_stays_within_its_byte_budget() {
         assert!(
-            PRIMER_BODY.len() <= 1_000,
+            PRIMER_BODY.len() <= 1_150,
             "primer body is {} bytes — depth belongs behind `aterm help`",
             PRIMER_BODY.len()
         );
         assert!(
-            PRIMER_BODY.lines().count() <= 12,
+            PRIMER_BODY.lines().count() <= 13,
             "{}",
             PRIMER_BODY.lines().count()
         );
+    }
+
+    /// v5's sentence, point by point (design §5.5). Each is a claim an agent
+    /// otherwise gets wrong: that a missing dialog means this is not a
+    /// permissions wall, that retrying might work, that `sudo` is the
+    /// escalation, or that a different path is a fix rather than a silent
+    /// divergence from what the operator asked for.
+    #[test]
+    fn primer_teaches_the_macos_eperm_that_has_no_dialog() {
+        let block = generic();
+        for needle in [
+            "Operation not permitted",
+            "NO dialog",
+            "`aterm ctl privacy` before retrying",
+            "never in a\nloop",
+            "never `sudo`",
+            "never by rewriting the path",
+            "`aterm help permissions`",
+        ] {
+            assert!(block.contains(needle), "primer missing {needle:?}\n{block}");
+        }
+        // It is macOS-specific, and the block is installed in a GLOBAL context
+        // file that loads on every platform — so it must say which platform it
+        // is about rather than teaching a Linux agent to doubt every EPERM.
+        assert!(block.contains("On macOS,"), "{block}");
+        // And it never promises the grant ends the prompts: only a human can
+        // grant it, and which services it covers is unmeasured.
+        assert!(!block.contains("no more prompts"), "{block}");
     }
 
     #[test]
@@ -1133,7 +1178,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         for prefix in aterm_types::domain::ENV_DENY_PREFIXES {
             let named = prefix.trim_end_matches('_').trim_end_matches('*');
             // `_DEVTOOL_` is an internal implementation marker, not an agent's
-            // context prefix — the primer stays 3 lines by omitting it.
+            // context prefix — the primer stays inside its budget by omitting it.
             if *prefix == "_DEVTOOL_" {
                 continue;
             }
@@ -1254,7 +1299,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         let old = format!("before\n\n{V1_BLOCK}\nafter\n");
         assert_eq!(block_state(&old, &block).unwrap(), BlockState::Stale);
         let updated = upsert_block(&old, &block).unwrap().unwrap();
-        assert!(updated.starts_with("before\n\n<!-- aterm primer v4"));
+        assert!(updated.starts_with("before\n\n<!-- aterm primer v5"));
         assert!(updated.ends_with("<!-- /aterm primer -->\n\nafter\n"));
         assert_eq!(
             updated.matches(MARK_PREFIX).count(),
@@ -1286,7 +1331,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v4"),
+                updated.starts_with("mine\n\n<!-- aterm primer v5"),
                 "{}",
                 a.name
             );
@@ -1346,7 +1391,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v4"),
+                updated.starts_with("mine\n\n<!-- aterm primer v5"),
                 "{}",
                 a.name
             );
@@ -1362,6 +1407,64 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
                 "{}",
                 a.name
             );
+        }
+    }
+
+    /// The exact v4 GENERIC block every machine primed since 2026-08-27 carries
+    /// — the live upgrade path today. Pinned as a literal, like its
+    /// predecessors, so v4 → v5 is tested against what is really on disk rather
+    /// than against today's constants (which would make the test vacuous the
+    /// moment the body changes again).
+    const V4_BLOCK: &str = r"<!-- aterm primer v4 — managed by `aterm agents`; `aterm agents remove` uninstalls -->
+## aterm
+If the environment has `TERM_PROGRAM=aterm` or `ATERM_CHILD=1`, this terminal is aterm — an
+AI-native terminal whose sessions are introspectable and drivable: agents and humans can read
+the live screen, send input, and await real transitions, concurrently. Run `aterm help` for the
+agent operating brief and `aterm help introspection` for the `aterm ctl` control verbs (`aterm`
+is already on PATH inside aterm sessions). First moves: `aterm ctl windows` and `aterm ctl ls`
+list every window and session; read a peer's `status` (detail= names the program it is running)
+before typing into it. aterm deliberately STRIPS `CLAUDE*`, `ANTHROPIC_*`, `COPILOT_*`,
+`CODEX_*`, `CURSOR_*`, and `AI_*` env vars from the shells it spawns — `aterm help` explains
+why. If neither variable is set, you are not inside aterm; ignore this section.
+<!-- /aterm primer -->
+";
+
+    /// A machine primed to v4 — every machine primed since 2026-08-27: stale by
+    /// its marker AND its body, rewritten in place for every agent, and the
+    /// macOS privacy sentence is what it gains.
+    #[test]
+    fn v4_block_is_stale_and_gains_the_macos_privacy_sentence() {
+        let old = format!("mine\n\n{V4_BLOCK}\ntheirs\n");
+        assert!(V4_BLOCK.starts_with("<!-- aterm primer v4 "));
+        assert!(
+            !V4_BLOCK.contains("Operation not permitted"),
+            "the v4 literal must be the PRE-privacy shape"
+        );
+        for a in AGENT_FILES {
+            let block = block_for(a);
+            assert_eq!(
+                block_state(&old, &block).unwrap(),
+                BlockState::Stale,
+                "{}: a v4 block must read stale",
+                a.name
+            );
+            let updated = upsert_block(&old, &block).unwrap().unwrap();
+            assert!(
+                updated.starts_with("mine\n\n<!-- aterm primer v5"),
+                "{}",
+                a.name
+            );
+            assert!(
+                updated.contains("`aterm help permissions`"),
+                "{}: the upgrade must deliver the privacy sentence",
+                a.name
+            );
+            assert!(
+                updated.ends_with("<!-- /aterm primer -->\n\ntheirs\n"),
+                "{}",
+                a.name
+            );
+            assert_eq!(updated.matches(MARK_PREFIX).count(), 1, "{}", a.name);
         }
     }
 

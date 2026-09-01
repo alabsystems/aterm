@@ -29,7 +29,7 @@
 //! that hold each.
 
 use crate::model::{CellSurvey, Graph, PkgId};
-use crate::survey::{commas, fit, wrap};
+use crate::survey::{commas, fit, fit_path, wrap};
 use crate::{Outcome, dominator, loc, resolve};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
@@ -172,13 +172,8 @@ fn versions_block(
             PatchState::ForkVersionUnreadable { path } => format!("fork? {path}"),
             PatchState::Registry => "registry".to_string(),
         };
-        let line = format!(
-            "    {:<28}{:<32}{}",
-            format!("{} {}", id.name, id.version),
-            tag,
-            where_.join(", ")
-        );
-        let _ = writeln!(log, "{}", line.trim_end());
+        let line = versions_row(&id.name, &id.version.to_string(), &tag, &where_.join(", "));
+        let _ = writeln!(log, "{line}");
     }
     if found.len() > 1 {
         // The same arithmetic `survey`'s DUPLICATE VERSIONS section reports,
@@ -388,7 +383,23 @@ fn package_block(
             }
         );
         if let Some(dir) = &f.root_dir {
-            let _ = writeln!(log, "                {}", dir.display());
+            // An IN-REPO dir prints repo-relative. The absolute prefix is the
+            // operator's checkout location — noise that varies per machine and,
+            // in a deep worktree, single-handedly blows the 100-column budget
+            // the width test holds every line to (measured: 132 columns for
+            // `vendor/indexmap` under a scratchpad worktree, on content that
+            // was green in a short checkout). Out-of-repo dirs (the registry
+            // cache) stay absolute: relative-to-what would be meaningless.
+            // …and whatever remains is BOUNDED. Stripping the checkout prefix
+            // fixed the in-repo half; an out-of-repo dir is still an absolute
+            // registry path whose width is set by $CARGO_HOME's depth and by
+            // the package's own name — neither of which this line controls.
+            // Measured on a SHORT checkout: 126 columns for
+            // `wgpu-core-deps-windows-linux-android`, against the 100-column
+            // budget the width test holds every line to. The tail that names
+            // the package survives; the constant prefix is what gets elided,
+            // visibly.
+            let _ = writeln!(log, "                {}", dir_line(root, dir));
         }
         // A fork is SIZED from the pristine registry copy on purpose (see
         // `loc::package_dir`), so say so where it would otherwise read as a
@@ -868,6 +879,49 @@ fn nearby(name: &str, surveys: &[CellSurvey]) -> Vec<String> {
 
 // ------------------------------------------------------------------ formatting
 
+/// The measured package's directory, as the report shows it: repo-relative
+/// when it is in the checkout, and BOUNDED either way.
+///
+/// Both halves are about the same hazard — a line whose width is decided by the
+/// environment rather than by the content. The absolute prefix of an in-repo dir
+/// is the operator's checkout location, noise that varies per machine and, in a
+/// deep worktree, single-handedly blew the budget (measured: 132 columns for
+/// `vendor/indexmap` under a scratchpad worktree). An OUT-OF-REPO dir has no
+/// prefix to strip — relative to what? — so its width is set by `$CARGO_HOME`'s
+/// depth and the package's own name (measured: 126 columns for
+/// `wgpu-core-deps-windows-linux-android` in a SHORT checkout), and it is
+/// [`fit_path`] that keeps it inside the terminal without losing the package
+/// directory the line exists to name.
+fn dir_line(root: &Path, dir: &Path) -> String {
+    let shown = dir.strip_prefix(root).unwrap_or(dir);
+    fit_path(&shown.display().to_string(), W_LINE - 16)
+}
+
+/// One VERSIONS RESOLVED row: `name version`, the patch tag, then the cells.
+///
+/// FIT, not merely PAD. `{:<28}` widens a short field but never narrows a long
+/// one, so a name+version past 28 columns ran straight into the next field with
+/// NO SEPARATOR — measured on the real tree:
+/// `wgpu-core-deps-windows-linux-android 29.0.3registry`, which reads as a
+/// version called `29.0.3registry`. Fitting one column short of each field's
+/// width makes the separating space unconditional.
+fn versions_row(name: &str, version: &str, tag: &str, cells: &str) -> String {
+    // THE NAME YIELDS, THE VERSION SURVIVES. This section exists to report
+    // WHICH VERSION resolved, so fitting the pair as one string is wrong when
+    // it overflows: the cut lands on the end and eats the version, leaving a
+    // row that answers nothing. Spend the budget on the version first.
+    const NAME_VERSION: usize = 27;
+    let for_name = NAME_VERSION.saturating_sub(version.chars().count() + 1);
+    let name_version = format!("{} {}", fit(name, for_name), version);
+    let line = format!(
+        "    {:<28}{:<32}{}",
+        fit(&name_version, NAME_VERSION),
+        fit(tag, 31),
+        cells
+    );
+    line.trim_end().to_string()
+}
+
 /// One root→package path, wrapped at the terminal width with the continuation
 /// hanging under the first segment. `indent` may carry a label (`[ 3] `); the
 /// continuation replaces it with blanks so the label reads once, not per line.
@@ -1017,6 +1071,81 @@ mod tests {
             patch_state(&forks, &PkgId::new("serde", "1.0.0")),
             PatchState::Registry
         );
+    }
+
+    /// THE DIR LINE'S WIDTH IS THE CONTENT'S, NEVER THE ENVIRONMENT'S.
+    ///
+    /// Pins both halves at the call site: an in-repo dir loses the checkout
+    /// prefix (which is why this test can assert an exact string), and an
+    /// out-of-repo registry dir — whose width `$CARGO_HOME` and the package
+    /// name decide — is bounded while keeping the package directory.
+    #[test]
+    fn the_dir_line_is_bounded_and_keeps_the_package_directory() {
+        let root = Path::new(
+            "/private/tmp/build-501/-Users-example-aterm/2b813347-8abb-4e85/scratchpad/wt",
+        );
+
+        // IN-REPO: repo-relative, and the deep checkout prefix is gone.
+        let line = dir_line(root, &root.join("vendor/indexmap"));
+        assert_eq!(line, "vendor/indexmap");
+
+        // OUT-OF-REPO: nothing to strip, so it must be bounded instead.
+        let registry = Path::new(
+            "/Users//a-very-long-operator-name/.cargo/registry/src/\
+             index.crates.io-1949cf8c6b5b557f/wgpu-core-deps-windows-linux-android-29.0.3",
+        );
+        let line = dir_line(root, registry);
+        assert!(
+            line.chars().count() <= W_LINE - 16,
+            "{} cols: {line:?}",
+            line.chars().count()
+        );
+        assert!(
+            line.ends_with("wgpu-core-deps-windows-linux-android-29.0.3"),
+            "the package directory is the part worth keeping: {line:?}"
+        );
+        // …and the whole rendered line, indent included, fits the budget the
+        // width test holds every line to.
+        assert!(format!("                {line}").chars().count() <= 100);
+    }
+
+    /// A LONG NAME NEVER EATS ITS NEIGHBOUR'S COLUMN.
+    ///
+    /// `{:<28}` pads a short field and ignores a long one, so the real tree's
+    /// longest package printed `...android 29.0.3registry` — the version and
+    /// the patch tag with no space between them.
+    #[test]
+    fn a_long_name_version_keeps_the_column_separator() {
+        let row = versions_row(
+            "wgpu-core-deps-windows-linux-android",
+            "29.0.3",
+            "registry",
+            "linux, win",
+        );
+        assert!(
+            !row.contains("29.0.3registry"),
+            "the version ran into the tag: {row:?}"
+        );
+        assert!(
+            row.chars().count() <= 100,
+            "{} cols: {row:?}",
+            row.chars().count()
+        );
+        // The fitted name is followed by a REAL separator, not butted up.
+        let tag_at = row.find("registry").expect("the tag is printed");
+        assert!(
+            row[..tag_at].ends_with(' '),
+            "no separator before the tag: {row:?}"
+        );
+        // THE VERSION IS WHAT THIS SECTION REPORTS — it must survive the cut.
+        assert!(
+            row.contains("29.0.3"),
+            "the version was truncated away: {row:?}"
+        );
+        // A short row is untouched, padding and all.
+        let short = versions_row("indexmap", "2.13.0", "registry", "mac-arm");
+        assert!(short.starts_with("    indexmap 2.13.0 "), "{short:?}");
+        assert!(short.contains(" registry"), "{short:?}");
     }
 
     #[test]

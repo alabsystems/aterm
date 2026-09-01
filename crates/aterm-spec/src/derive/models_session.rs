@@ -1915,9 +1915,16 @@ pub fn authorize_soundness_model() -> Model {
 
 /// NO TRANSITIVE AUTHORITY — the property that makes deep nesting SAFE and is the
 /// reason `proxy_forward_plan` refuses to forward a chained `@a @b verb`: forwarding
-/// requires OWNER scope (`if !matches!(scope, Scope::Owner) { return None }`), so a
-/// connection that itself ARRIVED over a forward (and therefore carries only an
-/// EDGE scope) cannot initiate a further forward. Authority does not COMPOSE: a
+/// requires OWNER-CLASS scope (`if !scope.is_owner_class() { return None }` — the
+/// instance token, or the fabric BRIDGE connection, which is Owner plus the two
+/// bridge verbs), so a connection that itself ARRIVED over a forward (and
+/// therefore carries only an EDGE scope) cannot initiate a further forward. The
+/// bridge widens WHO may forward and not WHETHER authority composes: a forwarded
+/// connection authenticates at the child socket with a token, so it resolves to
+/// `Owner` or `Edge` there and can never be `Bridge` — that scope exists only on
+/// an fd the instance handed its own child, which is never a relayed one.
+///
+/// Authority does not COMPOSE: a
 /// grandparent that owns a parent cannot borrow the parent's authority to reach a
 /// grandchild — it would need a DIRECT edge to the grandchild (a delegation/grant).
 /// This is the confused-deputy boundary the capability audit verified is closed.

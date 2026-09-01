@@ -819,6 +819,13 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         false,
     ),
     manual(
+        "output_streak",
+        "Output streak",
+        ConfigSchemaKind::Table,
+        &["streak", "effect", "output", "prism", "rainbow"],
+        false,
+    ),
+    manual(
         "sparkle_words",
         "Keyword toys",
         ConfigSchemaKind::Table,

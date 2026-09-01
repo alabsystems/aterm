@@ -81,8 +81,10 @@ fn main() -> ExitCode {
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
                  gate <check>      local enforcement gate (NO CI): all|drift|dormant|lint|perf\n\
-                                   `gate lint [--no-fmt]` — tippy + trustfmt + guards;\n\
-                                   --no-fmt drops the formatter lane, nothing else\n\
+                                   `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt +\n\
+                                   guards; --no-fmt drops the formatter lane and\n\
+                                   --fmt-only keeps only it (both passes, no compiler,\n\
+                                   seconds), nothing else narrowed either way\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
                                    (this is what the `cargo verify` alias dispatches to)"

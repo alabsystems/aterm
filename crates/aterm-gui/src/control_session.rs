@@ -173,12 +173,14 @@ pub(crate) fn sessions_lines(
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
         out.push_str(&format!(
-            "{} {} {} {} {} meta={has_meta} window={window} active={active} wfocus={wfocus} detail={detail}\n",
+            "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
+             wfocus={wfocus} detail={detail}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
             h.state.as_str(),
             title,
+            nonce = h.nonce.to_hex(),
         ));
     }
     out
@@ -477,7 +479,7 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
     let target_sid = match rest.trim() {
         "" => ctx.self_id.clone(),
         s => {
-            if scope != Scope::Owner {
+            if !scope.is_owner_class() {
                 return "ERR denied\n".to_string();
             }
             SessionId::new(s)
@@ -523,7 +525,7 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
     // Session-connection rows, OWNER ONLY (see the doc above). Each peer's
     // table is locked briefly against the already-released snapshot (the
     // connections-module discipline: no store lock across a table lock).
-    if scope == Scope::Owner {
+    if scope.is_owner_class() {
         // OUTBOUND (this node → peer): rows live in each PEER's table with
         // src == target. Snapshot order keeps peers local-id sorted.
         let (mut pushes, mut pulls) = (Vec::new(), Vec::new());
@@ -742,6 +744,7 @@ pub(crate) fn cmd_await(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
     session: u64,
+    ctx: &SessionCtx,
     rest: &str,
     subscribers: &crate::subscribe::Subscribers,
 ) -> String {
@@ -752,8 +755,8 @@ pub(crate) fn cmd_await(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str =
-        "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|block> [timeout <ms>]\n";
+    const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|block|\
+                         inbox since=<id> [kinds=<k,...>]> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
     // predicate + its arguments.
@@ -779,6 +782,15 @@ pub(crate) fn cmd_await(
     let Some(&kind) = args.first() else {
         return USAGE.to_string();
     };
+
+    // `await inbox` is the FABRIC predicate and the one form that arms nothing in
+    // the engine: it parks on the session's inbox condvar, which `deliver`, `hold`
+    // and a landing post all signal, so it is event-driven with no watcher budget
+    // spent and no terminal lock taken. Answered before the `match kind` below
+    // because that arm arms its watcher UNDER the terminal lock.
+    if kind == "inbox" {
+        return crate::fabric::cmd_await_inbox(ctx, &args[1..], timeout_ms);
+    }
 
     let now0 = Instant::now();
     // Arm the predicate. The `match` verb compiles an UNTRUSTED regex: that work
@@ -1848,7 +1860,7 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
 /// `grant <src-id> <op>` -> mint an edge (src -> this session, op) and return its
 /// bearer token hex. Owner-only (also enforced by the gate's catch-all Deny).
 pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let mut it = rest.split_whitespace();
@@ -1877,7 +1889,7 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
 /// `ERR no such edge` when nothing matches. Each successful act emits one
 /// `session_edge` audit event (§1.4#5).
 pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let rest = rest.trim();
@@ -1982,7 +1994,7 @@ pub(crate) fn cmd_connect_in(
     scope: Scope,
     rest: &str,
 ) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let Ok((dst, src, kind)) = parse_connection_args(rest) else {
@@ -2052,7 +2064,7 @@ pub(crate) fn cmd_disconnect_in(
     scope: Scope,
     rest: &str,
 ) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let Ok((dst, src, kind)) = parse_connection_args(rest) else {
@@ -2086,7 +2098,7 @@ pub(crate) fn cmd_disconnect_in(
 /// snapshot first, each table locked briefly, no store lock held across a
 /// table lock).
 pub(crate) fn cmd_flows(store: &Store, scope: Scope, rest: &str) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let mut json = false;
@@ -2159,7 +2171,7 @@ pub(crate) fn cmd_raise(
     scope: Scope,
     rest: &str,
 ) -> String {
-    if scope != Scope::Owner {
+    if !scope.is_owner_class() {
         return "ERR denied\n".to_string();
     }
     let session = match raise_target(store, rest) {
@@ -2266,6 +2278,14 @@ fn exit_rows<'a>(
 pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
     match scope {
         Scope::Owner => ExitActor::Unknown,
+        // The fabric bridge is anonymous here for exactly the reason the owner
+        // token is: it names a CONNECTION, not a session, and `by=` is a sid
+        // column. It is deliberately NOT folded into `Owner` — this is the one
+        // site where the two scopes would want to differ — but naming it would
+        // widen the `exits` wire with a fourth `by=` token, which §11.2 keeps as a
+        // separate, low-priority item. `by=-` beside `reason=ctl-close` stays the
+        // honest row until then.
+        Scope::Bridge => ExitActor::Unknown,
         Scope::Edge(presented) => target
             .edges
             .lock()
@@ -2286,6 +2306,10 @@ pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
 pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
     let s = match scope {
         Scope::Owner => "owner".to_string(),
+        // The bridge learns it IS the bridge — the one thing a hand-started
+        // `aterm-link serve --sock` (an Owner-token client, observer mode) cannot
+        // see any other way, and the check it makes before claiming delivery.
+        Scope::Bridge => "bridge".to_string(),
         Scope::Edge(presented) => {
             let table = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
             match table.authorize(&presented, &ctx.self_id, &ctx.nonce) {
@@ -2329,6 +2353,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         SessionHandle {
             sid,
@@ -2352,12 +2377,21 @@ mod tests {
         }
     }
 
-    /// The tail every line carries, after the sid (which is minted per run).
+    /// The tail every line carries, after the sid and with the per-launch
+    /// `nonce=` elided — both are minted per run, so neither can be pinned by
+    /// value. The nonce's PRESENCE is pinned separately, by
+    /// [`the_roster_carries_each_sessions_public_launch_nonce`].
     fn tail(line: &str) -> String {
         let mut f = line.splitn(3, ' ');
         let local = f.next().unwrap();
         let _sid = f.next().unwrap();
-        format!("{local} {}", f.next().unwrap())
+        let rest = f.next().unwrap();
+        let rest = rest
+            .split_whitespace()
+            .filter(|t| !t.starts_with("nonce="))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{local} {rest}")
     }
 
     /// With rows present, each line names its window, active-tab and front
@@ -2412,6 +2446,35 @@ mod tests {
             tail(lines[2]),
             "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep"
         );
+    }
+
+    /// THE EPOCH THE FABRIC BRIDGE READS. §7 of the fabric design says a
+    /// session's presence row carries `epoch=` — its public launch nonce,
+    /// verbatim — and names `whoami` as where the bridge reads it. `whoami`
+    /// reports only the CONNECTION's own session and refuses a selector, so a
+    /// bridge (whose connection is not a session's) cannot read any session's
+    /// nonce that way; the roster is where it can. Additive, and additive of
+    /// nothing secret: the nonce is public anti-spoof state by construction
+    /// (`aterm_session::LaunchNonce`), republished in every presence row on the
+    /// bus, and this listing is Owner-only anyway.
+    #[test]
+    fn the_roster_carries_each_sessions_public_launch_nonce() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h = handle(0, &term);
+        let expect = h.nonce.to_hex();
+        let out = sessions_lines(&[h], Err("no event loop"));
+        let row = out.lines().nth(1).expect("one session row");
+        assert!(
+            row.contains(&format!(" nonce={expect} ")),
+            "the roster must carry the launch nonce: {row}"
+        );
+        // Thirty-two hex digits, and it sits AFTER `meta=` so `aterm-ctl`'s
+        // `roster_tail` (which reads back to that anchor) keeps working.
+        assert_eq!(expect.len(), 32, "{expect}");
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        let meta_at = fields.iter().position(|f| f.starts_with("meta=")).unwrap();
+        let nonce_at = fields.iter().position(|f| f.starts_with("nonce=")).unwrap();
+        assert_eq!(nonce_at, meta_at + 1, "{row}");
     }
 
     /// `detail=` is the sanitized executing command (no arguments), `-` when
@@ -2496,6 +2559,7 @@ mod tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         }
     }
 

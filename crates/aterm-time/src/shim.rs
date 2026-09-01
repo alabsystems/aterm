@@ -6,8 +6,9 @@
 //!
 //! # This module is compiled on native too — under `cfg(test)`
 //!
-//! `wasm32-unknown-unknown` needs its own std, and the Trust toolchain does not
-//! ship one, so `cargo xtask gate web` SKIPS on a normal aterm dev box. A
+//! `wasm32-unknown-unknown` needs its own std and the Trust toolchain ships
+//! none, so `cargo xtask gate web` cross-compiles this crate on upstream
+//! stable. That proves it still COMPILES; it executes nothing. A
 //! browser-only module would therefore be code that no test on the machine
 //! writing it can reach — which is exactly how a clock ships broken.
 //!

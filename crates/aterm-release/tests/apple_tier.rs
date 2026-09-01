@@ -29,7 +29,9 @@
 //!
 //! Every team id is `TEAMIDXXXX` / `OTHERTEAM1`, every certificate hash is a
 //! repeated hex digit, and every name is `Placeholder Org`. `pins::APPLE_TEAM_ID`
-//! is EMPTY in this tree and this file does not assert otherwise — see
+//! is ARMED in this tree and this file asserts its value directly (see the team-id
+//! assertion below); the note that used to stand here said the opposite and pointed at
+//! a tripwire the arming commit deleted — see
 //! `the_shipped_anchor_is_unset_so_the_tier_is_inert`, which pins that fact
 //! deliberately.
 

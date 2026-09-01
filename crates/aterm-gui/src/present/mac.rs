@@ -103,7 +103,7 @@ const K_CG_IMAGE_ALPHA_NONE_SKIP_FIRST: u32 = 6;
 /// `kCGBitmapByteOrder32Little` (`2 << 12`, `CGImage.h`).
 const K_CG_BITMAP_BYTE_ORDER_32_LITTLE: u32 = 2 << 12;
 /// The `CGBitmapInfo` softbuffer's CG backend builds, verbatim: alpha-skip-first
-/// + integer components + 32-bit little-endian + packed pixel format. The
+/// plus integer components, 32-bit little-endian and a packed pixel format. The
 /// component-info and pixel-format contributions are both zero.
 const BITMAP_INFO: u32 = K_CG_IMAGE_ALPHA_NONE_SKIP_FIRST | K_CG_BITMAP_BYTE_ORDER_32_LITTLE;
 /// `kCGRenderingIntentDefault`.
@@ -288,11 +288,20 @@ impl fmt::Display for MacPresentError {
 type LayerGeometry = (CGFloat, CGFloat, CGFloat, CGFloat, CGFloat);
 
 /// One window's first-party macOS CPU presentation target.
+///
+/// FIELD ORDER IS LOAD-BEARING HERE. Rust drops a struct's fields in
+/// DECLARATION order, so `_window` is declared LAST: the `Arc<Window>` that
+/// keeps the `NSView` (and therefore `root_layer`) alive must outlive every
+/// field that borrows from it. It previously sat first, which is the exact
+/// inverse of what its own doc comment asked for.
+///
+/// No use-after-free was reachable from the old order — [`Drop`] runs before
+/// any field drops and already unparents the layer, and `root_layer` is a raw
+/// pointer nothing dereferences during teardown — so this is a latent hazard
+/// closed, not a live bug fixed. It is worth closing because the next thing
+/// that lands here (a `CAMetalLayer`, whose release path DOES touch its
+/// superlayer) would make the order matter for real.
 pub(crate) struct MacCpuPresenter {
-    /// Keeps winit's `NSWindow`/`NSView` alive for as long as this presenter
-    /// holds a layer parented into that view. Dropping the last window
-    /// reference before the layer would leave `root_layer` dangling.
-    _window: Arc<Window>,
     /// Our own +1 `CALayer`, a SUBLAYER of the view's backing layer.
     ///
     /// A sublayer, not the view's own layer, for the reason `softbuffer` gives:
@@ -310,6 +319,11 @@ pub(crate) struct MacCpuPresenter {
     height: usize,
     /// Change gate for [`MacCpuPresenter::sync_layer_geometry`].
     applied_geometry: Option<LayerGeometry>,
+    /// Keeps winit's `NSWindow`/`NSView` alive for as long as this presenter
+    /// holds a layer parented into that view. Dropping the last window
+    /// reference before the layer would leave `root_layer` dangling — which is
+    /// why this is the LAST field and therefore the last to drop.
+    _window: Arc<Window>,
 }
 
 impl MacCpuPresenter {
@@ -440,13 +454,14 @@ impl CpuPresenter for MacCpuPresenter {
             }
 
             Ok(Self {
-                _window: window,
                 layer,
                 root_layer,
                 color_space: OwnedColorSpace(color_space),
                 width: 0,
                 height: 0,
                 applied_geometry: None,
+                // Last, matching the declaration order the type's docs pin.
+                _window: window,
             })
         }
     }

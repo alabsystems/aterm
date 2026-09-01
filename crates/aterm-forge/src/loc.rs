@@ -40,15 +40,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Where a package's source lives, in the order the contract fixes:
-/// a WORKSPACE MEMBER first, then the registry checkout, then `vendor/<name>`
-/// for a `[patch.crates-io]` fork, then `crates/<name>`.
+/// a WORKSPACE MEMBER first, then its `[patch.crates-io]` target (both matched
+/// on name AND version), then the registry checkout, then `crates/<name>`.
 ///
-/// Registry-before-vendor is not an accident. Five of the six vendored forks
-/// also have a pristine registry copy of the same version, and measuring the
-/// pristine copy keeps the LOC ledger stable while a fork is being edited — a
-/// fork that deletes 400 lines has not shrunk the surface aterm depends on, it
-/// has shrunk the fork. [`crate::attest`] is where fork-vs-upstream drift is
-/// audited; this is where the surface is sized.
+/// PATCH-BEFORE-REGISTRY, since 2026-08-30, and the previous order is worth
+/// knowing about because it was deliberate and still wrong. It preferred a
+/// pristine registry copy of the same version, to keep the LOC ledger stable
+/// while a fork was being edited — "a fork that deletes 400 lines has not
+/// shrunk the surface aterm depends on, it has shrunk the fork". The goal was
+/// right; the mechanism silently fell through to `vendor/<name>` when no such
+/// checkout existed, so the ledger's committed numbers depended on whether the
+/// operator's CARGO_HOME happened to hold one — green on m21, red everywhere
+/// else, same commit. See the body for the measurement. What compiles is the
+/// fork, so the fork is what this module sizes; [`crate::attest`] remains where
+/// fork-vs-upstream drift is audited.
 ///
 /// WORKSPACE-MEMBER-BEFORE-REGISTRY IS ALSO NOT AN ACCIDENT, and it was found
 /// by being wrong. That same "prefer the pristine copy" rule matches purely on
@@ -89,48 +94,157 @@ pub fn package_dir_hinted(root: &Path, id: &PkgId, printed: Option<&Path>) -> Op
     {
         return Some(member.clone());
     }
-    // OPEN FINDING (2026-08-30): THIS BRANCH MAKES A RATCHETED NUMBER DEPEND ON
-    // AN UNVERSIONED LOCAL CACHE, and it is why `loc`, `dominator`, `resolve`
-    // and `survey` are red on some machines and green on others with the same
-    // commit.
+    // A PATCHED PACKAGE RESOLVES TO THE PATH THAT COMPILES, before the registry
+    // is consulted at all. This reverses "registry-before-vendor", and the
+    // reversal was forced by measurement rather than taste.
     //
-    // A `[patch.crates-io]` FORK resolves here to a PRISTINE registry checkout
-    // of the same version whenever one happens to be unpacked in this machine's
-    // CARGO_HOME, and silently falls through to `vendor/<name>` when none is.
-    // The two measure different code. Proved by construction: a scratch
-    // CARGO_HOME mirroring the real one plus only the pristine `winit 0.30.13`
-    // and `smol_str 0.2.2` trees unpacked from their published `.crate`s puts
-    // all four survey cells EXACTLY on their recorded ceilings and turns `check`
-    // green; without them each cell reads +713 lines (winit +685, smol_str +28,
-    // and smol_str is in every cell via winit — hence the identical delta).
+    // The old order preferred a PRISTINE registry checkout of the same version
+    // when one happened to be unpacked in this machine's CARGO_HOME, and fell
+    // through to `vendor/<name>` when none was — silently. The two measure
+    // different code, so a committed, ratcheted number depended on an
+    // unversioned local cache. Proved by construction: a scratch CARGO_HOME
+    // mirroring the real one plus only the pristine `winit 0.30.13` and
+    // `smol_str 0.2.2` trees unpacked from their published `.crate`s puts all
+    // four survey cells EXACTLY on their recorded ceilings and turns `check`
+    // green; without them every cell reads +713 lines (winit +685, smol_str
+    // +28, the latter in all four cells via winit). Every ratchet commit in
+    // this ledger's history was authored on m21, so the ceilings were
+    // calibrated to m21's cache, and the same commit was green there and red
+    // everywhere else.
     //
-    // Every ratchet commit in this ledger's history is authored on m21, so the
-    // committed ceilings are calibrated to m21's cache. Re-measuring them on a
-    // machine without those checkouts does not fix the skew, it moves it.
+    // The old rule's stated purpose was STABILITY — "a fork that deletes 400
+    // lines has not shrunk the surface aterm depends on, it has shrunk the
+    // fork". That goal is real, and this branch never delivered it: a number
+    // that changes with `cargo fetch` is not stable, it is only stable on one
+    // laptop. Nor is the pristine copy reliably obtainable — neither the
+    // unpacked source nor the `.crate` for either fork exists on this machine,
+    // so "measure pristine" is not even available to fail closed on here
+    // without a network.
     //
-    // The repair is a DECISION, not a patch, which is why this is a comment and
-    // not a change: either always measure the fork (drop this branch, so the
-    // number is what the repo carries), or always measure pristine (fail closed
-    // when the checkout is absent, so the number is the delta the fork adds) —
-    // but not "whichever this laptop happens to have". Note the separate, real
-    // movement underneath it: the graph itself has grown since the ceilings were
-    // set (third-party packages 91 -> 101 on mac-arm, +3 duplicate names), so a
-    // re-ratchet is owed too — and cannot be trusted until this is settled.
+    // What ships is the fork. `aterm` compiles `vendor/winit`, not the
+    // registry's winit, so the fork's lines ARE the third-party surface this
+    // campaign is scored on, and they are readable on every machine from the
+    // repository alone. The signal the old rule was protecting is not lost:
+    // fork-vs-upstream drift is [`crate::attest`]'s obligation (OB-7 diffs the
+    // fork against its pinned upstream), which is where it belongs — this
+    // module sizes the surface, attest audits how it differs.
+    //
+    // The patch TABLE is the authority, not the `vendor/` directory name: a
+    // patch may point anywhere, and the first-party replacements point at
+    // `crates/aterm-*`. Those are already resolved by the member branch above;
+    // this catches the vendored forks and anything else the table redirects.
+    // NAME AND VERSION HERE TOO, for the reason the member branch above spells
+    // out: `[patch.crates-io]` matches on package NAME, and cargo will still
+    // resolve a SECOND, registry-sourced copy of that name at a version the
+    // patch cannot satisfy. Billing that real third-party package to the fork's
+    // directory would drop it out of `third_party_*` entirely. The patch
+    // target's own manifest version is the discriminator, exactly as the
+    // member's is.
+    if let Some((version, dir)) = patch_targets(root).get(&id.name)
+        && version == &id.version
+        && dir.is_dir()
+    {
+        return Some(dir.clone());
+    }
     for src in registry_srcs() {
         let candidate = src.join(format!("{}-{}", id.name, id.version));
         if candidate.is_dir() {
             return Some(candidate);
         }
     }
-    let vendored = root.join("vendor").join(&id.name);
-    if vendored.is_dir() {
-        return Some(vendored);
-    }
+    // NO VERSION-BLIND `vendor/<name>` FALLBACK. There used to be one, and with
+    // the patch branch above it is worse than redundant: every `vendor/` tree
+    // here IS a `[patch.crates-io]` target, so the only ids it could still
+    // catch are the ones the version guard just REFUSED — a second,
+    // registry-sourced copy at a version the fork cannot satisfy. Answering
+    // `vendor/<name>` for those would bill a real third-party package to the
+    // fork's directory and drop it out of `third_party_*` entirely, which is
+    // the exact failure the member branch's version check was written to stop.
     let member = root.join("crates").join(&id.name);
     if member.is_dir() {
         return Some(member);
     }
     printed.filter(|p| p.is_dir()).map(Path::to_path_buf)
+}
+
+/// Package name → (version, directory) for every `[patch.crates-io]` target.
+///
+/// The patch TABLE, not the `vendor/` directory name, is the authority on where
+/// a patched package's source lives: a patch may point anywhere, and this
+/// repo's first-party replacements point at `crates/aterm-*` while its forks
+/// point at `vendor/*`. Parsed with the same minimal TOML walk
+/// `attest::patch_paths` uses; kept here rather than shared because `attest`
+/// returns an ordered pair list for its own obligations and this wants a
+/// lookup.
+///
+/// Memoized per root for the same reason [`workspace_members`] is: `survey`
+/// measures four cells over ~150 packages and each one asks this question.
+fn patch_targets(root: &Path) -> &'static MemberIndex {
+    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(hit) = guard.get(root) {
+        return hit;
+    }
+    let mut table: MemberIndex = BTreeMap::new();
+    if let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) {
+        let mut in_patch = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if t.starts_with('[') {
+                in_patch = t == "[patch.crates-io]";
+                continue;
+            }
+            if !in_patch || t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            // `name = { path = "vendor/name" }`
+            let Some((name, rest)) = t.split_once('=') else {
+                continue;
+            };
+            let Some(after) = rest.split_once("path") else {
+                continue;
+            };
+            let mut it = after.1.split('"');
+            let _ = it.next();
+            if let Some(path) = it.next().filter(|p| !p.is_empty()) {
+                let dir = root.join(path);
+                let Some(version) = manifest_version(&dir) else {
+                    continue;
+                };
+                table.insert(name.trim().trim_matches('"').to_string(), (version, dir));
+            }
+        }
+    }
+    let leaked: &'static MemberIndex = Box::leak(Box::new(table));
+    guard.insert(root.to_path_buf(), leaked);
+    leaked
+}
+
+/// `[package] version` from a manifest directory, if it reads.
+fn manifest_version(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("version") {
+            let mut it = rest.split('"');
+            let _ = it.next();
+            if let Some(v) = it.next().filter(|v| !v.is_empty()) {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// `[package] name` -> (version, directory) for every `crates/*` member.
@@ -148,7 +262,7 @@ type MemberIndex = BTreeMap<String, (String, PathBuf)>;
 /// third-party consumers at it. A directory-name lookup misses exactly the
 /// crate that needs to be found.
 ///
-/// Memoized per root: `survey` measures four cells that share ~150 packages,
+/// Memoized per root: `survey` measures five cells that share ~150 packages,
 /// and this is ~70 small manifest reads.
 fn workspace_members(root: &Path) -> &'static MemberIndex {
     static MEMBERS: OnceLock<Mutex<BTreeMap<PathBuf, &'static MemberIndex>>> = OnceLock::new();
@@ -325,8 +439,8 @@ pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
 }
 
 /// The process-wide memo. A package's on-disk facts do not change while forge
-/// runs, and the four cells share ~150 packages: without this, `survey` walks
-/// the same registry trees four times.
+/// runs, and the five cells share ~150 packages: without this, `survey` walks
+/// the same registry trees five times.
 fn cached_facts(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
     static CACHE: OnceLock<Mutex<BTreeMap<(PathBuf, PkgId), PkgFacts>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -516,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn package_dir_prefers_the_member_then_the_registry_then_vendor() {
+    fn package_dir_prefers_the_member_then_the_patch_then_the_registry() {
         let root = repo_root();
 
         // THE REGISTRY ARM. `syn` is the deliberate choice and the reason is a
@@ -544,10 +658,25 @@ mod tests {
             .expect("the patched `libc` resolves");
         assert_eq!(retired, root.join("crates").join("aterm-libc"));
 
-        // No registry copy of this version exists, so the fork answers.
-        let vendored = package_dir(&root, &PkgId::new("winit", "0.0.0-not-published"))
-            .expect("vendor/winit is the fallback for an unpublished winit version");
-        assert_eq!(vendored, root.join("vendor").join("winit"));
+        // THE PATCH ARM. A vendored fork answers from the path that COMPILES,
+        // on every machine — the assertion the old order could not make, since
+        // it read the registry first and reached `vendor/` only when this box
+        // happened to lack a pristine checkout of the same version.
+        let forked = package_dir(&root, &PkgId::new("winit", "0.30.13"))
+            .expect("the patched winit resolves");
+        assert_eq!(forked, root.join("vendor").join("winit"));
+
+        // …and only at the version the fork actually IS. This assertion used to
+        // read the other way — an unpublished version fell through to
+        // `vendor/winit` — and that fallback is exactly what had to go: a
+        // second, registry-sourced copy of the same NAME is somebody else's
+        // package, and billing it to the fork's directory would drop a real
+        // third-party package out of `third_party_*` altogether.
+        assert_ne!(
+            package_dir(&root, &PkgId::new("winit", "0.0.0-not-published")),
+            Some(root.join("vendor").join("winit")),
+            "the version guard must refuse a name-only match"
+        );
 
         let member = package_dir(&root, &PkgId::new("aterm-core", "0.47.0"))
             .expect("workspace members resolve under crates/");
@@ -680,13 +809,25 @@ mod tests {
 
     #[test]
     fn mac_arm_duplicate_names_match_the_baseline() {
-        let dups = survey(0).duplicate_names();
+        let s = survey(0);
+        let dups = s.duplicate_names();
         let names: Vec<&str> = dups.keys().map(String::as_str).collect();
         assert_eq!(names, measured::MAC_ARM_DUPLICATE_NAMES);
+        // THE hashbrown TOOTH. Counted over the RESOLVED graph, not looked up
+        // in `dups`: hashbrown is down to one version and therefore has no key
+        // in the duplicate map at all, so the old `dups["hashbrown"]` would
+        // panic on the fix instead of asserting it. One requirement in the whole
+        // tree ever asked for the second copy — upstream indexmap 2.14's
+        // `hashbrown = "0.17"`, now pinned to "0.16" in vendor/indexmap — so a
+        // 2 here means that vendored line came back, or a new parent brought a
+        // third major of hashbrown with it. Either is 25,236 lines of duplicated
+        // hash table in one binary, and either is worth failing for.
+        let versions = s.third_party().filter(|p| p.name == "hashbrown").count();
         assert_eq!(
-            dups["hashbrown"].len(),
+            versions,
             measured::MAC_ARM_HASHBROWN_VERSIONS,
-            "hashbrown resolves three times over"
+            "hashbrown resolves at {versions} version(s) on mac-arm; the dedup \
+             to a single 0.16.1 has regressed"
         );
     }
 
@@ -696,9 +837,79 @@ mod tests {
     }
 
     #[test]
-    fn windows_and_wasm_match_the_measured_baseline() {
+    fn windows_and_both_wasm_modules_match_the_measured_baseline() {
         assert_matches_baseline(2);
         assert_matches_baseline(3);
+        assert_matches_baseline(4);
+    }
+
+    /// THE CLAIM THE TWO wasm CELLS MAKE, CHECKED RATHER THAN ASSUMED.
+    ///
+    /// aterm ships THREE `cdylib` crates into the browser page — the census
+    /// names all three in `aterm_census::wasm_census::WASM_ROOT_CRATES` — and
+    /// forge gives only two of them a cell. That is honest only while the third,
+    /// `aterm-effects-web`, brings nothing of its own: measured, its `wasm32`
+    /// closure differs from `aterm-wasm`'s by exactly one node, its own root
+    /// package, so every third-party package it ships is already inside the
+    /// `wasm-cpu` row.
+    ///
+    /// Nothing about that is permanent. `aterm-effects-web` is a real crate with
+    /// its own manifest, and the day it takes a dependency the CPU module does
+    /// not have, a shipped browser module would be carrying third-party code no
+    /// ratchet bounds — silently, because no cell is rooted there. This test is
+    /// what makes that loud, and it names the packages.
+    ///
+    /// The same check runs for the CPU module against the GPU module, for the
+    /// weaker reason that it is the containment the `wgpu`-is-the-whole-gap note
+    /// on [`measured::WASM_GPU`] asserts in prose.
+    #[test]
+    fn the_wasm_cells_cover_every_shipped_web_crate() {
+        let root = repo_root();
+        let contained = |inner: &str, outer_cell_index: usize| {
+            let outer = survey(outer_cell_index);
+            let cell = crate::model::Cell {
+                name: format!("probe-{inner}"),
+                triple: "wasm32-unknown-unknown".to_string(),
+                package: inner.to_string(),
+            };
+            let g = crate::resolve::graph(&root, &cell)
+                .unwrap_or_else(|e| panic!("`{inner}` must resolve for wasm32 offline: {e}"));
+            let escaped: Vec<String> = g
+                .nodes
+                .iter()
+                .filter(|id| id.name != inner && !outer.graph.nodes.contains(id))
+                .map(ToString::to_string)
+                .collect();
+            assert!(
+                escaped.is_empty(),
+                "`{inner}` is a SHIPPED wasm module whose graph has left the `{}` cell: {escaped:?}.                  Either add a cell rooted at `{inner}` to aterm_forge::resolve::default_cells and                  ratchet it in tools/forge-budget.tsv AND measured.rs, or put the dependency back                  inside a cell that is measured. A shipped module outside every cell is                  third-party surface with no ceiling.",
+                outer.cell.name
+            );
+        };
+        // Every census-listed browser root is judged, BY READING THE CONSTANT.
+        // The first cut of this test hardcoded the two names it knew about, so a
+        // FOURTH cdylib added to `WASM_ROOT_CRATES` would have shipped with no
+        // cell, no ceiling and no failure — the exact silence the docstring
+        // promises against. A root that IS a cell root is measured directly and
+        // skipped here; every other root must fit inside the superset wasm cell
+        // (index 4, `wasm-gpu`), whose row then bounds all of its third-party
+        // packages. A bogus or unresolvable entry fails the resolve unwrap.
+        // The census roster holds repo-relative DIRECTORY paths; the package
+        // name is the final segment (true for every workspace member here, and
+        // the resolve unwrap below fails loudly if that ever stops holding).
+        let cells = crate::resolve::default_cells();
+        for entry in aterm_census::WASM_ROOT_CRATES {
+            let inner = entry.rsplit('/').next().expect("split never yields empty");
+            if cells.iter().any(|c| c.package == inner) {
+                continue;
+            }
+            contained(inner, 4);
+        }
+        // And the two STRONGER containments, pinned by name: the effects module
+        // fits the CPU cell (not merely the GPU superset), and CPU ⊆ GPU is the
+        // set-difference claim the `wgpu` note on [`measured::WASM_GPU`] makes.
+        contained("aterm-effects-web", 3);
+        contained("aterm-wasm", 4);
     }
 
     #[test]

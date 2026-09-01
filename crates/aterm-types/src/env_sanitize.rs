@@ -154,6 +154,35 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // Controller-spawn observation hint (session connections): one hop only —
     // a descendant that did not receive it fresh is not the controller.
     ENV_OBSERVE_SESSION_ID,
+    // FABRIC credentials (design §11.2). The bridge's broker endpoint, its
+    // capability FILE and its fleet name are the node's identity on the bus: a
+    // nested aterm that inherited them could publish AS the outer node, under the
+    // outer node's cap, which is the confused deputy the whole `via=`/relay
+    // discipline exists to avoid. An inner aterm becomes its own node only when a
+    // human mints it a cap out of band — never by inheritance, and never by env.
+    "ATERM_LINK_BROKER",
+    "ATERM_LINK_CAP_FILE",
+    "ATERM_LINK_FLEET",
+    // And the LAUNCH knob itself (A3), for the sharper version of the same
+    // reason: an inner aterm that inherited `$ATERM_FABRIC_COMMAND` would start
+    // its own bridge from the OUTER instance's command line — the outer node's
+    // id, the outer node's cap file, the outer node's state dir — and hand it
+    // `Scope::Bridge` over the INNER instance's sessions. Two bridges publishing
+    // as one node, each believing it owns the incarnation.
+    //
+    // THIS CLOSES THE ENV ROUTE ONLY, AND THE ENV ROUTE IS THE OVERRIDE, NOT THE
+    // ORDINARY ONE. `fabric_launch::configured_command` reads this variable
+    // first and falls back to `[fabric] command` in the per-user config file,
+    // which a nested aterm reads identically because it is the SAME file — so a
+    // nested instance still launches a second `aterm-link serve` from the outer
+    // node's command line, cap file and state dir, and `StateDir::open` takes no
+    // lock that would refuse it. A deny-list entry is not a gate: the gate for
+    // the config route would have to be in the launcher (spawn only from a ROOT
+    // instance — no `ATERM_PARENT_SESSION_ID` — the way the net-listen selectors
+    // are gated by never being inherited) or in the state dir (an exclusive
+    // lock). Neither exists yet; this entry is named honestly rather than read
+    // as closing a door that is still open. See the pin in this module's tests.
+    "ATERM_FABRIC_COMMAND",
 ];
 
 /// Returns `true` if `key` matches a deny-listed AI or containment env var.
@@ -269,6 +298,45 @@ mod tests {
             "ATERM_EDGE_TOKENS must stay deny-listed even though the file persists \
              for the session (cross-hop inheritance must still be stripped)"
         );
+    }
+
+    /// **THE DENY-LIST ENTRY FOR `ATERM_FABRIC_COMMAND` CLOSES ONE OF TWO
+    /// DOORS**, and its comment must keep saying so for as long as that is true.
+    ///
+    /// The variable is only the OVERRIDE: `fabric_launch::configured_command`
+    /// falls back to the per-user config's `[fabric] command`, which a nested
+    /// aterm reads from the same file, so denying the env var alone does not
+    /// stop a second bridge from starting on the outer node's identity. The
+    /// pin is one-directional ON PURPOSE — it fires while the launcher has no
+    /// nested-instance gate, and simply falls silent once one lands, so a fix
+    /// on the other side of the tree can never fail this crate's suite. What it
+    /// prevents is the thing an audit actually found: a comment that reads as
+    /// closed while the config route stays open.
+    ///
+    /// The `include_str!` reaches across crates, which is the house pattern for
+    /// pinning a claim to the code that would falsify it (see
+    /// `aterm-gui/src/control.rs`'s pin of `aterm-control/src/selection.rs`); it
+    /// is test-only and adds no dependency.
+    #[test]
+    fn the_fabric_command_denial_names_the_config_route_it_does_not_close() {
+        let launcher = include_str!("../../aterm-gui/src/fabric_launch.rs");
+        let me = include_str!("env_sanitize.rs");
+        assert!(
+            launcher.contains(".and_then(|f| f.command.clone())"),
+            "fabric_launch.rs no longer reads the config fallback; re-read this \
+             module's ATERM_FABRIC_COMMAND note, it may now be stale"
+        );
+        // Assembled, not written out: a literal here would be found in THIS
+        // function's own source and the pin would match itself — which is
+        // exactly how a test comes to guard nothing.
+        let marker = ["THIS", "CLOSES", "THE", "ENV", "ROUTE", "ONLY"].join(" ");
+        if !launcher.contains("PARENT_SESSION_ID") {
+            assert!(
+                me.contains(&marker),
+                "the launcher still spawns a bridge from a NESTED instance, so the \
+                 deny-list entry must keep saying which route it does not close"
+            );
+        }
     }
 
     #[test]

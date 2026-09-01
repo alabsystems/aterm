@@ -32,11 +32,26 @@ loc_method = "rs-physical-all-files-v1"
 graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
 # The measurement matrix: resolution needs no toolchain, so every cell is mandatory and
 # offline. A cell that cannot resolve is named and skipped, never passed.
+# EVERY CELL IS ROOTED AT SOMETHING ATERM SHIPS FOR THAT TARGET. The three native cells
+# are rooted at the `aterm` binary. The two wasm cells are NOT, and the correction is
+# recorded here because this file is the record: `aterm` is a [[bin]]
+# (crates/aterm/Cargo.toml) that nothing compiles for wasm32, and until 2026-08-30 the
+# single wasm cell was rooted at it anyway. cargo tree resolves it for that triple
+# regardless, so the cell reported a configuration nothing builds — wrong in both
+# directions, measured: it counted zstd (a C library, default-features'd OUT of both web
+# crates), winit, rustls and the whole updater, and it MISSED console_error_panic_hook,
+# which both shipped modules declare and the `aterm` root never reaches. There are two
+# wasm rows and not one because aterm ships two separate .wasm artifacts — `xtask gate
+# web` and tools/wasm-bench/run.sh each build `-p aterm-wasm -p aterm-gpu-web` — and they
+# are not the same surface: 27 third-party packages / 255,826 lines against 64 / 984,913,
+# a 37-package gap inside wgpu's subtree (dom(wgpu) there: 33 / 523,700 -- web-sys is direct). The third web cdylib, aterm-effects-web, needs no
+# cell: its wasm32 closure is a strict subset of aterm-wasm's, and a test holds it there.
 cells = [
     { name = "mac-arm", triple = "aarch64-apple-darwin", package = "aterm" },
     { name = "linux", triple = "x86_64-unknown-linux-gnu", package = "aterm" },
     { name = "win", triple = "x86_64-pc-windows-msvc", package = "aterm" },
-    { name = "wasm", triple = "wasm32-unknown-unknown", package = "aterm" },
+    { name = "wasm-cpu", triple = "wasm32-unknown-unknown", package = "aterm-wasm" },
+    { name = "wasm-gpu", triple = "wasm32-unknown-unknown", package = "aterm-gpu-web" },
 ]
 
 # --- winit 0.30.13 ------------------------------------------------------------
@@ -75,7 +90,7 @@ census.mode = "scanned"
 census.namespace = "libm"
 
 # --- indexmap 2.14.0 ----------------------------------------------------------
-# census review: aterm-trust fork of upstream indexmap (index-panic fix): one zero-arg
+# census review: aterm-trust fork of upstream indexmap (index-panic fix; PLUS a dependency-requirement change 2026-08-31: hashbrown pinned to 0.16 so one version serves the whole graph -- retiring this fork to the registry copy silently restores hashbrown 0.17.1 on four cells, 100,944 lines): one zero-arg
 #   `.read()` (extract.rs) that is core::ptr::read, categorized by the propagated
 #   raw-pointer evidence; no locks
 # LICENSE: Apache-2.0 OR MIT — dual-licensed, so a copy distributed under the non-Apache

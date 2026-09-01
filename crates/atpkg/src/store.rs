@@ -966,9 +966,32 @@ pub fn default_prefix(home: &Path) -> PathBuf {
 #[must_use]
 pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
     let home = aterm_types::dirs::home_dir()?;
-    Some(Layout {
-        prefix: vet_prefix(configured, &home),
-    })
+    let prefix = vet_prefix(configured, &home);
+    // A REJECTED prefix falls back to the default — correct in production (a typo in
+    // `[packages].prefix` must not brick the store) and catastrophic under test, where
+    // the default prefix is the developer's OWN live store. That is not theoretical: a
+    // test here once aimed at the process temp dir, which `vet_prefix` refuses (not
+    // under $HOME), and so wrote `trust` into the real machine's removed ledger —
+    // uninstalling that machine's compiler and, through the coherence rule, its whole
+    // `rustc` tuple. It went unnoticed for eight days because `doctor` had no
+    // completeness check to notice it with.
+    //
+    // The test that caused it was fixed by hand-rolling this assertion at its call site.
+    // It belongs HERE instead: one test remembering to check is a fix for one test,
+    // while the next author of the next test inherits the same trap. Costs nothing in a
+    // release build.
+    #[cfg(test)]
+    if let Some(asked) = configured {
+        assert_eq!(
+            prefix,
+            asked.to_path_buf(),
+            "vet_prefix rejected the prefix this test asked for and fell back to the \
+             DEFAULT — which under test is the developer's real store. Give the test a \
+             prefix the vet admits: strictly under $HOME, absolute, no `..`, and a real \
+             0700 directory (see `a_removed_program_is_read_from_the_layout_by_every_lane`)"
+        );
+    }
+    Some(Layout { prefix })
 }
 
 /// Resolve the layout THE USER CONFIGURED — `[packages].prefix` when set, the
@@ -1012,11 +1035,34 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     // the verified lane — Trust's default `CallerOwned` mode admits a component owned
     // by the invoking identity, so the $HOME shape proves fine (see the module docs).
     if !under_home(p, home) {
-        return if system_chain_trusted(p) {
-            p.to_path_buf()
-        } else {
-            default
-        };
+        if !system_chain_trusted(p) {
+            return default;
+        }
+        // TRUSTED IS NOT THE SAME AS USABLE. The chain check above proves no
+        // attacker-writable ancestor can swap a component; it says nothing about
+        // whether the CALLER can write here. A non-root user with a root-owned
+        // prefix configured used to pass this check and then fail on `store.lock`
+        // for every verb, forever — while the GUI's launch install reported the
+        // failure only as a WARN in a log file. That combination left a machine
+        // with no toolchain for three weeks, with a one-line stale config as the
+        // whole cause (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        //
+        // Falling back is the posture this function already takes for every other
+        // violation, and it is the safe direction: the default prefix is
+        // `$HOME`-owned and needs no privilege, so a config that would otherwise
+        // brick the install degrades to a working one. Say so out loud — silence
+        // is what made the original failure survive.
+        if !caller_can_use_prefix(p) {
+            eprintln!(
+                "atpkg: configured prefix {} is not writable by this user — \
+                 using the default {} instead (set [packages].prefix only for a \
+                 shared multi-user store this user can write)",
+                p.display(),
+                default.display()
+            );
+            return default;
+        }
+        return p.to_path_buf();
     }
     // HOME PREFIX — must be strictly under $HOME. Containment is compared with
     // `under_home` (case-insensitively on Windows, whose filesystem is
@@ -1054,6 +1100,41 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
 /// in the chain is enough to reintroduce the CWE-379 swap window this exists to close,
 /// so this is an AND over the full chain, not a leaf check.
 #[must_use]
+/// Can the caller actually install into `p`?
+///
+/// The tail of a configured prefix need not exist yet — atpkg creates it — so the
+/// question is asked of the deepest component that *does* exist, which is the
+/// directory the first `create_dir` would land in. A prefix whose every component is
+/// missing answers `false` only if even `/` is unwritable, which is the correct
+/// answer for a non-root caller.
+fn caller_can_use_prefix(p: &Path) -> bool {
+    // WRITABLE — we can install here. The tail of a configured prefix need not exist
+    // yet (atpkg creates it), so the question is asked of the deepest component that
+    // does, which is where the first `create_dir` lands.
+    if p.ancestors()
+        .find(|a| a.exists())
+        .is_some_and(crate::platform::dir_writable_by_caller)
+    {
+        return true;
+    }
+    // NOT writable — but a prefix that already SERVES WORKING TOOLS is still usable. A
+    // shared multi-user prefix is installed once by an admin and then read by users who
+    // cannot write it; degrading those users to a private default would cut them off
+    // from the very store they are meant to share.
+    //
+    // The test is whether a shim RESOLVES, not whether a `store/` directory exists.
+    // Those differ exactly where it matters: the machine this fix comes from had a
+    // fully populated `store/` and 22 shims in `bin/` every one of which dangled into
+    // a `/Library/aterm` that had been removed. A directory count called that healthy;
+    // a resolve call calls it what it is.
+    let Ok(entries) = std::fs::read_dir(p.join("bin")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|e| crate::platform::resolve_shim(&e.path()).is_some_and(|t| t.exists()))
+}
+
 fn system_chain_trusted(p: &Path) -> bool {
     p.ancestors().all(|anc| {
         // A component that does not exist yet is the tail we will create; skip it. An
@@ -1499,11 +1580,24 @@ mod tests {
         }
         // A non-existent leaf is the tail the installer creates (as root).
         let prefix = Path::new("/usr/lib/aterm-pkg-system-prefix-test");
-        assert_eq!(
-            vet_prefix(Some(prefix), &home),
-            prefix.to_path_buf(),
+        // The TRUST property this test is named for holds for every caller.
+        assert!(
+            system_chain_trusted(prefix),
             "a fully root-owned chain outside $HOME is a trusted system prefix"
         );
+        // What `vet_prefix` RETURNS now also depends on whether this caller could
+        // ever use it — trusted is not the same as usable. As root (the installer
+        // this test's comment describes) the tail is creatable and the prefix is
+        // returned; as an ordinary user it is not, and returning it would hand back
+        // a prefix that fails on `store.lock` for every verb, forever. That was a
+        // real three-week outage, so the fallback is deliberate
+        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+        let expected = if caller_can_use_prefix(prefix) {
+            prefix.to_path_buf()
+        } else {
+            default_prefix(&home)
+        };
+        assert_eq!(vet_prefix(Some(prefix), &home), expected);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1564,6 +1658,59 @@ mod tests {
         std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o700)).unwrap();
         let prefix = a.join("b").join("pkg"); // b + pkg do not exist yet
         assert_eq!(vet_prefix(Some(&prefix), &home), prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A SYSTEM prefix that is trusted but that this user cannot write must fall back
+    /// to the default, not be handed back to be failed on later.
+    ///
+    /// This is the defect that left a machine with no toolchain for three weeks: the
+    /// chain check proved `/usr/local/aterm/pkg` was root-owned and therefore
+    /// *trusted*, `vet_prefix` returned it, and every verb then died on `store.lock`
+    /// with `Operation not permitted` — while the GUI logged the failure and showed
+    /// nothing (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+    ///
+    /// Runs only as a non-root user: as root every path is writable and there is
+    /// nothing to assert.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_system_prefix_that_we_cannot_write_falls_back_to_default() {
+        if crate::platform::our_uid() == 0 {
+            return; // root can write anywhere; the case does not exist.
+        }
+        let home = temp_home("unwritable-system");
+        // `/usr` is the real thing this guards: outside $HOME, root-owned, not
+        // group/other-writable — so `system_chain_trusted` accepts it — and not
+        // writable by an ordinary user.
+        let prefix = PathBuf::from("/usr/local/aterm-nux-probe/pkg");
+        if !system_chain_trusted(&prefix) {
+            return; // a machine with a non-standard /usr chain proves nothing here.
+        }
+        assert!(
+            !caller_can_use_prefix(&prefix),
+            "precondition: a non-root user must not be able to write under /usr"
+        );
+        assert_eq!(
+            vet_prefix(Some(&prefix), &home),
+            default_prefix(&home),
+            "a trusted-but-unwritable system prefix must degrade to the default"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The negative half: a writable directory outside `$HOME` must still be usable,
+    /// so the check above cannot be satisfied by simply refusing every system prefix.
+    #[cfg(unix)]
+    #[test]
+    fn writable_prefix_is_still_accepted_by_the_usability_check() {
+        let home = temp_home("writable-check");
+        let writable = std::env::temp_dir().join(format!("atpkg-writable-{}", std::process::id()));
+        std::fs::create_dir_all(&writable).unwrap();
+        assert!(
+            caller_can_use_prefix(&writable.join("pkg")),
+            "a directory we just created must read as usable, including its absent tail"
+        );
+        let _ = std::fs::remove_dir_all(&writable);
         let _ = std::fs::remove_dir_all(&home);
     }
 

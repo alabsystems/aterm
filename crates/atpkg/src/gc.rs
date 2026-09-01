@@ -7,7 +7,7 @@
 //! Retention is **live + 1 rollback** per program. A superseded build is never reclaimed
 //! while it is the live build or the rollback target (reclaiming the latter resurrects the
 //! cryptic *"Reading release bundle rust-toolchain-version: No such file or directory"*
-//! failure `setup-trust-mc.sh` warns about), so [`reclaimable`] keeps the live build and the
+//! failure `scripts/verify-kani-proofs.sh` guards against), so [`reclaimable`] keeps the live build and the
 //! single most-recent build below it; everything else is safe to delete.
 //!
 //! **The live build is a WITNESS, not an inference — that distinction is the whole module.**

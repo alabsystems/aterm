@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "trust-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Build-script gate: the aterm workspace compiles only with the Trust compiler; any other rustc stops here, first, with the one message that names the fix."
+build = "build.rs"
+# Never published: the crate is a build-time refusal with an empty library.
+publish = false
+
+# NO dependencies, on purpose: a build script with no dependencies is one of
+# the first units cargo runs, so the refusal lands before any first-party crate
+# reaches Trust-only syntax on an upstream compiler.
+[dependencies]
+
+[lints]
+workspace = true

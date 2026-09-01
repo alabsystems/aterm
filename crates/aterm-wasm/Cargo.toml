@@ -43,9 +43,16 @@ aterm-types = { workspace = true }
 # one workspace lock; 0.2.108 is newer than the old 0.2.100 pin and compatible.
 wasm-bindgen = "=0.2.108"
 console_error_panic_hook = "0.1"
-# Some transitive deps may pull getrandom; on wasm32-unknown-unknown it needs the
-# JS backend. Harmless if unused.
-getrandom = { version = "0.2", features = ["js"] }
+# NO getrandom ROW, and none is needed. This was a `getrandom = { version =
+# "0.2", features = ["js"] }` line justified as "harmless if unused" — it was
+# neither. Measured: `cargo tree -p aterm-wasm --target wasm32-unknown-unknown
+# -i getrandom` named aterm's OWN manifests as the only parents, so the
+# defensive row was the entire reason getrandom (and js-sys under it) were in
+# the shipped CPU module at all: -2 packages / -9,774 lines when it went.
+# If a transitive dep ever does select getrandom on wasm32, the build fails
+# loudly with getrandom's own "unsupported target" error — a better outcome
+# than paying 9,774 lines forever against the possibility. Guarded by
+# tools/grep_guard.sh B13.
 
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm

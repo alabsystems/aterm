@@ -51,13 +51,37 @@ pub enum OpClass {
 pub enum Access {
     /// Normal: authority is exactly `op`, checked per resolved target.
     Scoped,
-    /// Non-sensitive build/meta provenance — answered for ANY authenticated scope
-    /// BEFORE target resolution (`version`/`update`/`help`/`verbs`). Self-scoped, no
-    /// session; a selector is meaningless.
+    /// Non-sensitive build/meta provenance and instance posture — answered for ANY
+    /// authenticated scope BEFORE target resolution
+    /// (`version`/`update`/`help`/`verbs`/`privacy`). Self-scoped, no session; a
+    /// selector is meaningless.
     AnyScopeMeta,
     /// Owner-only: only the instance god-token may run it, regardless of op-class
     /// (`sessions`/`who`/`grant`/`revoke`/`whoami`/`dial-*`). A selector is rejected.
     OwnerOnly,
+    /// Bridge-only: ONLY the fabric bridge connection may run it — the pair of
+    /// `socketpair` ends the instance keeps when it launches its `aterm-link serve`
+    /// child, served with the bridge scope PRE-RESOLVED instead of an `AUTH` line.
+    /// The pinned set is FOUR verbs: `deliver`, `hold`, `outbox` and `outbox sent`.
+    ///
+    /// Strictly narrower than [`Self::OwnerOnly`], and deliberately so: Owner scope is
+    /// what every in-session client already holds (`aterm-ctl @self` is Owner), so a
+    /// prompt-injected agent holding Owner must not be able to forge an attested human
+    /// order into a sibling's inbox (`deliver`, which stamps `from=`/`trust=`), lift a
+    /// fleet halt locally (`hold`), or read every session's outbound traffic
+    /// (`outbox`). There is no token file to steal: the only way to be the bridge is to
+    /// be the process the instance spawned. A selector is rejected — every one of them
+    /// names its session as an argument, like `raise`.
+    ///
+    /// A `hold` set through this gate has NO OPERATOR UNDO. `aterm-gui`'s
+    /// `fabric::apply_hold` has exactly two production callers — `hold` itself and the
+    /// fail-closed `bridge_lost` — and no GUI, palette, key-binding or Owner path
+    /// clears one. So a `reason=fabric-lost` hold stands until a bridge RECONNECTS and
+    /// issues `hold off`; if none can (a deleted cap file, a `[fabric] command` that
+    /// exits at startup), the only recovery is restarting the instance. DESIGN §11.2
+    /// says "or a human lifts it at the GUI"; that path does not exist, and this row
+    /// says so rather than repeating it.
+    BridgeOnly,
 }
 
 /// How a verb's reply is framed on the wire.
@@ -125,7 +149,18 @@ macro_rules! summary_max_chars {
 pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// The budget for the short catalog's rows put together (every [`catalog_lines`] row,
 /// `\n`-terminated): what discovering a verb costs, whatever the table grows to.
-pub const SHORT_CATALOG_MAX_BYTES: usize = 8192;
+///
+/// RAISED FROM 8192 when the fabric's bridge plane completed (`outbox` / `outbox
+/// sent`, DESIGN-aterm-fabric.md §11.2 as A3 settles it). The catalog was 8 170 B
+/// at that moment — twenty-two bytes of headroom — so the choice was between
+/// raising the number and rewording unrelated verbs' prose to make room, and
+/// rewording a verb's help to fit an unrelated verb is exactly the drift a
+/// generated golden exists to catch. What the budget actually bounds is the
+/// SHAPE — one row per verb, first sentence only, capped at
+/// [`SUMMARY_MAX_CHARS`] — and that shape is unchanged. The earlier move from
+/// the design's 4 KiB to 8 KiB is the same accounting
+/// (`docs/AGENT-EXPERIENCE-2026-08-26.md`, S7).
+pub const SHORT_CATALOG_MAX_BYTES: usize = 9216;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -189,7 +224,7 @@ impl VerbSpec {
     }
 }
 
-use Access::{AnyScopeMeta, OwnerOnly, Scoped};
+use Access::{AnyScopeMeta, BridgeOnly, OwnerOnly, Scoped};
 use Framing::{Bytes, Lines, Push, Status};
 use OpClass::{ClipboardWrite, ConfigWrite, Owner, Read, Signal, Write};
 use Target::{App, Meta, Session};
@@ -291,6 +326,37 @@ pub const VERBS: &[VerbSpec] = &[
             " chars); help <verb> = that verb's full entry, wrapped; help --full = the \
              complete catalog with the protocol header"
         ),
+    ),
+    // The macOS consent posture: instance-wide, self-scoped, and `AnyScopeMeta` for
+    // the same reason `version` is — an agent that just took an EPERM has to be able
+    // to ask a `--headless` instance what its permission state is. `Read`, not
+    // `Owner`: every fact here is one `status` already exposes a session at a time.
+    va(
+        "privacy",
+        Read,
+        Lines,
+        Meta,
+        AnyScopeMeta,
+        "privacy [--json]: the macOS consent posture behind EPERM",
+        "Self-scoped and instance-wide: no `@<sel>` (a selector is rejected), and a `--headless` \
+         instance answers it. `OK <n>` then n lines — `schema=1`, the platform, the code-signing \
+         identity macOS keys a grant to (`bundle_id= signing= team= dr= grant_stable=`), \
+         `full_disk_access=` with the probe that read it, the `covers=`/`uncovered=` service \
+         split, one `folder` line, `prompt_possible=`, one `session` line per LIVE session (never \
+         truncated, so `sessions_total=` always equals the number of `session` lines), then \
+         `containment`, `warmup=`, `observer`, `remediate` and a closing `note`. Free text is \
+         pct-encoded and `-` is unset. Reading this verb raises NO dialog: the probe reads state \
+         that already exists, and no value here is inferred from another. Per-folder state is \
+         `unknown` BY CONSTRUCTION — the only way to learn whether a folder is readable is to \
+         read it, which is the very act that raises the prompt — so a `folder` value leaves \
+         `unknown` only where aterm itself observed an access (its own EPERM, or a warm-up the \
+         human asked for), never because Full Disk Access is granted. `unavailable` on an \
+         `observer` row is a THIRD value, distinct from `off` and from `false`: the observer \
+         could not be consulted, which is not the same as its having answered no. \
+         `full_disk_access=granted` removes this class of interruption for the folders that \
+         grant covers; which services it covers is not measured here, so `fda_scope=unknown` and \
+         the `folder` rows stay `unknown`. Only a human can change any of this — aterm cannot \
+         grant it, and neither can you.",
     ),
     // screen / terminal state
     v(
@@ -598,7 +664,8 @@ pub const VERBS: &[VerbSpec] = &[
         "Reply: OK schema=1 sid= subject= subject_source=pin|osc|cwd|unavailable observed= \
          phase=unknown|starting|idle|running|quiet|exited since_ms= \
          outcome=none|success|failure|signal exit_code= signal= detail= \
-         confidence=exact|strong|heuristic|unknown reasons= conflict= revision= enabled=. \
+         confidence=exact|strong|heuristic|unknown reasons= conflict= revision= enabled= \
+         hold=<0|1> fabric=<connected|disconnected|absent>. \
          Read-only. `observed=false` means never classified, which is NOT `phase=unknown` \
          (classified, no evidence); `subject_source=unavailable` means the terminal lock was \
          contended, never a silent fall to a lower rung. Fields are ADDITIVE and never bump the \
@@ -610,7 +677,12 @@ pub const VERBS: &[VerbSpec] = &[
          COMPOUND command's first word is the shell keyword that opens it, so `for i in 1 2 \
          3; do ...; done` reads `detail=for`, not the program inside — while the \
          shell-integration block executes, `-` otherwise or when the terminal lock was \
-         contended: how an agent tells that a peer is another agent before typing into it. No `window=` here: `status` is \
+         contended: how an agent tells that a peer is another agent before typing into it. \
+         `hold=1` means a fleet halt is in force for this session, so every PTY-reaching verb \
+         answers `ERR halted` — read the reason from `inbox`. `fabric=` is INSTANCE state, not \
+         this session's: `absent` = no bridge was ever launched, `connected` = one is serving, \
+         `disconnected` = the bridge this instance had is gone, which is itself a held state. \
+         No `window=` here: `status` is \
          polled, and the window lives on the main thread, so a per-poll hop would be a \
          latency regression — ask `sessions`/`ls` (one hop for the whole fleet) or `dims`",
     ),
@@ -671,7 +743,12 @@ pub const VERBS: &[VerbSpec] = &[
          (id=/submitted=<0|1>/status=settled|timeout/seq=/dur_ms=/hash=<FNV16 of settled screen>) \
          then the rows; trim=1 drops the trailing all-blank rows and closes the verdict with \
          trimmed=<k> — hash= stays the FNV of the UNTRIMMED screen (a screen identity, the value \
-         `history` reports), not of the bytes sent. App-agnostic; humans can interject",
+         `history` reports), not of the bytes sent. App-agnostic; humans can interject. \
+         EXACTLY-ONCE: a leading id=<epoch>:<producer>:<seq> makes the turn replay-safe — see \
+         `send`'s entry for the key, which every input verb shares. A DUPLICATE answers `OK 0 \
+         dup=1` (this verb is Lines-framed) and carries NONE of the verdict fields above, id= \
+         included: nothing was typed, so there is no verdict to report. The reply's own id= is \
+         the TURN id and is unrelated to the key you sent",
     ),
     v(
         "lease",
@@ -693,7 +770,19 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "write text to the PTY; reply `OK seq=<n>`",
         "— the content baseline, so `await seq <n+1>` waits for the output this input causes \
-         (same seq= on key/ctrl/feed/mouse/paste)",
+         (same seq= on key/ctrl/feed/mouse/paste). EXACTLY-ONCE: a LEADING \
+         id=<epoch>:<producer>:<seq> stamps the write, and `key`, `feed-bin` and `turn` take the \
+         same key. <epoch> is this session's launch nonce (the roster's nonce=); <producer> is any \
+         u64 stable per driver; <seq> is that driver's own monotone sequence. A sequence at or \
+         below the producer's high-water writes NOTHING and answers the duplicate marker IN THE \
+         VERB'S OWN FRAMING — `OK dup=1` for a `Status`-framed verb (`send`, `key`), `OK 0 dup=1` \
+         for a `Lines`/`Bytes` one (`turn`, `feed-bin`), because a bare `OK dup=1` would make a \
+         Lines client read `dup=1` as a row count — so a driver that crashed without seeing its \
+         reply can retry safely. A retry of a sequence whose attempt \
+         did NOT answer OK gets `ERR in-doubt seq=<n>` — it may have typed, so it is reported, \
+         never replayed, and the session's `timeline` carries the row. A key minted before a \
+         relaunch is `ERR epoch`. OPTIONS LEAD: only a FIRST token spelled id= is a key, so \
+         `send hello id=1` still types `hello id=1`, and a leading `--` ends option parsing",
     ),
     v(
         "paste",
@@ -719,7 +808,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "send a named key (enter/tab/up/...)",
-        "",
+        "— accepts a leading id=<epoch>:<producer>:<seq> idempotency key (see `send`)",
     ),
     v("ctrl", Write, Status, Session, "send a control char", ""),
     v(
@@ -750,7 +839,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "length-prefixed raw bytes to the PTY",
-        "",
+        "`feed-bin <n> [id=<key>]` then <n> raw bytes. The optional idempotency key (see `send`) \
+         rides the HEADER, not the payload: a frame whose key is refused still consumes its \
+         announced bytes, so the stream stays framed and the next request line is the client's",
     ),
     v(
         "paste-bin",
@@ -907,6 +998,25 @@ pub const VERBS: &[VerbSpec] = &[
          scope=window|focused-pane focused= animating=, plus a live engine's weather= density= \
          tick= scanned= material= emitting= vis= drain= seq= streak= diag)",
     ),
+    // Read-only observability for an effect that is otherwise nearly INVISIBLE
+    // by design: PRISM WAKE answers program output with a ~0.10-coverage comet
+    // that lives under a second, so "off", "W11-demoted", "suppressed" and
+    // "resting" all look identical on glass. No write form — the knobs are
+    // durable config (`settings set output_streak.…`).
+    v(
+        "streak",
+        Read,
+        Status,
+        App,
+        "streak [status]: output-streak (PRISM WAKE) state for the focused window",
+        "(prints config_enabled= sound_key= motion_animates= focused= fx_focused= \
+         serious_sound= sounds_master= volume= engine=none|live panes= active= intensity= \
+         tail= max_streaks= idle_secs=; `motion_animates` folds the W11 unfocused \
+         demotion, which outranks even motion=full; `fx_focused` is the focus input the \
+         render tick actually uses (raw focus OR a live typed wake OR an in-flight \
+         recording), so a window can animate with focused=false; `panes` counts the \
+         composed path's per-pane engines, which is where a SPLIT's streaks live)",
+    ),
     // Read-only observability for an effect that is otherwise audible-only: the
     // tone-of-typing mood steering the trail synth's melody. No write form —
     // the knob is durable config (`settings set tone_melody`).
@@ -949,7 +1059,7 @@ pub const VERBS: &[VerbSpec] = &[
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= field= field_span= sparks= momentum= \
-         momentum_display= speed= resume_grant= woken= \
+         momentum_display= speed= resume_grant= woken= bloom= \
          glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
@@ -1061,9 +1171,26 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "await <idle <ms>|seq [<n>]|match <re>|block> [timeout=<ms>]: block until a predicate \
-         latches",
-        "",
+        "await <idle|seq|match|block|inbox|consent> [args] [timeout=<ms>]: block until one latches",
+        "Full grammar: `await idle <ms>` (no output for that long), `await seq [<n>]` (the \
+         content sequence passed <n>; bare = the next change, so `await seq <n> timeout=0` is the \
+         cheap dirty check), `await match <re> [rows <a> <b>]`, `await block` (the running \
+         command completed), `await inbox since=<id> [kinds=<k,...>]` — the FABRIC predicate: \
+         it latches on an inbox row with id > `since` of an accepted kind (default: every kind \
+         but `note`), or on a `hold` transition when `hold` is one of the listed kinds. Monotone, \
+         so a row the agent chose to ignore cannot latch the same wait twice. And `await consent` \
+         — the macOS privacy posture of THIS session: the instance's Full Disk Access state, this \
+         session's `fs_consent=` and its `attribution=` (see `privacy`). It ARMS when the request \
+         arrives, taking that tuple as its baseline, and latches on the first observed change \
+         from THAT baseline: never on a value that was already true when you asked, and never \
+         against a baseline captured earlier. Its default `timeout=300000` is finite on purpose — \
+         the system consent dialog it waits behind never expires, so an agent must not park on an \
+         absent human forever; a timeout there is an ordinary timeout reply, not an error. A \
+         latch says aterm's own posture CHANGED, not that a human \
+         answered a dialog (aterm cannot observe the answer), and a change becomes observable \
+         within one probe interval plus a polling tick. Every form answers `OK <predicate> <seq>` \
+         on a latch and `OK timeout` otherwise, which the client exits 124 on. One control lane \
+         per parked wait, so park at most one per driver.",
     ),
     v(
         "wait",
@@ -1100,6 +1227,171 @@ pub const VERBS: &[VerbSpec] = &[
          to stop each screen DELTA after its last non-blank row — `screen <nrows>` is then the \
          count sent (inert without screen)",
     ),
+    // fabric messaging — the per-session INBOX RING, this session's outbound posts,
+    // and the two BRIDGE-plane verbs. `inbox`/`inbox get`/`inbox seen`/`post` are
+    // ordinary scoped verbs an agent inside the session calls; `deliver`/`hold` are
+    // `BridgeOnly`, so no token reaches them (see [`Access::BridgeOnly`]).
+    v(
+        "inbox",
+        Read,
+        Lines,
+        Session,
+        "inbox [<n>] [since=<id>] [--peek] [--meta]: this session's message rows",
+        "Header `OK <n> hold=<0|1> holder=<p|-> seen=<id> bus_head=<off> dropped=<n> pending=<n>`, \
+         then one `msg <id> off=<n> t=<ms> from=<p> kind=<k> \
+         trust=<human|agent|relayed|screen> [re=<n> re-id=<id>] [dl=<ms>] [late=1] [demoted=<k>] \
+         [via=<p,...>] len=<n> [more=1] [truncated=1] text=<pct>` row per message and one `post \
+         <id> to=<> \
+         kind=<> off=<n|->` row per outbound post that has not landed yet. `trust=` is the \
+         RECEIVER's verdict on what the content is, never a sender's claim, and it is printed \
+         before the text on purpose. `text=` is pct-encoded and cut at 512 B with `more=1`; \
+         `inbox get <id>` returns the whole of what this endpoint HOLDS. `truncated=1` means the \
+         endpoint never received the rest: the delivering bridge cut the body to fit one control \
+         line and `len=` names the true size, so that message is NOT recoverable in full here — \
+         a cut row carries `more=1` too, even when what survived is under 512 B. `dropped=` \
+         counts UNHANDLED rows the bounded ring evicted (never silently) — every evicted row \
+         above `seen=`, not merely one nobody listed — and `pending=` the delivered rows this \
+         reply did not carry. A bare `inbox` advances the LISTED watermark — what the ring counts \
+         as read for eviction and for the per-peer quota — while `--peek` moves nothing and \
+         `--meta` omits `text=`; the HANDLED watermark `seen=` moves only on `inbox seen`, which \
+         also LISTS every row at or below its argument (see that entry).",
+    ),
+    v(
+        "inbox get",
+        Read,
+        Bytes,
+        Session,
+        "inbox get <id>: one message's body as this endpoint holds it, length-prefixed",
+        "`OK <nbytes>` then that many raw bytes (up to 256 KiB) — the un-PREVIEWED form of the \
+         `inbox` row's `text=`, which the row cuts at 512 B. Reading a body moves no watermark. \
+         NOT ALWAYS THE WHOLE MESSAGE, and it says which: a body the delivering bridge had to cut \
+         to fit one control line is answered `OK <nbytes> truncated=1 len=<true-size>`, and the \
+         missing bytes are NOT recoverable by any verb — they are on the bus, which the recipient \
+         has no access to. Only the first token after `OK` is the frame length, so the marker \
+         does not change the framing.",
+    ),
+    v(
+        "inbox seen",
+        Write,
+        Status,
+        Session,
+        "inbox seen <id> [handled|refused|deferred]: advance the HANDLED watermark",
+        "`OK seen=<id>`, and pushes `EVENT <local> inbox-seen <id> off=<n>` on the events digest. \
+         It ALSO LISTS every row at or below `<id>`, which is a second effect and not a side \
+         effect: listing is what the ring counts as read for eviction and what RELEASES the \
+         sender's per-peer quota, so an agent that only ever `--peek`s can still acknowledge its \
+         mail and keep receiving. Write-gated exactly like `meta set`: it records a decision and \
+         reaches no PTY, so it stays answerable while a fleet `hold` is on — a halted agent must \
+         still be able to mark the notice read.",
+    ),
+    v(
+        "post",
+        Write,
+        Status,
+        Session,
+        "post to=<@<sid>[@<node>]|<principal>|say> kind=<k> [opts] <text>: send a message",
+        "kind is `ask|answer|task|report|note|ack|control`; `re=<n>` names the offset being \
+         answered, `dl=<ms>` is an advisory deadline, `via=<p>` marks a relay, and `--wait[=<ms>]` \
+         (ON by default for `ask` and `task`) blocks until the bridge reports the record landed \
+         and answers `OK <id> off=<n>` — the broker-assigned offset is the correlation id an \
+         answer carries back as `re=`. When the link cannot report a landing the wait ends at \
+         once with `ERR fabric <absent|disconnected> id=<n> queued=1`: `queued=1` says the \
+         message is STILL IN THE OUTBOX and a replacement bridge will publish it (a bridge exit \
+         is the ordinary relaunch path, and `outbox` is a peek that removes nothing), so it must \
+         not be read as `not sent` and re-posted — `post` carries no idempotency key that would \
+         collapse the duplicate. The body is inline text up to 4 KiB, or `len=<n>` followed \
+         by that many raw bytes up to 256 KiB. There is no `to=fleet`: a node holds no fleet \
+         write grant, and an agent may only ASK a human to halt. REFUSED to an edge-token \
+         connection — a write-input edge over one session would otherwise speak AS that session, \
+         and the sender of a post must be attested by the instance Owner. Exempt from `hold`.",
+    ),
+    va(
+        "deliver",
+        Write,
+        Status,
+        Meta,
+        BridgeOnly,
+        "deliver <sid> off=<n> from=<p> kind=<k> ...: put one bus record in a session's inbox",
+        "BRIDGE-ONLY: only the fabric bridge connection may call it, Owner included — see the \
+         `hold` entry for why. Idempotent on `off=` over the last 1024 delivered offsets: a \
+         redelivered offset answers the id it first got and appends nothing, which is what turns \
+         the bus's at-least-once cursor into exactly-once at the endpoint — and NOT one offset \
+         further, because the dedup window is twice the 512-row ring. A redelivery older than \
+         that reappears as a FRESH row (the row was dropped unread and the bus still holds it), \
+         which a session that lists its mail without ever running `inbox seen` can reach: the \
+         bridge refills from the persisted `seen=` offset. `ERR quota` past 64 unread rows from \
+         one ATTESTED PEER — counted on the cap-forced `<src>` (the part after `@`, or the whole \
+         `from=` when there is none) and NOT on the whole `from=` string, half of which the \
+         sending node chooses — so one peer cannot evict a human's unread `task` under a burst of \
+         `note`s by rotating pseudo-sids, and eviction never drops an `h-*` row ahead of an \
+         agent's. `deliver <sid> landed=<post-id> off=<n>` is the \
+         other form: it closes an outbound `post` and releases its `--wait`.",
+    ),
+    va(
+        "hold",
+        Write,
+        Status,
+        Meta,
+        BridgeOnly,
+        "hold <sid> on|off [reason=<pct>] [origin=fleet|local]: the fleet drive halt",
+        "`OK hold=<0|1>`. BRIDGE-ONLY, and that is the whole point: Owner scope is what every \
+         in-session client already holds, so a halt an injected agent could lift locally would be \
+         no halt at all. While on, every PTY-reaching verb resolving to that session answers `ERR \
+         halted <reason>` from ANY scope — `send key ctrl feed feed-bin paste paste-bin mouse \
+         resize focus signal turn close invoke tab operator-propose-bin` — a TRANSIENT class \
+         beside `ERR busy`, so existing back-off code already does the right thing. `focus` is in \
+         that set because it writes the DEC 1004 focus reports to the PTY; `invoke` is, because \
+         `invoke Paste` writes the clipboard into the front tab's PTY; `tab` is, because `tab \
+         close [N]` RETIRES a session exactly as `close` does, and a driver refused `close` used \
+         to type that instead. `invoke` and `tab` resolve no session, so they are refused while \
+         ANY session on the instance is held. `post`, `inbox seen`, \
+         `meta set`, `lease` and every read verb stay answerable, and the physical keyboard is untouched: a \
+         halt stops drivers, not humans. When the bridge connection closes, the instance holds \
+         every session that bridge ever delivered to or held with `reason=fabric-lost \
+         origin=fleet` — the halt must not depend on a killable process staying alive.",
+    ),
+    va(
+        "outbox",
+        Read,
+        Bytes,
+        Meta,
+        BridgeOnly,
+        "outbox [<max>]: drain the queued outbound posts, bodies included",
+        "BRIDGE-ONLY, and the mirror image of `deliver`: `deliver` is how a record enters the \
+         instance, `outbox` is how one leaves it. `OK <nbytes>` then that many raw bytes, holding \
+         one `post sid=<s> id=<n> to=<pct> kind=<k> [re=<n>] [dl=<ms>] [via=<p,...>] len=<n>` \
+         line per queued post followed by that post's `len` body bytes — a length prefix and not \
+         a row, because a body may contain newlines and a line-framed listing could not carry it. \
+         A PEEK: it moves no watermark and drops nothing, so a bridge that dies mid-publish \
+         re-reads the same posts on restart and republishes them under the same producer \
+         sequence. `outbox sent` is what retires one. One drain is BOUNDED IN BYTES as well as \
+         by `<max>` (4 MiB across all sessions, always at least one post so a large body is \
+         never stranded): the per-session queue bounds are per session, and one reply used to \
+         concatenate every session's bodies. A drain stopped by the budget is resumed by the \
+         next call, which is safe precisely because nothing was retired. Owner-forbidden for the same reason \
+         `deliver` is: an Owner-token connection reading this would read every session's \
+         outbound traffic.",
+    ),
+    va(
+        "outbox sent",
+        Write,
+        Status,
+        Meta,
+        BridgeOnly,
+        "outbox sent <sid> <id> off=<n|->: retire one queued outbound post",
+        "BRIDGE-ONLY. `off=<n>` is the broker offset the post landed at: it fills the `post` \
+         row's `off=`, releases a `post --wait` parked on it, and lets the endpoint drop the \
+         retained body — the body is kept only until this arrives, which is what bounds the \
+         queue's memory. `off=-` retires it as permanently undeliverable instead, with an \
+         `undeliverable` row explaining why arriving separately through `deliver`. An optional \
+         `reason=<word>` on the `off=-` form names WHICH refusal it was, and a `post --wait` \
+         parked on that post wakes with `ERR <reason> id=<n>` instead of a uniform `ERR \
+         undeliverable`: routing is the bridge's knowledge, not the endpoint's, so `ERR \
+         ambiguous` for a sid two nodes claim can only reach the sender this way. Idempotent: \
+         retiring a post twice is `OK`, not a second event, so a bridge that retries after a lost \
+         reply cannot double-push. A connection that could forge this would release a `post \
+         --wait` for a message that never left the machine.",
+    ),
     // sessions, presence & capability — the OwnerOnly access declares the owner
     // gate IN the table (the dispatch reads it, no hardcoded verb list). `who`
     // keeps its `Read` op-class (a fleet-wide presence readout) yet is Owner-gated:
@@ -1135,8 +1427,11 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "OK <n> + per session: local sid parent state title meta= window= active= wfocus= detail=",
-        "Owner-only. `window=<id|none|->`: the hosting window (the `dims` rule — the front \
+        "OK <n> + per session: local sid parent state title meta= nonce= window= active= wfocus= detail=",
+        "Owner-only. `nonce=<hex32>` is the session's PUBLIC launch nonce — the freshness fence \
+         an edge binds to and the fabric's `epoch=` verbatim; it is here because `whoami` reports \
+         only the connection's own session, so a bridge could not read any other's. \
+         `window=<id|none|->`: the hosting window (the `dims` rule — the front \
          window when it shows the session, else the lowest window id); `none` = a session no \
          window holds; `-` = the main thread could not be asked (the line is still printed). \
          A `--headless` instance owns one logical window, id 0 — the one `dims` reports as \
@@ -1340,11 +1635,21 @@ pub fn is_owner_only(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::OwnerOnly))
 }
 
-/// Whether `verb` is non-sensitive build/meta provenance answered for ANY
-/// authenticated scope BEFORE target resolution (`version`/`update`/`help`/`verbs`).
+/// Whether `verb` is non-sensitive build/meta provenance or instance posture,
+/// answered for ANY authenticated scope BEFORE target resolution
+/// (`version`/`update`/`help`/`verbs`/`privacy`).
 #[must_use]
 pub fn is_any_scope_meta(verb: &str) -> bool {
     spec(verb).is_some_and(|s| matches!(s.access, Access::AnyScopeMeta))
+}
+
+/// Whether `verb` is BRIDGE-ONLY per the table — only the fabric bridge connection
+/// may run it, and no token unlocks it, Owner included. The dispatch reads THIS (not
+/// a hardcoded verb list), so classifying a verb `BridgeOnly` in the table is what
+/// gates it. Unknown verbs are not bridge-only (`ERR unknown verb`).
+#[must_use]
+pub fn is_bridge_only(verb: &str) -> bool {
+    spec(verb).is_some_and(|s| matches!(s.access, Access::BridgeOnly))
 }
 
 /// Trailer emitted after a complete guarded response. Its unpredictable nonce
@@ -1353,6 +1658,12 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
 pub const ARTIFACT_REPLY_CHALLENGE_PREFIX: &str = "ACK-CHALLENGE ";
 /// Client echo sent only after consuming the complete response and challenge.
 pub const ARTIFACT_REPLY_ACK_PREFIX: &str = "ACK ";
+
+/// Maximum UTF-8 bytes in one control-protocol reply line. The shipping client
+/// enforces this on every line; producers of intentionally large single-line
+/// payloads use the same ceiling so they never emit a reply their own client
+/// must reject.
+pub const MAX_CONTROL_REPLY_LINE_BYTES: usize = 8 << 20;
 
 /// Validate the fixed-width lowercase/uppercase hexadecimal nonce grammar used
 /// by guarded artifact acknowledgement frames.
@@ -1373,16 +1684,16 @@ pub fn artifact_reply_requires_ack(verb: &str, request: &str) -> bool {
         .and_then(|rest| rest.split_once(' ').map(|(_, tail)| tail))
         .unwrap_or(request);
     let sub = req_no_sel.split_whitespace().nth(1);
+    let image_bytes = req_no_sel
+        .split_whitespace()
+        .skip(1)
+        .any(|token| token == "--bytes" || token == "bytes");
     match verb {
-        // Only file framebuffer captures carry the exact-name guard. `image
-        // read` is an in-memory inline-image projection; `--bytes` returns the
-        // encoded PNG directly and writes no server-side artifact.
-        "image" => {
-            sub != Some("read")
-                && !req_no_sel
-                    .split_whitespace()
-                    .any(|token| matches!(token, "--bytes" | "bytes"))
-        }
+        // File captures retain exact-name guards. In-memory byte captures keep
+        // their admission only through the bounded write+flush and therefore do
+        // not need a post-response ACK. `image read` is an ordinary terminal-
+        // inline projection with no capture job or retained payload slot.
+        "image" => sub != Some("read") && !image_bytes,
         "window" => true,
         // Status/stop are ordinary in-memory control replies. A recording result
         // and `video frames` both advertise retained server-local paths.
@@ -1419,6 +1730,26 @@ pub fn framing_of(verb: &str, request: &str) -> Framing {
     }
     if verb == "cast" && sub == Some("frames") {
         return Lines;
+    }
+    // `inbox get <id>` returns ONE message body as a length-prefixed byte frame
+    // (`OK <nbytes>` + n raw bytes) and `inbox seen <id>` one `OK seen=<id>` status
+    // line — neither is the `OK <n>` + rows the bare `inbox` listing answers. The
+    // same base-verb/sub-form flip as `image read`, and for the same reason: a
+    // client that read `OK seen=42` as a row count hangs waiting for 42 rows that
+    // never come. Both sub-forms have their own table row (`inbox get`/`inbox
+    // seen`), but `spec()` keys on the verb KEYWORD, so the flip has to be here.
+    if verb == "inbox" {
+        match sub {
+            Some("get") => return Bytes,
+            Some("seen") => return Status,
+            _ => {}
+        }
+    }
+    // `outbox sent <sid> <id> off=<n>` answers one `OK` status line, not the
+    // `OK <nbytes>` + body frame the bare `outbox` drain answers. Same flip, same
+    // hazard: a client reading `OK` as a byte count parks on a body that never comes.
+    if verb == "outbox" && sub == Some("sent") {
+        return Status;
     }
     // `video frames [count=N]` lists the newest recording's top-delta frames as
     // `OK <n>\n` + n rows — Lines-framed, unlike the base `video <secs>` capture
@@ -1462,7 +1793,7 @@ pub fn framing_of(verb: &str, request: &str) -> Framing {
 /// `json_ok_sites_match_the_json_capable_verbs` test can bind the two ends
 /// together; add a verb here in the same change that adds its `_json` handler.
 pub const JSON_CAPABLE_VERBS: &[&str] = &[
-    "text", "screen", "cursor", "dims", "blocks", "edges", "grants", "metrics",
+    "text", "screen", "cursor", "dims", "blocks", "edges", "grants", "metrics", "privacy",
 ];
 
 /// One catalog row: the verb name in the [`CATALOG_TEXT_COLUMN`] gutter, then `text`.
@@ -1597,6 +1928,11 @@ mod tests {
         assert!(!artifact_reply_requires_ack("video", "video stop"));
         assert!(!artifact_reply_requires_ack("image", "@s-a image read"));
         assert!(!artifact_reply_requires_ack("image", "image --bytes"));
+        assert!(!artifact_reply_requires_ack(
+            "image",
+            "@s-a image --meta --bytes"
+        ));
+        assert!(!artifact_reply_requires_ack("image", "@s-a image bytes"));
         assert!(!artifact_reply_requires_ack("text", "text"));
         assert!(valid_artifact_ack_nonce("00112233445566778899aabbccddeeff"));
         assert!(!valid_artifact_ack_nonce("artifact"));
@@ -1786,11 +2122,12 @@ mod tests {
         assert!(
             sessions
                 .summary
-                .ends_with("meta= window= active= wfocus= detail="),
+                .ends_with("meta= nonce= window= active= wfocus= detail="),
             "{}",
             sessions.summary
         );
         for phrase in [
+            "`nonce=<hex32>` is the session's PUBLIC launch nonce",
             "`window=<id|none|->`",
             "`none` = a session no window holds",
             "`-` = the main thread could not be asked",
@@ -1874,22 +2211,233 @@ mod tests {
             .collect();
         assert_eq!(
             any_meta,
-            ["version", "update", "help", "verbs"],
+            ["version", "update", "help", "verbs", "privacy"],
             "the AnyScopeMeta set (answered pre-scope for any authenticated caller)",
         );
 
-        // The predicates project the same truth.
+        // The BridgeOnly set. It is EXACTLY the verbs that would let a prompt-injected
+        // agent holding Owner scope forge an attested human order into a sibling's
+        // inbox (`deliver`, which stamps `from=`/`trust=`), lift a fleet halt locally
+        // (`hold`), read every session's outbound traffic (`outbox`), or release a
+        // `post --wait` for a message that never left the machine (`outbox sent`).
+        // Every in-session client already holds Owner, so a member arriving here
+        // without that property is a real widening of the one authority no token
+        // unlocks — which is why the set is pinned, not counted.
+        let bridge_only: Vec<&str> = VERBS
+            .iter()
+            .filter(|s| matches!(s.access, Access::BridgeOnly))
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            bridge_only,
+            ["deliver", "hold", "outbox", "outbox sent"],
+            "the BridgeOnly set (only the inherited bridge connection may run these)",
+        );
+
+        // The predicates project the same truth, and the three exception sets are
+        // pairwise DISJOINT — a verb has exactly one scope gate.
         for v in &owner_only {
             assert!(is_owner_only(v), "{v} is_owner_only");
             assert!(!is_any_scope_meta(v), "{v} not any-scope-meta");
+            assert!(!is_bridge_only(v), "{v} not bridge-only");
         }
         for v in &any_meta {
             assert!(is_any_scope_meta(v), "{v} is_any_scope_meta");
             assert!(!is_owner_only(v), "{v} not owner-only");
+            assert!(!is_bridge_only(v), "{v} not bridge-only");
         }
-        // A normal `Scoped` verb is neither; unknown verbs are neither.
-        assert!(!is_owner_only("text") && !is_any_scope_meta("text"));
-        assert!(!is_owner_only("bogus") && !is_any_scope_meta("bogus"));
+        for v in &bridge_only {
+            assert!(is_bridge_only(v), "{v} is_bridge_only");
+            assert!(!is_owner_only(v), "{v} not owner-only");
+            assert!(!is_any_scope_meta(v), "{v} not any-scope-meta");
+        }
+        // A normal `Scoped` verb is none of them; unknown verbs are none of them.
+        assert!(!is_owner_only("text") && !is_any_scope_meta("text") && !is_bridge_only("text"));
+        assert!(!is_owner_only("bogus") && !is_any_scope_meta("bogus") && !is_bridge_only("bogus"));
+        // The fabric verbs an agent inside the session calls are ORDINARY scoped verbs:
+        // classifying `inbox`/`post` bridge-only would leave the agent unable to read
+        // its own mail, which is the whole point of the ring.
+        for v in ["inbox", "inbox get", "inbox seen", "post"] {
+            assert!(
+                matches!(
+                    spec(v).expect("fabric verb is in the table").access,
+                    Access::Scoped
+                ),
+                "{v} is a scoped verb"
+            );
+        }
+    }
+
+    /// The fabric rows carry exactly the classes §11.2 of the fabric design gives
+    /// them, and `framing_of` flips BOTH `inbox` sub-forms. The classes are what the
+    /// server gates on and what the client parses with, so a silent change to one of
+    /// them is a protocol change with no other alarm.
+    #[test]
+    fn fabric_verbs_carry_their_designed_classes() {
+        for (name, op, framing, target, access) in [
+            ("inbox", Read, Lines, Session, Scoped),
+            ("inbox get", Read, Bytes, Session, Scoped),
+            ("inbox seen", Write, Status, Session, Scoped),
+            ("post", Write, Status, Session, Scoped),
+            ("deliver", Write, Status, Meta, BridgeOnly),
+            ("hold", Write, Status, Meta, BridgeOnly),
+            ("outbox", Read, Bytes, Meta, BridgeOnly),
+            ("outbox sent", Write, Status, Meta, BridgeOnly),
+        ] {
+            let s = spec(name).unwrap_or_else(|| panic!("{name} is in the table"));
+            assert_eq!(s.op, op, "{name} op-class");
+            assert_eq!(s.framing, framing, "{name} framing");
+            assert_eq!(s.target, target, "{name} target");
+            assert_eq!(s.access, access, "{name} access");
+        }
+        // The sub-form flip: the base listing is Lines, `get` is a byte body, `seen`
+        // is a status line. Selector-aware, like every other sub-form rule.
+        assert_eq!(framing_of("inbox", "inbox"), Lines);
+        assert_eq!(framing_of("inbox", "inbox 20 since=4 --meta"), Lines);
+        assert_eq!(framing_of("inbox", "inbox get 7"), Bytes);
+        assert_eq!(framing_of("inbox", "@s-a inbox get 7"), Bytes);
+        assert_eq!(framing_of("inbox", "inbox seen 7 handled"), Status);
+        assert_eq!(framing_of("inbox", "@s-a inbox seen 7"), Status);
+        // `deliver`/`hold` are single status lines with no sub-form to change that.
+        assert_eq!(
+            framing_of("deliver", "deliver s-a off=9 from=h-x kind=task"),
+            Status
+        );
+        assert_eq!(framing_of("hold", "hold s-a on reason=x"), Status);
+        assert_eq!(framing_of("post", "post to=@s-b kind=ask hello"), Status);
+        // `outbox` flips the same way `inbox` does: the base drain is a byte frame,
+        // the `sent` sub-form a status line. A client that read `OK` as a byte count
+        // would park waiting for a body that never comes.
+        assert_eq!(framing_of("outbox", "outbox"), Bytes);
+        assert_eq!(framing_of("outbox", "outbox 8"), Bytes);
+        assert_eq!(framing_of("outbox", "outbox sent s-a 3 off=91"), Status);
+    }
+
+    /// `hold` and `deliver` are the fabric's whole safety story, so the catalog an
+    /// agent (or a human at `help hold`) reads must state it: which verbs the halt
+    /// refuses, which stay answerable, that the physical keyboard is untouched, and
+    /// that a dead bridge is itself a halt. Help that omits the exemptions invites a
+    /// driver to treat `ERR halted` as fatal and stop escalating.
+    #[test]
+    fn hold_help_states_the_halt_surface_and_its_exemptions() {
+        let hold = spec("hold").expect("hold ships").help_line();
+        for phrase in [
+            "ERR halted",
+            "from ANY scope",
+            "operator-propose-bin",
+            // `tab close [N]` RETIRES a session, which is the third act §5.3 says
+            // a halt refuses — and the one a driver refused `close` substituted.
+            "close invoke tab operator-propose-bin",
+            "`tab` is, because `tab close [N]` RETIRES a session",
+            "`post`, `inbox seen`, `meta set`, `lease` and every read verb stay answerable",
+            "physical keyboard is untouched",
+            "reason=fabric-lost",
+            "must not depend on a killable process staying alive",
+        ] {
+            assert!(hold.contains(phrase), "hold help lacks {phrase:?}");
+        }
+        // The bridge-only pair says WHY it is not an Owner verb, in the table that
+        // gates it — the reasoning has to live where the classification does.
+        let deliver = spec("deliver").expect("deliver ships").help_line();
+        assert!(deliver.contains("BRIDGE-ONLY") && deliver.contains("Idempotent on `off=`"));
+        assert!(deliver.contains("ERR quota") && deliver.contains("64 unread rows"));
+        assert!(hold.contains("Owner scope is what every"));
+        // `post` documents the edge refusal, which is a per-handler check no class
+        // in this table expresses.
+        assert!(
+            spec("post")
+                .expect("post ships")
+                .help_line()
+                .contains("REFUSED to an edge-token connection"),
+            "post help must state the Edge refusal"
+        );
+    }
+
+    /// EVERY FABRIC ROW STATES THE BOUND IT IS ACTUALLY HELD TO.
+    ///
+    /// aterm ships no evidence manifest, so these rows ARE its claims — and the
+    /// help an agent reads with `help <verb>` is the only place a driver can learn
+    /// a contract. Each assertion below replaced a sentence that promised more
+    /// than the code delivered, and each promise had a reachable failure:
+    ///
+    /// * `inbox get` said "the FULL body" while the bridge had begun delivering
+    ///   over-budget bodies TRUNCATED. Nothing recovers the rest — the record is
+    ///   on the bus, which the recipient cannot reach — so the answer has to say
+    ///   so, and the row has to say that it does.
+    /// * `deliver` said "exactly-once at the endpoint" with no qualifier over a
+    ///   1024-offset dedup window that ordinary refills reach, and stated its
+    ///   quota per `from=` when `from=`'s first half is the sending node's own
+    ///   word.
+    /// * `post` answered a still-queued message with a bare `ERR fabric
+    ///   disconnected`, which reads as "not sent" — and the remedy for "not sent"
+    ///   is to send again, into an inbox with no idempotency key.
+    /// * `inbox seen` moves the LISTED state as well as the handled watermark,
+    ///   which is what releases a sender's quota; the two rows read as if the
+    ///   watermarks were independently controlled.
+    /// * `send`'s duplicate reply is framed per verb (`OK 0 dup=1` for a
+    ///   Lines/Bytes verb), and `turn`'s duplicate carries none of the verdict
+    ///   fields its own row promises.
+    /// * `outbox` is bounded in bytes across all sessions, not only by `<max>`.
+    #[test]
+    fn the_fabric_rows_state_the_bounds_they_are_held_to() {
+        let help = |verb: &str| {
+            spec(verb)
+                .unwrap_or_else(|| panic!("{verb} ships"))
+                .help_line()
+        };
+
+        let get = help("inbox get");
+        assert!(
+            !get.contains("FULL body"),
+            "`inbox get` cannot promise a body the bridge may have cut"
+        );
+        assert!(get.contains("truncated=1") && get.contains("len=<true-size>"));
+        assert!(
+            get.contains("NOT recoverable by any verb"),
+            "the row must say the rest cannot be fetched, not merely that it is missing"
+        );
+
+        let inbox = help("inbox");
+        assert!(
+            inbox.contains("[truncated=1]"),
+            "the row grammar omits the marker"
+        );
+        assert!(inbox.contains("also LISTS every row at or below"));
+        assert!(
+            inbox.contains("counts UNHANDLED rows"),
+            "`dropped=` counts past the HANDLED watermark, not the listed one"
+        );
+
+        assert!(help("inbox seen").contains("RELEASES the sender's per-peer quota"));
+
+        let deliver = help("deliver");
+        assert!(
+            deliver.contains("over the last 1024 delivered offsets"),
+            "the exactly-once claim must carry its window"
+        );
+        assert!(deliver.contains("reappears as a FRESH row"));
+        assert!(
+            deliver.contains("ATTESTED PEER") && deliver.contains("cap-forced `<src>`"),
+            "the quota is per peer, not per `from=` string"
+        );
+
+        assert!(
+            help("post").contains("queued=1"),
+            "a `--wait` refused for want of a link must not read as `not sent`"
+        );
+
+        assert!(help("outbox").contains("BOUNDED IN BYTES"));
+
+        let send = help("send");
+        assert!(
+            send.contains("`OK dup=1` for a `Status`-framed verb") && send.contains("`OK 0 dup=1`"),
+            "the duplicate reply is framed per verb, and `send`'s row is where the \
+             key's contract is written"
+        );
+        assert!(
+            help("turn").contains("carries NONE of the verdict fields"),
+            "a duplicate `turn` answers a marker, not the verdict line its row promises"
+        );
     }
 
     /// `copy` is the clipboard-exfil boundary and `settings` rewrites durable config
@@ -1902,6 +2450,106 @@ mod tests {
         // scroll/select stay Read — viewport nav is part of reading, nothing leaves.
         assert_eq!(spec("scroll").unwrap().op, OpClass::Read);
         assert_eq!(spec("select").unwrap().op, OpClass::Read);
+    }
+
+    /// The `privacy` row's SHAPE is load-bearing, not cosmetic. `AnyScopeMeta` is
+    /// why a `--headless` instance answers it at all (`v()` would have hardcoded
+    /// `Access::Scoped`, under which the consent readout is unavailable to exactly
+    /// the caller it exists for); `Meta` rejects a selector; `Read` because every
+    /// fact it aggregates is one `status` already exposes a session at a time, so
+    /// the verb introduces no new authority; `Lines` because it replies `OK <n>`
+    /// plus n rows. The help is the wire documentation an agent reads after an
+    /// EPERM, so it must also carry the three things that are otherwise guessed
+    /// wrong: reading it raises no dialog, per-folder state is `unknown` by
+    /// construction, and `unavailable` is a third value, not `false`.
+    #[test]
+    fn privacy_is_a_headless_answerable_meta_read_that_documents_its_unknowns() {
+        let s = spec("privacy").expect("privacy is in the table");
+        assert_eq!(
+            s.op, Read,
+            "privacy is a Read verb (json-capable verbs must be)"
+        );
+        assert_eq!(s.framing, Lines, "privacy replies `OK <n>` + n lines");
+        assert_eq!(
+            s.target, Meta,
+            "privacy is self-scoped; a selector is rejected"
+        );
+        assert_eq!(
+            s.access, AnyScopeMeta,
+            "privacy must be AnyScopeMeta or a headless instance cannot answer it"
+        );
+        assert!(is_any_scope_meta("privacy") && !is_owner_only("privacy"));
+        assert!(
+            JSON_CAPABLE_VERBS.contains(&"privacy"),
+            "privacy --json is part of the contract"
+        );
+        assert_eq!(framing_of("privacy", "privacy --json"), Lines);
+        assert_eq!(framing_of("privacy", "privacy"), Lines);
+
+        let help = s.help_line();
+        for phrase in [
+            "no `@<sel>`",
+            "`--headless`",
+            "raises NO dialog",
+            "`unknown` BY CONSTRUCTION",
+            "THIRD value",
+            "distinct from `off` and from `false`",
+            "`fda_scope=unknown`",
+            "`sessions_total=` always equals the number of `session` lines",
+        ] {
+            assert!(help.contains(phrase), "privacy help lacks {phrase:?}");
+        }
+        // The scope ruling: a grant MITIGATES a class of interruption for the
+        // folders it covers. Which services those are is unmeasured, so the help
+        // may never say the grant ends prompting.
+        assert!(
+            help.contains("removes this class of interruption for the folders that grant covers"),
+            "the Full Disk Access claim must stay scoped to a class and to covered folders"
+        );
+        for overclaim in [
+            "all prompts",
+            "every prompt",
+            "no more prompts",
+            "never prompt",
+            "eliminates",
+        ] {
+            assert!(
+                !help.contains(overclaim),
+                "privacy help overclaims what a grant does: {overclaim:?}"
+            );
+        }
+    }
+
+    /// `await consent` is the park-until-the-posture-moves predicate. Two things
+    /// have to be IN the help or a caller writes the edge-trigger bug for us: it
+    /// arms when the request arrives (so it can never latch on a value that was
+    /// already true), and its default timeout is finite precisely because the
+    /// dialog it waits behind is not. It also must not claim to see the human's
+    /// answer — aterm observes its own posture, nothing more.
+    #[test]
+    fn await_declares_the_consent_predicate_its_arm_point_and_a_finite_timeout() {
+        let s = spec("await").expect("await is in the table");
+        assert!(
+            s.summary.contains("|consent>"),
+            "the grammar row must list the consent token: {:?}",
+            s.summary
+        );
+        let help = s.help_line();
+        for phrase in [
+            "ARMS when the request arrives",
+            "first observed change from THAT baseline",
+            "already true when you asked",
+            "never against a baseline captured earlier",
+            "`timeout=300000`",
+            "finite on purpose",
+            "an ordinary timeout reply, not an error",
+        ] {
+            assert!(help.contains(phrase), "await help lacks {phrase:?}");
+        }
+        assert!(
+            help.contains("not that a human answered a dialog"),
+            "await must not claim it observes the human's answer"
+        );
     }
 
     /// The FULL catalog is a wire surface (`help --full`, `aterm help introspection`),

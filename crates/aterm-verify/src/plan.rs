@@ -40,6 +40,7 @@ pub enum StageId {
     Doctests,
     RegexLane,
     Tippy,
+    Formatting,
     GrepGuards,
     InstallChannel,
     TrustGateVerdict,
@@ -103,6 +104,25 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         StageId::Tippy,
         format!("tippy lint ({label})"),
         Lane::TippyTarget,
+    ));
+    // FORMATTING, right after the lint it belongs beside. It is `xtask gate
+    // lint --fmt-only`: both passes of the formatter lane — `targo-fmt --all`
+    // over the workspace and the per-file sweep over the sources `--all` cannot
+    // reach — and no other lane. `MainTarget` because it runs through the xtask
+    // binary; the check itself needs no compiler and cost 7.5 s over 1,761 files
+    // on two measured runs.
+    //
+    // WHY THE CONTRACT NOW CHECKS FORMATTING. It did not until 2026-08-31, and
+    // the limit was stated rather than hidden — but `.githooks/pre-push` has
+    // been advisory since 2026-08-24, so nothing whatsoever ran the formatter
+    // unless a human chose to. MEASURED consequence: three consecutive rebases
+    // of `main` arrived with drift (5 files, 2 files, 1 file), and one of those
+    // files sat in a crate `targo-fmt --all` structurally cannot see. A rule the
+    // tree is held to by nobody is not a rule.
+    v.push(spec(
+        StageId::Formatting,
+        "formatting (targo-fmt --all + the per-file sweep)",
+        Lane::MainTarget,
     ));
     v.push(spec(StageId::GrepGuards, "grep guards", Lane::Pure));
     v.push(spec(
@@ -231,6 +251,7 @@ mod tests {
                 StageId::Doctests,
                 StageId::RegexLane,
                 StageId::Tippy,
+                StageId::Formatting,
                 StageId::GrepGuards,
                 StageId::InstallChannel,
                 StageId::TrustGateVerdict,
@@ -365,6 +386,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 20);
+        assert_eq!(plan(&nothing_installed).len(), 21);
     }
 }

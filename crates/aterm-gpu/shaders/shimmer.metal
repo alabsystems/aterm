@@ -5,7 +5,9 @@ struct VsOut {
     float4 pos [[position]];
 };
 
-vertex VsOut vs_fs_shimmer(uint vi [[vertex_id]]) {
+// NAMED `vs_fs`, not `vs_fs_shimmer` — the twin of `renderer.rs::SHIMMER_SHADER`'s
+// `vs_fs`. See the same note in `bloom.metal`.
+vertex VsOut vs_fs(uint vi [[vertex_id]]) {
     const float2 xy[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VsOut o;
     o.pos = float4(xy[vi], 0.0, 1.0);

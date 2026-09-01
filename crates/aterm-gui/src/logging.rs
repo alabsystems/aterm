@@ -75,17 +75,97 @@ pub fn init() {
 /// which nobody sees for a windowed app — the crash file is the artifact
 /// that survives the window vanishing. Chains to the previous (default)
 /// hook and returns, so the unwind itself proceeds unchanged.
+///
+/// [`file_panic_report`] decides WHICH surface a given panic belongs on: not every
+/// panic in this process is a crash of aterm, and one of them is an accessibility
+/// outage that the app survives.
 fn install_panic_hook(dir: PathBuf) {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Allocation-light: the small path string and the captured backtrace
-        // are the only buffers; the report streams straight to the fd.
-        let path = dir.join(format!("crash-{}.log", std::process::id()));
-        let _ = write_crash_report(&path, info, &std::backtrace::Backtrace::force_capture());
-        eprintln!("aterm-gui: panic — crash report at {}", path.display());
+        // The report path is the routing's testable answer; the hook has no further
+        // use for it once the artifact is on disk.
+        let _report = file_panic_report(
+            &dir,
+            info.location().map_or("", |l| l.file()),
+            std::thread::current().name(),
+            panic_payload(info),
+            info,
+            &std::backtrace::Backtrace::force_capture(),
+        );
         prev(info);
     }));
 }
+
+/// The panic message as text, for the surfaces that show a sentence rather than the
+/// whole `PanicHookInfo` rendering. Both payload shapes the standard library produces
+/// (`panic!("literal")` and a formatted `String`) are handled; anything else is a
+/// third-party payload type nothing can render, and keeps the neutral word.
+fn panic_payload<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
+    let payload = info.payload();
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("panicked")
+}
+
+/// File one panic on the surface it belongs to, and answer with the crash report's
+/// path when it was filed as a crash (`None` when it went to the accessibility
+/// surface instead). The panic's parts arrive as arguments so the routing is exercised
+/// without unwinding a real thread.
+///
+/// THE ACCESSIBILITY PUBLISHER'S BACKGROUND THREAD IS THE ONE PANIC THAT IS NOT A
+/// CRASH OF ATERM: the process keeps running and every other feature works, so the
+/// only thing lost is the tree a screen reader reads (see [`crate::a11y_backend`]).
+/// Filing it as `crash-<pid>.log` made the NEXT launch banner "aterm closed
+/// unexpectedly last time" for a run that never closed — a false alarm on every single
+/// launch, which is exactly how a true one stops being believed. It is reported as the
+/// accessibility failure it is instead; the caller still chains to the default hook, so
+/// nothing about the panic is swallowed.
+fn file_panic_report(
+    dir: &Path,
+    location_file: &str,
+    thread_name: Option<&str>,
+    payload: &str,
+    info: &dyn std::fmt::Display,
+    backtrace: &dyn std::fmt::Display,
+) -> Option<PathBuf> {
+    if is_accessibility_backend_panic(location_file, thread_name) {
+        report_accessibility_failure(payload, location_file);
+        return None;
+    }
+    // Allocation-light: the small path string and the captured backtrace
+    // are the only buffers; the report streams straight to the fd.
+    let path = dir.join(format!("crash-{}.log", std::process::id()));
+    let _ = write_crash_report(&path, info, backtrace);
+    eprintln!("aterm-gui: panic — crash report at {}", path.display());
+    Some(path)
+}
+
+/// [`crate::a11y_backend::is_backend_panic`] where an accessibility tree is compiled
+/// in. A build without one has no publisher to lose, so every panic is aterm's.
+#[cfg(a11y_tree)]
+fn is_accessibility_backend_panic(location_file: &str, thread_name: Option<&str>) -> bool {
+    crate::a11y_backend::is_backend_panic(location_file, thread_name)
+}
+
+#[cfg(not(a11y_tree))]
+fn is_accessibility_backend_panic(_location_file: &str, _thread_name: Option<&str>) -> bool {
+    false
+}
+
+/// Twin of [`is_accessibility_backend_panic`]: the report itself, unreachable in a
+/// build with no accessibility tree.
+#[cfg(a11y_tree)]
+fn report_accessibility_failure(payload: &str, location_file: &str) {
+    crate::a11y_backend::report_failure(
+        crate::a11y_backend::reason_from_payload(payload),
+        location_file,
+    );
+}
+
+#[cfg(not(a11y_tree))]
+fn report_accessibility_failure(_payload: &str, _location_file: &str) {}
 
 /// Write one `0600` crash report, truncating any prior report from this pid.
 fn write_crash_report(
@@ -120,6 +200,13 @@ fn write_crash_report(
 ///     `len() == 0` skip below is correct even though this runs AFTER
 ///     `install_signal_handlers` created ours (and after its sweep, which only
 ///     ever removes those same empty markers — ordering against it is moot).
+///
+/// WHAT IS NOT HERE: a dead accessibility publisher. Its background thread panics
+/// without ending the process, so a report filed under `crash-<pid>.log` would have
+/// this scan announce "aterm closed unexpectedly" for a run that never closed —
+/// every launch, for as long as the accessibility bus stays unreachable.
+/// [`file_panic_report`] routes that one class to [`crate::a11y_backend`] instead,
+/// which is why nothing in this scan needs to know about it.
 ///
 /// CONSUMING, so the banner shows exactly once: every artifact found is renamed
 /// to `<name>.seen` — renamed, never deleted, because the banner points the user
@@ -384,6 +471,56 @@ mod tests {
         // One-shot: a second scan (the next launch) finds nothing to banner —
         // the empty marker and aterm.log were never candidates.
         assert!(take_crash_evidence_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The accessibility publisher's background thread panics without ending the
+    /// process, so filing it as a crash makes the NEXT launch claim aterm closed
+    /// unexpectedly — on every launch, for as long as the accessibility bus stays
+    /// unreachable. It must leave no crash evidence behind; the surface it does get
+    /// is `a11y_backend`'s window notice, asserted there.
+    #[cfg(a11y_tree)]
+    #[test]
+    fn an_accessibility_backend_panic_leaves_no_crash_evidence_for_the_next_launch() {
+        let _lane = crate::config_notice::lane_test_guard();
+        let _ = crate::config_notice::take_deferred();
+        let dir = std::env::temp_dir().join(format!("aterm-log-a11y-{}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        let backend = "/r/accesskit_unix-0.22.0/src/context.rs";
+        let payload = "called `Result::unwrap()` on an `Err` value: \
+                       Handshake(\"Server GUID mismatch: expected a, got b\")";
+        assert_eq!(
+            file_panic_report(&dir, backend, None, payload, &"panicked", &"bt"),
+            None,
+            "a dead accessibility publisher is not a crash of aterm"
+        );
+        assert!(
+            take_crash_evidence_in(&dir).is_none(),
+            "the next launch must not be told aterm closed unexpectedly"
+        );
+        let queued = crate::config_notice::take_deferred();
+        assert!(
+            queued.iter().any(|l| l.contains("no screen reader")),
+            "the window must say the tree is gone: {queued:?}"
+        );
+        assert!(
+            queued.iter().any(|l| l.contains("Server GUID mismatch")),
+            "and must name the bus fault: {queued:?}"
+        );
+
+        // The SAME dir, an ordinary panic: still a crash report, still bannered.
+        let path = file_panic_report(
+            &dir,
+            "crates/aterm-gui/src/app.rs",
+            None,
+            "boom",
+            &"i",
+            &"b",
+        )
+        .expect("an ordinary panic is still filed as a crash");
+        assert!(path.exists());
+        assert!(take_crash_evidence_in(&dir).is_some());
+        let _ = crate::config_notice::take_deferred();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

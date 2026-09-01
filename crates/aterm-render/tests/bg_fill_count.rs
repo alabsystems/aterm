@@ -19,8 +19,10 @@
 //! contract — `xtask gate perf` is a TIMING gate that needs release builds of
 //! several harnesses and has not run green in a month. A COUNT has none of those
 //! problems: it is exact, machine-independent, cannot flake under load, and
-//! rides `cargo test` — hence `tools/verify.sh --fast` and the pre-push hook —
-//! at zero marginal cost.
+//! rides `cargo test` — hence `tools/verify.sh --fast`, the merge contract — at
+//! zero marginal cost. (This named "and the pre-push hook" until 2026-08-31.
+//! It does not ride one: `.githooks/pre-push` was demoted to ADVISORY on
+//! 2026-08-24 and its whole body is one printf and `exit 0`.)
 //!
 //! WHAT A COUNT CANNOT CATCH: a constant-factor slowdown with the counts
 //! unchanged. If `fill_rect` itself became 3x slower this file stays green. It

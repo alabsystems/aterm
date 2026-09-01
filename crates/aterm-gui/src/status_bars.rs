@@ -2444,9 +2444,20 @@ mod tests {
             ("own apply ", "lane"),
             ("launch is the ", "fallback"),
             ("retired-wording ", "detector"),
+            // The dead accessibility publisher, added 2026-08-31 alongside
+            // a11y_backend.rs joining the file list below. A restart is the
+            // only recovery there — one backend per process, by `OnceLock` —
+            // and this ruling is about the UPDATE lane, which updates in place.
+            ("restart aterm ", "to retry"),
         ]);
         let gui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut files: Vec<std::path::PathBuf> = [
+            // a11y_backend.rs was MISSING here until 2026-08-31, and that is how
+            // b571a20b9's restart prompt shipped with this test green: only
+            // tools/grep_guard.sh's B12 — which reads every shipping line of the
+            // crate rather than an enumerated set — ever saw it. An enumerated
+            // list is a list somebody has to remember to extend.
+            "a11y_backend.rs",
             "status_bars.rs",
             "menu.rs",
             "palette.rs",

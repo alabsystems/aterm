@@ -1113,6 +1113,24 @@ struct PressClass<'ev> {
     /// Ctrl/Alt/Super already held IS in it, which is exactly the
     /// mid-chord press that must stay silent.
     shift_key: bool,
+    /// THE GLYPH ITSELF WAS SHIFTED — a capital or a shifted symbol, as
+    /// distinct from `shift_key` (the bare modifier). Feeds
+    /// [`aterm_effects::trail_sound::SoundEvent::shifted`], which lifts the
+    /// keystroke's note an octave (owner ask, 2026-08-30: "when doing a
+    /// shift-key press (not the shift, but the shifted key) make it higher
+    /// pitched").
+    ///
+    /// Read off the MODIFIER SNAPSHOT, not off key identity — and that is
+    /// correct here for exactly the reason the doc on `shift_key` gives it is
+    /// wrong there. The snapshot is stale only on the bare modifier's OWN
+    /// keydown, which winit queues before the matching `ModifiersChanged`; by
+    /// the time the shifted LETTER arrives the SHIFT bit is present. This is
+    /// the same `mods` the encoder uses to pick the glyph it sends, so the
+    /// sound and the byte on the wire cannot disagree.
+    ///
+    /// Printable, unchorded presses only: a Ctrl-chord is not a capital, and
+    /// the bare spacebar is a word boundary whatever the other hand is doing.
+    glyph_shifted: bool,
 }
 
 /// Whether committed text can advance/reposition the terminal cursor. A run
@@ -1270,6 +1288,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     let mut ime: Option<&str> = None;
     let mut backspace = false;
     let mut brk = false;
+    let mut glyph_shifted = false;
     match ev {
         InputEvent::Key { key, mods, .. } => {
             let chorded = mods.contains(TMods::CTRL)
@@ -1282,6 +1301,9 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
                     // base) — folded to lowercase inside
                     // the detector, so KITTY still counts.
                     typed = Some(aterm_types::keyboard::shifted_character(*c, *mods).unwrap_or(*c));
+                    // …and the SOUND'S witness, from the same
+                    // snapshot that picked that glyph.
+                    glyph_shifted = mods.contains(TMods::SHIFT);
                 }
                 TKey::Named(TNamed::Space) if !chorded => typed = Some(' '),
                 TKey::Named(TNamed::Backspace) if !chorded => backspace = true,
@@ -1359,6 +1381,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         inert_modifier,
         spacebar,
         shift_key,
+        glyph_shifted,
     }
 }
 
@@ -1785,6 +1808,72 @@ impl App {
             dropped: self.trail_audio.dropped_cues(),
         }
         .line())
+    }
+
+    /// The `streak [status]` control verb: one line of PRISM WAKE state for the
+    /// FRONT window ([`crate::Wake::StreakStatus`]).
+    ///
+    /// It exists for the reason `tone_status` does, and the reason is sharper
+    /// here: the streak is DELIBERATELY subtle (a ~0.10-coverage comet that
+    /// lives under a second), so "I see no rainbow" is indistinguishable by eye
+    /// between a disabled key, an unfocused window's W11 demotion, reduced
+    /// motion, an alt-screen or scrolled-back suppression, an echo-discounted
+    /// stream that is genuinely all your own typing, and an engine that is
+    /// simply resting because no output arrived. Every one of those gates is
+    /// reported separately, so the answer NAMES the one that stopped it rather
+    /// than leaving an owner to guess — which is the whole difference between a
+    /// subtle effect and a broken one.
+    ///
+    /// `Err` when there is no focused window — an honest refusal, never a
+    /// fabricated neutral row.
+    pub(crate) fn streak_status(&self) -> Result<String, String> {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no focused window".to_string());
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return Err("no focused window".to_string());
+        };
+        let enabled = self.config.output_streak_enabled_or_default();
+        let sound = self.config.output_streak_sound_or_default();
+        // The MOTION verdict is reported with the SAME focus input the render
+        // tick uses — `cursor_fx_focus`, not the raw bit — or the line lies in
+        // both directions: it would claim animation a demoted window will never
+        // draw (W11's unfocused demotion is unconditional and outranks even
+        // `motion = "full"`), and it would report a dark window while a live
+        // typed wake or an in-flight recording is legitimately animating one.
+        // `raw_focused` is reported separately so the two stay tellable apart.
+        let raw_focused = ws.focused;
+        let fx_focused = self.cursor_fx_focus(wid, raw_focused, std::time::Instant::now());
+        let animate = self
+            .motion_policy(fx_focused)
+            .animate(crate::motion::MotionEffect::OutputStreak);
+        // BOTH engine families, because a split has no single-pane engine at
+        // all: reporting only that one would tell a split user "engine=none"
+        // while comets were on their glass.
+        let panes = ws.output_streak_panes.len();
+        let engine = if ws.output_streak.is_some() || panes > 0 {
+            "live"
+        } else {
+            "none"
+        };
+        let active = ws.output_streak.as_ref().is_some_and(|s| s.is_active())
+            || ws.output_streak_panes.values().any(|s| s.is_active());
+        Ok(format!(
+            "config_enabled={enabled} sound_key={sound} motion_animates={animate} \
+             focused={raw_focused} fx_focused={fx_focused} serious_sound={serious} \
+             sounds_master={master} volume={volume} engine={engine} panes={panes} \
+             active={active} intensity={intensity} tail={tail} max_streaks={max} \
+             idle_secs={idle}",
+            serious = self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::TerminalSound),
+            master = self.config.trail_sounds_or_default(),
+            volume = self.config.trail_sound_volume(),
+            intensity = self.config.output_streak_intensity_or_default(),
+            tail = self.config.output_streak_tail_or_default(),
+            max = self.config.output_streak_max_streaks_or_default(),
+            idle = self.config.output_streak_idle_secs_or_default(),
+        ))
     }
 
     /// Record a typed-"kitty" completion in the Kitty Log (detector:
@@ -2546,6 +2635,7 @@ impl App {
                     inert_modifier,
                     spacebar,
                     shift_key,
+                    glyph_shifted,
                 } = classify_press(&ev);
                 // Optional sound must never get ahead of terminal egress. The
                 // engine may mint/take the bounded cue while the window is
@@ -2981,8 +3071,22 @@ impl App {
                             } else {
                                 aterm_effects::trail_sound::SoundKind::Typed
                             };
+                            // THE CAPITAL'S OCTAVE. Shiftedness is a property
+                            // of the KEY EVENT and this is the only seam that
+                            // has one: the echo path mints its Typed cues from
+                            // a cursor delta and cannot tell `A` from `a`, so a
+                            // capital whose click missed this seam simply
+                            // sounds unshifted — the same soft degradation the
+                            // spacebar's comma already takes, and for the same
+                            // reason. Never on the space: a word boundary is a
+                            // word boundary in either case.
+                            let click_shifted = glyph_shifted && !spacebar;
                             if click_audible
-                                && ws.cursor_glow.cue_keystroke_kind(input_now, click_kind)
+                                && ws.cursor_glow.cue_keystroke_shifted(
+                                    input_now,
+                                    click_kind,
+                                    click_shifted,
+                                )
                             {
                                 let delivered =
                                     match (click_synth.as_ref(), ws.cursor_glow.take_key_cue()) {
@@ -12460,11 +12564,13 @@ mod press_path_lock_elision_tests {
             bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
             let bare_cfg = bare.glow_config();
             let b0 = Instant::now();
-            bare.windows
-                .get_mut(&wid)
-                .unwrap()
-                .cursor_glow
-                .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
+            bare.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+                Some((0, 0)),
+                b0,
+                &bare_cfg,
+                geom,
+                &mut out,
+            );
             assert_eq!(
                 bare.input(
                     wid,
@@ -12502,11 +12608,13 @@ mod press_path_lock_elision_tests {
                 "the return license is depth-1/consume-once — floods still decline"
             );
         }
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .cursor_glow
-            .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
+        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            Some((0, 0)),
+            t0,
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
         // Two real glyphs bank stamps; their echoes are in flight when Enter lands.
         for ch in ['g', 'i'] {
             assert_eq!(
@@ -12611,11 +12719,13 @@ mod press_path_lock_elision_tests {
         };
         let t0 = Instant::now();
         let mut out = Vec::new();
-        app.windows
-            .get_mut(&wid)
-            .unwrap()
-            .cursor_glow
-            .tick(Some((0, 0)), t0, &glow_cfg, geom, &mut out);
+        app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            Some((0, 0)),
+            t0,
+            &glow_cfg,
+            geom,
+            &mut out,
+        );
         for ch in ['l', 's'] {
             assert_eq!(
                 app.input(
@@ -12676,11 +12786,13 @@ mod press_path_lock_elision_tests {
         bare.config.cursor_trail_style = Some("rainbow kitty".to_string());
         let bare_cfg = bare.glow_config();
         let b0 = Instant::now();
-        bare.windows
-            .get_mut(&wid)
-            .unwrap()
-            .cursor_glow
-            .tick(Some((0, 0)), b0, &bare_cfg, geom, &mut out);
+        bare.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+            Some((0, 0)),
+            b0,
+            &bare_cfg,
+            geom,
+            &mut out,
+        );
         assert_eq!(
             bare.input(
                 wid,

@@ -2,6 +2,13 @@
 using namespace metal;
 
 // text_blend != 0.0 => fs_glyph applies the W2 linear-corrected coverage remap.
+//
+// BINDING LAW: uniform blocks in vertex functions here say [[buffer(0)]], and
+// that is safe ONLY because the instance stream is laid out at vertex-buffer
+// index 30 (ffi.rs::INSTANCE_STREAM_SLOT, wgpu-hal's own deconfliction).
+// [[stage_in]] attributes and constant buffers share ONE vertex argument
+// table; a stream at 0 lands on top of this block and the draw completes
+// having painted nothing. pipelines.rs's slot-scan test holds this file to it.
 struct Uniforms { float2 screen; float text_blend; float pad; };
 
 // Unit quad corner for vertex index 0..6 (two CCW triangles).

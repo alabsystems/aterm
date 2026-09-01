@@ -55,6 +55,11 @@ fn visible_leaf_plan_builds() -> usize {
     VISIBLE_LEAF_PLAN_BUILDS.with(std::cell::Cell::get)
 }
 
+/// What aterm says when the OS accessibility publisher stops serving its tree —
+/// the one surface between a dead AT-SPI backend and a screen-reader user who
+/// would otherwise be given silence.
+#[cfg(a11y_tree)]
+mod a11y_backend;
 mod about;
 mod accessibility;
 /// Cross-platform AccessKit adapter for transient/compatibility overlays; native
@@ -166,6 +171,18 @@ mod connection_map;
 /// The GUI connection core (§1.4): the process-local `ConnectionRecord` store,
 /// connect/disconnect, the §4.1 mark-role predicate, and the close-time sweep.
 mod connections;
+/// The `tccd` consent OBSERVER and the EPERM-driven attention path (design
+/// §3.6). Off by default (`[privacy] observer = false`), config-only — no
+/// environment variable and no control verb, because a consent surface an agent
+/// could enable from inside a session is exactly what this design removes.
+mod consent_observer;
+/// The macOS consent WARM-UP (design §3.5): the owner-initiated, off-event-loop
+/// worker that lists each configured folder in sequence so macOS asks its
+/// question at a moment a human chose, plus the bounded in-place-apply hold that
+/// keeps an automatic update from landing in the middle of that gesture.
+/// Reachable ONLY from the Security panel — no control verb, no environment
+/// variable, no automatic trigger.
+mod consent_warmup;
 mod control;
 /// The main-thread redraw conformance gate, for the `aterm-redraw-conformance`
 /// binary. Re-exported here because a `[[bin]]` is its own crate and everything
@@ -176,6 +193,11 @@ pub use control::control_redraw_conformance::run_redraw_conformance;
 mod control_auth;
 #[cfg(test)]
 mod control_connection_conformance;
+/// `aterm ctl privacy` + `await consent`: the macOS consent posture, the
+/// instance-owned consent state, and THE FENCE — every OS question this
+/// feature asks goes through injected function pointers with an inert
+/// headless/test arm (the `lock_modifiers` / `user_input_recent` pattern).
+mod control_privacy;
 // TRUST_NATIVE_TLA Tier-1: the `SelectionCustody` binding (real App gesture/press seams
 // + real `Terminal` damage/scroll/eviction batches). Test-only, like its siblings.
 mod selection_custody_conformance;
@@ -238,7 +260,7 @@ mod status_bars;
 // `trail_config`), driven from the render tick alongside the aurora.
 use aterm_effects::{
     cursor_beam, cursor_comet, cursor_droplet, cursor_fireball, cursor_glow, cursor_phaser,
-    cursor_rainbow, cursor_trail, kitty_cursor, matrix_rain, word_decorations,
+    cursor_rainbow, cursor_trail, kitty_cursor, matrix_rain, output_streak, word_decorations,
 };
 mod app_control;
 mod app_documents;
@@ -252,6 +274,15 @@ mod document_store;
 #[cfg(test)]
 mod document_store_conformance;
 mod echo_rtt;
+/// The FABRIC endpoint: the per-session inbox ring, the outbound post queue and
+/// the hold gate — state, not I/O (design §11.2). The bus itself lives in the
+/// `aterm-link serve` child the instance launches.
+mod fabric;
+/// The bridge LAUNCHER: `[fabric] command`, the two socketpairs, and the child
+/// that inherits their far ends at fds 3 and 4 (design §11.2). Unix only — the
+/// descriptor inheritance it rests on has no AF_UNIX-on-Windows analogue.
+#[cfg(unix)]
+mod fabric_launch;
 mod find_bar;
 mod fleet_watch;
 mod front_content;
@@ -334,6 +365,10 @@ mod trail_audio;
 pub(crate) use aterm_predict as predict;
 mod prefs;
 mod proxy;
+/// A6: the idempotency key at the PTY seam — `send|key|feed-bin|turn … id=<key>`,
+/// a per-session per-producer high-water mark, and an in-doubt outcome that is
+/// reported rather than replayed (design §6.5, §11.2).
+mod pty_idem;
 mod quit_safety;
 mod restore;
 mod scroll_motion;
@@ -2134,6 +2169,12 @@ struct RepaintKey {
     /// early-out; constant `0` when the feature is off / drained-empty (idle =
     /// byte-identical — nothing is added to the D-1 skip path when disabled).
     rain_fp: u64,
+    /// Fingerprint of PRISM WAKE's output streak this frame. The same contract
+    /// as `rain_fp`: it changes on every animating step so a live comet is
+    /// never skipped by the early-out, and it is constant `0` whenever the
+    /// engine is off, reduced to zero amplitude, or settled — so an idle or
+    /// disabled streak adds nothing at all to the D-1 skip path.
+    streak_fp: u64,
     /// The active text selection fingerprint — the FOCUSED pane's, compared
     /// exactly (not hashed).
     selection: SelectionFingerprint,
@@ -2507,6 +2548,9 @@ enum Wake {
         dir: crate::control_auth::ConfinedVideoDir,
         cancel: VideoCancellation,
         reply: std::sync::mpsc::Sender<control::Retained<String>>,
+        /// Last by construction: a dropped wake closes `dir` before returning
+        /// the descriptor charge to global admission.
+        handoff: control::ReplyRetentionPermit,
     },
     /// `video status` — observe the in-flight recording (if any) without touching
     /// it: mode, elapsed vs requested duration, frames captured so far, and
@@ -2551,6 +2595,40 @@ enum Wake {
         session: Option<u64>,
         reply: std::sync::mpsc::Sender<Vec<String>>,
     },
+    /// `privacy` (and `await consent`) want the macOS consent posture, which
+    /// joins main-thread `App` state (the live session set, each session's
+    /// adoption record and shell-integration cwd) with the INJECTED consent
+    /// probes. Same read-only round-trip shape as [`Wake::ReadPanes`]; the
+    /// probes' inert arm is what keeps a headless instance off `tccd`.
+    ReadPrivacy {
+        form: control_privacy::PrivacyForm,
+        reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
+    /// A consent WARM-UP worker (`consent_warmup`, design §3.5) queued one or
+    /// more results and is asking the event loop to fold them into the panel's
+    /// rows. Payload-free ON PURPOSE: the results themselves travel over the
+    /// worker's own BOUNDED, droppable channel (the `notify.rs` queue is the
+    /// precedent), and this is only the poke that says "drain it".
+    ///
+    /// That split is what makes the wake unable to wedge the loop. The worker
+    /// may be parked in a directory listing indefinitely — `tccd` holds the
+    /// syscall until a human answers, with no timeout (§1.4) — so nothing on
+    /// this thread ever joins it, and a lost poke is survivable: the channel's
+    /// disconnect edge ends the pass on the next drain, and the apply hold is
+    /// capped whether or not anyone drains at all.
+    WarmupResult,
+    /// The tccd CONSENT OBSERVER (`consent_observer`, design §3.6) queued one
+    /// or more parsed log events and is asking the event loop to fold them into
+    /// its correlation table. Payload-free ON PURPOSE, for exactly the reasons
+    /// [`Wake::WarmupResult`] is: the events themselves travel over the
+    /// worker's own BOUNDED, droppable channel, and this is only the poke that
+    /// says "drain it".
+    ///
+    /// The worker is parked in a blocking read of a child's stdout, so nothing
+    /// on this thread ever joins it and the child is reaped by the worker that
+    /// spawned it. A lost poke is survivable: the next park drains, and the
+    /// channel's disconnect edge is what ends the stream.
+    ConsentObserver,
     /// `dims` needs the selected terminal grid and main-thread window geometry
     /// from one coherent event turn. The handler samples `term` with `try_lock`
     /// and then projects it through the LIVE font/padding metrics and raw surface
@@ -2748,6 +2826,14 @@ enum Wake {
     /// the `toggle_matrix_rain` keybinding flip ([`App::rain_control`]).
     RainControl {
         op: RainCtlOp,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `streak [status]` (control socket): read the FRONT window's PRISM WAKE
+    /// state — every gate that decides whether program output earns a comet,
+    /// plus the live engine facts. Read-only like `tone`: the streak's knobs
+    /// are durable config (`settings set output_streak.…`), so there is no
+    /// on/off form to write here ([`App::streak_status`]).
+    StreakStatus {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `tone` (control socket): read the FRONT window's tone-of-typing state —
@@ -3237,6 +3323,7 @@ enum Wake {
     /// replies with the off-macOS error string.
     CaptureWindow {
         path: control_auth::ConfinedImage,
+        handoff: control::ReplyRetentionPermit,
         cancel: control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<control::WindowReply>,
     },
@@ -3251,6 +3338,7 @@ enum Wake {
     CaptureAuxWindow {
         target: app_introspect::AuxTarget,
         path: control_auth::ConfinedImage,
+        handoff: control::ReplyRetentionPermit,
         cancel: control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<control::WindowReply>,
     },
@@ -4799,6 +4887,40 @@ const fn defer_gpu_build(want_gpu: bool, headless: bool) -> bool {
     want_gpu && headless
 }
 
+/// THE HEADLESS FONT-SEAL DEFERRAL, the twin of [`defer_gpu_build`] and true for
+/// the same reason: NO GLASS.
+///
+/// `Renderer::seal_admitted_font_sources` settles the generation's broad
+/// fallback, symbol and colour-emoji candidates into resident bytes so that no
+/// later frame does font I/O. Those three faces are RASTERIZATION-ONLY — nothing
+/// but a glyph lookup can reach them, and the text surface (`text`, `send`,
+/// `history`, `status`, `await`) never asks for a glyph. A headless run that is
+/// never asked for a pixel therefore holds them for its whole life unread:
+/// MEASURED on this Linux host, `NotoColorEmoji.ttf` 11,020,136 B +
+/// `DroidSansFallbackFull.ttf` 4,033,420 B + `NotoSansSymbols2-Regular.ttf`
+/// 656,852 B = **15,710,408 B**, which `smaps` shows as three private anonymous
+/// mappings of 10,764 + 3,940 + 644 kB. Against a settled headless process's
+/// 26.6 MB of anonymous RSS that is 58% of its whole heap. Three paired
+/// launches, same config, `smaps_rollup` at 14 s: RSS **44,560 / 44,764 /
+/// 44,648 kB before, 29,132 / 28,896 / 28,728 kB after** (means 44,657 →
+/// 28,919, −15,738 kB), of which the anonymous half is 26,665 → 10,980 kB.
+/// A capture taken from either arm is pixel-identical outside the per-launch
+/// random kitty sprite, which differs between any two launches of ONE binary.
+///
+/// So headless keeps the seal as an INTENT, redeemed by
+/// [`App::ensure_pixel_backend`] — the one funnel every pixel verb (`image`,
+/// `snapshot`, the offscreen present-real `video` loop) already passes through
+/// to redeem the GPU device. Redemption seals the SAME generation the boot
+/// worker would have sealed, from the same candidate paths, so the artifact is
+/// the one an eager seal would have produced.
+///
+/// WINDOWED IS NEVER DEFERRED: its first frame is a glyph demand by definition,
+/// and the whole reason the seal is worker-only is to keep that read off the
+/// event loop.
+const fn defer_font_seal(headless: bool) -> bool {
+    headless
+}
+
 /// PROCESS-GLOBAL twin of [`App::backend_kind_undecided`], for the capability
 /// readers that have no `&App` to ask. Native Settings projects availability from
 /// FREE view functions (`setting_row`, `page`, `manual_override_disclosure`, …)
@@ -4866,6 +4988,116 @@ impl DeferredGpuIntentGuard {
 impl Drop for DeferredGpuIntentGuard {
     fn drop(&mut self) {
         set_backend_gpu_undecided(self.0);
+    }
+}
+
+#[cfg(test)]
+mod headless_font_seal_deferral_tests {
+    /// The font deferral turns on the GLASS question and nothing else. Its GPU
+    /// sibling needs `want_gpu` too, because a `--cpu` run has no device intent
+    /// to defer; every headless run has a font seal to defer, `--cpu` included,
+    /// since the broad/symbol/emoji cascade is read by the CPU rasterizer as
+    /// readily as by the GPU one.
+    #[test]
+    fn every_headless_launch_defers_its_font_seal_and_no_windowed_one_does() {
+        assert!(super::defer_font_seal(true), "headless launch");
+        assert!(!super::defer_font_seal(false), "windowed launch");
+    }
+
+    /// The redemption's whole job, at the seam a capture actually crosses: a
+    /// headless App holding an UNSEALED generation with the deferral armed must
+    /// come out of its first pixel demand SEALED, and the intent must be spent —
+    /// so a run serving a thousand captures reads its font files once.
+    #[test]
+    fn the_first_pixel_demand_seals_a_deferred_headless_generation_once() {
+        // The chrome faces the redemption re-syncs are PER-THREAD under `cfg(test)`
+        // (see `tray_raster::lock_fonts`), so this writes only this test's own.
+        let mut app = super::App::headless_for_test();
+        // The boot shape a deferred launch publishes: a live CPU renderer whose
+        // fallback/symbol/emoji candidates are still pathnames.
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        app.deferred_font_seal = true;
+        assert!(
+            !sealed(&app),
+            "precondition: the published generation is raw"
+        );
+
+        app.ensure_pixel_backend();
+        assert!(
+            sealed(&app),
+            "the first pixel demand must settle the cascade"
+        );
+        assert!(!app.deferred_font_seal, "the intent is spent, not standing");
+
+        // Repeat: a redemption that re-ran would re-read the same files, and the
+        // spent flag is the only thing preventing it.
+        app.ensure_pixel_backend();
+        assert!(sealed(&app));
+    }
+
+    /// The negative control, and the reason the flag exists rather than a
+    /// `headless` test: an App with no seal owed must not have one performed for
+    /// it. Every windowed run and every already-redeemed headless run reaches
+    /// `ensure_pixel_backend`, and a redemption that fired on headlessness alone
+    /// would seal generations their owners deliberately left open.
+    #[test]
+    fn a_pixel_demand_with_no_seal_owed_settles_nothing() {
+        let mut app = super::App::headless_for_test();
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        assert!(!app.deferred_font_seal, "a test App owes no seal");
+        app.ensure_pixel_backend();
+        assert!(
+            !sealed(&app),
+            "nothing may seal a generation nobody deferred"
+        );
+    }
+
+    /// A pixel demand is not the only thing that needs the resident generation.
+    /// `rebuild_backend` — live font zoom and the theme-only half of a config
+    /// reload — rebuilds FROM ADMITTED BYTES, and `rebuild_from_admitted` refuses
+    /// an unsealed generation outright. Left un-redeemed, a headless theme reload
+    /// would fail-soft onto the previous renderer with a font diagnostic, for a
+    /// reason having nothing to do with the reload. The rebuild redeems first.
+    #[test]
+    fn a_rebuild_from_admitted_redeems_the_owed_seal_instead_of_failing_soft() {
+        let mut app = super::App::headless_for_test();
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        app.deferred_font_seal = true;
+        assert!(
+            app.rebuild_backend(),
+            "the rebuild must settle the generation it needs, not decline it"
+        );
+        assert!(sealed(&app), "and the redemption is what settled it");
+        assert!(!app.deferred_font_seal);
+    }
+
+    /// The negative control that makes the test above non-vacuous: the SAME
+    /// unsealed generation with no debt owed really does decline the rebuild.
+    #[test]
+    fn a_rebuild_from_an_unsealed_generation_with_no_debt_owed_declines() {
+        let mut app = super::App::headless_for_test();
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        assert!(!app.deferred_font_seal);
+        assert!(!app.rebuild_backend(), "nothing owed, nothing sealed");
+    }
+
+    fn sealed(app: &super::App) -> bool {
+        match &app.backend {
+            super::BackendSlot::Ready(backend) => backend.admitted_font_sources_sealed(),
+            super::BackendSlot::Pending(_) => panic!("the test App holds a ready backend"),
+        }
     }
 }
 
@@ -5217,6 +5449,14 @@ impl BackendSlot {
         self.ready().cpu_renderer_from_admitted(px, theme)
     }
 
+    /// Settle every path-backed font source. Reachable through the slot only for
+    /// [`App::redeem_deferred_font_seal`], which is headless-only — and a headless
+    /// launch constructs `Ready` directly, so the fail-loud accessor is never the
+    /// lazy join it refuses to be.
+    fn seal_admitted_font_sources(&mut self) {
+        let _ = self.ready_mut().seal_admitted_font_sources();
+    }
+
     fn set_line_height(&mut self, scale: f32) {
         self.ready_mut().set_line_height(scale);
     }
@@ -5421,6 +5661,15 @@ pub struct SessionCtx {
     /// timeline nesting in `set_meta_field` is the only site that holds
     /// another lock WHEN TAKING it, and that order is never reversed).
     pub timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+    /// This session's FABRIC endpoint: the bounded inbox ring the bridge
+    /// `deliver`s into, this session's outbound posts, the two watermarks and the
+    /// hold gate. Lives HERE for the same reason `meta`/`timeline` do — exactly
+    /// one copy per session, reachable lock-disjointly from the control thread
+    /// (the verbs), the registry handle (a bridge-driven `deliver <sid>`) and the
+    /// event loop (`status`'s `hold=`) with no store lock on any hot path. A LEAF
+    /// lock with one sanctioned nesting, fabric -> [`Self::timeline`], never
+    /// reversed. Empty and free for a session nobody ever messages.
+    pub(crate) fabric: crate::fabric::SessionFabric,
 }
 
 struct Session {
@@ -6416,6 +6665,9 @@ struct VideoRec {
     presented: Option<VideoPresentedMeta>,
     /// The pre-created server-named recording dir (see `confine_video_dir`).
     dir: crate::control_auth::ConfinedVideoDir,
+    /// Global artifact capacity reserved before the recording enters the main
+    /// loop and carried unchanged through export, wire write, and ACK.
+    handoff: Option<control::ReplyRetentionPermit>,
     /// Request-lifetime cancellation shared with the blocking control handler,
     /// the export worker, and graceful application shutdown.
     cancel: VideoCancellation,
@@ -7932,6 +8184,20 @@ struct WindowState {
     /// on master-off / layout-space change. `set_config` on hot reload keeps
     /// the tick epoch.
     matrix_rain: Option<Box<matrix_rain::MatrixRain>>,
+    /// PRISM WAKE, per PANE — the COMPOSED path's engines, keyed by session.
+    /// A split shows several live terminals at once and each carries its own
+    /// arrival clock, so one engine per window would blend their streams into
+    /// nonsense (and let a chatty pane spend the quiet pane's spawn budget).
+    /// Pruned against the visible plan beside `unfocused_pane_scratch`, the
+    /// `retain_panes` discipline: a closed pane's engine cannot outlive it.
+    /// The single-pane present uses `output_streak` below instead.
+    output_streak_panes: std::collections::BTreeMap<u64, output_streak::OutputStreak>,
+    /// PRISM WAKE — the output streak. Built LAZILY at the first enabled tick
+    /// (the same zero-cost pin as `matrix_rain`: an off config constructs no
+    /// engine at all) and dropped on master-off. Appends its light to
+    /// `pane_nova`, so the word-decoration nova keeps sole ownership of that
+    /// scratch's clear and neither engine can strand the other's quads.
+    output_streak: Option<Box<output_streak::OutputStreak>>,
     /// Reusable scratch for this frame's rain glyph sprites, copied into
     /// `input_scratch.rain_quads` (resident → no per-frame alloc while raining).
     rain_scratch: Vec<aterm_render::SpriteQuad>,
@@ -9828,6 +10094,8 @@ impl WindowState {
             pane_free: Vec::new(),
             pane_nova: Vec::new(),
             matrix_rain: None,
+            output_streak: None,
+            output_streak_panes: std::collections::BTreeMap::new(),
             rain_scratch: Vec::new(),
             rain_add_scratch: Vec::new(),
             rain_hidden_band: Vec::new(),
@@ -11444,6 +11712,18 @@ struct App {
     /// Always `false` windowed: that device backs a swapchain the first frame
     /// needs, and its build already overlaps the OS window-server round trip.
     deferred_gpu: bool,
+    /// HEADLESS DEFERRAL, font half: an unsealed admitted font generation whose
+    /// seal is owed. `true` only on a headless launch that has not yet been asked
+    /// for a pixel — the broad fallback, symbol and colour-emoji candidates are
+    /// still pathnames rather than the 15.7 MB of resident bytes they become.
+    /// [`Self::ensure_pixel_backend`] redeems it at the first pixel demand and
+    /// clears it, so the redemption is paid once per process at most.
+    ///
+    /// Unlike [`Self::deferred_gpu`] this is not an intent that can DECLINE: the
+    /// seal reads the same candidate paths the boot worker would have read, and a
+    /// candidate that fails to load leaves exactly the absence an eager seal would
+    /// have left. Always `false` windowed (see [`defer_font_seal`]).
+    deferred_font_seal: bool,
     /// The configured renderer theme, re-applied when a font-zoom rebuilds the backend.
     theme: Theme,
     /// The live parsed [`Config`], retained so an OS light↔dark switch can re-resolve a
@@ -11727,17 +12007,48 @@ struct App {
     /// reason as `lock_modifiers` above (2026-08-17: the previous CoreGraphics
     /// probe opened a WindowServer connection from a headless test).
     user_input_recent: fn(std::time::Duration) -> bool,
+    /// THE macOS CONSENT STATE: this instance's injected consent probes plus
+    /// its Full Disk Access probe cache (`control_privacy::ConsentState`).
+    /// Injected the same way, for the same reason, as the two fields above —
+    /// a headless instance and every unit test get arms that answer `unknown`
+    /// without touching `tccd`. Instance-owned on purpose: there is no
+    /// process-global, so a successor started by an in-place apply inherits an
+    /// EMPTY cache and re-probes on first demand.
+    consent: control_privacy::ConsentState,
+    /// THE macOS CONSENT WARM-UP (design §3.5): the owner-initiated pass's rows,
+    /// its receiving end of the worker's bounded queue, and the bounded
+    /// in-place-apply hold. Injected the same way as `consent` above — a
+    /// headless instance and every unit test get a listing arm that answers
+    /// without touching the filesystem, because a warm-up's whole job is to
+    /// raise a system dialog and a unit test must never raise one.
+    consent_warmup: consent_warmup::WarmupState,
+    /// THE tccd CONSENT OBSERVER (design §3.6), OFF unless `[privacy] observer`
+    /// says otherwise. Injected exactly like `consent`/`consent_warmup`: a
+    /// headless instance and every unit test get the arm that spawns nothing
+    /// and reports `unavailable(inert)`. Its worker is detached and its child
+    /// is reaped by that worker, so nothing on this thread ever joins or waits.
+    consent_observer: consent_observer::ObserverState,
+    /// The EPERM-driven attention gate (design §3.6, last bullet): the
+    /// rate-limit that makes a denial storm ONE notification and a posture
+    /// transition the thing that re-arms it. Pure state; the acting is done by
+    /// `App::note_consent_attention`.
+    consent_attention: consent_observer::AttentionGate,
+    /// Whether an observer start has already been ATTEMPTED, so a spawn failure
+    /// is not retried on every park. A config that simply says no does not set
+    /// it, so turning `[privacy] observer` on takes effect at the next park.
+    consent_observer_started: bool,
     /// Shared queue of control-socket `image` requests, drained on
     /// [`Wake::Control`] (the control thread cannot touch the renderer).
     image_queue: control::ImageQueue,
-    /// Sender to the single PNG encode/write worker
+    /// Bounded, non-blocking sender to the single PNG encode/write worker
     /// ([`app_introspect::EncodeJob`]), spawned lazily on the first
     /// `image`/`window` capture — a Retina-sized PNG deflate is a 50–150 ms
     /// stall that must not run on this event-loop thread. ONE worker by design:
     /// submission order == reply order (queued `ImageReq`s must reply in FIFO
     /// queue order), and the worker replies only AFTER the confined write (the
-    /// client reads the file on OK). `None` until first use.
-    encode_tx: Option<std::sync::mpsc::Sender<app_introspect::EncodeJob>>,
+    /// client reads the file on OK). Saturation is rejected on the event-loop
+    /// thread rather than blocking it. `None` until first use.
+    encode_tx: Option<std::sync::mpsc::SyncSender<app_introspect::EncodeJob>>,
     /// Latency self-introspection ($ATERM_TRACE_LATENCY). When on, each PTY
     /// reader stamps the leading edge of its output bursts into ITS session's
     /// `last_output_ns` (nanos since `lat_epoch`), and `redraw()` logs
@@ -12451,12 +12762,324 @@ impl App {
     /// Secure Keyboard Entry; asking the OS instead would be a WindowServer call
     /// from the main thread, which this process does not make (see the 2026-08-17
     /// watchdog incident). Pure and total, so the policy is unit-testable.
+    ///
+    /// # The consent warm-up's bounded hold rides here too (design §3.5)
+    ///
+    /// This is the process's one AUTOMATIC-ONLY refusal that outranks the
+    /// past-grace force and returns above `begin_apply_preflight`, so it mints
+    /// no ticket and spends no retry budget — exactly the shape the warm-up
+    /// hold needs, and the reason §3.5 says the warm-up "reuses" this
+    /// mechanism rather than inventing one. An explicit
+    /// `aterm ctl update apply` never reaches here at all: the sole caller
+    /// (`App::apply_native_update`) consults it only under
+    /// `ApplyMode::is_automatic()`.
+    ///
+    /// The hold is checked FIRST, before the focus shortcut, on purpose: a
+    /// system consent dialog takes focus away from every aterm window, which is
+    /// precisely the case the shortcut answers `true` for.
     fn update_apply_hands_off_keys(&self, now: Instant) -> bool {
+        // A warm-up worker is mid-gesture. Bounded by `[privacy]
+        // warmup_hold_ms` inside `holds_automatic_apply`, so this refusal
+        // cannot repeat forever and cannot pin a build — and it is NOT
+        // "defer while agents are live", which §3.9 refuses outright.
+        if self.consent_warmup.holds_automatic_apply(now) {
+            return false;
+        }
         if !self.windows.values().any(|ws| ws.focused) {
             return true;
         }
         self.last_keystroke_at
             .is_none_or(|at| now.saturating_duration_since(at) >= AUTOMATIC_UPDATE_KEYSTROKE_GAP)
+    }
+
+    /// THE WARM-UP GESTURE (design §3.5) — *Ask for folder access now*, on the
+    /// Security panel and reachable from nowhere else.
+    ///
+    /// Spawns one DETACHED worker that lists each configured folder in
+    /// sequence. aterm renders nothing and asks nothing; it performs an
+    /// ordinary file access at a moment the owner chose, and macOS asks. The
+    /// paths arrive already resolved from `aterm_containment::consent`, as data
+    /// — this crate writes no protected-folder literal (`grep_guard` B13).
+    ///
+    /// While the worker is live the instance holds a bounded hold on the
+    /// automatic in-place apply (see [`Self::update_apply_hands_off_keys`]),
+    /// capped by `[privacy] warmup_hold_ms`. A manual apply is never held, and
+    /// if an apply lands anyway the successor starts with an empty consent
+    /// cache and every row back at `unknown`: it makes no claim about a modal
+    /// that may still be on the screen.
+    ///
+    /// NOT reachable from a control verb, an environment variable, or any
+    /// automatic trigger — a consent-raising action a program inside a session
+    /// could fire would be a consent surface an agent controls.
+    // PENDING CONSUMER. The four methods below are the Security panel's whole
+    // interface to the warm-up (design §3.5 lands the worker and the apply hold
+    // first, the panel that gestures at them second). They are deliberately not
+    // reachable from anywhere else — a consent-raising action with a second call
+    // site is a consent surface that outgrew its gesture — so until the panel
+    // exists they have no caller, and `-D warnings` would otherwise refuse the
+    // seam that the next change is specified to plug into. Every one of them is
+    // exercised by `consent_warmup`'s tests today.
+    #[allow(dead_code)]
+    pub(crate) fn begin_consent_warmup(&mut self) -> consent_warmup::StartOutcome {
+        // The master switch and the mode. `warmup = "never"` means the button is
+        // not even offered; refusing here as well keeps the invariant local to
+        // the gesture rather than to whoever draws the panel.
+        if !self.config.privacy_enabled()
+            || self.config.privacy_warmup() != app_config::PrivacyWarmup::OnRequest
+            || self.headless
+        {
+            return consent_warmup::StartOutcome::Refused;
+        }
+        let folders =
+            aterm_containment::consent::folder_paths(&self.config.privacy_warmup_folders());
+        let hold_cap = Duration::from_millis(self.config.privacy_warmup_hold_ms());
+        let proxy = self.proxy.clone();
+        self.consent_warmup.start(&folders, hold_cap, move || {
+            if let Some(proxy) = &proxy {
+                let _ = proxy.send_event(Wake::WarmupResult);
+            }
+        })
+    }
+
+    /// Whether a warm-up worker is walking right now, freshly drained. The
+    /// panel's *asking…* state and its second-click no-op both read this.
+    #[allow(dead_code)]
+    pub(crate) fn consent_warmup_live(&mut self) -> bool {
+        self.consent_warmup.drain();
+        self.consent_warmup.is_live()
+    }
+
+    /// The warm-up rows, freshly drained, in walk order.
+    #[allow(dead_code)]
+    pub(crate) fn consent_warmup_rows(
+        &mut self,
+    ) -> &[(aterm_containment::Folder, consent_warmup::WarmupRow)] {
+        self.consent_warmup.drain();
+        self.consent_warmup.rows()
+    }
+
+    /// Wall time of the last COMPLETED warm-up pass, for `privacy`'s
+    /// `warmup_last_ms=`. `None` until one completes in THIS process — a
+    /// successor inherits nothing.
+    #[allow(dead_code)]
+    pub(crate) fn consent_warmup_last_pass_ms(&mut self) -> Option<u128> {
+        self.consent_warmup.drain();
+        self.consent_warmup.last_pass_ms()
+    }
+
+    // -----------------------------------------------------------------------
+    // THE tccd CONSENT OBSERVER (design §3.6) — off by default
+    // -----------------------------------------------------------------------
+
+    /// Start the consent observer ONCE, if `[privacy] observer` asks for it.
+    ///
+    /// Config only. There is no environment variable and no control verb: a
+    /// program inside a session must not be able to turn on a consent surface,
+    /// which is the same rule that fences the warm-up (§3.5) and `tccutil
+    /// reset` (§3.7). A headless instance holds the inert arm, so even an
+    /// enabled config spawns nothing there.
+    ///
+    /// Idempotent and cheap: the latch means a park costs one `bool` test.
+    pub(crate) fn start_consent_observer(&mut self) -> consent_observer::StartOutcome {
+        let proxy = self.proxy.clone();
+        let outcome = self
+            .consent_observer
+            .start(self.config.privacy_observer(), move || {
+                if let Some(proxy) = &proxy {
+                    let _ = proxy.send_event(Wake::ConsentObserver);
+                }
+            });
+        // The latch records that an attempt HAPPENED, so a spawn failure is not
+        // retried in a loop. A refusal is deliberately NOT latched: turning the
+        // key on in the config file takes effect on the next park, with no
+        // further gesture asked of anyone.
+        self.consent_observer_started =
+            !matches!(outcome, consent_observer::StartOutcome::Disabled);
+        outcome
+    }
+
+    /// The observer's `observer log=` value: `off`, `ok`, or `unavailable`.
+    ///
+    /// PENDING CONSUMER: `control_privacy`'s `observer` row renders a literal
+    /// `unavailable` today, which is exactly right while the observer ships
+    /// off; this is the accessor that row reads once it takes the live value.
+    /// **`unavailable` is not `false`** (§5.1).
+    #[allow(dead_code)]
+    pub(crate) const fn consent_observer_availability(
+        &self,
+    ) -> consent_observer::ObserverAvailability {
+        self.consent_observer.availability()
+    }
+
+    /// THE VERDICTS: `(session, blocked_on token)` for every DIRECTLY OBSERVED
+    /// pending consent prompt that resolves to one of this instance's sessions.
+    ///
+    /// EMPTY IS THE COMMON ANSWER and it means "nothing observed", never "not
+    /// blocked" — read [`App::consent_observer_availability`] alongside it.
+    ///
+    /// PENDING CONSUMER: `session_status.rs` publishes `blocked_on=` from this
+    /// once Phase 3 is promoted; nothing is asserted about a session until then.
+    #[allow(dead_code)]
+    pub(crate) fn consent_blocked_on(&mut self) -> Vec<(u64, String)> {
+        let now = Instant::now();
+        self.consent_observer.drain(now);
+        let sessions: Vec<(u64, i32)> = self
+            .pool
+            .iter()
+            .map(|session| (session.id, session.pid))
+            .collect();
+        self.consent_observer
+            .verdicts(now, &sessions, consent_observer::live_pgid_of)
+    }
+
+    /// THE 3AM PAGE (design §3.6, the whole point of Phase 3). Every newly
+    /// observed pending prompt attributed to one of this instance's sessions
+    /// raises that tab's attention mark, posts ONE native notification, and
+    /// re-renders the menu-bar glance.
+    ///
+    /// Rate-limited by the `msgID` of the dialog itself rather than by the
+    /// posture epoch: two distinct dialogs are two distinct things a human has
+    /// to answer, and §1.4 proves neither of them ever times out. A quiet
+    /// stream announces NOTHING — this is the direct-observation path, and
+    /// silence is not evidence.
+    fn announce_observed_consent_prompts(&mut self) {
+        let now = Instant::now();
+        let sessions: Vec<(u64, i32)> = self
+            .pool
+            .iter()
+            .map(|session| (session.id, session.pid))
+            .collect();
+        let fresh =
+            self.consent_observer
+                .take_new_verdicts(now, &sessions, consent_observer::live_pgid_of);
+        if fresh.is_empty() {
+            return;
+        }
+        for prompt in &fresh {
+            self.raise_consent_tab_attention(prompt.session);
+            self.post_consent_notification(&prompt.notice());
+        }
+        self.refresh_operator_status_item();
+    }
+
+    // -----------------------------------------------------------------------
+    // THE EPERM-DRIVEN ATTENTION PATH (design §3.6, "what ships now")
+    // -----------------------------------------------------------------------
+
+    /// Fold one observed consent fact through the rate-limiting gate and ACT on
+    /// what it decides: raise the tab mark, post AT MOST ONE native
+    /// notification through `notify.rs`'s existing bounded queue, and re-render
+    /// the menu-bar glance.
+    ///
+    /// The gate is what makes this safe to call on every `EPERM`: a denial
+    /// storm is one notification, and only a posture TRANSITION re-arms it.
+    pub(crate) fn note_consent_attention(&mut self, event: consent_observer::AttentionEvent) {
+        let outcome = self.consent_attention.note(event);
+        if let Some(session) = outcome.raise_tab {
+            self.raise_consent_tab_attention(session);
+        }
+        if let Some(notice) = outcome.notice {
+            self.post_consent_notification(&notice);
+        }
+        if outcome.refresh_status_item {
+            // Call the existing menu-bar renderer; it re-fingerprints and
+            // rebuilds only if something actually moved.
+            self.refresh_operator_status_item();
+        }
+    }
+
+    /// aterm's own file work under a protected root came back `EPERM(1)` for
+    /// this session. The one entry point the rest of the app uses; everything
+    /// after it is the gate's decision.
+    ///
+    /// PENDING PRODUCER: the per-session file paths that can take a TCC `EPERM`
+    /// land with §3.7's repair work. The warm-up (below) is the producer that
+    /// exists today.
+    #[allow(dead_code)]
+    pub(crate) fn note_protected_eperm(&mut self, session: Option<u64>) {
+        self.note_consent_attention(consent_observer::AttentionEvent::ProtectedEperm { session });
+    }
+
+    /// The Full Disk Access probe reported a state. Only a granted → denied
+    /// flip announces; everything else re-arms the gate and re-renders.
+    ///
+    /// PENDING PRODUCER: `control_privacy` owns the probe and calls this as the
+    /// posture moves; the seam is here so the gate's rate limit is the single
+    /// place that decides.
+    #[allow(dead_code)]
+    pub(crate) fn note_fda_posture(&mut self, state: aterm_containment::consent::FdaState) {
+        self.note_consent_attention(consent_observer::AttentionEvent::FdaPosture(state));
+    }
+
+    /// A completed warm-up pass whose rows contain a `denied` folder is aterm's
+    /// OWN file work taking `EPERM(1)` under a protected root — the observed
+    /// fact §3.6's attention path is built on, and the one production producer
+    /// that exists today. Instance-level, so it marks no tab.
+    fn note_warmup_denials(&mut self) {
+        let denied = self
+            .consent_warmup
+            .rows()
+            .iter()
+            .any(|(_, row)| *row == consent_warmup::WarmupRow::Denied);
+        if denied {
+            self.note_protected_eperm(None);
+        }
+    }
+
+    /// Raise the out-of-band tab attention mark for one session's tab.
+    ///
+    /// The `attention` field, not `status_attention`: this is a fact the status
+    /// classifier cannot see and must not be able to erase (`TabIndicators`
+    /// states the rule).
+    fn raise_consent_tab_attention(&mut self, session: u64) {
+        let mut targets: Vec<(WindowId, usize)> = Vec::new();
+        for (wid, ws) in &self.windows {
+            for (index, tab) in ws.tab_set.tabs().iter().enumerate() {
+                let shows = tab.root.any_leaf(&mut |view| {
+                    self.view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(tab_model::View::terminal_session)
+                        == Some(session)
+                });
+                if shows {
+                    targets.push((*wid, index));
+                }
+            }
+        }
+        for (wid, index) in targets {
+            if let Some(tab) = self
+                .windows
+                .get_mut(&wid)
+                .and_then(|ws| ws.tab_set.tab_at_mut(index))
+            {
+                tab.presentation.indicators.attention = true;
+            }
+            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                w.request_redraw();
+            }
+        }
+    }
+
+    /// Post ONE native notification through `notify.rs`'s existing bounded
+    /// queue.
+    ///
+    /// The producer `try_send`s and DROPS on `Full` — never blocking the engine
+    /// — which is that queue's whole contract; this call site adds nothing to
+    /// it and restructures nothing.
+    fn post_consent_notification(&self, notice: &consent_observer::AttentionNotice) {
+        let message = crate::notify::NotifyMsg {
+            session: notice.session,
+            title: Some(notice.title.to_owned()),
+            body: notice.body.clone(),
+        };
+        match self.session_factory.notify_tx.try_send(message) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(dropped))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(dropped)) => {
+                aterm_log::debug!("consent notification not delivered: {}", dropped.body);
+            }
+        }
     }
 
     /// Sole gate into bulk scrollback maintenance. Passing an ordinary-output
@@ -12727,7 +13350,7 @@ impl App {
     }
 
     pub(crate) fn video_finalize(&mut self) {
-        let Some(rec) = self.video_rec.take() else {
+        let Some(mut rec) = self.video_rec.take() else {
             return;
         };
         // The capture episode is over (item 10). Paired with the `note_capture_
@@ -12769,6 +13392,18 @@ impl App {
         }
         match take {
             Some(take) => {
+                // Read disclosure counters before moving any of the recording's
+                // owned fields into the export job.
+                let unlogged_inputs = Self::video_unlogged_total(&rec);
+                let unlogged_other_window = rec.unlogged_other_window;
+                if rec.handoff.is_none() {
+                    fail_video_request(
+                        &rec.reply,
+                        rec.dir,
+                        "recording handoff capacity was not reserved",
+                    );
+                    return;
+                }
                 let Some(permit) = self.video_export.try_begin(rec.cancel.clone()) else {
                     fail_video_request(
                         &rec.reply,
@@ -12777,22 +13412,22 @@ impl App {
                     );
                     return;
                 };
-                // Read the disclosure counters BEFORE the ledger moves into the
-                // job: how many attempts happened during THIS take that the
-                // ledger could not stamp, and how many of those were the
-                // other-window cause. Reported verbatim so a zero-length ledger
-                // can never be mistaken for a quiet screen.
-                let unlogged_inputs = Self::video_unlogged_total(&rec);
-                let unlogged_other_window = rec.unlogged_other_window;
+                let handoff = rec
+                    .handoff
+                    .take()
+                    .expect("recording handoff was checked before export admission");
+                // Report the counters verbatim so a zero-length ledger can
+                // never be mistaken for a quiet screen.
                 self.submit_encode_job(crate::app_introspect::EncodeJob::VideoDump {
                     take,
+                    handoff,
                     mode: rec.mode,
                     keys_enabled: rec.keys,
                     inputs: rec.key_log,
                     unlogged_inputs,
                     unlogged_other_window,
                     started_us: rec.started_us,
-                    dir: rec.dir,
+                    dir: Box::new(rec.dir),
                     reply: rec.reply,
                     cancel: rec.cancel,
                     permit,
@@ -13464,6 +14099,17 @@ impl App {
                 engine.note_grid_replaced();
             }
             ws.rain_hidden_band.clear();
+            // PRISM WAKE, same seam and the same reason: the window's single
+            // engine now watches a DIFFERENT grid, and under the arrival-token
+            // law a swapped-in screen reads as a change — i.e. the switch
+            // itself would answer with a comet. Forget the token so the next
+            // observation baselines; momentum and any comets still in flight
+            // survive, exactly as the rain's field and weather do. The composed
+            // path needs no twin: its engines are keyed per session, so a
+            // different pane is structurally a different engine.
+            if let Some(engine) = ws.output_streak.as_mut() {
+                engine.rebase();
+            }
         }
         if !terminal_front {
             // Native content owns no terminal pixels, so retain terminal episode
@@ -13817,16 +14463,20 @@ impl App {
         UPDATE_ROOT.call_once(|| {
             let scratch =
                 std::env::temp_dir().join(format!("aterm-test-update-root-{}", std::process::id()));
-            // SAFETY: runs once, at the first harness construction — before
-            // any test in this process touches the update staging root; no
-            // test depends on the variable's prior value. The env-mutation
-            // lint's set-and-restore shape does not apply: this override is
-            // deliberately process-permanent (the whole test process must
-            // stage under scratch), and `Once` already serializes the write.
-            #[allow(env_mutation)]
-            unsafe {
-                std::env::set_var("ATERM_UPDATE_ROOT", &scratch)
-            };
+            // Through the workspace's ONE blessed mutation helper — the exact
+            // shape the `env_mutation` lint asks for — never a raw `set_var`.
+            // The lock serializes this write against every other blessed
+            // mutator and against `aterm_log::env::read`. BE HONEST ABOUT THE
+            // BOUND: it cannot serialize against a bare `getenv` on another
+            // thread, and this variable's reader (`seal_guard::updates_root`)
+            // is exactly that. What actually narrows the window is `Once` plus
+            // position: one write, at the first harness construction, before
+            // that harness's test can reach `Staging::resolve` — and the tests
+            // that must never race it (`github.rs::scratch_staging`) already
+            // build their staging by hand for this very reason. This override
+            // is deliberately process-permanent; set-and-restore would let a
+            // later test stage under the REAL per-user ledger again.
+            aterm_log::env::set("ATERM_UPDATE_ROOT", &scratch);
         });
         let session0 = stub_session_with_sink(0, sink);
         let term = session0.term.clone();
@@ -13988,6 +14638,8 @@ impl App {
             use_gpu: false,
             // No intent to redeem: the test App is handed a built CPU backend.
             deferred_gpu: false,
+            // Nor a seal to owe: the fixture renderer above is sealed already.
+            deferred_font_seal: false,
             theme,
             config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
@@ -14067,6 +14719,11 @@ impl App {
             typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
             lock_modifiers: keymap::no_lock_modifiers,
             user_input_recent: platform::no_recent_user_input_event,
+            consent: control_privacy::ConsentState::inert(),
+            consent_warmup: consent_warmup::WarmupState::inert(),
+            consent_observer: consent_observer::ObserverState::inert(),
+            consent_attention: consent_observer::AttentionGate::new(),
+            consent_observer_started: false,
             image_queue,
             encode_tx: None,
             trace_latency: false,
@@ -15644,6 +16301,52 @@ impl App {
         set_backend_gpu_undecided(on);
     }
 
+    /// HEADLESS DEFERRAL, font half, redeemed: settle the broad fallback, symbol
+    /// and colour-emoji candidates into resident bytes NOW, because something is
+    /// about to ask this process for a glyph.
+    ///
+    /// PARITY IS THE CONTRACT, as it is for the device: this seals the SAME
+    /// generation the boot worker was holding, from the same candidate paths it
+    /// was holding, so the capture is the one an eager seal would have produced.
+    /// What changes is only WHEN the three files are read — and on a run that is
+    /// never asked for a pixel, whether they are read at all (15.7 MB of them on
+    /// this Linux host; see [`defer_font_seal`]).
+    ///
+    /// The chrome re-sync is not optional bookkeeping. Headless boot hands the
+    /// chrome rasterizer a semantic surface forked from the backend, and a fork of
+    /// an UNSEALED generation carries candidate PATHS rather than the resident
+    /// cascade — so a later semantic warmup would re-read the colour face on the
+    /// parked prewarm thread, where `intern_font_bytes` is thread-local and would
+    /// pin a SECOND copy of it for that thread's life. Re-forking from the sealed
+    /// generation is what keeps one copy of each file in the process, which is the
+    /// property this deferral exists to protect.
+    fn redeem_deferred_font_seal(&mut self) {
+        if !self.settle_deferred_font_seal() {
+            return;
+        }
+        self.backend.seal_admitted_font_sources();
+        self.sync_chrome_fonts();
+    }
+
+    /// Mark the owed seal PAID WITHOUT performing it, for the one caller that
+    /// discharges the debt some other way: a prepared generation installed over
+    /// the deferred one is already sealed (the font-catalog worker sealed it), and
+    /// reading three font files into a renderer about to be dropped would leave
+    /// them in the never-evicting discovery intern for nothing. Returns whether a
+    /// debt was actually outstanding, so [`Self::redeem_deferred_font_seal`] can
+    /// use it as its own once-only latch.
+    fn settle_deferred_font_seal(&mut self) -> bool {
+        if !self.deferred_font_seal {
+            return false;
+        }
+        self.deferred_font_seal = false;
+        debug_assert!(
+            self.headless,
+            "the font-seal deferral is headless-only; windowed seals on its worker"
+        );
+        true
+    }
+
     /// HEADLESS DEFERRAL, redeemed: build the GPU device NOW, because something is
     /// about to ask this process for PIXELS. Called at the top of every path that
     /// can rasterize a headless frame — the `image` verb, the SIGUSR1/`snapshot`
@@ -15670,6 +16373,13 @@ impl App {
     /// CPU run instead of re-attempting on every capture. On failure the CPU
     /// renderer keeps serving — the same fail-soft the boot build has always had.
     pub(crate) fn ensure_pixel_backend(&mut self) {
+        // The FONT half of the same headless deferral, redeemed first and
+        // unconditionally: it is owed on every headless launch, including the
+        // `--cpu` ones that have no GPU intent at all and return below. Sealing
+        // before the fork also keeps `cpu_renderer_from_admitted`'s precondition
+        // — a sealed generation to rebuild from — exactly as the eager path left
+        // it.
+        self.redeem_deferred_font_seal();
         if !self.deferred_gpu {
             return;
         }
@@ -16708,6 +17418,14 @@ impl ApplicationHandler<Wake> for App {
         // App exists) become an in-window notice here. One relaxed atomic load on
         // an empty lane, which is every park but a handful per run.
         self.drain_deferred_config_notices();
+        // THE CONSENT OBSERVER'S ONE-SHOT START (design §3.6). Off unless
+        // `[privacy] observer` says otherwise, so on every shipping config this
+        // is one `bool` test and nothing else — and the latch makes it exactly
+        // one attempt per process either way. Placed here rather than at window
+        // attach because the observer is an instance fact, not a window one.
+        if !self.consent_observer_started && self.config.privacy_observer() {
+            let _ = self.start_consent_observer();
+        }
         // A title snapshot that lost a nonblocking terminal-lock race is retried from
         // this event-loop-owned lane. Its short fixed deadline below preserves
         // one-shot OSC/block transitions without ever waiting on the parser mutex.
@@ -18230,6 +18948,7 @@ impl ApplicationHandler<Wake> for App {
                 pace,
                 fps,
                 budget_bytes,
+                handoff,
                 dir,
                 cancel,
                 reply,
@@ -18360,6 +19079,7 @@ impl ApplicationHandler<Wake> for App {
                                 next_frame: video_initial_next_frame(mode, pace, now),
                                 presented: None,
                                 dir,
+                                handoff: Some(handoff),
                                 cancel,
                                 reply,
                             });
@@ -18479,6 +19199,35 @@ impl ApplicationHandler<Wake> for App {
             Wake::ReadPanes { session, reply } => {
                 let lines = self.read_pane_layout(session);
                 let _ = reply.send(lines);
+            }
+            // The consent posture: main-thread `App` state joined with the
+            // injected probes. A dropped receiver (dead client) just makes
+            // send() fail; ignore.
+            Wake::ReadPrivacy { form, reply } => {
+                let lines = self.read_privacy(form);
+                let _ = reply.send(lines);
+            }
+            // A warm-up worker queued results. Fold them into the rows and
+            // repaint: a folder the owner just allowed (or refused) in a system
+            // dialog must stop reading `asking…` while they are still looking
+            // at the panel. Never joins, never blocks — `drain` is `try_recv`
+            // until the queue is empty.
+            Wake::WarmupResult => {
+                if self.consent_warmup.drain() > 0 {
+                    self.request_redraw_all_windows();
+                }
+                // A warm-up folder that came back `EPERM(1)` IS aterm's own
+                // file work denied under a protected root — the observed fact
+                // the attention path (§3.6) exists to surface. Rate-limited to
+                // one notification per posture transition by the gate itself.
+                self.note_warmup_denials();
+            }
+            // The observer queued parsed log events. Fold them; the verdicts
+            // are read on demand by whoever reports `blocked_on=`. Never joins,
+            // never blocks — `drain` is `try_recv` until the queue is empty.
+            Wake::ConsentObserver => {
+                self.consent_observer.drain(Instant::now());
+                self.announce_observed_consent_prompts();
             }
             // Assemble one coherent session/window/frame/surface geometry record
             // from the main-thread-owned per-window state. A dropped control
@@ -18667,19 +19416,21 @@ impl ApplicationHandler<Wake> for App {
             // (dead client) just makes send() fail; ignore.
             Wake::CaptureWindow {
                 path,
+                handoff,
                 cancel,
                 reply,
             } => {
-                self.capture_window(path, cancel, reply);
+                self.capture_window(handoff, path, cancel, reply);
             }
             // Capture an own-rendered auxiliary surface through the confined image path.
             Wake::CaptureAuxWindow {
                 target,
                 path,
+                handoff,
                 cancel,
                 reply,
             } => {
-                self.capture_aux_window(target, path, cancel, reply);
+                self.capture_aux_window(target, handoff, path, cancel, reply);
             }
             // Dump an auxiliary surface's controls. Native Settings compiles its
             // exact semantic tree; the remaining compatibility surfaces use their
@@ -19219,6 +19970,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::RainControl { op, reply } => {
                 let _ = reply.send(self.rain_control(op));
+            }
+            Wake::StreakStatus { reply } => {
+                let _ = reply.send(self.streak_status());
             }
             Wake::ToneStatus { reply } => {
                 let _ = reply.send(self.tone_status());
@@ -19822,13 +20576,24 @@ impl ApplicationHandler<Wake> for App {
             // fresh bounded retry train and explicitly repaints; entering
             // occlusion does neither, so an unavailable surface stays parked.
             WindowEvent::Occluded(occluded) => {
-                if !occluded && let Some(ws) = self.windows.get_mut(&wid) {
-                    let window = ws.os_window.clone();
-                    let _ = rearm_present_and_request(&mut ws.present_retry, true, || {
-                        if let Some(window) = window {
-                            window.request_redraw();
-                        }
-                    });
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    // W6a: record BOTH edges on the window's GPU state — the
+                    // first-party Metal present arm classifies a bounded
+                    // nil-acquire as Occluded (park) vs Timeout (bounded
+                    // retry) by this frontend-owned bit, because no
+                    // CAMetalLayer occlusion signal exists (the wgpu arm
+                    // walks NSWindow.occlusionState itself and ignores it).
+                    if let Some(PresentTarget::Gpu { window_gpu, .. }) = &mut ws.present {
+                        window_gpu.set_occluded_hint(occluded);
+                    }
+                    if !occluded {
+                        let window = ws.os_window.clone();
+                        let _ = rearm_present_and_request(&mut ws.present_retry, true, || {
+                            if let Some(window) = window {
+                                window.request_redraw();
+                            }
+                        });
+                    }
                 }
             }
             // The OS desktop appearance toggled (light↔dark) while running. Forward
@@ -20509,8 +21274,9 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
     // `auto_update = false` (meaning "do not go to the network on a timer")
     // also lost the batteries sealed inside their own app bundle, while every
     // string in Settings and every line of §9.1 still told them a first launch
-    // installs the toolchain. The seed pass is not an update and touches no
-    // network (`cmd_seed` runs a local DirFetcher) — there is nothing in it for
+    // installs the toolchain. The seed pass is not an update: it records adoption
+    // and lays the pending stubs, and its only network touch is READING the signed
+    // index to say what this machine will get — there is nothing in it for
     // `auto_update` to be about.
     if !config.packages_enabled() {
         return false;
@@ -20531,11 +21297,15 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // `None` (no resolvable home) degrades to the pre-progress behavior —
             // children still run, nothing is tailed.
             let layout = atpkg::store::resolve_configured();
-            // First-run batteries-included SEED (§9.1): if the release cut sealed a
-            // signed toolchain registry into the app bundle, this one-shot fills an
-            // EMPTY store from it (`crates/atpkg/src/cli.rs` `cmd_seed` — bootstrap-
-            // only, network-index-outranked, the full verify chain unchanged). On a
-            // seedless or already-provisioned install it prints and does nothing.
+            // THE FIRST-RUN FILL (docs/GOLDEN-INSTALL-PATH.md §3 — lean-first since
+            // 2026-08-26; no release from v0.63.0 on seals a seed): this one-shot
+            // `atpkg seed` records adoption, lays a pending stub per default-set name,
+            // and consults the SIGNED NETWORK INDEX (`crates/atpkg/src/cli.rs`
+            // `cmd_seed` → `report_seedless_posture`); the update pass that follows it
+            // installs the default set from the network, unattended, sized from the
+            // signed cost sums. A pre-v0.63 seeded bundle still fills an EMPTY store
+            // from its seal through the same verify chain. On an already-provisioned
+            // install it prints and does nothing.
             // Store mutation is serialized by atpkg's own store-wide lock. Runs once
             // BEFORE the loop, off the event loop. Stdout is captured for the stable
             // seed markers (stderr stays discarded — atpkg records its own
@@ -20662,15 +21432,19 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // of a perfectly healthy machine. Same for a declined toolset, a
                 // disabled manager, and `seed_install = false`
                 // (2026-08-20 round-10 audit).
-                if saw_start && !saw_marker {
+                let detail_of = |said: &str| {
+                    if said.trim().is_empty() {
+                        "atpkg ended without saying what happened".to_string()
+                    } else {
+                        said.trim().to_string()
+                    }
+                };
+                let announced = saw_start && !saw_marker;
+                if announced {
                     // The announcement is held for 20 minutes and nothing else would
                     // take it down, so answer it however the child ended.
                     let _ = proxy.send_event(Wake::PkgSeedFailed {
-                        detail: if said.trim().is_empty() {
-                            "atpkg ended without saying what happened".to_string()
-                        } else {
-                            said.trim().to_string()
-                        },
+                        detail: detail_of(&said),
                     });
                 }
                 // The LOG is a different question from the pill: a non-zero exit with
@@ -20688,6 +21462,25 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                             why
                         }
                     );
+                    // ...AND SAY IT ON SCREEN, not only in the log. This branch is
+                    // the CLI-edge refusal — an unwritable prefix, store-lock
+                    // contention — and it was the ONE failing path with no card,
+                    // because the announcement above is gated on `saw_start` and a
+                    // refusal never gets that far. A machine sat with no toolchain
+                    // for three weeks in exactly this state: two WARN lines in a
+                    // file nobody opens, and a normal prompt on screen
+                    // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+                    //
+                    // This does NOT reintroduce the round-10 false positive. That
+                    // one fired on a HEALTHY machine, where `atpkg seed` exits
+                    // quietly, markerlessly and ZERO — so `!ok` is false here and
+                    // no card is raised. This fires only on a non-zero exit that
+                    // never reached the marker, which is a real failure every time.
+                    if !announced {
+                        let _ = proxy.send_event(Wake::PkgSeedFailed {
+                            detail: detail_of(&said),
+                        });
+                    }
                 }
             }
             if !run_update_loop {
@@ -20965,6 +21758,72 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
 /// the UI thread). The leading "✓" is deliberate: the notice renderer tints the
 /// FIRST character with the accent colour, so without a marker the "A" of
 /// "ALab" would be tinted alone and the word would read as "A Lab".
+
+/// Whether a display server is reachable at all, by the same two variables winit itself
+/// reads to choose a backend. Empty counts as unset, which is what winit does too — an
+/// exported-but-empty `DISPLAY` is a shell artefact, not a server.
+///
+/// Used ONLY to decide whether a `--headless` run needs the display-free backend. It is
+/// deliberately not consulted for a windowed run: that one must keep failing loudly when
+/// its display is missing.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
+))]
+fn a_display_server_is_reachable() -> bool {
+    display_is_reachable_from(|var| std::env::var_os(var).map(|v| v.to_string_lossy().into_owned()))
+}
+
+/// The decision itself, separated from the process environment so it can be tested
+/// without a test ever mutating env vars other tests are reading concurrently.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
+))]
+fn display_is_reachable_from(read: impl Fn(&str) -> Option<String>) -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"]
+        .iter()
+        .any(|var| read(var).is_some_and(|v| !v.is_empty()))
+}
+
+#[cfg(all(
+    test,
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "ios"))
+))]
+mod headless_display_probe_tests {
+    /// The three variables winit itself consults, and no others. If winit's own probe
+    /// grows a fourth, a headless run would take the display-free backend on a box that
+    /// HAS a display — still correct, but slower to notice, so the set is pinned here.
+    #[test]
+    fn any_one_of_the_three_display_variables_counts_as_a_display() {
+        for var in ["WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DISPLAY"] {
+            assert!(
+                super::display_is_reachable_from(|v| (v == var).then(|| ":0".to_string())),
+                "{var} alone must be enough to keep the real backend"
+            );
+        }
+    }
+
+    /// An exported-but-empty variable is a shell artefact, not a server — and winit
+    /// treats it as unset, so aterm must agree or the two would disagree about which
+    /// backend a run gets.
+    #[test]
+    fn an_empty_variable_is_not_a_display() {
+        assert!(!super::display_is_reachable_from(|_| Some(String::new())));
+        assert!(!super::display_is_reachable_from(|_| None));
+    }
+
+    /// The `env -i` case this whole lane exists for.
+    #[test]
+    fn a_cleared_environment_has_no_display() {
+        assert!(
+            !super::display_is_reachable_from(|_| None),
+            "env -i must select headless"
+        );
+    }
+}
+
 fn seed_pill_text(
     installed: &[String],
     shell_integration: Option<&crate::spawn::ShellIntegrationOutcome>,
@@ -21883,6 +22742,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // windowed or `--cpu` run stores the honest `false`.
     set_backend_gpu_undecided(defer_gpu);
     let build_gpu = want_gpu && !defer_gpu;
+    // The font twin of the same decision, taken here beside it so the two
+    // deferrals a headless launch arms are read together (see `defer_font_seal`).
+    let defer_seal = defer_font_seal(headless);
     // H1 (Windows Mica/Acrylic): when the config asks for a client-area backdrop
     // (`background_material != none`), latch the DirectComposition VISUAL
     // swapchain BEFORE the backend build below creates the wgpu instance — the
@@ -22095,8 +22957,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // This method is intentionally worker-only: it can read and parse the
         // broad fallback, symbol, and emoji candidates. Publish a sealed,
         // resident generation so the first event-loop turn performs no font I/O.
+        //
+        // HEADLESS keeps it as an intent instead (see `defer_font_seal`): those
+        // three faces are rasterization-only, this run has no glass, and
+        // `App::ensure_pixel_backend` seals the same generation from the same
+        // candidate paths at the first pixel demand. The leg then honestly reads
+        // as the zero it is rather than attributing the redemption's cost here.
         let font_seal_started = Instant::now();
-        backend.seal_admitted_font_sources();
+        if !defer_seal {
+            backend.seal_admitted_font_sources();
+        }
         let font_seal_ns = crate::metrics::leg_elapsed_ns(font_seal_started);
         // One transaction, then the done stamp: a snapshot can never observe a
         // finished worker whose legs are still missing.
@@ -22332,11 +23202,30 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // (SIGUSR1 is already blocked process-wide near the top of main(), before any
     // thread spawn, so the sigwait() snapshot thread is the sole SIGUSR1 recipient.)
 
-    // Opening the display can fail on a headless / misconfigured session (no
-    // $DISPLAY or $WAYLAND_DISPLAY, a dead X server). That is a user environment
+    // Opening the display can fail on a misconfigured session (no $DISPLAY or
+    // $WAYLAND_DISPLAY, a dead X server). For a WINDOWED run that is a user environment
     // problem, not an aterm bug, so report it as a clean one-line error and exit
     // non-zero — NOT the crash-signal report (which is for genuine internal faults).
-    let event_loop = match EventLoop::<Wake>::with_user_event().build() {
+    //
+    // FOR `--headless` IT IS NEITHER. A windowless run has already said it wants no
+    // window, and demanding a display server from it is the one requirement it exists to
+    // be free of: CI, containers, a plain SSH session and any `env -i` harness have no
+    // display, and aterm used to refuse to start there while advising the very flag that
+    // had been passed. Headless takes winit's display-free backend instead.
+    //
+    // Only when the display is genuinely ABSENT, though. A headless run on a desktop
+    // keeps the real backend, so the two paths stay one code path everywhere the display
+    // exists and the windowless lane is not a separately-rotting second implementation.
+    let mut builder = EventLoop::<Wake>::with_user_event();
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "ios"))
+    ))]
+    if headless && !a_display_server_is_reachable() {
+        use winit::platform::headless::EventLoopBuilderExtHeadless as _;
+        builder.with_headless();
+    }
+    let event_loop = match builder.build() {
         Ok(el) => el,
         Err(e) => {
             fatal_launch_error(
@@ -22709,9 +23598,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         let (mut backend, use_gpu) = backend_handle
             .join()
             .expect("backend-build thread panicked");
-        assert!(
+        // Two-way, not one-way: the publication contract is that the worker's
+        // seal state is EXACTLY the launch's `defer_font_seal` decision. A
+        // deferred launch that arrived sealed anyway would be paying the 15.7 MB
+        // this deferral exists to avoid, and would say nothing; an eager launch
+        // that arrived unsealed is the original ordering bug.
+        assert_eq!(
             backend.admitted_font_sources_sealed(),
-            "backend worker published an unsealed font generation"
+            !defer_seal,
+            "backend worker published a font generation whose seal state \
+             disagrees with the launch's deferral decision"
         );
         metrics::set_backend_gpu(use_gpu);
         // Config-resolved padding (`window_padding`; the built-in 12px default
@@ -23140,6 +24036,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         font_px_explicit,
         use_gpu,
         deferred_gpu: defer_gpu,
+        deferred_font_seal: defer_seal,
         theme,
         config: config.clone(),
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
@@ -23246,6 +24143,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         } else {
             platform::recent_user_input_event
         },
+        consent: control_privacy::ConsentState::new(headless),
+        consent_warmup: consent_warmup::WarmupState::new(headless),
+        consent_observer: consent_observer::ObserverState::new(headless),
+        consent_attention: consent_observer::AttentionGate::new(),
+        consent_observer_started: false,
         image_queue,
         // The PNG encode worker is spawned on the first `image`/`window` capture.
         encode_tx: None,
@@ -23323,9 +24225,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // This is Arc/scalar-only: the config service completed every bounded path
     // read and optional PNG decode before App construction.
     app.install_window_config_assets(WindowId(0));
-    // HEADLESS only: the backend worker already applied and sealed its complete
-    // font generation. Windowed startup reaches the same memory-only pin in
-    // `finalize_backend` after its deferred join.
+    // HEADLESS only: the backend worker already applied its complete font
+    // generation (and, unless the seal is deferred to the first pixel demand,
+    // sealed it — see `defer_font_seal`). Windowed startup reaches the same
+    // memory-only pin in `finalize_backend` after its deferred join.
     if headless {
         app.pin_backend_render_config_core();
         // Warn once about configured `font_features` that can't take effect (typo'd
@@ -23508,6 +24411,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
+        fabric: crate::fabric::SessionFabric::default(),
     });
     Session {
         child_reaped: std::sync::atomic::AtomicBool::new(false),
@@ -24732,6 +25636,133 @@ mod overlap_handoff_tests {
         assert!(
             app.update_apply_hands_off_keys(now),
             "no aterm window has focus, so no keystroke of ours is being interrupted"
+        );
+    }
+
+    /// THE WARM-UP HOLD (design §3.5): while an owner-initiated consent warm-up
+    /// is mid-gesture the AUTOMATIC in-place apply stands off — and stops
+    /// standing off at `[privacy] warmup_hold_ms`, so it can never pin a build.
+    ///
+    /// The manual leg is structural rather than asserted here: this gate has one
+    /// caller (`App::apply_native_update`) and that caller consults it only
+    /// under `ApplyMode::is_automatic()`, which
+    /// `consent_warmup::tests::a_manual_apply_is_never_held` pins.
+    #[test]
+    fn a_live_consent_warm_up_holds_the_automatic_apply_but_only_to_its_cap() {
+        use std::time::{Duration, Instant};
+
+        let mut app = App::headless_for_test();
+        let now = Instant::now();
+        assert!(
+            app.update_apply_hands_off_keys(now),
+            "precondition: nothing holds the lane"
+        );
+
+        let cap = Duration::from_millis(120_000);
+        app.consent_warmup.arm_hold_for_test(now, cap);
+        assert!(
+            !app.update_apply_hands_off_keys(now),
+            "an owner-initiated warm-up is mid-gesture"
+        );
+
+        // THE ORDERING LEG. A system consent dialog takes focus away from every
+        // aterm window, which is exactly the case the no-focus shortcut answers
+        // `true` for — so the hold must be checked BEFORE it, or the hold would
+        // evaporate the instant the dialog it exists for appeared.
+        for ws in app.windows.values_mut() {
+            ws.focused = false;
+        }
+        assert!(
+            !app.update_apply_hands_off_keys(now),
+            "losing focus to the dialog must not end the hold"
+        );
+
+        // …AND IT CANNOT PIN A BUILD.
+        assert!(
+            app.update_apply_hands_off_keys(now + cap),
+            "the hold expires at its cap"
+        );
+        assert!(
+            app.update_apply_hands_off_keys(now + cap + Duration::from_secs(3600)),
+            "an hour past the cap the build is still not pinned"
+        );
+    }
+
+    /// A headless instance has no Security panel to have gestured from, and a
+    /// warm-up is a deliberate consent prompt — so the gesture refuses, and
+    /// every query answers without a worker, a syscall or a hold.
+    #[test]
+    fn a_headless_instance_never_starts_a_consent_warm_up() {
+        use std::time::Instant;
+
+        let mut app = App::headless_for_test();
+        assert_eq!(
+            app.begin_consent_warmup(),
+            super::consent_warmup::StartOutcome::Refused
+        );
+        assert!(!app.consent_warmup_live());
+        assert!(app.consent_warmup_rows().is_empty());
+        assert_eq!(app.consent_warmup_last_pass_ms(), None);
+        assert!(
+            !app.consent_warmup.holds_automatic_apply(Instant::now()),
+            "nothing started, so nothing holds"
+        );
+    }
+
+    /// THE OBSERVER SHIPS OFF (design §3.6). A headless instance with the
+    /// default config starts nothing, reports `off`, and publishes no verdict —
+    /// and `off` is a different word from `unavailable` and from a denial.
+    #[test]
+    fn a_default_instance_starts_no_consent_observer_and_publishes_nothing() {
+        use super::consent_observer::{ObserverAvailability, StartOutcome};
+
+        let mut app = App::headless_for_test();
+        assert_eq!(
+            app.consent_observer_availability(),
+            ObserverAvailability::Off
+        );
+        assert_eq!(app.start_consent_observer(), StartOutcome::Disabled);
+        assert_eq!(
+            app.consent_observer_availability(),
+            ObserverAvailability::Off,
+            "a refusal is `off`, never a verdict"
+        );
+        assert!(
+            app.consent_blocked_on().is_empty(),
+            "nothing was observed, so nothing is published"
+        );
+    }
+
+    /// The EPERM-driven attention path, end to end on a headless instance: the
+    /// first observed denial notifies ONCE, a storm of further denials does not,
+    /// and a posture transition re-arms it. The gate is what makes the whole
+    /// path safe to call from any denial site.
+    #[test]
+    fn an_observed_eperm_storm_notifies_once_per_posture_transition() {
+        use aterm_containment::consent::FdaState;
+
+        let mut app = App::headless_for_test();
+        assert!(
+            !app.consent_attention.is_spent(),
+            "a fresh instance is armed"
+        );
+        app.note_protected_eperm(Some(0));
+        assert!(
+            app.consent_attention.is_spent(),
+            "the first denial spent it"
+        );
+        for _ in 0..25 {
+            app.note_protected_eperm(Some(0));
+        }
+        assert!(app.consent_attention.is_spent(), "and it stayed spent");
+        app.note_fda_posture(FdaState::Granted);
+        assert!(
+            !app.consent_attention.is_spent(),
+            "a posture transition re-arms it"
+        );
+        assert_eq!(
+            app.consent_attention.last_posture(),
+            Some(FdaState::Granted)
         );
     }
 
@@ -28430,6 +29461,7 @@ mod multi_window_tests {
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
             dir,
+            handoff: None,
             cancel: super::VideoCancellation::new(),
             reply,
         });
@@ -30136,6 +31168,7 @@ mod early_out_tests {
             // No matrix rain in these unit frames (default-off feature) — the
             // constant-0 sentinel keeps the key byte-identical to the pre-rain path.
             rain_fp: 0,
+            streak_fp: 0,
             selection: SelectionFingerprint::of(term.text_selection()),
             pane_selection_fp: super::fold_pane_selection_fp(0, 0, term.text_selection()),
             // These unit frames are single-pane, which marks no pane — the same
@@ -32850,6 +33883,7 @@ mod session_pool_tests {
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         Session {
             child_reaped: std::sync::atomic::AtomicBool::new(false),
@@ -34667,7 +35701,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            145,
+            147,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -34701,7 +35735,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 138-machine DesignOnly report shape must classify honestly"
+            "the real 147-machine DesignOnly report shape must classify honestly"
         );
     }
 
@@ -38740,6 +39774,7 @@ mod headless_video_tests {
             next_frame: None,
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39133,6 +40168,7 @@ mod headless_video_tests {
             next_frame: None,
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39174,6 +40210,7 @@ mod headless_video_tests {
                 next_frame: None,
                 presented: None,
                 dir,
+                handoff: None,
                 cancel: VideoCancellation::new(),
                 reply,
             });
@@ -39231,6 +40268,7 @@ mod headless_video_tests {
             next_frame: Some(Instant::now()),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39270,6 +40308,7 @@ mod headless_video_tests {
                 next_frame: Some(Instant::now()),
                 presented: None,
                 dir,
+                handoff: None,
                 cancel: VideoCancellation::new(),
                 reply,
             });
@@ -39301,6 +40340,7 @@ mod headless_video_tests {
             next_frame: Some(Instant::now()),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39345,6 +40385,7 @@ mod headless_video_tests {
             next_frame: Some(now),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39409,6 +40450,7 @@ mod headless_video_tests {
             next_frame: None,
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39448,6 +40490,7 @@ mod headless_video_tests {
             next_frame: Some(now - Duration::from_millis(5)),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39482,6 +40525,7 @@ mod headless_video_tests {
             next_frame: Some(armed_frame),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });
@@ -39526,6 +40570,7 @@ mod headless_video_tests {
             next_frame: Some(now),
             presented: None,
             dir,
+            handoff: None,
             cancel: VideoCancellation::new(),
             reply,
         });

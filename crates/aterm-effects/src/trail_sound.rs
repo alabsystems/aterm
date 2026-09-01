@@ -296,6 +296,21 @@ impl CelebrationGesture {
     }
 }
 
+/// The PRISM WAKE gesture vocabulary — the terminal's answer to PROGRAM
+/// OUTPUT (`crate::output_streak`). Two gestures, and by the episode law an
+/// episode may only ever produce one of each: output floods repeat far faster
+/// than typing, so this vocabulary is deliberately the quietest in the engine
+/// (see [`OUTPUT_PIP_KIND_GAIN`]) and the sparsest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutputGesture {
+    /// The episode's one soft pip, on the quiet→active crossing: two sine
+    /// partials on the tune's own pentatonic lattice, lowpassed to a whisper.
+    Shimmer,
+    /// The episode's closing exhale — the same voice, one partial, quieter
+    /// still. Sound as information (the output stopped), not repetition.
+    Settle,
+}
+
 /// One namespaced gesture: WHICH effect spoke, and WHAT it said. The
 /// source-effect axis is the enum variant; the gesture axis is the payload.
 /// Shared shaping (governor, admission, bed feed) dispatches on the pair, so
@@ -309,6 +324,8 @@ pub enum SoundGesture {
     Words(WordGesture),
     /// SING-ALONG sing-along gestures (`crate::kitty_sing`'s celebration).
     Celebration(CelebrationGesture),
+    /// PRISM WAKE gestures — the program-output pip and its closing exhale.
+    Output(OutputGesture),
 }
 
 /// WHICH palette family speaks for an event — the host's `trail_sound_style`
@@ -511,6 +528,21 @@ pub struct SoundEvent {
     /// gain-0 render of the same DSP); the discrete notes, the brrrring, the
     /// bonk and the melody are untouched.
     pub bed: bool,
+    /// THE GLYPH WAS SHIFTED — a capital or a shifted symbol (owner ask,
+    /// 2026-08-30: "when doing a shift-key press (not the shift, but the
+    /// shifted key) make it higher pitched"). Distinct from
+    /// [`SoundKind::Shift`], which is the bare modifier's own LIFT: this says
+    /// the letter that actually landed was `A` and not `a`, and it lifts that
+    /// letter's keystroke by [`SHIFT_GLYPH_LIFT`].
+    ///
+    /// THE HOST PRICES IT, and only the host can. Shiftedness lives in the key
+    /// event's modifier flags; the ECHO path that also mints `Typed` cues
+    /// (`cursor_glow`'s `cue_move_sound`, from a cursor delta after PTY output)
+    /// has no key in hand and can never fake it — every cue born there carries
+    /// `false`, which is the exact identity. So does every non-`Typed` gesture:
+    /// a shifted Space is still a word boundary, and a shifted Enter is still
+    /// an Enter.
+    pub shifted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -698,67 +730,168 @@ const SONG_GHOST_LEVEL: f32 = 0.55;
 /// which is what lets the accents' pitch actually be heard.
 const SONG_GHOST_FEEL: f32 = 0.62;
 
-/// Phrase length in notes — a phrase runs 6..=8 notes, chosen per phrase, then
-/// cadences. Short enough that the motif cell (4 notes) recurs and varies
-/// audibly within one breath; long enough not to feel like stuttering.
-const PHRASE_MIN: u8 = 6;
-const PHRASE_MAX: u8 = 8;
-
 /// A typing gap (seconds) longer than this ENDS the current phrase — the
 /// natural comma the ear already hears. Enter (a [`SoundKind::Jump`]) ends one
-/// too; both trigger the cadence onto the tonic. Sized to the same ~0.6 s the
-/// governor's rate estimate decays over.
+/// too; both close the phrase onto its own last note. Sized to the same ~0.6 s
+/// the governor's rate estimate decays over.
 const PHRASE_PAUSE_S: f32 = 0.6;
 
-/// Height of the phrase's CONTOUR ARC, in scale degrees: every phrase LIFTS
-/// through its middle and settles back for the cadence, so the line has a
-/// SHAPE instead of a flat random drift. Added to the pitch register, never to
-/// the motif accumulator, so it colours the contour without compounding.
+// ---------------------------------------------------------------------------
+// THE THEME — one household tune, composed, not wandered
+// ---------------------------------------------------------------------------
+//
+// Owner, 2026-08-29/30: "there should be more magic and it should be some
+// consistent musical theme you have in mind when i'm typing", and typing
+// should sound "like I'm playing a cute sing-song".
+//
+// WHAT WAS WRONG. The accent lane used to be a GENERATOR: a 4-step motif cell
+// of random ±1 deltas, re-drawn every phrase, dressed with a contour arc, a
+// repeat-and-vary lift and a leap at the peak. Every device in it was real
+// musical machinery and it worked — the line moved, it arched, it cadenced —
+// but a tune that is re-composed every six notes is not a THEME. There is
+// nothing to have in mind. Two minutes of typing never played the same phrase
+// twice, so nothing could ever become familiar, and familiarity is the whole
+// of what the owner asked for.
+//
+// THE THEME IS THE HOUSE'S OWN. The owner has already ruled once on what this
+// engine's melody should be: the held-key sing-along must be "the simple
+// v0.20.0 verse" (`aterm-sound-taste-rulings`). That verse is authored right
+// here, in [`CELEBRATION_PHRASE`] bars 0..3. So the typed line now sings THE
+// SAME MATERIAL, slow — hold a key and the cat sings the theme double-time
+// over its own bass and drums; type, and you are playing the verse yourself,
+// one note every three keystrokes. Typing and holding became two tempos of one
+// piece of music instead of two pieces that merely avoid clashing.
+//
+// THE FORM is A A' B A'' — the first half of the v0.20.0 song's own form:
+//
+//   A    0 2 4 5 4 2 4 7     THE HOOK. Rises do-re-mi-so, falls back through
+//                            mi-re, then vaults a sixth to the 7th degree —
+//                            the leap that makes it a tune and not a scale.
+//   A'   5 7 5 4 2 4 2 0     THE ANSWER. Opens where the hook left off, mirrors
+//                            its arch downward and lands on the tonic: the
+//                            classic antecedent/consequent pair.
+//   B    2 4 7 5 3 2         THE BRIDGE. Bar 2's pitch content with the
+//                            celebration's syncopation removed (its two RESTs
+//                            are sustains, and an accent lane has no sustain —
+//                            it has the NEXT accent). Reaches the 7th early and
+//                            walks down through the one degree the hook never
+//                            plays (3), which is what stops the bridge sounding
+//                            like a third pass at A.
+//   A''  0 2 4 5 7 8         THE HALF-CADENCE. The hook's opening four, then a
+//                            climb PAST the leap to the 8th — the highest note
+//                            in the piece, and the last. The theme never
+//                            resolves: it leans off its peak and falls a sixth
+//                            back onto A's 0, which is the right shape for an
+//                            activity with no end. You cannot type a final
+//                            keystroke, so the tune must not have a final note.
+//
+// 28 accents, ~84 keystrokes, ~8.4 s of sustained prose at 10 cps — long
+// enough to be a piece rather than a loop, short enough to become familiar
+// inside one session. Under it the SPACE walks those bars' roots (see
+// [`SONG_BASS`]) on the WORD clock, which is a different clock: the two
+// re-pair endlessly, and that phasing is the long-form variation the old
+// generator was paying randomness for.
+/// THE TUNE, in scale degrees on the active [`crate::tone::Tone`]'s table —
+/// [`CELEBRATION_PHRASE`] bars 0..3, verbatim where the accent lane can hold
+/// them (see the section comment for the two `REST` de-syncopations).
+const SONG_THEME: [i8; 28] = [
+    // A — THE HOOK (bar 0, verbatim).
+    0, 2, 4, 5, 4, 2, 4, 7, //
+    // A' — THE ANSWER (bar 1, verbatim).
+    5, 7, 5, 4, 2, 4, 2, 0, //
+    // B — THE BRIDGE (bar 2's pitches, de-syncopated).
+    2, 4, 7, 5, 3, 2, //
+    // A'' — THE HALF-CADENCE (bar 3's pitches, de-syncopated); climbs highest
+    // and stops, leaning back onto A.
+    0, 2, 4, 5, 7, 8,
+];
+
+/// Where each phrase of [`SONG_THEME`] BEGINS, plus the end sentinel — the
+/// form as an index, so a phrase boundary can be "jump to the next entry"
+/// rather than arithmetic on a length.
 ///
-/// TWO degrees, and the arc moves in ONE jump of that size rather than
-/// climbing a degree at a time. That is not a taste call — it is what stops
-/// the two pitch axes from cancelling. The motif walks in ±1 steps; when the
-/// arc also stepped by ±1 (`round(2·sin πf)`, the old law) the two annihilated
-/// exactly, and a note that should have moved played the same pitch again.
-/// Measured over a 12.5 s typing script that was 54 % of all consecutive
-/// notes: the "melody" was mostly a drone. A lift of a pentatonic THIRD is
-/// orthogonal to a step of a second — no motif delta can cancel it — and
-/// unisons fall to ~8 % with the contour left intact (mid-phrase notes still
-/// average +2.9 degrees over the phrase's ends).
-const ARC_LIFT: i32 = 2;
+/// THIS IS WHAT A PAUSE OBEYS. A comma-length gap or an Enter closes the
+/// phrase you are in and the next keystroke opens the NEXT one — the answer
+/// after the hook, the bridge after the answer — instead of restarting the
+/// theme from its first note. So thinking between sentences advances the piece
+/// exactly as resting between phrases advances a song; you cannot get stuck
+/// replaying bar 1 however you type.
+const SONG_FORM: [u8; 5] = [0, 8, 16, 22, 28];
 
-/// The REPEAT-AND-VARY lift: the motif cell's SECOND pass sits a scale-degree
-/// higher. It rides the pitch register beside the arc — never the delta — so
-/// the cell's step pattern stays exactly periodic (the motif genuinely
-/// recurs, which is what a lag-4 interval autocorrelation reads) and the lift
-/// can never zero out a step the way `delta += 1` could.
-const MOTIF_VARY: i32 = 1;
+/// THE BASS WALK — the four bars' ROOTS, one per word: [`CELEBRATION_BASS`]
+/// bars 0..3, C E D G | C E C G.
+///
+/// DEGREES ON THE PALETTE'S ANCHOR, not on the celebration's notation. The
+/// celebration spells these roots −10 −8 −9 −7 because its own base is C5 and
+/// it wants them at C3–G3, 131–196 Hz. That is inside the [110, 220) band this
+/// module already condemned once: the old sine downbeat lived there, the
+/// sub-250 Hz region held 12.5 % of the mix's energy, and the owner reported
+/// hearing "NO spacebar sound" at all. Written as 0 2 1 3 against the anchor
+/// and folded by [`TrailSynth::space_root_hz`], the SAME four pitch classes
+/// land 262–392 Hz at C5 — one octave up, entirely inside the [220, 440)
+/// register the re-voice proved audible
+/// (`the_bass_walk_stays_in_the_audible_register`).
+///
+/// Degrees, not Hz, so the walk rides every [`crate::tone::Tone`]'s table and
+/// the no-beating law is inherited whole: a root can never rub against the
+/// note above it.
+///
+/// TWELVE WORDS, NOT EIGHT (owner, 2026-08-31: "when pressing shift, the tone
+/// should rotate, same for space"). The eight-step walk `0 2 1 3 | 0 2 0 3`
+/// was genuinely moving — MEASURED on the `keyboard_song_ab` prose take, 91
+/// spaces sounded FOUR distinct roots (260 / 294 / 327 / 394 Hz), which is the
+/// progression the one-note drone was replaced by and it is real. What it was
+/// not was a rotation you could follow: the CLOSEST RECURRENCE was TWO EVENTS
+/// — degree 0 sits at steps 4 and 6 — so the ear was handed the same root
+/// again after a single intervening word, three times in every eight, and a
+/// line that returns home that fast reads as a restrike rather than a walk.
+/// Eight steps is also under a sentence: a typist is back at the top of the
+/// progression inside one clause.
+///
+/// The walk is now twelve steps over all FIVE roots of the lattice:
+///
+///   C E D G | C E A D | C E G A     (degrees 0 2 1 3 | 0 2 4 1 | 0 2 3 4)
+///
+/// - THE VERSE'S OWN BAR ROOTS ARE UNTOUCHED at steps 0..3 — the first group
+///   is [`CELEBRATION_BASS`] bars 0..3 verbatim, which is what
+///   `the_bass_walk_stays_in_the_audible_register` pins. The theme above is
+///   still harmonised by its own progression.
+/// - `C E` OPENS EVERY GROUP and the pair after it rotates (`D G` → `A D` →
+///   `G A`). The home is where the ear can find it; the movement is where the
+///   variation is. A twelve-word cycle is a PARAGRAPH rather than a clause.
+/// - DEGREE 4 JOINS. It is the one pentatonic root the celebration's four bars
+///   never touch — A against C E D G — so admitting it costs no new harmony
+///   (it is the lattice's own fifth root, consonant by the same law as the
+///   other four) and buys the fifth distinct pitch the walk can offer.
+/// - NO ROOT RECURS INSIDE FOUR WORDS, cyclically: every degree's occurrences
+///   are four or more steps apart, up from two. Pinned by
+///   `the_bass_walk_never_returns_inside_four_words`.
+/// - THE PHASING GETS LONGER, which is where this module says the long-form
+///   variation lives: the word clock against the theme's 28-accent clock now
+///   re-pairs every 84 accents rather than every 56.
+const SONG_BASS: [i8; 12] = [0, 2, 1, 3, 0, 2, 4, 1, 0, 2, 3, 4];
 
-/// The bright LEAP at the arc peak, in scale degrees — the classic
-/// "leap-and-recover" that makes a line sing; the motif steps back on the
-/// following note. Because degrees stay on the active table, the leap is a
-/// consonant sixth/octave, never a rub.
-const MELODY_LEAP: i32 = 2;
-
-/// Per-tone melodic REGISTER `(lo, hi)` the phrase walk is clamped into —
-/// Excited taller, Frustrated shorter. `lo` is 0 for every table so the
-/// cadence tonics (degrees 0 and 5) are always reachable.
+/// Per-tone melodic REGISTER `(lo, hi)` the theme is folded into.
+///
+/// EVERY REGISTER MUST HOLD THE WHOLE THEME (0..=8, shifted by
+/// [`melody_lean`]) — that is the constraint, and the old registers broke it.
+/// `fold_register(8, 0, 7)` is 6, so under the shipped Technical ceiling the
+/// half-cadence's climb 5 → 7 → 8 would have played 5 → 7 → 6: a dip where the
+/// tune's highest note belongs. A register that edits the melody is not a
+/// register, it is a censor. The per-tone character therefore lives entirely
+/// in the scale TABLE, the transpose and the LEAN now — every one of which
+/// moves the whole line and none of which can rewrite a single note.
+///
+/// The fold survives as a total guard (`walk` is read by the bonk, the cursor
+/// family and the column nudge), and on the theme path it is exactly the
+/// identity — pinned by `the_theme_never_folds_in_any_tone`.
 fn tone_register(tone: Tone) -> (i32, i32) {
     match tone {
-        Tone::Technical | Tone::Calm => (0, 7),
-        Tone::Excited => (0, 8),
-        Tone::Frustrated => (0, 6),
-        Tone::Playful => (0, 8),
-    }
-}
-
-/// Per-tone motif STEP SPAN: the maximum absolute scale-step a motif delta may
-/// take. Playful skips and leaps (±2, the whimsy knob); every other mood walks
-/// in gentle steps (±1). Technical is exactly ±1 — the re-baselined identity.
-fn melody_span(tone: Tone) -> i32 {
-    match tone {
-        Tone::Playful => 2,
-        _ => 1,
+        // The lean is +1: the theme occupies 1..=9.
+        Tone::Excited => (0, 9),
+        // The lean is −1: the theme occupies −1..=7.
+        Tone::Frustrated => (-1, 8),
+        _ => (0, 8),
     }
 }
 
@@ -898,6 +1031,37 @@ struct GestureShape {
     offset: i32,
 }
 
+/// THE CAPITAL'S LIFT for one event, in scale degrees — [`SHIFT_GLYPH_LIFT`]
+/// when a shifted glyph was typed, zero otherwise.
+///
+/// A function, not an inline test, for the same reason [`gesture_shape`] is
+/// one: a palette that builds its OWN degree (Phaser, whose pitch follows the
+/// live hue rather than the melody walk) must be able to ASK for the rule
+/// instead of spelling it again, or the ask would hold in eight palettes and
+/// silently not in the ninth. The rule has exactly one home.
+fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
+    if kind == SoundKind::Typed && ev.shifted {
+        SHIFT_GLYPH_LIFT
+    } else {
+        0
+    }
+}
+
+/// The capital's lift as a FREQUENCY RATIO — for the palettes whose pitch does
+/// not come from the lattice at all and so have no degree to add to.
+///
+/// FIRE is the one style that needs it: its keystroke is an impulsive noise
+/// snap over a woody ember knock at a RANDOM 85–125 Hz ("impulsiveness, not
+/// softness, is what separates fire from water"), with no melodic partial
+/// anywhere. Without this the ask would hold in eight styles and quietly fail
+/// in the ninth.
+///
+/// Derived from [`SHIFT_GLYPH_LIFT`] through the lattice's own five-degree
+/// octave, so the ratio and the degree can never disagree.
+fn shift_ratio(ev: &SoundEvent, kind: SoundKind) -> f32 {
+    (2.0f32).powf(shift_lift(ev, kind) as f32 / PENTA.len() as f32)
+}
+
 /// THE RULE, encoded. Every family degree in the engine comes from here.
 fn gesture_shape(kind: SoundKind) -> GestureShape {
     match kind {
@@ -1000,6 +1164,11 @@ const BONK_TRITONE: f32 = 45.0 / 32.0;
 // not authorship — and under Glide too: the lift is the quietest voice in the
 // engine, pinned relatively by `the_ladder_holds_for_the_key_family`.)
 //
+// (PRISM WAKE's output pip sits UNDER Shift, the new quietest voice — see
+// [`OUTPUT_PIP_KIND_GAIN`]. It is the ladder's own rule applied honestly: the
+// tier is indexed by repeat frequency, and program output can repeat faster
+// than any hand. Nothing NOT authored by the user may sit on an authored tier.)
+//
 // Kind gains are the TIER knob; `palette_trim` anchors each style's Typed on the
 // floor. Where a gain looks surprising it is compensating a VOICE design, and
 // the comment says so.
@@ -1021,6 +1190,85 @@ const SPACE_KIND_GAIN: f32 = 0.9;
 /// hand shaping the next letter, not a letter — so the lift sits below even
 /// a Glide's whisper (0.78): present in the music, never a note you count.
 const SHIFT_KIND_GAIN: f32 = 0.5;
+/// UNDER Shift — the quietest voice in the engine, and deliberately so. The
+/// ladder indexes loudness by REPEAT FREQUENCY, and program output is the one
+/// source that can repeat faster than a hand can type; a `cat bigfile` pip on
+/// the typing floor would be the loudest thing in a build log. The episode law
+/// in [`crate::output_streak`] already bounds this to one pip per episode, so
+/// this gain is the second, independent guarantee: even if that law were
+/// somehow defeated, the voice underneath it is a whisper.
+const OUTPUT_PIP_KIND_GAIN: f32 = 0.34;
+/// The episode's closing exhale, quieter again than the pip that opened it —
+/// a release is never louder than its onset.
+const OUTPUT_SETTLE_KIND_GAIN: f32 = 0.22;
+
+/// THE CAPITAL'S LIFT, in scale degrees: a SHIFTED glyph
+/// ([`SoundEvent::shifted`]) sings its note one OCTAVE up (owner ask,
+/// 2026-08-30: "when doing a shift-key press (not the shift, but the shifted
+/// key) make it higher pitched").
+///
+/// FIVE degrees is a pentatonic octave, and the octave is the only interval
+/// that answers the ask WITHOUT editing the tune. A capital is the same note
+/// of the theme, sung up — same pitch class, so the melodic contour a listener
+/// follows is untouched, and consonance is automatic (an octave cannot rub
+/// against anything the unshifted note was consonant with). A fifth or a third
+/// would have been "higher" too, and would have rewritten the melody every
+/// time a sentence began.
+///
+/// It rides the DEGREE, in [`TrailSynth::design_trail`], so every palette and
+/// every tone inherits it from one place, and it applies to
+/// [`SoundKind::Typed`] alone: a shifted Space is still a word boundary and a
+/// shifted Enter is still an Enter. It does NOT move [`TrailSynth::walk`] —
+/// the theme's own position is unaffected by how you spell a word.
+const SHIFT_GLYPH_LIFT: i32 = 5;
+
+/// THE LIFT'S OWN ROTATION, in scale degrees ADDED to the lift's base step
+/// ([`GESTURE_CHAR_STEP`]) — one entry per bare [`SoundKind::Shift`] that
+/// SOUNDS, cycling forever.
+///
+/// WHAT WAS WRONG (owner, 2026-08-31: "when pressing shift, the tone should
+/// rotate"), MEASURED on the `keyboard_song_ab` rotation scenario — twenty
+/// bare shifts, 0.45 s apart, pan held at centre:
+///
+///   events 20 · DISTINCT PITCHES 1 · closest recurrence 1 event
+///   (779.8 Hz, twenty times)
+///
+/// The lift's pitch was `walk + col_off + song_key + GESTURE_CHAR_STEP`, and
+/// on a bare modifier every one of those terms is a constant: a Shift is
+/// excluded from [`TrailSynth::advance_song`] (it composes nothing, correctly
+/// — a modifier is not a note of the sentence), the column does not move while
+/// the hand reaches for it, and the key is zero unless the cat is singing. So
+/// the ONE gesture in the vocabulary that a person fires repeatedly with
+/// nothing in between was the one gesture that could not change pitch. That is
+/// a drone by construction, exactly like the 91-identical-C4s the spacebar was
+/// rewritten out of.
+///
+/// THE ROTATION IS THE LATTICE'S OWN. Successive lifts step TWO degrees up the
+/// pentatonic and fold at the octave — `1 + 2i mod 5` — so the sounding
+/// offsets are
+///
+///   +1 +3 +5 +2 +4  (a fourth/fifth apart in the pentatonic: its circle of
+///                    fifths, which is what "rotate" means on a five-note
+///                    lattice — the cycle visits every degree exactly once)
+///
+/// and every property the shipped lift had survives:
+///
+/// - CONSONANT, structurally. Every entry is a degree of the active tone's
+///   table, so the no-beating law is inherited whole — a lift can no more rub
+///   against the melody than a bass root can.
+/// - BOUNDED. The offsets span `+1..=+5`: from the shipped step above the
+///   melody up to exactly [`SHIFT_GLYPH_LIFT`], the octave a capital's own
+///   keystroke sings at. The lift cannot climb out of the gesture it
+///   announces, and it does not wander with press count — it cycles.
+/// - A WHISPER. [`SHIFT_KIND_GAIN`] is untouched; this moves pitch only.
+/// - THE FIRST LIFT IS THE SHIPPED ONE. `SHIFT_ROTATION[0] == 0`, so a
+///   session's first lift — and every single-shift probe in the suite — is
+///   bit-identical to the pitch that shipped.
+///
+/// It is the modifier's own cycle rather than a read of the theme's playhead
+/// because the playhead is exactly what a bare shift does not move: following
+/// it would leave the drone in place for the only gesture that has the defect.
+const SHIFT_ROTATION: [i32; 5] = [0, 2, 4, 1, 3];
 
 // ---------------------------------------------------------------------------
 // THE ERASE POOF — the deletion's OWN voice (owner, 2026-08-26/28)
@@ -1282,6 +1530,77 @@ const SPACE_BREATHE_FIFTH_LEVEL: f32 = 0.10;
 /// makes literally no sound reads as a dropped keystroke, so the run's tail
 /// answers with air alone.
 const SPACE_RUN_BREATH_LEVEL: f32 = 0.35;
+/// THE BASS'S AIR — the level of the high breath riding over the walking root,
+/// against the root's own voice gain.
+///
+/// It exists because the shipped bass measured EXACTLY 0.000 of its energy
+/// over 2 kHz, with a spectral centroid of 294 Hz against the keystroke's
+/// 1382: the one gesture in the whole vocabulary with no top at all, which is
+/// what made it read as a woody thud instead of an instrument (owner: the
+/// spacebar note "isn't musical"). The same trick the erase poof's air cap
+/// plays, an octave higher and much quieter.
+///
+/// FITTED AGAINST THE NOTE, not by ear-guess. The constraint is that the space
+/// must still be a NOTE: the bench's tonality figure (peak-over-median in
+/// 150–4500 Hz) has to stay over its `PITCHED_TONALITY` = 60 threshold, or the
+/// downbeat stops being counted — and heard — as pitched at all. Measured on
+/// the isolated probe:
+///
+///   level   centroid   energy>2 kHz   tonality   peak vs the keystroke
+///    0.28     329 Hz       0.002        176        −5.9 dB   (no top yet)
+///    0.9      434 Hz       0.021         65        −4.5 dB   ← chosen
+///    1.6      667 Hz       0.062         40        −2.6 dB   (not a note)
+///    2.4     1037 Hz       0.127         27        −0.8 dB   (noise, and it
+///                                                             drags the whole
+///                                                             prose scenario's
+///                                                             pitched-onset
+///                                                             rate 8.07 → 6.59)
+///
+/// 0.9 is the most air the note will carry: ten times the high-band energy and
+/// +105 Hz of centroid for 1.4 dB of peak, with the whole prose mix's RMS
+/// unmoved (−29.79 → −29.77 dBFS).
+const SPACE_AIR_LEVEL: f32 = 0.9;
+/// THE WORD BOUNDARY'S TWINKLE — "needs some more sparkly noises" (owner,
+/// 2026-08-31), spent where a word gap can afford it: on the AIR voice, which
+/// was carrying all three of its partials silent.
+///
+/// FOUR OCTAVES UP, not two. The obvious chime is 4f, the crown's own ratio —
+/// and it is wrong here, because the root walks 262-392 Hz, so 4f is
+/// 1046-1568: the MELODY's register ([`SONG_PULSE`]'s four-band map), where a
+/// downbeat ornament would sit in the middle of the tune and mask it. 16f is
+/// 4.2-6.3 kHz: the same sparkle band the keystroke's own crown and glint
+/// occupy, so the word gap twinkles in the register the ear is already
+/// reading as glitter, four octaves clear of the note it decorates.
+///
+/// It also cannot ROUGHEN the bass, which a nearer partial could: an exact
+/// power-of-two multiple is the root's own pitch class, and the twin's detune
+/// is fitted to beat at 7.9-11.8 Hz across the walk — under the 15-30 Hz
+/// roughness band the re-voice measures, exactly like [`KEY_TINK_TWIN`]'s
+/// 0.010 at 4f.
+///
+/// The pair is a WHISPER (0.11/0.07 against the root's 0.55 body) and the
+/// voice's shimmer LFO costs it a further ~27 % of mean level, which is why the
+/// downbeat did not get louder — it got QUIETER. Measured on the isolated Space
+/// probe: peak −26.13 → −26.55 dBFS, energy over 2 kHz 0.021 → 0.038, spectral
+/// centroid 434 → 493 Hz, and the bench's tonality figure 65.0 → 74.0, i.e.
+/// further ABOVE the `PITCHED_TONALITY` threshold than the shipped thud was —
+/// the chime is a partial, so it raises the numerator of "is this a note"
+/// rather than the denominator. The gesture was the mix's darkest; it now
+/// glitters, reads MORE like a note, and does not spend a decibel doing it.
+const SPACE_TWINKLE_RATIO: f32 = 16.0;
+const SPACE_TWINKLE_DETUNE: f32 = 0.030;
+const SPACE_TWINKLE: f32 = 0.11;
+const SPACE_TWINKLE_TWIN: f32 = 0.07;
+/// The air's shimmer LFO. It rides the WHOLE voice — chime and breath alike —
+/// so the space's top scintillates rather than puffing: the twinkle is what
+/// turns a thud's cap into a sparkle.
+const SPACE_TWINKLE_RATE: f32 = 24.0;
+const SPACE_TWINKLE_DEPTH: f32 = 0.55;
+/// The air, lengthened from 0.075/0.030 so the shimmer above has ~2.5 cycles
+/// to be heard in. Still far inside the downbeat's own [`SPACE_DUR_S`]-scale
+/// life, so a word boundary is not made longer, only brighter.
+const SPACE_TWINKLE_DUR_S: f32 = 0.105;
+const SPACE_TWINKLE_DECAY_S: f32 = 0.038;
 /// TIER 0 — the SUB-FLOOR. Cursor motion is not authorship: it accompanies what
 /// you are doing rather than being the thing you did, so the three movement
 /// gestures sit AUDIBLY under the typing floor.
@@ -2124,35 +2443,42 @@ pub struct TrailSynth {
     /// run law lives with the rest of the admission policy instead of being
     /// re-derived inside the voice designer.
     space_head: bool,
-    /// The melody's CURRENT degree on the pentatonic lattice: the derived
-    /// output of the phrase generator (`phrase_home + phrase_step + arc`,
-    /// clamped into [`tone_register`]) — see [`Self::advance_melody`].
+    /// The melody's CURRENT degree on the pentatonic lattice: the theme's note
+    /// at the playhead plus the tone's [`melody_lean`], folded into
+    /// [`tone_register`] — see [`Self::advance_melody`].
     /// Advanced by TRAIL gestures only: a bonk clashes AGAINST the current
     /// degree, it does not move the melody. It is the one scalar every
     /// consumer reads — the bonk clashes against it, `design_trail` offsets
     /// it by the column, a cursor Glide/Sweep plays relative to it.
     walk: i32,
-    /// PHRASE-AWARE MELODY STATE. The 4-step motif CELL — scale-step deltas
-    /// re-chosen each phrase and replayed to fill it, so a recognisable shape
-    /// RECURS and varies instead of drifting.
-    motif: [i8; 4],
-    /// Index of the current note within the phrase (`0..phrase_len`).
-    phrase_pos: u8,
-    /// This phrase's length in notes ([`PHRASE_MIN`]..=[`PHRASE_MAX`]).
-    phrase_len: u8,
-    /// CALL-AND-RESPONSE toggle (the celebration bar-parity idiom applied to
-    /// the typed line): flipped at every phrase boundary. Even phrases ASK
-    /// (the motif as chosen), odd phrases ANSWER (the motif inverted) — two
-    /// shapes reading as dialogue.
-    phrase_parity: bool,
-    /// Unclamped in-phrase degree ACCUMULATOR (reset to 0 each phrase); the
-    /// pitch register is `phrase_home + phrase_step + arc`, clamped. Kept
-    /// unclamped so the motif's delta pattern stays exactly periodic (the
-    /// motif genuinely recurs) even when the clamped pitch saturates.
-    phrase_step: i32,
-    /// The register ANCHOR this phrase opened on — the tonic the previous
-    /// cadence resolved to.
-    phrase_home: i32,
+    /// THE THEME'S PLAYHEAD — the index into [`SONG_THEME`] the NEXT accent
+    /// will sing. Advances one per accent and wraps at 28, so sustained typing
+    /// plays the tune IN ORDER, over and over, at one note per three
+    /// keystrokes.
+    theme_pos: u8,
+    /// Which PHRASE of the form ([`SONG_FORM`]) the playhead is inside — the
+    /// index of its first note, so the phrase runs
+    /// `SONG_FORM[phrase_idx] .. SONG_FORM[phrase_idx + 1]`.
+    ///
+    /// A phrase boundary (Enter, a comma-length pause, or the phrase simply
+    /// running out) CLOSES this phrase and opens the next one: the playhead
+    /// jumps to `SONG_FORM[phrase_idx + 1]` rather than to zero, so a pause
+    /// ANSWERS the phrase it interrupted instead of restarting the theme.
+    phrase_idx: u8,
+    /// THE BASS WALK'S position — the index into [`SONG_BASS`] the NEXT word
+    /// boundary will play. Advanced by whitespace-run HEADS only (one root per
+    /// word, never per space), so the harmony moves at the rate of the text's
+    /// own words. On the WORD clock while the theme is on the ACCENT clock:
+    /// the two never re-align, which is where the long-form variation comes
+    /// from now that nothing is random.
+    bass_step: u8,
+    /// THE LIFT'S ROTATION POSITION — the index into [`SHIFT_ROTATION`] the
+    /// NEXT sounding bare [`SoundKind::Shift`] will play. Advanced by lifts
+    /// that are ADMITTED (a lift the governor thinned made no sound, so it may
+    /// not spend a step of the rotation), and never rewound: on the MODIFIER's
+    /// own clock, which is a third clock again — the theme walks on accents,
+    /// the bass on words, the lift on shifts.
+    shift_step: u8,
     /// THE BAR POSITION — the index into [`SONG_PULSE`] the NEXT keystroke
     /// will play. Advanced by keystrokes only (the gestures that compose), and
     /// reset to the downbeat by every phrase boundary, so a new phrase always
@@ -2391,17 +2717,17 @@ impl TrailSynth {
             space_run: false,
             space_head: false,
             walk: 2,
-            // Phrase state opens EMPTY: `phrase_len == 0` (with `phrase_pos ==
-            // 0`) makes the very first trail note a phrase boundary, so the
-            // melody starts by cadencing onto the tonic and drawing its first
-            // motif. The bonk-moves-nothing proof pushes no trail note, so
+            // THE THEME OPENS AT ITS FIRST NOTE. A session's first keystroke
+            // plays `SONG_THEME[0]` — the hook's own tonic — and the piece
+            // runs forward from there; there is no warm-up and no boundary to
+            // burn. The bonk-moves-nothing proof pushes no trail note, so
             // `walk` stays at its documented init of 2.
-            motif: [0; 4],
-            phrase_pos: 0,
-            phrase_len: 0,
-            phrase_parity: false,
-            phrase_step: 0,
-            phrase_home: 2,
+            theme_pos: 0,
+            phrase_idx: 0,
+            // The bass opens on the walk's root (C), so the FIRST word boundary
+            // of a session grounds the hook on its own tonic.
+            bass_step: 0,
+            shift_step: 0,
             // The bar opens on its DOWNBEAT, so the very first keystroke of a
             // session is an accent — which is also what keeps the loudness
             // ladder's isolated-keystroke pins measuring the accent level.
@@ -2550,6 +2876,28 @@ impl TrailSynth {
                 SoundKind::Space => {
                     self.space_head = !self.space_run;
                     self.space_run = true;
+                    if self.space_head {
+                        // THE WORD BOUNDARY IS THE BAR LINE. The space itself
+                        // is not the downbeat — the owner said so, and the
+                        // measurement agreed: with the bar left free-running,
+                        // only 31 % of the words in a minute of prose opened on
+                        // an accent, so more than two words in three began on
+                        // ACCOMPANIMENT. A tune whose phrases start wherever
+                        // the letter count happens to land is not a tune you
+                        // can follow.
+                        //
+                        // Resetting the bar here makes the FIRST LETTER of
+                        // every word an accent — the downbeat is the word, and
+                        // the space is the bass note that opens the bar under
+                        // it. The bar is still indexed by keystroke, so typing
+                        // speed is still the tempo; the text now supplies the
+                        // bar lines the way it already supplies the phrase
+                        // marks (`PHRASE_PAUSE_S`).
+                        //
+                        // Only the run HEAD does it: indentation is one gesture
+                        // and must not re-bar four times.
+                        self.song_pulse = 0;
+                    }
                 }
                 SoundKind::Shift => {}
                 _ => self.space_run = false,
@@ -2655,7 +3003,14 @@ impl TrailSynth {
             self.since_erase = 0.0;
         } else if !matches!(
             ev.kind,
-            SoundGesture::Trail(SoundKind::Shift) | SoundGesture::Trail(SoundKind::Poof)
+            SoundGesture::Trail(SoundKind::Shift)
+                | SoundGesture::Trail(SoundKind::Poof)
+                // THE OUTPUT PIP is the purest case of the same rule: it is
+                // not authored at all. A pip that claimed the shared beat
+                // would let the MACHINE thin the human's very next keystroke
+                // — output stealing authorship's admission slot — which is
+                // exactly backwards.
+                | SoundGesture::Output(_)
         ) {
             self.since_voice = 0.0;
         }
@@ -2667,7 +3022,12 @@ impl TrailSynth {
         // frame BEHIND the very deletion whose shimmer it must not kill.
         if !matches!(
             ev.kind,
-            SoundGesture::Trail(SoundKind::Shift) | SoundGesture::Trail(SoundKind::Poof)
+            SoundGesture::Trail(SoundKind::Shift)
+                | SoundGesture::Trail(SoundKind::Poof)
+                // An unauthored pip must not end a held delete run's story:
+                // output landing mid-backspace-run would otherwise kill the
+                // pending release shimmer the user's own hand earned.
+                | SoundGesture::Output(_)
         ) {
             self.damp_pending_shimmer();
         }
@@ -2708,6 +3068,12 @@ impl TrailSynth {
                 self.design_trail(ev, kind, duck, pause);
             }
             SoundGesture::Words(WordGesture::Bonk) => self.design_bonk(ev, duck),
+            // PRISM WAKE. Like the bonk it is designed at KIND level (no
+            // palette arm, so no `palette_trim`), and like the erase poof it
+            // spawns SEEDED — an unauthored voice must not consume draws from
+            // the typing melody's rng stream, or the machine's output would
+            // silently change the tune the human is playing.
+            SoundGesture::Output(gesture) => self.design_output_pip(&ev, gesture, duck),
             SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, sig }) => {
                 self.latch_song_key(sig);
                 self.design_celebration(ev, bar, sig);
@@ -2751,101 +3117,97 @@ impl TrailSynth {
         }
     }
 
-    /// Advance the PHRASE-AWARE MELODY by one note, setting [`Self::walk`] to
-    /// the new degree. Deterministic — `rnd()` is drawn only at phrase
-    /// boundaries (a fixed 1 + 4 draws), never per note, so the per-note step
-    /// is a pure function of phrase state and the whole generator replays
-    /// bit-for-bit per `(events, seed, tone)`. `pause` is the typing gap since
-    /// the previous event (captured before the governor reset it).
+    /// PLAY THE NEXT NOTE OF THE THEME, setting [`Self::walk`] to its degree.
     ///
-    /// The tune-making devices are layered onto the register — a
-    /// repeat-and-vary MOTIF cell, a raised-cosine contour ARC,
-    /// CALL-AND-RESPONSE by phrase parity, a leap-and-recover at the peak, and
-    /// a CADENCE onto the tonic at phrase ends (Enter or a pause) — with pitch
-    /// still flowing through [`Self::melody_hz`], so consonance and tone
-    /// adaptation are inherited untouched.
+    /// The tune is [`SONG_THEME`] and it is played IN ORDER: one degree per
+    /// accent, the playhead advancing by one, wrapping at 28 back onto the
+    /// hook. Nothing is generated and nothing is drawn — `rnd()` is not called
+    /// here at all any more, so the melody is a pure function of how many
+    /// accents have been struck and where the phrase marks fell. `pause` is the
+    /// typing gap since the previous event (captured before the governor reset
+    /// it).
+    ///
+    /// A PHRASE BOUNDARY — Enter, a comma-length gap, or the phrase running out
+    /// — CLOSES the phrase and opens the NEXT one, so a rest advances the form
+    /// (hook → answer → bridge → half-cadence) instead of rewinding it. The
+    /// boundary note itself is the closing phrase's LAST degree: the theme's
+    /// own cadence, which is a real one (A' and B both land low, A'' leans off
+    /// its peak) rather than the generic snap-to-tonic the generator used to
+    /// make.
+    ///
+    /// The per-tone LEAN is the only thing added on top, and it transposes the
+    /// WHOLE line — it cannot rewrite a note. Pitch still flows through
+    /// [`Self::melody_hz`], so consonance and tone adaptation are inherited
+    /// untouched.
     fn advance_melody(&mut self, kind: SoundKind, pause: f32) {
         let (lo, hi) = tone_register(self.tone);
-        // PHRASE BOUNDARY: Enter (a Jump), a comma-length typing gap, or the
-        // phrase simply running its length. On any of these the melody
-        // CADENCES onto the nearest tonic (degree 0, or its octave 5 — both
-        // the pentatonic root pitch class), then OPENS a fresh phrase from
-        // there: a new length, a new motif, the call/response parity flipped.
-        // This is what makes phrases LAND instead of drifting forever.
-        let boundary = matches!(kind, SoundKind::Jump)
-            || pause > PHRASE_PAUSE_S
-            || self.phrase_pos >= self.phrase_len;
-        if boundary {
-            let tonic = if self.walk * 2 <= 5 { 0 } else { 5 };
-            self.walk = tonic.clamp(lo, hi);
-            self.phrase_home = self.walk;
-            self.phrase_step = 0;
-            self.phrase_pos = 0;
-            self.phrase_parity ^= true;
-            // A fresh phrase length (6..=8) and a fresh 4-step motif cell. The
-            // draw COUNT is fixed (1 + 4) whatever the tone, so the rng stream
-            // is phrase-periodic and the byte pins cross-check cleanly.
-            self.phrase_len =
-                PHRASE_MIN + (self.rnd() * ((PHRASE_MAX - PHRASE_MIN + 1) as f32)) as u8;
-            let span = melody_span(self.tone);
-            // THE MOTIF CELL — three drawn steps and a CLOSING one. Two
-            // properties are what make the line a tune instead of a scatter,
-            // and both were missing:
-            // - EVERY STEP MOVES. The old draw included 0, and a zero delta
-            //   plays the same pitch twice; worse, a ±1 delta cancels exactly
-            //   against the arc's own ±1, so the two most common cases both
-            //   produced a repeated note. Measured over a 12.5 s typing
-            //   script: 54 % of consecutive notes were UNISONS — the melody's
-            //   single loudest defect.
-            // - THE CELL CLOSES. The fourth step is whatever returns the cell
-            //   to where it began, so the second pass starts where the first
-            //   did instead of the accumulator walking into the register bound
-            //   (the other unison source: two saturated notes are one pitch,
-            //   and a saturated motif is no longer periodic).
-            // The draw COUNT is fixed (1 + 3) whatever the tone, so the rng
-            // stream stays phrase-periodic and the byte pins cross-check.
-            let mut sum = 0;
-            for i in 0..3 {
-                // 2·span NONZERO choices: −span..=−1 then 1..=span.
-                let k = (self.rnd() * (2 * span) as f32) as i32;
-                let d = if k < span { k - span } else { k - span + 1 };
-                self.motif[i] = d as i8;
-                sum += d;
-            }
-            // The closing leap, held inside one step more than the cell's own
-            // span so the return home stays a consonant lattice interval (a
-            // pentatonic sixth at span 1) rather than a lurch.
-            self.motif[3] = (-sum).clamp(-(span + 1), span + 1) as i8;
+        let start = usize::from(SONG_FORM[usize::from(self.phrase_idx)]);
+        let end = usize::from(SONG_FORM[usize::from(self.phrase_idx) + 1]);
+        let pos = usize::from(self.theme_pos);
+        // The phrase RAN OUT: its last note has already sounded, so roll
+        // straight into the next phrase's first note. Re-playing the closing
+        // degree here would be a unison the listener hears as a stutter.
+        let ran_out = pos >= end;
+        // A REST — Enter or a comma-length gap. It cuts the phrase short and
+        // CADENCES onto that phrase's own final degree, which is the note the
+        // theme was heading for. Not applicable at a phrase's very first note:
+        // a rest before anything has been played (a fresh session, a think
+        // between paragraphs landing exactly on a phrase mark) has no phrase to
+        // close, and closing one would skip a phrase per pause.
+        let rest = (matches!(kind, SoundKind::Jump) || pause > PHRASE_PAUSE_S) && pos > start;
+        if rest && !ran_out {
+            self.walk = fold_register(
+                i32::from(SONG_THEME[end - 1]) + melody_lean(self.tone),
+                lo,
+                hi,
+            );
+            self.open_next_phrase();
             return;
         }
-        // MOTIF STEP: the cell delta at this position drives the note. The cell
-        // is inverted on ANSWER phrases (call/response), transposed up a degree
-        // on its SECOND pass (repeat-and-vary), and given one bright LEAP at the
-        // arc peak (leap-and-recover — the motif steps back on the next note).
-        let idx = (self.phrase_pos % 4) as usize;
-        let mut delta = i32::from(self.motif[idx]);
-        if self.phrase_parity {
-            delta = -delta;
+        if ran_out {
+            self.open_next_phrase();
         }
-        if self.phrase_pos == self.phrase_len / 2 {
-            delta += MELODY_LEAP;
-        }
-        self.phrase_step += delta;
-        // The CONTOUR ARC (a lift of [`ARC_LIFT`] degrees through the middle of
-        // the phrase, settling back for the cadence), the repeat-and-vary lift
-        // on the cell's second pass, and the per-tone LEAN — all three fold
-        // into the PITCH register, never the motif accumulator, so the cell's
-        // delta pattern stays exactly periodic (the motif genuinely recurs)
-        // while the line still has shape.
-        let frac = f32::from(self.phrase_pos) / f32::from(self.phrase_len);
-        let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
-        let vary = if self.phrase_pos >= 4 { MOTIF_VARY } else { 0 };
-        self.phrase_pos += 1;
         self.walk = fold_register(
-            self.phrase_home + self.phrase_step + arc + vary + melody_lean(self.tone),
+            i32::from(SONG_THEME[usize::from(self.theme_pos)]) + melody_lean(self.tone),
             lo,
             hi,
         );
+        self.theme_pos += 1;
+    }
+
+    /// THE BASS ROOT for walk position `step` under a palette's `anchor`: the
+    /// walk's degree on the active tone's lattice (song key included),
+    /// OCTAVE-FOLDED into the one bass register
+    /// `[2·SPACE_BASS_LO_HZ, 4·SPACE_BASS_LO_HZ)`.
+    ///
+    /// The fold is what makes the register a LAW rather than an accident.
+    /// Folding the ROOT alone — the shipped `bass_octave(anchor) * 2` — only
+    /// bounds the walk's first note; a fifth above a root already near the top
+    /// of the band lands outside it (Comet's degree 3 would sound at 645 Hz,
+    /// above its own melody floor). Folding the WALKED pitch bounds every note
+    /// of the walk for every palette, at the cost of the contour occasionally
+    /// inverting inside the octave — which is exactly what a bass player does
+    /// when a line runs off the end of the neck, and is why the walk can never
+    /// LURCH: consecutive roots are always inside one octave of each other
+    /// (`the_bass_walk_stays_in_the_audible_register`).
+    ///
+    /// At walk position 0 with no song key this is `bass_octave(anchor) * 2` —
+    /// the shipped pitch, exactly. It also closes a latent hole in the old
+    /// formula: `melody_hz(bass_octave(anchor) * 2, song_key)` left the band
+    /// entirely at song keys of 5 or more, so a singing cat could push the
+    /// downbeat up into the tune. The fold cannot.
+    fn space_root_hz(&self, anchor: f32, step: u8) -> f32 {
+        let deg = i32::from(SONG_BASS[usize::from(step)]) + i32::from(self.song_key);
+        bass_octave(self.melody_hz(anchor, deg)) * 2.0
+    }
+
+    /// Hand the playhead to the NEXT phrase of the form — the answer after the
+    /// hook, the bridge after the answer, the hook again after the
+    /// half-cadence. Never a rewind to zero: that is the whole difference
+    /// between a theme and a ringtone.
+    fn open_next_phrase(&mut self) {
+        self.phrase_idx = (self.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
+        self.theme_pos = SONG_FORM[usize::from(self.phrase_idx)];
     }
 
     /// The melody's pitch lattice under the CURRENT tone: `base` scaled to
@@ -2861,6 +3223,24 @@ impl TrailSynth {
         let oct = degree.div_euclid(5);
         let step = degree.rem_euclid(5) as usize;
         base * transpose * table[step] * (2.0_f32).powi(oct)
+    }
+
+    /// Is the note now being designed one of the THEME'S PEAKS — the top of
+    /// the phrase, the note a star is thrown from? See [`KEY_CREST_DEGREE`].
+    ///
+    /// Stated against the THEME's degree, not the sounding one: [`Self::walk`]
+    /// carries the tone's [`melody_lean`], so subtracting it back off asks "is
+    /// this the tune's high note" rather than "is this note high", and an
+    /// Excited line (leaning a degree up) flashes on exactly the same notes of
+    /// exactly the same tune as a Calm one. The column nudge and the borrowed
+    /// song key ride `deg`, never `walk`, so neither can move a crest either.
+    ///
+    /// A function on the synth rather than a test inside the one palette that
+    /// uses it, for [`gesture_shape`]'s reason: the crest is a property of THE
+    /// SONG, and if a second palette ever wants to decorate the tune's peaks it
+    /// must be able to ask instead of re-deriving.
+    fn song_crest(&self) -> bool {
+        self.song_accent && self.walk - melody_lean(self.tone) >= KEY_CREST_DEGREE
     }
 
     /// Claim a voice slot: first free, else steal the quietest.
@@ -3031,6 +3411,10 @@ impl TrailSynth {
         // the melody's own degree whatever the bar is doing — they accompany
         // the tune, they are not played by it.
         let ghosting = kind == SoundKind::Typed && !self.song_accent;
+        // THE CAPITAL'S LIFT rides here too, once, for every palette that takes
+        // its degree from the melody: a SHIFTED glyph sings its note an octave
+        // up ([`shift_lift`]). It never touches `self.walk`, so how you spell a
+        // word cannot move the theme.
         let deg = self.walk
             + col_off
             + i32::from(self.song_key)
@@ -3039,7 +3423,8 @@ impl TrailSynth {
                 i32::from(self.song_ghost)
             } else {
                 0
-            };
+            }
+            + shift_lift(&ev, kind);
 
         // CURSOR MOVEMENT (Glide/Sweep) is a style-agnostic, IN-KEY gesture
         // designed once here (like Kill/Bonk), before palette dispatch: it
@@ -3297,18 +3682,54 @@ impl TrailSynth {
         self.spawn(body, g * 0.3, ev.pan);
     }
 
-    /// THE SPACEBAR'S DOWNBEAT — one short bass root on the speaking palette's
-    /// own tonic, octave-folded into a single bass register
-    /// ([`SPACE_BASS_LO_HZ`]) and FIXED there. See that constant for why the
-    /// pitch no longer comes from the melody's degree: the old nearest-tonic
-    /// rule made consecutive spaces jump a full octave on nothing the ear can
-    /// attach to the text.
+    /// THE SPACEBAR'S BASS — one short root per WORD, walking the theme's own
+    /// harmony ([`SONG_BASS`]) in the palette's octave-folded bass register
+    /// ([`SPACE_BASS_LO_HZ`]).
     ///
-    /// MONOPHONIC — a live downbeat is damped before the next one spawns
-    /// ([`SPACE_DAMP_S`]), because two voices at one FIXED frequency with
-    /// randomised phase comb-filter against each other. And only the HEAD of a
-    /// whitespace run gets the bass at all: the tail answers with the breath
-    /// alone, so indentation is one gesture rather than four bass notes.
+    /// WHAT WAS WRONG, MEASURED rather than theorised. The owner said the
+    /// spacebar "isn't musical", and when it was described to him as a
+    /// fixed-tonic metronome downbeat he corrected that too: "it is not a
+    /// downbeat and it doesn't sound like that." Both halves of his correction
+    /// check out on the `keyboard_song_ab` prose scenario (60 s, 91 spaces,
+    /// RainbowKitty):
+    ///
+    /// - IT WAS ONE NOTE, FOREVER. Exactly ONE distinct pitch was measurable
+    ///   across the whole minute — 261.9 Hz, the folded tonic — because the
+    ///   only term in its frequency was `song_key`, which is zero unless the
+    ///   cat is singing. 91 word boundaries, 91 identical C4s. Not a bass
+    ///   line: a drone. Nothing about it could be "musical" because nothing
+    ///   about it was a musical CHOICE.
+    /// - IT WAS NOT ON A BEAT EITHER. The bar ([`SONG_PULSE`]) neither reset
+    ///   nor advanced at a space, so word boundaries landed on all twelve
+    ///   slots and only 31 % of words opened on an accent. Structurally it was
+    ///   never a downbeat, which is exactly what the owner heard.
+    /// - IT WAS NOT INAUDIBLE, so "louder" was never the fix. Its 60 ms body
+    ///   measured a median +2.6 dB ABOVE the letter bell before it (p10 −0.9,
+    ///   p90 +5.7), and its own note stood +37 dB over that letter's window at
+    ///   261.6 Hz. The note was there. It just had nothing to say.
+    /// - IT HAD NO AIR. Spectral centroid 301 Hz in context against the
+    ///   letters' 677, with 0.000 of its energy over 2 kHz — the only gesture
+    ///   in the vocabulary with no top at all, which is why it read as a
+    ///   woody thud rather than an instrument.
+    ///
+    /// WHAT IT IS NOW. The root WALKS: [`SONG_BASS`] steps one degree per word
+    /// through the v0.20.0 verse's own bar roots (C E D G | C E C G), so
+    /// consecutive words describe a chord progression instead of restriking
+    /// one note, and the walk is on the pentatonic lattice so it can never rub
+    /// against the tune above it. The word boundary also RE-BARS the pulse (in
+    /// [`Self::push`]), so the first letter of every word is an accent: the
+    /// space is not the downbeat — it is the bass that opens the bar, and the
+    /// WORD is the downbeat. And it gets a breath of top ([`SPACE_AIR_LEVEL`])
+    /// so it reads as the instrument it is.
+    ///
+    /// MONOPHONIC — a live root is damped before the next one spawns
+    /// ([`SPACE_DAMP_S`]), because two voices at one frequency with randomised
+    /// phase comb-filter against each other; now that the walk moves, the damp
+    /// additionally stops a held root from turning the progression into a
+    /// chord. And only the HEAD of a whitespace run gets a root at all: the
+    /// tail answers with the breath alone, so indentation is one gesture rather
+    /// than four bass notes — and the walk steps once per word, never once per
+    /// blank.
     ///
     /// The voice is deliberately UN-articulated: no [`gesture_bend`] scoop
     /// (a downbeat arrives, it does not lean), a round attack, a dark
@@ -3389,7 +3810,17 @@ impl TrailSynth {
         // monophonic damp, same coalesced-run breath; only the register and
         // the timbre moved, and the register map's four bands stay disjoint
         // (space 220-440, melody ≳ 520).
-        let f = self.melody_hz(bass_octave(anchor) * 2.0, i32::from(self.song_key));
+        //
+        // AND NOW IT WALKS. The pitch is the theme's own bar root for this WORD
+        // ([`SONG_BASS`]), folded into the one bass register, so the five pitch
+        // classes C E D G A sound under successive words — 262 / 327 / 294 /
+        // 392 / 440 Hz at the RainbowKitty anchor — over a twelve-word cycle
+        // that never returns to a root inside four words. The walk STEPS here,
+        // after the read, so exactly one root is consumed per word
+        // (`space_head` already guarantees this arm runs once per whitespace
+        // run).
+        let f = self.space_root_hz(anchor, self.bass_step);
+        self.bass_step = (self.bass_step + 1) % SONG_BASS.len() as u8;
         let v = Voice {
             bass: true,
             dur,
@@ -3432,10 +3863,64 @@ impl TrailSynth {
             n_f1: 180.0,
             n_glide: 0.005,
             n_q: 0.7,
-            lp_cut: 3600.0,
+            // THE ROOF, opened. At 3600 the root's own 4f tink (1046-1570 Hz)
+            // was the highest thing in the voice and the measured energy over
+            // 2 kHz was EXACTLY ZERO — the only gesture in the vocabulary with
+            // no top, which is why the bass read as a thud rather than an
+            // instrument. 5200 lets the tink's own air and the thumb's strike
+            // through without reaching the letters' 4f band.
+            lp_cut: 5200.0,
             ..breath(0.05)
         };
         self.spawn(v, g * SPACE_VOICE_LEVEL, 0.0);
+        // THE AIR — a breath of high, quiet noise riding the root: the top the
+        // bass never had. Spawned as its own short voice rather than as a
+        // fourth partial (the voice carries exactly three) and seeded, so it
+        // consumes no `rnd()` draws and the melody's stream is independent of
+        // how many words you type.
+        //
+        // …AND IT TWINKLES NOW (owner, 2026-08-31). The air voice was carrying
+        // its three partials UNUSED, so the word boundary's glitter is free:
+        // the detuned pair at [`SPACE_TWINKLE_RATIO`] and the whole voice's
+        // shimmer LFO cost one extra oscillator on a voice that already
+        // existed, no new polyphony, and no new level on the note itself. See
+        // [`SPACE_TWINKLE`] for why the chime is FOUR octaves up rather than
+        // two.
+        self.spawn_seeded(
+            Voice {
+                dur: SPACE_TWINKLE_DUR_S,
+                attack: 0.004,
+                decay: SPACE_TWINKLE_DECAY_S,
+                p: [
+                    Partial {
+                        lvl: SPACE_TWINKLE,
+                        f0: f * SPACE_TWINKLE_RATIO,
+                        f1: f * SPACE_TWINKLE_RATIO,
+                        ..Partial::default()
+                    },
+                    Partial {
+                        lvl: SPACE_TWINKLE_TWIN,
+                        f0: f * (SPACE_TWINKLE_RATIO + SPACE_TWINKLE_DETUNE),
+                        f1: f * (SPACE_TWINKLE_RATIO + SPACE_TWINKLE_DETUNE),
+                        ..Partial::default()
+                    },
+                    Partial::default(),
+                ],
+                n_lvl: 0.5,
+                n_f0: 6400.0,
+                n_f1: 3800.0,
+                n_glide: 0.020,
+                n_q: 1.0,
+                tw_rate: SPACE_TWINKLE_RATE,
+                tw_depth: SPACE_TWINKLE_DEPTH,
+                lp_cut: 8000.0,
+                ..Voice::default()
+            },
+            g * SPACE_VOICE_LEVEL * SPACE_AIR_LEVEL,
+            0.0,
+            0.0,
+            [0.0; 3],
+        );
     }
 
     /// The SHIFT LIFT — the family's anticipation gesture: one whisper-level
@@ -3445,8 +3930,20 @@ impl TrailSynth {
     /// keystroke will land. A breath of high air keys "lift" without adding
     /// a pitch; everything else about the voice is the movement family's
     /// soft sine, shorter and quieter still.
+    ///
+    /// AND IT ROTATES. The step above the melody is the FIRST entry of
+    /// [`SHIFT_ROTATION`], not the only one: successive lifts walk the
+    /// pentatonic's circle of fifths from that step up to the capital's own
+    /// octave and back, so pressing shift twice cannot play one note twice.
+    /// See the constant for the measurement that motivated it (twenty presses,
+    /// one pitch). The rotation STEPS HERE, after the read and inside the
+    /// admitted path — exactly where [`Self::design_space`] steps the bass
+    /// walk — so a lift the governor thinned into silence does not consume a
+    /// note the listener never heard.
     fn design_shift(&mut self, ev: &SoundEvent, deg: i32, g: f32) {
         let anchor = palette_for(ev.voice, ev.style).anchor_hz();
+        let deg = deg + SHIFT_ROTATION[usize::from(self.shift_step)];
+        self.shift_step = (self.shift_step + 1) % SHIFT_ROTATION.len() as u8;
         let f = self.melody_hz(anchor, deg);
         let (f0, f1) = gesture_bend(f, 1);
         let v = Voice {
@@ -3654,6 +4151,61 @@ impl TrailSynth {
             ..Voice::default()
         };
         self.spawn_seeded(v, g * POOF_CLOUD_GAIN, ev.pan, 0.0, [0.0; 3]);
+    }
+
+    /// PRISM WAKE's voice — the terminal's answer to program output. Two sine
+    /// partials (fundamental plus a quarter-amplitude octave), a soft 12 ms
+    /// attack so it can never click, and a low per-voice cutoff which is the
+    /// master keep-it-soft control: the whole point is a sound you notice only
+    /// when you are not busy. The pitch sits on the tune's OWN pentatonic
+    /// lattice via [`Self::melody_hz`], so a pip can never be dissonant against
+    /// whatever the typing is playing, and the degree comes from the comet's
+    /// theme-seeded spectrum phase ([`SoundEvent::hue`]) — which is how the
+    /// active theme audibly shades the pip without any new sound axis.
+    ///
+    /// The [`OutputGesture::Settle`] exhale is the same voice with the octave
+    /// dropped and less of everything: a release is never louder than its
+    /// onset.
+    fn design_output_pip(&mut self, ev: &SoundEvent, gesture: OutputGesture, duck: f32) {
+        let kind_gain = match gesture {
+            OutputGesture::Shimmer => OUTPUT_PIP_KIND_GAIN,
+            OutputGesture::Settle => OUTPUT_SETTLE_KIND_GAIN,
+        };
+        let g = ev.gain * duck * (0.55 + 0.45 * ev.heat) * kind_gain;
+        // Five lattice degrees, chosen by the theme-seeded hue. Deliberately
+        // NOT `self.walk`: the pip must not read as the melody's next note.
+        let deg = (ev.hue.clamp(0.0, 1.0) * 5.0) as i32;
+        let f = self.melody_hz(palette_for(ev.voice, ev.style).anchor_hz(), deg);
+        let octave = match gesture {
+            OutputGesture::Shimmer => 0.25,
+            OutputGesture::Settle => 0.0,
+        };
+        let v = Voice {
+            dur: 0.34,
+            attack: 0.012,
+            decay: 0.28,
+            p: [
+                Partial {
+                    lvl: 0.5,
+                    f0: f,
+                    f1: f,
+                    ..Partial::default()
+                },
+                Partial {
+                    lvl: octave,
+                    f0: f * 2.0,
+                    f1: f * 2.0,
+                    ..Partial::default()
+                },
+                Partial::default(),
+            ],
+            // No noise burst at all — a breath would read as an erase poof.
+            n_lvl: 0.0,
+            // THE master keep-it-soft control (module doc's own words).
+            lp_cut: 2200.0,
+            ..Voice::default()
+        };
+        self.spawn_seeded(v, g, ev.pan, 0.0, [0.0; 3]);
     }
 
     /// The curse-word BONK — designed once at kind level exactly like Kill,
@@ -4713,9 +5265,10 @@ impl Palette for PhaserPalette {
         // on Jump.
         let hue_deg = (ev.hue * 5.0) as i32;
         // Phaser builds its OWN degree (the live hue drives it, not the melody
-        // walk), so it must ASK for the family's deletion step rather than
-        // spell an interval of its own — the rule has exactly one home.
-        let d = hue_deg + col_off + gesture_shape(kind).offset;
+        // walk), so it must ASK for the family's deletion step and the
+        // capital's lift rather than spell intervals of its own — each rule has
+        // exactly one home.
+        let d = hue_deg + col_off + gesture_shape(kind).offset + shift_lift(ev, kind);
         let f = s.melody_hz(392.0, d);
         let (f0, f1v) = if kind == SoundKind::Backspace {
             (f, f * 1.12)
@@ -4854,9 +5407,354 @@ impl Palette for PhaserPalette {
 /// strike at fixed pitch, because the glass doesn't slide. Shared verbatim
 /// with the `v056_reference` oracle copy, exactly like [`GESTURE_BEND_TAU`].
 const KEY_BELL_BEND_SHARE: f32 = 0.33;
+
+// ---------------------------------------------------------------------------
+// THE SPARKLE — "and I want it be a bit more sparkly" (owner, 2026-08-30)
+// ---------------------------------------------------------------------------
+//
+// Prettier, NOT louder. The ladder is the constraint: an isolated Typed must
+// stay on the −21.0 dBFS tier-1 floor (`the_ladder_holds_for_the_key_family`,
+// `every_voice_lands_typed_on_the_ladder_floor`), so every gram of glitter
+// added here is paid for in [`KEY_BELL_TRIM`] rather than banked as level.
+// Three changes, each aimed at a different part of "sparkly":
+//
+//   TINK PRESENCE   the double-octave crown up ~1 dB, still strictly under the
+//                   body (the family tests select the LOUDEST partial and it
+//                   must land exactly on the melody note — that law is why the
+//                   tinks can never simply be raised to taste);
+//   HIGH-PARTIAL AIR the voice's roof lifted 4200 → 5600, which is what lets
+//                   the 4f crown's own top and the mallet's 5.2 kHz strike
+//                   through instead of shearing them off just above the tink;
+//   TWINKLE GLINTS  a delayed micro-chime an octave over the crown, twinkling.
+/// The double-octave crown, raised from 0.30/0.18. Still well under the body's
+/// 0.44 — the fundamental stays the strictly loudest single partial, which the
+/// pitch-selection tests depend on.
+const KEY_TINK: f32 = 0.34;
+const KEY_TINK_TWIN: f32 = 0.21;
+/// The bell's ROOF, 4200 → 5600. The mallet strikes out of 5.2 kHz and the
+/// crown sits at 2.1–6.3 kHz depending on degree; the old roof cut both off
+/// just above the tink at the tune's LOW notes and sheared the crown entirely
+/// at its high ones — which is exactly the air a glass bell is supposed to
+/// have, and exactly where the theme now spends most of its time.
+const KEY_BELL_ROOF: f32 = 5600.0;
+/// THE LIT ROOF — the roof a note that CATCHES THE LIGHT gets: an accent or a
+/// capital ([`KEY_AIR_HZ0`]'s section). Ghosts, cursor motion and the Jump
+/// cascade keep [`KEY_BELL_ROOF`] exactly.
+///
+/// This is the largest sparkle-per-decibel lever the voice has, and it adds no
+/// oscillator at all: the bell ALREADY generates the material above 5.6 kHz —
+/// the mallet strikes out of 5.2 kHz and the 4f crown reaches 6.3 kHz at the
+/// theme's top notes — and the shipped roof was throwing it away. Opening it
+/// does not synthesise brightness, it stops discarding it, which is why it buys
+/// centroid at a fraction of the peak a louder tink costs. Measured alone over
+/// the 60 s prose scenario it is worth +56 Hz of centroid and +79 Hz on the
+/// 20 cps burst, for 0.00 dB of pre-clip peak and 0.15 of a pitched onset per
+/// second — the cheapest line in the round.
+///
+/// AND IT IS WHY THE GHOSTS STAY MATTE. Two keystrokes in three keep the closed
+/// roof, so the accompaniment is now audibly DARKER than the tune rather than
+/// merely quieter and shorter — a timbral separation the level ladder alone
+/// could never make. The owner's "the tune's notes should catch the light, the
+/// accompaniment should not" is, here, literally a filter.
+///
+/// At 48 kHz this saturates `spawn`'s one-pole coefficient clamp
+/// (`lp_cut · τ / SR ≥ 1`, i.e. ≥ 7639 Hz), so a lit note's bell is UNROOFED
+/// and only the SVF-shaped mallet and the partials' own levels shape its top.
+/// The figure is not decorative: at 96 kHz and above it is a real 9 kHz pole,
+/// which is where a lit bell should stop.
+const KEY_BELL_ROOF_LIT: f32 = 9000.0;
+/// The bell's spawn trim — UNCHANGED at the shipped 0.30, and that is a
+/// measured decision, not an omission.
+///
+/// The obvious move was to pay for the sparkle here: with the theme in place an
+/// isolated degree-0 Typed measures −22.5 dBFS on the single-seed ladder stance
+/// instead of −21.0, and 0.34 puts it back. It was tried and REJECTED. The
+/// −1.5 dB is PHASE LUCK, not level: the theme calls `rnd()` zero times where
+/// the phrase generator drew four per boundary, so `spawn` takes different
+/// oscillator phases and three partials sum differently AT THAT ONE DEGREE —
+/// every other palette's row in `every_voice_lands_typed_on_the_ladder_floor`
+/// moved for the same reason without being touched. Compensating a one-degree
+/// phase artifact with a global trim raises every OTHER note, and the meters
+/// said exactly that: over the 60 s prose scenario 0.34 bought +6 Hz of
+/// spectral centroid (1994 → 2000) for +0.79 dB of RMS (−29.79 → −29.00).
+/// That is the palette's own TRIM LESSON, recorded above and re-learned here:
+/// fit on the right quantity and watch RMS while doing it.
+///
+/// At 0.30 the sparkle costs +1.05 dB of pre-clip peak and +0.67 dB of RMS
+/// against the pre-theme tree, and buys +338 Hz of centroid — prettier, not
+/// louder, inside one dB.
+const KEY_BELL_TRIM: f32 = 0.30;
+/// THE GLINT — a micro-chime one octave over the crown (8f), 18 ms behind the
+/// strike, twinkling as it dies.
+///
+/// ON THE ACCENTS ONLY, which is the whole design. The tune is one keystroke in
+/// three ([`SONG_PULSE`]); glinting every keystroke would add ten sparkles a
+/// second, which is a hiss, and would decorate the accompaniment as heavily as
+/// the melody. Glinting the accents makes the sparkle a property of THE TUNE —
+/// you hear the notes of the theme catch the light and the ghosts stay matte,
+/// which is more glitter and LESS density at the same time.
+///
+/// It is a delayed voice rather than a fourth partial for two reasons: the
+/// voice carries exactly three partials, and the DELAY is what stops the glint
+/// fusing into the bell — 18 ms is past the ~10 ms fusion window, so the ear
+/// hears a spark thrown off the strike instead of a brighter strike.
+/// Spawned SEEDED (fixed phases, no `rnd()` draws) so the melody's stream stays
+/// independent of the bar's accent pattern.
+const KEY_GLINT_RATIO: f32 = 8.0;
+const KEY_GLINT_DELAY_S: f32 = 0.018;
+/// THE GLINT'S LIFE, shortened 0.22/0.070 → 0.17/0.052 in the 2026-08-31 round
+/// and shortened FOR the round: with the layer up ~12 dB, the old tail spanned
+/// two keystrokes at prose cadence and three at flood, and overlapping glints
+/// stop being glints — they become a continuous shimmer BED filling the gaps
+/// the ear reads notes out of. Measured on the bench's own onset detector (a
+/// note announces itself by a RISE over the decay it lands on), shortening
+/// returned +0.09 onsets/s and +0.09 PITCHED onsets/s over the 60 s prose
+/// scenario. A small number, deliberately kept: it is the direction that
+/// matters, and 0.17 is still ~4 twinkle cycles of [`KEY_GLINT_TW_RATE`],
+/// which is all a spark needs.
+const KEY_GLINT_DUR_S: f32 = 0.17;
+const KEY_GLINT_DECAY_S: f32 = 0.052;
+const KEY_GLINT_TW_RATE: f32 = 24.0;
+const KEY_GLINT_TW_DEPTH: f32 = 0.55;
+/// The glint's level against the bell's own gain. At 4.2 kHz the ear is at its
+/// most sensitive, so a glint that MEASURES tiny still reads as plenty of
+/// glitter.
+///
+/// RAISED 0.034 → 0.140 for the 2026-08-31 sparkle round, and read together
+/// with [`KEY_GLINT_TWIN`]: the voice went from ONE partial to three at the
+/// same time. This is deliberately the largest single move in the round,
+/// because it is the only one whose decibels are spent ENTIRELY over 4 kHz: the
+/// strike is untouched, so the level it adds lands where the ear reads glitter
+/// and nowhere else. The meters agree — the isolated Typed probe's peak moved
+/// +0.27 dB for +284 Hz of centroid, and the 60 s prose mix's pre-clip peak did
+/// not move at all (see [`KEY_STAR_LEVEL`] for the whole round's staging).
+///
+/// FITTED AGAINST THE FLOOD, not against taste. The binding constraint is the
+/// bench's pitched-onset rate at 20 cps — "a burst may not turn into a hiss" —
+/// and the level was walked up until that rate started to fall. It does not:
+/// 0.095 → 0.140 costs the burst 0.00 pitched onsets/s (6.52 either way) and
+/// buys +112 Hz of prose centroid, which is why the round stops here rather
+/// than at the first figure that sounded like enough.
+const KEY_GLINT_LEVEL: f32 = 0.140;
+/// THE GLINT IS A CHIME NOW, not a sine — its two spare partials, spent.
+///
+/// The 2026-08-30 glint was a single 8f tone wearing an amplitude LFO, which
+/// is a tremolo, not glitter: one object, winking. Real glitter has INTERNAL
+/// motion, and this palette has already named the house device for it — the
+/// crown's detuned pair, whose beat IS the twinkle ([`KEY_TINK_TWIN`]). So the
+/// glint gets the same treatment an octave up: a twin at `8f · (1 + 0.008)`,
+/// beating at 4.2 Hz at C5 and 12.6 Hz at the theme's top note — under the
+/// 15-30 Hz roughness band at every degree, exactly as the crown's 0.010 at 4f
+/// is — plus a TOP at 12f, the fifth over the glint, which is what puts real
+/// energy in the 6.3-12.5 kHz air the ask calls for while staying TONAL.
+///
+/// TONAL IS THE WHOLE POINT, and it is a measured finding rather than a
+/// preference. The obvious build of "6-10 kHz air" is band-passed noise, and it
+/// was built, measured and REJECTED for the accents: at a level that moved the
+/// prose centroid by +88 Hz it cost the 20 cps burst 2.3 PITCHED ONSETS PER
+/// SECOND on the bench's tonality test (7.27 → 4.55 — a third of the tune's
+/// notes stopped being counted, and heard, as notes). Broadband energy raises
+/// the MEDIAN of the spectrum, which is the denominator of "is this a note",
+/// so noise-glitter turns a flood into exactly the hiss the governor exists to
+/// prevent. Partials raise the numerator instead. The noise air survives only
+/// where it cannot accumulate — on the star (see [`KEY_AIR_HZ0`]).
+const KEY_GLINT_TWIN: f32 = 0.30;
+const KEY_GLINT_DETUNE: f32 = 0.008;
+const KEY_GLINT_TOP: f32 = 0.30;
+const KEY_GLINT_TOP_RATIO: f32 = 12.0;
 /// The grace bend's glide time constant (seconds) — 3τ ≈ 12 ms, inside the
 /// mallet transient, so the bend reads as articulation, never as pitch.
 const KEY_BELL_BEND_TAU: f32 = 0.004;
+
+// ---------------------------------------------------------------------------
+// MORE SPARKLE — "sounds cute, needs some more sparkly noises" (owner,
+// 2026-08-31, on the theme + glint build)
+// ---------------------------------------------------------------------------
+//
+// The melody is APPROVED and is not touched here: same theme, same form, same
+// bass walk, same shift lift, same bell body. What follows is GLITTER ONLY, and
+// it deliberately does NOT repeat the previous round's move (raise the crown,
+// add level). That lever is the one this palette has twice proved is a volume
+// ride wearing a sparkle costume — see [`KEY_BELL_TRIM`]'s rejected 0.34 fit,
+// which bought +6 Hz of centroid for +0.79 dB of RMS. Five moves instead, each
+// on a DIFFERENT event and each in a band the arrangement leaves empty, so the
+// DENSITY stays where the owner already liked it while the light multiplies:
+//
+//   THE LIT CROWN (accents/caps)  the bell's roof opens on the notes the tune
+//                                 sang and stays shut on the ghosts — the
+//                                 brightness was already being generated and
+//                                 thrown away ([`KEY_BELL_ROOF_LIT`]).
+//   THE GLINT     (accents/caps)  the 8f spark becomes a three-partial CHIME
+//                                 with a beat-twinkle and a 12f top, up ~12 dB
+//                                 and entirely over 4 kHz ([`KEY_GLINT_TWIN`]).
+//   THE STAR      (phrase peaks)  a rare bright chime falling across the window
+//                                 when the tune reaches its top note — the
+//                                 house shooting-star idiom, ~1 per 17 keys.
+//   THE DUST      (phrase peaks)  the star's own 6-9 kHz air, the one place
+//                                 broadband glitter is affordable
+//                                 ([`KEY_AIR_HZ0`]).
+//   THE TWINKLE   (word gaps)     the downbeat's air gains a shimmering
+//                                 micro-chime four octaves up
+//                                 ([`SPACE_TWINKLE_RATIO`]).
+//
+// THE REGISTER MAP IS UNMOVED, which is why none of this can muddy a note: the
+// space bass owns 220-440, the ghosts 260-480, the melody ~520-950 and the
+// crown 2.1-6.3 k. Every layer here lives at or above 4.2 kHz — the glint at
+// 4.2-12.5 k, the star folded into [5, 10) k, the dust at 6-9 k, the space
+// twinkle at 4.2-6.3 k. Nothing added here can mask, beat against, or thicken
+// a note.
+//
+// AND THE GHOSTS STAY MATTE. Two keystrokes in three are accompaniment
+// ([`SONG_PULSE`]) and not one of them sparkles unless it is a CAPITAL, which
+// is authorship rather than accompaniment. The accompaniment is now audibly
+// DARKER than the tune as well as quieter and shorter, which is a distinction
+// the level ladder alone could not make.
+//
+// A 10 cps BURST STILL SPEAKS IN NOTES, and that was the round's binding
+// constraint rather than an afterthought: every layer above except the dust is
+// TONAL, and the dust fires ~0.2 times a second. The build that put band noise
+// on every accent was measured and thrown away — see [`KEY_GLINT_TWIN`] for the
+// 2.3-pitched-onsets-per-second it cost the 20 cps flood.
+
+/// THE DUST — the star's own halo: a very short band of 6-9 kHz noise settling
+/// downward, twinkling as it goes, thrown at the instant the crest note is
+/// struck so that the STAR (55 ms behind it) reads as the light the dust was
+/// kicked up by.
+///
+/// It is the one thing the re-voice never gave the bell — a real struck glass
+/// throws a wash of air off the contact that is not a partial of anything —
+/// and it is here, on 5 accents in 28, rather than on every accent, because
+/// that is the ONLY place it is affordable. On every accent the identical voice
+/// cost the 20 cps burst a third of its pitched onsets (the measurement is on
+/// [`KEY_GLINT_TWIN`]); at ~0.24 events per second it cannot accumulate into a
+/// floor at all, and what is left is exactly the ingredient the tonal layers
+/// cannot supply: the crest note, alone in the tune, sounds like something
+/// BROKE rather than rang.
+const KEY_AIR_HZ0: f32 = 9200.0;
+const KEY_AIR_HZ1: f32 = 6200.0;
+const KEY_AIR_GLIDE_S: f32 = 0.014;
+const KEY_AIR_Q: f32 = 3.0;
+const KEY_AIR_DUR_S: f32 = 0.070;
+const KEY_AIR_ATTACK_S: f32 = 0.0016;
+const KEY_AIR_DECAY_S: f32 = 0.022;
+/// The dust's own glitter: fast enough that its ~65 ms of life carries two full
+/// scintillations, so it SPARKLES rather than hisses.
+const KEY_AIR_TW_RATE: f32 = 34.0;
+const KEY_AIR_TW_DEPTH: f32 = 0.5;
+/// The dust's level against the bell's gain — a whisper, and fitted DOWN.
+///
+/// Band noise peaks far above a tonal voice at the same nominal level, and the
+/// meters caught it: at 0.60 the dust added +2.4 dB to the edit scenario's
+/// pre-clip peak and cost the 20 cps burst 0.76 pitched onsets per second, for
+/// +35 Hz of prose centroid. At 0.20 the edit scenario measures 0.75 dB
+/// QUIETER than the build the owner approved, the burst's pitched rate is
+/// unmoved, and the crest note still audibly breaks rather than rings. That is
+/// the whole argument for the level: the dust is a TEXTURE on a rare event, not
+/// a layer of the mix.
+const KEY_AIR_LEVEL: f32 = 0.20;
+
+/// THE CREST — the scale degree at or above which an accent is one of the
+/// theme's PEAK notes, and therefore earns a star.
+///
+/// [`SONG_THEME`] reaches 7 exactly once per phrase (the hook's sixth leap, the
+/// answer's opening, the bridge's early reach) and 8 exactly once in the whole
+/// tune (the half-cadence's climb, the highest note in the piece). So the star
+/// fires on 5 of 28 accents — one every ~17 keystrokes, ~2 s of prose at
+/// 10 cps: rare enough to stay an event, frequent enough to be a habit of the
+/// music rather than a curiosity.
+///
+/// DERIVED FROM THE TUNE, not from a die roll. The obvious build of "an
+/// occasional glint" is a probability per keystroke, and this palette has
+/// already ruled against exactly that shape once: the theme rewrite removed
+/// every `rnd()` draw from the melody so that two minutes of typing plays a
+/// piece instead of a wander. A random sparkle would be the one un-composed
+/// thing left in it. Landing the star on the phrase's own peak makes the
+/// glitter part of the FORM — you hear the tune reach its top note and the top
+/// note flash — which is the same rarity with a reason behind it.
+///
+/// Read off [`TrailSynth::walk`] minus the tone's [`melody_lean`], so the crest
+/// is the THEME's degree and every tone's transposed line flashes on the same
+/// notes of the same tune.
+const KEY_CREST_DEGREE: i32 = 7;
+/// THE STAR's pitch: the note's twelfth (an octave + a fifth — pitch class of
+/// the 3rd harmonic, so it cannot beat against anything the bell is doing),
+/// octave-folded into [`KEY_STAR_LO_HZ`]'s band. The fold is what makes it a
+/// STAR and not "a very high note": a bare ratio would put the crest degrees'
+/// twelfths at 3.9-4.7 kHz and a capital's at 9.4 kHz, so the ornament would
+/// wander with the melody it decorates. Folded, every star lands in one fixed
+/// band of the spectrum — the ear hears the SAME light each time, thrown by a
+/// different note.
+const KEY_STAR_RATIO: f32 = 3.0;
+const KEY_STAR_LO_HZ: f32 = 5000.0;
+/// Well past the glint's 18 ms: the star is not part of the strike at all, it
+/// is what the strike THREW, and 55 ms is long enough that the ear places it as
+/// a separate event in a separate place.
+const KEY_STAR_DELAY_S: f32 = 0.055;
+const KEY_STAR_DUR_S: f32 = 0.38;
+const KEY_STAR_ATTACK_S: f32 = 0.0015;
+const KEY_STAR_DECAY_S: f32 = 0.115;
+/// THE ARC. The star enters a whole tone sharp and settles over ~3τ ≈ 165 ms —
+/// DOWNWARD, which is the one direction this palette's squeak post-mortem
+/// exonerates (the condemned artifact was a rising glide on a dense midrange
+/// tone; this is a falling one at 5-10 kHz at ~25 dB under the strike, which is
+/// the twinkle archetype rather than the squeak archetype).
+const KEY_STAR_FALL: f32 = 1.06;
+const KEY_STAR_GLIDE_S: f32 = 0.055;
+/// Slow, deep glitter — ~1.5 scintillations across the star's audible life, so
+/// it reads as ONE light winking rather than a tremolo.
+const KEY_STAR_TW_RATE: f32 = 12.0;
+const KEY_STAR_TW_DEPTH: f32 = 0.7;
+/// The star's pan against the caret's: thrown wide to the far side, further
+/// than the glint's half-throw, so the rare event is also the WIDEST one —
+/// which is how a listener tells "something new happened" from "that note was
+/// brighter" without any level to spare.
+const KEY_STAR_PAN: f32 = -0.85;
+/// The star's level against the bell's gain — and the fit for [`KEY_AIR_LEVEL`]
+/// beside it.
+///
+/// FITTED ON THE METER over the 60 s prose scenario and the isolated Typed
+/// probe, because the whole budget for this round is "prettier, not louder"
+/// and the previous round spent ~1 dB of it on +338 Hz of centroid.
+///
+/// THE WHOLE ROUND, MEASURED (`keyboard_song_ab`, volume 1.0, base = the build
+/// the owner called cute; peak is PRE-CLIP, so it is the level the mix asked
+/// for rather than what the saturator let through):
+///
+///   scenario   peak dB          RMS dB            centroid Hz
+///   prose      -8.91 → -8.91    -29.77 → -29.51   2007 → 2265   (+258)
+///   edit      -12.63 → -13.38   -33.74 → -33.52   2810 → 3072   (+262)
+///   space     -11.23 → -10.85   -31.15 → -30.99   2000 → 2199   (+199)
+///   shift     -10.89 → -11.22   -31.16 → -30.60   2382 → 2730   (+348)
+///   burst     -12.76 → -12.41   -29.42 → -29.08   1701 → 2105   (+404)
+///
+/// i.e. the round's worst peak move in any scenario is +0.38 dB and its worst
+/// RMS move is +0.56 dB, for three quarters of the previous round's brightness
+/// gain — and the previous round bought its +338 Hz for +1.05 dB of peak. Voice
+/// steals stay at zero and the live-voice high-water mark does not rise.
+/// Every gesture the round does not touch — the erase poof, the word kill, the
+/// lift, the kill swoosh, the landing, the Jump cascade — renders to the
+/// IDENTICAL isolated figures it did before, which is the check that the
+/// glitter went where it was aimed.
+const KEY_STAR_LEVEL: f32 = 0.11;
+
+/// OCTAVE-FOLD an ornament's pitch into the one SPARKLE BAND
+/// `[KEY_STAR_LO_HZ, 2 × KEY_STAR_LO_HZ)`. Same construction, and the same
+/// reason, as [`bass_octave`]: halving and doubling are exact in binary
+/// floating point and preserve PITCH CLASS exactly, so a folded twelfth is
+/// still a twelfth of the note that threw it — consonant by construction —
+/// while every star in every tone and every octave sounds in one register.
+/// Total: the clamp bounds the input, so the loops run at most a few times and
+/// cannot spin on a zero, an infinity or a NaN-free extreme.
+fn sparkle_octave(f: f32) -> f32 {
+    let mut f = f.clamp(20.0, 20_000.0);
+    while f >= KEY_STAR_LO_HZ * 2.0 {
+        f *= 0.5;
+    }
+    while f < KEY_STAR_LO_HZ {
+        f *= 2.0;
+    }
+    f
+}
 
 /// RAINBOW KITTY — the glass-bell ribbon: tiny struck bells walking the
 /// pentatonic — mallet click, sine body with an icy FM glint, twin detuned
@@ -4959,6 +5857,20 @@ impl Palette for RainbowKittyPalette {
         // The GRACE bend: enter a third of the family bend out, settle onto
         // the note in ~12 ms — under the mallet, over before the ring.
         let f0 = b1 + (b0 - b1) * KEY_BELL_BEND_SHARE;
+        // WHO CATCHES THE LIGHT. A keystroke sparkles when the TUNE sang it (an
+        // accent) or when the TYPIST leaned on it (a capital) — never because a
+        // ghost happened to come round. See the MORE SPARKLE section above.
+        let typed = matches!(kind, SoundKind::Typed);
+        let sings = s.song_accent && typed;
+        let capital = ev.shifted && typed;
+        let lit = sings || capital;
+        // THE LIT CROWN — the roof opens for the notes that catch the light and
+        // stays shut for the ones that don't (see [`KEY_BELL_ROOF_LIT`]).
+        let roof = if lit {
+            KEY_BELL_ROOF_LIT
+        } else {
+            KEY_BELL_ROOF
+        };
         let mk = |f0: f32, f1: f32, delay: f32| Voice {
             delay,
             dur: 0.30,
@@ -4983,14 +5895,14 @@ impl Palette for RainbowKittyPalette {
                 // 4f tink at 0.010·f (5.2 Hz at C5, 13.1 Hz at degree 7), the
                 // twinkle itself, organically pitch-dependent.
                 Partial {
-                    lvl: 0.18,
+                    lvl: KEY_TINK_TWIN,
                     f0: f1 * 4.010,
                     f1: f1 * 4.010,
                     ..Partial::default()
                 },
                 // THE TINK — pure double-octave glass, fixed pitch.
                 Partial {
-                    lvl: 0.30,
+                    lvl: KEY_TINK,
                     f0: f1 * 4.0,
                     f1: f1 * 4.0,
                     ..Partial::default()
@@ -5003,10 +5915,138 @@ impl Palette for RainbowKittyPalette {
             n_f1: 180.0,
             n_glide: 0.006,
             n_q: 0.7,
-            lp_cut: 4200.0,
+            lp_cut: roof,
             ..Voice::default()
         };
-        s.spawn(mk(f0, f, 0.0), g * 0.30, ev.pan);
+        s.spawn(mk(f0, f, 0.0), g * KEY_BELL_TRIM, ev.pan);
+        // THE GLINT — sparkle, on the ACCENTS (owner ask, 2026-08-30: "I want
+        // it be a bit more sparkly"). See [`KEY_GLINT_LEVEL`] for why it rides
+        // the tune's notes only and why it is a delayed voice rather than more
+        // level on the tinks.
+        //
+        // …AND ON THE CAPITALS (owner ask, 2026-08-31: "needs some more sparkly
+        // noises"). A shifted glyph already sings an octave up
+        // ([`SHIFT_GLYPH_LIFT`]), so glinting it costs nothing musically — and
+        // at HALF THE RATIO, which is not a second decision but the same one:
+        // the lift is exactly one octave on a five-degree lattice, so 4f of the
+        // capital is the identical frequency as 8f of the plain letter. The
+        // sparkle stays in ONE band while the note moves, instead of the
+        // capital's ornament climbing to 8-25 kHz where there is no glitter to
+        // hear. A capital that lands on a ghost slot glints too, at the ghost's
+        // own -5.2 dB: emphasis is authorship, and it is the one thing in a
+        // line of prose the typist chose.
+        if sings || capital {
+            let gf = f * if capital {
+                KEY_GLINT_RATIO * 0.5
+            } else {
+                KEY_GLINT_RATIO
+            };
+            s.spawn_seeded(
+                Voice {
+                    delay: KEY_GLINT_DELAY_S,
+                    dur: KEY_GLINT_DUR_S,
+                    attack: 0.0012,
+                    decay: KEY_GLINT_DECAY_S,
+                    p: [
+                        Partial {
+                            lvl: 0.5,
+                            f0: gf,
+                            f1: gf,
+                            ..Partial::default()
+                        },
+                        // THE BEAT-TWINKLE — the crown's detuned-pair device an
+                        // octave up (see [`KEY_GLINT_TWIN`]).
+                        Partial {
+                            lvl: KEY_GLINT_TWIN,
+                            f0: gf * (1.0 + KEY_GLINT_DETUNE),
+                            f1: gf * (1.0 + KEY_GLINT_DETUNE),
+                            ..Partial::default()
+                        },
+                        // THE TOP — the fifth over the glint, 6.3-12.5 kHz: the
+                        // air layer, tonal.
+                        Partial {
+                            lvl: KEY_GLINT_TOP,
+                            f0: gf * (KEY_GLINT_TOP_RATIO / KEY_GLINT_RATIO),
+                            f1: gf * (KEY_GLINT_TOP_RATIO / KEY_GLINT_RATIO),
+                            ..Partial::default()
+                        },
+                    ],
+                    // The glitter itself: a fast amplitude twinkle, so the
+                    // glint SHIMMERS across its tail instead of just ringing.
+                    tw_rate: KEY_GLINT_TW_RATE,
+                    tw_depth: KEY_GLINT_TW_DEPTH,
+                    lp_cut: 12_000.0,
+                    ..Voice::default()
+                },
+                g * KEY_GLINT_LEVEL,
+                // Opposite the caret, at half throw: the glint lands ACROSS the
+                // bell it decorates, which is what makes the pair read as one
+                // wide sparkle rather than two notes in one ear.
+                -ev.pan * 0.5,
+                0.0,
+                [0.0; 3],
+            );
+        }
+        // THE STAR — the phrase's PEAK note flashes (see [`KEY_CREST_DEGREE`]),
+        // and THE DUST goes up with the strike that threw it
+        // ([`KEY_AIR_HZ0`]). Rare, bright, wide and falling: the one gesture in
+        // the typing vocabulary you are meant to NOTICE.
+        if typed && s.song_crest() {
+            // The dust is seeded like every other noise-only layer: a voice
+            // with no tonal partial has no phase to hear, and consuming no
+            // `rnd()` draws keeps the bell's own seeded stream independent of
+            // where in the theme the playhead happens to be.
+            s.spawn_seeded(
+                Voice {
+                    dur: KEY_AIR_DUR_S,
+                    attack: KEY_AIR_ATTACK_S,
+                    decay: KEY_AIR_DECAY_S,
+                    n_lvl: 0.6,
+                    n_f0: KEY_AIR_HZ0,
+                    n_f1: KEY_AIR_HZ1,
+                    n_glide: KEY_AIR_GLIDE_S,
+                    n_q: KEY_AIR_Q,
+                    tw_rate: KEY_AIR_TW_RATE,
+                    tw_depth: KEY_AIR_TW_DEPTH,
+                    // Above `spawn`'s one-pole clamp: the SVF band IS the
+                    // shape here, and a second filter would only dull it.
+                    lp_cut: 12_000.0,
+                    ..Voice::default()
+                },
+                g * KEY_AIR_LEVEL,
+                ev.pan,
+                0.0,
+                [0.0; 3],
+            );
+            let sf = sparkle_octave(f * KEY_STAR_RATIO);
+            s.spawn_seeded(
+                Voice {
+                    delay: KEY_STAR_DELAY_S,
+                    dur: KEY_STAR_DUR_S,
+                    attack: KEY_STAR_ATTACK_S,
+                    decay: KEY_STAR_DECAY_S,
+                    p: [
+                        Partial {
+                            lvl: 0.5,
+                            f0: sf * KEY_STAR_FALL,
+                            f1: sf,
+                            glide: KEY_STAR_GLIDE_S,
+                            ..Partial::default()
+                        },
+                        Partial::default(),
+                        Partial::default(),
+                    ],
+                    tw_rate: KEY_STAR_TW_RATE,
+                    tw_depth: KEY_STAR_TW_DEPTH,
+                    lp_cut: 12_000.0,
+                    ..Voice::default()
+                },
+                g * KEY_STAR_LEVEL,
+                ev.pan * KEY_STAR_PAN,
+                0.0,
+                [0.0; 3],
+            );
+        }
         if kind == SoundKind::Jump {
             // 1-3-5-8 run, 45 ms apart — the rainbow leaps, now a cascade of
             // ringing bells. Each note of the run sings onto its own degree
@@ -5262,7 +6302,12 @@ impl Palette for FirePalette {
             }
             // The ember: a short woody knock under the snap that only
             // really speaks when typing is hot — the log settling.
-            let fe = s.rnd_in(85.0, 125.0);
+            //
+            // The one pitched thing this palette has, so it is where the
+            // CAPITAL'S LIFT lands here ([`shift_ratio`]): Fire has no lattice
+            // degree to add an octave to, but it does have a note, and a
+            // shifted glyph must sound higher in every style.
+            let fe = s.rnd_in(85.0, 125.0) * shift_ratio(ev, kind);
             let v3 = Voice {
                 dur: 0.09,
                 attack: 0.002,
@@ -5365,7 +6410,15 @@ impl Palette for LaserPalette {
         // FULL STRIKE: crack, zap, sub-thump landing, then THUNDER — a long
         // low roll that sweeps down and echoes once. The archetype is kept
         // soft; thunder rumbles, it never booms.
-        let f_hi = s.melody_hz(880.0, deg.min(5));
+        // THE CEILING SHAPES THE TUNE, NOT THE CAPITAL. `deg.min(5)` bounds
+        // how high the MELODY may climb before the dive; a shifted glyph's
+        // octave ([`shift_lift`]) is a voicing on top of that, so it is peeled
+        // off before the clamp and added back after. Applied through the clamp
+        // it would be eaten whenever the tune was already near the ceiling —
+        // measured: a plain degree 1 lifted to 6 clamped back to 5, so the
+        // capital sang a sixth up instead of an octave.
+        let lift = shift_lift(ev, kind);
+        let f_hi = s.melody_hz(880.0, (deg - lift).min(5) + lift);
         let f_lo = f_hi * 0.25;
         let (a, b) = if kind == SoundKind::Backspace {
             (f_lo, f_hi)
@@ -5569,7 +6622,12 @@ impl Palette for BeamPalette {
         // (a gentle un-press). Jump = ENGAGE: press, a slow rising two-tone
         // confirm, and a distant engine surge from below decks. Everything
         // at a whisper — the standing law: never annoying.
-        let f = s.melody_hz(330.0, (deg / 2) * 2); // even degrees: stabler line
+        // Even degrees: a stabler line. The QUANTISER shapes the tune, not the
+        // capital — [`SHIFT_GLYPH_LIFT`] is an ODD five degrees, so lifting
+        // through the round-to-even would flip the parity and turn the
+        // capital's octave into a sixth. Peel it off, quantise, add it back.
+        let lift = shift_lift(ev, kind);
+        let f = s.melody_hz(330.0, ((deg - lift) / 2) * 2 + lift);
         // The button seating: felt more than heard.
         let thud = Voice {
             dur: 0.035,
@@ -7070,6 +8128,8 @@ mod tests {
             // need it fed; the bed-off proofs build their own `bed: false`
             // events.
             bed: true,
+            // Unshifted: the identity. The capital's lift has its own proof.
+            shifted: false,
         }
     }
 
@@ -7086,6 +8146,7 @@ mod tests {
             // Structurally irrelevant on a Words gesture: a bonk never
             // reaches the bed feed.
             bed: true,
+            shifted: false,
         }
     }
 
@@ -7610,13 +8671,29 @@ mod tests {
     /// The nine style palettes are PINNED AT THEIR MEASURED VALUES, which is
     /// a REPORTED FINDING, not a retune: `palette_trim`'s doc claims each of
     /// them lands on −21.0 (fitted as a 24-seed mean, an earlier ladder
-    /// pass), but on this single-seed stance only rainbow kitty (re-fitted
-    /// 2026-08-16), water, phaser and beam sit within half a dB of it —
-    /// lumen (−19.3), comet (−18.4), fire (−18.7), laser (−19.2) read hot
-    /// and sparkle (−23.1) cold. Those palettes are byte-pinned by the
-    /// `v056_reference` oracle; their trims are shared with it and were not
-    /// moved here (the picker exposes them, it does not re-voice them). This
-    /// pin makes any future drift a stated event.
+    /// pass), and this is the single-seed stance, where PHASE LUCK is worth
+    /// a dB or two per voice.
+    ///
+    /// RE-MEASURED 2026-08-31 with the THEME. Every row except rainbow kitty's
+    /// moved, and none of them was re-voiced: the theme calls `rnd()` ZERO
+    /// times where the old phrase generator drew 1 + 3 per phrase boundary, so
+    /// the seeded stream `spawn` takes its oscillator phases from is offset,
+    /// and a multi-partial voice's PEAK is a phase sum. The direction is worth
+    /// stating — the table got TIGHTER, not looser: the spread around the
+    /// −21.0 floor was 4.7 dB (−18.41 comet to −23.10 sparkle) and is now
+    /// 2.1 dB (−19.81 to −21.95), with fire's +2.3 dB and sparkle's −2.1 dB
+    /// outliers both pulled in. Nothing was tuned to achieve that; it is what
+    /// removing the randomness happened to do.
+    ///
+    /// Rainbow kitty moved too, by −1.5 dB, and it was DELIBERATELY NOT
+    /// re-fitted back: see [`KEY_BELL_TRIM`] for the measurement that rejected
+    /// the obvious 0.30 → 0.34 compensation (it bought +6 Hz of centroid for
+    /// +0.79 dB of RMS across the whole prose scenario — a global level ride
+    /// paying off a one-degree phase artifact). The DELIVERED loudness did not
+    /// follow this row down: over the same 60 s of prose the mix's pre-clip
+    /// peak went −9.96 → −8.91 dBFS and its RMS −30.84 → −29.79, both slightly
+    /// UP. This stance measures one note of one voice; it is a drift detector,
+    /// not the mix.
     #[test]
     fn every_voice_lands_typed_on_the_ladder_floor() {
         fn peak_db(voice: SoundVoice) -> f32 {
@@ -7631,35 +8708,42 @@ mod tests {
         }
         // (voice, expected peak dBFS)
         let table: [(SoundVoice, f32); 14] = [
-            (SoundVoice::Style, -21.0), // rides the RainbowKitty look here
-            (SoundVoice::Of(GlowStyle::RainbowKitty), -21.0),
-            (SoundVoice::Of(GlowStyle::Lumen), -19.34),
-            (SoundVoice::Of(GlowStyle::Sparkle), -23.10),
-            (SoundVoice::Of(GlowStyle::Comet), -18.41),
+            (SoundVoice::Style, -22.50), // rides the RainbowKitty look here
+            (SoundVoice::Of(GlowStyle::RainbowKitty), -22.50),
+            (SoundVoice::Of(GlowStyle::Lumen), -21.04),
+            (SoundVoice::Of(GlowStyle::Sparkle), -20.27),
+            (SoundVoice::Of(GlowStyle::Comet), -19.81),
             (SoundVoice::Of(GlowStyle::Water), -21.10),
             (SoundVoice::Of(GlowStyle::Phaser), -20.96),
-            (SoundVoice::Of(GlowStyle::Laser), -19.20),
-            (SoundVoice::Of(GlowStyle::Beam), -20.46),
-            (SoundVoice::Of(GlowStyle::Fire), -18.73),
+            (SoundVoice::Of(GlowStyle::Laser), -20.17),
+            (SoundVoice::Of(GlowStyle::Beam), -21.23),
+            (SoundVoice::Of(GlowStyle::Fire), -21.79),
             (SoundVoice::Mech, -21.34),
-            (SoundVoice::Typewriter, -21.0),
+            (SoundVoice::Typewriter, -21.95),
             (SoundVoice::Marimba, -21.0),
-            (SoundVoice::Felt, -21.0),
+            (SoundVoice::Felt, -21.62),
         ];
         assert_eq!(
             table.len(),
             SoundVoice::ALL.len(),
             "every voice is measured"
         );
+        // EVERY ROW, then one verdict. A pin that panics on the first
+        // deviation hides the rest, and this table moves as a BLOCK whenever
+        // the seeded phase stream shifts (see the doc above) — reading it one
+        // row per run costs a full re-measure per row.
+        let mut bad = String::new();
         for (voice, expect) in table {
             assert!(SoundVoice::ALL.contains(&voice));
             let got = peak_db(voice);
-            assert!(
-                (got - expect).abs() <= 0.5,
-                "{voice:?} ({}): Typed peaks at {got:.2} dBFS, expected {expect:.2} ± 0.5",
-                voice.name()
-            );
+            if (got - expect).abs() > 0.5 {
+                bad.push_str(&format!(
+                    "\n  {:<28} got {got:>7.2} dBFS, pinned {expect:>7.2}",
+                    format!("{voice:?} ({})", voice.name())
+                ));
+            }
         }
+        assert!(bad.is_empty(), "the ladder moved:{bad}");
     }
 
     /// EVERY PITCHED INSTRUMENT LANDS ITS KEYSTROKE ON THE MELODY NOTE in its
@@ -8680,6 +9764,7 @@ mod tests {
             gain: 0.4,
             tone: Tone::Technical,
             bed: false,
+            shifted: false,
         }
     }
 
@@ -9767,80 +10852,147 @@ mod tests {
         assert_eq!(s.song_pulse, 1, "…from the top of the bar");
     }
 
-    // -- phrase-aware melody proofs (structural, not byte) ------------------
+    // -- theme proofs (structural, not byte) --------------------------------
 
-    /// A MOTIF RECURS: the phrase generator replays a 4-note CELL to fill the
-    /// phrase, so the same delta shape returns — the thing a memoryless walk
-    /// (one state integer, note n+1 depends only on note n) can NEVER do. With
-    /// a length-8 phrase and a forced motif, the cell at note positions 1-3
-    /// reappears verbatim at positions 5-7 (the second pass), proving the
-    /// melody is built from a reusable motif rather than per-note randomness.
+    /// THE TUNE IS PLAYED, IN ORDER. Sustained typing walks [`SONG_THEME`] from
+    /// its first note to its last and then back onto the hook — the property a
+    /// generator can never have, and the whole of the owner's "some consistent
+    /// musical theme you have in mind when i'm typing".
+    ///
+    /// Sampled at the ACCENTS, because that is where the melody lives: a
+    /// keystroke on a GHOST slot accompanies the current note rather than
+    /// stepping to a new one (see [`SONG_PULSE`]), so sampling per keystroke
+    /// would read the bar's rhythm as the tune stuttering.
     #[test]
-    fn a_motif_recurs_across_the_phrase() {
+    fn the_theme_is_played_in_order_and_loops() {
         let mut s = TrailSynth::new(48_000.0, 0x0DDB_A11E);
-        // Force a known mid-phrase state (a length-8 phrase, a fixed cell), so
-        // the note positions are predictable. Reads/writes of private fields
-        // are fair game — the tests live in the module.
         s.tone = Tone::Technical;
-        s.motif = [1, -1, 2, 0];
-        s.phrase_len = 8;
-        s.phrase_pos = 0;
-        s.phrase_parity = false;
-        s.phrase_step = 0;
-        s.phrase_home = 0;
-        s.walk = 0;
-        let mut deltas = [0i32; 8];
-        for d in &mut deltas {
+        let mut sung = Vec::new();
+        // Two full passes plus a note, so the LOOP is proved and not just the
+        // first statement.
+        while sung.len() < SONG_THEME.len() * 2 + 1 {
+            let before = s.song_notes;
             // Keep every note ADMITTED (force the gap open) and IN-PHRASE (no
-            // pause, no Jump), so advance_melody takes the motif-step branch.
-            // Keystrokes that land on a GHOST slot of the bar do not step the
-            // generator at all, so keep pushing until the melody SINGS: what
-            // this proves is a property of the phrase generator, and the bar
-            // only decides how often it is asked (see `SONG_PULSE`).
-            let sung = s.song_notes;
-            let before = s.phrase_step;
-            while s.song_notes == sung {
-                s.since_voice = 1.0;
-                s.since_event = 0.0;
-                s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+            // pause, no Jump), so the playhead advances one note at a time.
+            s.since_voice = 1.0;
+            s.since_event = 0.0;
+            s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+            if s.song_notes != before {
+                sung.push(s.walk as i8);
             }
-            *d = s.phrase_step - before;
         }
         assert_eq!(
-            &deltas[1..4],
-            &deltas[5..8],
-            "the motif cell must recur across the phrase (positions 1-3 == 5-7): {deltas:?}"
+            &sung[..SONG_THEME.len()],
+            &SONG_THEME[..],
+            "the first pass must be the theme, note for note"
         );
-        // And the cell is the FORCED motif (not fresh randomness per note).
         assert_eq!(
-            &deltas[1..4],
-            &[-1, 2, 0],
-            "the recurring cell is the motif"
+            &sung[SONG_THEME.len()..SONG_THEME.len() * 2],
+            &SONG_THEME[..],
+            "…and the second pass is the same tune again, in phase"
+        );
+        assert_eq!(
+            sung[SONG_THEME.len() * 2],
+            SONG_THEME[0],
+            "the loop falls back onto the hook"
         );
     }
 
-    /// A PHRASE RESOLVES: Enter (a Jump), like a comma-length typing pause,
-    /// CADENCES the melody onto the tonic — degree 0 or its octave 5, the
-    /// pentatonic root pitch class. This is what makes phrases LAND instead of
-    /// drifting off the top of the register forever: the walk wanders during
-    /// the phrase, then the Enter snaps it home.
+    /// A PAUSE CLOSES A PHRASE AND THE NEXT ONE ANSWERS. Enter and a
+    /// comma-length gap both cadence the melody onto the phrase's OWN final
+    /// degree — the note the theme was heading for — and then hand the playhead
+    /// to the NEXT phrase of the form, never back to zero. That is what makes
+    /// thinking between sentences advance the piece instead of rewinding it.
     #[test]
-    fn a_phrase_resolves_toward_the_tonic_on_enter() {
+    fn a_rest_cadences_the_phrase_and_opens_the_next() {
         let mut s = TrailSynth::new(48_000.0, 0xCADE_5EED);
         let mut buf = [0.0f32; 256];
-        // Type a handful of notes so the walk climbs off the tonic.
-        for _ in 0..5 {
-            s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
-            for _ in 0..2 {
-                s.render(&mut buf); // ~5 ms: well under the phrase-pause gap
+        let accent = |s: &mut TrailSynth, kind: SoundKind| {
+            let before = s.song_notes;
+            while s.song_notes == before {
+                s.since_voice = 1.0;
+                s.since_event = 0.0;
+                s.push(ev(GlowStyle::Lumen, kind));
             }
+        };
+        // Three notes into the HOOK (phrase A, degrees 0 2 4 …).
+        for _ in 0..3 {
+            accent(&mut s, SoundKind::Typed);
         }
-        // Now an Enter — the cadence must land the melody on a tonic degree.
+        assert_eq!(s.walk, 4, "fixture: three notes into the hook");
+        assert_eq!(s.phrase_idx, 0, "…still inside phrase A");
+        // Now an Enter. It must land on A's LAST degree (7, the hook's leap),
+        // not on a generic tonic.
         s.push(ev(GlowStyle::Lumen, SoundKind::Jump));
-        assert!(
-            s.walk == 0 || s.walk == 5,
-            "Enter must cadence the melody onto a tonic (degree 0 or 5), got {}",
+        assert_eq!(
+            i32::from(SONG_THEME[usize::from(SONG_FORM[1]) - 1]),
+            s.walk,
+            "a rest cadences onto the phrase's own last note, got {}",
             s.walk
+        );
+        assert_eq!(s.phrase_idx, 1, "…and opens the ANSWER, not the hook again");
+        // And the next note is the answer's FIRST degree — the form moved on.
+        s.render(&mut buf);
+        accent(&mut s, SoundKind::Typed);
+        assert_eq!(
+            s.walk,
+            i32::from(SONG_THEME[usize::from(SONG_FORM[1])]),
+            "the phrase after a rest continues the form"
+        );
+        // A PAUSE does the same thing as an Enter (the ~0.6 s comma).
+        let mut p = TrailSynth::new(48_000.0, 0x9A11_5EED);
+        for _ in 0..3 {
+            accent(&mut p, SoundKind::Typed);
+        }
+        p.since_event = PHRASE_PAUSE_S + 0.1;
+        p.since_voice = 1.0;
+        p.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+        assert_eq!(
+            p.walk,
+            i32::from(SONG_THEME[usize::from(SONG_FORM[1]) - 1]),
+            "a comma-length gap cadences exactly as an Enter does"
+        );
+        assert_eq!(p.phrase_idx, 1, "…and advances the form too");
+    }
+
+    /// A REST AT A PHRASE MARK CANNOT SKIP A PHRASE. The cadence arm fires only
+    /// once a phrase has actually BEGUN (`pos > start`); without that guard a
+    /// rest landing on a phrase's first note would burn the whole phrase, and a
+    /// slow typist who thinks between every word would hear nothing but
+    /// cadences — the form racing past four phrases per typed note and the hook
+    /// never sounding at all.
+    #[test]
+    fn a_rest_before_a_phrase_starts_cannot_skip_it() {
+        let mut s = TrailSynth::new(48_000.0, 0x5C1D_0001);
+        // A brand-new synth is parked at the hook's first note, and `new` opens
+        // with `since_event = 1.0` — a full rest by the phrase-pause rule. The
+        // first keystroke of a session must still be the hook's FIRST degree.
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+        assert_eq!(
+            s.walk,
+            i32::from(SONG_THEME[0]),
+            "a session opens on the theme's first note"
+        );
+        assert_eq!(s.phrase_idx, 0, "…inside the first phrase, not past it");
+        // ONE rest closes the hook and opens the answer.
+        s.since_event = PHRASE_PAUSE_S + 0.1;
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+        assert_eq!(s.phrase_idx, 1, "one rest, one phrase");
+        // A SECOND rest, immediately, with the answer not yet begun: it must
+        // PLAY the answer's first note rather than cadence past the phrase.
+        s.since_event = PHRASE_PAUSE_S + 0.1;
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
+        assert_eq!(
+            s.phrase_idx, 1,
+            "a rest with nothing played cannot burn a phrase"
+        );
+        assert_eq!(
+            s.walk,
+            i32::from(SONG_THEME[usize::from(SONG_FORM[1])]),
+            "…it plays the phrase's first note instead"
         );
     }
 
@@ -9913,19 +11065,17 @@ mod tests {
         }
     }
 
-    /// THE CONTOUR ARC AND THE MOTIF ARE ORTHOGONAL — the property the whole
-    /// fix rests on. The motif walks in steps of [`melody_span`]; the arc moves
-    /// in ONE jump of [`ARC_LIFT`]. If a single arc move can equal a single
-    /// motif step the two cancel and the note repeats, which is exactly what
-    /// `round(2·sin)` (an arc that climbed ±1 at a time) did to every mood.
+    /// THE REGISTER NEVER EDITS THE TUNE. Every tone's [`tone_register`] must
+    /// hold the whole of [`SONG_THEME`] shifted by that tone's
+    /// [`melody_lean`], so the fold in `advance_melody` is exactly the identity
+    /// and the theme a listener hears is the theme that was composed.
     ///
-    /// PLAYFUL is the deliberate exception: skipping as wide as the arc IS its
-    /// character (`melody_span` 2, the whimsy knob), so for that one mood a
-    /// cancellation is possible on the ~3 of 7 transitions where the arc moves.
-    /// It is held instead by the empirical bound in
-    /// `the_typed_line_moves_more_than_it_repeats`, which covers every tone.
+    /// This is a real hazard, not a formality: the shipped Technical ceiling was
+    /// 7, and `fold_register(8, 0, 7) == 6` — under it the half-cadence's climb
+    /// 5 → 7 → 8 would have played 5 → 7 → 6, a DIP where the piece's highest
+    /// note belongs, and A'' would have stopped being a half-cadence at all.
     #[test]
-    fn the_contour_arc_cannot_cancel_a_motif_step() {
+    fn the_theme_never_folds_in_any_tone() {
         for tone in [
             Tone::Technical,
             Tone::Calm,
@@ -9933,26 +11083,246 @@ mod tests {
             Tone::Frustrated,
             Tone::Playful,
         ] {
-            if tone == Tone::Playful {
-                assert_eq!(melody_span(tone), ARC_LIFT, "the documented exception");
-                continue;
+            let (lo, hi) = tone_register(tone);
+            let lean = melody_lean(tone);
+            for (i, &deg) in SONG_THEME.iter().enumerate() {
+                let want = i32::from(deg) + lean;
+                assert_eq!(
+                    fold_register(want, lo, hi),
+                    want,
+                    "{tone:?}: theme note {i} (degree {deg} + lean {lean}) folds out of \
+                     {lo}..{hi} — the register is rewriting the melody"
+                );
             }
+        }
+    }
+
+    /// THE FORM IS WELL-FORMED: the phrase index covers the theme exactly, with
+    /// no gap and no overlap, and every phrase has at least one note. Cheap, and
+    /// it is the invariant that makes `open_next_phrase`'s modular step total.
+    #[test]
+    fn the_song_form_partitions_the_theme() {
+        assert_eq!(usize::from(SONG_FORM[0]), 0, "the form opens at note 0");
+        assert_eq!(
+            usize::from(SONG_FORM[SONG_FORM.len() - 1]),
+            SONG_THEME.len(),
+            "the form's sentinel is the theme's length"
+        );
+        for w in SONG_FORM.windows(2) {
             assert!(
-                ARC_LIFT > melody_span(tone),
-                "{tone:?}: an arc lift of {ARC_LIFT} is reachable by one motif step of \
-                 {} — the two can cancel into a unison",
-                melody_span(tone)
+                w[1] > w[0],
+                "a phrase must contain at least one note: {w:?}"
             );
         }
-        // And the arc really is a single move, not a climb: over any phrase
-        // length it takes exactly two values, 0 and ARC_LIFT.
-        for len in PHRASE_MIN..=PHRASE_MAX {
-            for pos in 0..len {
-                let frac = f32::from(pos) / f32::from(len);
-                let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
+        // A A' B A'' — four phrases, 8 + 8 + 6 + 6.
+        let lens: Vec<u8> = SONG_FORM.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(lens, vec![8, 8, 6, 6], "the authored form");
+    }
+
+    /// THE BASS WALKS the theme's harmony, one root per WORD, and cannot leave
+    /// the register the owner can actually hear.
+    ///
+    /// Both halves are measured claims. The ROOTS are [`CELEBRATION_BASS`]
+    /// bars 0..3 — the same four pitch classes — so the spaces spell the
+    /// verse's own chord progression under the letters. The REGISTER is
+    /// [220, 440): the shipped downbeat lived in [110, 220) and the owner
+    /// reported hearing no spacebar at all, which is the measurement this bound
+    /// exists to keep from recurring.
+    #[test]
+    fn the_bass_walk_stays_in_the_audible_register() {
+        // The PITCH CLASSES are the celebration's own bar roots. The
+        // celebration writes them against C5 and wants them two octaves down;
+        // the walk writes them against the palette anchor and lets
+        // `space_root_hz` fold — so the two agree modulo the octave, which is
+        // what "the same roots" means.
+        for (i, &want) in [
+            CELEBRATION_BASS[0][0],
+            CELEBRATION_BASS[1][0],
+            CELEBRATION_BASS[2][0],
+            CELEBRATION_BASS[3][0],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                i32::from(SONG_BASS[i]).rem_euclid(5),
+                want.rem_euclid(5),
+                "walk root {i} is not the v0.20.0 bar root's pitch class"
+            );
+        }
+        // …and it MOVES: a bass line that restrikes one note is exactly the
+        // drone this redesign exists to remove (measured: the shipped space had
+        // ONE distinct pitch over a minute of prose).
+        assert!(
+            SONG_BASS
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= 4,
+            "the walk must use at least four distinct roots"
+        );
+        assert!(
+            SONG_BASS.windows(2).all(|w| w[0] != w[1]),
+            "no root may repeat back-to-back"
+        );
+        // THE REGISTER, per palette and per tone: every root of the walk lands
+        // in [220, 440) — above a laptop speaker's rolloff — and no two
+        // consecutive roots are an octave apart, so the lurch the old
+        // nearest-tonic rule made is structurally impossible.
+        let mut s = TrailSynth::new(48_000.0, 1);
+        for tone in [
+            Tone::Technical,
+            Tone::Calm,
+            Tone::Excited,
+            Tone::Frustrated,
+            Tone::Playful,
+        ] {
+            s.tone = tone;
+            for style in STYLES {
+                let anchor = palette_for(SoundVoice::Style, style).anchor_hz();
+                // Every song key the celebration can latch, too: a singing cat
+                // transposes the floor and must not push it out of the band.
+                for key in -5i8..=5 {
+                    s.song_key = key;
+                    let hz: Vec<f32> = (0..SONG_BASS.len() as u8)
+                        .map(|i| s.space_root_hz(anchor, i))
+                        .collect();
+                    for (i, &f) in hz.iter().enumerate() {
+                        assert!(
+                            (SPACE_BASS_LO_HZ * 2.0..SPACE_BASS_LO_HZ * 4.0).contains(&f),
+                            "{style:?}/{tone:?}/key {key}: root {i} lands at {f} Hz, \
+                             outside [{}, {}) — the register the owner's speakers \
+                             reproduce",
+                            SPACE_BASS_LO_HZ * 2.0,
+                            SPACE_BASS_LO_HZ * 4.0
+                        );
+                    }
+                    for w in hz
+                        .windows(2)
+                        .chain(std::iter::once(&[hz[hz.len() - 1], hz[0]] as &[f32]))
+                    {
+                        let st = 12.0 * (w[1] / w[0]).log2();
+                        assert!(
+                            st.abs() < 12.0,
+                            "{style:?}/{tone:?}/key {key}: the walk lurched {st:.1} \
+                             semitones ({} -> {}) — an octave jump is the defect the \
+                             fold exists to prevent",
+                            w[0],
+                            w[1]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE BASS WALK IS A ROTATION, NOT A RESTRIKE — owner, 2026-08-31: "when
+    /// pressing shift, the tone should rotate, same for space."
+    ///
+    /// The measurement the ask lives in is not "how many roots" (the eight-step
+    /// walk already sounded four, and `the_bass_walk_stays_in_the_audible_
+    /// register` pins that floor) but HOW SOON ONE COMES BACK. On the
+    /// `keyboard_song_ab` prose take the shipped walk's closest recurrence was
+    /// TWO EVENTS — degree 0 at steps 4 and 6 — so a listener was handed the
+    /// same root again after one intervening word, three times in every eight.
+    /// This test states the floor that fixes it, and it is stated in HERTZ
+    /// rather than in degrees: two different degrees that fold to one pitch
+    /// would be the same defect wearing different notation.
+    #[test]
+    fn the_bass_walk_never_returns_inside_four_words() {
+        /// A word may not hear its own root back inside this many words.
+        const MIN_RETURN: usize = 4;
+        assert!(
+            SONG_BASS.len() > MIN_RETURN,
+            "a walk shorter than its own return floor cannot satisfy it"
+        );
+        // ALL FIVE roots of the lattice: the fifth is what buys the distance,
+        // and a walk that drops back to four cannot make this floor at twelve
+        // steps (12 slots over 4 values forces some value three times, and
+        // three occurrences at four apart need exactly 12 — leaving no room
+        // for the other three roots to appear twice each).
+        assert_eq!(
+            SONG_BASS
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            5,
+            "the walk must use every root of the lattice"
+        );
+        let n = SONG_BASS.len();
+        let mut s = TrailSynth::new(48_000.0, 0x5A_CE_11);
+        for tone in [
+            Tone::Technical,
+            Tone::Calm,
+            Tone::Excited,
+            Tone::Frustrated,
+            Tone::Playful,
+        ] {
+            s.tone = tone;
+            for style in STYLES {
+                let anchor = palette_for(SoundVoice::Style, style).anchor_hz();
+                for key in -5i8..=5 {
+                    s.song_key = key;
+                    let hz: Vec<f32> = (0..n as u8).map(|i| s.space_root_hz(anchor, i)).collect();
+                    for i in 0..n {
+                        for j in i + 1..n {
+                            // CYCLIC: the walk wraps, so the distance between
+                            // step 11 and step 0 is one word, not eleven.
+                            let d = (j - i).min(n - (j - i));
+                            let cents = 1200.0 * (hz[j] / hz[i]).log2().abs();
+                            assert!(
+                                cents > 25.0 || d >= MIN_RETURN,
+                                "{style:?}/{tone:?}/key {key}: the walk returns to \
+                                 {:.1} Hz after only {d} word(s) (steps {i} and {j}) \
+                                 — a root that comes back that fast is a restrike, \
+                                 not a progression",
+                                hz[i]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // AND IT HOLDS IN THE MIX, not just in the table: twelve words of real
+        // pushes, each root read off the voice the space actually spawned.
+        let mut w = TrailSynth::new(48_000.0, 0xBA_55_12);
+        let mut buf = [0.0f32; 2048];
+        let mut sung: Vec<f32> = Vec::new();
+        for _ in 0..n {
+            let before: [bool; MAX_VOICES] = core::array::from_fn(|i| w.voices[i].on);
+            w.since_voice = 1.0;
+            w.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+            sung.push(
+                w.voices
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, v)| v.on && !before[*i] && v.bass)
+                    .filter_map(|(_, v)| (v.p[0].lvl > 0.0).then_some(v.p[0].f1))
+                    .next()
+                    .expect("the bass speaks"),
+            );
+            // A letter closes the whitespace run, so the next space is a fresh
+            // word head and takes the next root.
+            w.render(&mut buf);
+            w.since_voice = 1.0;
+            w.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            w.render(&mut buf);
+        }
+        let distinct = sung
+            .iter()
+            .map(|f| (f * 4.0).round() as i32)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            5,
+            "twelve words must sound all five roots ({sung:?})"
+        );
+        for i in 0..sung.len() {
+            for j in i + 1..sung.len() {
+                let d = (j - i).min(sung.len() - (j - i));
                 assert!(
-                    arc == 0 || arc == ARC_LIFT,
-                    "arc took an intermediate value {arc} at {pos}/{len}"
+                    1200.0 * (sung[j] / sung[i]).log2().abs() > 25.0 || d >= MIN_RETURN,
+                    "word {j} restruck word {i}'s root after {d} word(s): {sung:?}"
                 );
             }
         }
@@ -10133,54 +11503,127 @@ mod tests {
             b.walk - a.walk
         );
         assert_eq!(
-            (a.phrase_pos, a.phrase_step),
-            (b.phrase_pos, b.phrase_step),
-            "…and they must not have moved the phrase state either"
+            (a.theme_pos, a.phrase_idx),
+            (b.theme_pos, b.phrase_idx),
+            "…and they must not have moved the theme's playhead either"
         );
     }
 
-    /// THE DOWNBEAT IS FIXED: a Space plays the speaking palette's own tonic,
-    /// octave-folded into ONE bass register, wherever the melody happens to be
-    /// standing — and it composes nothing.
+    /// THE SPACE IS A LAWFUL BASS: it plays the WALK's current root, folded
+    /// into one register, on a degree of the lattice — never a pitch derived
+    /// from where the melody happens to be standing — and it composes nothing.
     ///
-    /// The rule it replaces derived the pitch from `walk` through the
-    /// cadence's nearest-tonic test, so a space landed an OCTAVE apart
-    /// depending on a melody degree the ear cannot connect to the text. That
-    /// is the second half of this proof: the pitch is asserted to be the same
-    /// from two DIFFERENT melody states.
+    /// RECALIBRATED 2026-08-30 (the walking-bass redesign). The pin's SUBJECT
+    /// moved, deliberately, and the old subject was RED against this tree
+    /// before the recalibration — the direction is recorded here in place of a
+    /// mutation proof:
+    ///
+    /// - WAS: "one FIXED pitch, `melody_hz(bass_octave(anchor)·2, 0)`, the same
+    ///   from every melody state." That assert now FAILS from the second word
+    ///   onward, because the root moves: measured on the prose scenario the
+    ///   shipped space had exactly ONE distinct pitch over 91 word boundaries,
+    ///   which is the drone this redesign removes.
+    /// - IS: HARMONIC LAWFULNESS and REGISTER STABILITY. The pitch is an exact
+    ///   lattice degree (so it is consonant with the tune by construction, and
+    ///   `the_bass_walk_stays_in_the_audible_register` bounds the whole walk
+    ///   inside [220, 440) with no octave lurch possible); it is INDEPENDENT of
+    ///   the melody's degree (the second half of this proof, unchanged — the
+    ///   bass follows the WORD count, and typing more letters between two
+    ///   spaces cannot move it); and it still steps nothing in the tune.
+    ///
+    /// RE-READ 2026-08-31 (the word-boundary twinkle). The downbeat now speaks
+    /// TWO pitched voices, not one: the root, and the air voice's micro-chime
+    /// four octaves over it ([`SPACE_TWINKLE_RATIO`]). This pin's subject is
+    /// unchanged — it is about the ROOT's PITCH, which is the lowest of the two
+    /// and is asserted below exactly as before. The MONOPHONIC-DOWNBEAT law the
+    /// old "one pitched voice" line was mistaken for lives, and always lived,
+    /// in `two_word_boundaries_never_stack_one_bass_note` and
+    /// `a_whitespace_run_lands_one_downbeat`, both of which count `v.bass` and
+    /// so cannot be fooled by an ornament in another register. The chime is
+    /// pinned here too, since a twinkle that drifted into the melody's band
+    /// would be a defect this file has no other guard against.
     #[test]
-    fn the_space_is_a_fixed_bass_downbeat() {
+    fn the_space_is_a_lawful_walking_bass() {
         let (s, spaces) = family_voices(GlowStyle::RainbowKitty, SoundKind::Space);
-        assert_eq!(spaces.len(), 1, "the downbeat is one voice");
+        assert_eq!(
+            spaces.len(),
+            2,
+            "the downbeat is its root plus the air's twinkle"
+        );
+        // Sorted by pitch: the root, then its four-octave chime — which must
+        // stay FOUR octaves up (a 16:1 ratio is the root's own pitch class, so
+        // it cannot beat, and it is clear of the melody's ~520-950 band).
+        assert!(
+            (spaces[1].0 / spaces[0].0 - SPACE_TWINKLE_RATIO).abs() < 0.05,
+            "the twinkle rides {}× the root, not {}×",
+            SPACE_TWINKLE_RATIO,
+            spaces[1].0 / spaces[0].0
+        );
         let (land, enter) = spaces[0];
         assert!(
             (enter - land).abs() < 0.5,
-            "a downbeat arrives, it does not lean: {enter} -> {land}"
+            "a bass root arrives, it does not lean: {enter} -> {land}"
         );
         let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
-        // RECALIBRATED 2026-08-30 with the low-bell re-voice (owner: "like
-        // the cute ping … a bit lower"): the ONE register is now the folded
-        // tonic DOUBLED into [220, 440) — above a laptop speaker's rolloff
-        // (the old [110, 220) register measured 12.5% of the mix's energy
-        // under 250 Hz and the owner heard nothing), still an octave-plus
-        // under every melody. The pin's SUBJECT is unchanged: one fixed
-        // pitch, independent of the melody's walk. This assert was RED
-        // against the re-voice before this recalibration — the direction is
-        // recorded here in place of a mutation proof.
-        let expect = s.melody_hz(bass_octave(anchor) * 2.0, 0);
+        // The probe's space is the walk's FIRST root, and the walk opens on
+        // degree 0 — so this one word is still exactly the shipped pitch.
+        let expect = s.space_root_hz(anchor, 0);
         assert!(
             (land - expect).abs() < 0.5,
-            "the downbeat lands on the palette's octave-folded tonic, one \
-             octave up: got {land}, expected {expect}"
+            "the first word's root is the palette's octave-folded tonic: \
+             got {land}, expected {expect}"
         );
         assert!(
             (SPACE_BASS_LO_HZ * 2.0..SPACE_BASS_LO_HZ * 4.0).contains(&land),
-            "…inside the ONE audible bell register ({land} Hz)"
+            "…inside the ONE audible bass register ({land} Hz)"
         );
-        // INDEPENDENT OF THE MELODY. Walk the tune to a different degree and
-        // the downbeat must not move a cent.
+        // IT WALKS. Successive words play successive roots, and over one lap
+        // the space speaks at least four distinct pitches — the exact defect
+        // the owner named ("the spacebar note isn't musical": one note, 91
+        // times) turned into a progression.
+        let mut w = TrailSynth::new(48_000.0, 0xBA_55_11);
+        let mut buf = [0.0f32; 2048];
+        let mut sung: Vec<f32> = Vec::new();
+        for _ in 0..SONG_BASS.len() {
+            let before: [bool; MAX_VOICES] = core::array::from_fn(|i| w.voices[i].on);
+            w.since_voice = 1.0;
+            w.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+            sung.push(
+                w.voices
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, v)| v.on && !before[*i] && v.bass)
+                    .filter_map(|(_, v)| (v.p[0].lvl > 0.0).then_some(v.p[0].f1))
+                    .next()
+                    .expect("the bass speaks"),
+            );
+            // A letter closes the whitespace run, so the next space is a fresh
+            // word head and takes the next root.
+            w.render(&mut buf);
+            w.since_voice = 1.0;
+            w.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            w.render(&mut buf);
+        }
+        let distinct = sung
+            .iter()
+            .map(|f| (f * 4.0).round() as i32)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            distinct.len() >= 4,
+            "the bass must WALK: {} distinct roots over one lap ({sung:?})",
+            distinct.len()
+        );
+        for (i, f) in sung.iter().enumerate() {
+            let want = s.space_root_hz(anchor, i as u8);
+            assert!(
+                (f - want).abs() < 0.5,
+                "word {i} played {f} Hz, not the walk's root {want} Hz"
+            );
+        }
+        // INDEPENDENT OF THE MELODY. Walk the TUNE to a different degree with
+        // the word count held fixed and the bass must not move a cent: the
+        // harmony follows the text's words, never the melody's position.
         let mut t = TrailSynth::new(48_000.0, 0xFA_1117);
-        let mut buf = [0.0f32; 1024];
         let mut moved = false;
         for _ in 0..40 {
             t.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
@@ -10193,6 +11636,7 @@ mod tests {
             }
         }
         assert!(moved, "fixture: the melody must reach a different degree");
+        assert_eq!(t.bass_step, 0, "fixture: no word boundary has passed");
         let before: [bool; MAX_VOICES] = core::array::from_fn(|i| t.voices[i].on);
         t.since_voice = 1.0;
         t.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
@@ -10200,32 +11644,107 @@ mod tests {
             .voices
             .iter()
             .enumerate()
-            .filter(|(i, v)| v.on && !before[*i])
+            .filter(|(i, v)| v.on && !before[*i] && v.bass)
             .filter_map(|(_, v)| (v.p[0].lvl > 0.0).then_some(v.p[0].f1))
             .next()
-            .expect("the downbeat speaks");
+            .expect("the bass speaks");
         assert!(
             (far - land).abs() < 0.5,
-            "the downbeat must not follow the melody: {far} Hz at degree {} \
+            "the bass must not follow the melody: {far} Hz at degree {} \
              against {land} Hz at degree {}",
             t.walk,
             s.walk
         );
-        // The downbeat composes nothing: phrase position and degree are
-        // exactly what one Typed probe leaves behind (family_voices pushes
-        // Typed first, then the probed kind).
+        // The space composes nothing: the theme's playhead is exactly what one
+        // Typed probe leaves behind (family_voices pushes Typed first, then the
+        // probed kind).
         let (tp, _) = family_voices(GlowStyle::RainbowKitty, SoundKind::Typed);
         assert_eq!(
-            s.phrase_pos,
-            tp.phrase_pos.saturating_sub(1),
+            s.theme_pos,
+            tp.theme_pos.saturating_sub(1),
             "a space must not step the song (the Typed probe stepped once more)"
         );
     }
 
+    /// THE WORD IS THE DOWNBEAT. A whitespace run's HEAD re-bars the pulse, so
+    /// the first letter of every word lands on an accent and sings the tune.
+    ///
+    /// This is a MEASURED fix, not a preference. With the bar left
+    /// free-running, the `keyboard_song_ab` prose scenario put its 91 word
+    /// boundaries on all twelve slots and only 31 % of words opened on an
+    /// accent — more than two words in three began on accompaniment, which is
+    /// why the owner could say of the space "it is not a downbeat and it
+    /// doesn't sound like that" and be exactly right. The space itself still
+    /// is not the downbeat; it is the bass that opens the bar under one.
+    #[test]
+    fn a_word_boundary_re_bars_the_pulse() {
+        let mut s = TrailSynth::new(48_000.0, 0xBA_12_11);
+        let mut buf = [0.0f32; 2048];
+        // Type a word of awkward length, so the bar is left mid-figure.
+        for _ in 0..5 {
+            s.since_voice = 1.0;
+            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            s.render(&mut buf);
+        }
+        assert_ne!(s.song_pulse, 0, "fixture: the bar is mid-figure");
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+        assert_eq!(s.song_pulse, 0, "a word boundary opens a fresh bar");
+        // …so the next letter SINGS.
+        let sung = s.song_notes;
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        assert_eq!(
+            s.song_notes,
+            sung + 1,
+            "the first letter of a word must be an accent"
+        );
+        assert!(s.song_accent, "…and must be designed as one");
+        // A RUN re-bars ONCE: indentation is one gesture, and its tail must not
+        // keep re-barring (which would make every blank an accent and turn a
+        // four-space indent into four downbeats).
+        s.render(&mut buf);
+        for _ in 0..3 {
+            s.since_voice = 1.0;
+            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            s.render(&mut buf);
+        }
+        let mid = s.song_pulse;
+        assert_ne!(mid, 0, "fixture: the bar is mid-figure again");
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+        assert_eq!(s.song_pulse, 0, "the run's HEAD re-bars");
+        s.render(&mut buf);
+        for _ in 0..3 {
+            s.since_voice = 1.0;
+            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            s.render(&mut buf);
+        }
+        let before_tail = s.song_pulse;
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        s.render(&mut buf);
+        let _ = before_tail;
+        // Head, then tail: the tail must leave the bar alone.
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+        let at_head = s.song_pulse;
+        s.render(&mut buf);
+        s.since_voice = 1.0;
+        s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+        assert_eq!(
+            s.song_pulse, at_head,
+            "the tail of a whitespace run must not re-bar again"
+        );
+    }
+
     /// A WHITESPACE RUN IS ONE GESTURE: indentation and a run of blanks get
-    /// ONE bass downbeat, and the rest of the run answers with air alone —
-    /// never silence (a key that makes no sound reads as a dropped keystroke)
-    /// and never a second bass note (four stacked roots is a kick drum).
+    /// ONE bass root, and the rest of the run answers with air alone — never
+    /// silence (a key that makes no sound reads as a dropped keystroke) and
+    /// never a second bass note (four stacked roots is a kick drum).
+    ///
+    /// …and one WALK STEP: the harmony must move once per word, not once per
+    /// blank, or a four-space indent would spend half the progression.
     #[test]
     fn a_whitespace_run_lands_one_downbeat() {
         let mut s = TrailSynth::new(48_000.0, 0x5A_CE_00);
@@ -10239,9 +11758,16 @@ mod tests {
             s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
             s.live_voices() - before
         };
-        // The HEAD of the run: one bass downbeat.
-        assert_eq!(space(&mut s), 1, "the head speaks");
-        assert_eq!(bass(&s), 1, "…as a bass downbeat");
+        // The HEAD of the run: the bass root plus its air cap
+        // ([`SPACE_AIR_LEVEL`] — the top the shipped thud measured 0.000 of).
+        let step_before = s.bass_step;
+        assert_eq!(space(&mut s), 2, "the head speaks: a root and its air");
+        assert_eq!(bass(&s), 1, "…exactly one of them a bass root");
+        assert_eq!(
+            s.bass_step,
+            (step_before + 1) % SONG_BASS.len() as u8,
+            "the head steps the walk once"
+        );
         // The TAIL: still audible, never a second root.
         for i in 0..3 {
             s.render(&mut buf);
@@ -10263,14 +11789,26 @@ mod tests {
                 "…the run's tail is AIR: a breath with no tone under it"
             );
         }
-        // A letter CLOSES the run: the next space opens a new one.
+        // THE WALK DID NOT MOVE across the tail: one root per WORD.
+        assert_eq!(
+            s.bass_step,
+            (step_before + 1) % SONG_BASS.len() as u8,
+            "a whitespace run must spend exactly one step of the walk"
+        );
+        // A letter CLOSES the run: the next space opens a new one, and takes
+        // the NEXT root.
         s.render(&mut buf);
         s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
         s.render(&mut buf);
         s.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
         assert!(
             s.voices.iter().any(|v| v.on && v.bass && v.damp <= 0.0),
-            "a word boundary after a letter is a fresh downbeat"
+            "a word boundary after a letter is a fresh root"
+        );
+        assert_eq!(
+            s.bass_step,
+            (step_before + 2) % SONG_BASS.len() as u8,
+            "…and the harmony moves on"
         );
     }
 
@@ -10334,6 +11872,443 @@ mod tests {
             after > before,
             "the capital right behind a shift must not be thinned by its own \
              grace note ({before} -> {after} voices)"
+        );
+    }
+
+    /// THE LIFT ROTATES AND NEVER DRONES — owner, 2026-08-31: "when pressing
+    /// shift, the tone should rotate."
+    ///
+    /// THE CASE IS THE BARE MODIFIER PRESSED REPEATEDLY, and it is exactly the
+    /// case in which every term of the shipped lift's pitch is a constant: a
+    /// Shift is excluded from [`TrailSynth::advance_song`] so the melody does
+    /// not step, the column does not move while the hand reaches, and the song
+    /// key is zero unless the cat is singing. Measured on the
+    /// `keyboard_song_ab` rotation scenario before this change: twenty presses,
+    /// ONE distinct pitch, 779.8 Hz every time.
+    ///
+    /// Everything the lift already promised is asserted here beside the
+    /// rotation, because a rotation bought by breaking any of them is not the
+    /// ask: the first lift is still the SHIPPED pitch, every lift is still ON
+    /// THE LATTICE (consonant by the module's no-beating law), every lift is
+    /// still INSIDE ONE OCTAVE of the melody it announces, and the level never
+    /// moves — only the pitch does.
+    #[test]
+    fn the_lift_rotates_and_never_drones() {
+        // The rotation is a permutation of the lattice's degrees, and it opens
+        // on the shipped offset so no single-lift pin in the suite can move.
+        assert_eq!(SHIFT_ROTATION[0], 0, "the first lift is the shipped one");
+        assert_eq!(
+            SHIFT_ROTATION
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            SHIFT_ROTATION.len(),
+            "a rotation that visits a degree twice per lap is a shorter rotation"
+        );
+        let mut s = TrailSynth::new(48_000.0, 0x5111_F700);
+        let mut buf = [0.0f32; 2048];
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        let walk0 = s.walk;
+        // THREE LAPS of bare shifts and nothing else — the owner's case
+        // verbatim, at the pan the reaching hand actually holds (centre, so
+        // the column nudge is a constant and cannot be mistaken for the
+        // rotation doing the work).
+        let laps = 3usize;
+        let mut sung: Vec<f32> = Vec::new();
+        let mut levels: Vec<f32> = Vec::new();
+        for _ in 0..laps * SHIFT_ROTATION.len() {
+            let before: [bool; MAX_VOICES] = core::array::from_fn(|i| s.voices[i].on);
+            s.since_voice = 1.0;
+            // The flood duck is a function of the RATE, which climbs with every
+            // push in this loop — held here so the level assertion below reads
+            // the lift's own gain rather than the governor's ride.
+            s.rate = 0.0;
+            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Shift));
+            let (f, lvl) = s
+                .voices
+                .iter()
+                .enumerate()
+                .filter(|(i, v)| v.on && !before[*i] && v.p[0].lvl > 0.0)
+                .map(|(_, v)| (v.p[0].f1, v.p[0].lvl * (v.gl + v.gr)))
+                .next()
+                .expect("the lift speaks");
+            sung.push(f);
+            levels.push(lvl);
+            s.render(&mut buf);
+        }
+        assert_eq!(
+            s.walk, walk0,
+            "fixture: a bare shift composes nothing — the melody must not have \
+             moved, or this test is measuring the tune instead of the lift"
+        );
+        // ONE LAP IS ONE OF EACH. The whole point: press shift five times and
+        // hear five notes.
+        let one_lap = &sung[..SHIFT_ROTATION.len()];
+        let lap: std::collections::BTreeSet<i32> =
+            one_lap.iter().map(|f| (f * 4.0).round() as i32).collect();
+        assert_eq!(
+            lap.len(),
+            SHIFT_ROTATION.len(),
+            "one lap of the rotation must sound one note per press ({sung:?})"
+        );
+        // …AND NOTHING COMES BACK INSIDE A LAP, over every lap: the drone is
+        // the `d == 1` case of this, so this assertion is the ask.
+        for i in 0..sung.len() {
+            for j in i + 1..sung.len() {
+                let d = j - i;
+                assert!(
+                    1200.0 * (sung[j] / sung[i]).log2().abs() > 25.0 || d >= SHIFT_ROTATION.len(),
+                    "lift {j} repeated lift {i}'s note after {d} press(es): {sung:?}"
+                );
+            }
+        }
+        // THE SHIPPED PITCH, unchanged, on the first press — and every later
+        // one exactly on the lattice at its rotation's degree, which is what
+        // makes "consonant" structural rather than a listening claim.
+        let base = s.melody_hz(anchor, walk0);
+        for (i, &f) in sung.iter().enumerate() {
+            let want = s.melody_hz(
+                anchor,
+                walk0 + GESTURE_CHAR_STEP + SHIFT_ROTATION[i % SHIFT_ROTATION.len()],
+            );
+            assert!(
+                (f - want).abs() < 0.5,
+                "lift {i} played {f} Hz, not the rotation's degree at {want} Hz"
+            );
+            // BOUNDED: from the shipped step above the melody up to the
+            // capital's own octave ([`SHIFT_GLYPH_LIFT`]) and no further. A
+            // lift that climbed with press count would be a siren, not a
+            // rotation.
+            let ratio = f / base;
+            assert!(
+                ratio > 1.0 && ratio <= 2.0 + 1e-3,
+                "lift {i} left the octave above the melody ({ratio:.3}×)"
+            );
+        }
+        // A WHISPER STILL. Only the pitch moved: the lift's level is identical
+        // across the whole rotation, so nothing here can have made shift
+        // louder.
+        for (i, &l) in levels.iter().enumerate() {
+            assert!(
+                (l - levels[0]).abs() <= levels[0] * 1e-6,
+                "lift {i} changed level ({l} vs {}) — the rotation moves pitch \
+                 only",
+                levels[0]
+            );
+        }
+        // THE GOVERNOR OWNS THE ROTATION'S CLOCK: a lift that was thinned into
+        // silence may not spend a note the listener never heard.
+        let mut t = TrailSynth::new(48_000.0, 0x5111_F701);
+        t.since_voice = 1.0;
+        t.push(ev(GlowStyle::RainbowKitty, SoundKind::Shift));
+        let after_one = t.shift_step;
+        assert_eq!(after_one, 1, "fixture: the first lift sounded");
+        // A KEYSTROKE claims the beat (the lift never does), so the lift right
+        // behind it — no render between, well inside MIN_GAP — is thinned into
+        // silence. It must not spend a note the listener never heard.
+        t.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        let before: [bool; MAX_VOICES] = core::array::from_fn(|i| t.voices[i].on);
+        t.push(ev(GlowStyle::RainbowKitty, SoundKind::Shift));
+        assert!(
+            !t.voices.iter().enumerate().any(|(i, v)| v.on && !before[i]),
+            "fixture: the lift behind a keystroke must be thinned"
+        );
+        assert_eq!(
+            t.shift_step, after_one,
+            "a thinned lift must not step the rotation"
+        );
+    }
+
+    /// A SHIFTED GLYPH SINGS HIGHER — the owner's ask, as a measurement:
+    /// "when doing a shift-key press (not the shift, but the shifted key) make
+    /// it higher pitched".
+    ///
+    /// The SAME keystroke from the SAME melody state, shifted and not, must
+    /// land a clean octave apart ([`SHIFT_GLYPH_LIFT`]) in every palette that
+    /// speaks a pitch — and the lift must not move the theme, or how you spell
+    /// a word would change the tune.
+    #[test]
+    fn a_shifted_glyph_lands_an_octave_over_its_plain_self() {
+        for style in STYLES {
+            let plain = family_voices(style, SoundKind::Typed);
+            let (mut s, _) = family_voices(style, SoundKind::Typed);
+            // Re-probe from the identical settled state with the flag set.
+            let (probe, lifted) = {
+                let mut t = TrailSynth::new(48_000.0, 0xFA_1117);
+                let mut buf = [0.0f32; 1024];
+                for _ in 0..3 {
+                    t.push(ev(style, SoundKind::Typed));
+                    for _ in 0..25 {
+                        t.render(&mut buf);
+                    }
+                }
+                let before: [bool; MAX_VOICES] = core::array::from_fn(|i| t.voices[i].on);
+                t.since_voice = 1.0;
+                t.push(SoundEvent {
+                    shifted: true,
+                    ..ev(style, SoundKind::Typed)
+                });
+                let mut out: Vec<f32> = t
+                    .voices
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, v)| v.on && !before[*i])
+                    .filter_map(|(_, v)| {
+                        let p = v.p.iter().max_by(|a, b| a.lvl.total_cmp(&b.lvl))?;
+                        (p.lvl > 0.0).then_some(p.f1)
+                    })
+                    .collect();
+                out.sort_by(f32::total_cmp);
+                (t, out)
+            };
+            let plain_hz: Vec<f32> = plain.1.iter().map(|&(f1, _)| f1).collect();
+            assert!(
+                !plain_hz.is_empty() && !lifted.is_empty(),
+                "{style:?}: the keystroke must speak a pitch"
+            );
+            assert_eq!(
+                plain_hz.len(),
+                lifted.len(),
+                "{style:?}: the lift must not add or drop a voice"
+            );
+            // EVERY VOICE either FOLLOWS the note (×2, the octave) or is a
+            // fixed-pitch element of the palette (×1 — Fire's ember bed sits at
+            // 118 Hz whatever the melody does, and must). At least one must
+            // follow, or the palette silently ignores the ask.
+            //
+            // Matched as SETS rather than pairwise, because both lists are
+            // sorted by pitch and the lift reorders them.
+            let mut octaves = 0;
+            for &f in &lifted {
+                let near = |t: f32| {
+                    plain_hz
+                        .iter()
+                        .any(|&p| (t - p).abs() < 0.5f32.max(p * 0.002))
+                };
+                if near(f / 2.0) {
+                    octaves += 1;
+                } else {
+                    assert!(
+                        near(f),
+                        "{style:?}: a shifted voice at {f} Hz is neither its plain \
+                         self nor an octave over it ({plain_hz:?})"
+                    );
+                }
+            }
+            assert!(
+                octaves >= 1,
+                "{style:?}: no voice took the capital's octave — the palette is \
+                 ignoring the ask ({plain_hz:?} -> {lifted:?})"
+            );
+            // …and higher is the point: assert the DIRECTION separately, so a
+            // future sign slip cannot pass by landing an octave DOWN.
+            //
+            // Stated PER VOICE rather than on the two sets' maxima (2026-08-31).
+            // A palette may legitimately pin an ORNAMENT to a fixed sparkle band
+            // while the NOTE moves — rainbow kitty's capital glints at half its
+            // usual ratio for exactly that reason (see [`KEY_GLINT_LEVEL`]), so
+            // the plain letter's 8f glint and the capital's 4f glint are the
+            // SAME frequency and the two sets share their top entry. The maxima
+            // form could not tell that apart from a lift that failed, which is
+            // why the check moved to the voices themselves: `octaves >= 1` above
+            // proves the note went up, and this proves nothing went down.
+            for &f in &lifted {
+                assert!(
+                    !plain_hz
+                        .iter()
+                        .any(|&p| (f * 2.0 - p).abs() < 0.5f32.max(p * 0.002)),
+                    "{style:?}: shifted must be HIGHER, not lower — a voice at \
+                     {f} Hz is an octave UNDER its plain self ({plain_hz:?})"
+                );
+            }
+            // The theme is untouched: same playhead, same degree.
+            s.since_voice = 1.0;
+            assert_eq!(
+                (probe.walk, probe.theme_pos, probe.phrase_idx),
+                (s.walk, s.theme_pos, s.phrase_idx),
+                "{style:?}: shiftedness must not move the tune"
+            );
+            let _ = &mut s;
+        }
+        // A shifted SPACE is still a word boundary — the lift is Typed-only.
+        let mut a = TrailSynth::new(48_000.0, 0x5A_FE_01);
+        let mut b = TrailSynth::new(48_000.0, 0x5A_FE_01);
+        a.push(ev(GlowStyle::RainbowKitty, SoundKind::Space));
+        b.push(SoundEvent {
+            shifted: true,
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Space)
+        });
+        let hz = |s: &TrailSynth| {
+            s.voices
+                .iter()
+                .filter(|v| v.on && v.bass)
+                .map(|v| v.p[0].f1)
+                .next()
+        };
+        assert_eq!(
+            hz(&a),
+            hz(&b),
+            "a shifted Space is still a word boundary, at the same root"
+        );
+    }
+
+    /// THE SPARKLE RIDES THE TUNE — and the capitals — AND NOTHING ELSE.
+    ///
+    /// The 2026-08-31 glitter round ("sounds cute, needs some more sparkly
+    /// noises") is four layers over a bell that did not change, and every one
+    /// of them is addressed by MUSICAL POSITION rather than by keystroke. That
+    /// is the entire design, so it is the thing worth pinning: a ghost must
+    /// stay matte and dark, an accent must glint under an open roof, and the
+    /// phrase's PEAK — five accents in a 28-note lap of the theme — must throw
+    /// a star and its dust.
+    ///
+    /// Walked over one full lap (84 keystrokes at one accent in three) rather
+    /// than sampled, because the rarity is half the point: a star that fired
+    /// twice as often would still pass every per-keystroke assertion here.
+    #[test]
+    fn the_sparkle_rides_the_tune_and_the_capitals_and_nothing_else() {
+        const BASE: f32 = 523.25; // the palette's own C5
+        let mut s = TrailSynth::new(48_000.0, 0x5A_11_1E);
+        let mut buf = [0.0f32; 1024]; // 512 frames ~ 10.7 ms
+        let typed = || SoundEvent {
+            bed: false,
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
+        };
+        let mut crests = 0usize;
+        let mut accents = 0usize;
+        for k in 0..84 {
+            let before: [bool; MAX_VOICES] = core::array::from_fn(|i| s.voices[i].on);
+            s.since_voice = 1.0;
+            s.push(typed());
+            let new: Vec<Voice> = s
+                .voices
+                .iter()
+                .enumerate()
+                .filter(|(i, v)| v.on && !before[*i])
+                .map(|(_, v)| *v)
+                .collect();
+            // Four unambiguous shapes: the bell alone carries BOTH a mallet and
+            // partials, the dust is noise with no tone, the glint is the only
+            // tonal voice with a third partial, the star the only one without.
+            let bell = new.iter().find(|v| v.n_lvl > 0.0 && v.p[0].lvl > 0.0);
+            let dust = new
+                .iter()
+                .filter(|v| v.n_lvl > 0.0 && v.p[0].lvl <= 0.0)
+                .count();
+            let glint = new
+                .iter()
+                .find(|v| v.n_lvl <= 0.0 && v.p[0].lvl > 0.0 && v.p[2].lvl > 0.0);
+            let star = new
+                .iter()
+                .find(|v| v.n_lvl <= 0.0 && v.p[0].lvl > 0.0 && v.p[1].lvl <= 0.0);
+            let bell = bell.unwrap_or_else(|| panic!("keystroke {k}: no bell"));
+            let (accent, crest) = (s.song_accent, s.song_crest());
+            if !accent {
+                // A GHOST IS MATTE AND DARK: the bell, alone, under the closed
+                // roof. This is the assertion the whole round is balanced on.
+                assert_eq!(new.len(), 1, "keystroke {k}: a ghost must not sparkle");
+                assert_eq!(bell.lp_cut, KEY_BELL_ROOF, "keystroke {k}: ghost roof");
+                continue;
+            }
+            accents += 1;
+            assert_eq!(
+                bell.lp_cut, KEY_BELL_ROOF_LIT,
+                "keystroke {k}: an accent's crown is LIT"
+            );
+            let glint = glint.unwrap_or_else(|| panic!("keystroke {k}: accent without a glint"));
+            // The glint is the note's 8f, its beat-twinkle twin, and the 12f
+            // top — all of it over 4 kHz, none of it in the melody's band.
+            let f = s.melody_hz(BASE, s.walk);
+            assert!(
+                (glint.p[0].f1 - f * KEY_GLINT_RATIO).abs() < 0.5,
+                "keystroke {k}: the glint is the note's {KEY_GLINT_RATIO}f"
+            );
+            assert!(
+                glint.p[2].f1 > 2000.0 && glint.p[1].f1 > glint.p[0].f1,
+                "keystroke {k}: the glint's air sits over the melody's band"
+            );
+            if !crest {
+                assert_eq!(
+                    new.len(),
+                    2,
+                    "keystroke {k}: an ordinary accent is bell + glint"
+                );
+                assert!(
+                    star.is_none() && dust == 0,
+                    "keystroke {k}: no star off-peak"
+                );
+            } else {
+                crests += 1;
+                assert_eq!(
+                    new.len(),
+                    4,
+                    "keystroke {k}: a crest is bell + glint + dust + star"
+                );
+                assert_eq!(dust, 1, "keystroke {k}: the crest throws its dust");
+                let star = star.unwrap_or_else(|| panic!("keystroke {k}: crest without a star"));
+                // FOLDED INTO THE ONE SPARKLE BAND, whatever note threw it —
+                // that is what makes it the same light every time.
+                assert!(
+                    (KEY_STAR_LO_HZ..KEY_STAR_LO_HZ * 2.0).contains(&star.p[0].f1),
+                    "keystroke {k}: the star left its band at {} Hz",
+                    star.p[0].f1
+                );
+                assert!(
+                    (star.p[0].f1 - sparkle_octave(f * KEY_STAR_RATIO)).abs() < 0.5,
+                    "keystroke {k}: the star is the note's folded twelfth"
+                );
+                // It ARCS: enters sharp, settles down onto its pitch.
+                assert!(
+                    star.p[0].f0 > star.p[0].f1 && star.p[0].glide > 0.0,
+                    "keystroke {k}: a shooting star falls"
+                );
+            }
+            for _ in 0..30 {
+                s.render(&mut buf); // ~0.32 s — under PHRASE_PAUSE_S, so the lap holds
+            }
+        }
+        assert_eq!(accents, 28, "one lap of the theme is 28 accents");
+        // [`SONG_THEME`] reaches KEY_CREST_DEGREE at indices 7, 9, 18, 26 and
+        // its single 8 at 27 — five flashes a lap, one per ~17 keystrokes.
+        assert_eq!(crests, 5, "the theme's peaks are five in a lap");
+
+        // THE CAPITAL, off the beat. A shifted glyph that lands on a GHOST slot
+        // still glints — emphasis is authorship — and its glint lands at the
+        // PLAIN letter's own sparkle band rather than an octave over it.
+        let mut c = TrailSynth::new(48_000.0, 0x5A_11_2E);
+        c.push(SoundEvent {
+            bed: false,
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
+        }); // the downbeat accent
+        for _ in 0..30 {
+            c.render(&mut buf);
+        }
+        let before: [bool; MAX_VOICES] = core::array::from_fn(|i| c.voices[i].on);
+        c.since_voice = 1.0;
+        c.push(SoundEvent {
+            bed: false,
+            shifted: true,
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
+        });
+        assert!(!c.song_accent, "fixture: the second keystroke is a ghost");
+        let new: Vec<Voice> = c
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| v.on && !before[*i])
+            .map(|(_, v)| *v)
+            .collect();
+        assert_eq!(new.len(), 2, "a capital glints even off the beat");
+        let glint = new
+            .iter()
+            .find(|v| v.n_lvl <= 0.0)
+            .expect("the capital's glint");
+        let plain = c.melody_hz(BASE, c.walk + i32::from(c.song_ghost));
+        assert!(
+            (glint.p[0].f1 - plain * KEY_GLINT_RATIO).abs() < 0.5,
+            "a capital's glint keeps the plain letter's band: {} vs {}",
+            glint.p[0].f1,
+            plain * KEY_GLINT_RATIO
         );
     }
 
@@ -11034,9 +13009,29 @@ mod tests {
             SPACE_BREATHE_FIFTH_LEVEL.max(SPACE_BELL_TINK),
             "the rested tink keeps its floor"
         );
+        // BREATHING CHANGES THE ROOM, NEVER THE NOTE. It used to be enough to
+        // assert the two roots were the same frequency, because there was only
+        // ever one; the bass WALKS now, so the claim has to be stated as what
+        // it always meant — the envelope is a function of the REST and the
+        // pitch is a function of the WALK, and the two axes do not touch. The
+        // second space is one word later, so it is the walk's next root, and
+        // that root is what a fresh synth's second step plays.
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        assert!(
+            (v.p[0].f0 - s.space_root_hz(anchor, 0)).abs() < 0.5,
+            "the first word takes the walk's first root"
+        );
+        assert!(
+            (b.p[0].f0 - s.space_root_hz(anchor, 1)).abs() < 0.5,
+            "the rested word takes the NEXT root ({} vs {}) — the rest changed \
+             the envelope, the WORD changed the note",
+            b.p[0].f0,
+            s.space_root_hz(anchor, 1)
+        );
         assert_eq!(
-            b.p[0].f0, v.p[0].f0,
-            "breathing changes the ROOM, never the note: the root is fixed"
+            b.p[2].f0,
+            b.p[0].f0 * 4.0,
+            "…and the rested voice's own partials still stack on its own root"
         );
         // The bloom is still no kick drum: shorter than a Kill swoosh, and
         // its whole life fits inside half a second of thought.
@@ -11174,17 +13169,12 @@ mod tests {
             /// The ERASE GATE's clock, mirrored from production.
             since_erase: f32,
             walk: i32,
-            // The phrase-generator state, kept in lock-step with
-            // `TrailSynth`'s: duplicated here on purpose, so a divergence in
-            // the generator itself also trips the pin (the oracle's other
-            // value is catching drift in voice/bed/render arithmetic and rng
-            // ordering).
-            motif: [i8; 4],
-            phrase_pos: u8,
-            phrase_len: u8,
-            phrase_parity: bool,
-            phrase_step: i32,
-            phrase_home: i32,
+            // The THEME playhead, kept in lock-step with `TrailSynth`'s:
+            // duplicated here on purpose, so a divergence in the melody itself
+            // also trips the pin (the oracle's other value is catching drift in
+            // voice/bed/render arithmetic and rng ordering).
+            theme_pos: u8,
+            phrase_idx: u8,
             /// THE BAR, mirrored (see `SONG_PULSE`).
             song_pulse: u8,
             song_accent: bool,
@@ -11212,12 +13202,8 @@ mod tests {
                     since_event: 1.0,
                     since_erase: 1.0,
                     walk: 2,
-                    motif: [0; 4],
-                    phrase_pos: 0,
-                    phrase_len: 0,
-                    phrase_parity: false,
-                    phrase_step: 0,
-                    phrase_home: 2,
+                    theme_pos: 0,
+                    phrase_idx: 0,
                     song_pulse: 0,
                     song_accent: true,
                     song_ghost: 0,
@@ -11345,43 +13331,28 @@ mod tests {
                 }
                 self.song_accent = true;
                 self.song_ghost = 0;
-                let boundary = kind == SoundKind::Jump
-                    || pause > PHRASE_PAUSE_S
-                    || self.phrase_pos >= self.phrase_len;
-                if boundary {
-                    self.walk = if self.walk * 2 <= 5 { 0 } else { 5 };
-                    self.phrase_home = self.walk;
-                    self.phrase_step = 0;
-                    self.phrase_pos = 0;
-                    self.phrase_parity ^= true;
-                    self.phrase_len =
-                        PHRASE_MIN + (self.rnd() * ((PHRASE_MAX - PHRASE_MIN + 1) as f32)) as u8;
-                    // Three NONZERO drawn steps (span 1 ⇒ ±1) and a closing
-                    // one, verbatim with the production draw.
-                    let mut sum = 0;
-                    for i in 0..3 {
-                        let k = (self.rnd() * 2.0) as i32;
-                        let d = if k < 1 { k - 1 } else { k };
-                        self.motif[i] = d as i8;
-                        sum += d;
-                    }
-                    self.motif[3] = (-sum).clamp(-2, 2) as i8;
+                // THE THEME, mirrored verbatim from
+                // `TrailSynth::advance_melody` (Technical path, so the lean is
+                // zero and the fold is the identity).
+                let start = usize::from(SONG_FORM[usize::from(self.phrase_idx)]);
+                let end = usize::from(SONG_FORM[usize::from(self.phrase_idx) + 1]);
+                let pos = usize::from(self.theme_pos);
+                let ran_out = pos >= end;
+                let rest = (kind == SoundKind::Jump || pause > PHRASE_PAUSE_S) && pos > start;
+                let open_next = |s: &mut Self| {
+                    s.phrase_idx = (s.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
+                    s.theme_pos = SONG_FORM[usize::from(s.phrase_idx)];
+                };
+                if rest && !ran_out {
+                    self.walk = fold_register(i32::from(SONG_THEME[end - 1]), 0, 8);
+                    open_next(self);
                 } else {
-                    let idx = (self.phrase_pos % 4) as usize;
-                    let mut delta = i32::from(self.motif[idx]);
-                    if self.phrase_parity {
-                        delta = -delta;
+                    if ran_out {
+                        open_next(self);
                     }
-                    if self.phrase_pos == self.phrase_len / 2 {
-                        delta += MELODY_LEAP;
-                    }
-                    self.phrase_step += delta;
-                    let frac = f32::from(self.phrase_pos) / f32::from(self.phrase_len);
-                    let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
-                    let vary = if self.phrase_pos >= 4 { MOTIF_VARY } else { 0 };
-                    self.phrase_pos += 1;
                     self.walk =
-                        fold_register(self.phrase_home + self.phrase_step + arc + vary, 0, 7);
+                        fold_register(i32::from(SONG_THEME[usize::from(self.theme_pos)]), 0, 8);
+                    self.theme_pos += 1;
                 }
                 self.design(style, kind, pan, heat, hue, gain, duck);
                 self.song_feel = 1.0;
@@ -11761,6 +13732,16 @@ mod tests {
                         let f = penta(base, deg);
                         let (b0, b1) = gesture_bend(f, gesture_shape(kind).dir);
                         let f0 = b1 + (b0 - b1) * KEY_BELL_BEND_SHARE;
+                        // THE LIT CROWN, mirrored (see `KEY_BELL_ROOF_LIT`):
+                        // the roof opens for a note the tune sang. Production
+                        // also lights a CAPITAL; this oracle's cues are all
+                        // `shifted: false`, so that term is unreachable here.
+                        let lit = self.song_accent && kind == SoundKind::Typed;
+                        let roof = if lit {
+                            KEY_BELL_ROOF_LIT
+                        } else {
+                            KEY_BELL_ROOF
+                        };
                         let mk = |f0: f32, f1: f32, delay: f32| Voice {
                             delay,
                             dur: 0.30,
@@ -11780,14 +13761,14 @@ mod tests {
                                 },
                                 // THE TWIN TINK — the detuned half of the pair.
                                 Partial {
-                                    lvl: 0.18,
+                                    lvl: KEY_TINK_TWIN,
                                     f0: f1 * 4.010,
                                     f1: f1 * 4.010,
                                     ..Partial::default()
                                 },
                                 // THE TINK — pure double-octave glass.
                                 Partial {
-                                    lvl: 0.30,
+                                    lvl: KEY_TINK,
                                     f0: f1 * 4.0,
                                     f1: f1 * 4.0,
                                     ..Partial::default()
@@ -11799,10 +13780,117 @@ mod tests {
                             n_f1: 180.0,
                             n_glide: 0.006,
                             n_q: 0.7,
-                            lp_cut: 4200.0,
+                            lp_cut: roof,
                             ..Voice::default()
                         };
-                        self.spawn(mk(f0, f, 0.0), g * 0.30, pan);
+                        self.spawn(mk(f0, f, 0.0), g * KEY_BELL_TRIM, pan);
+                        // THE GLINT, mirrored (see `KEY_GLINT_LEVEL`): a
+                        // delayed, twinkling micro-chime on the ACCENTS. (The
+                        // production twin also glints a CAPITAL at half the
+                        // ratio; this oracle's scripts push `shifted: false`
+                        // for every cue — `SoundEvent` does not even reach it —
+                        // so that arm is unreachable here and is deliberately
+                        // not spelled, exactly like the Space/Shift kinds.)
+                        if self.song_accent && kind == SoundKind::Typed {
+                            let gf = f * KEY_GLINT_RATIO;
+                            self.spawn_seeded(
+                                Voice {
+                                    delay: KEY_GLINT_DELAY_S,
+                                    dur: KEY_GLINT_DUR_S,
+                                    attack: 0.0012,
+                                    decay: KEY_GLINT_DECAY_S,
+                                    p: [
+                                        Partial {
+                                            lvl: 0.5,
+                                            f0: gf,
+                                            f1: gf,
+                                            ..Partial::default()
+                                        },
+                                        // THE BEAT-TWINKLE, mirrored.
+                                        Partial {
+                                            lvl: KEY_GLINT_TWIN,
+                                            f0: gf * (1.0 + KEY_GLINT_DETUNE),
+                                            f1: gf * (1.0 + KEY_GLINT_DETUNE),
+                                            ..Partial::default()
+                                        },
+                                        // THE TOP, mirrored.
+                                        Partial {
+                                            lvl: KEY_GLINT_TOP,
+                                            f0: gf * (KEY_GLINT_TOP_RATIO / KEY_GLINT_RATIO),
+                                            f1: gf * (KEY_GLINT_TOP_RATIO / KEY_GLINT_RATIO),
+                                            ..Partial::default()
+                                        },
+                                    ],
+                                    tw_rate: KEY_GLINT_TW_RATE,
+                                    tw_depth: KEY_GLINT_TW_DEPTH,
+                                    lp_cut: 12_000.0,
+                                    ..Voice::default()
+                                },
+                                g * KEY_GLINT_LEVEL,
+                                -pan * 0.5,
+                                0.0,
+                                [0.0; 3],
+                            );
+                        }
+                        // THE STAR and THE DUST, mirrored (see
+                        // `KEY_CREST_DEGREE`): the phrase's peak note flashes.
+                        // `melody_lean` is zero on this oracle's
+                        // neutral-tone-only scripts, so the crest test is
+                        // `walk` against the degree directly — the exact
+                        // identity of `TrailSynth::song_crest` here.
+                        if kind == SoundKind::Typed
+                            && self.song_accent
+                            && self.walk >= KEY_CREST_DEGREE
+                        {
+                            self.spawn_seeded(
+                                Voice {
+                                    dur: KEY_AIR_DUR_S,
+                                    attack: KEY_AIR_ATTACK_S,
+                                    decay: KEY_AIR_DECAY_S,
+                                    n_lvl: 0.6,
+                                    n_f0: KEY_AIR_HZ0,
+                                    n_f1: KEY_AIR_HZ1,
+                                    n_glide: KEY_AIR_GLIDE_S,
+                                    n_q: KEY_AIR_Q,
+                                    tw_rate: KEY_AIR_TW_RATE,
+                                    tw_depth: KEY_AIR_TW_DEPTH,
+                                    lp_cut: 12_000.0,
+                                    ..Voice::default()
+                                },
+                                g * KEY_AIR_LEVEL,
+                                pan,
+                                0.0,
+                                [0.0; 3],
+                            );
+                            let sf = sparkle_octave(f * KEY_STAR_RATIO);
+                            self.spawn_seeded(
+                                Voice {
+                                    delay: KEY_STAR_DELAY_S,
+                                    dur: KEY_STAR_DUR_S,
+                                    attack: KEY_STAR_ATTACK_S,
+                                    decay: KEY_STAR_DECAY_S,
+                                    p: [
+                                        Partial {
+                                            lvl: 0.5,
+                                            f0: sf * KEY_STAR_FALL,
+                                            f1: sf,
+                                            glide: KEY_STAR_GLIDE_S,
+                                            ..Partial::default()
+                                        },
+                                        Partial::default(),
+                                        Partial::default(),
+                                    ],
+                                    tw_rate: KEY_STAR_TW_RATE,
+                                    tw_depth: KEY_STAR_TW_DEPTH,
+                                    lp_cut: 12_000.0,
+                                    ..Voice::default()
+                                },
+                                g * KEY_STAR_LEVEL,
+                                pan * KEY_STAR_PAN,
+                                0.0,
+                                [0.0; 3],
+                            );
+                        }
                         if kind == SoundKind::Jump {
                             // 1-3-5-8 run, 45 ms apart — the bell cascade.
                             let mut leap = |step: i32, delay: f32, lvl: f32, pan: f32| {
@@ -13048,6 +15136,7 @@ mod tests {
                     gain: 0.4,
                     tone: Tone::Technical,
                     bed: true, // the v0.56 reference has no bed gate
+                    shifted: false,
                 });
                 old.push(style, kind, pan, heat, hue, 0.4);
                 step(&mut new, &mut old, &mut nb, &mut ob, 5); // 100 ms
@@ -13065,6 +15154,7 @@ mod tests {
                     gain: 0.4,
                     tone: Tone::Technical,
                     bed: true, // the v0.56 reference has no bed gate
+                    shifted: false,
                 });
                 old.push(style, SoundKind::Typed, pan, 0.9, 0.5, 0.4);
                 step(&mut new, &mut old, &mut nb, &mut ob, 2); // 40 ms per key
@@ -13102,6 +15192,7 @@ mod tests {
                     gain: 0.4,
                     tone: Tone::Technical,
                     bed: true, // the v0.56 reference has no bed gate
+                    shifted: false,
                 });
                 old.push(style, SoundKind::Jump, -0.8, 0.3, 0.0, 0.4);
                 // Every jump must actually speak (min-gap bypass): Lumen's

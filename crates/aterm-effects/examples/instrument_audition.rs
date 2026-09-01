@@ -113,6 +113,7 @@ fn render(cues: &[Cue], seconds: f32) -> Vec<f32> {
                 gain: 0.4,
                 tone: Tone::Technical,
                 bed: false,
+                shifted: false,
             });
             cue_i += 1;
         }

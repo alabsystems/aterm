@@ -16,14 +16,25 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use aterm_effects::cat_glyphs_codegen::generate_pet_from_dir;
+use aterm_effects::cat_glyphs_codegen::generate_pet_from_assets;
+
+/// The shared asset-dir reader: the engine reads no file, the generator does.
+#[path = "support/asset_dir.rs"]
+mod asset_dir;
 
 fn main() -> ExitCode {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let pet_dir = root.join("art/pet");
     let out = root.join("src/pet_glyphs_gen.rs");
 
-    let source = match generate_pet_from_dir(&pet_dir) {
+    let assets = match asset_dir::read_toml_dir(&pet_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("gen_pet_glyphs: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match generate_pet_from_assets(&assets) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("gen_pet_glyphs: {e}");

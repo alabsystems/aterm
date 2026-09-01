@@ -64,6 +64,13 @@ pub struct Status {
     /// The last aggregate decision (`"up to date"`, `"staged …"`, `"idle: no token"`,
     /// `"rejected unsigned index at build N"`, …).
     pub outcome: String,
+    /// The rustup toolchain seams atpkg owns, as `rustup:<name>` ([`crate::seam`],
+    /// Lockstep S1): written when an attach succeeds, dropped by `seam detach` and
+    /// `uninstall --all`, and what every re-assertion walks. Absent from records
+    /// written before seams existed, so it defaults EMPTY — and an older app reading
+    /// a newer record simply ignores the key.
+    #[serde(default)]
+    pub seams: Vec<String>,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
@@ -203,6 +210,7 @@ mod tests {
             enabled: true,
             index_source: "alabsystems/aterm-toolchain-index".into(),
             outcome: "up to date".into(),
+            seams: Vec::new(),
             programs,
         };
         write(&l, &s).unwrap();
@@ -275,6 +283,56 @@ mod tests {
         let read_error = read_checked(&l).unwrap_err();
         assert_eq!(read_error.kind(), io::ErrorKind::InvalidData);
         assert!(read_error.to_string().contains("limit is"));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// Lockstep S1: the rustup `seams` record round-trips beside the program rows —
+    /// aterm-toml orders values before sub-tables, so the array never lands inside
+    /// the last `[programs.*]` table — and a record that predates the field (the
+    /// 0.65 shape) parses as "no seams", never as an error.
+    #[test]
+    fn seams_round_trip_and_default_empty() {
+        let l = layout("seams");
+        let mut programs = BTreeMap::new();
+        programs.insert(
+            "trust".to_string(),
+            ProgramStatus {
+                installed_build: Some(6808),
+                state: "managed 6808 — pinned by index 9".into(),
+                tree_root: "r".into(),
+            },
+        );
+        programs.insert("ay".to_string(), ProgramStatus::default());
+        let s = Status {
+            schema: 1,
+            updated_at: "2026-08-29T00:00:00Z".into(),
+            enabled: true,
+            index_source: "o/r".into(),
+            outcome: "up to date".into(),
+            seams: vec!["rustup:trust".into()],
+            programs,
+        };
+        write(&l, &s).unwrap();
+        let back = read(&l).expect("status reads back");
+        assert_eq!(back, s);
+        assert_eq!(back.seams, vec!["rustup:trust".to_string()]);
+        let text = std::fs::read_to_string(l.status()).unwrap();
+        let seams_at = text.find("seams = [").expect("seams array on disk");
+        let table_at = text.find("[programs.").expect("program tables on disk");
+        assert!(
+            seams_at < table_at,
+            "seams must precede the program tables:\n{text}"
+        );
+
+        // The 0.65 shape: no `seams` key at all.
+        let legacy = "schema = 1\nupdated_at = \"2026-08-01T00:00:00Z\"\nenabled = true\n\
+             index_source = \"o/r\"\noutcome = \"up to date\"\n\n[programs.trust]\n\
+             installed_build = 6808\nstate = \"managed 6808 — pinned by index 9\"\n\
+             tree_root = \"r\"\n";
+        std::fs::write(l.status(), legacy).unwrap();
+        let back = read_checked(&l).unwrap().expect("legacy record parses");
+        assert!(back.seams.is_empty(), "no key ⇒ no seams");
+        assert_eq!(back.programs["trust"].installed_build, Some(6808));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

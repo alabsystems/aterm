@@ -112,6 +112,7 @@ fn main() {
                     // (the redesign tournament listens to beds here even
                     // though the product default is off).
                     bed: true,
+                    shifted: false,
                 });
                 cue_i += 1;
             }

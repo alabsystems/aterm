@@ -43,11 +43,9 @@ and exits `1`.
 | `audit`         | `scripts/audit-supply-chain.sh`      | Supply-chain audit via cargo-deny |
 | `verify-proofs` | `scripts/verify-kani-proofs.sh`      | Opt-in Kani formal-proof verification |
 
-### Setup
-
-| Command | Wraps | Description |
-| --- | --- | --- |
-| `setup-trust` | `scripts/setup-trust-mc.sh` | Stand up the trust-mc checker |
+(The former `setup-trust` verb and its `scripts/setup-trust-mc.sh` are gone:
+`aterm pkg install trust-mc` provisions the model checker from the signed
+package index, and `aterm pkg doctor` names the store it filled.)
 
 ## Examples
 

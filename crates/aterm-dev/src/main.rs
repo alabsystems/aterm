@@ -30,12 +30,14 @@ struct Sub {
     group: Group,
 }
 
-/// Help groupings, in display order.
+/// Help groupings, in display order. (A `Setup` group existed while
+/// `setup-trust` wrapped `scripts/setup-trust-mc.sh`; both are gone —
+/// `aterm pkg install trust-mc` is the replacement, and toolchain provisioning
+/// belongs to the package manager, not a dev script.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Group {
     PackageRelease,
     QualityVerify,
-    Setup,
 }
 
 impl Group {
@@ -43,12 +45,11 @@ impl Group {
         match self {
             Group::PackageRelease => "Package & Release",
             Group::QualityVerify => "Quality & Verify",
-            Group::Setup => "Setup",
         }
     }
 
     /// Display order for the groups.
-    const ORDER: [Group; 3] = [Group::PackageRelease, Group::QualityVerify, Group::Setup];
+    const ORDER: [Group; 2] = [Group::PackageRelease, Group::QualityVerify];
 }
 
 /// The single Package & Release entry: `aterm-dev ship …` forwards to the
@@ -82,12 +83,6 @@ const SUBS: &[Sub] = &[
         about: "Opt-in Kani formal-proof verification",
         script: "scripts/verify-kani-proofs.sh",
         group: Group::QualityVerify,
-    },
-    Sub {
-        name: "setup-trust",
-        about: "Stand up the trust-mc checker",
-        script: "scripts/setup-trust-mc.sh",
-        group: Group::Setup,
     },
 ];
 

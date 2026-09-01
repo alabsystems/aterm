@@ -1203,16 +1203,25 @@ pub fn model_registry() -> Vec<Model> {
         // ancestor swaps and validates its identity again before replying.
         // Tier-1 binds GUI/media read and write transactions.
         anchored_artifact_transaction_model(),
-        // Capture publication continues past worker enqueue: exact handles are
-        // retained and revalidated through the control socket's complete reply
+        // Capture publication continues past worker enqueue: publication guards
+        // are retained and revalidated through the control socket's complete reply
         // and a fresh causal nonce challenge/echo. ACK-error/half-closed clients
         // and partial write failures retain the guard in a central quarantine
         // until its abstract 30-second expiry; only a valid echo releases
         // immediately.
         artifact_reply_publication_model(),
-        // `video frames` readers share a bounded refcount. Final validation arms
-        // one capability-bound last-release sweep; acquisition is fail-closed
-        // from the last-release decision through sweep completion.
+        // Failed ACKs can outlive their control workers, so one process-wide
+        // admission cap spans queued, active, and quarantined artifact replies.
+        artifact_handoff_capacity_model(),
+        // Every video frame/index member is file-synced before its write action;
+        // one directory batch barrier must cover the complete current member set
+        // before the reader-visible publication marker can appear. Tier-1 binds
+        // all three transitions to ConfinedVideoDir.
+        video_batch_publication_durability_model(),
+        // The video producer and `video frames` readers share a bounded lease
+        // count. Marker publication or final reader validation requests one
+        // capability-bound last-release sweep; acquisition is fail-closed from
+        // the last-release decision through sweep completion.
         artifact_reader_lease_model(),
         capture_after_present_model(),
         native_capture_source_model(),

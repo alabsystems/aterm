@@ -53,6 +53,12 @@ pub mod cat_glyphs_gen {
     include!("cat_glyphs_gen.rs");
 }
 pub mod color_math;
+/// THE ONE PET DRIVER (owner, 2026-08-30: *"first, you need to migrate the
+/// pet from the app and move it into the engine"*): `CompanionOwner` owns a
+/// resident [`kitty_pet`] brain per surface, senses for it, dresses it,
+/// decides custody and draws it — the laws the native app used to run in
+/// four copies, ported here so every host drives one implementation.
+pub mod companion;
 /// The dog roster's bake path: one authored breed head → an exact-size RGBA
 /// tile, handed to the shared cat atlas through `CatBaker::host_tile` — the
 /// [`pet_baker`] pattern applied to the typed-word dog cameo.
@@ -83,6 +89,12 @@ mod effect_util;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
+/// THE HOST CONTRACT (`docs/DESIGN-host-boundary-2026-08-30.md` §3): the plain
+/// data every host — the macOS app, the JS pages, a headless capture — hands
+/// the effects driver for one frame (`HostFrameInput`, `TerminalFacts`) and
+/// gets back (`HostFrameOutput`, `Wake`, `PressOutcome`, `FrameEvent`). No
+/// platform type, `aterm_time::Instant` only.
+pub mod host;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
 /// trail style — its art, pose, and exit choreography.
 pub mod kitty_cursor;
@@ -100,6 +112,11 @@ pub mod matrix_rain;
 pub mod nova;
 /// The mushroom cloud — the rarest f-bomb detonation tier.
 pub mod nuke;
+/// PRISM WAKE — the answer to PROGRAM OUTPUT: a thin per-theme rainbow comet on
+/// the newest damaged row plus one soft pip, metered by the typing-momentum law,
+/// echo-discounted so your own keystrokes are invisible to it, and coalescing to
+/// a single mute ribbon under a flood. See `docs/DESIGN-output-streak-2026-08-30.md`.
+pub mod output_streak;
 /// The pet roster's bake path: one authored full-body pose → an exact-size
 /// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
 pub mod pet_baker;

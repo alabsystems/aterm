@@ -62,6 +62,10 @@ impl EventLoopExtStartupNotify for ActiveEventLoop {
             crate::platform_impl::ActiveEventLoop::Wayland(_) => env::var(WAYLAND_VAR),
             #[cfg(x11_platform)]
             crate::platform_impl::ActiveEventLoop::X(_) => env::var(X11_VAR),
+            // Startup notification is a desktop-session handshake. A headless run has no
+            // session to be activated by, so there is no token to read — not an error,
+            // simply nothing, which is what `NotPresent` means to the `.ok()` below.
+            crate::platform_impl::ActiveEventLoop::Headless(_) => Err(env::VarError::NotPresent),
         }
         .ok()
         .map(ActivationToken::from_raw)

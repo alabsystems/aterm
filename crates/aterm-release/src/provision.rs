@@ -1497,8 +1497,8 @@ fn verifiers_check(bin: &Path) -> Check {
             // The config key had no FILE and named a tool that is not in the missing
             // list, so neither half of this remedy could be acted on. Name the file and
             // the command.
-            fix: "atpkg install trust\n\
-                  or rebuild: set `tools` in $HOME/trust/bootstrap.toml to include every \
+            fix: "aterm pkg install trust   (then `aterm pkg doctor` to confirm the store)\n\
+                  or, from source: set `tools` in $HOME/trust/bootstrap.toml to include every \
                   driver above, then `python3 x.py build --stage 2` in $HOME/trust"
                 .into(),
         }
@@ -1570,8 +1570,9 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
         // linking it would only relocate the death.
         return Check::Fail {
             what: format!("{} exists but is not executable", target.display()),
-            fix: "an incomplete stage2 — rebuild it (`python3 x.py build --stage 2` in \
-                  $HOME/trust) or reinstall via `atpkg install trust`"
+            fix: "an incomplete stage2 — reinstall it (`aterm pkg install trust`, then \
+                  `aterm pkg doctor`) or, from source, rebuild it (`python3 x.py build \
+                  --stage 2` in $HOME/trust)"
                 .into(),
         };
     }

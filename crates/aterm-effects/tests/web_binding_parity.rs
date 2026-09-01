@@ -312,6 +312,26 @@ fn effects_api_requires_matrix_rain_surface() {
     }
 }
 
+/// PRISM WAKE's twin of the rain symbol floor, and it exists for exactly the
+/// same reason: line parity proves the two copies AGREE, never that they agree
+/// on something. A symmetric deletion — dropping the streak from both bindings
+/// in one commit — reads as perfectly parallel and would sail through every
+/// other test in this file.
+#[test]
+fn effects_api_requires_output_streak_surface() {
+    let wasm = read_module(WASM_CRATE, "effects_api.rs");
+    let gpu = read_module(GPU_WEB_CRATE, "effects_api.rs");
+    for symbol in [
+        "set_output_streak(",
+        "set_output_streak_theme",
+        "set_output_streak_reduced_motion",
+        "note_output_streak_keystroke",
+    ] {
+        assert!(wasm.contains(symbol), "aterm-wasm missing {symbol}");
+        assert!(gpu.contains(symbol), "aterm-gpu-web missing {symbol}");
+    }
+}
+
 /// Test bodies are out of the parity contract, so nothing else stops a copy
 /// from being reconciled by DELETING its tests.
 #[test]

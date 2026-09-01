@@ -844,7 +844,7 @@ pub(crate) fn cmd_mouse(proxy: &EventLoopProxy<Wake>, scope: super::Scope, rest:
 /// carve-out. Split out pure so the policy is unit-testable without an event loop
 /// (mirrors `update_is_owner_only_subcmd` / `front_drive_escalation`).
 pub(crate) fn scope_suppresses_copy_on_select(scope: super::Scope) -> bool {
-    !matches!(scope, super::Scope::Owner)
+    !scope.is_owner_class()
 }
 
 /// Stamp the scoped-edge copy-on-select suppression onto a mouse `InputEvent` (a

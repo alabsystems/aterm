@@ -987,6 +987,12 @@ pub(crate) struct Config {
     /// network surface (secure default). See [`NetConfig`] and [`crate::net_listen`]/
     /// [`crate::net_connections`].
     pub(crate) net: Option<NetConfig>,
+    /// The fabric bridge (`[fabric]`): the `aterm-link serve …` child this
+    /// instance launches, holding the far ends of two socketpairs at fds 3 and 4
+    /// and speaking `Scope::Bridge` over them. Absent ⇒ no fabric (secure
+    /// default, exactly like the embedded operator). `ATERM_FABRIC_COMMAND`
+    /// overrides it. See [`FabricConfig`] and [`crate::fabric_launch`].
+    pub(crate) fabric: Option<FabricConfig>,
     /// In-app self-update channel (`[update]`): which GitHub repo the silent updater
     /// pulls notarized releases from. Absent ⇒ the compiled-in default channel
     /// (`alabsystems/aterm`, the PUBLIC mirror — readable with no token, which is
@@ -1007,12 +1013,25 @@ pub(crate) struct Config {
     /// costume mode is opt-in, required by the zero-cost pins); set
     /// `enabled = true` to rain. See [`MatrixRainConfig`].
     pub(crate) matrix_rain: Option<MatrixRainConfig>,
+    /// PRISM WAKE — the output streak (`[output_streak]`,
+    /// `docs/DESIGN-output-streak-2026-08-30.md`): a thin per-theme rainbow
+    /// comet answering fresh PROGRAM OUTPUT, plus one soft pip per episode.
+    /// Absent ⇒ ON (owner ruling 2026-08-31, *"default on"* — the inverse of
+    /// `[matrix_rain]`, which stays opt-in); `enabled = false` opts out. See
+    /// [`OutputStreakConfig`], whose field docs carry the per-key laws.
+    pub(crate) output_streak: Option<OutputStreakConfig>,
     /// Bundled ALab toolchain manager (`[packages]`, the `atpkg` lane): the
     /// background tools loop's master/auto flags plus the account/channel/
     /// include/exclude/links keys the CO-LOCATED `atpkg` reads out of this SAME
     /// file itself. Absent ⇒ today's behavior (loop on, update-only). See
     /// [`PackagesConfig`].
     pub(crate) packages: Option<PackagesConfig>,
+    /// macOS consent posture (`[privacy]`, the TCC lane): the master switch, the
+    /// silent full-disk-access probe, the at-most-once notice, the owner-initiated
+    /// folder warm-up and the protected-root set the consent tier shares with
+    /// Containment. Absent ⇒ today's behavior (report the posture, probe silently,
+    /// offer the warm-up only on an explicit gesture). See [`PrivacyConfig`].
+    pub(crate) privacy: Option<PrivacyConfig>,
 }
 
 /// Source used to produce a terminal's live, human-readable description.
@@ -1403,11 +1422,16 @@ pub(crate) fn path_feed_read_count() -> usize {
 /// value by `Arc` with the live terminal host and every semantic Settings view,
 /// keeping manifest IO, diagnostics, picker ids, and rendered parameters on the
 /// exact same revision instead of quietly compiling the same files again.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrailPackCatalog {
     pub(crate) packs: std::collections::HashMap<String, aterm_effects::cursor_glow::TrailParams>,
     pub(crate) ids: Vec<String>,
     pub(crate) diagnostics: Vec<String>,
+    /// Presentation parsed once with this immutable config-asset generation.
+    /// The live redraw path reads this POD instead of rescanning the style and
+    /// companion vocabularies every frame.
+    resolved_style_raw: Box<str>,
+    resolved_presentation: ResolvedTrailPresentation,
 }
 
 /// Maximum encoded PNG bytes admitted for one custom kitty cursor sprite.
@@ -2019,6 +2043,23 @@ impl TrailPackCatalog {
     pub(crate) fn get(&self, id: &str) -> Option<aterm_effects::cursor_glow::TrailParams> {
         self.packs.get(id).copied()
     }
+
+    fn cache_presentation(&mut self, raw: &str) {
+        self.resolved_presentation = resolve_trail_presentation(raw, self);
+        self.resolved_style_raw = raw.trim().into();
+    }
+
+    /// Cached production answer, with a dynamic fallback for test/preview code
+    /// that deliberately mutates `Config` without publishing a new immutable
+    /// asset generation.
+    pub(crate) fn presentation_for(&self, raw: &str) -> ResolvedTrailPresentation {
+        let raw = raw.trim();
+        if raw == self.resolved_style_raw.as_ref() {
+            self.resolved_presentation
+        } else {
+            resolve_trail_presentation(raw, self)
+        }
+    }
 }
 
 /// Why a configured trail style cannot emit.  This is shared by live terminal
@@ -2041,6 +2082,52 @@ pub(crate) struct ResolvedTrailStyle {
     pub(crate) issue: Option<TrailStyleIssue>,
 }
 
+/// All string-keyed presentation decisions for one resolved trail style.
+///
+/// Kept beside the immutable Trail Pack catalog because both are admitted from
+/// the same config generation. Rendering then consumes only `Copy` fields;
+/// aliases, companion species, ribbon geometry, and pack lookup cannot drift or
+/// be reparsed independently on the frame path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ResolvedTrailPresentation {
+    pub(crate) style: ResolvedTrailStyle,
+    pub(crate) beam: bool,
+    pub(crate) ribbon_tall: bool,
+    pub(crate) pet_species: Option<aterm_effects::kitty_pet::PetSpecies>,
+    pub(crate) comet: bool,
+}
+
+impl Default for ResolvedTrailPresentation {
+    fn default() -> Self {
+        let raw = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
+        let style = aterm_effects::cursor_glow::GlowStyle::parse(raw);
+        Self {
+            style: ResolvedTrailStyle {
+                canonical: Some(raw),
+                style: Some(style),
+                pack: None,
+                issue: None,
+            },
+            beam: aterm_effects::cursor_glow::style_has_beam_of(style, raw),
+            ribbon_tall: true,
+            pet_species: Some(aterm_effects::kitty_pet::PetSpecies::Cat),
+            comet: false,
+        }
+    }
+}
+
+impl Default for TrailPackCatalog {
+    fn default() -> Self {
+        Self {
+            packs: std::collections::HashMap::new(),
+            ids: Vec::new(),
+            diagnostics: Vec::new(),
+            resolved_style_raw: crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE.into(),
+            resolved_presentation: ResolvedTrailPresentation::default(),
+        }
+    }
+}
+
 impl ResolvedTrailStyle {
     fn off() -> Self {
         Self {
@@ -2054,9 +2141,8 @@ impl ResolvedTrailStyle {
 
 /// Renderer-neutral preference inputs for the shared cursor glow resolver.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct CursorGlowInputs<'a> {
+pub(crate) struct CursorGlowInputs {
     pub(crate) enabled: bool,
-    pub(crate) style_raw: &'a str,
     pub(crate) color: Option<u32>,
     pub(crate) accent: Option<u32>,
     pub(crate) duration_ms: u64,
@@ -2284,6 +2370,49 @@ pub(crate) struct MatrixRainConfig {
     pub(crate) seed: Option<u64>,
 }
 
+/// The `[output_streak]` table — PRISM WAKE
+/// (`docs/DESIGN-output-streak-2026-08-30.md`). ON BY DEFAULT, which is the
+/// inverse of `[matrix_rain]` beside it and the same posture as
+/// `[sparkle_words]`: owner ruling 2026-08-31, *"default on."* Every field is
+/// optional; defaults + clamps live ONLY in the six
+/// `Config::output_streak_*_or_default` resolvers, so an absent key and a
+/// default-valued key are indistinguishable — and every numeric one clamps
+/// rather than rejecting, because a config typo must never abort the load
+/// (the `[matrix_rain]` idiom, kept deliberately identical).
+///
+/// PURELY ADDITIVE LIGHT over the grid interior: the engine never mutates a
+/// cell, so copy, selection, search and recordings read exact bytes, and the
+/// `OVER_INK_COV_CAP` law keeps text no harder to read than with the effect
+/// off. The numeric bands below are the HOST's half of a two-sided clamp —
+/// `aterm_effects::output_streak` re-clamps every one of them defensively, so
+/// neither an embedder nor a future caller can widen what a user may reach.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct OutputStreakConfig {
+    /// Master switch. Absent ⇒ ON everywhere except Windows (see
+    /// [`Config::output_streak_enabled_or_default`] for the full ruling and
+    /// the platform law it inherits).
+    pub(crate) enabled: Option<bool>,
+    /// Amplitude scale `0..=1` (default `1.0`). Non-finite fails OFF.
+    pub(crate) intensity: Option<f32>,
+    /// Comet tail length in cells, clamped into
+    /// [`aterm_effects::output_streak::TAIL_MIN`]`..=`[`aterm_effects::output_streak::TAIL_MAX`].
+    /// Declared `u32` (not `u16`) for the same reason `matrix_rain.fps` is:
+    /// a wider parse type means an absurd value CLAMPS instead of failing
+    /// deserialization and taking the whole config file down with it.
+    pub(crate) tail: Option<u32>,
+    /// Resident comet cap, clamped `1..=`[`aterm_effects::output_streak::MAX_COMETS`].
+    /// Declared `u32` for the parse-then-clamp reason above.
+    pub(crate) max_streaks: Option<u32>,
+    /// Mandatory idle drain in seconds, clamped `2..=120`. There is no
+    /// `idle = "keep"` here any more than there is in `[matrix_rain]` — no
+    /// configuration animates forever (design §5).
+    pub(crate) idle_secs: Option<f32>,
+    /// Whether the episode's pip and closing exhale may be recorded at all.
+    /// Absent ⇒ ON (the same owner ruling: it is ONE feature).
+    pub(crate) sound: Option<bool>,
+}
+
 /// The `[packages]` table (the bundled-ALab-toolchain `atpkg` lane,
 /// `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Every field is optional;
 /// defaults live ONLY in the resolver ([`Config::packages_update_loop_enabled`])
@@ -2301,9 +2430,10 @@ pub(crate) struct MatrixRainConfig {
 /// # auto_update  = true    # run `atpkg update` on the 6h cadence (default true)
 /// # auto_install = false   # ALSO install missing default-set members (default
 /// #                        # FALSE — multi-GB toolchains need explicit consent)
-/// # seed_install = true    # install the BUNDLED seed registry on first launch
-/// #                        # (default TRUE — the bytes ship inside the app;
-/// #                        # false = announce an offer instead). atpkg-only key.
+/// # seed_install = true    # the first-run FILL: record adoption and install the
+/// #                        # ALab toolset from the SIGNED NETWORK INDEX, unattended
+/// #                        # (default TRUE; no release since v0.63.0 seals a seed —
+/// #                        # false = announce-only, nothing adopted). atpkg-only key.
 /// # account      = "alabsystems"   # index owner override (default = compiled owner)
 /// # channel      = "stable"
 /// # include      = ["ay"]  # narrowing-only filters over the signed index set
@@ -2323,8 +2453,9 @@ pub(crate) struct PackagesConfig {
     /// Absent ⇒ OFF (consent-gated — the Settings switch is the consent click).
     /// Consumed by ATPKG (its own reader), not by the GUI loop gate.
     pub(crate) auto_install: Option<bool>,
-    /// `[packages].seed_install`: install the BUNDLED toolchain seal on first launch.
-    /// Default TRUE (the bytes ship inside the app, so installing the app is the
+    /// `[packages].seed_install`: the first-run fill — record adoption and install the
+    /// ALab toolset from the signed network index, unattended (a pre-v0.63 seeded
+    /// bundle fills from its seal instead). Default TRUE (installing the app is the
     /// consent). Consumed by atpkg, mirrored here so Settings can offer the switch —
     /// the docs pointed at this key while the only way to set it was hand-editing a
     /// file a new user does not have yet, which made the documented opt-out
@@ -2338,6 +2469,169 @@ pub(crate) struct PackagesConfig {
     pub(crate) include: Option<Vec<String>>,
     /// Narrowing-only exclude filter — consumed by atpkg.
     pub(crate) exclude: Option<Vec<String>>,
+}
+
+/// `[privacy] warmup_hold_ms` DEFAULT: 120 s. The in-place apply already backs
+/// off while the user is interacting; a warm-up is the same shape (an owner
+/// gesture, seconds long) and gets the same bounded courtesy, not an open one.
+pub(crate) const PRIVACY_WARMUP_HOLD_MS_DEFAULT: u64 = 120_000;
+
+/// `[privacy] warmup_hold_ms` CEILING: 10 min, applied as a clamp in
+/// [`Config::privacy_warmup_hold_ms`] and reported by `--validate-config`.
+///
+/// The hold exists so a system modal raised by an owner gesture is not cut off
+/// mid-answer by the automatic in-place apply. A hold longer than this stops
+/// being that and becomes indistinguishable from pinning a build to one
+/// instance — which the design refuses outright — so the value is clamped here
+/// rather than trusted, and the author is told the effective number.
+pub(crate) const PRIVACY_WARMUP_HOLD_MS_MAX: u64 = 600_000;
+
+/// `[privacy] probe_interval_ms` DEFAULT: 5 s. It is a FLOOR on re-probing, so
+/// it is also the worst-case lag between a human answering a system dialog and
+/// aterm's posture changing.
+pub(crate) const PRIVACY_PROBE_INTERVAL_MS_DEFAULT: u64 = 5_000;
+
+/// The `[privacy] warmup` vocabulary: whether the deliberate pre-prompting
+/// gesture ("Ask for folder access now", on the Security panel) is offered.
+///
+/// THERE IS DELIBERATELY NO FIRST-LAUNCH VALUE. Walking the folder set the
+/// first time aterm opens would stack three system modals in front of a person
+/// who has not yet typed anything, which is its own bad surprise — and a
+/// consent-raising action that fires without a gesture is exactly what this
+/// design exists to remove. The vocabulary is closed here so a future "do it
+/// automatically" value has to be argued for in code review rather than
+/// arriving as a string in someone's config.
+///
+/// An unknown spelling resolves to the default rather than failing the parse:
+/// [`crate::app_config::load_config`] discards the WHOLE file on a serde error,
+/// so a closed serde enum here would silently throw away every other setting
+/// over one typo. `--validate-config` names the typo instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PrivacyWarmup {
+    /// Never offered.
+    Never,
+    /// Offered as an explicit owner gesture, and reachable no other way: no
+    /// control verb, no environment variable, no automatic trigger.
+    #[default]
+    OnRequest,
+}
+
+impl PrivacyWarmup {
+    /// The config spelling, which is also the report spelling.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::OnRequest => "on-request",
+        }
+    }
+
+    /// Every accepted spelling, in the order `--validate-config` lists them.
+    pub(crate) const ALL: &'static [Self] = &[Self::Never, Self::OnRequest];
+
+    /// Parse a config spelling (case-insensitive). `None` for anything else so
+    /// the validator can name it; the resolver then uses the default.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|candidate| value.eq_ignore_ascii_case(candidate.as_str()))
+    }
+}
+
+/// The `[privacy]` table (the macOS consent / TCC lane,
+/// `docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §4). Every field is optional;
+/// defaults live ONLY in the resolvers ([`Config::privacy_enabled`] and its
+/// siblings) — an absent table is exactly the shipping behavior.
+///
+/// The table governs REPORTING plus one owner-initiated gesture. Nothing here
+/// answers a system dialog, and nothing here grants aterm access it does not
+/// already have: the only thing that widens what aterm may read is a grant the
+/// owner makes in System Settings.
+///
+/// **No environment variable, by design.** `ATERM_*` is stripped from the
+/// shells aterm spawns (`aterm_types::env_sanitize`), and a knob a program
+/// inside a session could flip would be a consent surface an agent controls.
+/// For the same reason there is no control verb that writes this table.
+///
+/// ```toml
+/// [privacy]
+/// # enabled            = true            # master switch; false ⇒ every consent field reads `unknown`
+/// # check              = true            # the silent, prompt-free full-disk-access probe
+/// # notice             = true            # the at-most-once transient pill
+/// # report_attribution = true            # per-session responsible-pid corroboration
+/// # warmup             = "on-request"    # "never" | "on-request"  (no first-launch value, by design)
+/// # warmup_folders     = ["documents", "desktop", "downloads"]
+/// # warmup_hold_ms     = 120000          # hard cap on the in-place-apply hold while a warm-up runs
+/// # probe_interval_ms  = 5000            # floor on re-probing; also the worst-case posture lag
+/// # observer           = false           # the tccd log observer (§3.6) — OFF by default
+/// # protected_roots    = []              # empty ⇒ aterm_containment::sbpl::PRIVATE_SUBDIRS
+/// # auto_accept        = false           # RESERVED — not implemented; see below
+/// ```
+///
+/// `auto_accept` is parsed and deliberately UNIMPLEMENTED — no resolver reads
+/// it, so nothing in the build can act on it. Setting it earns a
+/// `--validate-config` semantic warning naming the grant that does work, which
+/// makes the refusal DISCOVERABLE rather than silent: a reserved key that says
+/// "aterm will not do this, here is what does" beats an unknown key that says
+/// nothing and beats a key that quietly does nothing.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct PrivacyConfig {
+    /// Master for the whole consent lane. Absent ⇒ ON. With it off every
+    /// consent field reads `unknown`, no probe runs, no notice fires and the
+    /// warm-up gesture is not offered — `unknown` because aterm stopped
+    /// looking, which is not the same claim as "denied".
+    pub(crate) enabled: Option<bool>,
+    /// The silent, prompt-free full-disk-access probe. Absent ⇒ ON. It opens
+    /// one already-protected file read-only and closes it; it cannot raise a
+    /// dialog, and it reads nothing.
+    pub(crate) check: Option<bool>,
+    /// The at-most-once transient notice. Absent ⇒ ON.
+    pub(crate) notice: Option<bool>,
+    /// Per-session responsible-process corroboration on the reports. Absent ⇒
+    /// ON. It only corroborates: aterm's own adoption record is what decides
+    /// whether a session is `live` or `adopted`.
+    pub(crate) report_attribution: Option<bool>,
+    /// `"never"` | `"on-request"`. Absent ⇒ `on-request`. See [`PrivacyWarmup`]
+    /// for why there is no first-launch value.
+    pub(crate) warmup: Option<String>,
+    /// Which folders the warm-up walks, by NAME
+    /// (`aterm_containment::consent::Folder`). Absent ⇒ every folder the
+    /// consent module knows, in the order it walks them. An explicit empty
+    /// list means exactly what it says — nothing to walk — which is NOT how
+    /// `protected_roots` reads an empty list, on purpose: one is a work list,
+    /// the other is a policy that must never resolve to "nothing is sensitive".
+    pub(crate) warmup_folders: Option<Vec<String>>,
+    /// Hard cap on the in-place-apply hold held while a warm-up worker is live,
+    /// in ms. Absent ⇒ [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]; clamped to
+    /// [`PRIVACY_WARMUP_HOLD_MS_MAX`].
+    pub(crate) warmup_hold_ms: Option<u64>,
+    /// Floor on re-probing, in ms. Absent ⇒
+    /// [`PRIVACY_PROBE_INTERVAL_MS_DEFAULT`].
+    pub(crate) probe_interval_ms: Option<u64>,
+    /// The `tccd` log OBSERVER (design §3.6, `crate::consent_observer`).
+    /// Absent ⇒ FALSE. It streams `/usr/bin/log` and reports a pending consent
+    /// prompt only on a direct observation; it is spike-gated, depends on
+    /// admin-group membership, and reads an undocumented message format, so it
+    /// ships off and is turned on here or not at all. There is deliberately no
+    /// environment variable and no control verb: a program inside a session
+    /// must not be able to enable a consent surface.
+    pub(crate) observer: Option<bool>,
+    /// Which roots count as protected. Absent or EMPTY ⇒
+    /// `aterm_containment::sbpl::PRIVATE_SUBDIRS` under `$HOME` — the same set
+    /// the Containment tier denies, because the containment tier and the
+    /// consent tier must not disagree about which paths are sensitive. Entries
+    /// are absolute or `~/`-prefixed; anything else is ignored and named by
+    /// `--validate-config`.
+    pub(crate) protected_roots: Option<Vec<String>>,
+    /// RESERVED AND UNIMPLEMENTED. aterm does not answer macOS consent
+    /// dialogs — it has no supported way to, and a terminal that clicked
+    /// "Allow" on a person's behalf would be a worse thing than the
+    /// interruption it removed. Parsed so the refusal can be stated by
+    /// `--validate-config` instead of the key reading as unknown; deliberately
+    /// NOT given a resolver, so no consumer can grow one by accident.
+    pub(crate) auto_accept: Option<bool>,
 }
 
 /// The `[net]` table: the inbound listener settings (persisting what was
@@ -2414,6 +2708,31 @@ pub(crate) struct Connection {
     /// enforces it before relaying and fails closed if it cannot be verified.
     #[serde(default)]
     pub(crate) expect_nonce: Option<String>,
+}
+
+/// The `[fabric]` table: the cross-aterm message bus, off by default.
+///
+/// ```toml
+/// [fabric]
+/// command = "aterm-link serve --fleet lab --broker /run/astream.sock --cap-file ~/.config/aterm/fabric.cap"
+/// ```
+///
+/// The command is split on whitespace and executed DIRECTLY — never through a
+/// shell, so no character of it is an injection surface for whoever can write the
+/// config. The child inherits two socketpair ends at fds 3 and 4 and nothing
+/// else: no instance token, no socket path, no aterm credential. Its authority is
+/// the DESCRIPTOR — there is no token file to steal, and the only way to be the
+/// bridge is to be the process aterm spawned.
+///
+/// The instance supervises it and relaunches with back-off. That is not a way
+/// around the halt: when either descriptor closes, every session the bridge
+/// governed is held `reason=fabric-lost origin=fleet` BEFORE any relaunch, so
+/// killing the bridge is strictly worse for an agent than leaving it alone.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct FabricConfig {
+    /// The bridge command line. Absent or blank ⇒ the fabric is off.
+    pub(crate) command: Option<String>,
 }
 
 /// The `[update]` table: where the in-app self-updater pulls releases from. Both
@@ -3190,10 +3509,10 @@ impl Config {
             .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
     }
 
-    /// The configured cursor-trail style, trimmed but NOT lowercased — borrowed, so
-    /// the per-redraw caller (`glow_config`, run every keystroke) can
-    /// classify it with `eq_ignore_ascii_case` / a case-insensitive `GlowStyle::parse`
-    /// instead of paying a `to_ascii_lowercase` heap allocation on every frame.
+    /// The configured cursor-trail style, trimmed but NOT lowercased. The
+    /// immutable config-asset generation parses it once and the frame path
+    /// consumes a [`ResolvedTrailPresentation`]; keeping this borrowed still
+    /// avoids an allocation at status, validation, and preview seams.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
         // Default: the RAINBOW KITTY PET (the smooth rainbow ribbon trailed by the
         // walking cat — the companion the owner runs), read from the single
@@ -3204,16 +3523,6 @@ impl Config {
             .as_deref()
             .unwrap_or(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
             .trim()
-    }
-
-    /// The configured style as the engine RESOLVES it — the canonical spelling,
-    /// or the default when the authored value is not a spelling anything knows.
-    /// Every raw-token predicate on the draw path asks this rather than
-    /// [`Self::cursor_trail_style_raw`]; see [`effective_trail_style_token`].
-    /// `trail status` still prints the authored string beside it, so a fallback
-    /// stays legible as a fallback.
-    pub(crate) fn cursor_trail_style_effective(&self) -> &str {
-        effective_trail_style_token(self.cursor_trail_style_raw())
     }
 
     /// Aurora brightness, default 0.7, clamped 0.0..=1.0. A non-finite value
@@ -3382,46 +3691,46 @@ impl Config {
 
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         let mut loaded = TrailPackCatalog::default();
-        let Some(paths) = self.cursor_trail_packs.as_deref() else {
-            return (std::sync::Arc::new(loaded), fingerprint.finish());
-        };
-        if paths.len() > MAX_ACTIVE_TOY_PACKS {
-            loaded.diagnostics.push(format!(
-                "cursor_trail_packs lists {} paths; only the first \
-                 {MAX_ACTIVE_TOY_PACKS} are active",
-                paths.len(),
-            ));
-        }
-        for (index, path) in paths.iter().take(MAX_ACTIVE_TOY_PACKS).enumerate() {
-            let (expanded, source) = read_and_fingerprint_path_feed_with_reader(
-                path,
-                aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES,
-                &mut fingerprint,
-                |expanded, max_bytes| read(index, expanded, max_bytes),
-            );
-            let source = match source {
-                Ok(source) => source,
-                Err(error) => {
-                    loaded.diagnostics.push(format!(
-                        "cursor_trail_packs[{index}] {expanded:?} unreadable ({error}); skipping"
-                    ));
-                    continue;
-                }
-            };
-            let pack = match aterm_effects::trail_pack::compile_trail_pack_toml(&source) {
-                Ok(pack) => pack,
-                Err(error) => {
-                    loaded.diagnostics.push(format!(
-                        "cursor_trail_packs[{index}] {expanded:?} invalid ({error}); skipping"
-                    ));
-                    continue;
-                }
-            };
-            let (metadata, params) = pack.into_parts();
-            loaded.packs.insert(metadata.id, params);
+        if let Some(paths) = self.cursor_trail_packs.as_deref() {
+            if paths.len() > MAX_ACTIVE_TOY_PACKS {
+                loaded.diagnostics.push(format!(
+                    "cursor_trail_packs lists {} paths; only the first \
+                     {MAX_ACTIVE_TOY_PACKS} are active",
+                    paths.len(),
+                ));
+            }
+            for (index, path) in paths.iter().take(MAX_ACTIVE_TOY_PACKS).enumerate() {
+                let (expanded, source) = read_and_fingerprint_path_feed_with_reader(
+                    path,
+                    aterm_effects::trail_pack::MAX_TRAIL_PACK_BYTES,
+                    &mut fingerprint,
+                    |expanded, max_bytes| read(index, expanded, max_bytes),
+                );
+                let source = match source {
+                    Ok(source) => source,
+                    Err(error) => {
+                        loaded.diagnostics.push(format!(
+                            "cursor_trail_packs[{index}] {expanded:?} unreadable ({error}); skipping"
+                        ));
+                        continue;
+                    }
+                };
+                let pack = match aterm_effects::trail_pack::compile_trail_pack_toml(&source) {
+                    Ok(pack) => pack,
+                    Err(error) => {
+                        loaded.diagnostics.push(format!(
+                            "cursor_trail_packs[{index}] {expanded:?} invalid ({error}); skipping"
+                        ));
+                        continue;
+                    }
+                };
+                let (metadata, params) = pack.into_parts();
+                loaded.packs.insert(metadata.id, params);
+            }
         }
         loaded.ids = loaded.packs.keys().cloned().collect();
         loaded.ids.sort();
+        loaded.cache_presentation(self.cursor_trail_style_raw());
         (std::sync::Arc::new(loaded), fingerprint.finish())
     }
 
@@ -3433,8 +3742,10 @@ impl Config {
         &self,
         themes: std::sync::Arc<ThemeCatalog>,
     ) -> std::sync::Arc<ConfigAssetCatalog> {
+        let mut trail_packs = TrailPackCatalog::default();
+        trail_packs.cache_presentation(self.cursor_trail_style_raw());
         std::sync::Arc::new(ConfigAssetCatalog {
-            trail_packs: std::sync::Arc::new(TrailPackCatalog::default()),
+            trail_packs: std::sync::Arc::new(trail_packs),
             kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
             wallpaper: resolve_wallpaper_asset(self.wallpaper.as_deref()),
             themes,
@@ -4087,6 +4398,148 @@ impl Config {
         self.packages_enabled() && p.auto_update.unwrap_or(true)
     }
 
+    /// The `[privacy]` master bit (default TRUE). With it off every consent
+    /// field reads `unknown` — the honest word for "aterm stopped looking",
+    /// which is a different claim from `denied`.
+    pub(crate) fn privacy_enabled(&self) -> bool {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.enabled)
+            .unwrap_or(true)
+    }
+
+    /// The `[privacy]` `check` bit (default TRUE): the silent, prompt-free
+    /// full-disk-access probe. Read it through [`Config::privacy_probe_gate`]
+    /// rather than alone — the master switch gates it, and a caller that reads
+    /// this bit by itself would probe with the lane switched off.
+    pub(crate) fn privacy_check(&self) -> bool {
+        self.privacy.as_ref().and_then(|p| p.check).unwrap_or(true)
+    }
+
+    /// The `[privacy]` `notice` bit (default TRUE): the at-most-once transient
+    /// pill. Also gated by the master switch, which is why `enabled = false`
+    /// with `notice = true` earns a `--validate-config` warning instead of
+    /// silently never firing.
+    pub(crate) fn privacy_notice(&self) -> bool {
+        self.privacy.as_ref().and_then(|p| p.notice).unwrap_or(true)
+    }
+
+    /// The `[privacy]` `report_attribution` bit (default TRUE): per-session
+    /// responsible-process corroboration on the consent reports. It only
+    /// corroborates — aterm's own adoption record decides `live` vs `adopted`,
+    /// and turning this off removes a column, not a verdict.
+    pub(crate) fn privacy_report_attribution(&self) -> bool {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.report_attribution)
+            .unwrap_or(true)
+    }
+
+    /// The two probe bits as the consent module's OWN gate type, so no caller
+    /// has to remember that the master switch outranks `check`. Pass this to
+    /// `aterm_containment::probe_fda`; it refuses when either bit is off,
+    /// before any syscall.
+    pub(crate) fn privacy_probe_gate(&self) -> aterm_containment::ProbeGate {
+        aterm_containment::ProbeGate {
+            enabled: self.privacy_enabled(),
+            check: self.privacy_check(),
+        }
+    }
+
+    /// The `[privacy]` `warmup` mode (default [`PrivacyWarmup::OnRequest`]).
+    /// An unrecognized spelling resolves to the default and is named by
+    /// `--validate-config`; it never fails the parse, because that would
+    /// discard the whole config file over one typo.
+    pub(crate) fn privacy_warmup(&self) -> PrivacyWarmup {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.warmup.as_deref())
+            .and_then(PrivacyWarmup::parse)
+            .unwrap_or_default()
+    }
+
+    /// The `[privacy]` `warmup_folders` NAMES (default: every folder the
+    /// consent module knows, in the order the warm-up walks them — taken from
+    /// `aterm_containment::Folder::ALL` rather than written out, so this
+    /// default cannot drift from the module that owns the paths).
+    ///
+    /// Names only. The PATHS are resolved by
+    /// `aterm_containment::consent::folder_paths`, never here: a protected
+    /// path literal in this crate is a system modal parked in front of whatever
+    /// thread ran it (`tools/grep_guard.sh` B13).
+    ///
+    /// An unknown name survives into this list — dropping it here would hide
+    /// the typo the validator exists to report; the resolver that turns names
+    /// into paths skips it.
+    pub(crate) fn privacy_warmup_folders(&self) -> Vec<String> {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.warmup_folders.clone())
+            .unwrap_or_else(|| {
+                aterm_containment::Folder::ALL
+                    .iter()
+                    .map(|folder| folder.as_str().to_string())
+                    .collect()
+            })
+    }
+
+    /// The `[privacy]` `warmup_hold_ms` RESOLVED value (default
+    /// [`PRIVACY_WARMUP_HOLD_MS_DEFAULT`]), CLAMPED to
+    /// [`PRIVACY_WARMUP_HOLD_MS_MAX`] so a configured hold can never grow into
+    /// a way of pinning a build to one instance. `--validate-config` states the
+    /// effective value when the clamp bites.
+    pub(crate) fn privacy_warmup_hold_ms(&self) -> u64 {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.warmup_hold_ms)
+            .unwrap_or(PRIVACY_WARMUP_HOLD_MS_DEFAULT)
+            .min(PRIVACY_WARMUP_HOLD_MS_MAX)
+    }
+
+    /// The `[privacy]` `probe_interval_ms` RESOLVED floor (default
+    /// [`PRIVACY_PROBE_INTERVAL_MS_DEFAULT`]) on re-probing, which is also the
+    /// worst-case lag between a human answering a system dialog and aterm's
+    /// reported posture changing.
+    pub(crate) fn privacy_probe_interval_ms(&self) -> u64 {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.probe_interval_ms)
+            .unwrap_or(PRIVACY_PROBE_INTERVAL_MS_DEFAULT)
+    }
+
+    /// The `[privacy]` `observer` bit (default FALSE — the shipping default).
+    ///
+    /// The `tccd` log observer (design §3.6) ships OFF: it is spike-gated, it
+    /// needs admin-group membership to see anything at all, and it parses an
+    /// undocumented message format. Config only — `crate::consent_observer`
+    /// takes this resolved `bool` as an argument and reads no environment knob
+    /// of its own, so a program inside a session has nothing to flip.
+    pub(crate) fn privacy_observer(&self) -> bool {
+        self.privacy
+            .as_ref()
+            .and_then(|p| p.observer)
+            .unwrap_or(false)
+    }
+
+    /// The `[privacy]` `protected_roots` RESOLVED to absolute paths.
+    ///
+    /// Absent or EMPTY resolves to `aterm_containment::sbpl::PRIVATE_SUBDIRS`
+    /// under `$HOME` — the SAME set the Containment tier denies, on purpose:
+    /// the containment tier and the consent tier must not disagree about which
+    /// paths are sensitive. The resolution (and every path literal in it) lives
+    /// in `aterm_containment::consent`; this crate only threads the answer.
+    ///
+    /// An empty result means `$HOME` is unset and no absolute override was
+    /// given. Treat that as "cannot answer", never as "nothing is protected".
+    pub(crate) fn privacy_protected_roots(&self) -> Vec<std::path::PathBuf> {
+        let overrides = self
+            .privacy
+            .as_ref()
+            .and_then(|p| p.protected_roots.as_deref())
+            .unwrap_or(&[]);
+        aterm_containment::protected_roots(overrides)
+    }
+
     /// Resolve the `[matrix_rain]` table into engine-ready PARAMETERS
     /// ([`crate::matrix_rain::RainConfig`]), applying every default + clamp
     /// (design §12 — defaults/clamps live ONLY here; the engine re-clamps
@@ -4160,6 +4613,216 @@ impl Config {
             default_bg: default_bg & 0x00FF_FFFF,
             theme_fg: theme_fg & 0x00FF_FFFF,
         }
+    }
+
+    /// THE `[output_streak]` MASTER — PRISM WAKE's on/off bit
+    /// (`docs/DESIGN-output-streak-2026-08-30.md` §7).
+    ///
+    /// **DEFAULT ON. This key is an opt-OUT**, by owner ruling 2026-08-31 —
+    /// *"default on."* That ruling STRUCK the design's own open question §11.1
+    /// and carried one consequence the resolvers below inherit: every governor
+    /// in design §5 is now a SHIPPING promise (the flood, echo, empty-damage
+    /// and reduced-motion laws are blocking tests, not best-effort ones for an
+    /// opt-in toy). It is written here the way the other shipped opt-OUTs are —
+    /// [`Self::notice_sparkle_or_default`], [`Self::trail_sound_riff_or_default`],
+    /// [`Self::bell_sound_or_default`] — and deliberately NOT the way the
+    /// opt-INs beside it are ([`Self::matrix_rain_enabled`],
+    /// [`Self::robi_or_default`]).
+    ///
+    /// THE THREE OFF SWITCHES, named because a default-ON decoration owes the
+    /// reader its exits:
+    ///
+    /// * `enabled = false` under `[output_streak]` in `aterm.toml` — the
+    ///   durable one, resolved here, and hot-reloaded like every other key on
+    ///   this struct (the whole `Config` is replaced on a config-file
+    ///   generation, so a save takes effect without a restart).
+    /// * REDUCED MOTION — OS Reduce Motion or `motion = "reduced"`. Design §7
+    ///   pins this as exact zero, not eased: `MotionEffect::OutputStreak` at
+    ///   amplitude 0 fully RESETS the engine (empty vectors, fingerprint 0, no
+    ///   cues), rather than dimming it.
+    /// * `aterm ctl streak off` — the per-session runtime override, the
+    ///   `cmd_rain` twin, which wins over this durable bit until the session
+    ///   ends.
+    ///
+    /// AND THE PLATFORM LAW ON TOP, which is why this reads
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] rather than a bare `true`. Design §7 is
+    /// explicit that the decorative-family-off-on-Windows gate "is a platform
+    /// law, not a family default, and stands" — the owner's ruling moved the
+    /// FAMILY default (ON instead of the opt-in this was drafted as), it did
+    /// not repeal the 2026-08 Windows minimal-fast directive that `6272bd7a`
+    /// and `d22ba722` twice established. This effect is squarely what that
+    /// directive addresses: unprompted decoration painted over ORDINARY program
+    /// output, on the exact path a Windows audit once traced typing lag to. So
+    /// on Windows a fresh config resolves OFF and `enabled = true` opts back
+    /// in, whole; everywhere else the ruling's "default on" is what a fresh
+    /// config gets. A DEFAULT, never a veto — in both directions, on every
+    /// platform.
+    pub(crate) fn output_streak_enabled_or_default(&self) -> bool {
+        self.output_streak
+            .as_ref()
+            .and_then(|streak| streak.enabled)
+            .unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
+    }
+
+    /// Whether PRISM WAKE may SPEAK (`[output_streak] sound`, default ON).
+    ///
+    /// ON by the SAME owner ruling as the master above — design §11.1 records
+    /// it as a consequence rather than a second decision: *"the sound half is
+    /// ON by the same ruling (it is one feature, and the ladder's own gates —
+    /// episode law, focus, the `trail_sounds` master — are what keep it
+    /// soft)"*. So this is an opt-OUT like [`Self::trail_sound_riff_or_default`],
+    /// its nearest sibling, and not like the opt-in bed.
+    ///
+    /// A plain `true` and NOT [`DEFAULT_DECORATIVE_EFFECTS`], deliberately:
+    /// that family exists for decoration painted over content the user is
+    /// reading, and a sound covers no pixel. It also cannot be heard on a
+    /// Windows box regardless, because a cue is recorded only on a spawn edge
+    /// and the master above already resolves OFF there — and because the synth
+    /// host is macOS-only (design §6, "platform truth"), which
+    /// [`crate::diagnostics`]' capability matrix already discloses.
+    ///
+    /// SUBORDINATE, like every other voice: `trail_sounds` × `trail_sound_volume`
+    /// × RAW window focus × `SeriousEffect::TerminalSound` all apply FIRST, so
+    /// this key can only ever take sound away, never add it.
+    pub(crate) fn output_streak_sound_or_default(&self) -> bool {
+        self.output_streak
+            .as_ref()
+            .and_then(|streak| streak.sound)
+            .unwrap_or(true)
+    }
+
+    /// PRISM WAKE amplitude scale (`[output_streak] intensity`, default `1.0`),
+    /// clamped `0..=1`.
+    ///
+    /// This is a SCALE on the engine's shipping amplitude, not the amplitude
+    /// itself: peak coverage is `output_streak::ALPHA_DEFAULT` (the 0.10 class)
+    /// under a hard `ALPHA_CLAMP` of 0.18 that lives in the state machine, so
+    /// no value here — and no embedder, theme derivation or future caller —
+    /// can put more light on a cell than the design's ceiling ruling allows.
+    /// `0` is a real setting, not a failure: design §1 pins intensity ≤ 0 as a
+    /// full RESET rather than a dimming, so it costs exactly what `enabled =
+    /// false` costs.
+    ///
+    /// TOML accepts `nan`/`inf`; those FAIL OFF to `0.0` rather than poisoning
+    /// the quad stream downstream — `clamp` passes NaN straight through, and
+    /// these scalars reach premultiplied vertex colours. Same arm, same reason,
+    /// as [`Self::trail_sound_volume`] and
+    /// [`Self::cursor_trail_bloom_strength_or_default`].
+    pub(crate) fn output_streak_intensity_or_default(&self) -> f32 {
+        match self
+            .output_streak
+            .as_ref()
+            .and_then(|streak| streak.intensity)
+        {
+            Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
+            Some(_) => 0.0,
+            None => 1.0,
+        }
+    }
+
+    /// Comet tail length in cells (`[output_streak] tail`, default 9), clamped
+    /// into [`aterm_effects::output_streak::TAIL_MIN`]`..=`[`aterm_effects::output_streak::TAIL_MAX`].
+    ///
+    /// The band is the ENGINE's own constant pair, read rather than re-typed,
+    /// so this resolver cannot drift from the state machine that re-clamps it.
+    /// A tail shorter than the floor stops reading as a comet at all; one
+    /// longer than the ceiling stops being a sheen and becomes a rainbow bar
+    /// laid across the user's text, which the ceiling ruling forbids.
+    /// Out-of-band values CLAMP (they never reject the file) — the
+    /// `[matrix_rain]` law: a typo may not take a whole config down.
+    pub(crate) fn output_streak_tail_or_default(&self) -> u16 {
+        use aterm_effects::output_streak::{TAIL_MAX, TAIL_MIN};
+        let raw = self
+            .output_streak
+            .as_ref()
+            .and_then(|streak| streak.tail)
+            .unwrap_or(9);
+        raw.clamp(u32::from(TAIL_MIN), u32::from(TAIL_MAX)) as u16
+    }
+
+    /// Resident comet cap (`[output_streak] max_streaks`, default 3), clamped
+    /// `1..=`[`aterm_effects::output_streak::MAX_COMETS`].
+    ///
+    /// The floor is 1, not 0: "no comets" is spelled `enabled = false`, and a
+    /// zero here would be a second, silent off switch that no disclosure
+    /// ladder names. The ceiling is the engine's own `MAX_COMETS`, read rather
+    /// than re-typed. Note that this cap is the WEAKEST of the seven governors
+    /// in design §5 — the ≤2/s window-wide ignition limiter, the ~700 ms engine
+    /// spawn min-gap and the flood ribbon all bind long before it does — so
+    /// raising it to 4 buys density in a burst, never a faster rate.
+    pub(crate) fn output_streak_max_streaks_or_default(&self) -> u8 {
+        use aterm_effects::output_streak::MAX_COMETS;
+        let raw = self
+            .output_streak
+            .as_ref()
+            .and_then(|streak| streak.max_streaks)
+            .unwrap_or(3);
+        raw.clamp(1, MAX_COMETS as u32) as u8
+    }
+
+    /// The MANDATORY idle drain in seconds (`[output_streak] idle_secs`,
+    /// default 10), clamped `2..=120` — the same band `[matrix_rain]` uses,
+    /// for the same design §5 reason: **no configuration animates forever.**
+    /// There is no `idle = "keep"` spelling to reach for.
+    ///
+    /// A non-finite value fails to the band FLOOR rather than to the default.
+    /// That is the deliberate choice and the asymmetry is the point: every
+    /// other fail-silent arm in this file picks the value that does LESS, and
+    /// for a drain timeout doing less means draining sooner. Falling back to
+    /// the 10 s default would let `idle_secs = nan` buy a longer animation
+    /// than `idle_secs = 2`, which is exactly the "a typo animates forever"
+    /// class the band exists to close.
+    pub(crate) fn output_streak_idle_secs_or_default(&self) -> f32 {
+        match self
+            .output_streak
+            .as_ref()
+            .and_then(|streak| streak.idle_secs)
+        {
+            Some(value) if value.is_finite() => value.clamp(2.0, 120.0),
+            Some(_) => 2.0,
+            None => 10.0,
+        }
+    }
+
+    /// The `--validate-config` domain warning for `[output_streak]`: the one
+    /// value in this table that is a SILENT NO-OP rather than a clamp.
+    ///
+    /// WHAT IS DELIBERATELY NOT WARNED, so a later reader can check the
+    /// reasoning instead of reading an omission: the four numeric keys. An
+    /// out-of-band `tail`, `max_streaks`, `intensity` or `idle_secs` is
+    /// DOCUMENTED clamping behaviour, and this repo warns about no such key —
+    /// not [`Self::trail_sound_volume`], not `matrix_rain.fps`/`density`/
+    /// `speed`/`trail`/`mutation_ms`/`idle_secs`. The numeric warnings that DO
+    /// exist in [`crate::diagnostics`] are all the other shape: a value whose
+    /// EFFECTIVE result differs from its own documented band for a reason the
+    /// author cannot see from the key alone (`matrix_rain.head_alpha` raised
+    /// to the resolved body alpha, `sparkle_words.ink.sweep_ms` raised by
+    /// `loop`, `window_padding_top` capped by `window_padding`).
+    ///
+    /// `sound = true` under `enabled = false` IS that shape. A cue is recorded
+    /// only on an edge that also minted light (design §6), so with the master
+    /// off the pip is unreachable — not quieter, unreachable — and the author
+    /// who wrote the key has no way to see that from the key.
+    ///
+    /// TEST-ONLY, and gated to say so, on the
+    /// [`Self::sparkle_words_enabled_or_default`] precedent: the shipping
+    /// caller for a warning of this shape is the aggregator in
+    /// [`crate::diagnostics`], and that file is a different rung of the design
+    /// §10 ladder. An ungated definition with only `#[cfg(test)]` callers is a
+    /// `dead_code` finding in the LIB target, so the definition is gated to
+    /// match its callers rather than left to rot. When the diagnostics rung
+    /// lands, delete the attribute and push the string as a
+    /// `ConfigSemanticWarning` keyed `output_streak.sound` — nothing else here
+    /// has to change.
+    #[cfg(test)]
+    pub(crate) fn output_streak_warning(&self) -> Option<String> {
+        let streak = self.output_streak.as_ref()?;
+        (streak.sound == Some(true) && !self.output_streak_enabled_or_default()).then(|| {
+            "output_streak.sound is configured as true but is effectively silent because \
+             output_streak is disabled; a streak pip is only ever recorded on an edge that \
+             also mints light"
+                .to_string()
+        })
     }
 
     /// GPU cursor-comet bloom — the light CROWN around the comet head. DEFAULT ON,
@@ -6757,6 +7420,46 @@ pub(crate) fn resolve_trail_style(raw: &str, catalog: &TrailPackCatalog) -> Reso
     }
 }
 
+/// Resolve every string-keyed trail presentation fork in one pass.
+///
+/// This is a config-generation operation. The returned value is `Copy` and is
+/// cached in [`TrailPackCatalog`], so the redraw path never repeats alias,
+/// geometry, companion, or species scans.
+pub(crate) fn resolve_trail_presentation(
+    raw: &str,
+    catalog: &TrailPackCatalog,
+) -> ResolvedTrailPresentation {
+    resolve_trail_presentation_from_style(raw, resolve_trail_style(raw, catalog))
+}
+
+/// Presentation half for preview surfaces that already hold a synthetic
+/// resolution (notably an in-memory Trail Pack not installed in a catalog).
+pub(crate) fn resolve_trail_presentation_from_style(
+    raw: &str,
+    style: ResolvedTrailStyle,
+) -> ResolvedTrailPresentation {
+    use aterm_effects::cursor_glow::{GlowStyle, style_has_beam_of};
+
+    let token = style.canonical.unwrap_or(raw.trim());
+    let glow_style = style.style.unwrap_or(GlowStyle::Lumen);
+    let pet_species = (style.style == Some(GlowStyle::RainbowKitty)
+        && GlowStyle::style_names_any_pet(token))
+    .then(|| {
+        if GlowStyle::style_names_dog_pet(token) {
+            aterm_effects::kitty_pet::PetSpecies::Dog
+        } else {
+            aterm_effects::kitty_pet::PetSpecies::Cat
+        }
+    });
+    ResolvedTrailPresentation {
+        style,
+        beam: style_has_beam_of(glow_style, token),
+        ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
+        pet_species,
+        comet: style.style == Some(GlowStyle::Comet),
+    }
+}
+
 /// The spelling the raw-token predicates must read: what the trail actually
 /// DRAWS, not what was authored.
 ///
@@ -6797,8 +7500,8 @@ fn brighten_cursor_color(color: u32, factor: f32) -> u32 {
 /// geometry/theme facts (`dark_theme` and `head_dx`); preference semantics are
 /// byte-for-byte shared here.
 pub(crate) fn resolve_cursor_glow(
-    inputs: CursorGlowInputs<'_>,
-    style: ResolvedTrailStyle,
+    inputs: CursorGlowInputs,
+    presentation: ResolvedTrailPresentation,
     theme_cursor: u32,
     dark_theme: bool,
     // The theme's resolved default foreground / background (`0x00RRGGBB`, or
@@ -6811,8 +7514,10 @@ pub(crate) fn resolve_cursor_glow(
 ) -> aterm_effects::cursor_glow::GlowConfig {
     use aterm_effects::cursor_glow::{
         BEAM_DEFAULT_COLOR, COMET_DEFAULT_COLOR, GlowStyle, LASER_DEFAULT_COLOR,
-        SPARKLE_DEFAULT_COLOR, style_has_beam_of,
+        SPARKLE_DEFAULT_COLOR,
     };
+
+    let style = presentation.style;
 
     // Off / missing-pack values carry a harmless concrete enum because
     // GlowConfig is a POD; `enabled = false` is the sole engine gate and no
@@ -6838,7 +7543,6 @@ pub(crate) fn resolve_cursor_glow(
     let beam_only = glow_style == GlowStyle::Beam;
     let intensity = finite_clamp_or_off(inputs.intensity, 0.0, 1.0);
     let radius = finite_clamp_or_off(inputs.radius, 0.0, 2.0);
-    let style_token = style.canonical.unwrap_or(inputs.style_raw.trim());
     aterm_effects::cursor_glow::GlowConfig {
         theme_fg,
         theme_bg,
@@ -6852,7 +7556,7 @@ pub(crate) fn resolve_cursor_glow(
         radius: if beam_only { 0.0 } else { radius },
         ring: !beam_only && inputs.ring,
         dark_theme,
-        beam: style_has_beam_of(glow_style, style_token),
+        beam: presentation.beam,
         head_dx,
         pack: style.pack,
         // The host's taste dial; the engine fails it OFF on a non-finite value,
@@ -6866,7 +7570,7 @@ pub(crate) fn resolve_cursor_glow(
         // the highlighter-plus-under-baseline mark. This reverses 317f765a,
         // which had flipped the default on a claimed ruling the owner did not
         // give; the explicit spellings for BOTH looks survive.
-        ribbon_tall: !GlowStyle::style_names_underline_ribbon(style_token),
+        ribbon_tall: presentation.ribbon_tall,
     }
 }
 
@@ -7912,12 +8616,26 @@ impl App {
                 self.font_family.clone(),
                 self.theme,
             );
-        } else if let Err(error) = self
-            .backend
-            .rebuild_font_from_admitted(self.font_px, self.theme)
-        {
-            eprintln!("aterm-gui: resident font generation rebuild failed: {error}");
-            return false;
+            // The catalog worker sealed the generation it prepared, so the debt a
+            // headless launch may still be carrying is settled by the swap itself
+            // — redeeming it first would read three font files into the renderer
+            // this line replaces, and the discovery intern never evicts.
+            self.settle_deferred_font_seal();
+        } else {
+            // "From admitted" means FROM RESIDENT BYTES, which a deferred headless
+            // generation does not yet have: `rebuild_from_admitted` refuses an
+            // unsealed one outright, and a live theme reload would fail-soft into
+            // keeping the old renderer for a reason that has nothing to do with
+            // the reload. Redeem the seal first so this path sees the generation
+            // an eager launch would have handed it.
+            self.redeem_deferred_font_seal();
+            if let Err(error) = self
+                .backend
+                .rebuild_font_from_admitted(self.font_px, self.theme)
+            {
+                eprintln!("aterm-gui: resident font generation rebuild failed: {error}");
+                return false;
+            }
         }
         self.backend.set_pad(pad);
         self.backend.set_pad_top(pad_top);
@@ -12741,6 +13459,231 @@ mod decorative_effect_default_tests {
     }
 }
 
+#[cfg(test)]
+mod output_streak_cfg_tests {
+    //! PRISM WAKE's `[output_streak]` resolver pins
+    //! (`docs/DESIGN-output-streak-2026-08-30.md` §5, §7, §10). Three laws are
+    //! under test and none of them is a taste call: the table ships ON as an
+    //! opt-OUT (owner ruling 2026-08-31) while the Windows decorative platform
+    //! law still stands over it; every numeric key CLAMPS into its documented
+    //! band at BOTH ends instead of rejecting the file; and every non-finite
+    //! scalar fails silent toward LESS effect rather than poisoning the quad
+    //! stream or buying an animation the band forbids.
+
+    use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
+    use aterm_effects::output_streak::{MAX_COMETS, TAIL_MAX, TAIL_MIN};
+
+    fn cfg(toml: &str) -> Config {
+        aterm_toml::from_str(toml).expect("valid toml")
+    }
+
+    /// THE OPT-OUT, in both directions. A fresh install animates (owner ruling
+    /// 2026-08-31, *"default on"*) — asserted against `cfg!` via
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] rather than a bare `true`, because design
+    /// §7 keeps the Windows minimal-fast platform law standing over the new
+    /// family default. A config that merely EXISTS, and a `[output_streak]`
+    /// table that sets only other knobs, are both still fresh for this key; and
+    /// an explicit value wins on every platform, in both directions, so this
+    /// stays a default and never becomes a veto.
+    #[test]
+    fn the_output_streak_ships_on_as_an_opt_out_under_the_windows_platform_law() {
+        assert_eq!(DEFAULT_DECORATIVE_EFFECTS, !cfg!(windows));
+        assert_eq!(
+            Config::default().output_streak_enabled_or_default(),
+            DEFAULT_DECORATIVE_EFFECTS,
+            "absent [output_streak] table ⇒ the ruling's default on, minus Windows"
+        );
+        assert_eq!(
+            cfg("font_px = 14.0").output_streak_enabled_or_default(),
+            DEFAULT_DECORATIVE_EFFECTS
+        );
+        assert_eq!(
+            cfg("[output_streak]\ntail = 12").output_streak_enabled_or_default(),
+            DEFAULT_DECORATIVE_EFFECTS,
+            "an absent `enabled` key is still the default, even with other knobs set"
+        );
+        assert!(cfg("[output_streak]\nenabled = true").output_streak_enabled_or_default());
+        assert!(!cfg("[output_streak]\nenabled = false").output_streak_enabled_or_default());
+    }
+
+    /// THE SOUND HALF SHIPS ON TOO, because the ruling treats the streak as ONE
+    /// feature (design §11.1). A plain `true` and not the decorative platform
+    /// family: that family exists for decoration painted over content, and a
+    /// pip covers no pixel — on Windows the master above already resolves off,
+    /// so nothing is ever heard there regardless of this bit.
+    #[test]
+    fn the_streak_pip_ships_on_because_the_ruling_calls_it_one_feature() {
+        assert!(
+            Config::default().output_streak_sound_or_default(),
+            "absent table ⇒ the pip is ON everywhere, platform-independently"
+        );
+        assert!(cfg("[output_streak]").output_streak_sound_or_default());
+        assert!(cfg("[output_streak]\nsound = true").output_streak_sound_or_default());
+        assert!(!cfg("[output_streak]\nsound = false").output_streak_sound_or_default());
+    }
+
+    /// EVERY NUMERIC KEY CLAMPS AT BOTH ENDS, into the band its doc comment
+    /// promises, and the two cell-counted ones read the ENGINE's own constants
+    /// so the host clamp and the state machine's defensive re-clamp cannot
+    /// drift. Nothing here rejects the file: an absurd value is a clamp, never
+    /// a config that fails to load.
+    #[test]
+    fn every_output_streak_number_clamps_into_its_band_at_both_ends() {
+        let fresh = Config::default();
+        assert_eq!(fresh.output_streak_intensity_or_default(), 1.0);
+        assert_eq!(fresh.output_streak_tail_or_default(), 9);
+        assert_eq!(fresh.output_streak_max_streaks_or_default(), 3);
+        assert_eq!(fresh.output_streak_idle_secs_or_default(), 10.0);
+
+        assert_eq!(
+            cfg("[output_streak]\nintensity = 4.0").output_streak_intensity_or_default(),
+            1.0
+        );
+        assert_eq!(
+            cfg("[output_streak]\nintensity = -2.0").output_streak_intensity_or_default(),
+            0.0,
+            "0 is a real setting — design §1 resets rather than dims there"
+        );
+
+        assert_eq!(
+            cfg("[output_streak]\ntail = 4000").output_streak_tail_or_default(),
+            TAIL_MAX,
+            "a tail past the ceiling would be a rainbow bar, not a sheen"
+        );
+        assert_eq!(
+            cfg("[output_streak]\ntail = 0").output_streak_tail_or_default(),
+            TAIL_MIN
+        );
+
+        assert_eq!(
+            cfg("[output_streak]\nmax_streaks = 99").output_streak_max_streaks_or_default(),
+            MAX_COMETS as u8
+        );
+        assert_eq!(
+            cfg("[output_streak]\nmax_streaks = 0").output_streak_max_streaks_or_default(),
+            1,
+            "\"no comets\" is spelled enabled = false, never a silent second off switch"
+        );
+
+        assert_eq!(
+            cfg("[output_streak]\nidle_secs = 9000.0").output_streak_idle_secs_or_default(),
+            120.0,
+            "no configuration animates forever (design §5)"
+        );
+        assert_eq!(
+            cfg("[output_streak]\nidle_secs = 0.0").output_streak_idle_secs_or_default(),
+            2.0
+        );
+
+        // In-band values pass through untouched, so the clamps above are real
+        // bounds rather than a resolver that ignores its input.
+        let set =
+            cfg("[output_streak]\nintensity = 0.5\ntail = 6\nmax_streaks = 2\nidle_secs = 33.5");
+        assert_eq!(set.output_streak_intensity_or_default(), 0.5);
+        assert_eq!(set.output_streak_tail_or_default(), 6);
+        assert_eq!(set.output_streak_max_streaks_or_default(), 2);
+        assert_eq!(set.output_streak_idle_secs_or_default(), 33.5);
+    }
+
+    /// NON-FINITE FAILS SILENT, and always toward LESS effect. TOML accepts
+    /// `nan`/`inf`, and `f32::clamp` passes NaN straight through, so an
+    /// unguarded resolver would hand a NaN to premultiplied vertex colours and
+    /// to a drain deadline. Intensity fails OFF (the
+    /// `cursor_trail_bloom_strength` arm); `idle_secs` fails to the band FLOOR,
+    /// not to its 10 s default, so `nan` can never buy a LONGER animation than
+    /// the shortest value a user is allowed to type.
+    #[test]
+    fn non_finite_output_streak_scalars_fail_silent_toward_less_effect() {
+        for source in [
+            "[output_streak]\nintensity = nan",
+            "[output_streak]\nintensity = inf",
+            "[output_streak]\nintensity = -inf",
+        ] {
+            assert_eq!(
+                cfg(source).output_streak_intensity_or_default(),
+                0.0,
+                "{source}"
+            );
+        }
+        for source in [
+            "[output_streak]\nidle_secs = nan",
+            "[output_streak]\nidle_secs = inf",
+            "[output_streak]\nidle_secs = -inf",
+        ] {
+            assert_eq!(
+                cfg(source).output_streak_idle_secs_or_default(),
+                2.0,
+                "{source}"
+            );
+        }
+    }
+
+    /// THE ONE DOMAIN WARNING, and its deliberate silences. A clamp is
+    /// documented behaviour and this repo warns about no clamped key, so three
+    /// out-of-band numbers produce nothing; `sound = true` under a disabled
+    /// master is the other shape — a value that is silently UNREACHABLE for a
+    /// reason invisible from the key — and it is named.
+    #[test]
+    fn the_streak_warning_names_only_the_silently_unreachable_pip() {
+        assert!(Config::default().output_streak_warning().is_none());
+        assert!(
+            cfg("[output_streak]\ntail = 4000\nmax_streaks = 99\nidle_secs = 9000.0")
+                .output_streak_warning()
+                .is_none(),
+            "a documented clamp is not a warning in this repo"
+        );
+        assert!(
+            cfg("[output_streak]\nenabled = true\nsound = true")
+                .output_streak_warning()
+                .is_none()
+        );
+        let warning = cfg("[output_streak]\nenabled = false\nsound = true")
+            .output_streak_warning()
+            .expect("an unreachable pip is worth saying out loud");
+        assert!(
+            warning.contains("output_streak.sound") && warning.contains("effectively silent"),
+            "the message names the key and the effective result: {warning}"
+        );
+    }
+
+    /// The whole table round-trips through serde — the hot-reload contract.
+    /// `Config` is replaced wholesale on a config-file generation and derives
+    /// `PartialEq` through every embedded table, so a semantic no-op still
+    /// dedupes and a real edit still lands without a restart.
+    #[test]
+    fn the_output_streak_table_round_trips_for_hot_reload() {
+        let source = concat!(
+            "[output_streak]\nenabled = false\nintensity = 0.6\ntail = 11\n",
+            "max_streaks = 2\nidle_secs = 45.0\nsound = false\n"
+        );
+        let parsed = cfg(source);
+        let streak = parsed.output_streak.as_ref().expect("table parsed");
+        assert_eq!(streak.enabled, Some(false));
+        assert_eq!(streak.intensity, Some(0.6));
+        assert_eq!(streak.tail, Some(11));
+        assert_eq!(streak.max_streaks, Some(2));
+        assert_eq!(streak.idle_secs, Some(45.0));
+        assert_eq!(streak.sound, Some(false));
+        // `Config` derives `PartialEq` but deliberately not `Debug` (it carries
+        // the whole user config, secrets included), so these compare with
+        // `assert!` rather than `assert_eq!`.
+        assert!(
+            parsed == cfg(source),
+            "a semantic no-op reload compares equal"
+        );
+        assert!(
+            parsed != Config::default(),
+            "a real edit is visible to the reload dedupe"
+        );
+        // An unknown key inside the table is IGNORED, never fatal — the
+        // forward-compatibility law this whole struct is built on.
+        assert!(
+            cfg("[output_streak]\nfuture_knob = 3\nenabled = true")
+                .output_streak_enabled_or_default()
+        );
+    }
+}
+
 /// C3 — the tab band's height policy and the synthetic-head arithmetic that
 /// realizes it. The law is pure, so the whole geometry is provable without a
 /// window; the ONE host-dependent fact (the real cell height of the shipped face)
@@ -14281,7 +15224,10 @@ mod matrix_rain_cfg_tests {
     //! inverted vs sparkle, required by the zero-cost pins), and malformed
     //! hue input fails CLOSED without aborting the config load.
 
-    use super::Config;
+    use super::{
+        Config, PRIVACY_PROBE_INTERVAL_MS_DEFAULT, PRIVACY_WARMUP_HOLD_MS_DEFAULT,
+        PRIVACY_WARMUP_HOLD_MS_MAX, PrivacyWarmup,
+    };
     use crate::matrix_rain::{RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue};
 
     /// Stock dark-theme chrome, as the renderer knows it (`0x00RR_GGBB`).
@@ -14421,6 +15367,207 @@ mod matrix_rain_cfg_tests {
             "auto_update raw value agrees (atpkg carries it; the GUI gates on it)"
         );
         assert!(!gui.packages_auto_update());
+    }
+
+    /// The `[privacy]` defaults, stated once: an ABSENT table is the shipping
+    /// behavior — the lane is on, the probe is on, the notice is on,
+    /// attribution corroboration is on, the warm-up is offered but never
+    /// automatic, and the folder list is the consent module's own, in the order
+    /// the warm-up walks them.
+    #[test]
+    fn privacy_absent_section_resolves_every_documented_default() {
+        let c = Config::default();
+        assert!(c.privacy_enabled(), "master default on");
+        assert!(c.privacy_check(), "silent probe default on");
+        assert!(c.privacy_notice(), "notice default on");
+        assert!(c.privacy_report_attribution(), "attribution default on");
+        assert!(
+            c.privacy_probe_gate().permits(),
+            "both bits on ⇒ the gate permits a probe"
+        );
+        assert_eq!(c.privacy_warmup(), PrivacyWarmup::OnRequest);
+        assert_eq!(c.privacy_warmup().as_str(), "on-request");
+        assert_eq!(
+            c.privacy_warmup_folders(),
+            aterm_containment::Folder::ALL
+                .iter()
+                .map(|folder| folder.as_str().to_string())
+                .collect::<Vec<_>>(),
+            "the default folder list IS the consent module's, not a copy"
+        );
+        assert_eq!(c.privacy_warmup_hold_ms(), PRIVACY_WARMUP_HOLD_MS_DEFAULT);
+        assert_eq!(
+            c.privacy_probe_interval_ms(),
+            PRIVACY_PROBE_INTERVAL_MS_DEFAULT
+        );
+        // The reserved key has no resolver at all — nothing in the build can
+        // read it, which is what makes "unimplemented" structural rather than
+        // a promise. It still round-trips so the validator can name it.
+        assert!(
+            !c.privacy_observer(),
+            "the tccd log observer ships OFF (design §3.6)"
+        );
+        assert_eq!(c.privacy.as_ref().and_then(|p| p.auto_accept), None);
+    }
+
+    /// An EMPTY `[privacy]` table is exactly the absent one: every field is
+    /// `Option`, so serde fills none of them and the resolvers answer the same
+    /// defaults. (The table's mere presence must not change behavior — that is
+    /// the trap `#[serde(default)]` on a struct of non-optional fields sets.)
+    #[test]
+    fn privacy_empty_table_resolves_the_same_as_an_absent_one() {
+        let empty = aterm_toml::from_str::<Config>("[privacy]").expect("empty table parses");
+        let absent = Config::default();
+        assert!(empty.privacy.is_some(), "the table itself parsed");
+        assert_eq!(empty.privacy_enabled(), absent.privacy_enabled());
+        assert_eq!(empty.privacy_check(), absent.privacy_check());
+        assert_eq!(empty.privacy_notice(), absent.privacy_notice());
+        assert_eq!(
+            empty.privacy_report_attribution(),
+            absent.privacy_report_attribution()
+        );
+        assert_eq!(empty.privacy_warmup(), absent.privacy_warmup());
+        assert_eq!(
+            empty.privacy_warmup_folders(),
+            absent.privacy_warmup_folders()
+        );
+        assert_eq!(
+            empty.privacy_warmup_hold_ms(),
+            absent.privacy_warmup_hold_ms()
+        );
+        assert_eq!(
+            empty.privacy_probe_interval_ms(),
+            absent.privacy_probe_interval_ms()
+        );
+        assert_eq!(empty.privacy_observer(), absent.privacy_observer());
+        assert_eq!(
+            empty.privacy_protected_roots(),
+            absent.privacy_protected_roots()
+        );
+    }
+
+    /// Explicit values win over every default, the whole table round-trips
+    /// through serde, and the two clamped/parsed fields resolve as documented:
+    /// an over-ceiling hold is clamped (it can never become a way to pin a
+    /// build) and an unknown `warmup` spelling falls back rather than failing
+    /// the file.
+    #[test]
+    fn privacy_explicit_values_win_over_the_defaults() {
+        let c = aterm_toml::from_str::<Config>(concat!(
+            "[privacy]\n",
+            "enabled = false\n",
+            "check = false\n",
+            "notice = false\n",
+            "report_attribution = false\n",
+            "warmup = \"never\"\n",
+            "warmup_folders = [\"desktop\"]\n",
+            "warmup_hold_ms = 45000\n",
+            "probe_interval_ms = 250\n",
+            "observer = true\n",
+            "protected_roots = [\"/tmp/aterm-privacy-explicit\"]\n",
+            "auto_accept = true\n",
+        ))
+        .expect("explicit table parses");
+        assert!(!c.privacy_enabled());
+        assert!(!c.privacy_check());
+        assert!(!c.privacy_notice());
+        assert!(!c.privacy_report_attribution());
+        assert!(
+            !c.privacy_probe_gate().permits(),
+            "either bit off ⇒ the gate refuses before any syscall"
+        );
+        assert_eq!(c.privacy_warmup(), PrivacyWarmup::Never);
+        assert_eq!(c.privacy_warmup_folders(), vec!["desktop".to_string()]);
+        assert_eq!(c.privacy_warmup_hold_ms(), 45_000);
+        assert_eq!(c.privacy_probe_interval_ms(), 250);
+        assert!(
+            c.privacy_observer(),
+            "the observer is opt-in from config, and config alone"
+        );
+        assert_eq!(
+            c.privacy_protected_roots(),
+            vec![std::path::PathBuf::from("/tmp/aterm-privacy-explicit")],
+            "an absolute override replaces the containment set verbatim"
+        );
+        assert_eq!(
+            c.privacy.as_ref().and_then(|p| p.auto_accept),
+            Some(true),
+            "the reserved key round-trips so --validate-config can refuse it"
+        );
+
+        // The clamp, and the fallback, each on their own.
+        let over = aterm_toml::from_str::<Config>("[privacy]\nwarmup_hold_ms = 3600000\n")
+            .expect("parses");
+        assert_eq!(
+            over.privacy_warmup_hold_ms(),
+            PRIVACY_WARMUP_HOLD_MS_MAX,
+            "an hour-long hold is clamped, not honored"
+        );
+        let typo = aterm_toml::from_str::<Config>("[privacy]\nwarmup = \"first-launch\"\n")
+            .expect("an unknown spelling must NOT fail the whole file");
+        assert_eq!(
+            typo.privacy_warmup(),
+            PrivacyWarmup::OnRequest,
+            "unknown spellings fall back; the validator names them"
+        );
+        assert_eq!(
+            PrivacyWarmup::parse("first-launch"),
+            None,
+            "there is deliberately no first-launch value"
+        );
+        assert_eq!(PrivacyWarmup::parse(" NEVER "), Some(PrivacyWarmup::Never));
+    }
+
+    /// `protected_roots = []` resolves to the CONTAINMENT private set, not to
+    /// "nothing is protected". The two tiers share one list on purpose, and a
+    /// user who empties the key gets the shared default rather than a silently
+    /// unprotected machine.
+    #[test]
+    fn privacy_empty_protected_roots_resolve_to_the_containment_private_set() {
+        let expected: Vec<std::path::PathBuf> = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| {
+                aterm_containment::sbpl::PRIVATE_SUBDIRS
+                    .iter()
+                    .map(|sub| home.join(sub))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let explicit_empty =
+            aterm_toml::from_str::<Config>("[privacy]\nprotected_roots = []\n").expect("parses");
+        assert_eq!(explicit_empty.privacy_protected_roots(), expected);
+        assert_eq!(
+            Config::default().privacy_protected_roots(),
+            expected,
+            "an absent key resolves the same way an empty one does"
+        );
+        assert!(
+            !expected.is_empty(),
+            "this test is only meaningful with a $HOME; the resolver returns \
+             empty for 'cannot answer', never for 'nothing is protected'"
+        );
+    }
+
+    /// A `~/`-prefixed override is expanded; an entry that is neither absolute
+    /// nor `~`-prefixed is dropped rather than guessed at (and
+    /// `--validate-config` names it).
+    #[test]
+    fn privacy_protected_root_overrides_expand_tilde_and_drop_relatives() {
+        let c = aterm_toml::from_str::<Config>(
+            "[privacy]\nprotected_roots = [\"~/src\", \"relative/path\", \"/tmp/absolute\"]\n",
+        )
+        .expect("parses");
+        let roots = c.privacy_protected_roots();
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let mut expected = Vec::new();
+        if let Some(home) = home {
+            expected.push(home.join("src"));
+        }
+        expected.push(std::path::PathBuf::from("/tmp/absolute"));
+        assert_eq!(
+            roots, expected,
+            "the relative entry is dropped, not guessed"
+        );
     }
 
     /// The §12 default column resolves exactly; alpha/head_alpha stay `None`
@@ -14901,7 +16048,6 @@ mod trail_style_resolution_tests {
         resolve_cursor_glow(
             CursorGlowInputs {
                 enabled,
-                style_raw: raw,
                 color: None,
                 accent: None,
                 duration_ms: 260,
@@ -14911,7 +16057,7 @@ mod trail_style_resolution_tests {
                 ring: true,
                 wake_persist_s: 0.9,
             },
-            resolve_trail_style(raw, &catalog),
+            resolve_trail_presentation(raw, &catalog),
             0x00FF_FFFF,
             true,
             0x00C8_D3F5,
@@ -14943,6 +16089,39 @@ mod trail_style_resolution_tests {
                 "native ribbon resolver returned the wrong geometry for {style:?}"
             );
         }
+    }
+
+    #[test]
+    fn immutable_catalog_caches_the_complete_trail_presentation() {
+        let config = Config {
+            cursor_trail_style: Some("rainbow kitty underline".to_string()),
+            ..Config::default()
+        };
+        let catalog = config.resolve_trail_pack_catalog();
+        let cached = catalog.presentation_for(config.cursor_trail_style_raw());
+        assert_eq!(cached.style.style, Some(GlowStyle::RainbowKitty));
+        assert!(!cached.ribbon_tall);
+        assert_eq!(
+            cached.pet_species,
+            Some(aterm_effects::kitty_pet::PetSpecies::Cat)
+        );
+        assert!(!cached.beam);
+        assert!(!cached.comet);
+
+        // Direct test/preview mutation bypasses publication. It must receive a
+        // correct dynamic answer without changing the immutable generation.
+        let fallback = catalog.presentation_for("rainbow dog pet");
+        assert!(fallback.ribbon_tall);
+        assert_eq!(
+            fallback.pet_species,
+            Some(aterm_effects::kitty_pet::PetSpecies::Dog)
+        );
+        assert_eq!(
+            catalog
+                .presentation_for(config.cursor_trail_style_raw())
+                .pet_species,
+            cached.pet_species
+        );
     }
 
     /// A MISTYPED STYLE FALLS BACK AND SAYS SO. It used to switch the whole

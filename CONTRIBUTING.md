@@ -39,17 +39,59 @@ reports `ok`, and the reason is printed to stderr — run
 `cargo test -- --nocapture` to see it. Nothing here requires those tools to go
 green.
 
+### If `cargo` says `error: toolchain 'trust' is not installed`
+
+That is rustup speaking, and it means the private line's `trust` toolchain link
+(`~/.rustup/toolchains/trust`) no longer reaches the atpkg-managed store that
+holds the compiler. Run `aterm pkg doctor`: it names the seam that broke, and
+`aterm pkg doctor --fix` re-points the link at `store/trust/current`. Do not
+rebuild a toolchain from source to answer that message, and do not add a
+`cargo`/`rustc`/`rustup` shim — the managed `bin/` never carries one by design.
+On this public snapshot the message cannot occur: it pins a stock toolchain.
+
 Run the focused tests for every crate you change; they are expected to pass on
 a fresh clone of this tree.
 
 There is no hosted CI: nothing runs automatically on a pull request, so paste
 the output of the tests you ran into the description.
-`cargo run -q -p xtask -- gate <check>` is the local gate ladder the project
-uses in place of CI (a bare `gate` only prints the list of checks and fails);
-run at least the lanes touching your change, or `gate all` for the whole
-ladder. If a change affects how the window looks or feels, also run a real
-aterm instance, capture the rendered frame through `aterm ctl image`, and
-include before/after evidence.
+
+**Which gate is the contract, and which one is yours.** The gate that decides
+whether a change lands is `tools/verify.sh --fast` — a nineteen-stage local
+ladder (`crates/aterm-verify`) that a maintainer runs on the rebased branch, on
+the development line, at land time. You are not expected to run it, and this
+file does not ask you to: that ladder drives the development line's own
+toolchain, while this snapshot deliberately pins a stock Rust release (see
+[PUBLICATION.md](PUBLICATION.md)). This paragraph used to call
+`cargo run -q -p xtask -- gate <check>` "the local gate ladder the project uses
+in place of CI", which read as though the verb you can run here were the
+contract. It is not, and being plain about that is worth more than the
+symmetry.
+
+What you *can* run on this snapshot, all on the pinned toolchain:
+
+* `cargo test --locked` for every crate you touched. This is the one that
+  matters, and the expectation is that it is green on a fresh clone.
+* `cargo run -q -p xtask -- gate <check>` for the source-walk lanes. These
+  shell out to nothing — they are in-process walks of the checked-in tree —
+  so they run anywhere the workspace builds: `drift`, `dormant`, `mainloop`,
+  `lockorder`, `wasmloop`, `scope`, `lazyinit`, `fault` and `counts`. Run the
+  ones touching your change. A bare `gate` prints the list of checks and fails.
+
+**`gate all` is not that ladder**, and a red `gate all` here is not evidence
+about your change. `crates/xtask/src/gate.rs` marks the verb MANUAL ONLY —
+nothing invokes it automatically — and its roster includes `lint`, whose tippy
+and trustfmt lanes drive the development line's own toolchain and whose guard
+lane shells out to a set of `tools/*.sh` scripts (`paint_guard`, `spin_guard`
+and friends) that [PUBLICATION.md](PUBLICATION.md)'s export list does not name;
+the only file it names under `tools/` is the installer. A lane that could not
+run is reported as reaching *no verdict*, and `gate lint` — and so `gate all` —
+returns failure for it rather than a pass, deliberately: a check that did not
+run must never read as a check that passed. Run the specific lanes above
+instead.
+
+If a change affects how the window looks or feels, also run a real aterm
+instance, capture the rendered frame through `aterm ctl image`, and include
+before/after evidence.
 
 ## Issues and pull requests
 

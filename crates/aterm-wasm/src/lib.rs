@@ -860,6 +860,10 @@ impl AtermTerminal {
         self.theme_bg = bg & 0x00FF_FFFF;
         self.effects
             .set_matrix_rain_theme(self.theme_bg, self.theme_fg);
+        // The pet's frozen contrast sample is keyed to the theme it was taken
+        // against; a new theme retires it (the native palette-authority edge)
+        // while the cat's behaviour, position and breed carry on.
+        self.effects.invalidate_companion_colors();
         apply_terminal_theme_colors(&mut self.term, fg, bg, cursor, selection);
         self.renderer.set_theme(Theme {
             fg,
@@ -4279,6 +4283,35 @@ mod tests {
             toggled.rgba(),
             "a live burn must visibly change the frame (non-vacuous toggle)"
         );
+        // A PET leg too: the resident cat is free sprites over the grid, so
+        // it must vanish with the seed door like every other channel. The
+        // glow style that names the pet is switched on, the pet enabled by
+        // seed, a witnessed type-then-erase keeps the cell bytes identical
+        // to the plain engine, and the frames advance until the cat has
+        // faded onto the glass (a non-vacuous toggle).
+        toggled.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+        toggled.set_cursor_pet(true, 7);
+        assert!(toggled.cursor_pet_enabled());
+        toggled.render();
+        toggled.note_typed_char('p');
+        toggled.process(b"p\x1b[D \x1b[D");
+        let mut on_glass = false;
+        for _ in 0..240 {
+            toggled.advance_effects(33.0);
+            toggled.render();
+            if toggled.cursor_pet_alpha() > 0 {
+                on_glass = true;
+                break;
+            }
+        }
+        assert!(on_glass, "the pet must reach the glass through the binding");
+        assert_ne!(
+            plain.rgba(),
+            toggled.rgba(),
+            "a drawn pet must visibly change the frame (non-vacuous toggle)"
+        );
+        toggled.set_cursor_pet(false, 7);
+        assert!(!toggled.cursor_pet_enabled());
         toggled.set_sparkle_words_enabled(false);
         toggled.set_cursor_glow(false, "lumen", None, None, 260, 24, 0.7, 0.6, true);
         toggled.set_cursor_trail(false, 260, 24, None);
@@ -4592,6 +4625,325 @@ mod tests {
         t.render();
         assert_eq!(stable, t.rgba(), "settled frame must be a fixed point");
         assert!(!t.is_effects_active(), "still idle after further advance");
+    }
+
+    // --- The resident pet through the binding (design 2026-08-30, Phase 1) --
+    //
+    // Every test here skips silently on a box with no system font, like the
+    // rest of this module: grep the run for "no system font" before trusting
+    // a green result.
+
+    /// Drive the pet onto the glass through the binding alone: the glow
+    /// style that names it, the seed door, then witnessed keystrokes at
+    /// 33 ms, until `cursor_pet_alpha` goes positive. Returns the frame it
+    /// took, or `None` when the budget ran out. Every character is typed
+    /// through `note_typed_char` + echo exactly as a JS keydown handler
+    /// would, so the caret the pet chases is a witnessed one.
+    fn wake_the_pet(t: &mut AtermTerminal, seed: u64) -> Option<u32> {
+        t.set_cursor_glow(true, "rainbow kitty", None, None, 260, 24, 0.7, 0.6, true);
+        t.set_cursor_pet(true, seed);
+        // Seed the just-enabled engines' cursor anchor (apply is the anchor
+        // authority) so the first witness below has an owner to check against.
+        t.render();
+        for frame in 0..240u32 {
+            if frame % 6 == 0 {
+                let ch = char::from(b'a' + u8::try_from(frame / 6 % 26).unwrap_or(0));
+                t.note_typed_char(ch);
+                t.process(&[ch as u8]);
+            }
+            t.advance_effects(33.0);
+            t.render();
+            if t.cursor_pet_alpha() > 0 {
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    /// Advance 100 ms frames with no input until the binding reports idle,
+    /// or the budget runs out — then render ONCE more. The gate key is read
+    /// before the pipeline advances, so the render that first observes idle
+    /// was keyed active; the active→idle edge changes the key on the NEXT
+    /// render, which the gate's contract buys as the one settle frame that
+    /// paints the released overlay channels (`frame_gate_skips_settled_
+    /// frames_and_reopens_on_every_change_class` pins the same one-frame
+    /// shape). After a `true` here the next `render()` takes the gate.
+    fn settle(t: &mut AtermTerminal, budget_frames: u32) -> bool {
+        for _ in 0..budget_frames {
+            t.advance_effects(100.0);
+            t.render();
+            if !t.is_effects_active() {
+                t.render();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The pet arrives beside a witnessed caret, walks with it while the
+    /// host types, and — left alone — sleeps and RELEASES the frame lane:
+    /// `is_effects_active()` false, the frame a fixed point, the next render
+    /// gate-hit. The cadence law through the binding: a cat that exists is
+    /// not a reason to run at 60 Hz; only a cat that is moving is.
+    #[test]
+    fn cursor_pet_walks_through_the_binding_and_settles() {
+        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            eprintln!("no system font; skipping pet walk/settle test");
+            return;
+        };
+        assert!(!t.cursor_pet_enabled(), "the pet defaults OFF");
+        assert_eq!(t.cursor_pet_alpha(), 0, "nothing on glass before opt-in");
+        t.process(b"$ ");
+        assert!(
+            wake_the_pet(&mut t, 7).is_some(),
+            "the pet must reach the glass through the binding"
+        );
+        assert!(t.cursor_pet_enabled());
+        assert!(
+            t.is_effects_active(),
+            "a pet fading in / walking holds the frame lane"
+        );
+        for ch in "the cat walks with the caret".chars() {
+            t.note_typed_char(ch);
+            t.process(ch.to_string().as_bytes());
+            t.advance_effects(33.0);
+            t.render();
+        }
+        assert!(t.cursor_pet_alpha() > 0, "still on glass while walking");
+
+        // A minute of quiet: the pet sleeps and the lane is released.
+        assert!(
+            settle(&mut t, 600),
+            "a quiet pet must sleep and release the frame lane (idle-to-zero)"
+        );
+        assert!(
+            t.cursor_pet_alpha() > 0,
+            "asleep is still on glass — the resident is not earned"
+        );
+        let stable = t.rgba();
+        t.advance_effects(500.0);
+        t.render();
+        assert_eq!(stable, t.rgba(), "the settled frame must be a fixed point");
+        assert!(!t.is_effects_active(), "still idle after further advance");
+        assert!(
+            t.last_render_skipped(),
+            "a settled sleeping cat takes the frame gate"
+        );
+    }
+
+    /// The seed door is the ONLY entropy: two instances fed the same seed,
+    /// the same bytes and the same `dt` stream are pixel-identical at every
+    /// step (the engine is clockless and dieless — nothing in-wasm rolls a
+    /// die), and a different seed dresses a visibly different cat (the
+    /// non-vacuity half: the seed actually reaches the coat).
+    #[test]
+    fn cursor_pet_is_deterministic_for_one_seed() {
+        let Some(mut a) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            eprintln!("no system font; skipping pet determinism test");
+            return;
+        };
+        let Some(mut b) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            return;
+        };
+        let Some(mut c) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            return;
+        };
+        const SEED: u64 = 7;
+        const OTHER_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+        let (look, other) = (
+            aterm_effects::kitty_registry::KittyLook::for_launch(SEED),
+            aterm_effects::kitty_registry::KittyLook::for_launch(OTHER_SEED),
+        );
+        assert_ne!(
+            (look.coat, look.iris),
+            (other.coat, other.iris),
+            "pick seeds that decode to different coats, or the second half is vacuous"
+        );
+        for (t, seed) in [(&mut a, SEED), (&mut b, SEED), (&mut c, OTHER_SEED)] {
+            t.process(b"$ ");
+            assert!(
+                wake_the_pet(t, seed).is_some(),
+                "the pet must reach the glass through the binding"
+            );
+        }
+        let mut other_seed_differs = false;
+        for step in 0..40u32 {
+            let ch = char::from(b'a' + u8::try_from(step % 26).unwrap_or(0));
+            for t in [&mut a, &mut b, &mut c] {
+                if step % 8 == 0 {
+                    t.process(b"\r\n");
+                }
+                t.note_typed_char(ch);
+                t.process(&[ch as u8]);
+                t.advance_effects(33.0);
+                t.render();
+            }
+            assert_eq!(
+                a.rgba(),
+                b.rgba(),
+                "same seed + same bytes + same dt stream must be pixel-identical (step {step})"
+            );
+            other_seed_differs |= a.rgba() != c.rgba();
+        }
+        assert!(
+            other_seed_differs,
+            "a different seed must dress a visibly different cat"
+        );
+    }
+
+    /// The pointer and the press are value-shadowed doors on the WF-1 gate:
+    /// a pointer sample that moved reopens it, the same sample again does
+    /// not; a leave reopens it once; a press outside the body passes (`0`)
+    /// and leaves the gate shut, a press inside pets (`1`) and buys the
+    /// frame that runs the purr. So an idle hover cannot delete the gate and
+    /// a stroked cat cannot be a stale frame.
+    #[test]
+    fn pointer_and_pet_press_reopen_the_frame_gate() {
+        let Some(mut t) = AtermTerminal::new_from_system(24, 80, 16.0) else {
+            eprintln!("no system font; skipping pointer/press gate test");
+            return;
+        };
+        t.process(b"$ ");
+        assert!(
+            wake_the_pet(&mut t, 7).is_some(),
+            "the pet must reach the glass through the binding"
+        );
+        assert!(settle(&mut t, 600), "the pet must sleep first");
+        t.render();
+        assert!(t.last_render_skipped(), "settled frame must take the gate");
+
+        // A moved pointer reopens; the same sample again does not.
+        let (px, py) = (t.width() as f32 * 0.5, t.height() as f32 * 0.5);
+        t.note_pointer_px(px, py);
+        assert!(t.needs_frame(), "a moved pointer must reopen the gate");
+        t.render();
+        assert!(!t.last_render_skipped(), "the pointer frame must draw");
+        assert!(settle(&mut t, 600), "a watching cat settles again");
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled after the pointer");
+        t.note_pointer_px(px, py);
+        assert!(
+            !t.needs_frame(),
+            "an identical pointer sample is value-shadowed and must not reopen the gate"
+        );
+        t.render();
+        assert!(t.last_render_skipped(), "an idle hover must gate");
+        t.note_pointer_px(f32::NAN, py);
+        assert!(!t.needs_frame(), "a non-finite sample is dropped");
+
+        // A leave reopens once.
+        t.note_pointer_leave();
+        assert!(t.needs_frame(), "the pointer leaving must reopen the gate");
+        t.render();
+        assert!(!t.last_render_skipped(), "the leave frame must draw");
+        assert!(settle(&mut t, 600), "the cat settles after the leave");
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled after the leave");
+        t.note_pointer_leave();
+        assert!(!t.needs_frame(), "a second leave is value-shadowed");
+        t.render();
+        assert!(t.last_render_skipped(), "a second leave must gate");
+
+        // A press outside passes and gates; a press inside pets and draws.
+        let (x0, x1, y0, y1) = t
+            .effects
+            .companion_hit_rect()
+            .expect("a sleeping cat on glass has a hit target");
+        let outside = ((x1 + 64) as f32, (y1 + 64) as f32);
+        assert_eq!(t.pet_press_px(outside.0, outside.1), 0, "outside passes");
+        assert!(
+            !t.needs_frame(),
+            "a pass changed nothing the gate cannot see"
+        );
+        t.render();
+        assert!(t.last_render_skipped(), "a passed press must gate");
+        let inside = (((x0 + x1) / 2) as f32, ((y0 + y1) / 2) as f32);
+        assert_eq!(t.pet_press_px(inside.0, inside.1), 1, "inside pets");
+        assert!(
+            t.needs_frame(),
+            "a petted cat needs the frame that runs the purr"
+        );
+        t.render();
+        assert!(!t.last_render_skipped(), "the petting frame must draw");
+    }
+
+    /// A walking pet is free sprites over the grid, so its motion presents
+    /// as SUB-FRAME bands (the rows the sprite vacated and entered), never
+    /// a full-frame band, and the partially-updated persistent buffer stays
+    /// byte-exact against a from-scratch expansion of the same frame — the
+    /// dirty-band oracle of `dirty_band_present_api`. A settled sleeping cat
+    /// gate-hits to zero bands.
+    #[test]
+    fn walking_pet_presents_sub_frame_bands() {
+        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            eprintln!("no system font; skipping pet band test");
+            return;
+        };
+        let full_expansion = |t: &AtermTerminal| {
+            let mut rgba = Vec::new();
+            let mut bands = Vec::new();
+            crate::dirty_band_present_api::expand_full(
+                t.win.frame_pixels(),
+                &mut rgba,
+                &mut bands,
+                t.width,
+                t.height,
+            );
+            rgba
+        };
+        t.process(b"$ ");
+        assert!(
+            wake_the_pet(&mut t, 7).is_some(),
+            "the pet must reach the glass through the binding"
+        );
+        let full = (t.width * t.height) as i32;
+        let mut banded_frames = 0u32;
+        for ch in "walk".chars().cycle().take(24) {
+            t.note_typed_char(ch);
+            t.process(ch.to_string().as_bytes());
+            t.advance_effects(33.0);
+            t.render();
+            assert!(!t.last_render_skipped(), "a walking cat never gates");
+            let banded_px: i32 = t
+                .present_bands
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| q[2] * q[3])
+                .sum();
+            assert!(
+                t.present_band_count() >= 1,
+                "a walking frame must surface as at least one band"
+            );
+            assert!(
+                banded_px < full,
+                "a walking cat never pays a full-frame band ({banded_px} of {full} px)"
+            );
+            assert_eq!(
+                t.rgba,
+                full_expansion(&t),
+                "the banded update is byte-exact against a full expansion"
+            );
+            banded_frames += 1;
+        }
+        assert!(banded_frames > 0, "non-vacuity: frames were checked");
+        assert!(
+            t.cursor_pet_alpha() > 0,
+            "the cat was on glass while walking"
+        );
+
+        assert!(settle(&mut t, 600), "the pet must sleep");
+        t.render();
+        assert_eq!(
+            t.present_band_count(),
+            0,
+            "a settled sleeping cat gate-hits to zero bands"
+        );
+        assert_eq!(
+            t.rgba,
+            full_expansion(&t),
+            "gate-hit leaves the buffer intact"
+        );
     }
 
     #[test]

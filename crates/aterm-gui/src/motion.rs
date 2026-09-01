@@ -106,6 +106,13 @@ pub(crate) enum MotionEffect {
     /// pure decoration; his tips re-appear on the next show once motion
     /// returns.
     Robi,
+    /// PRISM WAKE's output streak (`OutputStreak::tick` reads the amplitude as
+    /// `StreakConfig::intensity`): 0 ⇒ the engine RESETS and emits nothing —
+    /// no quads, no sound cue, fp 0, inactive. Bypass-to-final-state (the
+    /// settled frame), the matrix-rain rule, and deliberately a pin rather
+    /// than an ease: an effect that answers PROGRAM OUTPUT is exactly the kind
+    /// a motion-sensitive user needs GONE, not merely gentler.
+    OutputStreak,
 }
 
 impl MotionEffect {
@@ -115,7 +122,7 @@ impl MotionEffect {
     /// cannot silently skip the reduced-motion invariant. Test-only, like
     /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SettingsDemo,
@@ -125,6 +132,7 @@ impl MotionEffect {
         Self::MatrixRain,
         Self::NoticePill,
         Self::Robi,
+        Self::OutputStreak,
     ];
 
     /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
@@ -143,6 +151,7 @@ impl MotionEffect {
             Self::MatrixRain => 6,
             Self::NoticePill => 7,
             Self::Robi => 8,
+            Self::OutputStreak => 9,
         }
     }
 }
@@ -288,7 +297,8 @@ impl MotionPolicy {
                 | MotionEffect::StreamFade
                 | MotionEffect::MatrixRain
                 | MotionEffect::NoticePill
-                | MotionEffect::Robi => 0.0,
+                | MotionEffect::Robi
+                | MotionEffect::OutputStreak => 0.0,
             },
         }
     }

@@ -79,7 +79,10 @@ fn native_settings_package_actions_complete_with_hostile_metadata_files() {
     // admission returns defaults; it must not wait for a FIFO writer.
     //
     // THE PROPERTY UNDER TEST IS TERMINATION, not the exit code, and that distinction
-    // now matters: this tree ships with `PAPER_MASTER_PUBKEYS` empty, so the manager is
+    // now matters — but NOT for the reason this comment used to give. (It said the
+    // tree ships with `PAPER_MASTER_PUBKEYS` empty; it has been armed since
+    // 2026-08-15, so `update` reaches the network path rather than refusing as inert.
+    // The property under test is TERMINATION either way.) The old text: the manager is
     // INERT and `update` refuses (nonzero) instead of no-op-ing (zero). Either way the
     // child must exit promptly — the GUI clears its busy state on the child exiting, and
     // a hang is what strands Settings. `run_with_deadline` panics if it does not, so
@@ -198,12 +201,23 @@ fn subverb_flags_never_become_program_names() {
     }
 
     // An unrecognized flag is refused as a flag — never resolved as a program.
+    //
+    // Asserts the PROPERTY, not one wording. `abc261556` reworded this refusal from
+    // "--nonsense is not a program name — it is a flag" to "unknown option ... for
+    // `atpkg <verb>`" (plus the accepted list), which serves the same purpose better —
+    // and this test, pinned to the old literal, went red on main for it. What must hold
+    // is that the refusal NAMES the spelling it rejected and the verb it rejected it for,
+    // so the user can tell what was wrong; the sentence around them is free to improve.
     for verb in ["install", "update", "uninstall"] {
         let (code, err) = run_capture(&home, &config_home, &registry, &[verb, "--nonsense"]);
         assert_eq!(code, 2, "atpkg {verb} --nonsense exits 2");
         assert!(
-            err.contains("is not a program name"),
-            "atpkg {verb} --nonsense says why, got: {err}"
+            err.contains("--nonsense"),
+            "atpkg {verb} --nonsense must name the spelling it rejected, got: {err}"
+        );
+        assert!(
+            err.contains(verb),
+            "atpkg {verb} --nonsense must name the verb it was rejected for, got: {err}"
         );
     }
 

@@ -51,7 +51,8 @@ fuzz_target!(|data: &[u8]| {
             let decompressed = decompress_size_prepended(&compressed)
                 .expect("round-trip: decompression of our own compressed data must succeed");
             assert_eq!(
-                decompressed, data,
+                decompressed,
+                data,
                 "round-trip: decompressed output differs from original input ({} bytes)",
                 data.len()
             );

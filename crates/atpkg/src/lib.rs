@@ -60,10 +60,16 @@
 //! **Fail-closed-on-empty.** With no master pinned the manager is fully inert:
 //! [`enabled`] is false, [`select_index`] selects nothing (and observes nothing) before
 //! touching a candidate, and
-//! every roster admission returns [`sig::Reject::Disabled`] before any crypto runs. In
-//! THIS tree the master anchor is empty, so a build from this source installs, verifies
-//! and trusts **nothing** until an operator arms it in a reviewed commit — see
-//! `docs/ATPKG-KEY-MANAGEMENT.md`.
+//! every roster admission returns [`sig::Reject::Disabled`] before any crypto runs.
+//! That is the state a FORK starts from, and what shipped before v0.21.0.
+//!
+//! **THIS tree is ARMED** (2026-08-15, `atpkg-keys setup --id m3`):
+//! [`PKG_TRUST_ANCHORS`] carries one master key, so a build from this source installs,
+//! verifies and activates signed toolchains for real — see
+//! `docs/ATPKG-KEY-MANAGEMENT.md`, which says so too. (This paragraph claimed the
+//! opposite while the same file's [`enabled`] doc, 130 lines down, already said
+//! ARMED; a reviewer who believed it would think running the manager could not
+//! touch the fleet.)
 
 pub mod activate;
 pub mod appgate;
@@ -105,6 +111,9 @@ pub mod relocate;
 /// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
 /// set-completion pass, the OS-installed reconcile and the update pass.
 pub mod requires;
+/// The rustup toolchain seam owner (Lockstep S1): `<rustup_home>/toolchains/trust` ->
+/// `<prefix>/store/trust/current`, laid, adopted, re-asserted and recorded by atpkg.
+pub mod seam;
 pub mod select;
 pub mod shim_env;
 pub mod sig;

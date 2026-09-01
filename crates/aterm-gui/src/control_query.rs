@@ -3766,6 +3766,10 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         glow_halo: _, // OMITTED: host-owned GLOW-HALO radial cursor-effect light quads, not engine cell content
         glow_under: _, // OMITTED: host-owned EMBERFORGE under-glyph flame-body light quads, not engine cell content
         fire_patch: _, // OMITTED: host-owned EMBERFORGE per-pixel fire-field patches (render bling), not engine cell content
+        cursor_glow_add_damage: _, // OMITTED: producer-side dirty-row revision for host-owned LUMEN quads, not engine cell content
+        glow_halo_damage: _, // OMITTED: producer-side dirty-row revision for host-owned radial halos, not engine cell content
+        glow_under_damage: _, // OMITTED: producer-side dirty-row revision for host-owned flame-body quads, not engine cell content
+        fire_patch_damage: _, // OMITTED: producer-side dirty-row revision for host-owned fire patches, not engine cell content
         cursor_fill_override: _, // OMITTED: host-owned rainbow-cursor block fill, not engine cell content
         word_decorations: _, // OMITTED: host-owned sparkle-word decorations, not engine cell content
         ink: _, // OMITTED: host-owned animated-ink fg overrides (render bling), not engine cell content

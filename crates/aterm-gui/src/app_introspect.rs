@@ -168,6 +168,9 @@ struct NativeImageRequest<'a> {
     cancel: crate::control::CaptureCancellation,
     frame_metadata: &'a std::sync::Arc<std::sync::OnceLock<crate::control::ImageFrameMetadata>>,
     reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
+    /// Last so whole-request teardown releases every accounted buffer and
+    /// filesystem capability before returning admission capacity.
+    handoff: crate::control::ReplyRetentionPermit,
 }
 
 /// Convert an exact straight-RGBA client destination into the renderer Frame
@@ -267,9 +270,9 @@ fn non_macos_chrome_output(
 /// A finished capture handed OFF the winit event-loop thread for PNG encode +
 /// confined write. A Retina-sized deflate is a 50–150 ms stall, so the encode
 /// worker owns it. Only after the write completes does the worker transfer a
-/// guarded result to the control thread; that guard is revalidated and retained
-/// through the complete response and explicit client ACK. The client can
-/// therefore open the exact file named by a successful reply.
+/// guarded result to the control thread. File guards are revalidated and
+/// retained through the complete response and explicit client ACK; inline PNG
+/// memory is retained through the bounded write and flush.
 pub(crate) enum EncodeJob {
     /// The `image` verb's fully-composited application framebuffer (every
     /// app-owned splice/overlay is baked in before the `Frame` is moved here). A failed
@@ -283,6 +286,9 @@ pub(crate) enum EncodeJob {
         want_bytes: bool,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::ImageReply>,
+        /// Declared last so whole-job teardown closes every accounted resource
+        /// before returning its global admission charge.
+        handoff: crate::control::ReplyRetentionPermit,
     },
     /// SIGUSR1 `snapshot` output (PNG + parallel .txt + .done marker). The frame
     /// is fully composited on the main thread; only the deflate + writes run
@@ -305,6 +311,7 @@ pub(crate) enum EncodeJob {
         target: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
+        handoff: crate::control::ReplyRetentionPermit,
     },
     /// VIDEO introspection dump: one finalized recording (already byte-budget
     /// bounded at capture — at most one recording's RAM transits this channel,
@@ -338,12 +345,49 @@ pub(crate) enum EncodeJob {
         /// "drive the window being recorded" are different corrections.
         unlogged_other_window: u64,
         started_us: u64,
-        dir: crate::control_auth::ConfinedVideoDir,
+        // This capability owns a retained directory chain and is much larger
+        // than the other job fields. Keep it indirect so every queued enum
+        // value remains compact; video export is already a rare heap-backed
+        // workload and pays only this single allocation.
+        dir: Box<crate::control_auth::ConfinedVideoDir>,
         reply: std::sync::mpsc::Sender<crate::control::Retained<String>>,
         cancel: crate::VideoCancellation,
         /// Busy/idle acknowledgement for serialization and graceful shutdown.
         permit: crate::VideoExportPermit,
+        handoff: crate::control::ReplyRetentionPermit,
     },
+}
+
+/// Bound full-frame captures waiting behind the one shared PNG worker. The
+/// worker may own one additional active job; keeping the waiting set small
+/// prevents snapshots (which do not consume artifact-handoff permits) from
+/// accumulating unbounded framebuffer copies on the event-loop thread.
+const ENCODE_QUEUE_CAPACITY: usize = 4;
+
+const ENCODE_QUEUE_FULL: &str = "encode queue full; retry";
+const ENCODE_WORKER_UNAVAILABLE: &str = "encode worker unavailable; retry";
+
+fn reject_encode_job(mut job: EncodeJob, reason: &str) {
+    match &mut job {
+        EncodeJob::Image { target, reply, .. } => {
+            crate::control_auth::cleanup_failed_automatic_image(target);
+            let _ = reply.send(Err(format!("image {reason}")));
+        }
+        EncodeJob::Snapshot { transaction, .. } => {
+            // `begin_snapshot_generation` already removed `.done`; dropping the
+            // untouched transaction therefore leaves this attempt unpublished.
+            eprintln!(
+                "aterm-gui: snapshot rejected for {}: {reason}",
+                transaction.target.path.display()
+            );
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        EncodeJob::WindowRgba { target, reply, .. } => {
+            crate::control_auth::cleanup_failed_automatic_image(target);
+            let _ = reply.send(Err(format!("window capture {reason}")));
+        }
+        EncodeJob::VideoDump { dir, reply, .. } => fail_video_dump_in_place(dir, reply, reason),
+    }
 }
 
 /// Reconstruct a snapshot sidecar as a whole pathname. Only tests want this
@@ -883,11 +927,19 @@ mod video_keys_honesty_tests {
 /// The recording directory is server-created and unique to this job, so removing
 /// it also prevents failed, never-prunable partial PNG sequences from accumulating.
 fn fail_video_dump(
-    dir: crate::control_auth::ConfinedVideoDir,
+    mut dir: Box<crate::control_auth::ConfinedVideoDir>,
     reply: &std::sync::mpsc::Sender<crate::control::Retained<String>>,
     error: impl std::fmt::Display,
 ) {
-    let cleanup = match dir.abort() {
+    fail_video_dump_in_place(&mut dir, reply, error);
+}
+
+fn fail_video_dump_in_place(
+    dir: &mut crate::control_auth::ConfinedVideoDir,
+    reply: &std::sync::mpsc::Sender<crate::control::Retained<String>>,
+    error: impl std::fmt::Display,
+) {
+    let cleanup = match dir.abort_in_place() {
         Ok(()) => String::new(),
         Err(cleanup_error) => format!("; partial export cleanup failed: {cleanup_error}"),
     };
@@ -897,12 +949,13 @@ fn fail_video_dump(
 }
 
 /// Own the complete video publication transaction in an unwind-safe drop
-/// order. Rust drops fields in declaration order: exact file guards release
-/// first, then an unpublished directory capability can recursively clean the
-/// tree (required by Windows deny-delete handles). A marker-visible directory
-/// is irrevocable and survives later response/ACK failure.
+/// order. Rust drops fields in declaration order: the exact index/marker guards
+/// release before an unpublished directory capability recursively cleans the
+/// tree (required by Windows deny-delete handles). Frame seals hold no file
+/// descriptors. A marker-visible directory is irrevocable and survives later
+/// response/ACK failure.
 struct VideoPublication {
-    frame_files: Vec<crate::pinned_dir::PinnedFile>,
+    frame_seals: Vec<crate::control_auth::VideoFrameSeal>,
     index_file: crate::pinned_dir::PinnedFile,
     published_marker: Option<crate::pinned_dir::PinnedFile>,
     dir: crate::control_auth::ConfinedVideoDir,
@@ -910,37 +963,49 @@ struct VideoPublication {
 
 impl VideoPublication {
     fn prepare(&mut self) -> std::io::Result<std::path::PathBuf> {
-        self.dir.publish(&self.frame_files, &self.index_file)
+        self.dir.publish(&self.frame_seals, &self.index_file)
     }
 
     fn validate_for_reply(&self) -> std::io::Result<()> {
         self.dir
-            .validate_for_reply(&self.frame_files, &self.index_file)?;
+            .validate_for_reply(&self.frame_seals, &self.index_file)?;
         if let Some(marker) = &self.published_marker {
-            marker.validate_path_identity()?;
+            marker.validate_entry_identity_at_retained()?;
         }
         Ok(())
     }
 
     fn publish_marker(&mut self) -> std::io::Result<()> {
         let marker = self.dir.publish_marker()?;
-        marker.validate_path_identity()?;
+        marker.validate_entry_identity_at_retained()?;
         self.published_marker = Some(marker);
         Ok(())
     }
 
-    fn prune_after_publish(&self) {
-        self.dir.prune_after_publish();
+    #[cfg(test)]
+    fn publish_marker_with_test_hook(
+        &mut self,
+        after_publish: impl FnOnce(),
+    ) -> std::io::Result<()> {
+        let marker = self.dir.publish_marker_with_test_hook(after_publish)?;
+        marker.validate_entry_identity_at_retained()?;
+        self.published_marker = Some(marker);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn is_published(&self) -> bool {
+        self.dir.is_published()
     }
 
     fn abort(self) -> std::io::Result<()> {
         let Self {
-            frame_files,
+            frame_seals,
             index_file,
             published_marker,
             dir,
         } = self;
-        drop(frame_files);
+        drop(frame_seals);
         drop(index_file);
         drop(published_marker);
         dir.abort()
@@ -963,21 +1028,18 @@ fn fail_video_publication(
 
 struct VideoReplyRetention {
     publication: VideoPublication,
-    published: bool,
 }
 
-impl crate::control::WireRetention for VideoReplyRetention {
-    fn prepare_write(&mut self) -> Result<(), String> {
+impl VideoReplyRetention {
+    fn prepare_write_with(
+        &mut self,
+        publish_marker: impl FnOnce(&mut VideoPublication) -> std::io::Result<()>,
+    ) -> Result<(), String> {
         self.publication
             .validate_for_reply()
             .map_err(|error| format!("video identity changed before wire reply: {error}"))?;
-        self.publication
-            .publish_marker()
+        publish_marker(&mut self.publication)
             .map_err(|error| format!("video publish marker failed before wire reply: {error}"))?;
-        // Marker publication made the directory non-abortable before visibility.
-        // Record that fact before the final identity pass so Drop may run safe
-        // lease-aware retention even when the pass detects interference.
-        self.published = true;
         self.publication
             .validate_for_reply()
             .map_err(|error| format!("video identity changed at wire reply: {error}"))?;
@@ -985,29 +1047,26 @@ impl crate::control::WireRetention for VideoReplyRetention {
     }
 }
 
-impl Drop for VideoReplyRetention {
-    fn drop(&mut self) {
-        if self.published {
-            self.publication.prune_after_publish();
-        }
+impl crate::control::WireRetention for VideoReplyRetention {
+    fn prepare_write(&mut self) -> Result<(), String> {
+        self.prepare_write_with(VideoPublication::publish_marker)
     }
 }
 
 fn send_video_reply_with_retention(
     publication: VideoPublication,
+    permit: crate::control::ReplyRetentionPermit,
     reply: &std::sync::mpsc::Sender<crate::control::Retained<String>>,
     value: String,
 ) {
-    // Move every exact file/directory guard with the reply. Wire preparation
-    // revalidates the bundle and atomically publishes its marker before any OK
-    // byte; retention remains live through the client's explicit ACK. A channel
-    // drop before preparation still aborts the invisible tree. Once the marker
-    // could have been visible, a later write/ACK failure deliberately preserves
-    // the recording and only runs bounded retention.
-    let retention = crate::control::ReplyRetention::new(VideoReplyRetention {
-        publication,
-        published: false,
-    });
+    // Move every frame-identity checkpoint and exact index/directory guard with the reply.
+    // Wire preparation revalidates the bundle and atomically publishes its
+    // marker before any OK byte; retention remains live through the client's
+    // explicit ACK. A channel drop before preparation still aborts the invisible
+    // tree. Once the marker could have been visible, a later write/ACK failure
+    // deliberately preserves the recording and only runs bounded retention.
+    let guard = VideoReplyRetention { publication };
+    let retention = permit.retain(guard);
     let _ = reply.send(crate::control::Retained::guarded(value, retention));
 }
 
@@ -1048,74 +1107,117 @@ impl Drop for CaptureReplyRetention {
     }
 }
 
-fn send_capture_reply_after_validation<T: Send>(
+struct PendingCaptureReply {
     target: crate::control_auth::ConfinedImage,
     file: crate::pinned_dir::PinnedFile,
     lease: Option<crate::control_auth::ArtifactPathLease>,
+    permit: crate::control::ReplyRetentionPermit,
+}
+
+fn send_capture_reply_after_validation<T: Send>(
+    pending: PendingCaptureReply,
     reply: &std::sync::mpsc::Sender<Result<crate::control::Retained<T>, String>>,
     value: T,
     context: &str,
-    before_send: impl FnOnce(),
 ) -> bool {
-    if let Err(error) = target.validate_for_reply(&file) {
-        abort_authorized_artifact_anchor();
-        let _ = file.remove_exact();
-        let _ = reply.send(Err(format!(
-            "{context} path identity changed before reply: {error}"
-        )));
-        return false;
+    if let Err(error) = pending.target.validate_for_reply(&pending.file) {
+        return reject_pending_capture_reply(pending, reply, context, error);
     }
-    before_send();
-    if let Err(error) = target.validate_for_reply(&file) {
-        abort_authorized_artifact_anchor();
-        let _ = file.remove_exact();
-        let _ = reply.send(Err(format!(
-            "{context} path identity changed at reply barrier: {error}"
-        )));
-        return false;
-    }
+    let PendingCaptureReply {
+        permit,
+        lease,
+        file,
+        target,
+    } = pending;
     // Move the file and every directory handle with the reply. The control
     // server retains this bundle through explicit response acknowledgement, so
     // another capture cannot replace/prune the advertised identity before the
     // client consumes OK. The shared namespace advisory lock also excludes
     // same-uid explicit-name replacement across processes.
-    let retention = crate::control::ReplyRetention::new(CaptureReplyRetention {
+    let guard = CaptureReplyRetention {
         target,
         file: Some(file),
         _lease: lease,
         committed: false,
-    });
+    };
+    let retention = permit.retain(guard);
     let _ = reply.send(Ok(crate::control::Retained::guarded(value, retention)));
     true
 }
 
+fn reject_pending_capture_reply<T>(
+    pending: PendingCaptureReply,
+    reply: &std::sync::mpsc::Sender<Result<crate::control::Retained<T>, String>>,
+    context: &str,
+    error: std::io::Error,
+) -> bool {
+    abort_authorized_artifact_anchor();
+    let _ = pending.file.remove_exact();
+    let _ = reply.send(Err(format!(
+        "{context} path identity changed at reply barrier: {error}"
+    )));
+    false
+}
+
+#[cfg(test)]
+fn send_capture_reply_after_validation_with_hook<T: Send>(
+    pending: PendingCaptureReply,
+    reply: &std::sync::mpsc::Sender<Result<crate::control::Retained<T>, String>>,
+    value: T,
+    context: &str,
+    before_send: impl FnOnce(),
+) -> bool {
+    if let Err(error) = pending.target.validate_for_reply(&pending.file) {
+        return reject_pending_capture_reply(pending, reply, context, error);
+    }
+    before_send();
+    send_capture_reply_after_validation(pending, reply, value, context)
+}
+
 /// Encode + confined-write one job, then transfer its guarded result. Runs on
-/// the encode worker (or inline when the worker cannot be spawned/reached).
+/// the encode worker; unavailable or saturated workers reject at submission.
 /// The write keeps the TOCTOU confinement contract verbatim: each target owns
 /// the directory handles retained when the control thread confined it; the
 /// worker never re-opens a multi-segment pathname.
 fn run_encode_job(job: EncodeJob) {
     match job {
         EncodeJob::Image {
-            frame,
+            handoff,
+            reply,
+            cancel,
             target,
             want_bytes,
-            cancel,
-            reply,
+            frame,
         } => {
             let (w, h) = (frame.width as u32, frame.height as u32);
-            let png = frame.to_png();
             if want_bytes {
-                // `--bytes`: hand the PNG back over the wire; write no file (a remote
-                // driver cannot read the server's filesystem).
                 if cancel.is_cancelled() {
                     let _ =
                         reply.send(Err("image request cancelled before byte reply".to_string()));
-                } else {
-                    let _ = reply.send(Ok(crate::control::Retained::plain((w, h, Some(png)))));
+                    return;
                 }
+                let png = frame.to_png();
+                // A receiver may release admission as soon as `send` exposes
+                // the retained PNG. Destroy the raw framebuffer first so the
+                // old and newly admitted jobs cannot overlap unaccounted RAM.
+                drop(frame);
+                // `--bytes`: hand the PNG back over the wire; write no file (a remote
+                // driver cannot read the server's filesystem). Retain admission
+                // through base64 construction and the bounded socket flush. The
+                // payload has no path identity or post-flush lifetime to guard.
+                let retention = handoff.release_path_and_retain_in_memory(target);
+                let _ = reply.send(Ok(crate::control::Retained::write_retained(
+                    (w, h, Some(png)),
+                    retention,
+                )));
                 return;
             }
+            if cancel.is_cancelled() {
+                let _ = reply.send(Err("image request cancelled before encoding".to_string()));
+                return;
+            }
+            let png = frame.to_png();
+            drop(frame);
             let lease = match crate::control_auth::acquire_capture_name_lease(&target, || {
                 cancel.is_cancelled()
             }) {
@@ -1133,16 +1235,22 @@ fn run_encode_job(job: EncodeJob) {
                     return;
                 }
             };
-            match target.write_private_authorized(&png, || cancel.authorize_commit()) {
+            let write = target.write_private_authorized(&png, || cancel.authorize_commit());
+            // The file owns its encoded bytes now. Free the encode buffer before
+            // validation can transfer (or reject and release) the handoff permit.
+            drop(png);
+            match write {
                 Ok(file) => {
                     send_capture_reply_after_validation(
-                        target,
-                        file,
-                        Some(lease),
+                        PendingCaptureReply {
+                            target,
+                            file,
+                            lease: Some(lease),
+                            permit: handoff,
+                        },
                         &reply,
                         (w, h, None),
                         "image",
-                        || {},
                     );
                 }
                 Err(error) => {
@@ -1171,14 +1279,23 @@ fn run_encode_job(job: EncodeJob) {
         }
         #[cfg(any(target_os = "macos", windows))]
         EncodeJob::WindowRgba {
-            rgba,
+            handoff,
+            reply,
+            cancel,
+            target,
             width,
             height,
-            target,
-            cancel,
-            reply,
+            rgba,
         } => {
-            let png = match encode_rgba8_png(&rgba, width, height) {
+            if cancel.is_cancelled() {
+                let _ = reply.send(Err(
+                    "window capture request cancelled before encoding".to_string()
+                ));
+                return;
+            }
+            let encoded = encode_rgba8_png(&rgba, width, height);
+            drop(rgba);
+            let png = match encoded {
                 Ok(png) => png,
                 Err(error) => {
                     let _ = reply.send(Err(format!(
@@ -1207,16 +1324,20 @@ fn run_encode_job(job: EncodeJob) {
                     return;
                 }
             };
-            match target.write_private_authorized(&png, || cancel.authorize_commit()) {
+            let write = target.write_private_authorized(&png, || cancel.authorize_commit());
+            drop(png);
+            match write {
                 Ok(file) => {
                     send_capture_reply_after_validation(
-                        target,
-                        file,
-                        Some(lease),
+                        PendingCaptureReply {
+                            target,
+                            file,
+                            lease: Some(lease),
+                            permit: handoff,
+                        },
                         &reply,
                         (width, height),
                         "window capture",
-                        || {},
                     );
                 }
                 Err(error) => {
@@ -1233,22 +1354,26 @@ fn run_encode_job(job: EncodeJob) {
             }
         }
         EncodeJob::VideoDump {
-            take,
+            permit: _permit,
+            handoff,
+            reply,
+            cancel,
+            dir,
             mode,
             keys_enabled,
             inputs,
             unlogged_inputs,
             unlogged_other_window,
             started_us,
-            dir,
-            reply,
-            cancel,
-            permit: _permit,
+            take,
         } => {
+            use std::fmt::Write as _;
+
             if cancel.is_cancelled() {
                 fail_video_dump(dir, &reply, "request cancelled before export");
                 return;
             }
+            let inputs_logged = inputs.len();
             // A server-named directory should be fresh, but fail closed if a
             // collision/retry left a completion marker: this job may publish only
             // the index it builds after every requested frame is durable.
@@ -1277,7 +1402,78 @@ fn run_encode_job(job: EncodeJob) {
                 // Sampled sum — cheap, stable, sensitive to any visible change.
                 f.rgba.iter().step_by(64).map(|&b| b as u64).sum()
             };
-            let fps: Vec<(u64, u64)> = take.frames.iter().map(|f| (f.t_us, frame_fp(f))).collect();
+            let mut fps = if inputs.is_empty() {
+                Vec::new()
+            } else {
+                Vec::with_capacity(take.frames.len())
+            };
+            // Frames first, index.json last inside the still-private recording.
+            // Guarded wire preparation later publishes `.published`, the sole
+            // visibility marker readers accept, after revalidating these files.
+            let mut frame_lines = String::with_capacity(take.frames.len().saturating_mul(112));
+            let mut written = 0usize;
+            let mut frame_seals = Vec::with_capacity(take.frames.len());
+            // `delta` = how much this frame's sampled fingerprint moved from the
+            // previous captured frame. A multimodal AI reads index.json and pulls
+            // only the high-`delta` frames (the visually eventful moments) instead
+            // of downloading every PNG. Compute the fingerprint beside PNG
+            // encoding so the large frame store is streamed once; retain it for
+            // key analysis only when that ledger is non-empty. `prev_fp` tracks
+            // capture order. Any encode/write error aborts the whole export, so
+            // every adjacent fingerprint also has an adjacent PNG.
+            let mut prev_fp: Option<u64> = None;
+            for (i, f) in take.frames.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    fail_video_dump(dir, &reply, "request cancelled during export");
+                    return;
+                }
+                let fp = frame_fp(f);
+                if !inputs.is_empty() {
+                    fps.push((f.t_us, fp));
+                }
+                let delta = prev_fp.map_or(0, |p| fp.abs_diff(p));
+                prev_fp = Some(fp);
+                let name = format!("frame_{:04}.png", i + 1);
+                let png = match encode_rgba8_png(&f.rgba, f.w, f.h) {
+                    Ok(png) => png,
+                    Err(error) => {
+                        fail_video_dump(
+                            dir,
+                            &reply,
+                            format!("frame {} PNG encode failed: {error}", i + 1),
+                        );
+                        return;
+                    }
+                };
+                let frame_seal = match dir.write_sealed_frame(std::ffi::OsStr::new(&name), &png) {
+                    Ok(seal) => seal,
+                    Err(error) => {
+                        fail_video_dump(
+                            dir,
+                            &reply,
+                            format!("frame {} write failed ({name}): {error}", i + 1),
+                        );
+                        return;
+                    }
+                };
+                frame_seals.push(frame_seal);
+                written += 1;
+                if !frame_lines.is_empty() {
+                    frame_lines.push_str(",\n");
+                }
+                write!(
+                    &mut frame_lines,
+                    "    {{\"n\":{},\"seq\":{},\"t_us\":{},\"fp\":{fp},\"delta\":{delta},\"file\":\"{name}\"}}",
+                    i + 1,
+                    f.seq,
+                    f.t_us
+                )
+                .expect("writing to a String cannot fail");
+            }
+            if cancel.is_cancelled() {
+                fail_video_dump(dir, &reply, "request cancelled before index publish");
+                return;
+            }
             let analysis = if inputs.is_empty() {
                 format!(
                     "  \"analysis\": {{\"note\": \"{}\"}},\n",
@@ -1290,72 +1486,7 @@ fn run_encode_job(job: EncodeJob) {
                     .collect();
                 crate::video_key_analysis::analysis_block(&attempts, &fps)
             };
-            // Frames first, index.json last inside the still-private recording.
-            // Guarded wire preparation later publishes `.published`, the sole
-            // visibility marker readers accept, after revalidating these files.
-            let mut frame_lines = String::new();
-            let mut written = 0usize;
-            let mut frame_files = Vec::with_capacity(take.frames.len());
-            // `delta` = how much this frame's sampled fingerprint moved from the
-            // previous captured frame. A multimodal AI reads index.json and pulls
-            // only the high-`delta` frames (the visually eventful moments) instead
-            // of downloading every PNG — the fingerprint is already computed above
-            // for the keystroke analysis, so this is free. `prev_fp` tracks the
-            // previous frame in capture order. Any encode/write error aborts the
-            // whole export, so every adjacent fingerprint also has an adjacent PNG.
-            let mut prev_fp: Option<u64> = None;
-            for (i, f) in take.frames.iter().enumerate() {
-                if cancel.is_cancelled() {
-                    drop(frame_files);
-                    fail_video_dump(dir, &reply, "request cancelled during export");
-                    return;
-                }
-                let fp = fps.get(i).map_or(0, |&(_, fp)| fp);
-                let delta = prev_fp.map_or(0, |p| fp.abs_diff(p));
-                prev_fp = Some(fp);
-                let name = format!("frame_{:04}.png", i + 1);
-                let png = match encode_rgba8_png(&f.rgba, f.w, f.h) {
-                    Ok(png) => png,
-                    Err(error) => {
-                        drop(frame_files);
-                        fail_video_dump(
-                            dir,
-                            &reply,
-                            format!("frame {} PNG encode failed: {error}", i + 1),
-                        );
-                        return;
-                    }
-                };
-                let frame_file = match dir.write_new_private(std::ffi::OsStr::new(&name), &png) {
-                    Ok(file) => file,
-                    Err(error) => {
-                        drop(frame_files);
-                        fail_video_dump(
-                            dir,
-                            &reply,
-                            format!("frame {} write failed ({name}): {error}", i + 1),
-                        );
-                        return;
-                    }
-                };
-                frame_files.push(frame_file);
-                written += 1;
-                if !frame_lines.is_empty() {
-                    frame_lines.push_str(",\n");
-                }
-                frame_lines.push_str(&format!(
-                    "    {{\"n\":{},\"seq\":{},\"t_us\":{},\"fp\":{fp},\"delta\":{delta},\"file\":\"{name}\"}}",
-                    i + 1,
-                    f.seq,
-                    f.t_us
-                ));
-            }
-            if cancel.is_cancelled() {
-                drop(frame_files);
-                fail_video_dump(dir, &reply, "request cancelled before index publish");
-                return;
-            }
-            let mut input_lines = String::new();
+            let mut input_lines = String::with_capacity(inputs.len().saturating_mul(48));
             for (t, sample) in &inputs {
                 if !input_lines.is_empty() {
                     input_lines.push_str(",\n");
@@ -1363,7 +1494,12 @@ fn run_encode_job(job: EncodeJob) {
                 // `"ch"` for a character-shaped attempt, `"key"` for a named key
                 // that has none (esc / arrows / F-keys). Both are JSON-escaped by
                 // `json_field`.
-                input_lines.push_str(&format!("    {{\"t_us\":{t},{}}}", sample.json_field()));
+                write!(
+                    &mut input_lines,
+                    "    {{\"t_us\":{t},{}}}",
+                    sample.json_field()
+                )
+                .expect("writing to a String cannot fail");
             }
             let stop_us = crate::metrics::now_us();
             // HONEST COVERAGE: `dropped` on the wire stays the TOTAL loss
@@ -1414,7 +1550,7 @@ fn run_encode_job(job: EncodeJob) {
                 take.device_px.1,
                 take.half_res,
                 take.format,
-                inputs.len(),
+                inputs_logged,
                 take.dropped,
                 take.evicted,
                 take.decimated,
@@ -1422,18 +1558,30 @@ fn run_encode_job(job: EncodeJob) {
                 frame_lines,
                 input_lines,
             );
+            // `take` can be hundreds of MiB. The index now owns every scalar and
+            // text fact derived from it, so tear down the frame store and all
+            // encode scratch before any reply path can release admission.
+            drop((
+                take,
+                inputs,
+                fps,
+                frame_lines,
+                input_lines,
+                analysis,
+                covered_us,
+                fps_cap,
+            ));
             // Build and fsync `index.json` under a private create-new temporary
             // name, then atomically publish it with no-replace rename. A planted
             // final component fails the commit, and readers observe either no
             // index or the complete bounded JSON document—never partial bytes.
-            let index_file = match dir.write_new_private_authorized(
+            let index_file = match dir.write_batch_member_authorized(
                 std::ffi::OsStr::new("index.json"),
                 index.as_bytes(),
                 || cancel.authorize_commit(),
             ) {
                 Ok(file) => file,
                 Err(error) => {
-                    drop(frame_files);
                     let message = if error.kind() == std::io::ErrorKind::Interrupted
                         && cancel.is_cancelled()
                     {
@@ -1445,11 +1593,12 @@ fn run_encode_job(job: EncodeJob) {
                     return;
                 }
             };
+            drop(index);
             let mut publication = VideoPublication {
-                frame_files,
+                frame_seals,
                 index_file,
                 published_marker: None,
-                dir,
+                dir: *dir,
             };
             let published_dir = match publication.prepare() {
                 Ok(path) => path,
@@ -1462,29 +1611,19 @@ fn run_encode_job(job: EncodeJob) {
                     return;
                 }
             };
-            if let Err(error) = publication.validate_for_reply() {
-                fail_video_publication(
-                    publication,
-                    &reply,
-                    format!("recording identity changed before reply: {error}"),
-                );
-                return;
-            }
             // Publication ownership crosses before the observable reply. A
             // disconnected client or panic during send leaves the already
             // durable recording retained; it can never receive OK for a tree
             // that Drop subsequently removes.
             // Reply shape: new tokens go strictly BEFORE the path — the path
             // is ALWAYS the last whitespace token (the one client invariant).
-            send_video_reply_with_retention(
-                publication,
-                &reply,
-                format!(
-                    "OK frames={written} dropped={dropped_total} head_truncated={head_truncated}{} {}\n",
-                    video_keys_reply_tokens(keys_enabled, inputs.len(), unlogged_inputs),
-                    published_dir.join("index.json").display()
-                ),
+            let value = format!(
+                "OK frames={written} dropped={dropped_total} head_truncated={head_truncated}{} {}\n",
+                video_keys_reply_tokens(keys_enabled, inputs_logged, unlogged_inputs),
+                published_dir.join("index.json").display()
             );
+            drop(published_dir);
+            send_video_reply_with_retention(publication, handoff, &reply, value);
         }
     }
 }
@@ -2289,13 +2428,16 @@ impl App {
         let motion = self.motion_policy(capture_focused);
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
-        let glow_cfg = self.glow_config();
+        let trail_presentation = self.trail_presentation();
+        let glow_cfg = self.glow_config_for(trail_presentation);
         let cursor_companions_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorCat);
         let load_shed = self.load_shed_active();
-        let pet_mode = self.trail_is_kitty_pet();
-        let pet_species = self.trail_pet_species();
+        let pet_mode = trail_presentation.pet_species.is_some();
+        let pet_species = trail_presentation
+            .pet_species
+            .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
         // The ONE companion verdict (favourite > program with tenure > launch
         // kitty) — the same seam the composed PRESENT resolves through, so a
         // capture shows the breed the glass wears (gauntlet F3: a capture
@@ -2449,6 +2591,7 @@ impl App {
             focus_cursor,
             win_focused: raw_focused,
             animate_sparkles,
+            animate_streak: motion.animate(crate::motion::MotionEffect::OutputStreak),
             animate_cat,
             kitty_alpha,
             cat_frame,
@@ -2463,6 +2606,11 @@ impl App {
             now,
         };
         self.compose_word_decorations(wid, &ctx);
+        // PRISM WAKE rides the same composed pass the present uses, or a
+        // capture would show a frame the window does not — and every pixel
+        // gate in the paint-conformance matrix reads captures, so a streak
+        // absent HERE is a streak nothing can ever prove.
+        self.compose_output_streak(wid, &ctx);
         // The advancing capture already consumed every pane's represented
         // damage under its exact extraction lock. Nothing below may relock a
         // terminal and swallow a newer synchronized-output episode.
@@ -2614,12 +2762,15 @@ impl App {
         // than the glass (gauntlet F3).
         let capture_front_session = self.focused_session_id(wid).unwrap_or(0);
         let companion_look = self.companion_verdict(wid, capture_front_session, now);
-        let glow_cfg = self.glow_config();
+        let trail_presentation = self.trail_presentation();
+        let glow_cfg = self.glow_config_for(trail_presentation);
         let cursor_companions_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorCat);
-        let pet_mode = self.trail_is_kitty_pet();
-        let pet_species = self.trail_pet_species();
+        let pet_mode = trail_presentation.pet_species.is_some();
+        let pet_species = trail_presentation
+            .pet_species
+            .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
         let suppress_alt = sparkle.is_some() && self.config.sparkle_suppress_alt_screen();
@@ -2627,6 +2778,13 @@ impl App {
         // `deco_suspend` (app_render). The raw diagnostic latch does not
         // suppress a user-forced Full policy or an explicit adaptive opt-out.
         let load_shed = self.load_shed_active();
+        // PRISM WAKE knobs, resolved before the `self.windows` borrow below.
+        let streak_enabled = self.config.output_streak_enabled_or_default();
+        let streak_intensity = self.config.output_streak_intensity_or_default();
+        let streak_tail = self.config.output_streak_tail_or_default();
+        let streak_max = self.config.output_streak_max_streaks_or_default();
+        let streak_idle = self.config.output_streak_idle_secs_or_default();
+        let streak_animates = motion.animate(crate::motion::MotionEffect::OutputStreak);
         let windowless = self
             .windows
             .get(&wid)
@@ -3000,6 +3158,71 @@ impl App {
             &mut ws.free_scratch,
             &mut ws.nova_scratch,
         );
+        // PRISM WAKE on the SINGLE-PANE capture. This is the site the
+        // paint-conformance matrix actually reads: its rows drive a headless
+        // binary over the control socket and assert PIXELS, and headless never
+        // runs the windowed present — so a streak absent here is a streak no
+        // gate can ever see, however well the glass behaves.
+        //
+        // Appends to `nova_scratch` after the decoration tick filled it, the
+        // same co-residency discipline the present keeps. Silent on the alt
+        // screen and in scrollback (a TUI's own canvas is not arrival, and
+        // history is not arrival), and silent under load shed like every other
+        // decoration.
+        {
+            let enabled = streak_enabled
+                && !load_shed
+                && !ws.input_scratch.engine_alt
+                && ws.input_scratch.display_offset == 0;
+            if !enabled {
+                ws.output_streak = None;
+            } else {
+                let geom = crate::cursor_glow::Geom {
+                    cw: cell_w,
+                    ch: cell_h,
+                    rows,
+                    cols,
+                    origin_x: 0,
+                    origin_y: 0,
+                    win_w: u16::try_from(cols * cell_w).unwrap_or(u16::MAX),
+                    win_h: u16::try_from(rows * cell_h).unwrap_or(u16::MAX),
+                    head: 0,
+                };
+                let cfg = crate::output_streak::StreakConfig {
+                    enabled: true,
+                    intensity: if streak_animates {
+                        streak_intensity
+                    } else {
+                        0.0
+                    },
+                    tail: streak_tail,
+                    max_streaks: streak_max,
+                    idle_secs: streak_idle,
+                    dark_theme: aterm_render::theme_is_dark(ws.input_scratch.default_bg),
+                    theme_bg: ws.input_scratch.default_bg,
+                    theme_fg: ws.input_scratch.default_fg,
+                    theme_cursor: ws.input_scratch.cursor_color,
+                    // A CAPTURE NEVER SPEAKS. Pixels are being sampled, not
+                    // presented to a listener, and a still taken by a script
+                    // must not make the machine chime.
+                    sound: false,
+                };
+                let engine = ws.output_streak.get_or_insert_with(|| {
+                    Box::new(crate::output_streak::OutputStreak::new(
+                        aterm_effects::genome::mix(wid.0 ^ 0x5052_4953_4D5F_574B),
+                    ))
+                });
+                engine.note_output_cells(
+                    &ws.input_scratch.cells,
+                    ws.input_scratch.cursor_row,
+                    ws.input_scratch.cursor_col,
+                    rows,
+                    now,
+                    false,
+                );
+                engine.tick(now, geom, &cfg, &mut ws.nova_scratch);
+            }
+        }
         // Kitty Log drain (§F4.3): the capture tick is a REAL tick — the
         // sightings vec clears at the next tick's start, so a headless-only
         // session must drain here too or its sightings are lost. Same
@@ -4404,8 +4627,9 @@ impl App {
     /// on first use (a run that never screenshots pays nothing). EXACTLY ONE
     /// worker by design: queued `image` requests drained in one [`crate::Wake::Control`]
     /// turn must reply in FIFO queue order, and a single mpsc consumer preserves
-    /// submission order. Falls back to encoding inline (the old behavior) when
-    /// the thread cannot be spawned or has died, so a reply is never dropped.
+    /// submission order. Admission is bounded and non-blocking: a saturated or
+    /// unavailable worker rejects and cleans the job instead of stalling the
+    /// event-loop thread or accumulating full-frame buffers without limit.
     pub(crate) fn submit_encode_job(&mut self, mut job: EncodeJob) {
         // A VIDEO dump can hold the shared worker for seconds-to-minutes (hundreds of
         // full-frame PNG encodes); run it on its own ONE-SHOT lane so a subsequent
@@ -4424,24 +4648,31 @@ impl App {
                 })
                 .is_ok();
             if spawned {
-                // The receiver is owned by the just-spawned thread: this send
-                // cannot fail, and the thread exits after the one job.
-                let _ = vtx.send(job);
-                return;
+                // The receiver is owned by the just-spawned thread and exits
+                // after this job. Preserve ownership even if it dies before
+                // receiving, then use the bounded shared fallback below.
+                match vtx.send(job) {
+                    Ok(()) => return,
+                    Err(std::sync::mpsc::SendError(returned)) => job = returned,
+                }
             }
         }
         if let Some(tx) = &self.encode_tx {
-            match tx.send(job) {
+            match tx.try_send(job) {
                 Ok(()) => return,
+                Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                    reject_encode_job(job, ENCODE_QUEUE_FULL);
+                    return;
+                }
                 // Worker gone (its loop only ends when every sender drops, so
                 // this is defensive); respawn below with the returned job.
-                Err(std::sync::mpsc::SendError(j)) => {
+                Err(std::sync::mpsc::TrySendError::Disconnected(j)) => {
                     self.encode_tx = None;
                     job = j;
                 }
             }
         }
-        let (tx, rx) = std::sync::mpsc::channel::<EncodeJob>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<EncodeJob>(ENCODE_QUEUE_CAPACITY);
         let spawned = std::thread::Builder::new()
             .name("aterm-png-encode".to_string())
             .spawn(move || {
@@ -4454,14 +4685,20 @@ impl App {
             })
             .is_ok();
         if spawned {
-            // The receiver is owned by the just-spawned thread, so this send
-            // cannot fail; a (theoretical) failure returns the job to the drop
-            // path, where the client sees the same ERR a dead render does.
-            let _ = tx.send(job);
-            self.encode_tx = Some(tx);
+            match tx.try_send(job) {
+                Ok(()) => self.encode_tx = Some(tx),
+                Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                    // The fresh queue is empty and has positive capacity, but
+                    // keep ownership total if that invariant ever changes.
+                    self.encode_tx = Some(tx);
+                    reject_encode_job(job, ENCODE_QUEUE_FULL);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(job)) => {
+                    reject_encode_job(job, ENCODE_WORKER_UNAVAILABLE);
+                }
+            }
         } else {
-            // No thread available — encode inline rather than drop the reply.
-            run_encode_job(job);
+            reject_encode_job(job, ENCODE_WORKER_UNAVAILABLE);
         }
     }
 
@@ -4476,18 +4713,19 @@ impl App {
     /// what keeps them from being silently reordered.
     fn render_native_image(&mut self, request: NativeImageRequest<'_>) {
         let NativeImageRequest {
+            handoff,
+            reply,
+            frame_metadata,
+            cancel,
+            target,
+            want_metadata,
+            want_bytes,
             front,
             clean,
-            presented,
             request_layout,
             presented_metadata,
+            presented,
             exact_frame,
-            target,
-            want_bytes,
-            want_metadata,
-            cancel,
-            frame_metadata,
-            reply,
         } = request;
         if cancel.is_cancelled() {
             let _ = reply.send(Err("image request cancelled before render".to_string()));
@@ -4683,6 +4921,7 @@ impl App {
         }
         self.submit_encode_job(EncodeJob::Image {
             frame,
+            handoff,
             target,
             want_bytes,
             cancel,
@@ -5137,10 +5376,11 @@ impl App {
     /// thread per [`crate::Wake::Control`] — but ONLY the render + app-composition
     /// composites: the PNG encode + confined write are handed to the encode
     /// worker, which transfers guarded `(width, height)` after the write. The
-    /// control writer revalidates and retains it through the complete response
-    /// challenge and ACK (or the failed-handoff quarantine).
+    /// control writer revalidates file replies and retains them through response
+    /// ACK/quarantine; inline PNG memory is retained through write and flush.
     pub(crate) fn render_image(&mut self, req: ImageReq) {
         let ImageReq {
+            handoff,
             target,
             clean,
             session,
@@ -5200,6 +5440,7 @@ impl App {
             // The explicit request pays one destination copy/readback only.
             self.submit_encode_job(EncodeJob::Image {
                 frame: destination.frame,
+                handoff,
                 target,
                 want_bytes,
                 cancel,
@@ -5253,6 +5494,7 @@ impl App {
                     .then_some((request_plan, request_route)),
                 presented_metadata,
                 exact_frame: recording_destination.map(|destination| destination.frame),
+                handoff,
                 target,
                 want_bytes,
                 want_metadata,
@@ -5628,6 +5870,7 @@ impl App {
         // only after the write — the client reads the file the moment it sees OK.
         self.submit_encode_job(EncodeJob::Image {
             frame,
+            handoff,
             target,
             want_bytes,
             cancel,
@@ -5823,11 +6066,12 @@ impl App {
     #[cfg(target_os = "macos")]
     pub(crate) fn capture_window(
         &mut self,
+        handoff: crate::control::ReplyRetentionPermit,
         target: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
-        self.capture_window_of(self.frontmost_window, target, cancel, reply);
+        self.capture_window_of(self.frontmost_window, handoff, target, cancel, reply);
     }
 
     /// The body of [`Self::capture_window`], parameterized on which logical window to
@@ -5837,6 +6081,7 @@ impl App {
     fn capture_window_of(
         &mut self,
         wid: Option<WindowId>,
+        handoff: crate::control::ReplyRetentionPermit,
         target: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
@@ -5885,6 +6130,7 @@ impl App {
                 rgba,
                 width,
                 height,
+                handoff,
                 target,
                 cancel,
                 reply,
@@ -6437,6 +6683,7 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn capture_window(
         &mut self,
+        handoff: crate::control::ReplyRetentionPermit,
         target: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
@@ -6497,6 +6744,7 @@ impl App {
                 rgba,
                 width,
                 height,
+                handoff,
                 target,
                 cancel,
                 reply,
@@ -6513,6 +6761,7 @@ impl App {
     #[cfg(all(not(target_os = "macos"), not(windows)))]
     pub(crate) fn capture_window(
         &mut self,
+        _handoff: crate::control::ReplyRetentionPermit,
         _target: control_auth::ConfinedImage,
         _cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
@@ -6541,12 +6790,13 @@ impl App {
     pub(crate) fn capture_aux_window(
         &mut self,
         target: AuxTarget,
+        handoff: crate::control::ReplyRetentionPermit,
         confined: control_auth::ConfinedImage,
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
         let _ = target;
-        self.capture_window(confined, cancel, reply);
+        self.capture_window(handoff, confined, cancel, reply);
     }
 
     /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
@@ -6557,6 +6807,7 @@ impl App {
     pub(crate) fn capture_aux_window(
         &mut self,
         _target: AuxTarget,
+        _handoff: crate::control::ReplyRetentionPermit,
         _confined: control_auth::ConfinedImage,
         _cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
@@ -6819,10 +7070,9 @@ mod native_settings_compatibility_controls_tests {
         // compiled from `view_assets`.
         const HOST_ONLY: &str = "host-generation-only-pack";
         let mut host_assets = (*app.config_assets).clone();
-        host_assets.trail_packs = std::sync::Arc::new(crate::app_config::TrailPackCatalog {
-            ids: vec![HOST_ONLY.to_string()],
-            ..crate::app_config::TrailPackCatalog::default()
-        });
+        let mut host_trails = crate::app_config::TrailPackCatalog::default();
+        host_trails.ids.push(HOST_ONLY.to_string());
+        host_assets.trail_packs = std::sync::Arc::new(host_trails);
         app.config_assets = std::sync::Arc::new(host_assets);
         assert!(!std::sync::Arc::ptr_eq(&app.config_assets, &view_assets));
 
@@ -7963,6 +8213,122 @@ mod split_capture_tests {
         );
     }
 
+    /// THE Q5 GATE — PRISM WAKE paints in a SPLIT, anchored inside the pane
+    /// that produced the output.
+    ///
+    /// This is the hole the design called a blocking prerequisite: the streak is
+    /// spatially anchored, `redraw_compose` skips the spatially-anchored
+    /// cursor-body effects, and an effect that silently does not exist in half
+    /// the layouts is worse than one that does not exist at all — nobody
+    /// reports a bug they read as "my terminal is just quiet right now".
+    ///
+    /// WHAT THIS CAN AND CANNOT WITNESS. It asserts the composed pass emits
+    /// streak light and that the light lands inside the FOCUSED pane's own
+    /// column range — which is the whole spatial-anchoring claim: pane-local
+    /// emission plus `translate_nova_into_pane` must put a comet where the text
+    /// that earned it is, not at the window origin. It deliberately does NOT
+    /// assert the unfocused pane also paints, because no capture stages
+    /// `unfocused_pane_scratch` — only a real composed PRESENT does (the same
+    /// reason the sparkle channels are focused-pane-only through this seam), so
+    /// an unfocused-pane assertion here would be measuring the harness rather
+    /// than the product.
+    #[test]
+    fn a_split_paints_a_streak_anchored_in_the_pane_that_produced_it() {
+        let run = |enabled: bool| {
+            let t0 = Instant::now();
+            let mut app = App::headless_for_test();
+            app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
+                enabled: Some(enabled),
+                ..Default::default()
+            });
+            let wid = WindowId(0);
+            let sid = app.split_active_stub_tab(wid);
+            app.recompute_sparkle();
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                ws.focused = true;
+            }
+            // Establish both panes first: the first composed pass baselines
+            // every engine's arrival counter, so nothing answers history.
+            app.splice_word_decorations(wid, t0);
+            let term = app.pool.get(sid).expect("pane session").term.clone();
+            term_lock(&term).process(b"\r\noutput in the focused pane\r\n");
+            app.splice_word_decorations(wid, t0 + Duration::from_millis(120));
+            let ws = app.windows.get(&wid).expect("window");
+            let xs: Vec<u16> = ws.nova_scratch.iter().map(|q| q.x).collect();
+            let half = u32::from(ws.cols) * app.backend.cell_size().0 as u32 / 2;
+            (xs, half)
+        };
+        let (xs, half) = run(true);
+        assert!(
+            !xs.is_empty(),
+            "a split must not go dark: the composed pass owes streak light"
+        );
+        // The focused pane is the one the vertical split just created — the
+        // RIGHT half — so every quad must sit past the divider. A comet drawn
+        // in window coordinates instead of pane-local ones would land left of
+        // it, which is exactly the "silently dark / silently misplaced" failure
+        // this gate exists for.
+        let min_x = xs.iter().copied().min().expect("min");
+        assert!(
+            u32::from(min_x) >= half,
+            "streak light must be anchored inside the pane that earned it: \
+             x {min_x} is left of the divider at {half}"
+        );
+        let (off, _) = run(false);
+        assert!(
+            off.is_empty(),
+            "NON-VACUITY: with the streak off the same split draws none of it"
+        );
+    }
+
+    /// PRISM WAKE reaches the SINGLE-PANE capture — the path every pixel gate
+    /// reads. Headless never runs the windowed present, so before this site
+    /// existed the streak was invisible to `image`, to the paint-conformance
+    /// matrix, and therefore to every guard that could have caught it going
+    /// dark. The disabled twin is the non-vacuity control: without it, a test
+    /// that only asserts "quads appear" passes just as well when the quads
+    /// belong to some other engine.
+    #[test]
+    fn a_capture_carries_the_output_streak_and_an_off_config_carries_none() {
+        let streak_quads = |enabled: bool| {
+            let t0 = Instant::now();
+            let mut app = App::headless_for_test();
+            app.config.output_streak = Some(crate::app_config::OutputStreakConfig {
+                enabled: Some(enabled),
+                ..Default::default()
+            });
+            let wid = WindowId(0);
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                ws.focused = true;
+            }
+            let term = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            // The FIRST capture baselines the arrival counter (a fresh engine
+            // must never answer history with a burst), so the licensed
+            // observation is the second one.
+            app.splice_word_decorations(wid, t0);
+            let before = app.windows[&wid].nova_scratch.len();
+            term_lock(&term).process(b"\r\nprogram output arrives here\r\n");
+            app.splice_word_decorations(wid, t0 + Duration::from_millis(120));
+            app.windows[&wid].nova_scratch.len().saturating_sub(before)
+        };
+        let on = streak_quads(true);
+        let off = streak_quads(false);
+        assert!(
+            on > 0,
+            "an enabled streak must put light in the capture's nova channel"
+        );
+        assert_eq!(
+            off, 0,
+            "NON-VACUITY: with the streak off the same script draws none of it"
+        );
+    }
+
     /// T7 — a composed (split) capture splices the sparkle channels. The gate
     /// this replaces returned early on ANY multi-pane tab, so a split capture
     /// was decoration-free no matter what the window was showing.
@@ -8939,12 +9305,14 @@ mod terminal_split_capture_tests {
             next_frame: None,
             presented: None,
             dir: video_dir,
+            handoff: None,
             cancel: crate::VideoCancellation::new(),
             reply: video_reply,
         });
 
         let (early_reply, early_rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&root, "too-early.png"),
             clean: false,
             session: None,
@@ -9111,6 +9479,7 @@ mod terminal_split_capture_tests {
         let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (reply, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&root, "retained.png"),
             clean: false,
             session: None,
@@ -9738,6 +10107,7 @@ mod terminal_split_capture_tests {
         let metadata = std::sync::Arc::new(std::sync::OnceLock::new());
         let (tx, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&dir, "split.png"),
             clean: false,
             session: None,
@@ -9953,6 +10323,7 @@ mod encode_worker_tests {
                     height: side,
                     pixels: vec![0u32; side * side],
                 },
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
                 target,
                 want_bytes: false,
                 cancel: crate::control::CaptureCancellation::new(),
@@ -9985,6 +10356,101 @@ mod encode_worker_tests {
         }
         // The lazily-spawned worker is retained for reuse across captures.
         assert!(app.encode_tx.is_some());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_encode_queue_rejects_returned_job_without_displacing_fifo_head() {
+        let root = unique_dir("encode-queue-full");
+        ensure_private_dir(&root).unwrap();
+        let (queue_tx, queue_rx) = std::sync::mpsc::sync_channel(1);
+
+        let head_target =
+            control_auth::confine_automatic_image_path(&root, "head").expect("head target");
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        let head = EncodeJob::Image {
+            frame: Frame {
+                width: 1,
+                height: 1,
+                pixels: vec![0],
+            },
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            target: head_target,
+            want_bytes: false,
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: head_tx,
+        };
+        assert!(queue_tx.try_send(head).is_ok());
+
+        let rejected_target =
+            control_auth::confine_automatic_image_path(&root, "rejected").expect("rejected target");
+        let rejected_path = rejected_target.display_path();
+        let (rejected_tx, rejected_rx) = std::sync::mpsc::channel();
+        let rejected = EncodeJob::Image {
+            frame: Frame {
+                width: 2,
+                height: 2,
+                pixels: vec![0; 4],
+            },
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            target: rejected_target,
+            want_bytes: false,
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: rejected_tx,
+        };
+        let rejected = match queue_tx.try_send(rejected) {
+            Err(std::sync::mpsc::TrySendError::Full(job)) => job,
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                panic!("live full queue reported disconnected")
+            }
+            Ok(()) => panic!("full queue accepted another framebuffer"),
+        };
+        reject_encode_job(rejected, ENCODE_QUEUE_FULL);
+        let error = rejected_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rejection reply")
+            .expect_err("saturated capture must be rejected");
+        assert!(error.contains(ENCODE_QUEUE_FULL), "precise error: {error}");
+        assert!(
+            !rejected_path.exists(),
+            "rejection must not publish the capture target"
+        );
+
+        let head = queue_rx.try_recv().expect("FIFO head remains queued");
+        reject_encode_job(head, "test cleanup");
+        let head_error = head_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("head cleanup reply")
+            .expect_err("test cleanup rejects the queued head");
+        assert!(head_error.contains("test cleanup"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rejected_snapshot_stays_without_a_completion_marker() {
+        let root = unique_dir("snapshot-queue-reject");
+        ensure_private_dir(&root).unwrap();
+        let path = root.join("snapshot.png");
+        let done = snapshot_sidecar_path(&path, ".done");
+        std::fs::write(&done, b"stale\n").unwrap();
+        let transaction = begin_snapshot_generation(&path).expect("snapshot transaction");
+        assert!(!done.exists(), "begin removes the stale marker");
+
+        reject_encode_job(
+            EncodeJob::Snapshot {
+                frame: Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0],
+                },
+                text: "unpublished".to_string(),
+                transaction,
+            },
+            ENCODE_QUEUE_FULL,
+        );
+
+        assert!(!path.exists(), "rejection must not write snapshot pixels");
+        assert!(!done.exists(), "rejection must not publish `.done`");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -10089,10 +10555,13 @@ mod encode_worker_tests {
         let outside_for_hook = outside.clone();
         let (reply, result) = std::sync::mpsc::channel();
 
-        send_capture_reply_after_validation(
-            target,
-            file,
-            None,
+        send_capture_reply_after_validation_with_hook(
+            PendingCaptureReply {
+                target,
+                file,
+                lease: None,
+                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            },
             &reply,
             (1_u32, 1_u32, None::<Vec<u8>>),
             "image",
@@ -10130,13 +10599,15 @@ mod encode_worker_tests {
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         send_capture_reply_after_validation(
-            target,
-            file,
-            Some(lease),
+            PendingCaptureReply {
+                target,
+                file,
+                lease: Some(lease),
+                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            },
             &reply_tx,
             (1_u32, 1_u32, None::<Vec<u8>>),
             "image",
-            || {},
         );
         let mut retained = reply_rx
             .recv_timeout(Duration::from_secs(2))
@@ -10184,13 +10655,15 @@ mod encode_worker_tests {
             .unwrap();
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         send_capture_reply_after_validation(
-            first_target,
-            first_file,
-            Some(first_lease),
+            PendingCaptureReply {
+                target: first_target,
+                file: first_file,
+                lease: Some(first_lease),
+                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            },
             &first_tx,
             (),
             "image",
-            || {},
         );
         let mut first = first_rx.recv().unwrap().unwrap();
 
@@ -10229,13 +10702,15 @@ mod encode_worker_tests {
             .unwrap();
         let (second_tx, second_rx) = std::sync::mpsc::channel();
         send_capture_reply_after_validation(
-            second_target,
-            second_file,
-            Some(second_lease),
+            PendingCaptureReply {
+                target: second_target,
+                file: second_file,
+                lease: Some(second_lease),
+                permit: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            },
             &second_tx,
             (),
             "image",
-            || {},
         );
         let mut second = second_rx.recv().unwrap().unwrap();
         second
@@ -10284,7 +10759,7 @@ mod encode_worker_tests {
         let recording = control_auth::confine_video_dir(&sock).unwrap();
         let path = recording.path().to_path_buf();
         let frame = recording
-            .write_new_private(std::ffi::OsStr::new("frame-000000.png"), b"png")
+            .write_sealed_frame(std::ffi::OsStr::new("frame-000000.png"), b"png")
             .unwrap();
         let index = recording
             .write_new_private(
@@ -10295,7 +10770,7 @@ mod encode_worker_tests {
 
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _publication = VideoPublication {
-                frame_files: vec![frame],
+                frame_seals: vec![frame],
                 index_file: index,
                 published_marker: None,
                 dir: recording,
@@ -10305,13 +10780,13 @@ mod encode_worker_tests {
         assert!(unwind.is_err());
         assert!(
             !path.exists(),
-            "file deny-delete handles must release before directory cleanup"
+            "the index deny-delete handle must release before directory cleanup"
         );
 
         let retained = control_auth::confine_video_dir(&sock).unwrap();
         let retained_path = retained.path().to_path_buf();
         let frame = retained
-            .write_new_private(std::ffi::OsStr::new("frame-000000.png"), b"png")
+            .write_sealed_frame(std::ffi::OsStr::new("frame-000000.png"), b"png")
             .unwrap();
         let index = retained
             .write_new_private(
@@ -10320,7 +10795,7 @@ mod encode_worker_tests {
             )
             .unwrap();
         let mut publication = VideoPublication {
-            frame_files: vec![frame],
+            frame_seals: vec![frame],
             index_file: index,
             published_marker: None,
             dir: retained,
@@ -10347,7 +10822,7 @@ mod encode_worker_tests {
         let recording = control_auth::confine_video_dir(&sock).unwrap();
         let path = recording.path().to_path_buf();
         let frame = recording
-            .write_new_private(std::ffi::OsStr::new("frame-000000.png"), b"png")
+            .write_sealed_frame(std::ffi::OsStr::new("frame-000000.png"), b"png")
             .unwrap();
         let index = recording
             .write_new_private(
@@ -10356,14 +10831,19 @@ mod encode_worker_tests {
             )
             .unwrap();
         let mut publication = VideoPublication {
-            frame_files: vec![frame],
+            frame_seals: vec![frame],
             index_file: index,
             published_marker: None,
             dir: recording,
         };
         publication.prepare().unwrap();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        send_video_reply_with_retention(publication, &reply_tx, "OK video\n".to_string());
+        send_video_reply_with_retention(
+            publication,
+            crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            &reply_tx,
+            "OK video\n".to_string(),
+        );
         let mut retained = reply_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker handed publication to the control writer");
@@ -10376,7 +10856,6 @@ mod encode_worker_tests {
                 .unwrap();
             later.publish(&[], &later_index).unwrap();
             let later_marker = later.publish_marker().unwrap();
-            later.prune_after_publish();
             drop(later_marker);
             drop(later_index);
             drop(later);
@@ -10388,13 +10867,79 @@ mod encode_worker_tests {
         retained
             .retention
             .as_mut()
-            .expect("video OK carries every exact file handle")
+            .expect("video OK carries its publication retention")
             .prepare_write()
             .expect("wire-edge video validation succeeds");
         drop(retained);
         assert!(
             path.join("index.json").is_file(),
             "wire preparation makes publication irrevocable before OK bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(sock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_video_marker_validation_still_runs_bounded_prune() {
+        let sock = unique_dir("video-post-publish-prune");
+        ensure_private_dir(&sock).unwrap();
+        let recording = control_auth::confine_video_dir(&sock).unwrap();
+        let path = recording.path().to_path_buf();
+        let root = path.parent().unwrap().to_path_buf();
+        let oldest = root.join("rec-00000000000000000000-100");
+        for sequence in 100..112 {
+            let fixture = root.join(format!("rec-00000000000000000000-{sequence:03}"));
+            std::fs::create_dir(&fixture).unwrap();
+            std::fs::write(fixture.join("index.json"), b"{\"frames\":[]}").unwrap();
+            std::fs::write(
+                fixture.join(control_auth::VIDEO_PUBLISHED_FILE),
+                b"published",
+            )
+            .unwrap();
+        }
+
+        let index = recording
+            .write_new_private(std::ffi::OsStr::new("index.json"), b"{\"frames\":[]}")
+            .unwrap();
+        let mut publication = VideoPublication {
+            frame_seals: Vec::new(),
+            index_file: index,
+            published_marker: None,
+            dir: recording,
+        };
+        publication.prepare().unwrap();
+
+        let marker = path.join(control_auth::VIDEO_PUBLISHED_FILE);
+        let displaced_marker = path.join(".published-displaced");
+        let marker_for_hook = marker.clone();
+        let mut retention = VideoReplyRetention { publication };
+        let error = retention
+            .prepare_write_with(move |publication| {
+                publication.publish_marker_with_test_hook(move || {
+                    std::fs::rename(&marker_for_hook, &displaced_marker).unwrap();
+                    std::fs::write(&marker_for_hook, b"replacement").unwrap();
+                })
+            })
+            .expect_err("replacement after visibility must fail marker identity validation");
+        assert!(error.contains("video publish marker failed"));
+        assert!(
+            retention.publication.is_published(),
+            "the atomic visibility boundary, not the fallible return, owns publication state"
+        );
+        assert!(
+            marker.is_file(),
+            "the once-visible recording remains complete"
+        );
+
+        drop(retention);
+        assert!(
+            !oldest.exists(),
+            "a post-publication failure still runs the bounded retention sweep"
+        );
+        assert!(
+            path.join("index.json").is_file() && marker.is_file(),
+            "the irrevocable fresh recording survives its own sweep"
         );
 
         let _ = std::fs::remove_dir_all(sock);
@@ -10608,13 +11153,14 @@ mod encode_worker_tests {
             .expect("fresh export permit");
         run_encode_job(EncodeJob::VideoDump {
             take,
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             mode: crate::VideoMode::SwapchainTap,
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
             unlogged_other_window: 0,
             started_us: 0,
-            dir,
+            dir: Box::new(dir),
             reply,
             cancel,
             permit,
@@ -10633,6 +11179,88 @@ mod encode_worker_tests {
             "the server-owned partial export is removed rather than leaked forever"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A frame seal is metadata, not a retained file descriptor. Exercise the
+    /// complete worker/publication/reply path below a limit that cannot hold one
+    /// descriptor per frame. The limit changes only in an exact-test child so
+    /// parallel libtest workers never inherit the process-wide mutation.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn video_export_frame_seals_keep_file_descriptors_bounded() {
+        const CHILD: &str = "ATERM_TEST_VIDEO_FRAME_SEAL_NOFILE";
+        if !crate::control_auth::enter_low_nofile_test_child(
+            CHILD,
+            "app_introspect::encode_worker_tests::video_export_frame_seals_keep_file_descriptors_bounded",
+            16,
+        ) {
+            return;
+        }
+
+        let root = aterm_tempfile::tempdir().expect("temporary video root");
+        ensure_private_dir(root.path()).unwrap();
+        let dir =
+            crate::control_auth::confine_video_dir(root.path()).expect("server-minted video dir");
+        let dir_path = dir.path().to_path_buf();
+        let take = aterm_gpu::video_tap::VideoTake {
+            frames: (1..=32)
+                .map(|seq| aterm_gpu::video_tap::CapturedFrame {
+                    seq,
+                    t_us: seq,
+                    w: 1,
+                    h: 1,
+                    rgba: vec![u8::try_from(seq).expect("test sequence fits u8"), 0, 0, 255],
+                })
+                .collect(),
+            dropped: 0,
+            evicted: 0,
+            decimated: 0,
+            fps_cap: None,
+            budget_bytes: 16 << 20,
+            requested_ms: 100,
+            w: 1,
+            h: 1,
+            device_px: (1, 1),
+            half_res: false,
+            format: "rgba8",
+            resized_early_stop: false,
+        };
+
+        let (reply, rx) = std::sync::mpsc::channel();
+        let cancel = crate::VideoCancellation::new();
+        let export = std::sync::Arc::new(crate::VideoExportState::default());
+        let permit = export
+            .try_begin(cancel.clone())
+            .expect("fresh export permit");
+        run_encode_job(EncodeJob::VideoDump {
+            take,
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            mode: crate::VideoMode::SwapchainTap,
+            keys_enabled: false,
+            inputs: Vec::new(),
+            unlogged_inputs: 0,
+            unlogged_other_window: 0,
+            started_us: 0,
+            dir: Box::new(dir),
+            reply,
+            cancel,
+            permit,
+        });
+        let mut retained = rx.recv().expect("video reply");
+        assert!(
+            retained.value.starts_with("OK frames=32 "),
+            "bounded export completes: {}",
+            retained.value
+        );
+        retained
+            .retention
+            .as_mut()
+            .expect("successful video reply owns publication retention")
+            .prepare_write()
+            .expect("all sealed frames revalidate at the wire edge");
+        assert!(dir_path.join("index.json").is_file());
+        assert!(dir_path.join("frame_0032.png").is_file());
+        drop(retained);
     }
 
     #[test]
@@ -10672,13 +11300,14 @@ mod encode_worker_tests {
         let (reply, rx) = std::sync::mpsc::channel();
         run_encode_job(EncodeJob::VideoDump {
             take,
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             mode: crate::VideoMode::SwapchainTap,
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
             unlogged_other_window: 0,
             started_us: 0,
-            dir,
+            dir: Box::new(dir),
             reply,
             cancel,
             permit,
@@ -10719,6 +11348,7 @@ mod encode_worker_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         crate::reset_visible_leaf_plan_builds();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&dir, "terminal.png"),
             clean: false,
             session: None,
@@ -10814,6 +11444,7 @@ mod encode_worker_tests {
             request_layout: None,
             presented_metadata: None,
             exact_frame: None,
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&dir, "binding.png"),
             want_bytes: true,
             want_metadata: true,
@@ -10912,6 +11543,7 @@ mod encode_worker_tests {
             let (tx, rx) = std::sync::mpsc::channel();
             crate::reset_visible_leaf_plan_builds();
             app.render_image(crate::control::ImageReq {
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
                 target: confined(&dir, name),
                 clean: false,
                 session: None,
@@ -11290,6 +11922,7 @@ mod encode_worker_tests {
             let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
             crate::reset_visible_leaf_plan_builds();
             app.render_image(crate::control::ImageReq {
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
                 target: confined(&dir, name),
                 clean: false,
                 session: None,
@@ -11425,6 +12058,7 @@ mod encode_worker_tests {
                 request_layout: None,
                 presented_metadata: None,
                 exact_frame: None,
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
                 target: confined(&dir, name),
                 want_bytes: true,
                 want_metadata: false,
@@ -11508,13 +12142,14 @@ mod encode_worker_tests {
             .expect("fresh export permit");
         run_encode_job(EncodeJob::VideoDump {
             take,
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             mode: crate::VideoMode::SwapchainTap,
             keys_enabled: false,
             inputs: Vec::new(),
             unlogged_inputs: 0,
             unlogged_other_window: 0,
             started_us: 500,
-            dir,
+            dir: Box::new(dir),
             reply: tx,
             cancel,
             permit,
@@ -12102,6 +12737,7 @@ mod encode_worker_tests {
                 height: 1,
                 pixels: vec![0u32; 1],
             },
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&dir, "dead.png"),
             want_bytes: false,
             cancel: crate::control::CaptureCancellation::new(),
@@ -12114,6 +12750,7 @@ mod encode_worker_tests {
                 height: 2,
                 pixels: vec![0u32; 4],
             },
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: confined(&dir, "live.png"),
             want_bytes: false,
             cancel: crate::control::CaptureCancellation::new(),
@@ -12133,6 +12770,41 @@ mod encode_worker_tests {
         // A dropped receiver never observes OK, so its unpublished exact file is
         // removed when the guard cannot cross into the control writer.
         assert!(!dir.join("dead.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_image_retains_admission_through_the_wire_handoff() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-inline-image-retention-{}",
+            std::process::id()
+        ));
+        ensure_private_dir(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_encode_job(EncodeJob::Image {
+            frame: Frame {
+                width: 2,
+                height: 2,
+                pixels: vec![0u32; 4],
+            },
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+            target: confined(&dir, "unused.png"),
+            want_bytes: true,
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: tx,
+        });
+        let mut retained = rx.recv().expect("inline reply").expect("inline encode");
+        assert!(retained.value.2.is_some(), "inline reply carries PNG bytes");
+        retained
+            .retention
+            .as_mut()
+            .expect("byte reply retains its admission permit")
+            .prepare_write()
+            .expect("in-memory wire payload is ready");
+        assert!(
+            !dir.join("unused.png").exists(),
+            "inline capture never publishes a file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -12189,6 +12861,7 @@ mod window_render_context_capture_tests {
         app.frontmost_window = Some(wid);
         let (tx, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: control_auth::ConfinedImage::for_test(dir, name),
             clean: false,
             session: None,
@@ -12507,6 +13180,7 @@ mod headless_cursor_fx_tests {
         control_auth::ensure_private_dir(&dir).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: control_auth::ConfinedImage::for_test(&dir, "singer.png"),
             clean: false,
             session: None,
@@ -12581,6 +13255,7 @@ mod headless_cursor_fx_tests {
         control_auth::ensure_private_dir(&dir).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         app.render_image(crate::control::ImageReq {
+            handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
             target: control_auth::ConfinedImage::for_test(&dir, "classic.png"),
             clean: false,
             session: None,

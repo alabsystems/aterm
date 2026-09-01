@@ -138,6 +138,12 @@ pub(crate) enum Reason {
     OutputActivity,
     Stall,
     NoEvidence,
+    /// A macOS consent wall is POSSIBLE for this session: its `fs_consent` is
+    /// not `covered` and its shell-integration cwd is under a protected root
+    /// (design §3.6). A conjunction of two observed facts — NOT a claim that a
+    /// dialog is showing, which aterm cannot see. Never emitted when the cwd is
+    /// unknown, i.e. whenever shell integration is absent.
+    ConsentPrompt,
 }
 
 impl Reason {
@@ -152,6 +158,7 @@ impl Reason {
             Self::OutputActivity => "output_activity",
             Self::Stall => "stall",
             Self::NoEvidence => "no_evidence",
+            Self::ConsentPrompt => "consent_at_risk",
         }
     }
 }
@@ -1868,6 +1875,15 @@ impl crate::App {
             return Err(format!("no such session {session}"));
         };
         let enabled = self.config.tab_status_or_default();
+        // FABRIC, additive (§11.2). `hold=` is this session's standing fleet halt
+        // — a driver polling `status` learns why its `send` will answer `ERR
+        // halted` without a second round trip — and `fabric=` is the INSTANCE's
+        // bridge state, which is the other half of the same question: a
+        // `disconnected` bridge is itself a held state, because the halt does not
+        // depend on that process staying alive. Both are plain flag reads on leaf
+        // state, so they cost this polled record nothing.
+        let hold = u8::from(pooled.ctx.fabric.hold().is_some());
+        let fabric = crate::fabric::fabric_state();
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
@@ -1876,6 +1892,17 @@ impl crate::App {
             Ok(t) => Some(t),
             Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        // The RAW shell-integration cwd, taken from the SAME guard as the
+        // subject rungs: `consent_at_risk` is a lexical test against the
+        // protected roots, and it must not re-take a lock this scope already
+        // holds (nor answer from a display-abbreviated string).
+        let reported_cwd = {
+            use crate::cwd_native::ReportedCwd as _;
+            term.as_deref().and_then(|t| {
+                t.native_working_directory()
+                    .map(std::borrow::Cow::into_owned)
+            })
         };
         let (subject, subject_source) = match pin {
             Some(title) if !title.is_empty() => (Some(title), "pin"),
@@ -1910,6 +1937,10 @@ impl crate::App {
         // producer, so the two verbs can never disagree about who lives here.
         let detail = term.as_deref().and_then(executing_detail);
         drop(term);
+        // THE TWO ADDITIVE FIELDS (design §5.2). Additive: `schema=1` does not
+        // move. Computed after the terminal guard is released, from the cwd
+        // that guard already produced.
+        let consent = self.session_consent(session, reported_cwd.as_deref());
         let opt = |value: Option<&str>| {
             value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
         };
@@ -1922,9 +1953,12 @@ impl crate::App {
             return Ok(format!(
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
                  phase=unknown since_ms=- outcome=none exit_code=- signal=- detail={} \
-                 confidence=unknown reasons=- conflict=false revision=0 enabled={enabled}",
+                 confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
+                 revision=0 enabled={enabled} hold={hold} fabric={fabric}",
                 opt(subject.as_deref()),
                 opt(detail.as_deref()),
+                consent.attribution.as_str(),
+                consent.fs_consent.as_str(),
             ));
         };
         // `Status::since` is a raw `Instant`, so the reply carries an AGE rather
@@ -1937,25 +1971,34 @@ impl crate::App {
             Outcome::Signal { signal } => ("-".to_string(), signal.to_string()),
             Outcome::None | Outcome::Success => ("-".to_string(), "-".to_string()),
         };
-        let reasons = if status.reasons.is_empty() {
+        // `consent_at_risk` rides the reasons list rather than the classifier:
+        // the FSM is a pure function of terminal evidence and has no consent
+        // input, and this token is a join of two facts it never sees.
+        let mut reason_tokens: Vec<&str> = status
+            .reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect();
+        if consent.at_risk {
+            reason_tokens.push(Reason::ConsentPrompt.as_str());
+        }
+        let reasons = if reason_tokens.is_empty() {
             "-".to_string()
         } else {
-            status
-                .reasons
-                .iter()
-                .map(|reason| reason.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
+            reason_tokens.join(",")
         };
         Ok(format!(
             "schema=1 sid={session} subject={} subject_source={subject_source} observed=true \
              phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
-             detail={} confidence={} reasons={reasons} conflict={} revision={} enabled={enabled}",
+             detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
+             conflict={} revision={} enabled={enabled} hold={hold} fabric={fabric}",
             opt(subject.as_deref()),
             status.phase.as_str(),
             status.last_outcome.as_str(),
             opt(detail.as_deref().or(status.detail.as_deref())),
             status.confidence.as_str(),
+            consent.attribution.as_str(),
+            consent.fs_consent.as_str(),
             status.conflict,
             self.session_status.revision(session),
         ))
@@ -2871,10 +2914,57 @@ mod tests {
         );
     }
 
+    /// The two ADDITIVE fabric fields (§11.2). They answer the question a driver
+    /// asks right after `ERR halted`: is this session held, and is there a bridge
+    /// alive to lift it? Both arrive on BOTH arms of the record — the unobserved
+    /// arm too, because a session nobody has classified yet can still be halted —
+    /// and neither bumps `schema=`, which is what "additive" means here.
+    #[test]
+    fn the_status_record_carries_hold_and_fabric_inbox_hold() {
+        crate::fabric::with_link_reset(the_status_record_carries_hold_and_fabric_body);
+    }
+
+    fn the_status_record_carries_hold_and_fabric_body() {
+        let mut app = crate::App::headless_for_test();
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=false "), "the unobserved arm");
+        assert!(record.contains(" hold=0 "), "{record}");
+        assert!(record.contains(" fabric=absent"), "{record}");
+        assert!(
+            record.starts_with("schema=1 "),
+            "additive, not a new schema"
+        );
+
+        // Held: the flag flips on the OBSERVED arm too, from the same leaf read.
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        let ctx = app.pool.get(0).expect("live session").ctx.clone();
+        crate::fabric::apply_hold_for_test(
+            &ctx,
+            Some(crate::fabric::Hold {
+                reason: "main%20broken".to_string(),
+                origin: "fleet".to_string(),
+            }),
+        );
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=true "), "{record}");
+        assert!(record.contains(" hold=1 "), "{record}");
+        assert!(!record.contains('\n'), "one line, always");
+    }
+
     /// The `status` verb's reply, field by field. `schema=` leads so a consumer
     /// can reject an unknown MAJOR from the first token.
     #[test]
     fn the_status_record_is_versioned_and_separates_unobserved_from_unknown() {
+        // The tail it pins is `fabric=`, which is process-global instance state.
+        crate::fabric::with_link_reset(
+            the_status_record_is_versioned_and_separates_unobserved_from_unknown_body,
+        );
+    }
+
+    fn the_status_record_is_versioned_and_separates_unobserved_from_unknown_body() {
         let mut app = crate::App::headless_for_test();
 
         // Never classified. This is NOT `phase=unknown`, which means the
@@ -2909,11 +2999,114 @@ mod tests {
         // a wall of `unknown`.
         app.config.tab_status = Some(false);
         let record = app.session_status_record(0).expect("live session");
-        assert!(record.ends_with(" enabled=false"), "{record}");
+        // `enabled=` was the LAST field when this was written, and the assertion
+        // said so with `ends_with`. Two ADDITIVE fabric fields now follow it
+        // (`hold=`, `fabric=`), which is exactly what the record's own help
+        // promises a consumer — fields are appended and never bump `schema=`. So
+        // pin the VALUE, and let the tail keep growing.
+        assert!(record.contains(" enabled=false "), "{record}");
+        assert!(record.ends_with(" fabric=absent"), "{record}");
 
         assert!(
             app.session_status_record(9999).is_err(),
             "an unknown session is an error, not a blank record"
+        );
+    }
+
+    /// THE TWO ADDITIVE FIELDS (design §5.2). They ride BOTH branches of the
+    /// record — the never-classified one as well as the classified one — so a
+    /// poller can never see a field appear from nowhere, and `schema=1` does
+    /// not move because nothing was renamed or removed.
+    ///
+    /// `covered` is deliberately unreachable today: it needs Full Disk Access
+    /// AND `attribution=live` AND a service §7 S4 proved covered, and S4 has
+    /// not been run. `unknown` here is the honest answer, not a stub.
+    #[test]
+    fn the_status_record_carries_the_two_additive_consent_fields() {
+        let mut app = crate::App::headless_for_test();
+
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=false "), "{record}");
+        assert!(
+            record.contains(" reasons=- attribution=live fs_consent=unknown conflict=false "),
+            "the fields sit between `reasons=` and `conflict=`: {record}"
+        );
+        assert!(
+            record.contains(" schema=1 ") || record.starts_with("schema=1 "),
+            "{record}"
+        );
+
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=true "), "{record}");
+        assert!(
+            record.contains(" reasons=shell_block attribution=live fs_consent=unknown conflict="),
+            "{record}"
+        );
+        assert!(
+            !record.contains("fs_consent=covered"),
+            "`covered` needs a measurement nobody has taken: {record}"
+        );
+        assert!(!record.contains('\n'), "still ONE line: {record}");
+
+        // An ADOPTED session says so, and still refuses to assert the TCC
+        // consequence (§3.9 pt 3).
+        app.pool
+            .sessions
+            .get_mut(&0)
+            .expect("session 0")
+            .session
+            .handoff_local_id = Some(11);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" attribution=adopted fs_consent=unknown "),
+            "{record}"
+        );
+    }
+
+    /// `consent_at_risk` is emitted on the CONJUNCTION and on nothing else: it
+    /// is silent while the cwd is unknown (every session without shell
+    /// integration), and it appears the moment a reported cwd lands under a
+    /// protected root. It is not a claim that a dialog is showing.
+    #[test]
+    fn consent_at_risk_rides_the_reasons_token_only_on_the_conjunction() {
+        assert_eq!(Reason::ConsentPrompt.as_str(), "consent_at_risk");
+
+        let mut app = crate::App::headless_for_test();
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            !record.contains("consent_at_risk"),
+            "no cwd reported, so no token: {record}"
+        );
+
+        // The protected roots are RESOLVED DATA from the consent module — this
+        // file writes no protected-folder literal of its own (rule B13).
+        let roots = aterm_containment::consent::protected_roots(&[]);
+        let Some(root) = roots.first() else {
+            return; // no $HOME resolved: nothing to assert against
+        };
+        let cwd = root.join("aterm-consent-proof");
+        {
+            let term = app.pool.get(0).expect("session 0").term.clone();
+            let mut t = crate::term_lock(&term);
+            t.process(format!("\x1b]7;file://localhost{}\x07", cwd.display()).as_bytes());
+        }
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(",consent_at_risk "),
+            "a protected cwd with an uncovered fs_consent arms the token: {record}"
+        );
+        assert!(
+            record.contains(" fs_consent=unknown "),
+            "and the token never upgrades the verdict it rides on: {record}"
         );
     }
 

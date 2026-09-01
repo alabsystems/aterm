@@ -135,6 +135,7 @@ fn render_candidate(variant: BedVariant, seconds: f32) -> Vec<f32> {
                 tone: Tone::Technical,
                 // Bed ON: the audition audits beds — that is the point.
                 bed: true,
+                shifted: false,
             });
             cue_i += 1;
         }

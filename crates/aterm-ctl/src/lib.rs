@@ -130,8 +130,8 @@
 //!   the calling terminal). Discovers `<dir>/aterm-<pid>.sock` files and probes
 //!   each with its own token.
 //! * `ls`              — every session of every live instance, one line each:
-//!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> window=<id|none|->
-//!   active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]` (the server's
+//!   `<pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
+//!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
 //!   terminal's own session, from `$ATERM_PARENT_SESSION_ID`; the title is
 //!   pct-encoded and often mirrors the cwd via shell integration). The
@@ -330,7 +330,7 @@ const CLIENT_VERBS: &str = "\
 \n\
 CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
-                  <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1>
+                  <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->[ *]
                   (* = the calling terminal's own session; window= is the
                   hosting window — a headless instance reports its one logical
@@ -3764,7 +3764,7 @@ const MAX_BODY_BYTES: usize = 256 << 20; // 256 MiB
 /// a 240×96 grid), and `image read` returns base64 of the server's 4 MiB raw
 /// frame cap, ~5.33 MiB on one line. 8 MiB clears both with headroom while
 /// still bounding a hostile stream to one small allocation.
-const MAX_LINE_BYTES: usize = 8 << 20; // 8 MiB
+const MAX_LINE_BYTES: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE_BYTES;
 
 /// Hard deadline on each socket read/write in [`exchange`]. This CANNOT be
 /// [`probe_lines`]' 2 s discovery deadline: the blocking verbs (`await`,
@@ -3897,7 +3897,7 @@ fn send_request(mut stream: &CtlStream, token: Option<&str>, request: &str) -> i
 }
 
 /// Confirm that a guarded artifact response was consumed in full. The server
-/// releases its exact path/handle retention only after receiving this frame.
+/// releases its artifact publication retention only after receiving this frame.
 ///
 /// Servers predating the acknowledgement trailer leave the persistent socket
 /// open after the ordinary response. Bound the optional trailer read so a new
@@ -4041,17 +4041,18 @@ fn print_payload(reader: &mut BufReader<&CtlStream>, count: usize) -> io::Result
     out.flush()
 }
 
-/// Guarded line replies are currently `video frames`, whose server-side maximum
-/// is 64 short metadata/path rows. Read the complete wire frame before ACK so
-/// acknowledgement never depends on a potentially backpressured stdout pipe.
-/// The aggregate cap also prevents a compromised/skewed server from turning
-/// that small handoff buffer into an unbounded allocation.
+/// Guarded line replies are `video frames` (at most 64 short path rows). Read
+/// the complete wire frame before ACK so acknowledgement never depends on a
+/// potentially backpressured stdout pipe. The aggregate cap prevents a
+/// compromised/skewed server from turning the handoff buffer into an unbounded
+/// allocation.
 const MAX_GUARDED_ARTIFACT_LINES: usize = 64;
-const MAX_GUARDED_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GUARDED_PATH_BYTES: usize = 4 * 1024 * 1024;
 
-fn read_guarded_payload(
-    reader: &mut BufReader<&CtlStream>,
+fn read_guarded_payload<R: BufRead>(
+    reader: &mut R,
     count: usize,
+    max_bytes: usize,
 ) -> io::Result<Vec<String>> {
     if count > MAX_GUARDED_ARTIFACT_LINES {
         return Err(io::Error::new(
@@ -4075,15 +4076,19 @@ fn read_guarded_payload(
                 "guarded artifact response size overflow",
             )
         })?;
-        if total > MAX_GUARDED_ARTIFACT_BYTES {
+        if total > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "guarded artifact response exceeds its 4 MiB bound",
+                "guarded artifact response exceeds its 4 MiB aggregate bound",
             ));
         }
-        let line = line.strip_suffix('\n').unwrap_or(&line);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        lines.push(line.to_string());
+        if line.ends_with('\n') {
+            line.pop();
+        }
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        lines.push(line);
     }
     Ok(lines)
 }
@@ -4116,7 +4121,7 @@ fn receive_guarded_artifact_reply(
 ) -> io::Result<GuardedArtifactOutput> {
     if streams_payload(verb, request) {
         let count = stream_count(tail).ok_or_else(|| malformed_header_error(status_line))?;
-        let lines = read_guarded_payload(reader, count)?;
+        let lines = read_guarded_payload(reader, count, MAX_GUARDED_PATH_BYTES)?;
         acknowledge_artifact_reply(stream, reader, verb, request)?;
         Ok(GuardedArtifactOutput::Lines(lines))
     } else {
@@ -4789,7 +4794,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_artifact_ack_echoes_only_the_server_nonce() {
+    fn guarded_file_artifact_echoes_only_the_server_nonce() {
         let (client, mut server) = CtlStream::pair().unwrap();
         server
             .write_all(b"ACK-CHALLENGE 00112233445566778899aabbccddeeff\n")
@@ -4806,6 +4811,19 @@ mod tests {
             peer.join().unwrap(),
             "ACK 00112233445566778899aabbccddeeff\n"
         );
+    }
+
+    #[test]
+    fn in_memory_image_never_probes_for_an_optional_ack_challenge() {
+        let (client, mut server) = CtlStream::pair().unwrap();
+        server.write_all(b"not-an-ack-challenge\n").unwrap();
+        server.flush().unwrap();
+        let mut reader = BufReader::new(&client);
+        acknowledge_artifact_reply(&client, &mut reader, "image", "image --bytes").unwrap();
+
+        let mut untouched = String::new();
+        reader.read_line(&mut untouched).unwrap();
+        assert_eq!(untouched, "not-an-ack-challenge\n");
     }
 
     #[test]

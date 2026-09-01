@@ -2756,6 +2756,7 @@ mod tests {
             timeline: Arc::new(Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
+            fabric: crate::fabric::SessionFabric::default(),
         });
         SessionHandle {
             sid,
@@ -3612,6 +3613,12 @@ mod tests {
             reached_tx: std::sync::mpsc::SyncSender<usize>,
             release_rx: Mutex<std::sync::mpsc::Receiver<()>>,
             blocked_once: AtomicBool,
+            /// When the timeout fallback DECIDED — entry into
+            /// `fault_marker_without_live`, before any durable I/O. The one
+            /// clocked assertion below reads this, so what it times is an
+            /// I/O-free window (stop flag, unpark, a few 10 ms polls), never
+            /// the marker's F_FULLFSYNC.
+            fallback_decision_at: Mutex<Option<Instant>>,
         }
 
         impl EventSink for WedgedCycleSink {
@@ -3624,6 +3631,10 @@ mod tests {
             }
 
             fn fault_marker_without_live(&self, reason: FleetFaultReason) -> Result<(), String> {
+                self.fallback_decision_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_or_insert_with(Instant::now);
                 self.queue
                     .latch_fault_marker_without_live(reason)
                     .map(|_| ())
@@ -3659,6 +3670,7 @@ mod tests {
             reached_tx,
             release_rx: Mutex::new(release_rx),
             blocked_once: AtomicBool::new(false),
+            fallback_decision_at: Mutex::new(None),
         });
         let mut runtime = start(
             store,
@@ -3667,29 +3679,53 @@ mod tests {
         )
         .unwrap();
         runtime.shutdown_timeout = Duration::from_millis(30);
+        // 30 s: a hang discriminator, not a latency SLA — passing runs have
+        // been measured stretching past 7 s under fsync-contended load.
         assert_eq!(
-            reached_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            reached_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
             1,
             "timeout seam must hold a real classified candidate"
         );
 
         let started = Instant::now();
-        runtime.shutdown_and_join();
-        // The property is BOUNDED-vs-HUNG, not a latency SLA: the observer stays
-        // wedged until `release_tx.send()` BELOW, so a broken fallback that waited
-        // behind it would not return until the test's own 2 s reached-window — it
-        // would hang, not merely run late. The bound only has to sit clearly below
-        // that hang while absorbing scheduler noise: 30 ms configured timeout, and
-        // the timeout thread itself can be starved for hundreds of ms under a
-        // loaded gate (observed: a full-core cold rebuild made a 500 ms bound
-        // flake). 1500 ms keeps the fallback provably finite without pinning a
-        // latency the scheduler does not guarantee.
+        // ORDER, not wall-clock. The old shape clocked `shutdown_and_join`
+        // whole — a window containing the fault marker's F_FULLFSYNC (twice:
+        // file then directory), which no constant bound covers on a contended
+        // disk; the 1500 ms it used flaked in convoys, and its predecessor at
+        // 500 ms flaked before that. Run shutdown on a helper thread so a
+        // fallback that waits behind the wedged observer fails as a NAMED
+        // 30 s panic instead of wedging the suite, and prove the property by
+        // order: the observer provably cannot have released yet (its release
+        // channel is sent below), so `shutdown_and_join` returning at all
+        // proves the timeout path fired without joining it.
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            runtime.shutdown_and_join();
+            let _ = done_tx.send(runtime);
+        });
+        let runtime = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("timeout fallback waited behind the wedged observer");
         assert!(
-            started.elapsed() < Duration::from_millis(1500),
-            "timeout fallback waited behind the wedged observer"
+            Arc::strong_count(&sink) >= 2,
+            "shutdown returned only after the observer exited; timeout path not taken"
+        );
+        // The one remaining clocked claim covers an I/O-FREE window: the
+        // fallback DECISION (entry into `fault_marker_without_live`, stamped
+        // before any durable sync) must come from the configured 30 ms
+        // timeout, not the 2 s default. Measured <= 38 ms on a saturated box;
+        // 1 s cannot confuse the two.
+        let decided_at = sink
+            .fallback_decision_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("timeout fallback never invoked the live-lock-independent marker");
+        assert!(
+            decided_at.duration_since(started) < Duration::from_secs(1),
+            "fallback decision came at 2 s-default scale, not the configured 30 ms timeout"
         );
         release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while Arc::strong_count(&sink) != 1 {
             assert!(Instant::now() < deadline, "detached observer did not exit");
             std::thread::sleep(Duration::from_millis(2));
