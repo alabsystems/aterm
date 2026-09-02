@@ -1302,9 +1302,29 @@ impl WinitView {
         // later will work though, since the flags are attached to the event and contain valid
         // information.
         'send_event: {
+            // LOCAL PATCH (aterm): `-keyCode` IS ONLY VALID ON A KEY EVENT.
+            // AppKit asserts on it for any other type (`NSEvent.m`), and this
+            // function is called with a MOUSE event on every pointer move —
+            // `mouse_motion` ends in `update_modifiers(event, false)`. Reading
+            // it unconditionally therefore raised an NSException inside a Rust
+            // method, which crossed the `declare_class!` trampoline as a
+            // FOREIGN exception and aborted the process: v0.72.0 crashed with
+            // `*** Assertion failure ... NSEvent.m:3220` under
+            // `_routeMouseMovedEvent` after a few minutes of ordinary mouse
+            // movement.
+            //
+            // The value is USED only inside the `is_flags_changed_event` arm
+            // below, so gating the READ on the same flag is semantics-
+            // preserving and removes the invalid send entirely.
+            //
             // SAFETY: `-keyCode` is `S16@0:8` on `NSEvent` — an UNSIGNED
-            // short; see `send_u16`.
-            let scancode = unsafe { send_u16(ns_event, sel!(keyCode)) };
+            // short; see `send_u16` — and it is now only ever sent to the
+            // flags-changed event, which is a key event.
+            let scancode = if is_flags_changed_event {
+                unsafe { send_u16(ns_event, sel!(keyCode)) }
+            } else {
+                0
+            };
             if is_flags_changed_event && scancode != 0 {
                 let physical_key = scancode_to_physicalkey(scancode as u32);
 
