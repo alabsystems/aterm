@@ -52,17 +52,33 @@ thread_local! {
 pub(crate) fn pbcopy(text: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-        use objc2_foundation::NSString;
-        // SAFETY: generalPasteboard is a valid singleton on any thread;
-        // clearContents/setString:forType: take ownership of the pasteboard
-        // before writing (the documented write protocol) and the NSString
-        // argument outlives the call.
-        unsafe {
-            let pb = NSPasteboard::generalPasteboard();
-            pb.clearContents();
-            pb.setString_forType(&NSString::from_str(text), NSPasteboardTypeString)
-        }
+        use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
+
+        use crate::appkit;
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
+        // thread; `-clearContents` is `-(NSInteger)` (the new change count,
+        // discarded) and takes ownership of the pasteboard before writing — the
+        // documented write protocol; `-setString:forType:` is
+        // `-(BOOL)(NSString *, NSPasteboardType)`, where the type IS an
+        // `NSString *`, and both arguments outlive the call.
+        autoreleasepool(|_| unsafe {
+            let Some(ns) = appkit::nsstring(text) else {
+                return false;
+            };
+            let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
+            if pb.is_null() || pasteboard_type_string().is_null() {
+                return false;
+            }
+            let _ = appkit::send_isize(pb, sel!(clearContents));
+            let set: unsafe extern "C" fn(Id, Sel, Id, Id) -> aterm_objc::Bool = aterm_objc::msg();
+            set(
+                pb,
+                sel!(setString:forType:),
+                ns.id(),
+                pasteboard_type_string(),
+            )
+            .as_bool()
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -80,6 +96,27 @@ pub(crate) fn pbcopy(text: &str) -> bool {
     }
 }
 
+/// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type.
+///
+/// LINKED, and it is the exception that proves the rule the rest of this port
+/// found: nearly every AppKit "constant" aterm reaches is a header-only
+/// `static const` or enumerator with no symbol (see `appkit::consts`), but the
+/// `NSPasteboardType` family really is `APPKIT_EXTERN NSPasteboardType const`
+/// — a genuine exported `NSString *`. So this one is bound, not transcribed;
+/// transcribing it would mean inventing the string `"public.utf8-plain-text"`
+/// and hoping.
+#[cfg(target_os = "macos")]
+fn pasteboard_type_string() -> aterm_objc::Id {
+    // SAFETY: AppKit exports this as an immortal `NSString *` constant; reading
+    // the symbol is a load, and the object it names outlives the process.
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {
+        static NSPasteboardTypeString: *mut std::ffi::c_void;
+    }
+    // SAFETY: as above.
+    aterm_objc::Id::from_ptr(unsafe { NSPasteboardTypeString })
+}
+
 /// Read the system CLIPBOARD as UTF-8 text, or `None` when empty / unavailable.
 /// macOS reads the general `NSPasteboard` in-process (see [`pbcopy`] for the
 /// locale + threading notes); Linux/X11 reads the CLIPBOARD selection via the
@@ -93,14 +130,24 @@ pub(crate) fn pbpaste() -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-        // SAFETY: generalPasteboard is a valid singleton on any thread and
-        // stringForType: only reads it; the returned NSString is retained.
-        let s = unsafe {
-            NSPasteboard::generalPasteboard()
-                .stringForType(NSPasteboardTypeString)?
-                .to_string()
-        };
+        use aterm_objc::{autoreleasepool, class, sel};
+
+        use crate::appkit;
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
+        // thread, and `-stringForType:` is `-(NSString *)(NSPasteboardType)`, a
+        // read that returns a BORROWED string — copied out to Rust inside this
+        // pool, which is why the pool is here rather than at the caller.
+        let s = autoreleasepool(|_| unsafe {
+            let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
+            if pb.is_null() || pasteboard_type_string().is_null() {
+                return String::new();
+            }
+            appkit::nsstring_to_rust(appkit::send_id_id(
+                pb,
+                sel!(stringForType:),
+                pasteboard_type_string(),
+            ))
+        });
         (!s.is_empty()).then_some(s)
     }
     #[cfg(target_os = "linux")]

@@ -1001,6 +1001,22 @@ pub(crate) fn touched_len() -> usize {
     LINK.touched.lock().unwrap_or_else(|p| p.into_inner()).len()
 }
 
+/// Whether [`FabricLink::touched`] currently holds `sid`. Test-only. Unlike
+/// [`touched_len`], MEMBERSHIP of a sid this test itself minted is meaningful
+/// even while unlocked sibling tests insert THEIR sids concurrently — which is
+/// exactly what they do: 17 tests in `inbox_hold` call `deliver` outside
+/// [`with_link_reset`]'s mutex, so any exact global count raced and the
+/// governed-set test flaked whenever the schedule overlapped it with one of
+/// them (2 of 3 full-suite samples, 2026-09-01).
+#[cfg(test)]
+pub(crate) fn touched_contains(sid: &str) -> bool {
+    LINK.touched
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|s| s == sid)
+}
+
 /// [`apply_hold`] for a caller that already holds the ctx — the `status` test's
 /// door into the same state the bridge writes, without a registry round trip.
 #[cfg(test)]
@@ -3711,11 +3727,19 @@ mod inbox_hold {
                 assert_eq!(deliver(&store, &sid, local, "h-a", "note", "x"), "OK 1\n");
                 sids.push(sid);
             }
-            assert_eq!(
-                touched_len(),
-                n,
-                "every governed sid is remembered while its session lives"
-            );
+            // MEMBERSHIP, not the global count. `touched` is process-global and
+            // 17 sibling tests insert into it OUTSIDE `with_link`'s mutex, so an
+            // exact `touched_len()` raced the schedule (2 of 3 full-suite
+            // samples failed here, 2026-09-01, while the test was green alone
+            // and green single-threaded). This test's own sids are unforgeable
+            // by siblings, so membership states the same pruning property,
+            // schedule-proof.
+            for sid in &sids {
+                assert!(
+                    touched_contains(sid),
+                    "every governed sid is remembered while its session lives"
+                );
+            }
 
             // All but the last leave. Nothing has pruned yet — the set still
             // carries every dead sid.
@@ -3725,7 +3749,12 @@ mod inbox_hold {
                     .unwrap_or_else(|p| p.into_inner())
                     .deregister_local(local);
             }
-            assert_eq!(touched_len(), n, "a session leaving does not itself prune");
+            for sid in &sids {
+                assert!(
+                    touched_contains(sid),
+                    "a session leaving does not itself prune"
+                );
+            }
 
             // The next bridge verb prunes against the live registry.
             let last = sids.last().expect("a session").clone();
@@ -3733,10 +3762,15 @@ mod inbox_hold {
                 deliver(&store, &last, 9_999, "h-a", "note", "again"),
                 "OK 2\n"
             );
-            assert_eq!(
-                touched_len(),
-                1,
-                "the set must shrink to the sessions that still exist"
+            for sid in &sids[..n - 1] {
+                assert!(
+                    !touched_contains(sid),
+                    "the set must shrink to the sessions that still exist"
+                );
+            }
+            assert!(
+                touched_contains(&last),
+                "the one live session survives the prune"
             );
         });
     }

@@ -58,6 +58,15 @@ impl FakeRepo {
         // finding; `redraw_harness` re-writes it for the tests that are about
         // what its exit code means.
         me.redraw_harness(0);
+        // Likewise the live-class auditor, which is an `[[example]]` and so
+        // lands under `target/debug/examples/`.
+        me.objc_auditor(0);
+        // And the IME driver beside it, same shape, same reason.
+        me.objc_ime_driver(0);
+        // And the toolbar driver, likewise.
+        me.objc_toolbar_driver(0);
+        // And the window driver (W8), likewise.
+        me.objc_window_driver(0);
         me
     }
 
@@ -69,6 +78,54 @@ impl FakeRepo {
         self.script(
             "target/debug/aterm-redraw-conformance",
             &format!("echo 'aterm-redraw-conformance: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_live_class_audit` example that exits `code`. Same
+    /// `0`/`1`/`2` contract as the redraw harness, and what these tests
+    /// exercise is likewise the STAGE's reading of it.
+    fn objc_auditor(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_live_class_audit",
+            &format!("echo 'objc-live-class-audit: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_ime_drive` example that exits `code`. Same `0`/`1`/`2`
+    /// contract, and what these tests exercise is likewise the STAGE's reading
+    /// of it and not the composition itself.
+    fn objc_ime_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_ime_drive",
+            &format!("echo 'objc-ime-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_toolbar_drive` example that exits `code`. FOUR codes
+    /// here and not three (`3` is the watchdog), and what these tests exercise
+    /// is likewise the STAGE's reading of them and not the drive itself.
+    fn objc_toolbar_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_toolbar_drive",
+            &format!("echo 'objc-toolbar-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_window_drive` example that exits `code`. THREE codes,
+    /// not the toolbar's four: this driver pops no menu, so it has no modal
+    /// tracking loop to hang in and no watchdog to report one.
+    fn objc_window_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_window_drive",
+            &format!("echo 'objc-window-drive: stub'; exit {code}"),
         );
         self
     }
@@ -224,8 +281,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        22,
-        "19 gate stages plus the three --full tiers"
+        26,
+        "23 gate stages plus the three --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -664,6 +721,188 @@ fn a_widened_change_scoped_run_is_a_whole_tree_run_and_keeps_the_claim() {
     assert!(v.text.contains(MERGE_CONTRACT_SENTENCE));
 }
 
+/// THE SAME OBLIGATION, for the live-class auditor. The regression it exists
+/// for lives one layer down — a retyped argument or a dropped protocol in
+/// `vendor/winit`'s ported delegate, both of which left `cargo build` at 0 and
+/// the seam census at 6/6. What is tested HERE is that something LOOKS at the
+/// answer, and above all that `2` (no window server, no delegate) is never
+/// green: a headless CI box reading that as a pass would restore the identical
+/// silence in a new place.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_objc_audit_reads_its_exit_code_and_a_two_is_never_green() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcClassAudit)
+        .expect("the objc live-class audit is planned");
+
+    repo.objc_auditor(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a clean audit leaves the run clean"
+    );
+
+    repo.objc_auditor(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+
+    repo.objc_auditor(2);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
+    assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render()
+            .contains("  FAIL  objc live-class audit: NOT RUN"),
+        "{}",
+        r.render()
+    );
+}
+
+/// The IME drive answers the same three codes, and `2` is likewise never green.
+///
+/// It is a SEPARATE stage from the audit because it asks a separate question —
+/// the audit proves the ported `WinitView` is shaped right, this proves it
+/// composes — and a separate stage is a separate exit code to misread. On a
+/// headless box the driver has no input context and answers `2`; read as a pass
+/// that would leave the whole `NSTextInputClient` surface unexercised while the
+/// ladder printed green, which is the exact failure D1 was raised for.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_objc_ime_drive_reads_its_exit_code_and_a_two_is_never_green() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcImeDrive)
+        .expect("the objc IME drive is planned");
+
+    repo.objc_ime_driver(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a clean composition leaves the run clean"
+    );
+
+    repo.objc_ime_driver(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+
+    repo.objc_ime_driver(2);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
+    assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render().contains("  FAIL  objc IME drive: NOT RUN"),
+        "{}",
+        r.render()
+    );
+}
+
+/// THE TOOLBAR DRIVE answers FOUR codes, and neither `2` nor `3` is green.
+///
+/// It is a separate stage from the two beside it because it audits a separate
+/// file — `crates/aterm-gui/src/toolbar.rs`, the largest ported one, whose four
+/// declared classes were checked only by a literal table in the same file. `3`
+/// is its own code because the drive enters `-mouseDown:` IMPs directly and a
+/// context menu that actually popped would never return: a hang that reached
+/// the ladder as a generic timeout is a stage that decided nothing while
+/// looking busy.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_objc_toolbar_drive_reads_its_exit_code_and_neither_two_nor_three_is_green() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcToolbarDrive)
+        .expect("the objc toolbar drive is planned");
+
+    repo.objc_toolbar_driver(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a clean drive leaves the run clean"
+    );
+
+    repo.objc_toolbar_driver(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+
+    for (code, words) in [(2, "NOT RUN"), (3, "HUNG")] {
+        repo.objc_toolbar_driver(code);
+        let r = stages::run_stage(&ctx, &spec);
+        let t = tally(std::slice::from_ref(&r));
+        assert_eq!(t.could_not_run, 1, "exit {code} decided nothing");
+        assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+        assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+        assert!(t.failed(), "so the run cannot end green");
+        assert!(
+            r.render()
+                .contains(&format!("  FAIL  objc toolbar drive: {words}")),
+            "{}",
+            r.render()
+        );
+    }
+}
+
+/// The window driver's exit code, read the same way — and `2` is NOT green.
+///
+/// THREE codes, not the toolbar's four. This driver pops no menu and enters no
+/// `-mouseDown:` IMP, so there is no modal tracking loop to hang in; anything
+/// outside `0`/`1`/`2` is reported as the SIGNAL it probably is, which is the
+/// shape of the use-after-free the drive found on its first run.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_objc_window_drive_reads_its_exit_code_and_two_is_not_green() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcWindowDrive)
+        .expect("the objc window drive is planned");
+
+    repo.objc_window_driver(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a clean drive leaves the run clean"
+    );
+
+    repo.objc_window_driver(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+
+    repo.objc_window_driver(2);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
+    assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render().contains("  FAIL  objc window drive: NOT RUN"),
+        "{}",
+        r.render()
+    );
+}
+
 #[test]
 fn selftest_matches_the_scripts_selftest_ladder_exactly() {
     // The reference is `tools/verify.sh --selftest` on this tree: every stage
@@ -723,6 +962,10 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "control-socket smoke (selftest)"),
             ("skip", "gui typing-pacing smoke (selftest)"),
             ("skip", "redraw conformance (selftest: not executed)"),
+            ("skip", "objc live-class audit (selftest: not executed)"),
+            ("skip", "objc IME drive (selftest: not executed)"),
+            ("skip", "objc toolbar drive (selftest: not executed)"),
+            ("skip", "objc window drive (selftest: not executed)"),
             // The six verdict cases the bash gate printed here too. They are the
             // selftest's actual evidence: every other row above says "not
             // executed", so without these the ladder shows a run that checked

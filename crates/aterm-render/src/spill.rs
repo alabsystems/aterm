@@ -574,10 +574,15 @@ fn clip_to_strip(
     (x0 < xe && y0 < ye).then_some((x0, y0, xe, ye))
 }
 
-/// The flat additive quads (`glow_under`, `cursor_glow_add`): the
-/// `draw_flat_add` contract — window-absolute premultiplied [`add_sat`] light
-/// — restricted to one strip. Pure per-pixel functions of absolute coords, so
-/// the strip clip is byte-identical to the frame's own rasterization.
+/// The flat glow quads (`glow_under`, `cursor_glow_add`): the `draw_flat_add`
+/// contract — window-absolute premultiplied light, [`add_sat`] when
+/// `GlowQuad::alpha == 0` and premultiplied source-over otherwise (the
+/// rainbow bed is the live Over emitter) — restricted to one strip. Pure
+/// per-pixel functions of absolute coords, so the strip clip is
+/// byte-identical to the frame's own rasterization. The Over branch used to
+/// be missing here — an alpha-blind `add_sat` replay of the bed's Over quads
+/// — so a tall ribbon poking into the head band exported a seam-discontinuous
+/// sliver on light themes (2026-09-01 audit).
 fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[GlowQuad]) {
     for q in quads {
         let Some((x0, y0, xe, ye)) =
@@ -585,12 +590,22 @@ fn replay_flat_add(color: &mut [u32], cover: &mut [u8], s: StripRect, quads: &[G
         else {
             continue;
         };
-        let ap = max_channel(q.color);
+        // The Over case occludes by its own opacity as well as its light —
+        // the solver's `a0` must reflect the paint's real coverage.
+        let ap = if q.alpha == 0 {
+            max_channel(q.color)
+        } else {
+            q.alpha.max(max_channel(q.color))
+        };
         for y in y0..ye {
             let row = (y - s.y) * s.w;
             for x in x0..xe {
                 let i = row + (x - s.x);
-                color[i] = add_sat(color[i], q.color);
+                color[i] = if q.alpha == 0 {
+                    add_sat(color[i], q.color)
+                } else {
+                    crate::over_premul(color[i], q.color, q.alpha)
+                };
                 cover[i] = cover_union(cover[i], ap);
             }
         }
@@ -853,6 +868,19 @@ mod tests {
                     color: 0x0008_1020,
                     // ADDITIVE light (see `GlowQuad::alpha`).
                     alpha: 0,
+                },
+                GlowQuad {
+                    row: 0,
+                    x: 6,
+                    y: 22,
+                    w: 24,
+                    h: 12,
+                    color: 0x0009_1216,
+                    // SOURCE-OVER paint (the rainbow bed's blend) straddling
+                    // grid_top: the replay must take draw_flat_add's Over
+                    // branch, not an alpha-blind add — the seam-continuity
+                    // law this suite pins (2026-09-01 audit).
+                    alpha: 0x16,
                 },
             ];
             // Fire field patches in the head band, Add then Over ink.

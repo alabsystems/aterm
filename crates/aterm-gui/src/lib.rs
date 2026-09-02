@@ -110,6 +110,12 @@ mod app_tabs;
 mod app_update_handoff;
 mod app_update_screen;
 mod app_window;
+/// aterm's own AppKit/Foundation layer over `aterm-objc` — the first-party
+/// replacement for the slice of `objc2-app-kit`/`objc2-foundation` this crate
+/// actually reaches, plus `MainThread`, aterm's answer to objc2's
+/// `MainThreadMarker`. macOS only, like the runtime layer beneath it.
+#[cfg(target_os = "macos")]
+mod appkit;
 #[cfg(test)]
 mod artifact_transaction_conformance;
 // `mod bench_knobs;` was here, with NO cfg — so ATERM_GATHER_SINK,
@@ -422,6 +428,19 @@ mod tab_model_conformance;
 mod temporal;
 mod title_summary;
 mod toolbar;
+/// THE TOOLBAR DRIVER, for the `objc_toolbar_drive` example. Re-exported here
+/// for the same reason `run_redraw_conformance` is: an `[[example]]` is its own
+/// crate and everything the drive touches — `mod toolbar`, `Wake`, `WindowId` —
+/// is library-private, so the body lives in the library and the example
+/// supplies only the process main thread (libtest cannot host AppKit:
+/// `pthread_main_np()` answers 0 on every worker, `--test-threads=1` included).
+///
+/// macOS-only because the four classes it audits are declared inside
+/// `#[cfg(target_os = "macos")]` and do not exist elsewhere.
+#[cfg(target_os = "macos")]
+mod toolbar_drive;
+#[cfg(target_os = "macos")]
+pub use toolbar_drive::run_toolbar_drive;
 mod tray_raster;
 mod turn_ledger;
 mod type_scale;
@@ -1494,8 +1513,16 @@ fn fatal_launch_error(headless: bool, detail: &str) -> ! {
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
     ) {
         menu::notify("aterm could not start", detail);
+        // LOCAL PATCH (aterm), W9: `objc2_foundation::MainThreadMarker::new` became
+        // `aterm_objc::MainThread::new`. This site used objc2 purely as a THREAD
+        // ORACLE — the marker was constructed, tested for `None` and dropped, never
+        // handed to a binding — so the substitution is exact and costs nothing. The
+        // two crates ask the same question: objc2's `is_main_thread()` calls
+        // `pthread_main_np()` and says in its own comment that this is what
+        // `+[NSThread isMainThread]` does underneath, which is what `MainThread::new`
+        // sends.
         #[cfg(target_os = "macos")]
-        if objc2_foundation::MainThreadMarker::new().is_none() {
+        if aterm_objc::MainThread::new().is_none() {
             let quoted = detail.replace('\\', "\\\\").replace('"', "\\\"");
             let _ = std::process::Command::new("/usr/bin/osascript")
                 .arg("-e")
@@ -11125,12 +11152,25 @@ impl HandoffAttemptArbiter {
     }
 }
 
-/// Typed distinction between a safe automatic-activity deferral and a genuine
-/// handoff setup failure. The former retains exact auto intent and consumes no
-/// retry budget; string matching must never decide this safety transition.
+/// Typed distinction between a safe automatic-activity deferral, an admission
+/// REFUSAL, and a genuine handoff setup failure. The first two retain exact
+/// auto intent and consume no retry budget; string matching must never decide
+/// these safety transitions.
+///
+/// `Refused` is the admission classifier saying "I will not attempt this here
+/// and now" — the seamless lane unavailable with terminals open, native state
+/// uncertified, no verified stage. Nothing was tried, so nothing FAILED: until
+/// 2026-09-01 these refusals were minted as `Failed`, and a machine whose
+/// seamless lane was legitimately (or, before d024efcd5, spuriously) disabled
+/// counted a hard apply failure every ~30 min — 23 in the owner's field log —
+/// flipping the health ledger persistent, firing the "auto-update is failing"
+/// escalation, spending the bounded physical-failure budget on attempts that
+/// never started, and ERASING the honest standing explanation the Refused
+/// ledger slot exists to hold.
 #[derive(Debug)]
 enum UpdateHandoffStartError {
     ActivityDeferred(String),
+    Refused(String),
     Failed(String),
 }
 
@@ -11143,13 +11183,23 @@ impl UpdateHandoffStartError {
         Self::ActivityDeferred(message.into())
     }
 
+    fn refused(message: impl Into<String>) -> Self {
+        Self::Refused(message.into())
+    }
+
     fn is_activity_deferred(&self) -> bool {
         matches!(self, Self::ActivityDeferred(_))
     }
 
+    fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused(_))
+    }
+
     fn into_message(self) -> String {
         match self {
-            Self::ActivityDeferred(message) | Self::Failed(message) => message,
+            Self::ActivityDeferred(message) | Self::Refused(message) | Self::Failed(message) => {
+                message
+            }
         }
     }
 }
@@ -11157,7 +11207,9 @@ impl UpdateHandoffStartError {
 impl std::fmt::Display for UpdateHandoffStartError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ActivityDeferred(message) | Self::Failed(message) => formatter.write_str(message),
+            Self::ActivityDeferred(message) | Self::Refused(message) | Self::Failed(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -17544,7 +17596,21 @@ impl ApplicationHandler<Wake> for App {
         // busy hour costs a delay rather than the whole automatic lane until
         // the next relaunch. Genuine-failure latches carry no deadline.
         if self.lapse_expired_auto_apply_manual_only() {
-            self.rearm_native_auto_apply_after_lapse();
+            // RECONCILE-FIRST. The in-memory rearm re-ticketed whatever the
+            // reducer snapshot still held — on the owner's daily driver that
+            // was a SUPERSEDED stage, so every ~30 min cycle first burned an
+            // attempt (and a ledger apply-failure, and physical budget) on
+            // "staged build X is not the authorized build Y" before a fresh
+            // attempt in the same second (the 2026-09-01 field log). The
+            // Refresh reconcile's Reduced arm arms whatever the DISK actually
+            // holds and fires try_pending itself; the direct rearm stays only
+            // as the fallback when dispatch is impossible (no proxy /
+            // disabled), where the snapshot is all there is.
+            if !self
+                .request_native_update_reconcile(app_native::NativeUpdateReconcilePurpose::Refresh)
+            {
+                self.rearm_native_auto_apply_after_lapse();
+            }
         }
         // AUTOMATIC APPLY TURNED BACK ON. Switching it off clears the armed intent
         // (`poll` answers `Clear`), and nothing re-armed it when the switch came back:

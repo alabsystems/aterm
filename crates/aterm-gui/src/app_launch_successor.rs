@@ -250,6 +250,16 @@ pub(crate) enum LaunchError {
     /// null error); treated as a failure rather than assumed away.
     #[cfg(target_os = "macos")]
     NoApplication,
+    /// Foundation refused to mint one of the objects the launch needs.
+    ///
+    /// Only reachable on an allocation failure: every string reaching
+    /// `launch_validated` has already passed the text validation above, so an
+    /// interior NUL or a bad encoding cannot get this far. It exists because
+    /// the first-party layer returns `Option` where the binding crate returned
+    /// an infallible constructor, and the honest answer to "Foundation said no"
+    /// is a named refusal rather than an `expect`.
+    #[cfg(target_os = "macos")]
+    ForeignObject(&'static str),
     /// LaunchServices reported an implausible pid — `NSRunningApplication`
     /// answers `-1` when it does not know one.
     #[cfg(target_os = "macos")]
@@ -303,6 +313,10 @@ impl std::fmt::Display for LaunchError {
             #[cfg(target_os = "macos")]
             Self::NoApplication => {
                 f.write_str("LaunchServices reported neither an application nor an error")
+            }
+            #[cfg(target_os = "macos")]
+            Self::ForeignObject(what) => {
+                write!(f, "Foundation refused to build the launch's {what}")
             }
             #[cfg(target_os = "macos")]
             Self::PidUnknown(pid) => {
@@ -503,15 +517,16 @@ fn launch_validated(
     request: &LaunchRequest,
     budget: Duration,
 ) -> Result<LaunchedSuccessor, LaunchError> {
-    use block2::RcBlock;
-    use objc2::rc::Retained;
-    use objc2_app_kit::{NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
-    use objc2_foundation::{MainThreadMarker, NSArray, NSDictionary, NSError, NSString, NSURL};
+    use std::ffi::c_void;
+
+    use aterm_objc::{Bool, Id, Obj, RcBlock, Sel, autoreleasepool, class, sel};
+
+    use crate::appkit::{self, MainThread};
 
     // BEFORE anything is launched: a refusal here leaves the machine exactly as
     // it was, whereas refusing after the call would abandon a running instance
     // and hand the user a second window.
-    if MainThreadMarker::new().is_some() {
+    if MainThread::new().is_some() {
         return Err(LaunchError::WouldBlockMainThread);
     }
 
@@ -521,84 +536,174 @@ fn launch_validated(
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let watch = LaunchWatch::pending();
     let slot = Arc::clone(&watch.slot);
-    let handler = RcBlock::new(move |app: *mut NSRunningApplication, error: *mut NSError| {
+    // The completion body is bound FIRST and wrapped SECOND, so its own sends
+    // keep their own `unsafe` block: writing `unsafe { RcBlock::new2(|..| ..) }`
+    // puts the whole closure inside the constructor's unsafe context, which
+    // makes every SAFETY comment inside it decorative and earns an
+    // `unnecessary_unsafe` warning that says so.
+    let completion = move |app: Id, error: Id| {
         // SAFETY: LaunchServices hands the completion a live, autoreleased
-        // `NSRunningApplication` OR a live `NSError`, valid for the duration of
-        // the call; both are borrowed only here and neither is retained past the
-        // block. Reading them off the main thread is sound because both classes
-        // are thread-safe (objc2 models them `InteriorMutable`, not
-        // `MainThreadOnly`) — see the module docs.
+        // `NSRunningApplication` OR a live `NSError`, valid for the duration
+        // of the call; both are borrowed only here and neither is retained
+        // past the block. Reading them off the main thread is sound because
+        // both classes are thread-safe — see the module docs.
+        // `-domain` and `-localizedDescription` are `-(NSString *)`,
+        // `-code` is `-(NSInteger)` and `-processIdentifier` is `-(pid_t)`,
+        // i.e. `int` and NOT `NSInteger`, which is why it is written out.
         let answer = unsafe {
-            match (app.as_ref(), error.as_ref()) {
-                // An error is authoritative even if an application also arrives:
-                // the only safe reading of "launched, but here is why it failed"
-                // is that we do not have a successor we may commit to.
-                (_, Some(error)) => Err(LaunchError::Rejected {
-                    domain: error.domain().to_string(),
-                    code: error.code(),
-                    message: error.localizedDescription().to_string(),
-                }),
-                (Some(app), None) => admit_launched_pid(app.processIdentifier(), own_pid),
-                (None, None) => Err(LaunchError::NoApplication),
+            if !error.is_null() {
+                // An error is authoritative even if an application also
+                // arrives: the only safe reading of "launched, but here is
+                // why it failed" is that we do not have a successor we may
+                // commit to.
+                Err(LaunchError::Rejected {
+                    domain: appkit::nsstring_to_rust(appkit::send_id(error, sel!(domain))),
+                    code: appkit::send_isize(error, sel!(code)),
+                    message: appkit::nsstring_to_rust(appkit::send_id(
+                        error,
+                        sel!(localizedDescription),
+                    )),
+                })
+            } else if app.is_null() {
+                Err(LaunchError::NoApplication)
+            } else {
+                let pid_of: unsafe extern "C" fn(Id, Sel) -> i32 = aterm_objc::msg();
+                admit_launched_pid(pid_of(app, sel!(processIdentifier)), own_pid)
             }
         };
         slot.deliver(answer);
-    });
+    };
+    // `RcBlock::new2` — the two-argument constructor `aterm-objc`'s block
+    // module names this very site for. The prototype is `(id, id) -> void`,
+    // which is what LaunchServices calls it with, and `Encode` on both
+    // arguments is what makes that statable.
+    //
+    // SAFETY: the argument and return types are exactly the completion
+    // signature `-openApplicationAtURL:configuration:completionHandler:`
+    // declares, and the closure cannot unwind past the guard `new2` installs.
+    let Some(handler) = (unsafe { RcBlock::new2(completion) }) else {
+        return Err(LaunchError::ForeignObject("completion handler"));
+    };
 
-    let path = NSString::from_str(&request.bundle);
-    let arguments = NSArray::from_vec(
-        request
-            .arguments
-            .iter()
-            .map(|argument| NSString::from_str(argument))
-            .collect::<Vec<Retained<NSString>>>(),
-    );
-    let keys = request
+    // The `NSString`s are built into owned `Obj`s FIRST and only then handed to
+    // the array/dictionary constructors as raw `id`s, so each one is alive
+    // across the construction call that retains it. `objc2` got that from its
+    // `Retained<NSString>` vectors; here it is the `Vec<Obj>` binding's scope.
+    let Some(path) = appkit::nsstring(&request.bundle) else {
+        return Err(LaunchError::ForeignObject("bundle path"));
+    };
+    let Some(arg_objs) = request
+        .arguments
+        .iter()
+        .map(|argument| appkit::nsstring(argument))
+        .collect::<Option<Vec<Obj>>>()
+    else {
+        return Err(LaunchError::ForeignObject("arguments"));
+    };
+    let Some(key_objs) = request
         .environment
         .iter()
-        .map(|(key, _)| NSString::from_str(key))
-        .collect::<Vec<Retained<NSString>>>();
-    let values = request
+        .map(|(key, _)| appkit::nsstring(key))
+        .collect::<Option<Vec<Obj>>>()
+    else {
+        return Err(LaunchError::ForeignObject("environment keys"));
+    };
+    let Some(value_objs) = request
         .environment
         .iter()
-        .map(|(_, value)| NSString::from_str(value))
-        .collect::<Vec<Retained<NSString>>>();
-    let key_refs = keys.iter().map(|key| &**key).collect::<Vec<&NSString>>();
-    let environment = NSDictionary::<NSString, NSString>::from_id_slice(&key_refs, &values);
+        .map(|(_, value)| appkit::nsstring(value))
+        .collect::<Option<Vec<Obj>>>()
+    else {
+        return Err(LaunchError::ForeignObject("environment values"));
+    };
+    let arg_ids = arg_objs.iter().map(Obj::id).collect::<Vec<Id>>();
+    let key_ids = key_objs.iter().map(Obj::id).collect::<Vec<Id>>();
+    let value_ids = value_objs.iter().map(Obj::id).collect::<Vec<Id>>();
 
-    // SAFETY: standard AppKit construction. `fileURLWithPath:isDirectory:` is
-    // handed a live `NSString` (a `.app` IS a directory, so `true` is the truth
-    // and saves LaunchServices a stat); the configuration is freshly minted and
-    // every setter below is a plain property write on it; the workspace is the
-    // process-wide singleton. None of these is main-thread-only (module docs).
-    unsafe {
-        let url = NSURL::fileURLWithPath_isDirectory(&path, true);
-        let configuration = NSWorkspaceOpenConfiguration::configuration();
+    // SAFETY: standard AppKit construction, none of it main-thread-only (module
+    // docs). `+arrayWithObjects:count:` is `-(id)(const id *, NSUInteger)` and
+    // `+dictionaryWithObjects:forKeys:count:` is
+    // `-(id)(const id *, const id *, NSUInteger)`; both COPY the C arrays and
+    // RETAIN the elements, which the `Vec<Obj>`s above keep alive across the
+    // call. `+fileURLWithPath:isDirectory:` is `-(id)(NSString *, BOOL)` and is
+    // handed a live string (a `.app` IS a directory, so `true` is the truth and
+    // saves LaunchServices a stat). `+configuration` mints a fresh
+    // `NSWorkspaceOpenConfiguration` and every setter below is
+    // `-(void)(BOOL)` or `-(void)(id)` on it. Everything returned here is
+    // AUTORELEASED into the pool this whole body runs in.
+    autoreleasepool(|_| unsafe {
+        let array_with: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id = aterm_objc::msg();
+        let arguments = array_with(
+            class(c"NSArray").as_id(),
+            sel!(arrayWithObjects:count:),
+            arg_ids.as_ptr(),
+            arg_ids.len(),
+        );
+        let dict_with: unsafe extern "C" fn(Id, Sel, *const Id, *const Id, usize) -> Id =
+            aterm_objc::msg();
+        let environment = dict_with(
+            class(c"NSDictionary").as_id(),
+            sel!(dictionaryWithObjects:forKeys:count:),
+            value_ids.as_ptr(),
+            key_ids.as_ptr(),
+            key_ids.len(),
+        );
+        let file_url: unsafe extern "C" fn(Id, Sel, Id, Bool) -> Id = aterm_objc::msg();
+        let url = file_url(
+            class(c"NSURL").as_id(),
+            sel!(fileURLWithPath:isDirectory:),
+            path.id(),
+            Bool::YES,
+        );
+        let configuration = appkit::send_id(
+            class(c"NSWorkspaceOpenConfiguration").as_id(),
+            sel!(configuration),
+        );
+        if arguments.is_null() || environment.is_null() || url.is_null() || configuration.is_null()
+        {
+            return;
+        }
         // THE point of this lane: a second instance of a bundle that is already
         // running, with a launchd application job of its own.
-        configuration.setCreatesNewApplicationInstance(true);
+        appkit::send_v_bool(configuration, sel!(setCreatesNewApplicationInstance:), true);
         // Belt to that brace: substitution would hand back the ALREADY-RUNNING
         // instance — this very process — and no successor would exist at all.
-        configuration.setAllowsRunningApplicationSubstitution(false);
+        appkit::send_v_bool(
+            configuration,
+            sel!(setAllowsRunningApplicationSubstitution:),
+            false,
+        );
         // A self-relaunch is not something the user "opened"; keep it out of
         // Recent Items.
-        configuration.setAddsToRecentItems(false);
+        appkit::send_v_bool(configuration, sel!(setAddsToRecentItems:), false);
         // No system prompt may appear on a handoff deadline: a modal
         // quarantine/consent dialog would burn the whole budget and strand the
         // user mid-update with the answer still pending.
-        configuration.setPromptsUserIfNeeded(false);
+        appkit::send_v_bool(configuration, sel!(setPromptsUserIfNeeded:), false);
         // The successor takes over the user's windows, so it — not the outgoing
         // process, which is about to exit — must be the frontmost app. Set
         // explicitly because it is load-bearing, not incidental.
-        configuration.setActivates(true);
-        configuration.setArguments(&arguments);
-        configuration.setEnvironment(&environment);
-        NSWorkspace::sharedWorkspace().openApplicationAtURL_configuration_completionHandler(
-            &url,
-            &configuration,
-            Some(&*handler),
+        appkit::send_v_bool(configuration, sel!(setActivates:), true);
+        appkit::send_v_id(configuration, sel!(setArguments:), arguments);
+        appkit::send_v_id(configuration, sel!(setEnvironment:), environment);
+        let workspace = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+        if workspace.is_null() {
+            return;
+        }
+        // The completion handler is a BLOCK, so the parameter is spelled
+        // `*mut c_void` rather than `Id`: a block is `@?` to the runtime, not
+        // `@`. It does not matter for a SEND — nothing reads an encoding here —
+        // but writing it as an object would be the shape that, in a DECLARED
+        // method, registers the wrong letter.
+        let open: unsafe extern "C" fn(Id, Sel, Id, Id, *mut c_void) = aterm_objc::msg();
+        open(
+            workspace,
+            sel!(openApplicationAtURL:configuration:completionHandler:),
+            url,
+            configuration,
+            handler.as_ptr(),
         );
-    }
+    });
 
     // TAIL EXPRESSION ON PURPOSE: locals are dropped only after it is evaluated,
     // so `handler` outlives the wait. AppKit copies a completion handler (that

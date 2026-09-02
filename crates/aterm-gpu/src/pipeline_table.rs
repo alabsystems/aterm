@@ -1234,7 +1234,14 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         target: TargetRole::OffscreenUnorm,
         // REPLACE by omission: the fragment IS the refracted frame.
         blend: None,
-        write_mask: WriteMask::Color,
+        // ALL, alpha included: the refraction displaces the WHOLE sample
+        // (fs_shimmer returns the displaced rgba), so the translucent
+        // present's alpha coheres with the rgb it publishes. Under Color the
+        // alpha byte stayed the UNDISPLACED pixel's — rgb and opacity from
+        // two different source pixels inside the haze band (2026-09-01
+        // audit). Opaque presents are byte-identical either way (uniform
+        // offscreen alpha inside the grid).
+        write_mask: WriteMask::All,
         vertex: VertexLayout::None,
         topology: Topology::TriangleList,
         binds: BindSpec::POST_FS,

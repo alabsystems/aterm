@@ -19,6 +19,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aterm_objc::{Bool, ClassPtr, ClassType, Id, Sel, class, declare_class, msg, sel};
 
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
+/// for a test that is not on the main thread and does not need to be.
+///
+/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
+/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
+/// here and the checked constructor is unusable. Every class in this file is an
+/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
+/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
+/// the thread that made them — which is the second form of `new_unchecked`'s
+/// obligation, written once instead of at every call site.
+fn mtm() -> aterm_objc::MainThread {
+    // SAFETY: see this function's doc comment — the class has no main-thread
+    // affinity and its ivars are born and dropped on this one worker.
+    unsafe { aterm_objc::MainThread::new_unchecked() }
+}
+
 /// An ivar that needs 16-byte alignment — `class_addIvar` is told the
 /// alignment as a log2, and nothing else in the crate exercises a value > 3.
 #[repr(align(16))]
@@ -83,10 +99,13 @@ declare_class! {
 fn a_sixteen_byte_aligned_ivar_lands_aligned_and_drops_once() {
     let drops = Arc::new(AtomicUsize::new(0));
     {
-        let obj = Aligned::alloc_init(AlignedIvars {
-            marker: 0xDEAD_BEEF,
-            drops: Arc::clone(&drops),
-        })
+        let obj = Aligned::alloc_init(
+            mtm(),
+            AlignedIvars {
+                marker: 0xDEAD_BEEF,
+                drops: Arc::clone(&drops),
+            },
+        )
         .expect("+alloc/-init");
         // SAFETY: `-marker` is `-(unsigned long long)` on a live instance.
         unsafe {
@@ -101,7 +120,7 @@ fn a_sixteen_byte_aligned_ivar_lands_aligned_and_drops_once() {
 fn a_class_with_no_methods_and_a_zero_sized_ivar_still_registers() {
     let cls = Empty::class();
     assert!(!cls.is_null());
-    let obj = Empty::alloc_init(()).expect("+alloc/-init");
+    let obj = Empty::alloc_init(mtm(), ()).expect("+alloc/-init");
     // SAFETY: `-description` is `-(NSString *)` on a live instance; the result
     // is autoreleased and only read inside the pool.
     let d = aterm_objc::autoreleasepool(|_| unsafe {
@@ -113,7 +132,7 @@ fn a_class_with_no_methods_and_a_zero_sized_ivar_still_registers() {
 
 #[test]
 fn a_ten_colon_selector_counts_and_dispatches() {
-    let obj = Wide::alloc_init(()).expect("+alloc/-init");
+    let obj = Wide::alloc_init(mtm(), ()).expect("+alloc/-init");
     // SAFETY: the exact declared prototype, on a live instance.
     unsafe {
         let f: unsafe extern "C" fn(

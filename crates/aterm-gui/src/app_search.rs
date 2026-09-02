@@ -1882,7 +1882,14 @@ pub(crate) struct FindStatus {
     /// field. The find bar paints the same qualifier, which is what keeps the
     /// wire and the glass agreeing.
     pub(crate) stale: bool,
-    /// `(row, col, len)` in `search` coordinates (negative row = scrollback).
+    /// `(row, col, len)` in SELECTION coordinates — 0..rows is the live
+    /// screen, a negative row is scrollback above it. NOT `search`'s rows:
+    /// `search` emits absolute usize rows from the oldest retained line
+    /// (`SearchMatch.line`), and `map_matches` below subtracts `base_y` to get
+    /// these. The find catalog entry said "`search` coordinates" for a full
+    /// audit cycle, teaching scripts to feed a find row to `line`, which
+    /// parses u64 and refuses the negative rows outright — and silently reads
+    /// the wrong line for the non-negative ones.
     pub(crate) current_match: Option<(i32, u16, u32)>,
 }
 

@@ -3395,5 +3395,4 @@ mod tests {
     // the seventh anchor was adopted to remove. The successors named above
     // therefore inherit the BOUND, not the prohibition; see their own headers for
     // the share each one now permits.
-
 }

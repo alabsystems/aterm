@@ -2814,7 +2814,14 @@ pub(crate) enum AutoApplySetting {
 /// `OnceLock` whose initializer asks its own owner parks the caller forever, and
 /// that shape hung every apply on 2026-08-30.
 pub(crate) fn update_auto_apply_setting(config: &Config) -> AutoApplySetting {
-    if std::env::var_os("ATERM_NO_AUTO_APPLY").is_some() {
+    // Value semantics via the shared flag rule: unset, EMPTY and "0" do not
+    // veto (see `env_flag_engaged` — the empty-inherited-var species,
+    // 2026-09-01).
+    if aterm_types::control_socket::env_flag_engaged(
+        std::env::var_os("ATERM_NO_AUTO_APPLY")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
+    ) {
         return AutoApplySetting::OffByEnv;
     }
     if config
@@ -6454,57 +6461,203 @@ fn decode_wallpaper_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Strin
 
 #[cfg(target_os = "macos")]
 fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
-    use objc2_app_kit::{
-        NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey,
-        NSColorRenderingIntent, NSColorSpace,
-    };
-    use objc2_foundation::{NSData, NSDictionary};
+    use std::ffi::c_void;
 
-    let data = NSData::with_bytes(bytes);
-    // SAFETY: pure raster construction from immutable bytes; NSBitmapImageRep
-    // is not main-thread-bound (no view or window involvement).
-    let Some(rep) = (unsafe { NSBitmapImageRep::imageRepWithData(&data) }) else {
-        return Err("not a decodable image".to_string());
-    };
-    let (pw, ph) = unsafe { (rep.pixelsWide(), rep.pixelsHigh()) };
-    if pw <= 0
-        || ph <= 0
-        || pw as usize > MAX_WALLPAPER_SOURCE_DIMENSION
-        || ph as usize > MAX_WALLPAPER_SOURCE_DIMENSION
-    {
-        return Err(format!(
-            "decoded image must be 1..={MAX_WALLPAPER_SOURCE_DIMENSION} pixels per side"
-        ));
-    }
-    // Convert the pixels (not merely retag) to the renderer's canonical sRGB
-    // before Rust reads them — the window-capture rule.
-    let srgb = unsafe { NSColorSpace::sRGBColorSpace() };
-    let rep = unsafe {
-        rep.bitmapImageRepByConvertingToColorSpace_renderingIntent(
-            &srgb,
-            NSColorRenderingIntent::Perceptual,
-        )
-    }
-    .ok_or_else(|| "could not convert the image to sRGB".to_string())?;
-    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, objc2::runtime::AnyObject>::new();
-    // PNG standardizes the rep's implementation-defined channel order and
-    // premultiplication into straight RGBA before Rust reads it.
-    let png =
-        unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties) }
-            .ok_or_else(|| "could not re-encode the decoded image".to_string())?;
-    let png_len = png.length();
-    let mut png_bytes = vec![0_u8; png_len];
-    if png_len != 0 {
-        // SAFETY: the Vec owns `png_len` initialized bytes and the non-null
-        // destination remains valid for the duration of NSData's bounded copy.
-        let destination = std::ptr::NonNull::new(png_bytes.as_mut_ptr().cast())
-            .ok_or_else(|| "could not allocate the decoded image bytes".to_string())?;
+    use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
+
+    use crate::appkit;
+
+    /// `NSBitmapImageRep.h:32-38` — `NSBitmapImageFileTypePNG` is the FIFTH
+    /// enumerator of an unvalued `NS_ENUM(NSUInteger, …)`, i.e. 4.
+    const NS_BITMAP_IMAGE_FILE_TYPE_PNG: usize = 4;
+    /// `NSGraphics.h:124-130` — `NSColorRenderingIntentPerceptual` is the
+    /// FOURTH enumerator of an unvalued `NS_ENUM(NSInteger, …)`, i.e. 3.
+    const NS_COLOR_RENDERING_INTENT_PERCEPTUAL: isize = 3;
+
+    autoreleasepool(|_| {
+        // SAFETY: pure raster work from immutable bytes; none of these classes
+        // is main-thread-bound (no view or window is involved).
+        // `+dataWithBytes:length:` is `-(id)(const void *, NSUInteger)` and
+        // COPIES; `+imageRepWithData:` is `-(id)(NSData *)` and returns an
+        // AUTORELEASED rep, alive for this pool; `-pixelsWide`/`-pixelsHigh`
+        // are `-(NSInteger)`.
         unsafe {
-            png.getBytes_length(destination, png_len);
+            let data_with: unsafe extern "C" fn(Id, Sel, *const c_void, usize) -> Id =
+                aterm_objc::msg();
+            let data = data_with(
+                class(c"NSData").as_id(),
+                sel!(dataWithBytes:length:),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+            );
+            if data.is_null() {
+                return Err("not a decodable image".to_string());
+            }
+            let rep = appkit::send_id_id(
+                class(c"NSBitmapImageRep").as_id(),
+                sel!(imageRepWithData:),
+                data,
+            );
+            if rep.is_null() {
+                return Err("not a decodable image".to_string());
+            }
+            let pw = appkit::send_isize(rep, sel!(pixelsWide));
+            let ph = appkit::send_isize(rep, sel!(pixelsHigh));
+            if pw <= 0
+                || ph <= 0
+                || pw as usize > MAX_WALLPAPER_SOURCE_DIMENSION
+                || ph as usize > MAX_WALLPAPER_SOURCE_DIMENSION
+            {
+                return Err(format!(
+                    "decoded image must be 1..={MAX_WALLPAPER_SOURCE_DIMENSION} pixels per side"
+                ));
+            }
+            // Convert the pixels (not merely retag) to the renderer's canonical
+            // sRGB before Rust reads them — the window-capture rule.
+            // `+sRGBColorSpace` is `-(id)`, an immortal shared space;
+            // `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` is
+            // `-(id)(NSColorSpace *, NSColorRenderingIntent)` where the intent
+            // is an `NSInteger`.
+            let srgb = appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace));
+            if srgb.is_null() {
+                return Err("could not convert the image to sRGB".to_string());
+            }
+            let convert: unsafe extern "C" fn(Id, Sel, Id, isize) -> Id = aterm_objc::msg();
+            let rep = convert(
+                rep,
+                sel!(bitmapImageRepByConvertingToColorSpace:renderingIntent:),
+                srgb,
+                NS_COLOR_RENDERING_INTENT_PERCEPTUAL,
+            );
+            if rep.is_null() {
+                return Err("could not convert the image to sRGB".to_string());
+            }
+            // PNG standardizes the rep's implementation-defined channel order
+            // and premultiplication into straight RGBA before Rust reads it.
+            // `-representationUsingType:properties:` is
+            // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)`; an EMPTY
+            // properties dictionary is `+dictionary`, which is nil-free and
+            // autoreleased.
+            let properties = appkit::send_id(class(c"NSDictionary").as_id(), sel!(dictionary));
+            let representation: unsafe extern "C" fn(Id, Sel, usize, Id) -> Id = aterm_objc::msg();
+            let png = representation(
+                rep,
+                sel!(representationUsingType:properties:),
+                NS_BITMAP_IMAGE_FILE_TYPE_PNG,
+                properties,
+            );
+            if png.is_null() {
+                return Err("could not re-encode the decoded image".to_string());
+            }
+            // `-length` is `-(NSUInteger)` and `-getBytes:length:` is
+            // `-(void)(void *, NSUInteger)`, a BOUNDED copy into a destination
+            // the caller owns for the call.
+            let png_len = appkit::send_usize(png, sel!(length));
+            let mut png_bytes = vec![0_u8; png_len];
+            if png_len != 0 {
+                let get_bytes: unsafe extern "C" fn(Id, Sel, *mut c_void, usize) =
+                    aterm_objc::msg();
+                get_bytes(
+                    png,
+                    sel!(getBytes:length:),
+                    png_bytes.as_mut_ptr().cast(),
+                    png_len,
+                );
+            }
+            aterm_render::decode_png_rgba8_bounded(
+                &png_bytes,
+                MAX_WALLPAPER_SOURCE_DIMENSION as u32,
+            )
+            .ok_or_else(|| "could not read the decoded image pixels".to_string())
         }
+    })
+}
+
+/// The AppKit wallpaper decoder, driven on REAL bytes.
+///
+/// `decode_wallpaper_appkit` is the whole reason a non-PNG wallpaper works on
+/// macOS at all, and the port rewrote every one of its eleven sends. Nothing in
+/// the suite reached it before — it decoded, and if it had started returning
+/// transposed or channel-swapped pixels the only detector would have been a
+/// user's desktop. So: hand a hand-written 24-bit BMP (a format the pure-Rust
+/// path CANNOT decode, so this can only be AppKit) to the real function and
+/// check the geometry and the channel order that come back.
+#[cfg(all(test, target_os = "macos"))]
+mod appkit_wallpaper_tests {
+    use super::decode_wallpaper_appkit;
+
+    /// A 2x2 24-bit BMP: red, green on the top row; blue, white below.
+    ///
+    /// BMP stores rows BOTTOM-UP and pixels as B,G,R, with each row padded to a
+    /// 4-byte boundary — so this literal also pins that the decoder is not
+    /// merely echoing our own bytes back.
+    fn two_by_two_bmp() -> Vec<u8> {
+        let mut v = Vec::new();
+        // BITMAPFILEHEADER: "BM", size, reserved, pixel-data offset.
+        v.extend_from_slice(b"BM");
+        v.extend_from_slice(&70_u32.to_le_bytes());
+        v.extend_from_slice(&0_u32.to_le_bytes());
+        v.extend_from_slice(&54_u32.to_le_bytes());
+        // BITMAPINFOHEADER: 40 bytes, 2x2, 1 plane, 24bpp, BI_RGB.
+        v.extend_from_slice(&40_u32.to_le_bytes());
+        v.extend_from_slice(&2_i32.to_le_bytes());
+        v.extend_from_slice(&2_i32.to_le_bytes());
+        v.extend_from_slice(&1_u16.to_le_bytes());
+        v.extend_from_slice(&24_u16.to_le_bytes());
+        v.extend_from_slice(&0_u32.to_le_bytes());
+        v.extend_from_slice(&16_u32.to_le_bytes());
+        v.extend_from_slice(&2835_i32.to_le_bytes());
+        v.extend_from_slice(&2835_i32.to_le_bytes());
+        v.extend_from_slice(&0_u32.to_le_bytes());
+        v.extend_from_slice(&0_u32.to_le_bytes());
+        // Bottom row first: blue, white — then two padding bytes.
+        v.extend_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
+        // Top row: red, green — then two padding bytes.
+        v.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        v
     }
-    aterm_render::decode_png_rgba8_bounded(&png_bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32)
-        .ok_or_else(|| "could not read the decoded image pixels".to_string())
+
+    /// The strongest channel of an RGBA pixel, as an index, plus its alpha.
+    fn dominant(px: &[u8]) -> (usize, u8) {
+        let (mut best, mut best_v) = (0, px[0]);
+        for (i, &v) in px.iter().take(3).enumerate() {
+            if v > best_v {
+                best = i;
+                best_v = v;
+            }
+        }
+        (best, px[3])
+    }
+
+    #[test]
+    fn appkit_decodes_a_bmp_with_the_right_geometry_and_channel_order() {
+        let (rgba, w, h) =
+            decode_wallpaper_appkit(&two_by_two_bmp()).expect("AppKit decoded the BMP");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgba.len(), 2 * 2 * 4);
+        // Row-major, TOP-DOWN, straight RGBA — which is BMP's own order
+        // inverted, so a decoder that forgot the flip fails here.
+        let px = |i: usize| &rgba[i * 4..i * 4 + 4];
+        assert_eq!(dominant(px(0)).0, 0, "top-left is red");
+        assert_eq!(dominant(px(1)).0, 1, "top-right is green");
+        assert_eq!(dominant(px(2)).0, 2, "bottom-left is blue");
+        for i in 0..4 {
+            assert_eq!(px(i)[3], 255, "pixel {i} lost its alpha");
+        }
+        let white = px(3);
+        assert!(
+            white[0] > 200 && white[1] > 200 && white[2] > 200,
+            "bottom-right should be near-white, got {white:?}"
+        );
+    }
+
+    /// Bytes that are not an image are an error, not a panic and not a
+    /// zero-sized success — the failure mode the wallpaper picker relies on.
+    #[test]
+    fn appkit_refuses_bytes_that_are_not_an_image() {
+        assert!(decode_wallpaper_appkit(b"not an image at all").is_err());
+        assert!(decode_wallpaper_appkit(&[]).is_err());
+    }
 }
 
 pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
@@ -7025,7 +7178,13 @@ pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironment
             .map(|value| value.trim().to_string())
             .filter(|value| aterm_update_core::is_valid_slug(value))
             .map(|value| resolved("ATERM_UPDATE_REPO", value)),
-        "update.auto_apply" if std::env::var_os("ATERM_NO_AUTO_APPLY").is_some() => {
+        "update.auto_apply"
+            if aterm_types::control_socket::env_flag_engaged(
+                std::env::var_os("ATERM_NO_AUTO_APPLY")
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .as_deref(),
+            ) =>
+        {
             Some(resolved("ATERM_NO_AUTO_APPLY", "false".to_string()))
         }
         "packages.account" => std::env::var("ATPKG_ACCOUNT")

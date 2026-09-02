@@ -1,3 +1,7 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (The application delegate is declared with `aterm_objc::declare_class!`,
+//  so the handle stored here is that crate's `Retained` and the protocol
+//  object handed to `setDelegate:` is a named crossing.)
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -15,10 +19,11 @@ use core_foundation::runloop::{
     CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
 };
 use objc2::rc::{autoreleasepool, Retained};
-use objc2::runtime::ProtocolObject;
 use objc2::sel;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWindow};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEvent, NSWindow};
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
+
+use super::aterm_objc_seam;
 
 use super::app::override_send_event;
 use super::app_state::{ApplicationDelegate, HandlePendingUserEvents};
@@ -67,13 +72,20 @@ impl PanicInfo {
 
 #[derive(Debug)]
 pub struct ActiveEventLoop {
-    delegate: Retained<ApplicationDelegate>,
+    delegate: aterm_objc::Retained<ApplicationDelegate>,
     pub(super) mtm: MainThreadMarker,
 }
 
 impl ActiveEventLoop {
-    pub(super) fn new_root(delegate: Retained<ApplicationDelegate>) -> RootWindowTarget {
-        let mtm = MainThreadMarker::from(&*delegate);
+    pub(super) fn new_root(
+        delegate: aterm_objc::Retained<ApplicationDelegate>,
+    ) -> RootWindowTarget {
+        // LOCAL PATCH (aterm): `MainThreadMarker::from(&*delegate)` was a
+        // COMPILE-TIME derivation off objc2's `mutability::MainThreadOnly`, and
+        // `ApplicationDelegate` no longer carries it. This asks the same
+        // question the marker's own constructor asks.
+        let mtm = MainThreadMarker::new()
+            .expect("an ActiveEventLoop was rooted off the main thread");
         let p = Self { delegate, mtm };
         RootWindowTarget { p, _marker: PhantomData }
     }
@@ -111,7 +123,17 @@ impl ActiveEventLoop {
         let app = NSApplication::sharedApplication(self.mtm);
 
         if app.respondsToSelector(sel!(effectiveAppearance)) {
-            Some(super::window_delegate::appearance_to_theme(&app.effectiveAppearance()))
+            // LOCAL PATCH (aterm): `appearance_to_theme` takes the raw `id` its
+            // own sends take, now that `window_delegate.rs`'s bindings are
+            // ported. This file is not, so it crosses here.
+            //
+            // SAFETY: `-effectiveAppearance` answers a live `NSAppearance`,
+            // borrowed for the duration of this statement.
+            Some(unsafe {
+                super::window_delegate::appearance_to_theme(aterm_objc::Id::from_ptr(
+                    std::ptr::from_ref(&*app.effectiveAppearance()).cast_mut().cast(),
+                ))
+            })
         } else {
             Some(Theme::Light)
         }
@@ -190,7 +212,7 @@ pub struct EventLoop<T: 'static> {
     ///
     /// The delegate is only weakly referenced by NSApplication, so we must
     /// keep it around here as well.
-    delegate: Retained<ApplicationDelegate>,
+    delegate: aterm_objc::Retained<ApplicationDelegate>,
 
     // Event sender and receiver, used for EventLoopProxy.
     sender: mpsc::Sender<T>,
@@ -237,19 +259,24 @@ impl<T> EventLoop<T> {
         );
 
         autoreleasepool(|_| {
-            app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            app.setDelegate(Some(delegate.as_protocol_object()));
         });
 
         // Override `sendEvent:` on the application to forward to our application state.
         override_send_event(&app);
 
         let panic_info: Rc<PanicInfo> = Default::default();
-        setup_control_flow_observers(mtm, Rc::downgrade(&panic_info));
+        // LOCAL PATCH (aterm): `observer.rs` speaks `aterm_objc::MainThread` now,
+        // so the marker crosses here. This file keeps `MainThreadMarker` as its own
+        // currency because six of its uses feed `NSApplication::sharedApplication`
+        // and `NSWindow::{setAllowsAutomaticWindowTabbing,allowsAutomaticWindowTabbing}`,
+        // which are `objc2-app-kit` bindings and pin it until those rows are ported.
+        setup_control_flow_observers(aterm_objc_seam::witness(mtm), Rc::downgrade(&panic_info));
 
         let (sender, receiver) = mpsc::channel();
         Ok(EventLoop {
             app,
-            delegate: delegate.clone(),
+            delegate: delegate.clone_retained(),
             sender,
             receiver: Rc::new(receiver),
             window_target: RootWindowTarget {
@@ -413,7 +440,16 @@ pub(super) fn stop_app_immediately(app: &NSApplication) {
         app.stop(None);
         // To stop event loop immediately, we need to post some event here.
         // See: https://stackoverflow.com/questions/48041279/stopping-the-nsapplication-main-event-loop/48064752#48064752
-        app.postEvent_atStart(&dummy_event().unwrap(), true);
+        // LOCAL PATCH (aterm): `dummy_event` now answers an `aterm_objc::Obj`
+                // (a +1 handle) rather than `Retained<NSEvent>`; this file still
+                // sends through the `objc2` binding, so the handle is crossed back
+                // for the one call. The `Obj` is bound to a local so its +1
+                // outlives the borrow.
+                let dummy = dummy_event().expect("NSEvent refused the dummy event");
+                // SAFETY: `dummy` owns a +1 to a live `NSEvent`, which is what
+                // `NSEvent` is a correct binding for.
+                let dummy: &NSEvent = unsafe { super::aterm_objc_seam::objc2_ref(dummy.id()) };
+                app.postEvent_atStart(dummy, true);
     });
 }
 
@@ -436,8 +472,11 @@ pub(super) fn notify_windows_of_exit(app: &NSApplication) {
 /// Catches panics that happen inside `f` and when a panic
 /// happens, stops the `sharedApplication`
 #[inline]
+// LOCAL PATCH (aterm): takes `aterm_objc::MainThread`, because its only caller
+// (`observer.rs::control_flow_handler`) is ported and no longer mints an objc2
+// marker. The marker is re-derived at the one line that needs one.
 pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
-    mtm: MainThreadMarker,
+    mtm: aterm_objc::MainThread,
     panic_info: Weak<PanicInfo>,
     f: F,
 ) -> Option<R> {
@@ -452,7 +491,7 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
                 let panic_info = panic_info.upgrade().unwrap();
                 panic_info.set_panic(e);
             }
-            let app = NSApplication::sharedApplication(mtm);
+            let app = NSApplication::sharedApplication(aterm_objc_seam::marker(mtm));
             stop_app_immediately(&app);
             None
         },

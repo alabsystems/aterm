@@ -6,16 +6,16 @@
 //! menu bar, the per-window toolbar tab strip, and the desktop-notification
 //! delivery thread). It exists so `main.rs` / `app_window.rs` / `app_tabs.rs`
 //! stay platform-NEUTRAL: they call through an [`AppRt`] instance and never name
-//! AppKit/objc2 directly.
+//! AppKit directly (through `aterm-objc`, the first-party runtime layer).
 //!
 //! Two impls back the one trait:
 //!
-//! * [`AppRtMacOS`] WRAPS the existing objc2 calls EXACTLY — the NSWindow
+//! * [`AppRtMacOS`] WRAPS the existing AppKit calls EXACTLY — the NSWindow
 //!   colour-space + NSAppearance/titlebar logic moved here verbatim from
 //!   `app_window.rs`, and the menu/toolbar/notify methods forward straight to the
 //!   already-`cfg(macos)`-guarded [`crate::menu`] / [`crate::toolbar`] /
 //!   [`crate::notify`] modules. So the macOS binary is behaviorally identical: the
-//!   same objc2 operations run, just reached through the trait.
+//!   same AppKit operations run, just reached through the trait.
 //! * [`AppRtLinux`] is the no-op fallback for every non-macOS target: chrome
 //!   colour/appearance do nothing, the menu/toolbar install nothing (`None`), the
 //!   tab-strip sync + chrome read are no-ops, and notification delivery spins the
@@ -67,7 +67,7 @@ pub(crate) enum RenameEditorEdit {
 }
 
 /// The native application-runtime seam. Every method is a platform OS-integration
-/// operation aterm performs; the macOS impl runs the real objc2 calls, the Linux
+/// operation aterm performs; the macOS impl runs the real AppKit calls, the Linux
 /// impl is a graceful no-op. Implementors are zero-sized.
 pub(crate) trait AppRt {
     /// Paint the OS window background the terminal's theme background colour
@@ -555,7 +555,42 @@ impl From<crate::app_config::WindowColorspace> for SurfaceColorspace {
     }
 }
 
-/// macOS application-runtime: WRAPS the existing objc2 integration exactly. The
+/// This window's live AppKit `NSView`, or nil when the window has no AppKit
+/// backend (headless, or another platform's handle).
+///
+/// The winit → `raw-window-handle` → `NSView` walk that every macOS chrome
+/// method below opened by hand, written once. It is NOT a message send: the
+/// pointer comes straight out of the handle, so nothing here can raise.
+#[cfg(target_os = "macos")]
+pub(crate) fn ns_view_of(window: &Window) -> aterm_objc::Id {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return aterm_objc::Id::NIL;
+    };
+    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+        return aterm_objc::Id::NIL;
+    };
+    aterm_objc::Id::from_ptr(h.ns_view.as_ptr().cast())
+}
+
+/// This window's AppKit `NSWindow`, or nil.
+///
+/// `-window` is nil for a view that is not in a window yet, which every caller
+/// here treats as "no chrome to configure" — the best-effort contract.
+#[cfg(target_os = "macos")]
+fn ns_window_of(window: &Window) -> aterm_objc::Id {
+    let view = ns_view_of(window);
+    if view.is_null() {
+        return aterm_objc::Id::NIL;
+    }
+    // SAFETY: `view` is this window's live NSView (winit owns it for the
+    // window's lifetime), borrowed on the main thread as AppKit requires;
+    // `-window` is `-(id)`, a side-effect-free accessor returning a BORROWED
+    // reference that the view keeps alive.
+    unsafe { crate::appkit::send_id(view, aterm_objc::sel!(window)) }
+}
+
+/// macOS application-runtime: WRAPS the existing AppKit integration exactly. The
 /// chrome methods carry the verbatim NSWindow colour-space + NSAppearance logic
 /// relocated from `app_window.rs`; the rest forward to the `cfg(macos)`-guarded
 /// menu/toolbar/notify modules. Zero-sized.
@@ -580,29 +615,39 @@ impl AppRt for AppRtMacOS {
     /// Best-effort, mirroring [`Self::window_set_appearance`]: off the main thread
     /// or with no AppKit `NSWindow`, it is simply a no-op.
     fn window_set_background_color(&self, window: &Window, bg: u32) {
-        use objc2_app_kit::{NSColor, NSView};
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` points at this window's live NSView (owned by winit for
-        // the window's lifetime); we only borrow it — on the main thread, as AppKit
-        // requires — to reach its `window` and set the background colour.
-        let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-        let Some(ns_window) = view.window() else {
-            return;
-        };
+        }
         let r = f64::from((bg >> 16) & 0xff) / 255.0;
         let g = f64::from((bg >> 8) & 0xff) / 255.0;
         let b = f64::from(bg & 0xff) / 255.0;
-        // SAFETY: standard AppKit colour construction + a plain setter on the main
-        // thread; the colour is autoreleased and consumed within this call.
+        // SAFETY: `+colorWithSRGBRed:green:blue:alpha:` is
+        // `-(id)(CGFloat, CGFloat, CGFloat, CGFloat)` and returns an
+        // AUTORELEASED colour — borrowed for the length of `-setBackgroundColor:`,
+        // which is `-(void)(NSColor *)` and RETAINS it. The pool is the caller's
+        // (the winit event loop's), which is why the borrow is sound.
         unsafe {
-            let color = NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
-            ns_window.setBackgroundColor(Some(&color));
+            let make: unsafe extern "C" fn(
+                aterm_objc::Id,
+                aterm_objc::Sel,
+                f64,
+                f64,
+                f64,
+                f64,
+            ) -> aterm_objc::Id = aterm_objc::msg();
+            let color = make(
+                aterm_objc::class(c"NSColor").as_id(),
+                aterm_objc::sel!(colorWithSRGBRed:green:blue:alpha:),
+                r,
+                g,
+                b,
+                1.0,
+            );
+            if color.is_null() {
+                return;
+            }
+            crate::appkit::send_v_id(ns_window, aterm_objc::sel!(setBackgroundColor:), color);
         }
     }
 
@@ -618,26 +663,25 @@ impl AppRt for AppRtMacOS {
     /// frame. aterm's framebuffer pixels are unchanged — only the redundant gamut
     /// round-trip is removed. `$ATERM_NO_COLORSPACE_MATCH` opts out.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme) {
-        use objc2_app_kit::{NSColorSpace, NSView};
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = window.window_handle() else {
+        use aterm_objc::sel;
+
+        use crate::appkit;
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` points at this window's live NSView (owned by winit for
-        // the window's lifetime); we only borrow it — on the main thread, as AppKit
-        // requires — to read its `window` and configure it.
-        let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-        let Some(ns_window) = view.window() else {
-            return;
-        };
-        // Colour-space match (device-RGB) — see fn doc. SAFETY: standard AppKit calls.
+        }
+        // Colour-space match (device-RGB) — see fn doc.
+        // SAFETY: `+deviceRGBColorSpace` is `-(id)`, a shared immortal singleton;
+        // `-setColorSpace:` is `-(void)(NSColorSpace *)` and retains it.
         if std::env::var_os("ATERM_NO_COLORSPACE_MATCH").is_none() {
             unsafe {
-                let cs = NSColorSpace::deviceRGBColorSpace();
-                ns_window.setColorSpace(Some(&cs));
+                let cs = appkit::send_id(
+                    aterm_objc::class(c"NSColorSpace").as_id(),
+                    sel!(deviceRGBColorSpace),
+                );
+                if !cs.is_null() {
+                    appkit::send_v_id(ns_window, sel!(setColorSpace:), cs);
+                }
             }
         }
         // Ghostty-style unified chrome: a transparent titlebar so the window frame
@@ -662,16 +706,22 @@ impl AppRt for AppRtMacOS {
             WindowTheme::Light => Some("NSAppearanceNameAqua"),
             WindowTheme::Dark => Some("NSAppearanceNameDarkAqua"),
         };
+        // SAFETY: `+appearanceNamed:` is `-(id)(NSString *)` and returns an
+        // AUTORELEASED, framework-owned appearance (nil for a name this OS does
+        // not know, which is checked); `-setAppearance:` is `-(void)(id)` and
+        // accepts nil, which is exactly the Auto path; `-setTitlebarAppears
+        // Transparent:` is `-(void)(BOOL)`.
         unsafe {
-            use objc2::runtime::AnyObject;
-            use objc2::{class, msg_send};
-            use objc2_foundation::NSString;
             if let Some(name) = appearance_name {
-                let name = NSString::from_str(name);
-                let appearance: *mut AnyObject =
-                    msg_send![class!(NSAppearance), appearanceNamed: &*name];
-                if !appearance.is_null() {
-                    let _: () = msg_send![&*ns_window, setAppearance: appearance];
+                if let Some(name) = appkit::nsstring(name) {
+                    let appearance = appkit::send_id_id(
+                        aterm_objc::class(c"NSAppearance").as_id(),
+                        sel!(appearanceNamed:),
+                        name.id(),
+                    );
+                    if !appearance.is_null() {
+                        appkit::send_v_id(ns_window, sel!(setAppearance:), appearance);
+                    }
                 }
             } else {
                 // Auto: CLEAR any previously-forced appearance (`setAppearance: nil`)
@@ -679,12 +729,11 @@ impl AppRt for AppRtMacOS {
                 // this, a live Dark/Light -> Auto change would leave the last forced
                 // appearance stuck instead of reverting. nil is harmless at attach
                 // (a fresh NSWindow already tracks the OS).
-                let nil_appearance: *const AnyObject = std::ptr::null();
-                let _: () = msg_send![&*ns_window, setAppearance: nil_appearance];
+                appkit::send_v_id(ns_window, sel!(setAppearance:), aterm_objc::Id::NIL);
             }
             // Transparent titlebar is desired in every mode (it is the
             // chrome-unification half, independent of light/dark).
-            let _: () = msg_send![&*ns_window, setTitlebarAppearsTransparent: true];
+            appkit::send_v_bool(ns_window, sel!(setTitlebarAppearsTransparent:), true);
         }
         // NOTE: the fullSizeContentView style mask deliberately does NOT live here —
         // config reload re-runs this method on EVERY window (including Settings),
@@ -737,31 +786,21 @@ impl AppRt for AppRtMacOS {
     /// window is off-screen so `screen` is nil) returns `1.0` — no headroom,
     /// which the proven sanitizer treats as SDR.
     fn screen_edr_max(&self, window: &Window) -> f32 {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-        use objc2_app_kit::NSView;
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return 1.0;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return 1.0;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires;
-        // `screen` / the EDR getter are plain side-effect-free property reads
-        // (the getter returns CGFloat == f64).
+        }
+        // SAFETY: `-screen` is `-(id)` (nil for an off-screen window, checked)
+        // and the EDR getter is `-(CGFloat)`, both side-effect-free reads.
         unsafe {
-            let view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
-            let Some(ns_window) = view.window() else {
-                return 1.0;
-            };
-            let screen: *mut AnyObject = msg_send![&*ns_window, screen];
+            let screen = crate::appkit::send_id(ns_window, aterm_objc::sel!(screen));
             if screen.is_null() {
                 return 1.0;
             }
-            let v: f64 = msg_send![screen, maximumExtendedDynamicRangeColorComponentValue];
-            v as f32
+            crate::appkit::send_f64(
+                screen,
+                aterm_objc::sel!(maximumExtendedDynamicRangeColorComponentValue),
+            ) as f32
         }
     }
 
@@ -771,28 +810,23 @@ impl AppRt for AppRtMacOS {
     /// `$ATERM_NO_FULLSIZE_CONTENT` is the escape hatch (a plain env opt-out, so
     /// a misbehaving band never needs a rebuild to disable).
     fn window_set_fullsize_content(&self, window: &Window) {
-        use objc2::msg_send;
-        use objc2_app_kit::NSView;
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
         if std::env::var_os("ATERM_NO_FULLSIZE_CONTENT").is_some() {
             return;
         }
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires;
-        // the style-mask read-modify-write is a standard NSWindow property pair.
+        }
+        // SAFETY: the style-mask read-modify-write is a standard NSWindow
+        // property pair, `-(NSWindowStyleMask)` and `-(void)(NSWindowStyleMask)`,
+        // where `NSWindowStyleMask` is `NSUInteger`.
         unsafe {
-            let view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
-            let Some(ns_window) = view.window() else {
-                return;
-            };
-            let mask: usize = msg_send![&*ns_window, styleMask];
-            let _: () = msg_send![&*ns_window, setStyleMask: mask | (1usize << 15)];
+            let mask = crate::appkit::send_usize(ns_window, aterm_objc::sel!(styleMask));
+            crate::appkit::send_v_usize(
+                ns_window,
+                aterm_objc::sel!(setStyleMask:),
+                mask | (1usize << 15),
+            );
         }
     }
 
@@ -804,25 +838,16 @@ impl AppRt for AppRtMacOS {
     /// still excludes the chrome — and correctly `0` in fullscreen, where the
     /// titlebar detaches). Best-effort: any missing link returns `0.0` (no band).
     fn titlebar_band_pts(&self, window: &Window) -> f64 {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-        use objc2_app_kit::NSView;
-        use objc2_foundation::NSRect;
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return 0.0;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return 0.0;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires;
-        // every message below is a side-effect-free geometry read.
+        }
+        // SAFETY: every message below is a side-effect-free geometry read.
+        // `-bounds` and `-contentLayoutRect` are `-(NSRect)`, a 32-byte struct
+        // return — the shape D4 exists for, and `msg` picks
+        // `objc_msgSend_stret` for it on the x86_64 compat slice without this
+        // call site having to know.
         unsafe {
-            let view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
-            let Some(ns_window) = view.window() else {
-                return 0.0;
-            };
             // ONE formula, post-mask only: `contentView.bounds − contentLayoutRect`
             // is the chrome band actually overlapping the drawable content. It is
             // 0 until fullSizeContentView is applied (so the ATERM_NO_FULLSIZE_CONTENT
@@ -833,12 +858,12 @@ impl AppRt for AppRtMacOS {
             // The pre-mask `frame − contentRectForFrameRect` form was dropped: it
             // under-counts the unified toolbar AND reports a phantom band when the
             // mask was deliberately never applied (adversarial review).
-            let content_view: *mut AnyObject = msg_send![&*ns_window, contentView];
+            let content_view = crate::appkit::send_id(ns_window, aterm_objc::sel!(contentView));
             if content_view.is_null() {
                 return 0.0;
             }
-            let bounds: NSRect = msg_send![content_view, bounds];
-            let layout: NSRect = msg_send![&*ns_window, contentLayoutRect];
+            let bounds = crate::appkit::send_rect(content_view, aterm_objc::sel!(bounds));
+            let layout = crate::appkit::send_rect(ns_window, aterm_objc::sel!(contentLayoutRect));
             (bounds.size.height - layout.size.height).max(0.0)
         }
     }
@@ -855,39 +880,28 @@ impl AppRt for AppRtMacOS {
     /// NOT from `NSScreen.mainScreen` (which is the FOCUSED screen, not the origin
     /// screen).
     fn window_work_area_pts(&self, window: &Window) -> Option<crate::app_window::WorkAreaPts> {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-        use objc2_app_kit::NSView;
-        use objc2_foundation::NSRect;
-        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
         #[link(name = "CoreGraphics", kind = "framework")]
         unsafe extern "C" {
             fn CGMainDisplayID() -> u32;
-            fn CGDisplayBounds(display: u32) -> NSRect;
+            fn CGDisplayBounds(display: u32) -> aterm_objc::CGRect;
         }
 
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return None;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return None;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires; every
-        // message below is a side-effect-free geometry read, and the CoreGraphics
-        // pair is a flat display-bounds getter that neither allocates nor dispatches.
+        }
+        // SAFETY: every message below is a side-effect-free geometry read, and
+        // the CoreGraphics pair is a flat display-bounds getter that neither
+        // allocates nor dispatches.
         unsafe {
-            let view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
-            let ns_window = view.window()?;
             // Nil for a window that is not on any screen (fully off-screen, or a
             // hidden window the WindowServer has not placed yet) — fail closed to
             // the caller's monitor-bounds fallback rather than guess a screen.
-            let screen: *mut AnyObject = msg_send![&*ns_window, screen];
+            let screen = crate::appkit::send_id(ns_window, aterm_objc::sel!(screen));
             if screen.is_null() {
                 return None;
             }
-            let visible: NSRect = msg_send![screen, visibleFrame];
+            let visible = crate::appkit::send_rect(screen, aterm_objc::sel!(visibleFrame));
             let main_height = CGDisplayBounds(CGMainDisplayID()).size.height;
             Some(crate::app_window::WorkAreaPts {
                 x: visible.origin.x,
@@ -923,21 +937,45 @@ impl AppRt for AppRtMacOS {
         // this is only ever called on the event-loop turn, keeping the AppKit
         // call ordered against our own window state. `ActivateAllWindows`
         // only — `IgnoringOtherApps` is deprecated and inert on macOS 14+.
-        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+        /// `NSRunningApplication.h:23` — `NSApplicationActivateAllWindows = 1 << 0`.
+        const ACTIVATE_ALL_WINDOWS: usize = 1 << 0;
         if pid == 0 || pid == std::process::id() {
             return false;
         }
         let Ok(pid) = libc::pid_t::try_from(pid) else {
             return false;
         };
-        // SAFETY: plain AppKit lookup + activation request; a dead pid yields
-        // None and reads as a failed activation, never a crash.
+        // SAFETY: `+runningApplicationWithProcessIdentifier:` is
+        // `-(id)(pid_t)` — `pid_t` is `int`, i.e. `i32`, NOT `NSInteger`, which
+        // is why the prototype is written out here rather than reaching for the
+        // `isize` helper — and returns nil for a dead pid, which reads as a
+        // failed activation. `-activateWithOptions:` is
+        // `-(BOOL)(NSApplicationActivationOptions)`, an `NSUInteger` bitmask.
         unsafe {
-            NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(|app| {
-                app.activateWithOptions(
-                    NSApplicationActivationOptions::NSApplicationActivateAllWindows,
-                )
-            })
+            let find: unsafe extern "C" fn(
+                aterm_objc::Id,
+                aterm_objc::Sel,
+                libc::pid_t,
+            ) -> aterm_objc::Id = aterm_objc::msg();
+            let app = find(
+                aterm_objc::class(c"NSRunningApplication").as_id(),
+                aterm_objc::sel!(runningApplicationWithProcessIdentifier:),
+                pid,
+            );
+            if app.is_null() {
+                return false;
+            }
+            let activate: unsafe extern "C" fn(
+                aterm_objc::Id,
+                aterm_objc::Sel,
+                usize,
+            ) -> aterm_objc::Bool = aterm_objc::msg();
+            activate(
+                app,
+                aterm_objc::sel!(activateWithOptions:),
+                ACTIVATE_ALL_WINDOWS,
+            )
+            .as_bool()
         }
     }
 
@@ -1062,18 +1100,38 @@ pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<winit::window:
 /// which is exactly today's behaviour.
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
-    use objc2_app_kit::NSApplication;
-    use objc2_foundation::{MainThreadMarker, NSProcessInfo};
+    use aterm_objc::{class, sel};
 
-    let mtm = MainThreadMarker::new()?;
-    let ev = NSApplication::sharedApplication(mtm).currentEvent()?;
-    let ts = unsafe { ev.timestamp() };
+    use crate::appkit::{self, MainThread};
+
+    let _main_thread = MainThread::new()?;
+    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton
+    // (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil
+    // outside a dispatch, which is the fail-closed case; `-timestamp` and
+    // `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free
+    // scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
+    let (ts, uptime) = unsafe {
+        let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+        if app.is_null() {
+            return None;
+        }
+        let ev = appkit::send_id(app, sel!(currentEvent));
+        if ev.is_null() {
+            return None;
+        }
+        let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+        if info.is_null() {
+            return None;
+        }
+        (
+            appkit::send_f64(ev, sel!(timestamp)),
+            appkit::send_f64(info, sel!(systemUptime)),
+        )
+    };
     if ts <= 0.0 {
         return None; // synthesized events carry timestamp 0
     }
-    // SAFETY: `systemUptime` is a plain scalar getter with no preconditions
-    // (marked unsafe only by objc2's blanket policy for unaudited methods).
-    let age_s = unsafe { NSProcessInfo::processInfo().systemUptime() } - ts;
+    let age_s = uptime - ts;
     // Negative up to ~1 ms is clock-read jitter (treat as "no queueing"); beyond
     // the window in either direction the pair can't be trusted — fail closed.
     if !(-0.001..=2.0).contains(&age_s) {
@@ -1097,22 +1155,14 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn appkit_window_number(window: &Window) -> i64 {
-    use objc2_app_kit::NSView;
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    let Ok(handle) = window.window_handle() else {
+    let ns_window = ns_window_of(window);
+    if ns_window.is_null() {
         return 0;
-    };
-    let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-        return 0;
-    };
-    // SAFETY: `ns_view` points at this window's live NSView (owned by winit for the
-    // window's lifetime); we only borrow it — on the main thread, as AppKit
-    // requires — to read its window's number, a plain scalar getter.
-    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-    let Some(ns_window) = view.window() else {
-        return 0;
-    };
-    unsafe { ns_window.windowNumber() as i64 }
+    }
+    // SAFETY: `-windowNumber` is `-(NSInteger)`, a plain scalar getter with no
+    // side effects — which is what keeps this read from perturbing the loop
+    // whose stalls are the subject of the measurement.
+    unsafe { crate::appkit::send_isize(ns_window, aterm_objc::sel!(windowNumber)) as i64 }
 }
 
 /// Non-macOS peer of the macOS reader: there is no AppKit window number, and the
@@ -1593,31 +1643,40 @@ pub(crate) type ReduceMotionObserver = ();
 ///
 /// # THE W2 SEAM
 ///
-/// This module is HALF ported. What is off `objc2` and onto
-/// [`aterm_objc`](aterm_objc) — the first-party runtime layer — is the part W1
-/// exists to prove: the declared class, its ivars, its `dealloc`, its
-/// registration with the notification centre, and the `Retained` handle `App`
-/// holds ([`ReduceMotionObserver`]).
+/// W1 left this module HALF ported and named what remained. What was already
+/// off `objc2` and onto [`aterm_objc`](aterm_objc) is the part W1 exists to
+/// prove: the declared class, its ivars, its `dealloc`, its registration with
+/// the notification centre, and the `Retained` handle `App` holds
+/// ([`ReduceMotionObserver`]).
 ///
-/// What is deliberately NOT ported, and is W2's to take:
+/// # THE W2 SEAM IS CLOSED
+///
+/// W1 left two things here and named them as W2's:
 ///
 /// * [`query`] / [`increase_contrast`] / [`reduce_transparency`] — three plain
-///   `msg_send!` BOOL getters. They are the cheapest possible port (one typed
-///   cast each) and are left as a matched pair with the ported half so a reader
-///   can see both forms side by side.
-/// * `MainThreadMarker` — `objc2`'s proof-of-main-thread token, which
-///   `aterm-objc` deliberately does not model. Replacing it means deciding what
-///   aterm's own main-thread proof is; that is a design question, not a
-///   translation, and it is shared with all six remaining `declare_class!`
-///   sites.
+///   `msg_send!` BOOL getters, "the cheapest possible port (one typed cast
+///   each)". They are ported, and the estimate was right: three lines each,
+///   through [`crate::appkit`]. They are also three of the sites that `bool`
+///   would have been wrong for on the x86_64 compat slice, which is why
+///   `send_bool` returns Rust's `bool` only after asking the runtime for a
+///   [`aterm_objc::Bool`].
+/// * `MainThreadMarker` — objc2's proof-of-main-thread token, "a design
+///   question, not a translation". The decision is
+///   [`crate::appkit::MainThread`]: the same proof objc2 uses
+///   (`+[NSThread isMainThread]`), asked at the boundary, carried in a
+///   `!Send`/`!Sync` zero-sized witness, and NOT wired to `Send`/`Sync` on the
+///   declared classes the way objc2 0.5's `Mutability` was —
+///   [`aterm_objc::Retained`] is unconditionally `!Send` already, so the token
+///   is left doing exactly one job. See that type for the reasoning.
+///
+/// This module now carries no `objc2` token at all.
 #[cfg(target_os = "macos")]
 mod reduce_motion {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-    use objc2_foundation::MainThreadMarker;
+    use aterm_objc::{class, sel};
     use winit::event_loop::EventLoopProxy;
 
     use crate::Wake;
+    use crate::appkit::{self, MainThread};
 
     /// The workspace notification this module observes. Its value equals
     /// AppKit's exported `NSWorkspaceAccessibilityDisplayOptionsDidChange
@@ -1665,8 +1724,11 @@ mod reduce_motion {
 
     /// Build a target around an arbitrary relay. `observe` is the production
     /// caller; the test below is the other one.
-    fn new_target(relay: Box<dyn Fn()>) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
-        ReduceMotionTarget::alloc_init(ReduceMotionIvars { relay })
+    fn new_target(
+        mtm: aterm_objc::MainThread,
+        relay: Box<dyn Fn()>,
+    ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
+        ReduceMotionTarget::alloc_init(mtm, ReduceMotionIvars { relay })
     }
 
     /// `[[NSWorkspace sharedWorkspace] notificationCenter]`, or null.
@@ -1739,14 +1801,23 @@ mod reduce_motion {
     /// Query `NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion`
     /// — the live OS "Reduce Motion" accessibility preference.
     pub(crate) fn query() -> bool {
-        // SAFETY: `sharedWorkspace` is a standard singleton accessor and the
-        // getter is a plain side-effect-free BOOL read.
+        workspace_flag(sel!(accessibilityDisplayShouldReduceMotion))
+    }
+
+    /// `[[NSWorkspace sharedWorkspace] <flag>]`, or `false` if there is no
+    /// workspace. The one shape all three accessibility getters have.
+    fn workspace_flag(flag: aterm_objc::Sel) -> bool {
+        // SAFETY: `+sharedWorkspace` is `-(id)`, the standard singleton
+        // accessor, and each `flag` is a `-(BOOL)` side-effect-free property
+        // read on it. `Bool`, not `bool`: on the x86_64 compat slice `BOOL` is
+        // `signed char` and only two of its 256 values are valid `bool` bit
+        // patterns, so the conversion happens once, inside `send_bool`.
         unsafe {
-            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
             if ws.is_null() {
                 return false;
             }
-            msg_send![ws, accessibilityDisplayShouldReduceMotion]
+            appkit::send_bool(ws, flag)
         }
     }
 
@@ -1754,23 +1825,11 @@ mod reduce_motion {
     /// notification. Keeping all three under one observer makes a burst atomic at the
     /// next event-loop turn.
     pub(crate) fn increase_contrast() -> bool {
-        unsafe {
-            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            if ws.is_null() {
-                return false;
-            }
-            msg_send![ws, accessibilityDisplayShouldIncreaseContrast]
-        }
+        workspace_flag(sel!(accessibilityDisplayShouldIncreaseContrast))
     }
 
     pub(crate) fn reduce_transparency() -> bool {
-        unsafe {
-            let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-            if ws.is_null() {
-                return false;
-            }
-            msg_send![ws, accessibilityDisplayShouldReduceTransparency]
-        }
+        workspace_flag(sel!(accessibilityDisplayShouldReduceTransparency))
     }
 
     /// Register a workspace-notification observer for the accessibility
@@ -1781,13 +1840,16 @@ mod reduce_motion {
     pub(crate) fn observe(
         proxy: &EventLoopProxy<Wake>,
     ) -> Option<aterm_objc::Retained<ReduceMotionTarget>> {
-        let _mtm = MainThreadMarker::new()?;
+        let main_thread = MainThread::new()?;
         let proxy = proxy.clone();
-        let target = new_target(Box::new(move || {
-            // Fire-and-forget: a closed loop (app shutting down) just drops the
-            // event, exactly as the objc2 version did.
-            let _ = proxy.send_event(Wake::ReduceMotionChanged);
-        }))?;
+        let target = new_target(
+            main_thread,
+            Box::new(move || {
+                // Fire-and-forget: a closed loop (app shutting down) just drops the
+                // event, exactly as the objc2 version did.
+                let _ = proxy.send_event(Wake::ReduceMotionChanged);
+            }),
+        )?;
         if register(&target) {
             Some(target)
         } else {
@@ -1855,9 +1917,12 @@ mod reduce_motion {
 
             let hits = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&hits);
-            let target = new_target(Box::new(move || {
-                seen.fetch_add(1, Ordering::SeqCst);
-            }))
+            let target = new_target(
+                crate::appkit::test_witness(),
+                Box::new(move || {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
             .expect("+alloc/-init produced a ReduceMotionTarget");
 
             // The runtime's own view of what got registered.
@@ -1925,9 +1990,12 @@ mod reduce_motion {
             }
             let drops = Arc::new(AtomicUsize::new(0));
             let spy = Spy(Arc::clone(&drops));
-            let target = new_target(Box::new(move || {
-                let _ = &spy;
-            }))
+            let target = new_target(
+                crate::appkit::test_witness(),
+                Box::new(move || {
+                    let _ = &spy;
+                }),
+            )
             .expect("target");
             assert_eq!(drops.load(Ordering::SeqCst), 0);
             drop(target);
@@ -1949,30 +2017,38 @@ mod reduce_motion {
 mod layer_colorspace {
     use std::ffi::c_void;
 
-    use objc2::encode::{Encoding, RefEncode};
-    use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject};
-    use objc2_foundation::NSString;
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use aterm_objc::{Id, Sel, class, sel};
     use winit::window::Window;
 
-    /// An OPAQUE `CGColorSpace` — never dereferenced in Rust; we only ever hold pointers
-    /// to it (handed back to CG / CoreAnimation or released). Giving it the real struct
-    /// encoding (rather than a bare `*mut c_void`, which encodes as `^v`) makes a
-    /// `*mut CGColorSpace` encode as `^{CGColorSpace=}` — exactly the argument type
-    /// `-[CAMetalLayer setColorspace:]` declares, so objc2's message-type check accepts
-    /// it instead of aborting the process (a `^v` vs `^{CGColorSpace=}` mismatch panic on
-    /// every windowed GPU launch).
-    #[repr(C)]
-    struct CGColorSpace {
-        _opaque: [u8; 0],
-    }
-    // SAFETY: a pointer to an opaque CoreGraphics type; the encoding names the struct so
-    // the pointer reads as `^{CGColorSpace=}` — what CoreAnimation's setter expects.
-    unsafe impl RefEncode for CGColorSpace {
-        const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGColorSpace", &[]));
-    }
-    type CGColorSpaceRef = *mut CGColorSpace;
+    use super::ns_view_of;
+    use crate::appkit;
+
+    /// An OPAQUE `CGColorSpace`, as a bare pointer.
+    ///
+    /// # This type used to be a struct with an `Encode` impl, and the PORT DELETED IT
+    ///
+    /// The objc2 form declared a `#[repr(C)] struct CGColorSpace` with a
+    /// hand-written `RefEncode` whose only job was to make a
+    /// `*mut CGColorSpace` encode as `^{CGColorSpace=}` rather than `^v` —
+    /// because objc2 CHECKS the argument encodings of a send against the
+    /// runtime's own method signature and ABORTS THE PROCESS on a mismatch, so
+    /// a bare `void *` panicked on every windowed GPU launch.
+    ///
+    /// `aterm-objc` does not perform that check: a send is a typed cast to the
+    /// selector's exact C prototype, which is the contract, and there is no
+    /// second opinion to satisfy. So the struct, the `RefEncode` impl and the
+    /// `Encoding::Pointer(&Encoding::Struct(…))` literal all go away and the
+    /// argument is what CoreGraphics actually hands back: a pointer.
+    ///
+    /// That is a REAL trade, not a free win, and it is worth stating in both
+    /// directions: objc2 caught a wrong prototype at run time and turned it into
+    /// a loud abort; this layer catches nothing and a wrong cast is undefined
+    /// behaviour. The crate's answer is that the cast IS the contract — the same
+    /// posture `aterm-gpu/src/metal/ffi.rs` has always had — and that the
+    /// encodings it registers for its own DECLARED methods are checked against
+    /// the runtime by the tests in this tree. It is also one of the few places
+    /// in this whole port where removing the binding made the code SHORTER.
+    type CGColorSpaceRef = *mut c_void;
 
     // SAFETY: standard, stable CoreGraphics C entry points with the published
     // signatures; contracts honoured at the call site below (the one Create is
@@ -1986,35 +2062,58 @@ mod layer_colorspace {
         fn CGColorSpaceRelease(space: CGColorSpaceRef);
     }
 
+    /// `-[CALayer isKindOfClass:CAMetalLayer]`, with the class looked up
+    /// dynamically so a hypothetical process without QuartzCore degrades to a
+    /// no-op instead of a panic — the property the objc2 form got from
+    /// `AnyClass::get`.
+    ///
+    /// # Safety
+    /// `obj` must be nil or a live object.
+    unsafe fn is_metal_layer(obj: Id) -> bool {
+        let metal = class(c"CAMetalLayer");
+        if obj.is_null() || metal.is_null() {
+            return false;
+        }
+        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free.
+        // The argument is a CLASS, not an object — `@encode(Class)` is `"#"`,
+        // not `"@"` — which is exactly the distinction `ClassPtr`'s own newtype
+        // exists to keep, and the reason this is not `send_bool_id`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
+                aterm_objc::msg();
+            f(obj, sel!(isKindOfClass:), metal).as_bool()
+        }
+    }
+
     /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace`
     /// to the named CG colour space. Best-effort: any missing link in the chain
     /// (no AppKit handle, no layer, unknown name) is a silent no-op — the layer
     /// then keeps its previous tag (untagged = the legacy panel-native read).
     #[must_use]
     pub(crate) fn set(window: &Window, cg_name: &str) -> bool {
-        let Ok(handle) = window.window_handle() else {
+        let view = ns_view_of(window);
+        let Some(name) = appkit::nsstring(cg_name) else {
             return false;
         };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return false;
-        };
-        // SAFETY: `ns_view` points at this window's live NSView (winit owns it
-        // for the window's lifetime); borrowed on the main thread (this is only
-        // reached from the winit event loop), as AppKit requires. The layer
-        // walk reads retained CALayer objects owned by that view; the setter is
-        // a plain property write that RETAINS the colour space, so releasing
-        // our create-ref afterwards is balanced.
+        // SAFETY: `view` is this window's live NSView (winit owns it for the
+        // window's lifetime); borrowed on the main thread (this is only reached
+        // from the winit event loop), as AppKit requires. The layer walk reads
+        // retained CALayer objects owned by that view. `CGColorSpaceCreateWith
+        // Name` takes a `CFStringRef`, and an `NSString` is toll-free-bridged,
+        // so the +1 NSString is passed as one; the returned space is +1 by the
+        // CREATE rule. `-setColorspace:` is `-(void)(CGColorSpaceRef)` — a bare
+        // pointer argument, not an object — and RETAINS, so releasing our
+        // create-ref right after is balanced.
         unsafe {
-            let view = h.ns_view.as_ptr() as *mut AnyObject;
             let Some(layer) = find_metal_layer(view) else {
                 return false;
             };
-            let name = NSString::from_str(cg_name);
-            let cs = CGColorSpaceCreateWithName(&*name as *const NSString as *const c_void);
+            let cs = CGColorSpaceCreateWithName(name.id().as_ptr().cast_const());
             if cs.is_null() {
                 return false;
             }
-            let _: () = msg_send![layer, setColorspace: cs];
+            let set_cs: unsafe extern "C" fn(Id, Sel, *mut c_void) = aterm_objc::msg();
+            set_cs(layer, sel!(setColorspace:), cs);
             CGColorSpaceRelease(cs);
             true
         }
@@ -2033,23 +2132,18 @@ mod layer_colorspace {
         #[link(name = "QuartzCore", kind = "framework")]
         unsafe extern "C" {
             /// Pins unrescaled contents to the layer's MAXIMUM-Y left corner.
-            static kCAGravityTopLeft: *const AnyObject;
+            static kCAGravityTopLeft: *const c_void;
             /// Pins unrescaled contents to the layer's MINIMUM-Y left corner.
-            static kCAGravityBottomLeft: *const AnyObject;
+            static kCAGravityBottomLeft: *const c_void;
         }
-        let Ok(handle) = window.window_handle() else {
-            return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
+        let view = ns_view_of(window);
+        // SAFETY: `view` is this window's live NSView (winit owns it for the
         // window's lifetime), borrowed on the main thread as AppKit requires;
-        // `contentsAreFlipped` is a side-effect-free read and
-        // `setContentsGravity:` is a plain property write that RETAINS the
-        // string, which is a framework constant that outlives us.
+        // `-contentsAreFlipped` is a side-effect-free `-(BOOL)` read and
+        // `-setContentsGravity:` is `-(void)(NSString *)`, a plain property
+        // write that RETAINS the string, which is a framework constant that
+        // outlives us.
         unsafe {
-            let view = h.ns_view.as_ptr() as *mut AnyObject;
             let Some(layer) = find_metal_layer(view) else {
                 return;
             };
@@ -2069,7 +2163,7 @@ mod layer_colorspace {
             // whether minimum-Y is the visual top. Read it and pick the constant
             // that lands on the visual TOP-LEFT either way, which is the corner a
             // terminal grows from.
-            let flipped: bool = msg_send![layer, contentsAreFlipped];
+            let flipped = appkit::send_bool(layer, sel!(contentsAreFlipped));
             let gravity = if flipped {
                 kCAGravityBottomLeft
             } else {
@@ -2078,7 +2172,11 @@ mod layer_colorspace {
             if gravity.is_null() {
                 return;
             }
-            let _: () = msg_send![layer, setContentsGravity: gravity];
+            appkit::send_v_id(
+                layer,
+                sel!(setContentsGravity:),
+                Id::from_ptr(gravity.cast_mut()),
+            );
         }
     }
 
@@ -2089,32 +2187,21 @@ mod layer_colorspace {
     /// [`super::AppRt::window_surface_presentation`]). Pure reads; `None` when there
     /// is no metal layer.
     pub(crate) fn read_contents_presentation(window: &Window) -> Option<(String, f64, bool)> {
-        let handle = window.window_handle().ok()?;
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return None;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires. Every
-        // message below is a side-effect-free property read; the returned
-        // `contentsGravity` is an autoreleased NSString we copy out immediately.
+        let view = ns_view_of(window);
+        // SAFETY: `view` is this window's live NSView (winit owns it for the
+        // window's lifetime), borrowed on the main thread as AppKit requires.
+        // Every message below is a side-effect-free property read; the returned
+        // `contentsGravity` is a borrowed NSString copied out immediately.
         unsafe {
-            let view = h.ns_view.as_ptr() as *mut AnyObject;
             let layer = find_metal_layer(view)?;
-            let gravity: *mut AnyObject = msg_send![layer, contentsGravity];
+            let gravity = appkit::send_id(layer, sel!(contentsGravity));
             let gravity = if gravity.is_null() {
                 "none".to_string()
             } else {
-                let utf8: *const std::ffi::c_char = msg_send![gravity, UTF8String];
-                if utf8.is_null() {
-                    "none".to_string()
-                } else {
-                    std::ffi::CStr::from_ptr(utf8)
-                        .to_string_lossy()
-                        .into_owned()
-                }
+                appkit::nsstring_to_rust(gravity)
             };
-            let scale: f64 = msg_send![layer, contentsScale];
-            let flipped: bool = msg_send![layer, contentsAreFlipped];
+            let scale = appkit::send_f64(layer, sel!(contentsScale));
+            let flipped = appkit::send_bool(layer, sel!(contentsAreFlipped));
             Some((gravity, scale, flipped))
         }
     }
@@ -2124,21 +2211,15 @@ mod layer_colorspace {
     /// behind it; `true` restores the opaque default. Best-effort: no metal layer →
     /// a silent no-op. Shares [`find_metal_layer`] with the colour-space tagger.
     pub(crate) fn set_metal_opaque(window: &Window, opaque: bool) {
-        let Ok(handle) = window.window_handle() else {
-            return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
+        let view = ns_view_of(window);
+        // SAFETY: `view` is this window's live NSView (winit owns it for the
         // window's lifetime), borrowed on the main thread as AppKit requires;
-        // `setOpaque:` is a plain BOOL property write on the CAMetalLayer.
+        // `-setOpaque:` is `-(void)(BOOL)` on the CAMetalLayer.
         unsafe {
-            let view = h.ns_view.as_ptr() as *mut AnyObject;
             let Some(layer) = find_metal_layer(view) else {
                 return;
             };
-            let _: () = msg_send![layer, setOpaque: opaque];
+            appkit::send_v_bool(layer, sel!(setOpaque:), opaque);
         }
     }
 
@@ -2151,29 +2232,27 @@ mod layer_colorspace {
     ///
     /// SAFETY: caller guarantees `view` is a live NSView borrowed on the main
     /// thread; every message below is a side-effect-free read.
-    unsafe fn find_metal_layer(view: *mut AnyObject) -> Option<*mut AnyObject> {
-        let metal = AnyClass::get("CAMetalLayer")?;
+    unsafe fn find_metal_layer(view: Id) -> Option<Id> {
+        if view.is_null() {
+            return None;
+        }
         unsafe {
-            let layer: *mut AnyObject = msg_send![view, layer];
+            let layer = appkit::send_id(view, sel!(layer));
             if layer.is_null() {
                 return None;
             }
-            let is_metal: bool = msg_send![layer, isKindOfClass: metal];
-            if is_metal {
+            if is_metal_layer(layer) {
                 return Some(layer);
             }
-            let subs: *mut AnyObject = msg_send![layer, sublayers];
+            let subs = appkit::send_id(layer, sel!(sublayers));
             if subs.is_null() {
                 return None;
             }
-            let n: usize = msg_send![subs, count];
+            let n = appkit::send_usize(subs, sel!(count));
+            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
             for i in 0..n {
-                let l: *mut AnyObject = msg_send![subs, objectAtIndex: i];
-                if l.is_null() {
-                    continue;
-                }
-                let is_metal: bool = msg_send![l, isKindOfClass: metal];
-                if is_metal {
+                let l = at(subs, sel!(objectAtIndex:), i);
+                if is_metal_layer(l) {
                     return Some(l);
                 }
             }
@@ -2191,19 +2270,20 @@ mod layer_colorspace {
 /// on the main thread (the winit event loop guarantees it) as AppKit requires.
 #[cfg(target_os = "macos")]
 mod vibrancy {
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject};
-    use objc2::{class, msg_send};
-    use objc2_app_kit::NSColor;
-    use objc2_foundation::NSRect;
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use aterm_objc::{Id, Sel, class, sel};
     use winit::window::Window;
 
-    use super::layer_colorspace;
+    use super::{layer_colorspace, ns_window_of};
     use crate::app_config::BackgroundMaterial;
+    use crate::appkit;
 
-    // `NSVisualEffectMaterial` raw values (stable ABI — objc2-app-kit 0.2 pins the
-    // same constants). Only the three semantic materials the config exposes.
+    // `NSVisualEffectMaterial` raw values, at the SDK's own numbers
+    // (`NSVisualEffectView.h:33/45/57`, `:74`, `:85`; `NSView.h` for the
+    // autoresize bits and `NSWindow.h` for the ordering mode). These were
+    // already hand-written constants before the port, for the same reason every
+    // AppKit constant in this tree is one: they are header ENUMERATORS with no
+    // exported symbol, so `objc2-app-kit` compiles its own copy too.
+    // Only the three semantic materials the config exposes.
     const MATERIAL_SIDEBAR: isize = 7; // NSVisualEffectMaterialSidebar
     const MATERIAL_HUD: isize = 13; // NSVisualEffectMaterialHUDWindow
     const MATERIAL_UNDER_WINDOW: isize = 21; // NSVisualEffectMaterialUnderWindowBackground
@@ -2231,23 +2311,18 @@ mod vibrancy {
     /// Apply the resolved vibrancy state to `window`. See
     /// [`super::AppRt::window_set_vibrancy`] for the full contract.
     pub(crate) fn set(window: &Window, material: BackgroundMaterial, translucent: bool, bg: u32) {
-        let Ok(handle) = window.window_handle() else {
+        let ns_window = ns_window_of(window);
+        if ns_window.is_null() {
             return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
-        // window's lifetime), borrowed on the main thread as AppKit requires. Every
-        // message below is a standard AppKit call; the created view is retained by
-        // `addSubview:` (AppKit owns it), and the colours are autoreleased.
+        }
+        // SAFETY: every message below is a standard AppKit call on the main
+        // thread. `-contentView` is `-(id)`; `-setOpaque:` is `-(void)(BOOL)`;
+        // `+clearColor` is `-(id)` returning a shared immortal colour and
+        // `+colorWithSRGBRed:green:blue:alpha:` an AUTORELEASED one, both
+        // borrowed only for the length of `-setBackgroundColor:`, which is
+        // `-(void)(NSColor *)` and RETAINS.
         unsafe {
-            let view = h.ns_view.as_ptr() as *mut AnyObject;
-            let ns_window: *mut AnyObject = msg_send![view, window];
-            if ns_window.is_null() {
-                return;
-            }
-            let content: *mut AnyObject = msg_send![ns_window, contentView];
+            let content = appkit::send_id(ns_window, sel!(contentView));
             if content.is_null() {
                 return;
             }
@@ -2260,9 +2335,11 @@ mod vibrancy {
                 // A behind-window blur needs a NON-opaque window with a clear fill,
                 // so the desktop (blurred by the effect view) shows through the
                 // translucent bg pixels the Metal layer composites.
-                let _: () = msg_send![ns_window, setOpaque: false];
-                let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-                let _: () = msg_send![ns_window, setBackgroundColor: clear];
+                appkit::send_v_bool(ns_window, sel!(setOpaque:), false);
+                let clear = appkit::send_id(class(c"NSColor").as_id(), sel!(clearColor));
+                if !clear.is_null() {
+                    appkit::send_v_id(ns_window, sel!(setBackgroundColor:), clear);
+                }
                 if let Some(mat) = material_value(material) {
                     install_effect_view(content, mat);
                 }
@@ -2271,13 +2348,23 @@ mod vibrancy {
             } else {
                 // Restore the opaque default: no backdrop, an opaque window painted
                 // the theme bg (the seamless-titlebar fill), an opaque Metal layer.
-                let _: () = msg_send![ns_window, setOpaque: true];
+                appkit::send_v_bool(ns_window, sel!(setOpaque:), true);
                 let r = f64::from((bg >> 16) & 0xff) / 255.0;
                 let g = f64::from((bg >> 8) & 0xff) / 255.0;
                 let b = f64::from(bg & 0xff) / 255.0;
-                let color: Retained<NSColor> =
-                    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0);
-                let _: () = msg_send![ns_window, setBackgroundColor: &*color];
+                let make: unsafe extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id =
+                    aterm_objc::msg();
+                let color = make(
+                    class(c"NSColor").as_id(),
+                    sel!(colorWithSRGBRed:green:blue:alpha:),
+                    r,
+                    g,
+                    b,
+                    1.0,
+                );
+                if !color.is_null() {
+                    appkit::send_v_id(ns_window, sel!(setBackgroundColor:), color);
+                }
                 layer_colorspace::set_metal_opaque(window, true);
             }
         }
@@ -2289,29 +2376,34 @@ mod vibrancy {
     ///
     /// SAFETY: `content` is a live NSView on the main thread; the reads are
     /// side-effect-free and `removeFromSuperview` is a standard call.
-    unsafe fn remove_effect_views(content: *mut AnyObject) {
-        let Some(effect_cls) = AnyClass::get("NSVisualEffectView") else {
+    unsafe fn remove_effect_views(content: Id) {
+        let effect_cls = class(c"NSVisualEffectView");
+        if effect_cls.is_null() {
             return;
-        };
+        }
         unsafe {
-            let subs: *mut AnyObject = msg_send![content, subviews];
+            let subs = appkit::send_id(content, sel!(subviews));
             if subs.is_null() {
                 return;
             }
-            let n: usize = msg_send![subs, count];
-            let mut ours: Vec<*mut AnyObject> = Vec::new();
+            let n = appkit::send_usize(subs, sel!(count));
+            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
+            // `-isKindOfClass:` takes a CLASS, encoded `"#"` and not `"@"` —
+            // hence the explicit prototype rather than `send_bool_id`.
+            let is_kind: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
+                aterm_objc::msg();
+            let mut ours: Vec<Id> = Vec::new();
             for i in 0..n {
-                let sv: *mut AnyObject = msg_send![subs, objectAtIndex: i];
+                let sv = at(subs, sel!(objectAtIndex:), i);
                 if sv.is_null() {
                     continue;
                 }
-                let is_effect: bool = msg_send![sv, isKindOfClass: effect_cls];
-                if is_effect {
+                if is_kind(sv, sel!(isKindOfClass:), effect_cls).as_bool() {
                     ours.push(sv);
                 }
             }
             for sv in ours {
-                let _: () = msg_send![sv, removeFromSuperview];
+                appkit::send_v(sv, sel!(removeFromSuperview));
             }
         }
     }
@@ -2332,30 +2424,35 @@ mod vibrancy {
     /// view stays alive under the superview's retain. On the nil path we do NOT
     /// release: a failing `init` already releases `self` per Cocoa convention, so
     /// touching it would be an over-release.
-    unsafe fn install_effect_view(content: *mut AnyObject, material: isize) {
-        let Some(effect_cls) = AnyClass::get("NSVisualEffectView") else {
+    unsafe fn install_effect_view(content: Id, material: isize) {
+        let effect_cls = class(c"NSVisualEffectView");
+        if effect_cls.is_null() {
             return;
-        };
+        }
         unsafe {
-            let bounds: NSRect = msg_send![content, bounds];
-            let obj: *mut AnyObject = msg_send![effect_cls, alloc];
-            let effect: *mut AnyObject = msg_send![obj, initWithFrame: bounds];
+            let bounds = appkit::send_rect(content, sel!(bounds));
+            let effect =
+                appkit::send_id_rect(appkit::alloc(effect_cls), sel!(initWithFrame:), bounds);
             if effect.is_null() {
                 return; // init consumed (released) the alloc — nothing for us to free
             }
-            let _: () = msg_send![effect, setMaterial: material];
-            let _: () = msg_send![effect, setBlendingMode: BLENDING_BEHIND_WINDOW];
-            let _: () = msg_send![effect, setState: STATE_ACTIVE];
-            let _: () = msg_send![effect, setAutoresizingMask: AUTORESIZE_WH];
-            let nil: *mut AnyObject = std::ptr::null_mut();
-            let _: () = msg_send![
+            appkit::send_v_isize(effect, sel!(setMaterial:), material);
+            appkit::send_v_isize(effect, sel!(setBlendingMode:), BLENDING_BEHIND_WINDOW);
+            appkit::send_v_isize(effect, sel!(setState:), STATE_ACTIVE);
+            appkit::send_v_usize(effect, sel!(setAutoresizingMask:), AUTORESIZE_WH);
+            let add: unsafe extern "C" fn(Id, Sel, Id, isize, Id) = aterm_objc::msg();
+            add(
                 content,
-                addSubview: effect,
-                positioned: ORDER_BELOW,
-                relativeTo: nil,
-            ];
-            // Balance the create-rule +1 from alloc/init; the superview now owns it.
-            let _: () = msg_send![effect, release];
+                sel!(addSubview:positioned:relativeTo:),
+                effect,
+                ORDER_BELOW,
+                Id::NIL,
+            );
+            // Balance the create-rule +1 from alloc/init; the superview now owns
+            // it. `-release` is sent explicitly rather than through `Obj`
+            // because the +1 is handed straight to `addSubview:` and never held
+            // in Rust — wrapping it would be a `Retained` created only to drop.
+            appkit::send_v(effect, sel!(release));
         }
     }
 
@@ -2524,24 +2621,47 @@ mod tests {
 /// first window is created, while AppKit is still reading the value.
 #[cfg(target_os = "macos")]
 pub(crate) fn disable_press_and_hold() {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
+    use aterm_objc::{Bool, Id, Sel, autoreleasepool, class, sel};
 
-    // SAFETY: standard NSUserDefaults registration with an owned dictionary of
-    // owned objects; no raw pointers escape and nothing here is thread-affine
-    // (`registerDefaults:` is documented as safe from any thread, and this is called
-    // from the main thread at startup regardless).
-    unsafe {
-        let key = NSString::from_str("ApplePressAndHoldEnabled");
-        // NSNumber -> NSValue -> NSObject -> AnyObject: three upcasts, because
-        // `registerDefaults:` is typed on the erased element. Chained `into_super`
-        // rather than a `Retained::cast`, so the upcast stays checked by the
-        // class hierarchy instead of asserted.
-        let boxed = NSNumber::new_bool(false);
-        let value: Retained<AnyObject> =
-            Retained::into_super(Retained::into_super(Retained::into_super(boxed)));
-        let defaults = NSDictionary::from_vec(&[&*key], vec![value]);
-        NSUserDefaults::standardUserDefaults().registerDefaults(&defaults);
-    }
+    use crate::appkit;
+
+    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` is
+    // `-(id)(BOOL)` and `+dictionaryWithObject:forKey:` is `-(id)(id, id)`;
+    // both return AUTORELEASED objects, borrowed inside this pool.
+    // `+standardUserDefaults` is `-(id)`, the process singleton, and
+    // `-registerDefaults:` is `-(void)(NSDictionary *)`, which COPIES the
+    // dictionary — so nothing here has to outlive the pool.
+    //
+    // The objc2 form's three chained `Retained::into_super` upcasts
+    // (NSNumber → NSValue → NSObject → AnyObject, to satisfy the erased
+    // element type of `registerDefaults:`) have no counterpart: `Id` IS the
+    // erased type, so the upcast is not expressible and not needed. That is
+    // the same shape as the `CGColorSpace` `RefEncode` deletion above — where
+    // the binding's type discipline cost lines, the port gets them back.
+    autoreleasepool(|_| unsafe {
+        let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
+            return;
+        };
+        let boxed: unsafe extern "C" fn(Id, Sel, Bool) -> Id = aterm_objc::msg();
+        let value = boxed(class(c"NSNumber").as_id(), sel!(numberWithBool:), Bool::NO);
+        if value.is_null() {
+            return;
+        }
+        let dict: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id = aterm_objc::msg();
+        let defaults = dict(
+            class(c"NSDictionary").as_id(),
+            sel!(dictionaryWithObject:forKey:),
+            value,
+            key.id(),
+        );
+        if defaults.is_null() {
+            return;
+        }
+        let std_defaults =
+            appkit::send_id(class(c"NSUserDefaults").as_id(), sel!(standardUserDefaults));
+        if std_defaults.is_null() {
+            return;
+        }
+        appkit::send_v_id(std_defaults, sel!(registerDefaults:), defaults);
+    });
 }

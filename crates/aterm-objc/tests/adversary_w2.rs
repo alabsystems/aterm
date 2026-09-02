@@ -15,6 +15,22 @@ use aterm_objc::{
     class_of, declare_class, msg, sel,
 };
 
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
+/// for a test that is not on the main thread and does not need to be.
+///
+/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
+/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
+/// here and the checked constructor is unusable. Every class in this file is an
+/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
+/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
+/// the thread that made them — which is the second form of `new_unchecked`'s
+/// obligation, written once instead of at every call site.
+fn mtm() -> aterm_objc::MainThread {
+    // SAFETY: see this function's doc comment — the class has no main-thread
+    // affinity and its ivars are born and dropped on this one worker.
+    unsafe { aterm_objc::MainThread::new_unchecked() }
+}
+
 /// 16 bytes — the last size that comes back in registers on x86_64.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -101,7 +117,7 @@ declare_class! {
         /// against a drop counter.
         @sel(makeChild)
         fn make_child(&self) -> Id {
-            match Adv::alloc_init(Ivars {
+            match Adv::alloc_init(mtm(), Ivars {
                 calls: Cell::new(0),
                 drops: Arc::clone(&self.ivars().drops),
             }) {
@@ -114,7 +130,7 @@ declare_class! {
         /// difference rather than assert it.
         @sel(makeLeakedChild)
         fn make_leaked_child(&self) -> Id {
-            match Adv::alloc_init(Ivars {
+            match Adv::alloc_init(mtm(), Ivars {
                 calls: Cell::new(0),
                 drops: Arc::clone(&self.ivars().drops),
             }) {
@@ -146,10 +162,13 @@ declare_class! {
 }
 
 fn adv(drops: &Arc<AtomicUsize>) -> aterm_objc::Retained<Adv> {
-    Adv::alloc_init(Ivars {
-        calls: Cell::new(0),
-        drops: Arc::clone(drops),
-    })
+    Adv::alloc_init(
+        mtm(),
+        Ivars {
+            calls: Cell::new(0),
+            drops: Arc::clone(drops),
+        },
+    )
     .expect("+alloc/-init")
 }
 

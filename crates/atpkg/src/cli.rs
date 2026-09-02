@@ -398,11 +398,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         // `status` is the name people reach for first — it is what every other package
         // manager calls this — and it answered "unknown verb" while `doctor` sat two lines
         // away. An alias costs nothing and removes a guess from the first minute of use.
-        Some("doctor") => return doctor("doctor"),
+        Some("doctor") => {
+            return zero_arity(&args[1..], "doctor").unwrap_or_else(|| doctor("doctor"));
+        }
         // Same report, and the report SIGNS ITSELF with the verb the user typed: every
         // line answered "doctor:" regardless, so a `status` user could not tell which
         // verb they had run and a script keying on the prefix keyed on the wrong verb.
-        Some("status") => return doctor("status"),
+        Some("status") => {
+            return zero_arity(&args[1..], "status").unwrap_or_else(|| doctor("status"));
+        }
         Some("which") => return cmd_which(args.get(1)),
         Some("list") => return cmd_list(args.get(1..).unwrap_or(&[])),
         Some("repair") => return run_repair(layout()),
@@ -416,7 +420,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("rollback") => return cmd_rollback(args.get(1)),
         Some("pin") => return cmd_pin(args.get(1), true),
         Some("unpin") => return cmd_pin(args.get(1), false),
-        Some("gc") => return cmd_gc(),
+        Some("gc") => return zero_arity(&args[1..], "gc").unwrap_or_else(cmd_gc),
         Some("verify") => return cmd_verify(args.get(1)),
         Some("link") => return cmd_link(&args[1..]),
         Some("unlink") => return cmd_unlink(args.get(1)),
@@ -995,6 +999,22 @@ fn layout() -> Option<crate::store::Layout> {
 /// `cmd_run` owns its own `--` handling, and its failure mode is already non-durable (exit
 /// 127, no `status.toml` write) — there is nothing here to protect and a dispatcher to
 /// avoid disturbing.
+/// Refuse any argument to a verb that takes none — `Some(usage error)` when one
+/// was given, `None` to proceed. `doctor`, `status` and `gc` ran to completion
+/// at exit 0 on any argument (audit D-12: `atpkg doctor --json` printed the
+/// human report and discarded the flag, so a script author read the exit code
+/// as "flag accepted" and went hunting for the JSON bug downstream). The
+/// `-h`/`--help` spellings never reach here — the dispatch edge above answers
+/// them with the verb's own usage.
+fn zero_arity(rest: &[String], verb: &str) -> Option<ExitCode> {
+    let stray = rest.first()?;
+    eprintln!("atpkg {verb}: unknown argument {stray:?} — this verb takes none");
+    if let Some(usage) = usage_of(verb) {
+        eprintln!("usage: {usage}");
+    }
+    Some(ExitCode::from(2))
+}
+
 const NAME_TAKING_VERBS: &[(&str, &[&str])] = &[
     (
         "install",
@@ -1400,7 +1420,12 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
             "--advisory" => advisory = true,
             s if !s.starts_with('-') && stage.is_none() => stage = Some(s),
             other => {
+                // Name the grammar with the refusal. The bare "unexpected
+                // argument" read as "this verb takes no flags", and the manual
+                // agreed by omission — the audit's D-5, in the verb where the
+                // wrong conclusion means signing with the wrong identity.
                 eprintln!("atpkg relocate: unexpected argument {other:?}");
+                eprintln!("usage: atpkg relocate <stage-root> [--sign <identity>] [--advisory]");
                 return ExitCode::from(2);
             }
         }
@@ -7569,6 +7594,23 @@ mod tests {
     /// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
     /// a far-fetched guess erodes trust in the near ones.
     #[test]
+    /// `doctor --json` swallowed the flag and exited 0 with the human report
+    /// (audit D-12). A zero-arity verb refuses ANY argument at the usage exit,
+    /// naming the verb, the argument and the arity — while `--help` still
+    /// answers with usage via the dispatch edge, and the bare forms run.
+    #[test]
+    fn zero_arity_verbs_refuse_arguments_instead_of_swallowing_them() {
+        for verb in ["doctor", "status", "gc"] {
+            let rest = vec!["--json".to_string()];
+            let code = zero_arity(&rest, verb).expect("an argument must be refused");
+            assert_eq!(code, ExitCode::from(2), "{verb} refusal is the usage exit");
+            assert!(
+                zero_arity(&[], verb).is_none(),
+                "bare `{verb}` must proceed"
+            );
+        }
+    }
+
     /// A reader must never be told that a command they did not type failed.
     /// `atpkg update status` used to answer `atpkg: install status failed: …`
     /// because `update` on a not-installed program routes through the single

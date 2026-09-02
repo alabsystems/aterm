@@ -71,8 +71,21 @@ pub const JET_SAMPLES: usize = 30;
 pub const MAX_NOVA_QUADS_PER: usize = 512;
 /// §6.3 caps: concurrent animating novas (excess skips straight to Ember).
 pub const MAX_ACTIVE_NOVAS: usize = 3;
-/// §6.3 caps: global nova quad backstop (never binds on a genome-reachable
-/// frame: 3 × 392 = 1176 < 1536 at every cell size).
+/// §6.3 caps: the DECORATION producers' backstop on the shared `nova_add`
+/// channel — the ceiling `word_decorations` funds every classic nova and every
+/// supernova under (`MAX_NOVA_QUADS.saturating_sub(nova.len())`). It never binds
+/// on a genome-reachable frame: 3 × 392 = 1176 < 1536 at every cell size.
+///
+/// NOT a bound on the channel TOTAL, and never was one. PRISM WAKE
+/// (`crate::output_streak`) is a SECOND producer, and the host appends its
+/// per-pane quads AFTER the decoration pass has finished spending — so they are
+/// neither funded by this budget nor visible to it, and the channel carries
+/// `decoration share + Σ panes streak share` (measured at ~2000 quads on four
+/// 200-column panes). Nothing downstream cares: the consumer
+/// (`aterm_render::Renderer::draw_nova` → `draw_flat_add`) walks the whole slice
+/// with no cap, no fixed buffer and no assert, and the host's channel is a
+/// resident scratch that grows once. Pinned in
+/// `aterm-effects/tests/nova_channel_budget.rs`.
 pub const MAX_NOVA_QUADS: usize = 1536;
 /// §6.3 crown worst case (4 tapered spike chords + 2 core-beam chords, each
 /// band shorter than one cell ⇒ ≤ 2 row-split quads per chord) — the ≤ 12
@@ -621,6 +634,15 @@ pub fn emit_debris(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, cap:
                             .sin());
         let alpha = (env.intensity * fade * tw).clamp(0.0, 1.0);
         if alpha <= 0.01 {
+            continue;
+        }
+        // OFF-GRID MOTES ARE CULLED, exactly as the supernova sibling culls
+        // its debris (supernova.rs `emit_super_decos`): the clamp below can
+        // only pin a cell index, and the residual then lands in dx/dy — whose
+        // contract is SUB-CELL jitter — so a mote past the grid edge rendered
+        // its star inside the window padding gutters, a region every quad
+        // stream is clamped away from (2026-09-01 audit).
+        if x < 0.0 || y < 0.0 || x >= env.grid_w as f32 || y >= env.grid_h as f32 {
             continue;
         }
         let col = ((x as i32) / env.cell_w).clamp(0, cols - 1);

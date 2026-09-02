@@ -24,6 +24,69 @@ name = "aterm-redraw-conformance"
 path = "src/bin/aterm-redraw-conformance.rs"
 required-features = ["control-conformance"]
 
+# THE LIVE-CLASS AUDITOR (D1). `vendor/winit`'s ported `WinitWindowDelegate` had
+# NOTHING IN CI READING THE REGISTERED CLASS: two compile-verified plants — an
+# argument retyped `Id` -> `Bool`, and `NSWindowDelegate` deleted from the
+# `protocols:` list — both left `cargo build` at 0 and the seam census at 6/6,
+# because that census checks a mirror class it declares itself. An EXAMPLE and
+# not a `#[test]` for the same reason `aterm-redraw-conformance` is a binary:
+# libtest runs every test body on a spawned thread, `pthread_main_np()` answers
+# 0 there, and `EventLoop` construction panics — so only a target owning
+# `fn main` can create the NSWindow whose delegate this reads. Run by
+# `aterm verify`; by hand it is
+# `cargo run -p aterm-gui --example objc_live_class_audit`.
+[[example]]
+name = "objc_live_class_audit"
+path = "examples/objc_live_class_audit.rs"
+
+# THE IME DRIVER, the auditor's other half and DECLARED FOR THE SAME REASON.
+# It was auto-discovered while its sibling was declared, and three places call
+# it "the `[[example]]`" — aterm-verify's stages.rs:394 says the target name,
+# the built file and the argv "all have to agree, so they read it from here",
+# which is only true of a target this file names. Two gates of the same kind,
+# spelled the same way. The auditor asks whether the class is SHAPED right;
+# this one drives a whole composition through it — marked text, cursor ranges,
+# commit, doCommandBySelector: — and asks whether it BEHAVES right. Also run by
+# `aterm verify`; by hand it is
+# `cargo run -p aterm-gui --example objc_ime_drive`.
+[[example]]
+name = "objc_ime_drive"
+path = "examples/objc_ime_drive.rs"
+
+# THE TOOLBAR DRIVER, and it closes the same D1 gap ONE FILE OVER. The auditor
+# above drives FIVE targets, all of them `vendor/winit`'s; `src/toolbar.rs` is
+# the largest ported file in the tree — four declared classes, and after W7
+# every AppKit binding call in it — and NOTHING IN THE TREE DROVE IT. Its
+# classes were checked by `#[cfg(test)] mod objc_tests`, whose central case is
+# thirty-two registered encodings against a literal written in the same file:
+# a plant that registered `controlTextDidChange:` as `v@:B` AND edited the
+# table to agree left that test GREEN. This installs the real toolbar in a real
+# NSWindow, enters the registered IMPs through AppKit's own dispatch, captures
+# 26 drawing states with `-cacheDisplayInRect:`, and reads all four classes off
+# the live objects. DECLARED and not auto-discovered for the same reason as its
+# siblings: `aterm-verify`'s stages.rs says the target name, the built file and
+# the argv all have to agree, which is only true of a target this file names.
+# Run by `aterm verify`; by hand it is
+# `cargo run -p aterm-gui --example objc_toolbar_drive`.
+[[example]]
+name = "objc_toolbar_drive"
+path = "examples/objc_toolbar_drive.rs"
+
+# THE WINDOW DRIVER (W8), and it closes the same D1 gap one file over again.
+# `window_delegate.rs` is the largest file in the mac-arm endgame and W8 moved
+# all 177 of its AppKit BINDING calls off `objc2-app-kit`. The live auditor
+# checks that file's DECLARED rows and `winit_sent_prototypes.rs` checks the
+# ENCODINGS of the rows it sends; neither can see a correct send of the wrong
+# selector, an inverted boolean, or a constant that encodes fine and means
+# something else — which is precisely the defect W7 shipped and pixels caught.
+# This drives the window surface for real: title, style mask, geometry, size
+# limits, visibility, focus, theme, tabs, drag-and-drop, close and fullscreen.
+# Also run by `aterm verify`; by hand it is
+#   cargo run -q -p aterm-gui --example objc_window_drive
+[[example]]
+name = "objc_window_drive"
+path = "examples/objc_window_drive.rs"
+
 [features]
 # `sixel` is ON by default so the SHIPPED GUI binary decodes + renders sixel
 # graphics and DA1 advertises code 4. It forwards to aterm-core's `sixel`

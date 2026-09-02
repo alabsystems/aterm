@@ -476,7 +476,9 @@ fragment float4 fs_deco_over(GlyphVsOut in [[stage_in]],
                              texture2d<float> atlas_tex [[texture(0)]],
                              sampler atlas_samp [[sampler(0)]]) {
     float cov = atlas_tex.sample(atlas_samp, in.uv).r;
-    float a = cov * in.color.a;
+    // Quantized to the CPU's intermediate byte lattice — the wgsl twin's law
+    // (fs_deco_over): round(cov*a*255)/255 == the CPU (cov*alpha+127)/255.
+    float a = rint(cov * in.color.a * 255.0) / 255.0;
     return float4(s2l(in.color.rgb), a);
 }
 
@@ -486,7 +488,8 @@ fragment float4 fs_deco_add(GlyphVsOut in [[stage_in]],
                             texture2d<float> atlas_tex [[texture(0)]],
                             sampler atlas_samp [[sampler(0)]]) {
     float cov = atlas_tex.sample(atlas_samp, in.uv).r;
-    float a = cov * in.color.a;
+    // Quantized to the CPU's intermediate byte lattice — see fs_deco_over.
+    float a = rint(cov * in.color.a * 255.0) / 255.0;
     return float4(in.color.rgb * a, a);
 }
 

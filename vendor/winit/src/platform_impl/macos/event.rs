@@ -1,11 +1,26 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (Every `objc2` binding call in this file was replaced with a typed send
+// through `aterm_objc`; `objc2_foundation::run_on_main` became
+// `aterm_objc::run_on_main`; the `NSEvent`-typed parameters became raw `Id`,
+// which is what this backend's trampolines already hold. Search for the aterm
+// local-patch marker.)
+
 use std::ffi::c_void;
 
+use aterm_objc::send::{
+    send_id, send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_u16, send_usize,
+};
+// LOCAL PATCH (aterm): `objc2::rc::Retained`, `objc2_app_kit`'s four `NSEvent`
+// types and `objc2_foundation`'s `run_on_main`/`NSPoint` are gone. `Obj` is the
+// +1 handle `Retained<NSEvent>` was, `Id` is the borrowed receiver, and the
+// four enum/bitmask types are plain integers whose values live in the seam's
+// `consts` module beside every other AppKit constant this fork reads.
+use aterm_objc::{CGPoint, Id, Obj, autoreleasepool, class, run_on_main, sel};
 use core_foundation::base::CFRelease;
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
-use objc2::rc::Retained;
-use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventSubtype, NSEventType};
-use objc2_foundation::{run_on_main, NSPoint};
 use smol_str::SmolStr;
+
+use super::aterm_objc_seam::{self as seam, consts};
 
 use crate::event::{ElementState, KeyEvent, Modifiers};
 use crate::keyboard::{
@@ -40,7 +55,7 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
         }
         layout = CFDataGetBytePtr(layout_data as CFDataRef) as *const ffi::UCKeyboardLayout;
     }
-    let keyboard_type = run_on_main(|_mtm| unsafe { ffi::LMGetKbdType() });
+    let keyboard_type = run_on_main(|_mt| unsafe { ffi::LMGetKbdType() });
 
     let mut result_len = 0;
     let mut dead_keys = 0;
@@ -77,10 +92,16 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
 }
 
 // Ignores all modifiers except for SHIFT (yes, even ALT is ignored).
-fn get_logical_key_char(ns_event: &NSEvent, modifierless_chars: &str) -> Key {
-    let string = unsafe { ns_event.charactersIgnoringModifiers() }
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+fn get_logical_key_char(ns_event: Id, modifierless_chars: &str) -> Key {
+    // LOCAL PATCH (aterm): `-charactersIgnoringModifiers` answers a +0
+    // autoreleased `NSString` (encoding `@16@0:8`). The pool is explicit
+    // because this is reachable from `replace_event`, which AppKit calls
+    // outside its own event pool.
+    let string = autoreleasepool(|_| {
+        // SAFETY: `ns_event` is the live `NSEvent` the caller borrows for the
+        // whole of this call, and the cast matches the read encoding.
+        unsafe { seam::nsstring_to_rust(send_id(ns_event, sel!(charactersIgnoringModifiers))) }
+    });
     if string.is_empty() {
         // Probably a dead key
         let first_char = modifierless_chars.chars().next();
@@ -92,11 +113,13 @@ fn get_logical_key_char(ns_event: &NSEvent, modifierless_chars: &str) -> Key {
 /// Create `KeyEvent` for the given `NSEvent`.
 ///
 /// This function shouldn't be called when the IME input is in process.
-pub(crate) fn create_key_event(ns_event: &NSEvent, is_press: bool, is_repeat: bool) -> KeyEvent {
+pub(crate) fn create_key_event(ns_event: Id, is_press: bool, is_repeat: bool) -> KeyEvent {
     use ElementState::{Pressed, Released};
     let state = if is_press { Pressed } else { Released };
 
-    let scancode = unsafe { ns_event.keyCode() };
+    // SAFETY: `ns_event` is live for the call; `-keyCode` encodes `S16@0:8`,
+    // an UNSIGNED short — see `send_u16`.
+    let scancode = unsafe { send_u16(ns_event, sel!(keyCode)) };
     let mut physical_key = scancode_to_physicalkey(scancode as u32);
 
     // NOTE: The logical key should heed both SHIFT and ALT if possible.
@@ -106,7 +129,10 @@ pub(crate) fn create_key_event(ns_event: &NSEvent, is_press: bool, is_repeat: bo
     // * Pressing CTRL SHIFT A: logical key should also be "A"
     // This is not easy to tease out of `NSEvent`, but we do our best.
 
-    let characters = unsafe { ns_event.characters() }.map(|s| s.to_string()).unwrap_or_default();
+    // SAFETY: as above; `-characters` answers a +0 autoreleased `NSString`.
+    let characters = autoreleasepool(|_| unsafe {
+        seam::nsstring_to_rust(send_id(ns_event, sel!(characters)))
+    });
     let text_with_all_modifiers = if characters.is_empty() {
         None
     } else {
@@ -122,9 +148,10 @@ pub(crate) fn create_key_event(ns_event: &NSEvent, is_press: bool, is_repeat: bo
         // `get_modifierless_char/key_without_modifiers` ignores ALL modifiers.
         let key_without_modifiers = get_modifierless_char(scancode);
 
-        let modifiers = unsafe { ns_event.modifierFlags() };
-        let has_ctrl = modifiers.contains(NSEventModifierFlags::NSEventModifierFlagControl);
-        let has_cmd = modifiers.contains(NSEventModifierFlags::NSEventModifierFlagCommand);
+        // SAFETY: as above; `-modifierFlags` encodes `Q16@0:8`.
+        let modifiers = unsafe { send_usize(ns_event, sel!(modifierFlags)) };
+        let has_ctrl = has_flag(modifiers, consts::NS_EVENT_MODIFIER_FLAG_CONTROL);
+        let has_cmd = has_flag(modifiers, consts::NS_EVENT_MODIFIER_FLAG_COMMAND);
 
         let logical_key = match text_with_all_modifiers.as_ref() {
             // Only checking for ctrl and cmd here, not checking for alt because we DO want to
@@ -286,68 +313,92 @@ pub fn extra_function_key_to_code(scancode: u16, string: &str) -> PhysicalKey {
 }
 
 // The values are from the https://github.com/apple-oss-distributions/IOHIDFamily/blob/19666c840a6d896468416ff0007040a10b7b46b8/IOHIDSystem/IOKit/hidsystem/IOLLEvent.h#L258-L259
-const NX_DEVICELCTLKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000001);
-const NX_DEVICELSHIFTKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000002);
-const NX_DEVICERSHIFTKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000004);
-const NX_DEVICELCMDKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000008);
-const NX_DEVICERCMDKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000010);
-const NX_DEVICELALTKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000020);
-const NX_DEVICERALTKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00000040);
-const NX_DEVICERCTLKEYMASK: NSEventModifierFlags = NSEventModifierFlags(0x00002000);
+const NX_DEVICELCTLKEYMASK: usize = 0x0000_0001;
+const NX_DEVICELSHIFTKEYMASK: usize = 0x0000_0002;
+const NX_DEVICERSHIFTKEYMASK: usize = 0x0000_0004;
+const NX_DEVICELCMDKEYMASK: usize = 0x0000_0008;
+const NX_DEVICERCMDKEYMASK: usize = 0x0000_0010;
+const NX_DEVICELALTKEYMASK: usize = 0x0000_0020;
+const NX_DEVICERALTKEYMASK: usize = 0x0000_0040;
+const NX_DEVICERCTLKEYMASK: usize = 0x0000_2000;
 
-pub(super) fn lalt_pressed(event: &NSEvent) -> bool {
-    unsafe { event.modifierFlags() }.contains(NX_DEVICELALTKEYMASK)
+/// LOCAL PATCH (aterm): `NSEventModifierFlags::contains`, spelled out.
+///
+/// `objc2-app-kit` generated these as `bitflags`, whose `contains` is
+/// `self & other == other` — NOT `!= 0`. Every mask this file tests is a single
+/// bit, so the two agree today; the stricter form is written anyway because it
+/// is the one the binding had, and a future multi-bit mask would silently mean
+/// something different under the looser spelling.
+#[inline]
+fn has_flag(flags: usize, mask: usize) -> bool {
+    flags & mask == mask
 }
 
-pub(super) fn ralt_pressed(event: &NSEvent) -> bool {
-    unsafe { event.modifierFlags() }.contains(NX_DEVICERALTKEYMASK)
+pub(super) fn lalt_pressed(event: Id) -> bool {
+    // SAFETY: `event` is the live `NSEvent` the caller borrows for this call.
+    has_flag(unsafe { send_usize(event, sel!(modifierFlags)) }, NX_DEVICELALTKEYMASK)
 }
 
-pub(super) fn event_mods(event: &NSEvent) -> Modifiers {
-    let flags = unsafe { event.modifierFlags() };
+pub(super) fn ralt_pressed(event: Id) -> bool {
+    // SAFETY: as `lalt_pressed`.
+    has_flag(unsafe { send_usize(event, sel!(modifierFlags)) }, NX_DEVICERALTKEYMASK)
+}
+
+pub(super) fn event_mods(event: Id) -> Modifiers {
+    // SAFETY: as `lalt_pressed`.
+    let flags = unsafe { send_usize(event, sel!(modifierFlags)) };
     let mut state = ModifiersState::empty();
     let mut pressed_mods = ModifiersKeys::empty();
 
-    state
-        .set(ModifiersState::SHIFT, flags.contains(NSEventModifierFlags::NSEventModifierFlagShift));
-    pressed_mods.set(ModifiersKeys::LSHIFT, flags.contains(NX_DEVICELSHIFTKEYMASK));
-    pressed_mods.set(ModifiersKeys::RSHIFT, flags.contains(NX_DEVICERSHIFTKEYMASK));
+    state.set(ModifiersState::SHIFT, has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_SHIFT));
+    pressed_mods.set(ModifiersKeys::LSHIFT, has_flag(flags, NX_DEVICELSHIFTKEYMASK));
+    pressed_mods.set(ModifiersKeys::RSHIFT, has_flag(flags, NX_DEVICERSHIFTKEYMASK));
 
-    state.set(
-        ModifiersState::CONTROL,
-        flags.contains(NSEventModifierFlags::NSEventModifierFlagControl),
-    );
-    pressed_mods.set(ModifiersKeys::LCONTROL, flags.contains(NX_DEVICELCTLKEYMASK));
-    pressed_mods.set(ModifiersKeys::RCONTROL, flags.contains(NX_DEVICERCTLKEYMASK));
+    state.set(ModifiersState::CONTROL, has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_CONTROL));
+    pressed_mods.set(ModifiersKeys::LCONTROL, has_flag(flags, NX_DEVICELCTLKEYMASK));
+    pressed_mods.set(ModifiersKeys::RCONTROL, has_flag(flags, NX_DEVICERCTLKEYMASK));
 
-    state.set(ModifiersState::ALT, flags.contains(NSEventModifierFlags::NSEventModifierFlagOption));
-    pressed_mods.set(ModifiersKeys::LALT, flags.contains(NX_DEVICELALTKEYMASK));
-    pressed_mods.set(ModifiersKeys::RALT, flags.contains(NX_DEVICERALTKEYMASK));
+    state.set(ModifiersState::ALT, has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_OPTION));
+    pressed_mods.set(ModifiersKeys::LALT, has_flag(flags, NX_DEVICELALTKEYMASK));
+    pressed_mods.set(ModifiersKeys::RALT, has_flag(flags, NX_DEVICERALTKEYMASK));
 
-    state.set(
-        ModifiersState::SUPER,
-        flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand),
-    );
-    pressed_mods.set(ModifiersKeys::LSUPER, flags.contains(NX_DEVICELCMDKEYMASK));
-    pressed_mods.set(ModifiersKeys::RSUPER, flags.contains(NX_DEVICERCMDKEYMASK));
+    state.set(ModifiersState::SUPER, has_flag(flags, consts::NS_EVENT_MODIFIER_FLAG_COMMAND));
+    pressed_mods.set(ModifiersKeys::LSUPER, has_flag(flags, NX_DEVICELCMDKEYMASK));
+    pressed_mods.set(ModifiersKeys::RSUPER, has_flag(flags, NX_DEVICERCMDKEYMASK));
 
     Modifiers { state, pressed_mods }
 }
 
-pub(super) fn dummy_event() -> Option<Retained<NSEvent>> {
-    unsafe {
-        NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-            NSEventType::ApplicationDefined,
-            NSPoint::new(0.0, 0.0),
-            NSEventModifierFlags(0),
+pub(super) fn dummy_event() -> Option<Obj> {
+    // LOCAL PATCH (aterm): the constructor answers a +0 AUTORELEASED `NSEvent`,
+    // which is why the result is retained into an `Obj` rather than wrapped.
+    // `Retained<NSEvent>` carried its own +1 and the binding did the retain
+    // invisibly; here it is written.
+    //
+    // SAFETY: the receiver is the live `NSEvent` class object and the argument
+    // list is the prototype
+    // `send_id_usize_point_usize_f64_isize_id_i16_isize_isize` names, read from
+    // `method_getTypeEncoding` — note `subtype:` is a SIGNED short.
+    let raw = unsafe {
+        send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
+            class(c"NSEvent").as_id(),
+            sel!(
+                otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:
+            ),
+            consts::NS_EVENT_TYPE_APPLICATION_DEFINED,
+            CGPoint { x: 0.0, y: 0.0 },
+            0,
             0.0,
             0,
-            None,
-            NSEventSubtype::WindowExposed.0,
+            Id::NIL,
+            consts::NS_EVENT_SUBTYPE_WINDOW_EXPOSED,
             0,
             0,
         )
-    }
+    };
+    // SAFETY: `raw` is nil or the live autoreleased event just constructed;
+    // `Obj::retain` answers `None` for nil and takes its own +1 otherwise.
+    unsafe { Obj::retain(raw) }
 }
 
 pub(crate) fn physicalkey_to_scancode(physical_key: PhysicalKey) -> Option<u32> {

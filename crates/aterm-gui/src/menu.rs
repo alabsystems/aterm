@@ -1538,17 +1538,28 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, Sel};
-    use objc2::{
-        ClassType, DeclaredClass, class, declare_class, msg_send, msg_send_id, mutability, sel,
-    };
-    use objc2_app_kit::{
-        NSApplication, NSButton, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponseOK,
-        NSOpenPanel, NSWindow,
-    };
-    use objc2_foundation::{MainThreadMarker, NSString};
+    use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
+    // THE SEAM, and it is one function wide. `confirm` below is the ONLY thing
+    // in this module still on `objc2`, because its key interceptor is
+    // `crate::alert_keys`, whose `RcBlock` event monitor is shared with the
+    // multi-line-paste SHEET in `lib.rs` — a different subsystem with its own
+    // `NSAlert`, its own completion block and its own `PasteConfirm` state.
+    // Porting one without the other would leave two spellings of the same
+    // monitor; porting both is the modal-alert subsystem's own wave. Everything
+    // else here — the whole menu bar, the open panel, the alerts that need no
+    // interceptor, and the workspace URL opens — is first-party.
+    use objc2::rc::Retained as Objc2Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class as objc2_class, msg_send, msg_send_id};
+    use objc2_app_kit::{NSButton, NSWindow};
+    use objc2_foundation::NSString;
     use winit::event_loop::EventLoopProxy;
+
+    use crate::appkit::consts::{
+        NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_MODIFIER_FLAG_CONTROL,
+        NS_EVENT_MODIFIER_FLAG_SHIFT, NS_MODAL_RESPONSE_OK,
+    };
+    use crate::appkit::{self, MainThread};
 
     use super::{
         MenuAction, NativeTerminateArbiter, NativeTerminateDecision, PrivacyPane, SettingsOpen,
@@ -1572,10 +1583,10 @@ mod macos {
         target: Retained<MenuTarget>,
         /// The Version menu's top-level bar item (title `v<version>[ ⬆️]`), whose
         /// submenu [`update_version_menu`] rebuilds on update-state transitions.
-        version_item: Retained<NSMenuItem>,
+        version_item: Obj,
     }
 
-    declare_class!(
+    aterm_objc::declare_class! {
         /// The target object for every menu item. Owns the `EventLoopProxy<Wake>`
         /// and exposes one `menuAction:` selector: it reads the sending
         /// `NSMenuItem`'s `tag`, decodes a [`MenuAction`], and posts a
@@ -1586,33 +1597,30 @@ mod macos {
         /// `pub(crate)` so the `MenuHandle` alias (held in an `App` field) and
         /// `install`'s return type are not "more private than the item" — the
         /// type itself is never named outside this module.
-        pub(crate) struct MenuTarget;
-
-        // SAFETY:
-        // - NSObject imposes no subclassing requirements.
-        // - InteriorMutable is the safe default; we never mutate the proxy.
-        // - MenuTarget has no Drop impl beyond the auto-generated ivar drop.
-        unsafe impl ClassType for MenuTarget {
-            type Super = objc2::runtime::NSObject;
-            type Mutability = mutability::InteriorMutable;
-            const NAME: &'static str = "ATermMenuTarget";
-        }
-
-        impl DeclaredClass for MenuTarget {
+        ///
+        /// Declared with [`aterm_objc::declare_class!`]. The class name, the
+        /// superclass, both selectors and the behaviour are unchanged from the
+        /// `objc2` declaration this replaces. What objc2 spelled
+        /// `type Mutability = InteriorMutable` has no counterpart and needs none:
+        /// the proxy is never mutated, [`aterm_objc::Retained`] is
+        /// unconditionally `!Send`, and the two entry points take a
+        /// [`MainThread`] witness.
+        pub(crate) struct MenuTarget: NSObject {
+            const NAME: &str = "ATermMenuTarget";
             type Ivars = EventLoopProxy<Wake>;
-        }
 
-        unsafe impl MenuTarget {
             /// `menuAction:` — the single selector wired to every item. `sender`
             /// is the clicked `NSMenuItem`; its `tag` decodes to the action. A tag
             /// that doesn't decode is ignored (no dispatch), so a stray/zero tag
             /// is inert rather than firing the wrong command.
-            #[method(menuAction:)]
-            fn menu_action(&self, sender: Option<&NSMenuItem>) {
-                let Some(item) = sender else { return };
-                // SAFETY: `item` is the live NSMenuItem AppKit passed as the
-                // action sender; `tag` is a plain getter with no side effects.
-                let tag = unsafe { item.tag() };
+            @sel(menuAction:)
+            fn menu_action(&self, sender: Id) {
+                if sender.is_null() {
+                    return;
+                }
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
+                // action sender; `-tag` is `-(NSInteger)` with no side effects.
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = MenuAction::from_tag(tag) {
                     // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors every other `send_event` here.
@@ -1623,26 +1631,24 @@ mod macos {
             /// AppKit asks this immediately before displaying/dispatching a menu
             /// item. Terminal-only commands grey out over a native whole tab instead
             /// of accepting a click that the host can only ignore.
-            #[method(validateMenuItem:)]
-            fn validate_menu_item(&self, sender: Option<&NSMenuItem>) -> bool {
-                let Some(item) = sender else {
-                    return false.into();
-                };
+            ///
+            /// The return is [`aterm_objc::Bool`], not Rust's `bool`, and that is
+            /// D3's rule rather than a style choice: on the `x86_64-apple-darwin`
+            /// compat slice `BOOL` is `signed char`, so `bool` is the wrong ABI
+            /// type. objc2 hid the conversion inside `#[method]`; here it is
+            /// written once, in the return position.
+            @sel(validateMenuItem:)
+            fn validate_menu_item(&self, sender: Id) -> aterm_objc::Bool {
+                if sender.is_null() {
+                    return aterm_objc::Bool::NO;
+                }
                 // SAFETY: AppKit supplied a live NSMenuItem; reading its integer tag
                 // has no side effects. Unknown/untagged items fail closed.
-                let tag = unsafe { item.tag() };
-                MenuAction::from_tag(tag).is_some_and(super::native_menu_action_enabled)
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                aterm_objc::Bool::new(
+                    MenuAction::from_tag(tag).is_some_and(super::native_menu_action_enabled),
+                )
             }
-        }
-    );
-
-    impl MenuTarget {
-        /// Allocate a target owning `proxy`. `mtm` proves we are on the main
-        /// thread (AppKit requirement), which the winit loop guarantees.
-        fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<Wake>) -> Retained<Self> {
-            let this = mtm.alloc().set_ivars(proxy);
-            // SAFETY: plain `[super init]` on a freshly allocated instance.
-            unsafe { msg_send_id![super(this), init] }
         }
     }
 
@@ -1651,27 +1657,26 @@ mod macos {
     /// alive (AppKit holds menu-item targets only weakly). Called from `resumed`
     /// after the window exists and only when NOT headless.
     ///
-    /// Best-effort: if we are somehow off the main thread (`MainThreadMarker::new`
+    /// Best-effort: if we are somehow off the main thread (`MainThread::new`
     /// is `None`) the menu is simply not installed — never a panic. The winit
     /// event loop always runs `resumed` on the main thread, so in practice the
     /// marker is always present.
     pub fn install(proxy: &EventLoopProxy<Wake>) -> Option<MenuHandle> {
-        let mtm = MainThreadMarker::new()?;
+        let main_thread = MainThread::new()?;
         let _ = TERMINATE_PROXY.set(proxy.clone());
-        let app = NSApplication::sharedApplication(mtm);
-        let target = MenuTarget::new(mtm, proxy.clone());
+        let target = MenuTarget::alloc_init(main_thread, proxy.clone())?;
 
-        let main = NSMenu::new(mtm);
+        let main = new_menu()?;
 
         // Each submenu is built in full, then attached under its top-level title.
         // Order is App / File / Edit / View / Window / Help, the standard Mac
         // arrangement — preserved exactly by the order of these calls.
-        let _ = attach_submenu(mtm, &main, "aterm", build_app_menu(mtm, &target));
-        let _ = attach_submenu(mtm, &main, "File", build_file_menu(mtm, &target));
-        let _ = attach_submenu(mtm, &main, "Edit", build_edit_menu(mtm, &target));
-        let _ = attach_submenu(mtm, &main, "View", build_view_menu(mtm, &target));
-        let _ = attach_submenu(mtm, &main, "Window", build_window_menu(mtm, &target));
-        let _ = attach_submenu(mtm, &main, "Help", build_help_menu(mtm, &target));
+        let _ = attach_submenu(&main, "aterm", build_app_menu(&target)?);
+        let _ = attach_submenu(&main, "File", build_file_menu(&target)?);
+        let _ = attach_submenu(&main, "Edit", build_edit_menu(&target)?);
+        let _ = attach_submenu(&main, "View", build_view_menu(&target)?);
+        let _ = attach_submenu(&main, "Window", build_window_menu(&target)?);
+        let _ = attach_submenu(&main, "Help", build_help_menu(&target)?);
         // The version identity goes LAST — after Help, so `v<version>` is the rightmost
         // menu-bar title (a quiet trailing build badge). Installed in its PLAIN state
         // (no update staged at boot); `App::refresh_version_menu` retitles it (via
@@ -1680,13 +1685,22 @@ mod macos {
         // item with an action greys out in the main menu bar, so its commands are
         // reached via this submenu (the reliable, idiomatic AppKit shape).
         let version_item = attach_submenu(
-            mtm,
             &main,
             &super::version_menu_bar_title(false),
-            build_version_menu(mtm, &target, None, None, false),
-        );
+            build_version_menu(&target, None, None, false)?,
+        )?;
 
-        app.setMainMenu(Some(&main));
+        // SAFETY: `+sharedApplication` is `-(id)` and is the main-thread AppKit
+        // singleton accessor (`_main_thread` is the witness); `-setMainMenu:` is
+        // `-(void)(NSMenu *)` and RETAINS the menu, which is why `main` may drop
+        // at the end of this frame.
+        unsafe {
+            let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            if app.is_null() {
+                return None;
+            }
+            appkit::send_v_id(app, sel!(setMainMenu:), main.id());
+        }
         Some(MenuHandle {
             target,
             version_item,
@@ -1714,31 +1728,37 @@ mod macos {
         trouble: Option<&super::ApplyTrouble>,
         realized: bool,
     ) {
-        let Some(mtm) = MainThreadMarker::new() else {
+        let Some(_main_thread) = MainThread::new() else {
             return;
         };
         let title =
             super::version_menu_bar_title(super::bar_title_attention(staged.is_some(), realized));
-        let submenu = build_version_menu(mtm, &handle.target, staged, trouble, realized);
+        let Some(submenu) = build_version_menu(&handle.target, staged, trouble, realized) else {
+            return;
+        };
+        let Some(ns_title) = appkit::nsstring(&title) else {
+            return;
+        };
         // Set the title on BOTH the bar item and the submenu: AppKit takes a top-level
         // bar title from whichever is authoritative for the toolkit version in play
         // (historically the submenu's title), so writing both is the robust retitle.
-        // SAFETY: plain main-thread setters on live retained objects; the NSStrings
-        // outlive the calls (same contract as every setter in `add_item_mods`).
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)` and `-setSubmenu:` is
+        // `-(void)(NSMenu *)`, both plain main-thread setters on live objects
+        // that COPY/RETAIN their argument, so the +1 title and the submenu may
+        // drop at the end of this frame.
         unsafe {
-            submenu.setTitle(&NSString::from_str(&title));
-            handle.version_item.setTitle(&NSString::from_str(&title));
+            appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
+            appkit::send_v_id(handle.version_item.id(), sel!(setTitle:), ns_title.id());
+            appkit::send_v_id(handle.version_item.id(), sel!(setSubmenu:), submenu.id());
         }
-        handle.version_item.setSubmenu(Some(&submenu));
     }
 
     /// Build the App menu (titled with the app name by convention): About,
     /// Settings (⌘, — the native tab), Open aterm.toml in Manual, Quit. Items and separators
     /// preserved verbatim from [`install`].
-    fn build_app_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let app_menu = NSMenu::new(mtm);
+    fn build_app_menu(target: &MenuTarget) -> Option<Obj> {
+        let app_menu = new_menu()?;
         add_item(
-            mtm,
             &app_menu,
             target,
             "About aterm",
@@ -1746,10 +1766,9 @@ mod macos {
             "",
             false,
         );
-        add_separator(mtm, &app_menu);
+        add_separator(&app_menu);
         // The ONE update entry point — opens the overlay and checks in one gesture.
         add_item(
-            mtm,
             &app_menu,
             target,
             "Check for Updates…",
@@ -1757,13 +1776,12 @@ mod macos {
             "",
             false,
         );
-        add_separator(mtm, &app_menu);
+        add_separator(&app_menu);
         // ⌘, — the standard macOS settings chord — focuses the own-rendered native
         // Settings tab (the separate Preferences NSWindow is retired). The menu key
         // equivalent IS the shortcut: AppKit's performKeyEquivalent dispatches it
         // into the Wake::MenuAction relay before keyDown reaches on_key.
         add_item(
-            mtm,
             &app_menu,
             target,
             "Settings…",
@@ -1775,7 +1793,6 @@ mod macos {
         // item below Settings… so the toolset is discoverable from the menu
         // bar (the seed notice pill points at the same page).
         add_item(
-            mtm,
             &app_menu,
             target,
             "Packages…",
@@ -1784,7 +1801,6 @@ mod macos {
             false,
         );
         add_item(
-            mtm,
             &app_menu,
             target,
             "Open aterm.toml",
@@ -1792,17 +1808,9 @@ mod macos {
             "",
             false,
         );
-        add_separator(mtm, &app_menu);
-        add_item(
-            mtm,
-            &app_menu,
-            target,
-            "Quit aterm",
-            MenuAction::Quit,
-            "q",
-            true,
-        );
-        app_menu
+        add_separator(&app_menu);
+        add_item(&app_menu, target, "Quit aterm", MenuAction::Quit, "q", true);
+        Some(app_menu)
     }
 
     /// The Version submenu for the given update state. Mirrors [`super::VERSION_MENU`]
@@ -1816,16 +1824,14 @@ mod macos {
     ///     then About.
     ///   * NEITHER: just About — the quiet steady-state badge menu.
     fn build_version_menu(
-        mtm: MainThreadMarker,
         target: &MenuTarget,
         staged: Option<(u64, &str)>,
         trouble: Option<&super::ApplyTrouble>,
         realized: bool,
-    ) -> Retained<NSMenu> {
-        let menu = NSMenu::new(mtm);
+    ) -> Option<Obj> {
+        let menu = new_menu()?;
         if let Some((build, version)) = staged {
             add_item(
-                mtm,
                 &menu,
                 target,
                 &super::staged_apply_label("\u{2B06}\u{FE0F}", build, version, trouble),
@@ -1833,10 +1839,9 @@ mod macos {
                 "",
                 false,
             );
-            add_separator(mtm, &menu);
+            add_separator(&menu);
         } else if realized {
             add_item(
-                mtm,
                 &menu,
                 target,
                 &format!(
@@ -1847,10 +1852,9 @@ mod macos {
                 "",
                 false,
             );
-            add_separator(mtm, &menu);
+            add_separator(&menu);
         }
         add_item(
-            mtm,
             &menu,
             target,
             "About aterm — build & version…",
@@ -1862,7 +1866,6 @@ mod macos {
             // The details surface, one row under the one-click apply — mirrors the App
             // menu's "Check for Updates…" (same SoftwareUpdate action, staged-only here).
             add_item(
-                mtm,
                 &menu,
                 target,
                 "Update details…",
@@ -1871,16 +1874,15 @@ mod macos {
                 false,
             );
         }
-        menu
+        Some(menu)
     }
 
     /// Build the File menu: New Window/Tab, the tab-relocation commands, and
     /// Close Tab. Items, modifier masks, and separators preserved verbatim from
     /// [`install`].
-    fn build_file_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let file = NSMenu::new(mtm);
+    fn build_file_menu(target: &MenuTarget) -> Option<Obj> {
+        let file = new_menu()?;
         add_item(
-            mtm,
             &file,
             target,
             "New Window",
@@ -1889,7 +1891,6 @@ mod macos {
             true,
         );
         add_item(
-            mtm,
             &file,
             target,
             "New Terminal Tab",
@@ -1897,11 +1898,10 @@ mod macos {
             "t",
             true,
         );
-        add_separator(mtm, &file);
+        add_separator(&file);
         // The session-connection spawn presets (design §2.3), mirroring the
         // portable FILE_MENU model: four flat rows, no key equivalents.
         add_item(
-            mtm,
             &file,
             target,
             "New Controlled Session in New Window",
@@ -1910,7 +1910,6 @@ mod macos {
             false,
         );
         add_item(
-            mtm,
             &file,
             target,
             "New Controlled Session as Tab",
@@ -1919,7 +1918,6 @@ mod macos {
             false,
         );
         add_item(
-            mtm,
             &file,
             target,
             "New Controller Session in New Window",
@@ -1928,7 +1926,6 @@ mod macos {
             false,
         );
         add_item(
-            mtm,
             &file,
             target,
             "New Controller Session as Tab",
@@ -1936,9 +1933,8 @@ mod macos {
             "",
             false,
         );
-        add_separator(mtm, &file);
+        add_separator(&file);
         add_item(
-            mtm,
             &file,
             target,
             "Open Markdown…",
@@ -1947,7 +1943,6 @@ mod macos {
             false,
         );
         add_item(
-            mtm,
             &file,
             target,
             "Open File in Editor…",
@@ -1956,7 +1951,6 @@ mod macos {
             true,
         );
         add_item_mods(
-            mtm,
             &file,
             target,
             "Reopen Closed Native Tab",
@@ -1964,10 +1958,9 @@ mod macos {
             "t",
             command_shift_mask(),
         );
-        add_separator(mtm, &file);
+        add_separator(&file);
         // Cmd-Shift-N moves the active tab out into a new in-process window.
         add_item_mods(
-            mtm,
             &file,
             target,
             "Move Tab to New Window",
@@ -1977,7 +1970,6 @@ mod macos {
         );
         // Cmd-Shift-M moves the active tab into the NEXT existing window (wrapping).
         add_item_mods(
-            mtm,
             &file,
             target,
             "Move Tab to Next Window",
@@ -1991,7 +1983,6 @@ mod macos {
         // equivalent BEFORE the keyDown reaches on_key, so a "d" here would shadow
         // Cmd-Shift-D (SplitHorizontal) and make that primary chord keyboard-dead.
         add_item_mods(
-            mtm,
             &file,
             target,
             "Open Session in New Window",
@@ -1999,27 +1990,18 @@ mod macos {
             "o",
             command_shift_mask(),
         );
-        add_separator(mtm, &file);
-        add_item(
-            mtm,
-            &file,
-            target,
-            "Close Tab",
-            MenuAction::CloseTab,
-            "w",
-            true,
-        );
-        file
+        add_separator(&file);
+        add_item(&file, target, "Close Tab", MenuAction::CloseTab, "w", true);
+        Some(file)
     }
 
     /// Build the Edit menu: Copy, Paste, Select All, Find. Items and separators
     /// preserved verbatim from [`install`].
-    fn build_edit_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let edit = NSMenu::new(mtm);
-        add_item(mtm, &edit, target, "Copy", MenuAction::Copy, "c", true);
-        add_item(mtm, &edit, target, "Paste", MenuAction::Paste, "v", true);
+    fn build_edit_menu(target: &MenuTarget) -> Option<Obj> {
+        let edit = new_menu()?;
+        add_item(&edit, target, "Copy", MenuAction::Copy, "c", true);
+        add_item(&edit, target, "Paste", MenuAction::Paste, "v", true);
         add_item(
-            mtm,
             &edit,
             target,
             "Select All",
@@ -2027,19 +2009,10 @@ mod macos {
             "a",
             true,
         );
-        add_separator(mtm, &edit);
-        add_item(mtm, &edit, target, "Find…", MenuAction::Find, "f", true);
-        add_item(
-            mtm,
-            &edit,
-            target,
-            "Find Next",
-            MenuAction::FindNext,
-            "g",
-            true,
-        );
+        add_separator(&edit);
+        add_item(&edit, target, "Find…", MenuAction::Find, "f", true);
+        add_item(&edit, target, "Find Next", MenuAction::FindNext, "g", true);
         add_item_mods(
-            mtm,
             &edit,
             target,
             "Find Previous",
@@ -2047,16 +2020,15 @@ mod macos {
             "g",
             command_shift_mask(),
         );
-        edit
+        Some(edit)
     }
 
     /// Build the View menu: Enter Full Screen. Modifier mask preserved verbatim
     /// from [`install`].
-    fn build_view_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let view = NSMenu::new(mtm);
+    fn build_view_menu(target: &MenuTarget) -> Option<Obj> {
+        let view = new_menu()?;
         // Font size: ⌘= / ⌘- / ⌘0 (the chords App::on_key_font_zoom already handles).
         add_item(
-            mtm,
             &view,
             target,
             "Increase Font Size",
@@ -2065,7 +2037,6 @@ mod macos {
             true,
         );
         add_item(
-            mtm,
             &view,
             target,
             "Decrease Font Size",
@@ -2074,7 +2045,6 @@ mod macos {
             true,
         );
         add_item(
-            mtm,
             &view,
             target,
             "Actual Size",
@@ -2082,10 +2052,9 @@ mod macos {
             "0",
             true,
         );
-        add_separator(mtm, &view);
+        add_separator(&view);
         // Splits: ⌘D (left/right) and ⇧⌘D (top/bottom), matching on_key.
         add_item(
-            mtm,
             &view,
             target,
             "Split Right",
@@ -2094,7 +2063,6 @@ mod macos {
             true,
         );
         add_item_mods(
-            mtm,
             &view,
             target,
             "Split Down",
@@ -2102,10 +2070,9 @@ mod macos {
             "d",
             command_shift_mask(),
         );
-        add_separator(mtm, &view);
+        add_separator(&view);
         // Cmd-Ctrl-F is the macOS-standard Enter Full Screen equivalent.
         add_item_mods(
-            mtm,
             &view,
             target,
             "Enter Full Screen",
@@ -2113,11 +2080,10 @@ mod macos {
             "f",
             command_control_mask(),
         );
-        add_separator(mtm, &view);
+        add_separator(&view);
         // Process-wide effect suppression. No key-equivalent: it is bindable as
         // `toggle_serious_mode` and also exposed through the command palette.
         add_item(
-            mtm,
             &view,
             target,
             "Serious Mode",
@@ -2130,7 +2096,6 @@ mod macos {
         // `requires_terminal_tab`). No key-equivalent; `[keybindings]` can bind
         // `toggle_matrix_rain` for a chord.
         add_item(
-            mtm,
             &view,
             target,
             "Matrix Rain",
@@ -2144,7 +2109,6 @@ mod macos {
         // one-way act, reachable from the menu bar and the ⇧⌘P palette (the
         // cross-platform surface).
         add_item(
-            mtm,
             &view,
             target,
             "Favourite This Kitty",
@@ -2152,14 +2116,13 @@ mod macos {
             "",
             false,
         );
-        add_separator(mtm, &view);
-        add_separator(mtm, &view);
+        add_separator(&view);
+        add_separator(&view);
         // The own-rendered, cross-platform command palette (⇧⌘P). A real menu key
         // equivalent, so AppKit's performKeyEquivalent dispatches it into the SAME
         // Wake::MenuAction relay — making the palette reachable by keyboard on macOS
         // (where platform_defaults ships no keybindings).
         add_item_mods(
-            mtm,
             &view,
             target,
             "Command Palette…",
@@ -2167,27 +2130,18 @@ mod macos {
             "p",
             command_shift_mask(),
         );
-        view
+        Some(view)
     }
 
     /// Build the Window menu: Minimize, Zoom. Items preserved verbatim from
     /// [`install`].
-    fn build_window_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let window = NSMenu::new(mtm);
-        add_item(
-            mtm,
-            &window,
-            target,
-            "Minimize",
-            MenuAction::Minimize,
-            "m",
-            true,
-        );
-        add_item(mtm, &window, target, "Zoom", MenuAction::Zoom, "", false);
-        add_separator(mtm, &window);
+    fn build_window_menu(target: &MenuTarget) -> Option<Obj> {
+        let window = new_menu()?;
+        add_item(&window, target, "Minimize", MenuAction::Minimize, "m", true);
+        add_item(&window, target, "Zoom", MenuAction::Zoom, "", false);
+        add_separator(&window);
         // Tab navigation: ⇧⌘] / ⇧⌘[ (the chords on_key already handles).
         add_item_mods(
-            mtm,
             &window,
             target,
             "Show Next Tab",
@@ -2196,7 +2150,6 @@ mod macos {
             command_shift_mask(),
         );
         add_item_mods(
-            mtm,
             &window,
             target,
             "Show Previous Tab",
@@ -2204,11 +2157,10 @@ mod macos {
             "[",
             command_shift_mask(),
         );
-        add_separator(mtm, &window);
+        add_separator(&window);
         // The bar face of the inline tab-strip rename (the double-click twin).
         // Unbound: `requires_terminal_tab` greys it on a native whole tab.
         add_item(
-            mtm,
             &window,
             target,
             "Rename Session…",
@@ -2216,43 +2168,56 @@ mod macos {
             "",
             false,
         );
-        window
+        Some(window)
     }
 
     /// Build the Help menu: aterm Help. Item preserved verbatim from [`install`].
-    fn build_help_menu(mtm: MainThreadMarker, target: &MenuTarget) -> Retained<NSMenu> {
-        let help = NSMenu::new(mtm);
-        add_item(
-            mtm,
-            &help,
-            target,
-            "aterm Help",
-            MenuAction::Help,
-            "",
-            false,
-        );
-        help
+    fn build_help_menu(target: &MenuTarget) -> Option<Obj> {
+        let help = new_menu()?;
+        add_item(&help, target, "aterm Help", MenuAction::Help, "", false);
+        Some(help)
     }
 
     /// `Cmd` modifier mask (the default for a single-letter key equivalent).
-    fn command_mask() -> NSEventModifierFlags {
-        NSEventModifierFlags::NSEventModifierFlagCommand
+    fn command_mask() -> usize {
+        NS_EVENT_MODIFIER_FLAG_COMMAND
     }
 
     /// `Cmd-Ctrl` mask (Enter Full Screen's standard equivalent).
-    fn command_control_mask() -> NSEventModifierFlags {
-        NSEventModifierFlags(
-            NSEventModifierFlags::NSEventModifierFlagCommand.0
-                | NSEventModifierFlags::NSEventModifierFlagControl.0,
-        )
+    fn command_control_mask() -> usize {
+        NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_CONTROL
     }
 
     /// `Cmd-Shift` mask (Move Tab to New Window's ⇧⌘N equivalent).
-    fn command_shift_mask() -> NSEventModifierFlags {
-        NSEventModifierFlags(
-            NSEventModifierFlags::NSEventModifierFlagCommand.0
-                | NSEventModifierFlags::NSEventModifierFlagShift.0,
-        )
+    fn command_shift_mask() -> usize {
+        NS_EVENT_MODIFIER_FLAG_COMMAND | NS_EVENT_MODIFIER_FLAG_SHIFT
+    }
+
+    /// `[[NSMenu alloc] init]`, +1, or `None` if the allocation failed.
+    fn new_menu() -> Option<Obj> {
+        // SAFETY: `+alloc` gives a +1 uninitialised NSMenu and `-init` consumes
+        // it, so `Obj::from_owned` adopts exactly one +1.
+        unsafe { Obj::from_owned(appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init))) }
+    }
+
+    /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`, +1. `action`
+    /// is [`Sel::NULL`] for an item that only holds a submenu.
+    fn new_item(title: &str, action: Sel, key: &str) -> Option<Obj> {
+        let title = appkit::nsstring(title)?;
+        let key = appkit::nsstring(key)?;
+        // SAFETY: NSMenuItem's designated initializer,
+        // `-(id)(NSString *, SEL, NSString *)`; a nil SEL is its documented
+        // "no action" value. `+alloc` is +1 and the initializer consumes it.
+        // Both strings are live +1 NSStrings the initializer copies.
+        unsafe {
+            Obj::from_owned(appkit::send_id_id_sel_id(
+                appkit::alloc(class(c"NSMenuItem")),
+                sel!(initWithTitle:action:keyEquivalent:),
+                title.id(),
+                action,
+                key.id(),
+            ))
+        }
     }
 
     /// Build one menu item wired to `menuAction:` on `target`, tagged with
@@ -2261,65 +2226,58 @@ mod macos {
     /// equivalent is VISUAL only — it just renders next to the item; the actual
     /// keystroke is still handled by `App::on_key`.
     fn add_item(
-        mtm: MainThreadMarker,
-        menu: &NSMenu,
+        menu: &Obj,
         target: &MenuTarget,
         title: &str,
         action: MenuAction,
         key: &str,
         cmd: bool,
     ) {
-        let mods = if cmd {
-            command_mask()
-        } else {
-            NSEventModifierFlags(0)
-        };
-        add_item_mods(mtm, menu, target, title, action, key, mods);
+        let mods = if cmd { command_mask() } else { 0 };
+        add_item_mods(menu, target, title, action, key, mods);
     }
 
     /// As [`add_item`] but with an explicit modifier mask (for non-⌘ equivalents
     /// like Enter Full Screen's ⌃⌘F).
     fn add_item_mods(
-        mtm: MainThreadMarker,
-        menu: &NSMenu,
+        menu: &Obj,
         target: &MenuTarget,
         title: &str,
         action: MenuAction,
         key: &str,
-        mods: NSEventModifierFlags,
+        mods: usize,
     ) {
-        let title = NSString::from_str(title);
-        let key = NSString::from_str(key);
         // Build with the menuAction: selector so AppKit dispatches to `target`.
-        let sel: Sel = sel!(menuAction:);
-        // SAFETY: standard NSMenuItem construction + plain setters on a fresh
-        // instance, all on the main thread (`mtm`). The selector exists on
-        // MenuTarget (declared above). `setTarget`/`setTag`/`setKeyEquivalent*`
-        // have no preconditions beyond a live receiver.
+        let Some(item) = new_item(title, sel!(menuAction:), key) else {
+            return;
+        };
+        // SAFETY: plain setters on a fresh NSMenuItem, then `-addItem:` on the
+        // live menu. `-setTarget:` is `-(void)(id)` and holds the target WEAKLY
+        // (which is why `MenuHandle` retains it), `-setTag:` is
+        // `-(void)(NSInteger)` and `-setKeyEquivalentModifierMask:` is
+        // `-(void)(NSEventModifierFlags)`, an `NSUInteger` bitmask.
         unsafe {
-            let item: Retained<NSMenuItem> = NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc(),
-                &title,
-                Some(sel),
-                &key,
-            );
-            // Deref-coerce MenuTarget -> NSObject -> AnyObject for the `id`
-            // target argument (same pattern as accessibility.rs).
-            let target_obj: &AnyObject = target;
-            item.setTarget(Some(target_obj));
-            item.setTag(action.tag());
+            appkit::send_v_id(item.id(), sel!(setTarget:), target.as_id());
+            appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
             if !key.is_empty() {
-                item.setKeyEquivalentModifierMask(mods);
+                appkit::send_v_usize(item.id(), sel!(setKeyEquivalentModifierMask:), mods);
             }
-            menu.addItem(&item);
+            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
         }
     }
 
     /// Append a separator line to `menu`.
-    fn add_separator(mtm: MainThreadMarker, menu: &NSMenu) {
-        let sep = NSMenuItem::separatorItem(mtm);
-        // `addItem` is a safe binding in objc2-app-kit; no `unsafe` needed.
-        menu.addItem(&sep);
+    fn add_separator(menu: &Obj) {
+        // SAFETY: `+separatorItem` is `-(id)` and returns a shared, AUTORELEASED
+        // item — borrowed for the length of `-addItem:`, which retains it into
+        // the menu. The pool it lives in is the caller's; every path into this
+        // module opens one.
+        unsafe {
+            let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
+            if !sep.is_null() {
+                appkit::send_v_id(menu.id(), sel!(addItem:), sep);
+            }
+        }
     }
 
     /// Present the system open panel and return exactly the one local path the user
@@ -2327,27 +2285,41 @@ mod macos {
     /// still canonicalizes, bounds, UTF-8-validates, and mints the process-local
     /// document grant before reading the file.
     pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
-        let mtm = MainThreadMarker::new()?;
-        let title = NSString::from_str(title);
-        let prompt = NSString::from_str(prompt);
-        // SAFETY: NSOpenPanel is created and run on AppKit's main thread. These are
-        // plain property setters; `runModal` owns its nested modal loop and URL until
-        // it returns. Only an affirmative response is converted to a local path.
-        unsafe {
-            let panel = NSOpenPanel::openPanel(mtm);
-            panel.setCanChooseFiles(true);
-            panel.setCanChooseDirectories(false);
-            panel.setAllowsMultipleSelection(false);
-            panel.setResolvesAliases(true);
-            panel.setTitle(Some(&title));
-            panel.setPrompt(Some(&prompt));
-            if panel.runModal() != NSModalResponseOK {
+        let _main_thread = MainThread::new()?;
+        let title = appkit::nsstring(title)?;
+        let prompt = appkit::nsstring(prompt)?;
+        // SAFETY: NSOpenPanel is created and run on AppKit's main thread
+        // (`_main_thread` is the witness). `+openPanel` is `-(id)` and returns an
+        // AUTORELEASED panel — borrowed for the length of this pool, which is
+        // why the whole body is inside one. The setters are `-(void)(BOOL)` and
+        // `-(void)(NSString *)`; `-runModal` is `-(NSModalResponse)`, i.e.
+        // `NSInteger`, and owns its nested modal loop; `-URL` and `-path` are
+        // `-(id)` accessors valid until the pool pops. Only an affirmative
+        // response is converted to a local path.
+        autoreleasepool(|_| unsafe {
+            let panel = appkit::send_id(class(c"NSOpenPanel").as_id(), sel!(openPanel));
+            if panel.is_null() {
                 return None;
             }
-            let url = panel.URL()?;
-            let path = url.path()?;
-            Some(std::path::PathBuf::from(path.to_string()))
-        }
+            appkit::send_v_bool(panel, sel!(setCanChooseFiles:), true);
+            appkit::send_v_bool(panel, sel!(setCanChooseDirectories:), false);
+            appkit::send_v_bool(panel, sel!(setAllowsMultipleSelection:), false);
+            appkit::send_v_bool(panel, sel!(setResolvesAliases:), true);
+            appkit::send_v_id(panel, sel!(setTitle:), title.id());
+            appkit::send_v_id(panel, sel!(setPrompt:), prompt.id());
+            if appkit::send_isize(panel, sel!(runModal)) != NS_MODAL_RESPONSE_OK {
+                return None;
+            }
+            let url = appkit::send_id(panel, sel!(URL));
+            if url.is_null() {
+                return None;
+            }
+            let path = appkit::send_id(url, sel!(path));
+            if path.is_null() {
+                return None;
+            }
+            Some(std::path::PathBuf::from(appkit::nsstring_to_rust(path)))
+        })
     }
 
     /// Attach `submenu` under a new top-level item titled `title` on `bar`, returning
@@ -2356,27 +2328,22 @@ mod macos {
     /// other menus ignore the return). The item carries no action (its only job is to
     /// hold the submenu). The submenu is titled to match: AppKit takes a top-level
     /// bar title from the submenu on some paths, so both must agree.
-    fn attach_submenu(
-        mtm: MainThreadMarker,
-        bar: &NSMenu,
-        title: &str,
-        submenu: Retained<NSMenu>,
-    ) -> Retained<NSMenuItem> {
-        let title = NSString::from_str(title);
-        // SAFETY: standard top-level menu-item creation + title/submenu setters on
-        // fresh instances, all on the main thread.
+    fn attach_submenu(bar: &Obj, title: &str, submenu: Obj) -> Option<Obj> {
+        let ns_title = appkit::nsstring(title)?;
+        // A top-level bar item carries NO action — its only job is to hold the
+        // submenu — which is [`Sel::NULL`], the value W2 had to add to
+        // `aterm-objc` to express this at all.
+        let item = new_item(title, Sel::NULL, "")?;
+        // SAFETY: `-setTitle:` is `-(void)(NSString *)`, `-setSubmenu:` is
+        // `-(void)(NSMenu *)` and RETAINS, `-addItem:` is `-(void)(NSMenuItem *)`
+        // and RETAINS — so both the +1 title and the moved `submenu` may drop at
+        // the end of this frame, exactly as the objc2 form's `Retained` did.
         unsafe {
-            submenu.setTitle(&title);
-            let item: Retained<NSMenuItem> = NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc(),
-                &title,
-                None,
-                &NSString::from_str(""),
-            );
-            item.setSubmenu(Some(&submenu));
-            bar.addItem(&item);
-            item
+            appkit::send_v_id(submenu.id(), sel!(setTitle:), ns_title.id());
+            appkit::send_v_id(item.id(), sel!(setSubmenu:), submenu.id());
+            appkit::send_v_id(bar.id(), sel!(addItem:), item.id());
         }
+        Some(item)
     }
 
     /// Show a native modal confirmation alert (a ⌘Q quit, or a close gesture that
@@ -2400,28 +2367,33 @@ mod macos {
     /// Escape clicks Cancel, everything else passes through. The watch is a LOCAL whose
     /// scope ends with the blocking call, so it cannot outlive the alert.
     pub fn confirm(title: &str, body: &str, proceed_label: &str) -> bool {
-        if MainThreadMarker::new().is_none() {
+        if MainThread::new().is_none() {
             return true;
         }
         let title = NSString::from_str(title);
         let body = NSString::from_str(body);
         let proceed = NSString::from_str(proceed_label);
         let cancel = NSString::from_str("Cancel");
+        // THE SEAM — see the module's import block. `confirm` is the one
+        // function here still on `objc2`, because `alert_keys::watch_alert_keys`
+        // (its `RcBlock` key monitor) is shared with `lib.rs`'s paste sheet.
         // SAFETY: standard `NSAlert` construction + setters + `runModal`, all on the
         // main thread. Every operand is a valid, retained object for the call;
         // `runModal` returns the clicked button's `NSModalResponse` (an `isize`). The
         // alert keeps the default `NSAlertStyleWarning` (the app-icon caution panel).
         // `window` / `addButtonWithTitle:` are plain accessors on the fresh alert.
         unsafe {
-            let alert: Retained<AnyObject> = msg_send_id![class!(NSAlert), new];
+            let alert: Objc2Retained<AnyObject> = msg_send_id![objc2_class!(NSAlert), new];
             let _: () = msg_send![&alert, setMessageText: &*title];
             let _: () = msg_send![&alert, setInformativeText: &*body];
             // First button added is the default (Return, with an EMPTY modifier mask —
             // hence the key watch below): the PROCEED action. The second is Cancel
             // (AppKit binds Escape to it).
-            let accept: Retained<NSButton> = msg_send_id![&alert, addButtonWithTitle: &*proceed];
-            let refuse: Retained<NSButton> = msg_send_id![&alert, addButtonWithTitle: &*cancel];
-            let panel: Retained<NSWindow> = msg_send_id![&alert, window];
+            let accept: Objc2Retained<NSButton> =
+                msg_send_id![&alert, addButtonWithTitle: &*proceed];
+            let refuse: Objc2Retained<NSButton> =
+                msg_send_id![&alert, addButtonWithTitle: &*cancel];
+            let panel: Objc2Retained<NSWindow> = msg_send_id![&alert, window];
             // Dropped when this function returns — i.e. the moment `runModal` comes
             // back — so the interceptor's lifetime is exactly the alert's.
             let _keys = crate::alert_keys::watch_alert_keys(panel, None, accept, refuse);
@@ -2437,21 +2409,32 @@ mod macos {
     /// main thread it does nothing. `runModal` is the same nested-modal pattern `confirm`
     /// uses, safe to call straight from the winit event handler.
     pub fn notify(title: &str, body: &str) {
-        if MainThreadMarker::new().is_none() {
+        if MainThread::new().is_none() {
             return;
         }
-        let title = NSString::from_str(title);
-        let body = NSString::from_str(body);
-        let ok = NSString::from_str("OK");
-        // SAFETY: standard `NSAlert` construction + setters + `runModal`, all on the main
-        // thread; every operand is a valid, retained object for the call.
-        unsafe {
-            let alert: Retained<AnyObject> = msg_send_id![class!(NSAlert), new];
-            let _: () = msg_send![&alert, setMessageText: &*title];
-            let _: () = msg_send![&alert, setInformativeText: &*body];
-            let _: Retained<AnyObject> = msg_send_id![&alert, addButtonWithTitle: &*ok];
-            let _: isize = msg_send![&alert, runModal];
-        }
+        let (Some(title), Some(body), Some(ok)) = (
+            appkit::nsstring(title),
+            appkit::nsstring(body),
+            appkit::nsstring("OK"),
+        ) else {
+            return;
+        };
+        // SAFETY: standard `NSAlert` construction + setters + `runModal`, all on
+        // the main thread. `+new` is +1 (alloc+init) and lands in `Obj`;
+        // `-setMessageText:`/`-setInformativeText:` are `-(void)(NSString *)`;
+        // `-addButtonWithTitle:` is `-(id)` returning a BORROWED button this
+        // caller does not keep; `-runModal` is `-(NSModalResponse)`.
+        autoreleasepool(|_| unsafe {
+            let Some(alert) =
+                Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))
+            else {
+                return;
+            };
+            appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
+            appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
+            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), ok.id());
+            let _ = appkit::send_isize(alert.id(), sel!(runModal));
+        });
     }
 
     /// AppKit's synchronous `applicationShouldTerminate:` hook. The first request
@@ -2514,21 +2497,36 @@ mod macos {
     /// so a caller that reads the answer cannot mistake "not attempted" for
     /// "opened".
     fn open_in_workspace(s: &str, is_file: bool) -> bool {
-        if MainThreadMarker::new().is_none() {
+        if MainThread::new().is_none() {
             return false;
         }
-        let ns = NSString::from_str(s);
-        // SAFETY: `NSURL`/`NSWorkspace` are standard AppKit; the string is valid and
-        // retained for the call. `openURL:` returns BOOL, handed straight back.
-        unsafe {
-            let url: Retained<AnyObject> = if is_file {
-                msg_send_id![class!(NSURL), fileURLWithPath: &*ns]
-            } else {
-                msg_send_id![class!(NSURL), URLWithString: &*ns]
-            };
-            let ws: Retained<AnyObject> = msg_send_id![class!(NSWorkspace), sharedWorkspace];
-            msg_send![&ws, openURL: &*url]
-        }
+        let Some(ns) = appkit::nsstring(s) else {
+            return false;
+        };
+        // SAFETY: `+fileURLWithPath:` / `+URLWithString:` are `-(id)(NSString *)`
+        // convenience constructors returning an AUTORELEASED NSURL (nil for a
+        // string that is not a URL, which is checked); `+sharedWorkspace` is the
+        // `-(id)` singleton; `-openURL:` is `-(BOOL)(NSURL *)` and its answer is
+        // handed straight back. Both borrows live inside this pool.
+        autoreleasepool(|_| unsafe {
+            let url = appkit::send_id_id(
+                class(c"NSURL").as_id(),
+                if is_file {
+                    sel!(fileURLWithPath:)
+                } else {
+                    sel!(URLWithString:)
+                },
+                ns.id(),
+            );
+            if url.is_null() {
+                return false;
+            }
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            if ws.is_null() {
+                return false;
+            }
+            appkit::send_bool_id(ws, sel!(openURL:), url)
+        })
     }
 
     /// How long after the first open the same URL is issued again. The anchor
@@ -2575,7 +2573,7 @@ mod macos {
     /// nothing is attempted and the answer is [`SettingsOpen::Refused`], which is
     /// the same instruction to the caller.
     pub fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
-        if MainThreadMarker::new().is_none() {
+        if MainThread::new().is_none() {
             return SettingsOpen::Refused;
         }
         let urls = privacy_settings_urls(pane);
@@ -2610,10 +2608,12 @@ mod macos {
     /// tracking ends rather than on the second. That only ever makes the second
     /// issue LATE; it cannot lose it, and the first open has already happened.
     fn open_in_workspace_after_delay(s: &str, secs: f64) {
-        if MainThreadMarker::new().is_none() {
+        if MainThread::new().is_none() {
             return;
         }
-        let ns = NSString::from_str(s);
+        let Some(ns) = appkit::nsstring(s) else {
+            return;
+        };
         // SAFETY: standard AppKit. Every `s` reaching here is one of this module's
         // own `&'static str` URL constants, so `URLWithString:` is non-nil.
         // `NSWorkspace` retains both the receiver and the argument until the
@@ -2621,15 +2621,453 @@ mod macos {
         // selector is `openURL:`, whose real return is `BOOL` while the delayed
         // perform invokes it as `id`-returning; the value lands in the same return
         // register on every target aterm builds for and is discarded either way.
-        unsafe {
-            let url: Retained<AnyObject> = msg_send_id![class!(NSURL), URLWithString: &*ns];
-            let ws: Retained<AnyObject> = msg_send_id![class!(NSWorkspace), sharedWorkspace];
-            let _: () = msg_send![
-                &ws,
-                performSelector: sel!(openURL:),
-                withObject: &*url,
-                afterDelay: secs,
-            ];
+        autoreleasepool(|_| unsafe {
+            let url = appkit::send_id_id(class(c"NSURL").as_id(), sel!(URLWithString:), ns.id());
+            let ws = appkit::send_id(class(c"NSWorkspace").as_id(), sel!(sharedWorkspace));
+            if url.is_null() || ws.is_null() {
+                return;
+            }
+            let perform: unsafe extern "C" fn(Id, Sel, Sel, Id, f64) = aterm_objc::msg();
+            perform(
+                ws,
+                sel!(performSelector:withObject:afterDelay:),
+                sel!(openURL:),
+                url,
+                secs,
+            );
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use aterm_objc::{
+            Bool, ClassType, Encode, Id, Obj, autoreleasepool, class, class_name, method_types, sel,
+        };
+
+        use super::{MenuTarget, add_separator, new_item, new_menu};
+        use crate::appkit;
+
+        /// How many `validateMenuItem:` calls the probe answered, and what it
+        /// was asked about. A real `MenuTarget`'s ivar is an
+        /// `EventLoopProxy<Wake>`, which needs a live winit `EventLoop`; the
+        /// probe is a second expansion of the identical shape whose bodies
+        /// record instead of posting.
+        static VALIDATED: AtomicUsize = AtomicUsize::new(0);
+        static ACTIONED: AtomicUsize = AtomicUsize::new(0);
+
+        aterm_objc::declare_class! {
+            struct MenuProbe: NSObject {
+                const NAME: &str = "ATermMenuProbe";
+                type Ivars = ();
+
+                @sel(menuAction:)
+                fn menu_action(&self, sender: Id) {
+                    // SAFETY: AppKit passed the live sending NSMenuItem.
+                    let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                    ACTIONED.fetch_add(usize::try_from(tag).unwrap_or(0), Ordering::SeqCst);
+                }
+
+                /// Enabled iff the item's tag is ODD — an arbitrary rule whose
+                /// only job is to make AppKit's OWN reading of the returned
+                /// `BOOL` observable in `-isEnabled`.
+                @sel(validateMenuItem:)
+                fn validate_menu_item(&self, sender: Id) -> Bool {
+                    VALIDATED.fetch_add(1, Ordering::SeqCst);
+                    // SAFETY: AppKit passed the live NSMenuItem being validated.
+                    let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                    Bool::new(tag % 2 != 0)
+                }
+            }
+        }
+
+        /// The registered class is what the runtime says it is.
+        #[test]
+        fn the_registered_class_is_what_the_runtime_reports() {
+            let cls = MenuTarget::class();
+            assert!(!cls.is_null());
+            assert_eq!(class(c"ATermMenuTarget"), cls);
+            // SAFETY: `cls` is the class this module registered.
+            unsafe {
+                assert_eq!(class_name(cls), c"ATermMenuTarget");
+                assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
+                assert!(appkit::send_bool_sel(
+                    cls.as_id(),
+                    sel!(instancesRespondToSelector:),
+                    sel!(menuAction:)
+                ));
+                assert!(appkit::send_bool_sel(
+                    cls.as_id(),
+                    sel!(instancesRespondToSelector:),
+                    sel!(validateMenuItem:)
+                ));
+            }
+        }
+
+        /// THE PROOF for the ENCODINGS — read back out of the runtime with
+        /// `method_getTypeEncoding`, against the verified table.
+        ///
+        /// `validateMenuItem:` is the D3 shape: `- (BOOL)validateMenuItem:(id)`
+        /// registers `"B@:@"` on `aarch64-apple-darwin` and `"c@:@"` on the
+        /// `x86_64-apple-darwin` compat slice, because `@encode(BOOL)` differs
+        /// between them. The expectation is written FROM `Bool::ENCODING`
+        /// rather than hard-coded, which is what makes it a check on both
+        /// arches from one source; the literal is asserted alongside on the arch
+        /// that can execute, so a `Bool::ENCODING` that went wrong could not
+        /// make this test vacuous.
+        #[test]
+        fn the_runtime_reports_the_encodings_the_table_says() {
+            let cls = MenuTarget::class();
+            // SAFETY: `cls` is the live registered class.
+            unsafe {
+                assert_eq!(
+                    method_types(cls, sel!(menuAction:)).as_deref(),
+                    Some("v@:@")
+                );
+                assert_eq!(
+                    method_types(cls, sel!(validateMenuItem:)),
+                    Some(format!("{}@:@", Bool::ENCODING))
+                );
+                assert_eq!(method_types(cls, sel!(dealloc)).as_deref(), Some("v@:"));
+            }
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(Bool::ENCODING, "B");
+        }
+
+        /// THE PROOF for BEHAVIOUR, and FOUNDATION is what reads the `BOOL`.
+        ///
+        /// `NSMethodSignature` + `NSInvocation` is not a detour, it is the
+        /// exact machinery the registered encoding exists for: a method type
+        /// string is what AppKit reaches for on every path that does not send
+        /// the selector directly, and `NSInvocation` decodes the return value
+        /// **by that string**. So this asks Foundation three questions the port
+        /// cannot answer for itself —
+        ///
+        /// * what does `- (BOOL)validateMenuItem:(id)` look like from outside?
+        ///   (`-methodReturnType` must be `Bool::ENCODING`, `-methodReturnLength`
+        ///   must be one byte, `-numberOfArguments` must be three)
+        /// * what does invoking it return for an item AppKit itself tagged?
+        /// * and does the answer differ for the two tags?
+        ///
+        /// — and a wrong encoding fails all three rather than half-passing: a
+        /// `"q"` return would report length 8, an `"@"` return would report a
+        /// pointer, and `NSInvocation` would copy the wrong number of bytes out.
+        ///
+        /// REFUTED, and the refutation is why this shape: the obvious test was
+        /// `-[NSMenu update]`, AppKit's own NSMenuValidation pass. It reaches
+        /// the target through `NSApplication`, and a libtest process has no
+        /// `NSApplication` and cannot make one (`+sharedApplication` is
+        /// main-thread-only; libtest runs every test on a spawned thread). It
+        /// counted **0** `validateMenuItem:` calls, silently — exactly the
+        /// "compiles, does nothing, reports success" shape this campaign has
+        /// already been caught by once.
+        #[test]
+        fn foundation_reads_the_declared_bool_through_the_registered_encoding() {
+            VALIDATED.store(0, Ordering::SeqCst);
+            ACTIONED.store(0, Ordering::SeqCst);
+            let probe = MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+            autoreleasepool(|_| {
+                // SAFETY: every send below is cast to the exact prototype named
+                // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
+                // `+invocationWithMethodSignature:` is `-(id)(id)`;
+                // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
+                // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
+                // at the pointer, so `&mut arg` need only outlive the call;
+                // `-invokeWithTarget:` is `-(void)(id)`; `-getReturnValue:` is
+                // `-(void)(void *)` and writes `methodReturnLength` bytes, which
+                // is asserted to be `size_of::<Bool>()` before the call.
+                unsafe {
+                    let menu = new_menu().expect("NSMenu");
+                    appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), true);
+                    let mut items = Vec::new();
+                    for tag in 1..=2 {
+                        let item =
+                            new_item(&format!("row {tag}"), sel!(menuAction:), "").expect("item");
+                        appkit::send_v_id(item.id(), sel!(setTarget:), probe.as_id());
+                        appkit::send_v_isize(item.id(), sel!(setTag:), tag);
+                        appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+                        items.push(item);
+                    }
+                    add_separator(&menu);
+
+                    // What Foundation reads out of the REGISTERED encoding.
+                    let sig_for: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::Sel) -> Id =
+                        aterm_objc::msg();
+                    let sig = sig_for(
+                        probe.as_id(),
+                        sel!(methodSignatureForSelector:),
+                        sel!(validateMenuItem:),
+                    );
+                    assert!(
+                        !sig.is_null(),
+                        "Foundation could not build a signature for the declared method"
+                    );
+                    // THE PRODUCTION CLASS, not the probe. A judge planted a
+                    // wrong return type on `MenuTarget::validate_menu_item` and
+                    // this test PASSED, because every signature below came from
+                    // `MenuProbe` — a copy that carries the same shape by hand.
+                    // Only the encoding test caught the plant. The probe is
+                    // still what gets INVOKED (constructing a real `MenuTarget`
+                    // needs an `EventLoopProxy` this test has no event loop to
+                    // give), but the signature Foundation is asked to agree with
+                    // now comes from the class that ships, via the class-side
+                    // `+instanceMethodSignatureForSelector:` — which needs no
+                    // instance at all.
+                    let cls_sig_for: unsafe extern "C" fn(
+                        aterm_objc::ClassPtr,
+                        aterm_objc::Sel,
+                        aterm_objc::Sel,
+                    ) -> Id = aterm_objc::msg();
+                    let target_sig = cls_sig_for(
+                        MenuTarget::class(),
+                        sel!(instanceMethodSignatureForSelector:),
+                        sel!(validateMenuItem:),
+                    );
+                    assert!(
+                        !target_sig.is_null(),
+                        "Foundation could not build a signature for MenuTarget's declared method"
+                    );
+                    let target_ret_type: unsafe extern "C" fn(
+                        Id,
+                        aterm_objc::Sel,
+                    )
+                        -> *const std::ffi::c_char = aterm_objc::msg();
+                    let target_ret = std::ffi::CStr::from_ptr(target_ret_type(
+                        target_sig,
+                        sel!(methodReturnType),
+                    ));
+                    assert_eq!(
+                        target_ret.to_str().expect("ascii"),
+                        Bool::ENCODING,
+                        "MenuTarget — the class that ships — disagrees with the encoding table"
+                    );
+                    assert_eq!(
+                        appkit::send_usize(target_sig, sel!(methodReturnLength)),
+                        size_of::<Bool>(),
+                        "MenuTarget's registered return length is not a Bool's"
+                    );
+                    assert_eq!(
+                        appkit::send_usize(target_sig, sel!(numberOfArguments)),
+                        3,
+                        "MenuTarget's registered argument count moved"
+                    );
+                    let ret_type: unsafe extern "C" fn(
+                        Id,
+                        aterm_objc::Sel,
+                    )
+                        -> *const std::ffi::c_char = aterm_objc::msg();
+                    let ret = std::ffi::CStr::from_ptr(ret_type(sig, sel!(methodReturnType)));
+                    assert_eq!(
+                        ret.to_str().expect("ascii"),
+                        Bool::ENCODING,
+                        "NSMethodSignature disagrees with the encoding table"
+                    );
+                    assert_eq!(
+                        appkit::send_usize(sig, sel!(methodReturnLength)),
+                        size_of::<Bool>()
+                    );
+                    assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 3);
+
+                    // …and what it returns, per tag, decoded by that string.
+                    for (i, item) in items.iter().enumerate() {
+                        let tag = i as isize + 1;
+                        let inv = appkit::send_id_id(
+                            class(c"NSInvocation").as_id(),
+                            sel!(invocationWithMethodSignature:),
+                            sig,
+                        );
+                        assert!(!inv.is_null());
+                        let set_sel: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::Sel) =
+                            aterm_objc::msg();
+                        set_sel(inv, sel!(setSelector:), sel!(validateMenuItem:));
+                        let set_arg: unsafe extern "C" fn(
+                            Id,
+                            aterm_objc::Sel,
+                            *mut std::ffi::c_void,
+                            isize,
+                        ) = aterm_objc::msg();
+                        let mut arg = item.id();
+                        set_arg(
+                            inv,
+                            sel!(setArgument:atIndex:),
+                            std::ptr::from_mut(&mut arg).cast(),
+                            2,
+                        );
+                        appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
+                        let mut out = Bool::NO;
+                        let get_ret: unsafe extern "C" fn(
+                            Id,
+                            aterm_objc::Sel,
+                            *mut std::ffi::c_void,
+                        ) = aterm_objc::msg();
+                        get_ret(
+                            inv,
+                            sel!(getReturnValue:),
+                            std::ptr::from_mut(&mut out).cast(),
+                        );
+                        assert_eq!(
+                            out.as_bool(),
+                            tag % 2 != 0,
+                            "NSInvocation decoded the wrong BOOL for tag {tag}"
+                        );
+                    }
+                    assert_eq!(VALIDATED.load(Ordering::SeqCst), 2);
+
+                    // The separator AppKit made really is one.
+                    let sep = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 2);
+                    assert!(appkit::send_bool(sep, sel!(isSeparatorItem)));
+
+                    // …and the action leg, through the runtime's own dispatch
+                    // of the target/action pair AppKit stored.
+                    let target_of: unsafe extern "C" fn(Id, aterm_objc::Sel) -> Id =
+                        aterm_objc::msg();
+                    assert_eq!(target_of(items[1].id(), sel!(target)), probe.as_id());
+                    let perform_sel: unsafe extern "C" fn(
+                        Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Sel,
+                        Id,
+                    ) -> Id = aterm_objc::msg();
+                    perform_sel(
+                        probe.as_id(),
+                        sel!(performSelector:withObject:),
+                        sel!(menuAction:),
+                        items[1].id(),
+                    );
+                }
+            });
+            assert_eq!(ACTIONED.load(Ordering::SeqCst), 2);
+        }
+
+        /// The menu bar this module builds is the menu bar it built before: the
+        /// same titles, in the same order, with the same submenu item titles,
+        /// tags, key equivalents and modifier masks — read back out of AppKit.
+        ///
+        /// This is the regression check the port owes a USER-VISIBLE surface. It
+        /// does not install the bar (that needs `NSApp` and the main thread); it
+        /// builds the identical structure through the ported constructors and
+        /// interrogates it.
+        #[test]
+        fn the_built_menu_bar_has_the_titles_tags_and_masks_it_had() {
+            let probe = MenuProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+            autoreleasepool(|_| {
+                // SAFETY: plain AppKit accessors on menus this test built.
+                unsafe {
+                    // The App menu, whole, as `build_app_menu` composes it.
+                    let menu = new_menu().expect("NSMenu");
+                    super::add_item(
+                        &menu,
+                        probe_as_menu_target(&probe),
+                        "Settings…",
+                        super::MenuAction::ToggleSettings,
+                        ",",
+                        true,
+                    );
+                    super::add_item_mods(
+                        &menu,
+                        probe_as_menu_target(&probe),
+                        "Enter Full Screen",
+                        super::MenuAction::ToggleFullScreen,
+                        "f",
+                        super::command_control_mask(),
+                    );
+                    let settings = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 0);
+                    assert_eq!(
+                        appkit::nsstring_to_rust(appkit::send_id(settings, sel!(title))),
+                        "Settings…"
+                    );
+                    assert_eq!(
+                        appkit::send_isize(settings, sel!(tag)),
+                        super::MenuAction::ToggleSettings.tag()
+                    );
+                    assert_eq!(
+                        appkit::nsstring_to_rust(appkit::send_id(settings, sel!(keyEquivalent))),
+                        ","
+                    );
+                    assert_eq!(
+                        appkit::send_usize(settings, sel!(keyEquivalentModifierMask)),
+                        super::command_mask()
+                    );
+                    let full = appkit::send_id_isize(menu.id(), sel!(itemAtIndex:), 1);
+                    assert_eq!(
+                        appkit::send_usize(full, sel!(keyEquivalentModifierMask)),
+                        super::command_control_mask()
+                    );
+                    assert_ne!(super::command_control_mask(), super::command_mask());
+
+                    // A submenu attaches under a titled, action-less bar item.
+                    let bar = new_menu().expect("NSMenu");
+                    let sub = new_menu().expect("NSMenu");
+                    let item = super::attach_submenu(&bar, "Version", sub).expect("attached");
+                    assert_eq!(
+                        appkit::nsstring_to_rust(appkit::send_id(item.id(), sel!(title))),
+                        "Version"
+                    );
+                    // The item was BUILT with `Sel::NULL`, and AppKit then
+                    // rewrote its action to its own `submenuAction:` when the
+                    // submenu was attached — measured here rather than assumed;
+                    // the first version of this assertion expected nil and was
+                    // wrong. What matters is that nothing of ours is left on it.
+                    let action_of: unsafe extern "C" fn(Id, aterm_objc::Sel) -> aterm_objc::Sel =
+                        aterm_objc::msg();
+                    let action = action_of(item.id(), sel!(action));
+                    assert_ne!(action, sel!(menuAction:));
+                    assert_eq!(action, sel!(submenuAction:));
+                    let attached = appkit::send_id(item.id(), sel!(submenu));
+                    assert!(!attached.is_null());
+                    assert_eq!(
+                        appkit::nsstring_to_rust(appkit::send_id(attached, sel!(title))),
+                        "Version"
+                    );
+                    assert_eq!(appkit::send_isize(bar.id(), sel!(numberOfItems)), 1);
+                }
+            });
+        }
+
+        /// `add_item` takes a `&MenuTarget`; the probe is a different declared
+        /// class of the same shape, so this reinterprets it for the two calls
+        /// above. Sound for exactly the reason the trampolines are: both types
+        /// are zero-sized opaque markers AT the instance address, and
+        /// `add_item` only ever asks for `as_id()`.
+        fn probe_as_menu_target(probe: &aterm_objc::Retained<MenuProbe>) -> &MenuTarget {
+            // SAFETY: `MenuTarget` is a zero-sized marker that borrows no bytes
+            // of its own; the reference is used only to reach `as_id()`, which
+            // re-derives the object pointer from the reference's ADDRESS. That
+            // address is the probe's live instance.
+            unsafe { &*std::ptr::from_ref::<MenuProbe>(probe).cast::<MenuTarget>() }
+        }
+
+        /// The generated `-dealloc` drops the Rust ivars.
+        #[test]
+        fn dropping_a_declared_instance_drops_its_ivars() {
+            static DROPS: AtomicUsize = AtomicUsize::new(0);
+            struct Spy;
+            impl Drop for Spy {
+                fn drop(&mut self) {
+                    DROPS.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            aterm_objc::declare_class! {
+                struct MenuDropProbe: NSObject {
+                    const NAME: &str = "ATermMenuDropProbe";
+                    type Ivars = Spy;
+
+                    @sel(ping)
+                    fn ping(&self) {}
+                }
+            }
+            DROPS.store(0, Ordering::SeqCst);
+            let t = MenuDropProbe::alloc_init(crate::appkit::test_witness(), Spy).expect("probe");
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+            drop(t);
+            assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        }
+
+        /// Keeps `Obj` used even if a future edit drops the only other use.
+        #[allow(dead_code)]
+        fn _obj_is_the_owning_type(o: Obj) -> Id {
+            o.id()
         }
     }
 }

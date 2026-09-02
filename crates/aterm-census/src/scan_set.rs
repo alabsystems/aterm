@@ -1516,6 +1516,15 @@ pub(crate) mod test_fixtures {
         "crates/aterm-log/src",
         "crates/aterm-lz4/src",
         "crates/aterm-net/src",
+        // Entered the closure 2026-09-01 with b90beb2d2 ("aterm-objc — the
+        // first-party ObjC runtime layer, and the first declare_class! site off
+        // objc2"): the wave that moved the menu bar, the toolbar classes, the
+        // status item, the hardware-key injector, the clipboard, accessibility
+        // and platform.rs off `objc2` onto a first-party runtime layer. It is
+        // aterm-gui's own dependency, so the DERIVATION picked it up on its own
+        // and this pin is the audit trail catching up — which is the automation
+        // working, not drift.
+        "crates/aterm-objc/src",
         "crates/aterm-observe/src",
         "crates/aterm-parser/src",
         // Entered the closure when the first-party PNG codec replaced `png`

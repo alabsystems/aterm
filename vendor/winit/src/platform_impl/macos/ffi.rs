@@ -1,3 +1,7 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (The two private CoreGraphics/SkyLight prototypes below were re-typed off
+//  `objc2`: `NSInteger` -> `isize` and `*mut AnyObject` -> `*mut c_void`.
+//  Both substitutions are identities; the marked hunk explains why.)
 // TODO: Upstream these
 
 #![allow(dead_code, non_snake_case, non_upper_case_globals)]
@@ -10,8 +14,6 @@ use core_foundation::string::CFStringRef;
 use core_foundation::uuid::CFUUIDRef;
 use core_graphics::base::CGError;
 use core_graphics::display::{CGDirectDisplayID, CGDisplayConfigRef};
-use objc2::ffi::NSInteger;
-use objc2::runtime::AnyObject;
 
 pub type CGDisplayFadeInterval = f32;
 pub type CGDisplayReservationInterval = f32;
@@ -118,10 +120,32 @@ extern "C" {
     pub fn CGDisplayModeRelease(mode: CGDisplayModeRef);
 
     // Wildly used private APIs; Apple uses them for their Terminal.app.
-    pub fn CGSMainConnectionID() -> *mut AnyObject;
+    //
+    // LOCAL PATCH (aterm): `*mut AnyObject` -> `*mut c_void` and `NSInteger` ->
+    // `isize`. Both substitutions are EXACT rather than approximate:
+    // `objc2::ffi::NSInteger` IS `isize` — this fork is on objc2 0.5.2, whose
+    // `ffi` module re-exports `objc-sys`, and the definition is
+    // `objc-sys-0.3.5/src/types.rs:152` —
+    // and `AnyObject` is a thin pointee, so neither the size, the alignment nor
+    // the register class of any argument changes.
+    //
+    // `c_void` and not `aterm_objc::Id`, deliberately, and the reason is the
+    // one `Id`'s own doc gives for existing as a newtype: `Id` carries the
+    // `"@"` encoding, and declaring an opaque caller-owned handle as an OBJECT
+    // is what invites `NSInvocation`, forwarding and accessibility to RETAIN
+    // it. A CGS connection is not an Objective-C object at all — it is
+    // SkyLight's `int` connection id, which upstream winit happens to have
+    // declared pointer-shaped. `"^v"` is what the runtime would say it is, so
+    // `*mut c_void` is the honest spelling and the one that costs nothing.
+    //
+    // The pointer-shaped declaration of an `int` handle is upstream's and is
+    // left alone: it works because arm64 and x86-64 both pass the low word in
+    // the same register the callee reads, and correcting it would be an ABI
+    // change to a private API this wave has no way to test.
+    pub fn CGSMainConnectionID() -> *mut c_void;
     pub fn CGSSetWindowBackgroundBlurRadius(
-        connection_id: *mut AnyObject,
-        window_id: NSInteger,
+        connection_id: *mut c_void,
+        window_id: isize,
         radius: i64,
     ) -> i32;
 }

@@ -80,6 +80,23 @@
 //! — the grid is never touched), and empty-is-off: disabled, reduced-motion, or
 //! settled ticks reset the state machine, emit no quads, record no cue, and
 //! return fingerprint `0`.
+//!
+//! ## Its share of the channel
+//!
+//! The host APPENDS this engine's quads to `nova_add` AFTER the word-decoration
+//! pass has spent its own [`crate::nova::MAX_NOVA_QUADS`] budget (app_render.rs
+//! `compose_output_streak` / the single-pane PRISM WAKE block), so the streak
+//! share is neither funded by that budget nor counted by it — 1536 is a funding
+//! ceiling on the DECORATION producers, not a total for the channel. This
+//! engine's own bound is one ribbon row of ≤ `cols` cells plus at most
+//! `MAX_COMETS` comet heads of ≤ `TAIL_MAX` + 2 cells each (a comet lights
+//! its head and tail, never the whole row), so `cols + 64` at the config corner
+//! — PER PANE, since the engines are per pane and nothing sums them. Four
+//! 200-column panes of build output measure ~823 quads on top of the decoration
+//! share. That overrun is deliberate and inert: the consumer walks the whole
+//! slice (no cap, no fixed buffer, no assert) and the host's channel is a
+//! resident scratch that grows once. Pinned in
+//! `tests/nova_channel_budget.rs`.
 
 use aterm_render::{GlowQuad, premul_rgb};
 use aterm_time::Instant;
@@ -668,7 +685,7 @@ impl OutputStreak {
         // GOVERNOR 4 — FLOOD COALESCING. Past saturation nothing new spawns; the
         // single ribbon carries the activity at constant cost, mutely.
         if m >= SATURATED {
-            self.refresh_ribbon(pending, cfg, geom);
+            self.refresh_ribbon(now, pending, cfg, geom);
             return None;
         }
 
@@ -781,21 +798,81 @@ impl OutputStreak {
     }
 
     /// Refresh (or open) the flood ribbon on the newest output row.
-    fn refresh_ribbon(&mut self, pending: Pending, cfg: &StreakConfig, geom: Geom) {
+    /// Refresh — or open, or MOVE — the flood ribbon, spending an ignition to
+    /// move it, because moving it is one.
+    ///
+    /// MOVING THE RIBBON IS AN EDGE ON TWO ROWS AT ONCE: it takes light off
+    /// every cell of the row it leaves and puts light on every cell of the row
+    /// it arrives at, inside one frame. That is an ignition by the same
+    /// definition GOVERNOR 2 applies to a comet, and until 2026-09-01 it was
+    /// exempt from GOVERNOR 2's floor — this ran on EVERY licensed observation.
+    ///
+    /// The host samples the anchor row from the LIVE CURSOR once a frame
+    /// (`note_output_cells`: the cursor's own row mid-line, the row above it at
+    /// column 0), so a program whose cursor sits on two rows in turn — a
+    /// two-line progress display, a multi-line spinner, or a scrolling flood
+    /// sampled sometimes mid-line and sometimes just after the newline — handed
+    /// this engine alternating rows at the frame rate, and the ribbon answered
+    /// every one of them. MEASURED on the mechanism, 8 s of a two-row
+    /// alternation at 120 Hz: **811 re-homes, 101.4 per second**. With this
+    /// floor: 10, i.e. 1.25 per second.
+    /// [`Self::a_two_row_alternation_cannot_strobe_the_ribbon`] pins it and is
+    /// RED without the floor.
+    ///
+    /// SHARING `last_spawn` WITH THE COMET FLOOR IS THE POINT, not an economy.
+    /// One clock means a cell cannot be handed a comet edge and a ribbon edge
+    /// inside the same [`SPAWN_MIN_GAP_MS`], so the per-cell edge rate is bounded
+    /// by the one floor rather than by the sum of two independent ones.
+    ///
+    /// THE CONTINUOUS TERMS ARE NOT EDGES and still refresh on every
+    /// observation: the linger clock (`since_output_s`), and the hue drift that
+    /// rides it in [`Self::advance_ribbon`]. Neither puts light on a cell nor
+    /// takes it off; they only recolour light already there.
+    ///
+    /// WHAT IT COSTS, VISIBLY, so nobody meets it as a surprise: the ribbon can
+    /// now LAG the newest output row by up to [`SPAWN_MIN_GAP_MS`]. On the flood
+    /// this exists for — `cat bigfile`, a build log scrolling at the bottom of
+    /// the screen — the anchor row does not move and nothing changes. On a flood
+    /// still FILLING a fresh screen it steps down at the ignition rate instead
+    /// of following every line. That is the right way round: the ribbon is a
+    /// constant-cost wash saying "output is pouring", not a cursor.
+    fn refresh_ribbon(&mut self, now: Instant, pending: Pending, cfg: &StreakConfig, geom: Geom) {
+        // CLIP FIRST, so the unchanged-geometry test below compares the span
+        // this call would STORE against the span already stored. Comparing an
+        // unclipped `pending` against a clipped `Ribbon` reports a change on
+        // every frame of any flood whose span runs past the last column, and the
+        // ribbon would then re-home at the ignition floor forever — a slower
+        // strobe rather than no strobe.
+        let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
+            return;
+        };
+        let want = (pending.row, from_col, to_col);
+        if let Some(r) = self.ribbon.as_mut() {
+            // The linger clock refreshes whatever happens: the flood is still
+            // running, and that is what this term measures.
+            r.since_output_s = 0.0;
+            if (r.row, r.from_col, r.to_col) == want {
+                // Same geometry. No light moved, so there is nothing to charge.
+                return;
+            }
+        }
+        if let Some(last) = self.last_spawn
+            && now.saturating_duration_since(last) < Duration::from_millis(SPAWN_MIN_GAP_MS)
+        {
+            return;
+        }
         let hue = match self.ribbon {
             Some(r) => r.hue,
             None => self.hue_for(pending, cfg),
         };
-        let Some((from_col, to_col)) = clipped_span(pending, geom.cols) else {
-            return;
-        };
         self.ribbon = Some(Ribbon {
-            row: pending.row,
-            from_col,
-            to_col,
+            row: want.0,
+            from_col: want.1,
+            to_col: want.2,
             hue,
             since_output_s: 0.0,
         });
+        self.last_spawn = Some(now);
     }
 
     /// Advance every resident comet's sweep and retire the finished ones.
@@ -1384,6 +1461,70 @@ mod tests {
             assert_eq!(f.fp, 0);
             assert!(out.is_empty());
         }
+    }
+
+    /// A RIBBON RE-HOME IS AN IGNITION, and GOVERNOR 2's floor covers it.
+    ///
+    /// THE SHAPE THAT PRODUCED THE REGRESSION: the host samples the anchor row
+    /// from the live cursor once a frame, so a program whose cursor sits on two
+    /// rows in turn — a two-line progress display, a multi-line spinner, a
+    /// scrolling flood sampled sometimes mid-line and sometimes just after the
+    /// newline — hands this engine alternating rows at the frame rate.
+    /// `refresh_ribbon` used to answer every one by MOVING the ribbon, which
+    /// takes light off a whole row and puts it on another inside one frame.
+    ///
+    /// MEASURED on the mechanism at 120 Hz over 8 s, with the floor removed and
+    /// nothing else changed: **811 re-homes, 101.38 per second**. With it: 10,
+    /// i.e. 1.25 per second — [`SPAWN_MIN_GAP_MS`] doing for the ribbon exactly
+    /// what it already did for a comet.
+    ///
+    /// The bound is asserted against the FLOOR, not against the number I
+    /// happened to measure: a test that pins 11 fails when someone retunes
+    /// `SPAWN_MIN_GAP_MS` for an unrelated reason, and teaches them to update
+    /// the number rather than to think.
+    #[test]
+    fn a_two_row_alternation_cannot_strobe_the_ribbon() {
+        let t0 = Instant::now();
+        let mut e = OutputStreak::new(17);
+        let cfg = cfg_on();
+        let g = geom();
+
+        // 120 Hz for 8 s, the cursor alternating between two rows every frame,
+        // driven hard enough to stay past SATURATED so the ribbon is the only
+        // thing on glass (GOVERNOR 4).
+        let steps = 960u64;
+        let hz = 120u64;
+        let mut homes = 0u32;
+        let mut prev: Option<(u16, i32, i32)> = None;
+        for i in 0..steps {
+            let at = t0 + Duration::from_millis(i * 1000 / hz);
+            let row = if i % 2 == 0 { 5 } else { 6 };
+            // A big content step per frame keeps momentum saturated.
+            e.note_output(i * 4096, &span(row), at, false);
+            let mut out = Vec::new();
+            e.tick(at, g, &cfg, &mut out);
+            let now = e.ribbon.map(|r| (r.row, r.from_col, r.to_col));
+            if now.is_some() && now != prev {
+                homes += 1;
+            }
+            prev = now;
+        }
+
+        let secs = steps as f32 / hz as f32;
+        let per_s = homes as f32 / secs;
+        let floor_per_s = 1000.0 / SPAWN_MIN_GAP_MS as f32;
+        assert!(
+            per_s <= floor_per_s + 0.05,
+            "the ribbon re-homed {homes} times in {secs:.1} s = {per_s:.2}/s, above the \
+             ignition floor of {floor_per_s:.2}/s. A re-home moves light off one whole row \
+             and onto another; unbounded, this is the strobe that measured 60 re-homes per \
+             second before the floor covered it."
+        );
+        assert!(
+            homes >= 2,
+            "the drive must actually MOVE the ribbon, or this test cannot fail: {homes} \
+             re-home(s) means the fixture stopped exercising the alternation"
+        );
     }
 
     /// THE FLOOD: 10 k content steps a second yield ONE ribbon at constant cost,

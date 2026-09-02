@@ -287,8 +287,9 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         AnyScopeMeta,
-        "build + compiler provenance (version, commit, rustc, flavor, signature)",
-        "",
+        "build provenance (version, commit, trustc, flavor, signature)",
+        "The compiler keys are `trustc=`/`trustc_commit=`/`trustc_host=` — renamed from rustc in \
+         v0.10.0, so a script parsing `rustc=` finds nothing.",
     ),
     va(
         "update",
@@ -481,8 +482,11 @@ pub const VERBS: &[VerbSpec] = &[
          pre-find viewport); `find status` mutates nothing. Every form answers the SAME line: `OK \
          open=0` when no find bar is up, else `OK open=1 query=<pct> case= regex= regex_error= \
          matches=<n> current=<i> row= col= len= truncated= stale=`. row/col/len are the CURRENT \
-         match in \
-         `search` coordinates (negative row = scrollback) and are `-` when there is no match — \
+         match in SELECTION coordinates — row 0..rows is the live screen, a NEGATIVE row is \
+         scrollback above it — which are NOT `search`'s rows: `search` emits ABSOLUTE rows \
+         (0-indexed from the oldest retained line, never negative) that feed `line`/`text` \
+         directly, and a `find` row fed to `line` reads the wrong line or is refused. They are \
+         `-` when there is no match — \
          never a position that does not exist. current/matches are the 1-based `i/n` the find bar \
          itself paints, so the wire and the glass always agree; `truncated=1` means the search \
          index capped the batch, so that pair counts within the cap rather than over the whole \
@@ -556,8 +560,10 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "window [<target>] [path] : assemble a full-window artifact",
         "(platform-owned chrome + the exact submitted client destination) -> PNG, reply OK <w> \
-         <h> <path> (target: front|prefs|about|menu|update, default front; bare filename confined \
-         to images/). Compositor visibility and scanout are not observed",
+         <h> <path> (target: front | prefs | about | menu | tab-menu | conn-card | \
+         session-picker | connections | update, default front — aliases settings, palette and \
+         software-update resolve too; bare filename confined to images/). Compositor visibility \
+         and scanout are not observed",
     ),
     v(
         "video",
@@ -565,7 +571,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "record N seconds (0.5..=60) of the front window's WSI-SUBMITTED destination frames",
-        "-> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front), and input that lands on a WINDOW this take is not capturing (the front window changed mid-take — an `aterm ctl spawn` alone does it) has no frame here that could answer it; those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta (with the window share broken out as `unlogged_other_window`), so an empty inputs[] is never ambiguous and a logged row is never a key the recorded window never saw. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape — NOT key->photon and NOT comparable to a keystroke-sampled latency: the recorder can only see a key's effect on its NEXT captured frame, so at fps=N no reading goes below ~1000/N ms however fast the terminal is. index.json `analysis` publishes that floor with every number (per row capture_floor_ms/at_capture_floor; per take capture_floor_p50_ms, capture_interval_p50_ms, attempts_outpace_readings, capture_verdict) — use `metrics percentiles` input_p50/p95/p99_ms when you want typing latency); cadence gaps = frames[].t_us deltas vs ~16667",
+        "-> frame_NNNN.png + index.json (same-clock timestamps; compositor visibility and scanout are not observed). Flags: full | keys (owner-only keystroke log: hardware input, plus socket input aimed at the tab ON SCREEN — `key`, `ctrl`, `send`, `feed`, `paste`, flagless OR an explicit `@<sid>` naming the front tab — each stamped on the frame clock. A verb aimed at a BACKGROUND session egresses on the control thread and CANNOT be logged (`@self` expands to that when the driving session is not front), and input that lands on a WINDOW this take is not capturing (the front window changed mid-take — an `aterm ctl spawn` alone does it) has no frame here that could answer it; those attempts are COUNTED instead and reported as `unlogged_inputs=` on the reply line, live as `unlogged=` on `video status`, and in index.json meta (with the window share broken out as `unlogged_other_window`), so an empty inputs[] is never ambiguous and a logged row is never a key the recorded window never saw. Drive the FRONT tab when you need key->frame latency) | pace (keep redraws flowing) | fps=<n> (cap capture rate, 1..=120) | budget=<MiB> (frame-store RAM, 64..=4096, default 512). Every recording carries >=1 baseline keyframe; retention converges to 8 eligible completed recordings while preserving fresh/live handoffs. `video status` = one-line read of the in-flight recording (recording= mode= elapsed_ms= frames= resized= keys=, and for a keys take the RUNNING inputs= unlogged= so a driver learns mid-take that it is driving an unloggable path); `video stop` = finalize it now — owner-only, like `keys`, because it truncates the take. `video frames [count=N]` = no capture; list the newest recording's N highest-delta (most-changed) frames as `frame n= delta= t_us= seq= <path>` rows, so an AI pulls just the eventful key frames instead of every PNG (default 8, max 64). index.json meta reports honest coverage: head_truncated/evicted_frames/ring_skipped/covered_us vs requested_ms, plus keys_requested/inputs_logged/unlogged_inputs. key->captured-frame latency = first recorded submitted destination containing the glyph minus inputs[].t_us (an inputs[] row is `ch` for a character or `key` for a named key like ArrowUp/Escape — NOT key->photon and NOT comparable to a keystroke-sampled latency: the recorder can only see a key's effect on its NEXT captured frame, so at fps=N no reading goes below ~1000/N ms however fast the terminal is. index.json `analysis` publishes that floor with every number (per row capture_floor_ms/at_capture_floor; per take capture_floor_p50_ms, capture_interval_p50_ms, attempts_outpace_readings, capture_verdict) — use `metrics percentiles` input_p50/p95/p99_ms when you want typing latency); cadence gaps = frames[].t_us deltas vs ~16667",
     ),
     v(
         "appstatus",
@@ -573,7 +579,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         App,
         "OK <n> + one `activity` row per live/finished app-initiated job",
-        "What aterm has been doing on its own initiative — a toolchain install, a self-update download — as the two status bars show it, plus the finished jobs the ring still remembers. Rows are `activity kind=<toolchain|update> phase=<live|done> progress=<pct>/100 title=<t> detail=<d> stats=<s> outcome=<ok|warn|-> [since_ms=<ms>]`; live rows first, then finished oldest-first. Free text is percent-encoded. Read-only: it starts and cancels nothing.",
+        "What aterm has been doing on its own initiative — a toolchain install, a self-update download — as the two status bars show it, plus the finished jobs the ring still remembers. Rows are `activity kind=<toolchain|update> phase=<live|done> progress=<pct>/100|- title=<t> detail=<d> stats=<s> outcome=<ok|warn|-> [since_ms=<ms>]` — progress= is `-` on every phase=done row (and on a live bar with no fill yet), and stats= is empty on done rows; live rows first, then finished oldest-first. Free text is percent-encoded. Read-only: it starts and cancels nothing.",
     ),
     v(
         "chrome",
@@ -588,8 +594,10 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         App,
-        "GUI controls as text (front|prefs|about|menu|update)",
-        "",
+        "GUI controls as text (the nine `window` targets, default front)",
+        "Targets: front | prefs | about | menu | tab-menu | conn-card | session-picker | \
+         connections | update — the roster the verb's own usage error enumerates. `controls \
+         connections` is Owner-escalated; the rest answer at any scope.",
     ),
     v(
         "panes",
@@ -599,8 +607,9 @@ pub const VERBS: &[VerbSpec] = &[
         "the front window's ACTIVE-tab split-pane layout: `layout tab=<i> panes=<n> zoomed=<bool>`",
         "header, then one `pane session=<sid> rect=<row_off>,<col_off>,<rows>x<cols> \
          focused=<bool>` row per visible pane (cell coords; 1-cell divider gaps between rects). \
-         @<sid> describes the window whose ACTIVE tab displays that session, and errors when none \
-         does (background tab?)",
+         @<sid> describes the window whose ACTIVE tab displays that session; when none does \
+         (background tab, or no window) the reply is `OK 0` with the header's panes=0 — an \
+         honest empty layout, never an ERR, so poll loops need no error arm for it",
     ),
     v(
         "inspect",
@@ -696,8 +705,10 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Session,
         "timeline [<n>] [since=<id>]: the session EVENT TIMELINE",
-        "- one `event <id> t=<ms> kind=<k> ...` line per lifecycle event \
-         (spawned/state-change/title-change/cwd-change/meta-change), monotonic ids, drop-oldest \
+        "- one `event <id> t=<ms> kind=<k> ...` line per recorded event: the lifecycle kinds \
+         (spawned/state-change/title-change/cwd-change/meta-change) AND the fabric/messaging \
+         kinds the same ring records (hold/inbox/inbox-seen/post/post-landed), monotonic ids, \
+         drop-oldest \
          ring. The two rows a session records as it is retired — `closing reason= by=` and the \
          final `state-change state=closed` — cannot be asked for here after the close: the sid \
          stops resolving in the same store write (only a request that resolved the session just \
@@ -749,7 +760,10 @@ pub const VERBS: &[VerbSpec] = &[
          trimmed=<k> — hash= stays the FNV of the UNTRIMMED screen (a screen identity, the value \
          `history` reports), not of the bytes sent. App-agnostic; humans can interject. \
          EXACTLY-ONCE: a leading id=<epoch>:<producer>:<seq> makes the turn replay-safe — see \
-         `send`'s entry for the key, which every input verb shares. A DUPLICATE answers `OK 0 \
+         `send`'s entry for the key, which exactly `send`, `key`, `feed-bin` and `turn` take. \
+         The OTHER input verbs (`paste`, `ctrl`, `feed`, `paste-bin`, `mouse`, `pointer`, \
+         `hwkey`) take NO key — a leading id= on `paste` is delivered as literal text — so a \
+         crash-safe driver retries only through the four keyed verbs. A DUPLICATE answers `OK 0 \
          dup=1` (this verb is Lines-framed) and carries NONE of the verdict fields above, id= \
          included: nothing was typed, so there is no verdict to report. The reply's own id= is \
          the TURN id and is unrelated to the key you sent",
@@ -902,16 +916,17 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "scroll the view (up|down|top|bottom|N)",
-        "",
+        "scroll the view (up|down|top|bottom|N|prev/next-prompt)",
+        "A bare `scroll` mutates nothing and reports the current position.",
     ),
     v(
         "select",
         Read,
         Status,
         Session,
-        "select a region / word <r> <c> / line <r> / clear",
-        "`word` and `line` are the double/triple-click gestures and select the \
+        "select region / word <r> <c> / line <r> / block <r1> <c1> <r2> <c2> / extend / clear",
+        "`extend <r> <c>` is the shift-click grow of whichever selection stands. \
+         `word` and `line` are the double/triple-click gestures and select the \
          LOGICAL line, not the physical row: a soft-wrapped line is selected \
          from its first row through its last (so `copy` gets the whole command, \
          not the window's width of it), and a word straddling the wrap is \
@@ -985,7 +1000,7 @@ pub const VERBS: &[VerbSpec] = &[
         ConfigWrite,
         Status,
         App,
-        "settings [open|close|toggle], or `settings set|unset <key> [value...]`",
+        "settings [open|close|toggle|section <name>]; `settings set|unset <key> [value...]`",
         "",
     ),
     v(
@@ -1082,7 +1097,9 @@ pub const VERBS: &[VerbSpec] = &[
          painted (`rainbow`/`forge`/`phaser`/`bolt`/`comet`/`droplet`/`beamrod`, or `none` \
          for the terminal's own cursor colour), `block_fill_rgb=` is the hex it drew, and \
          `block_fill_base=`/`block_fill_base_from=` are the colour that body was built \
-         FROM and which knob supplied it (`cursor_color`/`trail_color`/`style_identity`) — \
+         FROM and which source supplied it (`cursor_color`/`trail_color`/`style_identity`, \
+         or `white` — a CursorColor-based owner handed no pinned cursor colour builds from \
+         the theme-polar white, and the shipped-default rainbow style takes that path) — \
          so a caret that ignored OSC 12 is separable from one that honoured it. Read-only; \
          typed text is never reported",
     ),
@@ -1098,7 +1115,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "custody: why the reading position or the highlight last moved",
-        "— one `last=<transition|none> event=<0-7|-> changed=<transition|none> offset= \
+        "— one `last=<transition|none> event=<0-7|-> changed=<transition|none> \
+         took_selection=<transition|none> offset= \
          owner=user|tail selection=yes|no scrollback=` line naming the PressCustody transition \
          the engine recorded: a press (TypingPress, RepeatPress, InertPress, ReleaseEvent), a \
          gesture (UserScroll, UserSelect, UserClear), or output (OutputAtLive, \
@@ -1113,7 +1131,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "toggle the drop-target highlight",
+        "hover <on|off>: set the drop-target highlight (no toggle form)",
         "",
     ),
     // session lifecycle
@@ -1198,9 +1216,12 @@ pub const VERBS: &[VerbSpec] = &[
          absent human forever; a timeout there is an ordinary timeout reply, not an error. A \
          latch says aterm's own posture CHANGED, not that a human \
          answered a dialog (aterm cannot observe the answer), and a change becomes observable \
-         within one probe interval plus a polling tick. Every form answers `OK <predicate> <seq>` \
-         on a latch and `OK timeout` otherwise, which the client exits 124 on. One control lane \
-         per parked wait, so park at most one per driver.",
+         within one probe interval plus a polling tick. The kernel forms \
+         (idle/seq/match/block) and the inbox ROW latch answer `OK <predicate> <seq>` on a \
+         latch; `await consent` latches as `OK consent fs_consent= fda= attribution= \
+         elapsed_ms=` (no seq), and `await inbox`'s hold-TRANSITION latch answers `OK inbox \
+         hold=0|1`. Every form answers `OK timeout` otherwise, which the client exits 124 on. \
+         One control lane per parked wait, so park at most one per driver.",
     ),
     v(
         "wait",
@@ -1466,8 +1487,9 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "PRESENCE: per session driving=<turn-id|-> watchers=<n> turns=<n> - the hand + the eye.",
-        "Owner-only",
+        "PRESENCE: per session driving= watchers=<n> turns=<n> - the hand + the eye.",
+        "Owner-only. driving= is `<turn-id>` under a live turn, `lease:<holder>` under a \
+         cooperative drive lease (the `lease` verb's surfacing), and `-` when nobody drives.",
     ),
     // `exits` reads the instance's roster journal — every sid the instance ever
     // hosted — so it is Owner-gated like `sessions`, whose past it is.

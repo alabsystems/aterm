@@ -1494,9 +1494,17 @@ fn preverify_staged_handoff_candidate_at(
     expected_commit: Option<&str>,
 ) -> Result<(), String> {
     // Serialize against a concurrent publication/apply exactly like the swap
-    // path: verifying a half-published candidate proves nothing. Held only for
-    // the verification itself; readers are all still live during this wait.
-    let _lock = FileLock::acquire(&staging.apply_lock)
+    // path: verifying a half-published candidate proves nothing.
+    //
+    // BOUNDED, like the launch path's taker at `apply_staged_if_ready` and for
+    // a harsher reason: the seamless worker calls this with EVERY PTY reader
+    // already parked — the whole terminal frozen. An unbounded `acquire`
+    // against a wedged holder (SIGSTOPped, debugger, dead volume) froze the
+    // screen indefinitely, deferred Cmd+Q behind the stuck attempt, and made
+    // every later apply answer "an update handoff is already in flight"
+    // (2026-09-01 audit). A timeout is an ordinary refusal: overlap rolls
+    // back, readers resume, the stage stays armed for the next attempt.
+    let _lock = FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
         .map_err(|error| format!("pre-verify lock: {error}"))?;
     let ready = match read_ready(staging, current_build) {
         ReadyState::Newer(ready) => ready,

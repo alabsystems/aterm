@@ -2435,7 +2435,16 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         record_covered_stage_status(&staging, current_build, &manifest);
-        return Ok(None);
+        // ANSWER `Some`, exactly as the check loop's contract says: "the check
+        // also answers `Some` for a build that was already published and is
+        // only waiting to be applied". These two covered arms answered `None`,
+        // so `on_staged` never fired for a stage some SIBLING process won the
+        // race to publish — and every `aterm` session process runs this
+        // checker, so on a daily driver the GUI lost that race about half the
+        // time per release and its in-session apply lane never armed: the
+        // staged build sat "verified and ready" until a relaunch (2026-09-01
+        // audit; the GUI side is idempotent — `arm` dedups the armed build).
+        return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
     }
 
     // If this exact build already failed to stage, don't re-download the (up to
@@ -2491,11 +2500,13 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let _stage_lock = aterm_update_core::FileLock::acquire(&staging.stage_lock)
         .map_err(|e| format!("stage lock: {e}"))?;
     // Re-check under the lock: another instance may have just staged this build.
-    // Same terminal-healthy reasoning as the pre-lock check above.
+    // Same terminal-healthy reasoning as the pre-lock check above — and the same
+    // `Some` answer, so the sibling's freshly-won stage arms THIS process's
+    // apply lane too.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
         record_covered_stage_status(&staging, current_build, &manifest);
-        return Ok(None);
+        return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
     }
     // Under the same lock, re-read the roster floor: a concurrent instance may have
     // observed a newer roster generation after this check's admission. Nothing signed

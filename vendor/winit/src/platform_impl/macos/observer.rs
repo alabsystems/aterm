@@ -1,3 +1,7 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (`RunLoop::main`, `setup_control_flow_observers` and this file's internal
+//  handlers take `aterm_objc::MainThread` instead of objc2's
+//  `MainThreadMarker`; the file's only remaining third-party name is `block2`.)
 //! Utilities for working with `CFRunLoop`.
 //!
 //! See Apple's documentation on Run Loops for details:
@@ -19,8 +23,16 @@ use core_foundation::runloop::{
     CFRunLoopObserverRef, CFRunLoopRef, CFRunLoopTimerCreate, CFRunLoopTimerInvalidate,
     CFRunLoopTimerRef, CFRunLoopTimerSetNextFireDate, CFRunLoopWakeUp,
 };
-use objc2_foundation::MainThreadMarker;
 use tracing::error;
+
+// LOCAL PATCH (aterm): `objc2_foundation::MainThreadMarker` became
+// `aterm_objc::MainThread`. Every marker in this file is a WITNESS ONLY —
+// `stop_app_on_panic`, `ApplicationDelegate::get` and `RunLoop::main` are all
+// first-party, and `RunLoop::main` discards it — so nothing here was pinned by
+// a framework binding and the file needed no `seam::marker` crossing at all.
+// That is what makes this file, and `window_delegate.rs`, the two the
+// substitution actually frees.
+use aterm_objc::MainThread;
 
 use super::app_state::ApplicationDelegate;
 use super::event_loop::{stop_app_on_panic, PanicInfo};
@@ -40,7 +52,7 @@ where
     // However we want to keep that weak reference around after the function.
     std::mem::forget(info_from_raw);
 
-    let mtm = MainThreadMarker::new().unwrap();
+    let mtm = MainThread::new().unwrap();
     stop_app_on_panic(mtm, Weak::clone(&panic_info), move || {
         let _ = &panic_info;
         f(panic_info.0)
@@ -59,7 +71,7 @@ extern "C" fn control_flow_begin_handler(
             match activity {
                 kCFRunLoopAfterWaiting => {
                     // trace!("Triggered `CFRunLoopAfterWaiting`");
-                    ApplicationDelegate::get(MainThreadMarker::new().unwrap()).wakeup(panic_info);
+                    ApplicationDelegate::get(MainThread::new().unwrap()).wakeup(panic_info);
                     // trace!("Completed `CFRunLoopAfterWaiting`");
                 },
                 _ => unreachable!(),
@@ -81,7 +93,7 @@ extern "C" fn control_flow_end_handler(
             match activity {
                 kCFRunLoopBeforeWaiting => {
                     // trace!("Triggered `CFRunLoopBeforeWaiting`");
-                    ApplicationDelegate::get(MainThreadMarker::new().unwrap()).cleared(panic_info);
+                    ApplicationDelegate::get(MainThread::new().unwrap()).cleared(panic_info);
                     // trace!("Completed `CFRunLoopBeforeWaiting`");
                 },
                 kCFRunLoopExit => (), // unimplemented!(), // not expected to ever happen
@@ -101,8 +113,9 @@ impl Default for RunLoop {
 }
 
 impl RunLoop {
-    pub fn main(mtm: MainThreadMarker) -> Self {
-        // SAFETY: We have a MainThreadMarker here, which means we know we're on the main thread, so
+    pub fn main(mtm: MainThread) -> Self {
+        // SAFETY: We have a main-thread witness here, which means we know we're on the main
+        // thread, so
         // scheduling (and scheduling a non-`Send` block) to that thread is allowed.
         let _ = mtm;
         RunLoop(unsafe { CFRunLoopGetMain() })
@@ -202,7 +215,7 @@ impl RunLoop {
     }
 }
 
-pub fn setup_control_flow_observers(mtm: MainThreadMarker, panic_info: Weak<PanicInfo>) {
+pub fn setup_control_flow_observers(mtm: MainThread, panic_info: Weak<PanicInfo>) {
     let run_loop = RunLoop::main(mtm);
     unsafe {
         let mut context = CFRunLoopObserverContext {

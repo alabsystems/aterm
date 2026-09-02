@@ -484,9 +484,36 @@ impl MonitorHandleExtMacOS for MonitorHandle {
     }
 
     fn ns_screen(&self) -> Option<*mut c_void> {
-        // SAFETY: We only use the marker to get a pointer
-        let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
-        self.inner.ns_screen(mtm).map(|s| objc2::rc::Retained::as_ptr(&s) as _)
+        // LOCAL PATCH (aterm), W9: `MonitorHandle::ns_screen` takes
+        // `aterm_objc::MainThread` now (see `platform_impl/macos/monitor.rs`), so the
+        // unchecked mint is that crate's.
+        //
+        // W9 PHASE 3: and the `objc2::rc::Retained::as_ptr` that used to be on
+        // the last line is gone with it. THIS FILE IS COMPILED ON macOS and was
+        // the only `objc2` use in `src/platform/` — invisible to both endgame
+        // metrics, because both were scoped to `platform_impl/macos` and
+        // `aterm-gui/src`. An exit condition that cannot see a live use is not
+        // an exit condition; the scope is widened in
+        // `crates/aterm-objc/tests/objc2_exit_condition.rs`, and the pointer is
+        // taken by `MonitorHandle::ns_screen_ptr` now, at the same +0 and with
+        // the same lifetime wart.
+        //
+        // ONE BEHAVIOUR DIFFERENCE, and it is stated rather than absorbed: the
+        // backend re-derives an objc2 marker through `aterm_objc_seam::marker`,
+        // which ASKS. Called off the main thread this used to reach
+        // `+[NSScreen screens]` on the strength of upstream's "SAFETY: We only use
+        // the marker to get a pointer" — which is not what the marker means — and
+        // now panics with the thread named instead. Nothing in this tree calls this
+        // trait method (`grep MonitorHandleExtMacOS` finds only its declaration and
+        // this impl); it is kept for winit API compatibility, so the difference is
+        // reachable only by a downstream user who was already doing the unsound
+        // thing.
+        //
+        // SAFETY: unchanged from upstream — the caller of this public trait method
+        // is the one asserting the main thread, and this mint records that rather
+        // than establishing it.
+        let mtm = unsafe { aterm_objc::MainThread::new_unchecked() };
+        self.inner.ns_screen_ptr(mtm)
     }
 }
 

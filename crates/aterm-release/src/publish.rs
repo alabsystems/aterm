@@ -5212,7 +5212,9 @@ pub struct SigningVerdict {
     /// The verdict the pipeline has always carried.
     pub policy: SignaturePolicy,
     /// WHICH machine the roster says this key is, when the tier is armed. `None`
-    /// with an unpinned master — which is every cut this tree can make.
+    /// with an unpinned master — a FORK or a pre-v0.21.0 build, never this tree, whose
+    /// master has been armed since 2026-08-15. (WRONG BEFORE: "which is every cut this
+    /// tree can make".)
     pub attribution: Option<roster::Attribution>,
     /// The exact roster bytes that authorized the cut, to be published as assets so
     /// clients can check the same document. `None` exactly when `attribution` is.
@@ -5251,9 +5253,10 @@ struct CutAttribution {
 }
 
 impl CutAttribution {
-    /// Nothing to stamp and nothing to stage — every cut this tree makes, and every
-    /// resume past `build`, where the manifest already carries its attribution and the
-    /// roster assets are already on disk.
+    /// Nothing to stamp and nothing to stage — a FORK's cut (this tree's master has been
+    /// armed since 2026-08-15, so its cuts stamp; WRONG BEFORE this said "every cut this
+    /// tree makes"), and every resume past `build`, where the manifest already carries its
+    /// attribution and the roster assets are already on disk.
     const fn none() -> Self {
         Self {
             machine_id: None,
@@ -5266,9 +5269,9 @@ impl CutAttribution {
 /// May a resume that re-authorized as `observed` continue a cut the journal says was
 /// started by `journaled`?
 ///
-/// Only if they are the same machine — including "both nameless", which is every cut
-/// made while the paper master is unpinned. The asymmetric cases are the interesting
-/// ones and both must refuse:
+/// Only if they are the same machine — including "both nameless", which is every cut made
+/// while the paper master is unpinned: a fork, or this tree before 2026-08-15. The
+/// asymmetric cases are the interesting ones and both must refuse:
 ///
 /// * journaled `Some`, observed `None` — the cut was authorized by a roster and this
 ///   resume has none. Continuing would rebuild and re-sign a manifest whose
@@ -5277,9 +5280,11 @@ impl CutAttribution {
 ///   published (or already built) bytes carry no attribution, so finishing under one
 ///   would produce a release whose halves disagree.
 ///
-/// A pure rule with a name, rather than an inline `!=`, because it is the only part
-/// of the resume path the empty anchor makes unreachable — and an unreachable rule
-/// with no test is a rule that rots for exactly as long as nobody would notice.
+/// A pure rule with a name, rather than an inline `!=`, because a FORK's empty anchor
+/// makes it the one part of the resume path that never runs there — and an unreachable
+/// rule with no test is a rule that rots for exactly as long as nobody would notice.
+/// WRONG BEFORE: "the only part of the resume path the empty anchor makes unreachable",
+/// as if this tree's anchor were empty; armed since 2026-08-15, every resume here runs it.
 pub fn resume_attribution_agrees(journaled: Option<&str>, observed: Option<&str>) -> Result<()> {
     if journaled == observed {
         return Ok(());
@@ -5295,10 +5300,11 @@ pub fn resume_attribution_agrees(journaled: Option<&str>, observed: Option<&str>
 ///
 /// The anchors are named here and nowhere below, exactly as [`resolve_apple_tier`]
 /// names `pins::APPLE_TEAM_ID` at the two cut entry points and passes it inward. That
-/// is what makes the armed path drivable by a test with a synthetic master: a
-/// resolver that read the constants itself would be inert in this tree — the master
-/// is unpinned — and its rules would be untestable for exactly as long as they are
-/// unused, which is exactly as long as nobody would notice them breaking.
+/// is what makes the armed path drivable by a test with a SYNTHETIC master: a resolver
+/// that read the constants itself could only ever be driven with the REAL master, whose
+/// secret half is on paper and belongs in no test. WRONG BEFORE: it said such a resolver
+/// "would be inert in this tree — the master is unpinned"; armed since 2026-08-15, the
+/// resolver would be live, and untestable, which is the stronger reason for the parameter.
 fn preflight_signature_policy(
     repo: &Path,
     creds: Option<&sign::ReleaseCredentials>,
@@ -5507,7 +5513,8 @@ pub fn stage_manifest(
 /// rather than re-read: publishing a roster other than the one that authorized the
 /// cut is the producer-side version of checking one document and using another.
 ///
-/// `None` — the shipped state — writes nothing and removes nothing, so an unarmed
+/// `None` — a FORK's cut, or one of this tree's from before 2026-08-15, when this doc
+/// still called it "the shipped state" — writes nothing and removes nothing, so an unarmed
 /// cut's `dist/` is exactly what it was. There is no "clean up a stale roster" branch
 /// on purpose: `validate_draft_asset_set` refuses any asset outside the exact allowed
 /// set, so a leftover file in `dist/` cannot become a published asset.
@@ -5724,8 +5731,9 @@ pub struct CutCtx {
     /// is still free — a claim burns a single-use build number, and discovering
     /// an empty keychain after that costs one.
     ///
-    /// `AppleTier::Inactive` whenever `pins::APPLE_TEAM_ID` is empty, which is
-    /// every build that ships today.
+    /// `AppleTier::Inactive` whenever `pins::APPLE_TEAM_ID` is empty, which is a FORK's
+    /// build — not this tree's, whose anchor has been armed ("A66A9P66Z7") since
+    /// 2026-08-15. WRONG BEFORE: "which is every build that ships today".
     pub apple: sign::AppleTier,
     pub repo: PathBuf,
     pub dist: PathBuf,
@@ -6083,7 +6091,9 @@ impl CutCtx {
         self.signature_machine_id.is_some()
     }
 
-    /// The two roster assets in `dist/`, or nothing at all on the shipped path.
+    /// The two roster assets in `dist/`, or nothing at all on an UNATTRIBUTED cut — a
+    /// fork's, or a resume past `build`. WRONG BEFORE: "on the shipped path"; this tree's
+    /// cuts have attributed since the master was armed on 2026-08-15.
     fn roster_asset_paths(&self) -> Vec<PathBuf> {
         if !self.attaches_roster() {
             return Vec::new();
@@ -8200,8 +8210,9 @@ fn resume_cut(
     // The `roster_tier_armed()` guard is what makes the unarmed resume path provably
     // unchanged: with `PAPER_MASTER_PUBKEYS` empty this block is not entered at all,
     // so a resume performs exactly the calls, in exactly the order, that it always
-    // has. The RULE inside it is a pure function ([`resume_attribution_agrees`]) so
-    // that being unreachable in this tree does not make it untested.
+    // has. The RULE inside it is a pure function ([`resume_attribution_agrees`]) so that
+    // a fork, where this guard is never entered, still tests it. WRONG BEFORE: "being
+    // unreachable in this tree" — armed since 2026-08-15, it runs on every resume here.
     let resumed = if aterm_update_core::pins::roster_tier_armed() && !journal.is_done("build") {
         let verdict = preflight_signature_policy(
             repo,
@@ -9049,9 +9060,10 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
-    // Tier APPLE, resolved once at the entry point. Inactive (the shipped tier)
-    // means `identity()` is None and every hook below is a no-op, leaving this
-    // region byte-for-byte the ad-hoc path it has always been.
+    // Tier APPLE, resolved once at the entry point. Inactive — a FORK's tier, not this
+    // tree's, ARMED since 2026-08-15 (WRONG BEFORE: "the shipped tier") — means
+    // `identity()` is None and every hook below is a no-op, leaving this region
+    // byte-for-byte the ad-hoc path it has always been.
     let sign_id = ctx.apple.identity();
     let signed_by = sign::sign_app(
         &app,
@@ -9335,17 +9347,19 @@ pub fn selfcheck_signing(
     tools: &dyn sign::AppleTools,
 ) -> Result<&'static str> {
     // The hard gate (sign.rs's inline verify print is advisory), on EVERY tier
-    // including the ad-hoc one that ships today.
+    // including the ad-hoc one a FORK ships. WRONG BEFORE: "that ships today" —
+    // `pins::APPLE_TEAM_ID` has been armed since 2026-08-15.
     tools.codesign_verify_strict(app).map_err(|e| {
         Error::new(format!(
             "self-check failed: codesign --verify --deep --strict: {e}"
         ))
     })?;
     if team.is_empty() {
-        // The shipped tier claims no team, so there is no notarization promise
-        // to keep and nothing further to prove. Note what is NOT done here: no
-        // Apple tool is spawned at all, so an inactive cut costs exactly what it
-        // did before Tier APPLE was wired.
+        // A cut that claims no team has no notarization promise to keep and nothing
+        // further to prove — a FORK's tier, not this tree's, armed since 2026-08-15
+        // (WRONG BEFORE: "the shipped tier claims no team"). Note what is NOT done here:
+        // no Apple tool is spawned at all, so an inactive cut costs exactly what it did
+        // before Tier APPLE was wired.
         return Ok("");
     }
     // Evidence gathered here, verdict passed in sign.rs — so the rules are
@@ -11970,8 +11984,10 @@ mod roster_wiring_tests {
             .collect()
     }
 
-    /// AN ATTRIBUTED CUT attaches the roster to everything that carries assets, and an
-    /// UNATTRIBUTED one — every cut this tree makes — attaches it to nothing.
+    /// AN ATTRIBUTED CUT attaches the roster to everything that carries assets — which is
+    /// every cut this tree makes, its master armed since 2026-08-15 — and an UNATTRIBUTED
+    /// one (a fork's, or a resume past `build`) attaches it to nothing. WRONG BEFORE: this
+    /// had it backwards, calling the unattributed cut "every cut this tree makes".
     ///
     /// Kills four mutations that were all silent: `attaches_roster()` returning false,
     /// `roster_asset_paths()` returning empty, dropping the roster from the upload set,
@@ -12006,8 +12022,10 @@ mod roster_wiring_tests {
             assert!(set.contains(&"aterm-appcast.toml".to_string()), "{set:?}");
         }
 
-        // THE SHIPPED PATH. An unattributed cut's sets are exactly what they were
-        // before the roster existed — the fleet-safety requirement, not a nicety.
+        // THE FORK / PRE-ROSTER PATH — this tree's own before 2026-08-15, when this
+        // comment still called it "THE SHIPPED PATH". An unattributed cut's sets are
+        // exactly what they were before the roster existed — the fleet-safety
+        // requirement, not a nicety.
         let plain = ctx(None);
         assert!(!plain.attaches_roster());
         assert!(plain.roster_asset_paths().is_empty());
@@ -12168,7 +12186,9 @@ mod roster_wiring_tests {
         assert_eq!(
             published_roster_seq(Some(&head(&unattributed))).unwrap(),
             None,
-            "an unrostered head imposes no floor — the shipped state"
+            // WRONG BEFORE: "the shipped state" — armed since 2026-08-15, this tree's
+            // heads are rostered.
+            "an unrostered head imposes no floor — the fork / pre-roster state"
         );
         assert_eq!(
             published_roster_seq(Some(&head(&attributed))).unwrap(),

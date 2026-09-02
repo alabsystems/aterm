@@ -327,8 +327,13 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg verify-index | verify-pkg <args…>
                              run the client's full trust chain over index/roster or
                              pkg-manifest files on disk (operator / mirror self-check)
-  aterm pkg relocate <stage> producer pack-time: vendor machine-local dylibs into the
-                             staged sysroot so the signed tarball is self-contained
+  aterm pkg relocate <stage> [--sign <identity>] [--advisory]
+                             producer pack-time: vendor machine-local dylibs into the
+                             staged sysroot so the signed tarball is self-contained.
+                             --sign re-signs with the named identity; --advisory
+                             reports instead of failing. The flags were omitted here
+                             for a full audit cycle, in the one verb where signing
+                             with the wrong identity is the cost (audit D-5)
 
 WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see

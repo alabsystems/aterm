@@ -42,6 +42,17 @@ pub fn debug_bin(root: &Path, cargo_target_dir: Option<&OsStr>, name: &str) -> P
     dir.join("debug").join(name)
 }
 
+/// The same, for a `[[example]]` target — cargo puts those under
+/// `<target>/debug/examples/`, not beside the binaries.
+///
+/// A separate function rather than a `name` a caller spells with a slash: the
+/// layout is cargo's, and a caller encoding it in a string is a caller that
+/// will be wrong on the day it changes.
+#[must_use]
+pub fn debug_example(root: &Path, cargo_target_dir: Option<&OsStr>, name: &str) -> PathBuf {
+    debug_bin(root, cargo_target_dir, "examples").join(name)
+}
+
 /// Pull `<field>=<digits>` out of a metrics reply.
 ///
 /// Faithful to the script's `sed -n "s/.*[[:space:]]$2=\([0-9][0-9]*\).*/\1/p"`,

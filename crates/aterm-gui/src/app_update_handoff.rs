@@ -2969,7 +2969,17 @@ fn optional_carry_fits(
 /// status bar's posture share.
 #[must_use]
 pub(crate) fn seamless_handoff_opted_out() -> bool {
-    std::env::var_os("ATERM_NO_SEAMLESS_UPDATE").is_some()
+    // Value semantics via the ONE shared flag rule (`env_flag_engaged`):
+    // unset, EMPTY and "0" are NOT an opt-out. `is_some()` here made a
+    // present-but-empty inherited var silently reroute every update to the
+    // cold lane — the same species as the empty-$ATERM_CONTROL_SOCK veto
+    // fixed on 2026-09-01, and inconsistent with $ATERM_NO_CONTROL_SOCK,
+    // whose empty value has always meant "not disabled".
+    aterm_types::control_socket::env_flag_engaged(
+        std::env::var_os("ATERM_NO_SEAMLESS_UPDATE")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
+    )
 }
 
 /// Why the in-session overlap handoff cannot run in THIS process. ONE predicate
@@ -2992,6 +3002,17 @@ pub(crate) enum HandoffUnavailable {
     /// path. The successor inherits the variable and would come up on the same
     /// path, which explicit paths keep under the strict never-hijack probe
     /// (`control.rs`) while this process still holds it.
+    ///
+    /// HOLDS ONLY FOR AN ACTUAL EXPLICIT PATH — the same
+    /// [`aterm_types::control_socket::socket_directive`] reading the socket
+    /// plan binds by. An EMPTY value means the per-instance default
+    /// (`aterm-<pid>.sock`, collision-free by construction) and `0`/`off`
+    /// means no socket at all; neither has the shared-path hazard. The old
+    /// `var_os(..).is_some()` read called both "explicit": a daily driver
+    /// launched from a shell that happened to export an empty
+    /// `ATERM_CONTROL_SOCK` bound its default socket like any other instance
+    /// yet had every seamless apply refused — 23 consecutive automatic-apply
+    /// failures on the owner's own terminal before the 2026-09-01 diagnosis.
     ExplicitControlSock,
     /// `--headless` / `$ATERM_HEADLESS`: no window to hand across.
     Headless,
@@ -3018,7 +3039,9 @@ impl HandoffUnavailable {
     pub(crate) fn cause(self) -> &'static str {
         match self {
             Self::OptedOut => "$ATERM_NO_SEAMLESS_UPDATE is set",
-            Self::ExplicitControlSock => "$ATERM_CONTROL_SOCK is set (--control-sock)",
+            Self::ExplicitControlSock => {
+                "$ATERM_CONTROL_SOCK names an explicit socket path (--control-sock)"
+            }
             Self::Headless => "--headless (no window)",
             Self::NoEventLoopProxy => "no event loop",
         }
@@ -3041,11 +3064,33 @@ impl HandoffUnavailable {
     fn holds_for(self, app: &App) -> bool {
         match self {
             Self::OptedOut => seamless_handoff_opted_out(),
-            Self::ExplicitControlSock => std::env::var_os("ATERM_CONTROL_SOCK").is_some(),
+            Self::ExplicitControlSock => control_sock_is_explicit(
+                std::env::var_os("ATERM_CONTROL_SOCK")
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .as_deref(),
+                std::env::var_os("ATERM_NO_CONTROL_SOCK")
+                    .map(|v| v.to_string_lossy().into_owned())
+                    .as_deref(),
+            ),
             Self::Headless => app.headless,
             Self::NoEventLoopProxy => app.proxy.is_none(),
         }
     }
+}
+
+/// Whether these `$ATERM_CONTROL_SOCK` / `$ATERM_NO_CONTROL_SOCK` values name
+/// an EXPLICIT socket path — decided by the ONE engine-side reading the socket
+/// plan itself binds by ([`aterm_types::control_socket::socket_directive`],
+/// via `control_auth::resolve_socket_plan`), so the update gate can never
+/// disagree with the bind about what the variable means. Unset and EMPTY are
+/// the per-instance default; `0`/`off` (either variable) is a DISABLED socket;
+/// only a real path carries the shared-path collision the seamless lane must
+/// refuse.
+fn control_sock_is_explicit(sock: Option<&str>, no_sock: Option<&str>) -> bool {
+    matches!(
+        aterm_types::control_socket::socket_directive(sock, no_sock),
+        aterm_types::control_socket::SocketDirective::Explicit(_)
+    )
 }
 
 impl App {
@@ -3177,12 +3222,13 @@ impl App {
                     crate::native_update_admission::ApplyLane::Cold,
                 ) if live_ptys == 0 => {}
                 crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                    return Err(crate::UpdateHandoffStartError::failed(
+                    // Refusal, not failure — the unix arm's law.
+                    return Err(crate::UpdateHandoffStartError::refused(
                         reason.message(facts),
                     ));
                 }
                 _ => {
-                    return Err(crate::UpdateHandoffStartError::failed(
+                    return Err(crate::UpdateHandoffStartError::refused(
                         "Windows update replacement requires an exact zero-session state",
                     ));
                 }
@@ -3363,7 +3409,12 @@ impl App {
         };
         match crate::native_update_admission::classify(facts) {
             crate::native_update_admission::AdmissionDecision::Block(reason) => {
-                return Err(crate::UpdateHandoffStartError::failed(
+                // A Block is a REFUSAL TO ATTEMPT, never a failed attempt — see
+                // [`crate::UpdateHandoffStartError::Refused`]. Minting it as
+                // `failed` counted every deterministic "the seamless lane is
+                // unavailable here" as a hard apply failure (the field's
+                // failing_applies=23) and erased the standing explanation.
+                return Err(crate::UpdateHandoffStartError::refused(
                     reason.message(facts),
                 ));
             }
@@ -5150,6 +5201,38 @@ mod capture_budget_reservation_tests {
                 );
             }
         }
+    }
+
+    /// REGRESSION (the desk that could not update, part two — 2026-09-01). The
+    /// seamless gate's `ExplicitControlSock` reason used to hold for ANY
+    /// present `$ATERM_CONTROL_SOCK`, while the socket plan reads the same
+    /// variable through `socket_directive`, where EMPTY means the
+    /// per-instance default and `0`/`off` means no socket at all. A daily
+    /// driver that inherited an empty value from its launching shell bound
+    /// its default `aterm-<pid>.sock` like any other instance — no shared
+    /// path, no collision — yet every automatic seamless apply was refused
+    /// (23 consecutive failures in the field log). The gate now asks the one
+    /// engine-side reading the bind uses: only a REAL path holds the reason.
+    #[test]
+    fn only_a_real_control_sock_path_disables_the_seamless_lane() {
+        use crate::app_update_handoff::control_sock_is_explicit;
+        // The hazard: a genuinely explicit shared path.
+        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), None));
+        // The field case: empty = the per-instance default socket.
+        assert!(!control_sock_is_explicit(Some(""), None));
+        // Unset = the per-instance default socket.
+        assert!(!control_sock_is_explicit(None, None));
+        // A disabled socket has no path to collide on.
+        assert!(!control_sock_is_explicit(Some("0"), None));
+        assert!(!control_sock_is_explicit(Some("off"), None));
+        assert!(!control_sock_is_explicit(Some("OFF"), None));
+        // `$ATERM_NO_CONTROL_SOCK` wins: no socket, no collision, whatever
+        // the path variable says.
+        assert!(!control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("1")));
+        // …but its inert spellings do not disable the socket, so the path
+        // stays explicit.
+        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("0")));
+        assert!(control_sock_is_explicit(Some("/tmp/x/c.sock"), Some("")));
     }
 
     /// The exact boundary the reservation establishes: a session is refused if and

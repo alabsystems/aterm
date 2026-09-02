@@ -136,6 +136,21 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // per-instance socket and never unlinks/steals the parent's explicit path.
     "ATERM_CONTROL_SOCK",
     "ATERM_NO_CONTROL_SOCK",
+    // Update-contract knobs: never inherit into child SHELLS, for the same
+    // one-hop reason as the socket selectors — an aterm launched from an aterm
+    // shell must make its own update decisions, not run under a veto (or a QA
+    // seam) the parent's environment happened to carry. The 2026-09-01 field
+    // bug was exactly this shape: an inherited-but-empty selector rerouted the
+    // updater of a daily driver for its whole process lifetime. The vars stay
+    // settable ON PURPOSE at launch; they just do not propagate through a
+    // shell hop.
+    "ATERM_NO_AUTO_UPDATE",
+    "ATERM_NO_AUTO_APPLY",
+    "ATERM_NO_SEAMLESS_UPDATE",
+    "ATERM_DEBUG_SEAMLESS_REEXEC",
+    "ATERM_DEBUG_RELAUNCH_NUDGE",
+    "ATERM_UPDATE_ROOT",
+    "ATERM_UPDATE_INTERVAL_SECS",
     // Network-drive selectors: never inherit, so a nested aterm cannot open a
     // second network control surface and the operator's key path is not fanned
     // into every descendant (only the explicitly-configured root binds).
@@ -271,6 +286,31 @@ mod tests {
         }
         // Shell-integration ATERM_* vars are still preserved (not over-broad).
         assert!(!is_ai_env_var("ATERM_SHELL_INTEGRATION_DIR"));
+    }
+
+    /// The update-contract knobs are denied by exact name (2026-09-01): a
+    /// nested aterm launched from an aterm shell makes its own update
+    /// decisions — no inherited veto, no inherited QA seam. Each name here has
+    /// a real reader: enabled()/spawn_background_check (ATERM_NO_AUTO_UPDATE),
+    /// update_auto_apply_setting (ATERM_NO_AUTO_APPLY),
+    /// seamless_handoff_opted_out (ATERM_NO_SEAMLESS_UPDATE),
+    /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC),
+    /// relaunch_nudge_seam (ATERM_DEBUG_RELAUNCH_NUDGE), seal_guard's
+    /// updates_root (ATERM_UPDATE_ROOT), and the check cadence
+    /// (ATERM_UPDATE_INTERVAL_SECS).
+    #[test]
+    fn test_update_contract_vars_are_denied_by_name() {
+        for v in [
+            "ATERM_NO_AUTO_UPDATE",
+            "ATERM_NO_AUTO_APPLY",
+            "ATERM_NO_SEAMLESS_UPDATE",
+            "ATERM_DEBUG_SEAMLESS_REEXEC",
+            "ATERM_DEBUG_RELAUNCH_NUDGE",
+            "ATERM_UPDATE_ROOT",
+            "ATERM_UPDATE_INTERVAL_SECS",
+        ] {
+            assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
+        }
     }
 
     /// L3 network drive: the listener bind address + the operator's TLS cert/key

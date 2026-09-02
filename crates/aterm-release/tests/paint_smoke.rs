@@ -111,9 +111,10 @@ impl publish::PaintProbe for FakePaintProbe {
     }
 }
 
-/// A healthy Apple-side machine that records every spawn. With an EMPTY team —
-/// the tier every cut ships today — `selfcheck_signing` runs exactly one of
-/// these: `verify_strict`.
+/// A healthy Apple-side machine that records every spawn. With an EMPTY team — a fork's
+/// tier, and this tree's before `APPLE_TEAM_ID` was armed on 2026-08-15, which is what
+/// this doc used to call "the tier every cut ships today" — `selfcheck_signing` runs
+/// exactly one of these: `verify_strict`.
 struct RecordingTools {
     log: Log,
 }

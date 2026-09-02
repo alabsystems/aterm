@@ -6561,8 +6561,28 @@ impl App {
         // The retained custom strip must be inside the selected titlebar root.
         // Otherwise the snapshot would silently omit native tabs or the '+' button.
         if let Some(toolbar) = self._toolbars.get(&wid) {
-            let strip = crate::toolbar::native_strip_container(toolbar);
-            if !macos_view_is_ancestor_of(&chrome_root, &strip)? {
+            // THE SEAM, and it lives HERE on purpose. `toolbar.rs` is ported
+            // whole off `objc2` (W7) and hands back the first-party `Obj`; this
+            // module is on the list of what is still `objc2` and goes whole or
+            // not at all, so the one crossing between them is one line in the
+            // UNPORTED module rather than the last `objc2` type in the ported
+            // one. `grep -n native_strip_container` finds exactly this site.
+            // THE OWNER IS NAMED AND IT IS NOT SHADOWED. `native_strip_container`
+            // hands back a +1 `Obj`; the `&NSView` below is that retain
+            // reinterpreted, and the only thing keeping it valid is the retain.
+            // This used to bind both to `strip`, which was sound — a shadowed
+            // binding lives to the end of its scope — but sound BY NAMING: the
+            // link ran through a raw pointer, so renaming the owner and dropping
+            // it would have compiled. `appkit::objc2_ref` now takes `&Obj` and
+            // elides the lifetime, so the borrow is the compiler's business:
+            // `drop(strip_owner)` before the last use of `strip` is an error.
+            // SAFETY: the handle's container is a live `NSView` — `toolbar.rs`
+            // built it with `+[NSView alloc] -initWithFrame:` and retains it for
+            // the handle's lifetime — and `objc2`'s `NSView` is a zero-sized
+            // marker at the instance address, so this borrows no bytes of its own.
+            let strip_owner = crate::toolbar::native_strip_container(toolbar);
+            let strip: &NSView = unsafe { crate::appkit::objc2_ref(&strip_owner) };
+            if !macos_view_is_ancestor_of(&chrome_root, strip)? {
                 return Err(
                     "window capture could not isolate the complete AppKit toolbar subtree"
                         .to_string(),

@@ -23414,7 +23414,16 @@ impl CursorGlow {
             // ZOOM streak should hang long enough to READ as a streak
             // (owner, 2026-08-29). The distance grade is kept; the floor and
             // ceiling both rise.
-            (0.45 + 0.014 * dist).clamp(0.45, 1.10),
+            // SHORTENED 0.45..1.10 -> 0.30..0.72 (owner, 2026-09-02: snappy).
+            // The two lengthenings above were both answers to "the streak is
+            // gone before I can read it", and both spent their fix on TIME
+            // while the curve above was holding the mark bright for most of
+            // it. With the decay front-loaded, the readable part of the mark
+            // now happens in the first third of its life, so the life itself
+            // can come back down without returning to the flicker the
+            // 0.26 s note describes: what a reader sees is a bright streak and
+            // a decaying tail, not a bar that waits.
+            (0.30 + 0.010 * dist).clamp(0.30, 0.72),
             // …AND the distance, which it never did before: the ZOOM's only
             // distance term was its life, so a screen-crossing fling drew the
             // same bar as a two-cell hop and merely held it longer.
@@ -24250,7 +24259,30 @@ impl CursorGlow {
                     j.y0 + (j.y1 - j.y0) * rebased,
                 );
                 u = rebased;
-                fade = 1.0 - rebased * rebased; // hold bright, then drop away
+                // **A METEOR DROPS, IT DOES NOT HOLD** (owner, 2026-09-02:
+                // "FAST like meteor and then nicely fade… feeling snappy is
+                // important"). The retired curve was `1 - u^2`, which is a
+                // HOLD: still 75 % bright at the halfway point and 44 % at
+                // three-quarters, so over a life that reached 1.1 s the mark
+                // sat on the glass at readable brightness long after the
+                // gesture that made it. That is what reads as a lingering
+                // smear rather than speed — and a wide, dim, long-lived smear
+                // over the page is also where "grey" gets reported, because a
+                // barely-lit coloured pixel is barely a colour.
+                //
+                // `(1 - u)^2` is the same family run the other way: 56 % at a
+                // quarter, 25 % at half, 6 % at three-quarters. The light is
+                // spent EARLY, next to the flight that earned it, and what is
+                // left is a thin decaying tail rather than a bar. Snappy at
+                // the front, graceful at the back, and the total life below
+                // still bounds it.
+                //
+                // FADE MOVES ALPHA, NEVER CHROMA — the one invariant this
+                // family keeps getting wrong. A dim pixel is a dim COLOUR; a
+                // desaturated one is grey. `the_jump_streak_is_never_grey_on_glass`
+                // holds that end.
+                let drop = 1.0 - rebased;
+                fade = drop * drop;
             }
             if fade <= 0.02 {
                 continue;
@@ -28409,9 +28441,23 @@ impl CursorGlow {
         // top + bottom
         push_rect(out, geom, cx - s, cy - s, 2 * s, th, premul);
         push_rect(out, geom, cx - s, cy + s - th, 2 * s, th, premul);
-        // left + right (split per row inside push_rect)
-        push_rect(out, geom, cx - s, cy - s, th, 2 * s, premul);
-        push_rect(out, geom, cx + s - th, cy - s, th, 2 * s, premul);
+        // left + right, INSET by the bar thickness at both ends so the four
+        // bars PARTITION the outline. Full-height verticals re-covered the
+        // th×th corner blocks the horizontals already own, and the stream is
+        // additive One/One — every corner composited twice and read as a ~2×
+        // lit rivet on the expanding square (the rainbow-comb ownership bug's
+        // sibling, found by the 2026-09-01 audit). `2s − 2th > 0` always:
+        // s ≥ 0.6·ch ≥ 19 while th = 2.
+        push_rect(out, geom, cx - s, cy - s + th, th, 2 * s - 2 * th, premul);
+        push_rect(
+            out,
+            geom,
+            cx + s - th,
+            cy - s + th,
+            th,
+            2 * s - 2 * th,
+            premul,
+        );
         // No trailing SECOND ring here: fire's aftershock rides its radial
         // flash and water's ripple train rides its elliptical branch — both
         // return above, so the square outline stays a single clean ping for
@@ -29787,6 +29833,13 @@ fn push_halo_over(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    // The falloff centre is stored TRUE, or the halo is culled — the same law
+    // as [`push_halo`] above: a centre clamped into the box relocated the
+    // radial peak onto the edge for the sliver frames of anything sliding off
+    // the grid (2026-09-01 audit).
+    if cxi < 0 || cyi < 0 {
+        return;
+    }
     let ch = geom.ch as i32;
     let oy = geom.origin_y as i32;
     let mut yy = y0;
@@ -29802,8 +29855,8 @@ fn push_halo_over(
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color,
-            cx: cxi.clamp(0, br) as u16,
-            cy: cyi.clamp(0, bb) as u16,
+            cx: cxi as u16,
+            cy: cyi as u16,
             rx: rxi as u16,
             ry: ryi as u16,
             mode: HaloMode::Over,
@@ -29918,6 +29971,19 @@ fn push_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, rx: f32, ry:
     {
         return;
     }
+    // THE CENTRE IS THE FALLOFF'S TRUTH — store it, never clamp it into the
+    // box. Clamping `cxi` to `br` moved an off-right centre ONTO the edge, so
+    // the surviving 1..r-px sliver of a particle sliding off the grid rendered
+    // at 41-96% of peak radial weight where the true falloff says ~0 — a
+    // bright fringe pinned against the boundary that then popped off
+    // (2026-09-01 audit; both backends read this same field). A positive
+    // overshoot fits u16 (`br + rxi` is far under 65536); a NEGATIVE centre
+    // cannot be represented, so cull the halo instead — reachable only when
+    // the box starts at 0, and the surviving band is at most r px of the
+    // falloff's own dim tail.
+    if cxi < 0 || cyi < 0 {
+        return;
+    }
     let ch = geom.ch as i32;
     let oy = geom.origin_y as i32;
     let mut yy = y0;
@@ -29932,8 +29998,8 @@ fn push_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, rx: f32, ry:
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color: peak,
-            cx: cxi.clamp(0, br) as u16,
-            cy: cyi.clamp(0, bb) as u16,
+            cx: cxi as u16,
+            cy: cyi as u16,
             rx: rxi as u16,
             ry: ryi as u16,
             // Defaulted `mode: HaloMode::Add` — the historical light.
@@ -58539,6 +58605,108 @@ mod tests {
         );
     }
 
+    /// The landing ring's four bars PARTITION the square outline: no pixel is
+    /// owned by two bars. The full-height verticals used to re-cover the th×th
+    /// corner blocks the horizontals already own — an additive double-add that
+    /// lit every corner of the expanding square as a ~2× "rivet" (the
+    /// rainbow-comb ownership bug's sibling, 2026-09-01 audit). The outline
+    /// must also stay CLOSED: every edge of the square keeps its light.
+    #[test]
+    fn landing_ring_bars_partition_the_square_outline() {
+        let g = geom();
+        let born = Instant::now();
+        let c = cfg(GlowStyle::Phaser, true);
+        // Sweep the ring's life so every expansion size s is exercised.
+        for ms in [10u64, 60, 120, 170] {
+            let ring = Ring {
+                cx: 100.0,
+                cy: 40.0,
+                born,
+                life: 0.30,
+            };
+            let glow = CursorGlow {
+                ring: Some(ring),
+                ..Default::default()
+            };
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_ring(
+                born + Duration::from_millis(ms),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
+            assert!(!out.is_empty(), "the dark square outline draws at {ms}ms");
+            let mut owners = std::collections::HashMap::new();
+            for q in &out {
+                for y in q.y..q.y + q.h {
+                    for x in q.x..q.x + q.w {
+                        *owners.entry((y, x)).or_insert(0u32) += 1;
+                    }
+                }
+            }
+            assert!(
+                owners.values().all(|&n| n == 1),
+                "a ring pixel is owned by two bars at {ms}ms (the corner rivet): {:?}",
+                owners
+                    .iter()
+                    .filter(|&(_, &n)| n > 1)
+                    .take(4)
+                    .collect::<Vec<_>>()
+            );
+            // Closure: the outline's extreme rows and columns are still lit
+            // (clamped to the effects box, which the fixture's centre avoids).
+            let min_y = out.iter().map(|q| q.y).min().unwrap();
+            let max_y = out.iter().map(|q| q.y + q.h - 1).max().unwrap();
+            let min_x = out.iter().map(|q| q.x).min().unwrap();
+            let max_x = out.iter().map(|q| q.x + q.w - 1).max().unwrap();
+            for (y, x) in [
+                (min_y, min_x),
+                (min_y, max_x),
+                (max_y, min_x),
+                (max_y, max_x),
+            ] {
+                assert!(
+                    owners.contains_key(&(y, x)),
+                    "the outline's {y},{x} corner went dark at {ms}ms — a bar gap"
+                );
+            }
+        }
+    }
+
+    /// THE HALO-CENTRE LAW: a halo whose centre lies past the effects box
+    /// keeps its TRUE centre in the emitted bands (the renderer's falloff must
+    /// read ~0 on the surviving sliver), and a centre that cannot be
+    /// represented (negative) culls the halo. The old `.clamp(0, br)` moved an
+    /// off-right centre ONTO the edge, so a particle sliding off the grid
+    /// flashed at up to ~96% of peak on its last visible pixels (2026-09-01
+    /// audit).
+    #[test]
+    fn halo_centres_past_the_box_stay_true_and_negative_centres_cull() {
+        let g = geom(); // box [0,320) x [0,96)
+        let mut out = Vec::new();
+        push_halo(&mut out, g, 322.0, 48.0, 5.0, 5.0, 0x0020_2020);
+        assert!(!out.is_empty(), "the sliver band still draws");
+        assert!(
+            out.iter().all(|h| h.cx == 322),
+            "the falloff centre is the TRUE centre, not the clamped edge: {:?}",
+            out.iter().map(|h| h.cx).collect::<Vec<_>>()
+        );
+        let mut neg = Vec::new();
+        push_halo(&mut neg, g, -2.0, 48.0, 5.0, 5.0, 0x0020_2020);
+        assert!(neg.is_empty(), "an unrepresentable centre culls the halo");
+
+        let mut over = Vec::new();
+        push_halo_over(&mut over, g, 322.0, 48.0, 5.0, 5.0, 0x0033_3333, 255);
+        assert!(
+            over.iter().all(|h| h.cx == 322) && !over.is_empty(),
+            "the Over veil follows the same centre law"
+        );
+        let mut over_neg = Vec::new();
+        push_halo_over(&mut over_neg, g, 48.0, -2.0, 5.0, 5.0, 0x0033_3333, 255);
+        assert!(over_neg.is_empty(), "…including the cull side");
+    }
+
     // `glide_star_forks_dark_additive_and_light_source_over` STOOD HERE and is
     // deleted (step 13). The fork it pinned — additive rainbow light on dark,
     // a darkened source-over streak on white — is the STREAK's law, not the
@@ -61560,16 +61728,25 @@ mod tests {
         // entry also carries the deliberate geometry above. The isolated-field
         // fingerprint and Water ownership/drain regressions are the independent
         // controls for those two causes.
+        // RECAPTURED for the landing-ring corner fix (2026-09-01 audit): the
+        // square outline's vertical bars are inset by the bar thickness so the
+        // four bars PARTITION the ring — the th×th corners had composited
+        // twice under One/One and lit as ~2× rivets. Exactly the SIX
+        // square-outline styles moved (Lumen, Phaser, Sparkle, Laser, Beam,
+        // Comet); Fire and Water — which return before the outline with their
+        // own art — and the zero-momentum RainbowKitty held, which is the
+        // control: the byte change is the ring's and nothing else's
+        // (`landing_ring_bars_partition_the_square_outline` pins the geometry).
         const GOLDEN: [u64; 9] = [
-            14_149_409_705_401_620_614,
-            11_585_823_368_185_847_981,
+            7_311_572_356_106_409_050,
+            15_992_340_453_230_736_825,
             0,
-            790_118_939_137_437_558,
+            4_860_916_537_009_075_818,
             2_367_067_016_366_301_709,
-            6_304_687_310_682_831_539,
-            1_232_516_479_805_656_864,
+            7_722_362_062_232_441_407,
+            4_985_842_062_844_328_140,
             12_989_637_048_037_794_453,
-            1_257_280_251_693_167_888,
+            14_542_522_712_162_096_404,
         ];
         let styles = [
             GlowStyle::Lumen,
@@ -66480,6 +66657,201 @@ halo = "add"
         }
         // One line, still — the whole row stays greppable without reassembly.
         assert!(!owned.line().contains('\n'));
+    }
+
+    /// **THE GREY GATE.** No lit pixel of a jump streak may be achromatic.
+    ///
+    /// The rule the owner states is that the mark must read as a RAINBOW. The
+    /// old family had a zero-cyan rule instead, and every law that enforced it
+    /// paid in chroma through a LUMINANCE-PRESERVING fold — so a pixel it
+    /// touched kept all of its light and lost all of its colour, which is a
+    /// bright grey and not a paler blue. Those laws are retired; this gate is
+    /// what keeps them from coming back by any other name.
+    ///
+    /// **The population floor is the pixel's LIGHT, not its brightest channel,**
+    /// and that is the whole difference between an instrument and a blind spot.
+    /// [`pale_to_grey`] holds `r+g+b` constant while it lowers the max channel,
+    /// so a `max`-based floor would let a greyed pixel fall out of the census
+    /// BECAUSE it was greyed. A sum floor cannot be escaped that way.
+    ///
+    /// White is not grey: the meteor's nucleus is legitimately achromatic and
+    /// bright in EVERY channel, so it is excluded by a min-channel test rather
+    /// than by hue.
+    ///
+    /// The bound is ZERO, not a share — a statistical allowance is exactly what
+    /// the owner rejected when this family's other gate had one.
+    #[test]
+    fn the_jump_streak_is_never_grey_on_glass() {
+        let g = Geom {
+            cw: 9,
+            ch: 20,
+            rows: 20,
+            cols: 100,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 900,
+            win_h: 400,
+            head: 0,
+        };
+        /// The streak's own light over the page, summed, below which a pixel is
+        /// the `u8` premultiply's rounding rather than a choice of colour.
+        const GREY_LIT: i32 = 192;
+        /// Bright in every channel is WHITE — the nucleus, not a grey.
+        const WHITE_HOT: i32 = 160;
+
+        let lit = |px: u32, ground: u32| -> [i32; 3] {
+            let ch =
+                |sh: u32| (((px >> sh) & 0xff) as i32 - ((ground >> sh) & 0xff) as i32).max(0);
+            [ch(16), ch(8), ch(0)]
+        };
+        // `census(keep)` walks the corpus and returns (lit population, grey
+        // count, white exclusions, worst seen). `keep < 1.0` re-greys the
+        // emitted quads exactly the way the retired folds did — that is the
+        // CONTROL, and it is what proves this gate can fail at all.
+        let census = |keep: f32| -> (usize, usize, usize, Option<(i32, i32)>) {
+            let (mut n, mut grey, mut white, mut worst) = (0usize, 0usize, 0usize, None);
+            for &ground in &[0x0011_1318u32, 0x001A_1B26] {
+                for &(o, t) in &[
+                    ((40.0f32, 210.0f32), (860.0f32, 210.0f32)),
+                    ((860.0, 210.0), (40.0, 210.0)),
+                    ((40.0, 190.0), (860.0, 250.0)),
+                    ((860.0, 190.0), (40.0, 230.0)),
+                    ((400.0, 210.0), (500.0, 210.0)),
+                    ((40.0, 210.0), (860.0, 130.0)),
+                ] {
+                    for &mom in &[0.0f32, 1.0] {
+                        for k in 0..6u32 {
+                            let mut c = cfg(GlowStyle::RainbowKitty, true);
+                            c.theme_bg = ground;
+                            let born = Instant::now();
+                            let mut glow = CursorGlow::default();
+                            // The streak reads the LIT field under it, so the
+                            // page has to carry a laid mark for the jump to have
+                            // a colour to fly over.
+                            for (row, phase) in [(9u16, 0.60f32), (10, 0.80), (11, 0.60)] {
+                                for col in 0..100u16 {
+                                    glow.sparks.push(Spark {
+                                        row,
+                                        col,
+                                        classic_run: u32::from(row),
+                                        classic_t: 0.0,
+                                        born_cov: 200,
+                                        pos: 1.0,
+                                        life: 4.0,
+                                        typing: true,
+                                        hue: phase + RAINBOW_KITTY_HUE_STEP * f32::from(col),
+                                        born,
+                                        fade_at: None,
+                                        fade_from: 1.0,
+                                        rearm: None,
+                                    });
+                                }
+                            }
+                            for run in [9, 10, 11] {
+                                glow.reflow_classic_run(run);
+                            }
+                            glow.rainbow.jumps.push(JumpStreak {
+                                x0: o.0,
+                                y0: o.1,
+                                x1: t.0,
+                                y1: t.1,
+                                born,
+                                life: 1.0,
+                                mom,
+                                grade: 0.0,
+                            });
+                            let at = born
+                                + Duration::from_secs_f32(
+                                    CursorGlow::RAINBOW_METEOR_FLIGHT_S + k as f32 / 10.0,
+                                );
+                            let mut q = Vec::new();
+                            glow.emit_rainbow_jumps(at, &c, g, &mut q, &mut Vec::new());
+                            if keep < 1.0 {
+                                for qq in q.iter_mut() {
+                                    qq.color = pale_to_grey(qq.color, keep);
+                                }
+                            }
+                            let (w, h) = (900usize, 400usize);
+                            let mut buf = vec![ground; w * h];
+                            for qq in &q {
+                                for yy in usize::from(qq.y)..usize::from(qq.y) + usize::from(qq.h) {
+                                    for xx in
+                                        usize::from(qq.x)..usize::from(qq.x) + usize::from(qq.w)
+                                    {
+                                        if yy < h && xx < w {
+                                            buf[yy * w + xx] = crate::spectrum::compose_on_glass(
+                                                buf[yy * w + xx],
+                                                qq.color,
+                                                qq.alpha,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            for px in &buf {
+                                let d = lit(*px, ground);
+                                if d[0] + d[1] + d[2] < GREY_LIT {
+                                    continue;
+                                }
+                                let mx = d[0].max(d[1]).max(d[2]);
+                                let mn = d[0].min(d[1]).min(d[2]);
+                                if mn >= WHITE_HOT {
+                                    white += 1;
+                                    continue;
+                                }
+                                n += 1;
+                                let chroma = mx - mn;
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    reason = "the chroma floor is a small integer"
+                                )]
+                                let bar = crate::spectrum::SPECTRUM_THING_CHROMA_FLOOR as i32;
+                                if chroma < bar {
+                                    grey += 1;
+                                    if worst.is_none_or(|(_, bc)| chroma < bc) {
+                                        worst = Some((mx, chroma));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (n, grey, white, worst)
+        };
+
+        let (n, grey, white, worst) = census(1.0);
+        println!(
+            "JUMP-STREAK-GREY-CENSUS lit={n} grey={grey} white={white} worst={worst:?}"
+        );
+        // NON-VACUOUS: the corpus lit a real mark.
+        // The floor is set against the SNAPPY mark, not the lingering one it
+        // replaced: front-loading the decay legitimately removed more than half
+        // the lit population (48,270 -> 20,878 on this corpus), and a
+        // vacuity floor calibrated to the old smear would fail the fix rather
+        // than the regression.
+        assert!(
+            n > 10_000,
+            "only {n} lit streak pixels walked — this gate is measuring an empty frame"
+        );
+        // AND THE GATE CAN FAIL. The same corpus, re-greyed the way the retired
+        // folds greyed it, must be caught — otherwise the zero above is a
+        // statement about the instrument, not about the mark.
+        let (_, control_grey, _, _) = census(0.35);
+        assert!(
+            control_grey > 0,
+            "the control did not register grey: a gate that cannot fail proves \
+             nothing about the frames that pass it"
+        );
+        // **THE BOUND IS ZERO**, not a share.
+        assert_eq!(
+            grey, 0,
+            "grey is not a rainbow colour: {grey} of {n} lit jump-streak pixels \
+             carry chroma under {} — worst {worst:?}. Every law that has ever \
+             greyed this mark did so by spending chroma at constant light; if \
+             one has come back, it is in the emitter, not here.",
+            crate::spectrum::SPECTRUM_THING_CHROMA_FLOOR
+        );
     }
 
     // NOT PORTED FROM origin/main, 2026-08-27, and this is a DEBT not a

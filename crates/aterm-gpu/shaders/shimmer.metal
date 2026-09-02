@@ -79,5 +79,9 @@ fragment float4 fs_shimmer(VsOut in [[stage_in]],
     // interior (the ClampToEdge sampler is the second fence).
     float2 sp = clamp(p + d, float2(0.5, 0.5), su.frame - float2(0.5, 0.5));
     float4 c = shimmer_src.sample(shimmer_samp, sp / su.frame, level(0.0));
-    return float4(c.rgb, 1.0);
+    // The WHOLE displaced sample, alpha included — the wgsl twin's law
+    // (fs_shimmer): rgb and alpha must describe ONE source pixel, or the
+    // translucent present decoheres inside the haze band. Byte-identical on
+    // opaque presents, where the offscreen alpha is uniform.
+    return c;
 }

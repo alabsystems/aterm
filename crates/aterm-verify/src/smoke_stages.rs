@@ -326,11 +326,34 @@ fn headless_round_trips(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path)
     // first byte, or the first startup-edge repair is miscounted as a
     // typing-burst lost-wake heal.
     std::thread::sleep(Duration::from_millis(250));
+    // COUNT WHAT THE ENGINE ACCEPTED. The burst was driven through `ctl_quiet`,
+    // which discards the client's status on the grounds that "a dropped
+    // keystroke shows up in the pacing counters this stage reads next" — true of
+    // a keystroke that ARRIVED, false of one that never did. Every counter
+    // decided on below (`sync_rel_timeout=0`, `perf_reduced=0`, `wake_heals=0`)
+    // is satisfied A FORTIORI by a burst that typed NOTHING, so a dead client, a
+    // rejected verb or a wedged input seam printed `ok  smoke: typing burst
+    // pacing counters clean` — a pass for a subject this stage never exercised.
+    // `send` answers the bare `OK` on success (no fields, which is why
+    // `pattern::OK`'s protocol space deliberately does not match it) and `ERR …`
+    // otherwise, so an OK-prefixed reply is the evidence available at this seam.
+    // At least one is now required, and the count rides on the ladder line so
+    // the row states what it measured.
+    let mut accepted = 0usize;
     for _ in 0..BURST_KEYS {
-        ctl_quiet(ctx, sb, ctl_bin, &["send", "x"]);
+        if ctl(ctx, sb, ctl_bin, &["send", "x"]).starts_with("OK") {
+            accepted += 1;
+        }
         std::thread::sleep(BURST_GAP);
     }
     std::thread::sleep(SETTLE);
+    if accepted == 0 {
+        r.fail(format!(
+            "smoke: none of the {BURST_KEYS} driven keys were accepted, so the pacing \
+             counters below describe a burst that never happened"
+        ));
+        return;
+    }
 
     let got = ctl(ctx, sb, ctl_bin, &["metrics"]);
     if !glob_match(pattern::SYNC_CLEAN, &got) {
@@ -347,7 +370,9 @@ fn headless_round_trips(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path)
         return;
     }
     if glob_match(pattern::NO_WAKE_HEALS, &got) {
-        r.pass("smoke: typing burst pacing counters clean");
+        r.pass(format!(
+            "smoke: typing burst pacing counters clean ({accepted}/{BURST_KEYS} keys accepted)"
+        ));
     } else {
         r.fail(format!(
             "smoke: wake heals during a plain typing burst -> {got}"

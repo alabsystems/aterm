@@ -2675,6 +2675,55 @@ fn background_and_cursor_opacity_gpu_match_cpu() {
             "{name}: no pixel of the translucent cursor cell may be the raw cursor fill"
         );
     }
+
+    // THE EFFECTS FAMILY UNDER TRANSLUCENCY: additive glow (an Add quad + a
+    // radial halo) over a translucent ground must PRESERVE the ground's
+    // transmittance on both backends — the GPU draws these streams with
+    // `WriteMask::Color`, and the CPU blends used to zero the top byte, so a
+    // glow-touched default-bg pixel presented opaque on every surface that
+    // converts transmittance to output alpha (2026-09-01 audit).
+    let mut input_glow = input_at(b"\x1b[1;6H");
+    input_glow.default_bg = 0x0022_3344;
+    input_glow.default_bg_spans = vec![vec![aterm_render::DefaultBgSpan::new(0, cols, BG)]; rows];
+    input_glow.glow_under = vec![aterm_render::GlowQuad {
+        row: 1,
+        x: (cw / 2) as u16,
+        y: (ch + ch / 2) as u16,
+        w: (cw * 3) as u16,
+        h: 4,
+        color: 0x0018_0c04,
+        alpha: 0,
+    }];
+    input_glow.glow_halo = vec![aterm_render::RainHalo {
+        row: 1,
+        x: (cw * 4) as u16,
+        y: (ch + 2) as u16,
+        w: (cw * 2) as u16,
+        h: (ch / 2) as u16,
+        color: 0x0010_1418,
+        cx: (cw * 5) as u16,
+        cy: (ch + ch / 4) as u16,
+        rx: cw as u16,
+        ry: (ch / 3) as u16,
+        ..Default::default()
+    }];
+    let cpu_glow = cpu.render_input(&input_glow);
+    let gpu_glow = gpu.render_input(&mut win, &input_glow, None);
+    let mut gdelta = max_channel_delta(&cpu_glow, &gpu_glow);
+    for (&pa, &pb) in cpu_glow.pixels.iter().zip(gpu_glow.pixels.iter()) {
+        gdelta = gdelta.max(((pa >> 24) as i32 - (pb >> 24) as i32).abs());
+    }
+    assert!(
+        gdelta <= 8,
+        "glow-over-translucent CPU/GPU pixels diverge (alpha included): {gdelta} > 8"
+    );
+    let (qx, qy) = (cw / 2 + 2, ch + ch / 2 + 1);
+    let p = cpu_glow.pixels[qy * cpu_glow.width + qx];
+    assert!(
+        ((p >> 24) as i32 - 127).abs() <= 1,
+        "CPU: a glow-lit default-bg pixel keeps the ground's transmittance, got {:#010x}",
+        p
+    );
 }
 
 /// Animated ink (`RenderInput.ink`, Sparkle Words v2) parity: ink rides the

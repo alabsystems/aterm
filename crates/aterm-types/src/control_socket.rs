@@ -83,7 +83,7 @@ pub fn socket_directive(
     control_sock: Option<&str>,
     no_control_sock: Option<&str>,
 ) -> SocketDirective {
-    if no_control_sock.is_some_and(|v| !v.is_empty() && v != "0") {
+    if env_flag_engaged(no_control_sock) {
         return SocketDirective::Disabled;
     }
     match control_sock {
@@ -91,6 +91,23 @@ pub fn socket_directive(
         Some("") | None => SocketDirective::PerInstance,
         Some(v) => SocketDirective::Explicit(v.to_string()),
     }
+}
+
+/// **THE ONE READING of a boolean `ATERM_NO_*` / veto env var** (`None` =
+/// unset): engaged only by a value that is non-empty and not `"0"` — the rule
+/// `$ATERM_NO_CONTROL_SOCK` has always used, promoted to a name so every
+/// boolean flag shares it. Unset, EMPTY and `"0"` are "not engaged".
+///
+/// WHY THIS EXISTS: `var_os(..).is_some()` treats a present-but-empty variable
+/// as engaged, and empty env vars travel — a shell exporting `ATERM_X=` hands
+/// every descendant an is_some() veto nothing intended. That exact species
+/// disabled the seamless updater on the owner's daily terminal twice over
+/// (an empty `$ATERM_CONTROL_SOCK` on 2026-09-01, and the `ATERM_NO_*` family
+/// audited the same day). Flag readers go through here, or they re-grow the
+/// bug.
+#[must_use]
+pub fn env_flag_engaged(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
 /// The per-instance socket filename for `pid`: `aterm-<pid>.sock`. Also the

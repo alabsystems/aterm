@@ -2218,7 +2218,10 @@ mod tests {
                     veto: None
                 }
             )
-            .starts_with("build 7 — verified; $ATERM_CONTROL_SOCK is set (--control-sock) — ")
+            .starts_with(
+                "build 7 — verified; $ATERM_CONTROL_SOCK names an explicit socket path \
+                 (--control-sock) — "
+            )
         );
         // The vetoed twin: names the veto, points at the manual affordance
         // (qualified by the zero-terminal admission), keeps the true

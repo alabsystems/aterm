@@ -85,7 +85,8 @@ macro_rules! __aterm_objc_count {
 ///   only ever reached through a reference to a live instance.
 /// * `$name::class()` — registers the pair on first call (`OnceLock`, so exactly
 ///   once per process) and returns the class.
-/// * `$name::alloc_init(ivars)` — `+alloc`, store the ivars, `-init`. The ivars
+/// * `$name::alloc_init(mtm, ivars)` — `+alloc`, store the ivars, `-init`,
+///   against a [`crate::MainThread`] witness. The ivars
 ///   are stored BEFORE `init` runs, deliberately: a superclass `init` may send
 ///   overridden methods back to the instance (`NSView -initWithFrame:` calls
 ///   `updateTrackingAreas` on some paths), and those methods read `ivars()`.
@@ -109,12 +110,36 @@ macro_rules! __aterm_objc_count {
 ///   trick, so `@sel(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:)`
 ///   is written exactly as objc2 writes it, and — since the arity fix below —
 ///   means what it says at three arguments as well as one.
-/// * **No `type Mutability`** — objc2 uses it to drive `Send`/`Sync` and its
-///   `&mut` story. Every class in the tree is main-thread AppKit state and
-///   [`crate::Retained`] is unconditionally `!Send`, so the parameter would
-///   have exactly one useful value. Interior mutability is spelled the Rust
-///   way, in the ivar type (`Cell`, `RefCell`), which is what all seven sites
-///   already do.
+/// * **No `type Mutability`, but the WITNESS it carried is back.** objc2 uses
+///   the parameter to drive `Send`/`Sync`, its `&mut` story — and, through
+///   `mutability::MainThreadOnly`, to make `alloc` reachable only from a
+///   `MainThreadMarker`. This macro dropped all three, on the argument that
+///   [`crate::Retained`] is unconditionally `!Send` so the parameter had one
+///   useful value. That argument covers where an instance may TRAVEL and says
+///   nothing about where one may be BORN, and the difference was provable: a
+///   declared class registered, instantiated and DEALLOCATED on a spawned
+///   thread with no witness, no `unsafe` at the call site and no diagnostic,
+///   running the ivar type's Rust destructor there. `alloc_init` and
+///   `alloc_ivars` now take a [`crate::MainThread`], so that program does not
+///   compile. `Send`/`Sync` stay structural (the generated marker type is
+///   `!Send`) and interior mutability stays spelled the Rust way, in the ivar
+///   type (`Cell`, `RefCell`) — which is what all seven sites already do.
+///
+///   Instantiating without asking the thread question is a compile error:
+///
+///   ```compile_fail
+///   aterm_objc::declare_class! {
+///       struct DocNoWitness: NSObject {
+///           const NAME: &str = "ATermDocNoWitness";
+///           type Ivars = ();
+///
+///           @sel(ping)
+///           fn ping(&self) {}
+///       }
+///   }
+///   // `alloc_init` takes a `MainThread` witness first.
+///   let _ = DocNoWitness::alloc_init(());
+///   ```
 /// * **One ivar, not a struct of them** — see [`crate::declare`].
 /// * **`&self` is captured as an `ident`, not matched literally** — macro
 ///   hygiene: a `self` token emitted from the macro's own definition lives in
@@ -502,16 +527,53 @@ macro_rules! declare_class {
                 unsafe { $crate::IvarSlot::get(__slot) }
             }
 
-            /// `+alloc`, store `ivars`, `-init`. `None` if either returns nil.
+            /// `+alloc` and store `ivars`, returning the +1 but UNINITIALISED
+            /// instance — the first half of [`Self::alloc_init`], for a class
+            /// whose designated initializer is not `-init`.
+            ///
+            /// # Why this exists
+            ///
+            /// `alloc_init` sends `-init`, which is right for the four
+            /// `NSObject` subclasses in the tree and WRONG for the two `NSView`
+            /// ones: a view's designated initializer is `-initWithFrame:`, and
+            /// `NSView` documents that its subclasses must go through it.
+            /// Nothing in W1 needed a non-`NSObject` superclass, so nothing
+            /// noticed; the `aterm-gui` port did, immediately, and winit's five
+            /// declared classes include `NSView` and `NSWindow` subclasses that
+            /// will need it too.
+            ///
+            /// The ivars are stored BEFORE the initializer runs, which is the
+            /// same order `alloc_init` uses and for the same reason: a
+            /// superclass `init` may send overridden methods back to the
+            /// instance (`NSView -initWithFrame:` sends `updateTrackingAreas`
+            /// on some paths) and those methods read `ivars()`.
+            ///
+            /// # The witness
+            ///
+            /// `_mtm` is unused at run time and load-bearing at compile time:
+            /// it is the parameter that makes "was the thread question asked?"
+            /// a type error rather than a convention. See
+            /// [`crate::MainThread`] for what it does and does not promise.
+            ///
+            /// # Safety
+            ///
+            /// The returned reference is +1 and NOT initialised. The caller
+            /// must send it exactly one designated initializer and adopt that
+            /// initializer's +1 result (or release the instance). Using it
+            /// before initialisation, initialising it twice, or dropping it on
+            /// the floor are all the caller's to avoid — which is why
+            /// [`Self::alloc_init`] exists and should be preferred whenever
+            /// `-init` is the right initializer.
             #[allow(dead_code)]
-            $vis fn alloc_init(ivars: $ivars) -> ::core::option::Option<$crate::Retained<Self>> {
+            $vis unsafe fn alloc_ivars(
+                _mtm: $crate::MainThread,
+                ivars: $ivars,
+            ) -> $crate::Id {
                 let __meta = Self::meta();
                 // SAFETY: `+alloc` on a registered class returns a +1,
                 // zero-filled instance or nil; the ivar slot inside it is
                 // therefore unwritten, which is exactly `IvarSlot::init`'s
-                // precondition. `-init` then consumes that +1 and returns the
-                // initialised +1 (or nil, having released it, in which case
-                // `dealloc` already dropped the ivars).
+                // precondition.
                 unsafe {
                     let __alloc: unsafe extern "C" fn(
                         $crate::ClassPtr,
@@ -519,7 +581,7 @@ macro_rules! declare_class {
                     ) -> $crate::Id = $crate::msg();
                     let __raw = __alloc(__meta.class(), $crate::sel!(alloc));
                     if __raw.is_null() {
-                        return ::core::option::Option::None;
+                        return $crate::Id::NIL;
                     }
                     let __slot = ::core::ptr::with_exposed_provenance_mut::<
                         $crate::IvarSlot<$ivars>,
@@ -527,6 +589,30 @@ macro_rules! declare_class {
                         __raw.expose_provenance().wrapping_add_signed(__meta.ivar_offset())
                     );
                     $crate::IvarSlot::init(__slot, ivars);
+                    __raw
+                }
+            }
+
+            /// `+alloc`, store `ivars`, `-init`. `None` if either returns nil.
+            ///
+            /// `mtm` is the [`crate::MainThread`] witness every instantiation
+            /// owes; it is consumed for its type and nothing else.
+            #[allow(dead_code)]
+            $vis fn alloc_init(
+                mtm: $crate::MainThread,
+                ivars: $ivars,
+            ) -> ::core::option::Option<$crate::Retained<Self>> {
+                // SAFETY: `alloc_ivars` returns a +1 instance owing exactly one
+                // designated initializer, and `-init` is NSObject's — the right
+                // one for every class whose superclass chain does not override
+                // it with a stricter designated initializer. It consumes that
+                // +1 and returns the initialised +1 (or nil, having released
+                // it, in which case `dealloc` already dropped the ivars).
+                unsafe {
+                    let __raw = Self::alloc_ivars(mtm, ivars);
+                    if __raw.is_null() {
+                        return ::core::option::Option::None;
+                    }
                     let __init: unsafe extern "C" fn(
                         $crate::Id,
                         $crate::Sel,

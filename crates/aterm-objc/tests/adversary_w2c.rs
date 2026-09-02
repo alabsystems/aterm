@@ -25,6 +25,22 @@ use aterm_objc::{
     method_encoding, msg, ns_string, sel, sel_uncached,
 };
 
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
+/// for a test that is not on the main thread and does not need to be.
+///
+/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
+/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
+/// here and the checked constructor is unusable. Every class in this file is an
+/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
+/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
+/// the thread that made them — which is the second form of `new_unchecked`'s
+/// obligation, written once instead of at every call site.
+fn mtm() -> aterm_objc::MainThread {
+    // SAFETY: see this function's doc comment — the class has no main-thread
+    // affinity and its ivars are born and dropped on this one worker.
+    unsafe { aterm_objc::MainThread::new_unchecked() }
+}
+
 /// `SIGABRT`, spelled out: this crate has ZERO dependencies by construction.
 const SIGABRT: i32 = 6;
 
@@ -79,7 +95,7 @@ declare_class! {
 
 #[test]
 fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
-    let obj = Widest::alloc_init(()).expect("+alloc/-init");
+    let obj = Widest::alloc_init(mtm(), ()).expect("+alloc/-init");
     // SAFETY: the exact declared prototype — 16 parameters, `self` and `_cmd`
     // included — on a live instance of the class that declares it.
     unsafe {
@@ -147,7 +163,7 @@ fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
         let borrowed: Id = s.autorelease();
         assert!(!borrowed.is_null());
 
-        let typed = Bare::alloc_init(()).expect("+alloc/-init");
+        let typed = Bare::alloc_init(mtm(), ()).expect("+alloc/-init");
         let borrowed2: Id = typed.autorelease();
         assert!(!borrowed2.is_null());
 

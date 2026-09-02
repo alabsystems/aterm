@@ -1,3 +1,6 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (`ApplicationDelegate::get` takes `aterm_objc::MainThread`, so the marker
+//  crosses at that one call through `aterm_objc_seam::witness`.)
 #![allow(clippy::unnecessary_cast)]
 #![allow(unknown_lints)] // New lint below
 #![allow(static_mut_refs)] // Uses `MainThreadBound` in new version.
@@ -11,6 +14,7 @@ use objc2_app_kit::{NSApplication, NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_foundation::MainThreadMarker;
 
 use super::app_state::ApplicationDelegate;
+use super::aterm_objc_seam;
 use crate::event::{DeviceEvent, ElementState};
 
 type SendEvent = extern "C" fn(&NSApplication, Sel, &NSEvent);
@@ -42,7 +46,17 @@ extern "C" fn send_event(app: &NSApplication, sel: Sel, event: &NSEvent) {
 
     // Events are generally scoped to the window level, so the best way
     // to get device events is to listen for them on NSApplication.
-    let delegate = ApplicationDelegate::get(mtm);
+    // LOCAL PATCH (aterm), W9: `ApplicationDelegate::get` takes a witness now, so
+    // the marker crosses here. This file keeps `MainThreadMarker` — it is pinned
+    // by `NSApplication::new` and by `MainThreadMarker::from(app)`, the latter a
+    // COMPILE-TIME derivation off an objc2 receiver type that has no witness
+    // equivalent while the receiver is still an objc2 binding.
+    //
+    // (Citations in this file's prose omit their argument lists on purpose.
+    // `objc2-send-sites-v1` COUNTS COMMENTS, so `NS…::…` followed by an open
+    // paren reads as a new send site — the imprecision the metric's own author
+    // tripped while writing up W8, and one this wave declined to repeat.)
+    let delegate = ApplicationDelegate::get(aterm_objc_seam::witness(mtm));
     maybe_dispatch_device_event(&delegate, event);
 
     let _ = mtm;

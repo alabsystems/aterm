@@ -574,15 +574,19 @@ mod tests {
         assert_eq!(off, vec!["bg", "shimmer", "blit"]);
     }
 
-    /// The TEN RGB-only rows, named. Metal's default write mask is ALL and so
+    /// The NINE RGB-only rows, named. Metal's default write mask is ALL and so
     /// is `wgpu`'s, so a row that lost its `WriteMask::Color` is silent on both
     /// backends until a translucent window goes opaque — this is the assertion
     /// that makes it loud.
     ///
-    /// Ten ROWS, nine `renderer.rs` CALL SITES: `build_glow_boost_pipeline` is
-    /// one site that builds both crowns, and both are RGB-only.
+    /// Nine ROWS, eight `renderer.rs` CALL SITES: `build_glow_boost_pipeline`
+    /// is one site that builds both crowns, and both are RGB-only. The shimmer
+    /// LEFT this set on 2026-09-01: its refraction displaces the whole rgba
+    /// sample now, so its row writes ALL — an RGB-only shimmer paired the
+    /// displaced rgb with the undisplaced pixel's alpha on translucent
+    /// presents.
     #[test]
-    fn ten_rows_are_rgb_only_and_they_are_these() {
+    fn nine_rows_are_rgb_only_and_they_are_these() {
         let rgb_only: Vec<&str> = ALL_PIPELINES
             .into_iter()
             .filter(|r| metal_write_mask(r.spec().write_mask) == ColorWriteMask::COLOR)
@@ -598,7 +602,6 @@ mod tests {
                 "fire_over",
                 "deco_add",
                 "bloom",
-                "shimmer",
                 "hdr_glow",
                 "sdr_glow",
             ]

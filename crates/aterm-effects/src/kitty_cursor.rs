@@ -2134,6 +2134,13 @@ fn push_exit_veil(
     if x1 <= x0 || y1 <= y0 {
         return;
     }
+    // The falloff centre is stored TRUE, or the veil is culled — the shared
+    // halo-centre law (see `cursor_glow::push_halo`): clamping the centre into
+    // the box relocated the radial peak onto the grid edge for anything
+    // sliding off it (2026-09-01 audit). Positive overshoot fits u16.
+    if cxi < 0 || cyi < 0 {
+        return;
+    }
     let ch = geom.ch as i32;
     let oy = geom.origin_y as i32;
     let mut yy = y0;
@@ -2149,8 +2156,8 @@ fn push_exit_veil(
             w: (x1 - x0) as u16,
             h: (band_end - yy) as u16,
             color,
-            cx: cxi.clamp(0, br) as u16,
-            cy: cyi.clamp(0, bb) as u16,
+            cx: cxi as u16,
+            cy: cyi as u16,
             rx: rxi as u16,
             ry: ryi as u16,
             mode: HaloMode::Over,

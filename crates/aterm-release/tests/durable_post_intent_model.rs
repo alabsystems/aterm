@@ -84,7 +84,9 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         verify_pubkey: None,
         // No credentials: this model exercises journal/state transitions, not signing.
         credentials: None,
-        // Tier APPLE inactive, as the shipped anchor is. This model covers the
+        // Tier APPLE inactive — NOT because the shipped anchor is (it has been armed
+        // since 2026-08-15, which is what this line used to claim), but because this
+        // model covers the
         // one-shot POST intents; a resolved Apple tier would be a certificate
         // this test has no business needing.
         apple: sign::AppleTier::Inactive,
@@ -101,8 +103,9 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
-        // Unattributed, as every cut from this tree is: the paper master is
-        // unpinned, so no roster authorizes anything and no roster asset ships.
+        // Unattributed, as a FORK's cut is: with no master pinned no roster authorizes
+        // anything and no roster asset ships. WRONG BEFORE: "as every cut from this tree
+        // is" — this tree's master has been armed since 2026-08-15.
         signature_machine_id: None,
         attribution: None,
         roster: None,

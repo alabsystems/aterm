@@ -1,6 +1,15 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (`flip_window_screen_coordinates` takes and answers `aterm_objc`'s
+// `CGRect`/`CGPoint` rather than objc2's `NSRect`/`NSPoint`, because its one
+// live caller — `window_delegate.rs` — computes in those. Search for the aterm
+// local-patch marker.)
+//
+// NOTE ON THIS NOTICE: see the same note at the head of `view.rs`; it was
+// missing here too until W8.
 #![allow(clippy::unnecessary_cast)]
 
 use std::collections::VecDeque;
+use std::ffi::c_void;
 use std::fmt;
 
 use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex};
@@ -13,7 +22,7 @@ use core_graphics::display::{
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_app_kit::NSScreen;
-use objc2_foundation::{ns_string, run_on_main, MainThreadMarker, NSNumber, NSPoint, NSRect};
+use objc2_foundation::{ns_string, run_on_main, NSNumber};
 use tracing::warn;
 
 use super::ffi;
@@ -250,7 +259,7 @@ impl MonitorHandle {
 
     pub fn scale_factor(&self) -> f64 {
         run_on_main(|mtm| {
-            match self.ns_screen(mtm) {
+            match self.ns_screen(super::aterm_objc_seam::witness(mtm)) {
                 Some(screen) => screen.backingScaleFactor() as f64,
                 None => 1.0, // default to 1.0 when we can't find the screen
             }
@@ -349,9 +358,15 @@ impl MonitorHandle {
         }
     }
 
-    pub(crate) fn ns_screen(&self, mtm: MainThreadMarker) -> Option<Retained<NSScreen>> {
+    /// LOCAL PATCH (aterm), W9: takes `aterm_objc::MainThread`, because its two
+    /// cross-file callers are in `window_delegate.rs`, which is ported and holds
+    /// a witness. `NSScreen::screens` still consumes an objc2 marker, so one is
+    /// re-derived here — this file stays on the objc2 list, pinned by that
+    /// binding and by `run_on_main`, and says so rather than pretending the
+    /// signature change moved it.
+    pub(crate) fn ns_screen(&self, w: aterm_objc::MainThread) -> Option<Retained<NSScreen>> {
         let uuid = self.uuid();
-        NSScreen::screens(mtm).into_iter().find(|screen| {
+        NSScreen::screens(super::aterm_objc_seam::marker(w)).into_iter().find(|screen| {
             let other_native_id = get_display_id(screen);
             if let Some(other) = MonitorHandle::new(other_native_id) {
                 uuid == other.uuid()
@@ -362,6 +377,27 @@ impl MonitorHandle {
                 false
             }
         })
+    }
+
+    /// LOCAL PATCH (aterm), W9 phase 3: the same screen as a BARE POINTER.
+    ///
+    /// `crate::platform::macos`'s `MonitorHandleExtMacOS::ns_screen` — a
+    /// macOS-COMPILED file that lives outside `platform_impl/` — used to write
+    /// `objc2::rc::Retained::as_ptr(&s)` itself. That was the only `objc2` name
+    /// left in `src/platform/`, and neither endgame metric could see it,
+    /// because both were scoped to `platform_impl/macos` and `aterm-gui/src`.
+    /// Widening the scope is the real fix (`tests/objc2_exit_condition.rs` now
+    /// derives it from `platform/mod.rs`'s own `cfg` gates); moving the one
+    /// line here is what keeps the widened count from regressing, and it puts
+    /// the `objc2` name in the file that already owns five of them and is
+    /// scheduled to lose all of them together.
+    ///
+    /// THE +0 IS UPSTREAM'S, unchanged: the `Retained` is dropped as this
+    /// returns, so the pointer is only valid because AppKit owns the screen.
+    /// A public trait method answering `*mut c_void` has no other option, and
+    /// re-signaturing winit's public API is not this campaign's business.
+    pub(crate) fn ns_screen_ptr(&self, w: aterm_objc::MainThread) -> Option<*mut c_void> {
+        self.ns_screen(w).map(|s| Retained::as_ptr(&s) as _)
     }
 }
 
@@ -398,12 +434,19 @@ pub(crate) fn get_display_id(screen: &NSScreen) -> u32 {
 ///
 /// This conversion happens to be symmetric, so we only need this one function
 /// to convert between the two coordinate systems.
-pub(crate) fn flip_window_screen_coordinates(frame: NSRect) -> NSPoint {
+// LOCAL PATCH (aterm): `NSRect`/`NSPoint` -> `aterm_objc::CGRect`/`CGPoint`.
+// This function's ONLY caller is `window_delegate.rs`, whose bindings W8 ported
+// (the second call in this file is commented out, six lines above), and the
+// geometry it now computes in is that file's. The two struct pairs are
+// `#[repr(C)]` over `f64` in the same order on every 64-bit Apple target, so
+// this is a re-typing and not a conversion; `CGDisplay::bounds()` is
+// `core-graphics`' own type and is unchanged.
+pub(crate) fn flip_window_screen_coordinates(frame: aterm_objc::CGRect) -> aterm_objc::CGPoint {
     // It is intentional that we use `CGMainDisplayID` (as opposed to
     // `NSScreen::mainScreen`), because that's what the screen coordinates
     // are relative to, no matter which display the window is currently on.
     let main_screen_height = CGDisplay::main().bounds().size.height;
 
     let y = main_screen_height - frame.size.height - frame.origin.y;
-    NSPoint::new(frame.origin.x, y)
+    aterm_objc::CGPoint { x: frame.origin.x, y }
 }

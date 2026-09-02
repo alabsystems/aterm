@@ -15610,7 +15610,10 @@ impl Renderer {
     ///
     /// `Add` decorations (the profanity sparkle) use the premultiplied saturating
     /// add — the SAME math as the LUMEN aurora, so they only brighten and stay
-    /// CPU/GPU byte-exact. `Over` decorations (the feline paw) alpha-blend a tint.
+    /// CPU/GPU byte-exact (the GPU twin quantizes `cov·alpha` to this stamp's
+    /// intermediate byte lattice — see `fs_deco_add`; before it did, the two
+    /// backends disagreed by ±1 code value on ~12% of mid-fade texels).
+    /// `Over` decorations (the feline paw) alpha-blend a tint.
     /// The sprite mask comes from [`crate::procedural::deco_coverage`]; both
     /// renderers consume that one mask, so shape never diverges.
     fn draw_decorations(
@@ -20774,7 +20777,13 @@ pub fn premul_rgb(rgb: u32, a: u8) -> u32 {
 #[must_use]
 pub fn add_sat(dst: u32, premul: u32) -> u32 {
     let a = |sh: u32| -> u32 { (((dst >> sh) & 0xff) + ((premul >> sh) & 0xff)).min(255) };
-    (a(16) << 16) | (a(8) << 8) | a(0)
+    // The destination's top (transmittance) byte rides through UNTOUCHED —
+    // the GPU twin draws this stream with `WriteMask::Color`, and zeroing it
+    // here forced every glow-touched pixel opaque on the surfaces that
+    // convert transmittance to output alpha (canvas presents, RGBA/PNG
+    // captures) while the GPU window kept the ground's own translucency
+    // (2026-09-01 audit).
+    (dst & 0xFF00_0000) | (a(16) << 16) | (a(8) << 8) | a(0)
 }
 
 /// SOURCE-OVER a PREMULTIPLIED light colour `premul` onto a destination pixel
@@ -20801,14 +20810,16 @@ pub fn add_sat(dst: u32, premul: u32) -> u32 {
 /// [`premul_rgb`] scales a byte by `a/255`), and the destination term is at
 /// most `255 − a`, so the sum is at most `255`. The `min` is a guard against a
 /// malformed pair, not a clamp the well-formed path ever reaches. Like
-/// `add_sat`, the top (transmittance) byte of the result is 0.
+/// `add_sat`, the destination's top (transmittance) byte is carried through
+/// untouched — the GPU twin's `WriteMask::Color` semantics.
 #[must_use]
 pub fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
     let inv = 255 - a as u32;
     let ch = |sh: u32| -> u32 {
         (((premul >> sh) & 0xff) + (((dst >> sh) & 0xff) * inv + 127) / 255).min(255)
     };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    // Transmittance byte carried through — see [`add_sat`].
+    (dst & 0xFF00_0000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// SOURCE-OVER a STRAIGHT (unpremultiplied) colour `rgb` onto a destination
@@ -20821,15 +20832,17 @@ pub fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
 /// integer, and `255k + 127.5` never is), and the hardware's float error is
 /// orders of magnitude below the half-LSB gap, so CPU and GPU land the
 /// IDENTICAL byte — the same argument that makes One/One == [`add_sat`]. Like
-/// `add_sat`, the top (transmittance) byte of the result is 0. `a == 255`
-/// returns `rgb` exactly; `a == 0` returns `dst`'s RGB exactly.
+/// `add_sat`, the destination's top (transmittance) byte is carried through
+/// untouched (`WriteMask::Color` semantics). `a == 255` returns `rgb` plus
+/// `dst`'s transmittance; `a == 0` returns `dst`'s RGB exactly.
 #[must_use]
 pub fn over_rgb(dst: u32, rgb: u32, a: u8) -> u32 {
     let a = a as u32;
     let ch = |sh: u32| -> u32 {
         (((rgb >> sh) & 0xff) * a + ((dst >> sh) & 0xff) * (255 - a) + 127) / 255
     };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    // Transmittance byte carried through — see [`add_sat`].
+    (dst & 0xFF00_0000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// Per-row Y term of the [`RainHalo`] elliptical falloff:

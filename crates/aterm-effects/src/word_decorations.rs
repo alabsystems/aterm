@@ -6706,9 +6706,11 @@ impl WordDecorations {
         // behind — published from its persist-wide busy scan, so a live
         // window holds the mutex even while its word is scrolled off — and
         // it defers its own ignition behind any LIVE classic window
-        // (two-way) — so the combined `nova_add` channel stays bounded by
-        // `max(3·392, S_max) ≤ MAX_NOVA_QUADS` (the mutex keeps the windows
-        // from ever overlapping; the bound is a max, not a sum).
+        // (two-way) — so THIS PASS's share of the `nova_add` channel stays
+        // bounded by `max(3·392, S_max) ≤ MAX_NOVA_QUADS` (the mutex keeps the
+        // windows from ever overlapping; the bound is a max, not a sum). The
+        // channel TOTAL is larger: PRISM WAKE appends outside this budget (see
+        // `nova::MAX_NOVA_QUADS`).
         if let Some(until) = self.super_prepass(now, cfg, geom, sel) {
             arm_until(&mut active_until, until);
         }
@@ -7695,9 +7697,10 @@ impl WordDecorations {
         // second roll can never overlap it. The mutex is TWO-WAY: a live
         // CLASSIC nova (its genome-derived window still running) blocks a
         // supernova ignition just like a live supernova blocks classic
-        // grants in `nova_prepass` — otherwise combined `nova_add` could
-        // reach 3·392 + S_max > MAX_NOVA_QUADS and the "never binds" claim
-        // would be falsified. The episode's stored `burst_kind` tells the
+        // grants in `nova_prepass` — otherwise THIS PASS's `nova_add` share
+        // could reach 3·392 + S_max > MAX_NOVA_QUADS, the funding clamp would
+        // start truncating a live effect mid-emission, and the "never binds"
+        // claim would be falsified. The episode's stored `burst_kind` tells the
         // two windows apart without the occurrence in scope. Live supernova
         // window ends fold into `super_until` HERE, from the persist-wide
         // scan — a scrolled-off supernova (episode alive on grace with
@@ -8195,8 +8198,8 @@ fn emit_nova_axis(
         arm_until(active_until, until);
         *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
         let env = nova_env(occ, &nv, geom, cfg);
-        // Per-nova budget under the global backstop (which a
-        // genome-reachable frame never binds, §6.3).
+        // Per-nova budget under the decoration backstop (which
+        // a genome-reachable frame never binds, §6.3).
         let budget = nova::MAX_NOVA_QUADS_PER.min(nova::MAX_NOVA_QUADS.saturating_sub(nova.len()));
         let n0 = nova.len();
         nova::emit_nova(t, &env, budget, nova);
@@ -8374,10 +8377,12 @@ fn emit_super_axis(
             seed: occ.seed,
             base_hue: rainbow_base_hue(occ.genome.gkey),
         };
-        // Own budget under the SHARED nova_add backstop; the
-        // burst mutex — held for the FULL window, on-screen
-        // or scrolled off (persist-wide scan) — keeps the
-        // combined channel ≤ 1536, so the clamp never binds.
+        // Own budget under the decoration backstop; the burst
+        // mutex — held for the FULL window, on-screen or
+        // scrolled off (persist-wide scan) — keeps THIS PASS's
+        // share ≤ 1536, so the clamp never binds. The channel
+        // total is larger: PRISM WAKE appends after this pass
+        // spends (see `nova::MAX_NOVA_QUADS`).
         let budget =
             supernova::MAX_SUPER_QUADS_PER.min(nova::MAX_NOVA_QUADS.saturating_sub(nova.len()));
         let n0 = nova.len();

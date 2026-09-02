@@ -1,4 +1,7 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
+// (Marked hunks below: the ApplicationDelegate class is DECLARED with
+//  `aterm_objc::declare_class!` instead of objc2's. Search for the aterm
+//  local-patch marker.)
 
 use std::cell::{Cell, RefCell};
 use std::mem;
@@ -6,12 +9,12 @@ use std::rc::Weak;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use objc2::rc::Retained;
-use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
+use aterm_objc::{Bool, Id};
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
 };
-use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSUInteger};
+use objc2_foundation::MainThreadMarker;
 
 /// An optional handler consulted from `applicationShouldTerminate:` — see
 /// [`set_quit_confirm_hook`]. Returns `true` to ALLOW termination, `false` to CANCEL.
@@ -36,7 +39,7 @@ fn quit_confirm_allows() -> bool {
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
-use super::{menu, WindowId, DEVICE_ID};
+use super::{aterm_objc_seam, menu, WindowId, DEVICE_ID};
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::window::WindowId as RootWindowId;
@@ -67,35 +70,61 @@ pub(super) struct AppState {
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
 
-declare_class!(
+// LOCAL PATCH (aterm): the class pair, the ivars, the `dealloc` and all three
+// trampolines below are declared by `aterm_objc::declare_class!` rather than
+// `objc2::declare_class!` — the same move `window_delegate.rs` and `view.rs`
+// made. The METHOD BODIES still speak objc2 for their AppKit BINDINGS; what is
+// first-party is the class creation, the ivar slot, the panic guards and every
+// type encoding.
+//
+// The registered rows are READ OFF THE LIVE CLASS by
+// `crates/aterm-gui/examples/objc_live_class_audit.rs`, which the verify ladder
+// runs, and which audits THIS class from `[NSApp delegate]` in the same process
+// it already builds a window in. Do not maintain a count here.
+//
+// ALL THREE ROWS ARE `@optional`, and that is the shape of the risk: an
+// `@optional` protocol row is reached only after `-respondsToSelector:` says
+// yes, so a row that fails to register does not crash — the app simply never
+// finishes launching, never sets its activation policy and never terminates
+// cleanly. There is no first message to fail at. That is why the audit reading
+// the registered table matters more here than on a required row, and it is
+// MEASURED: `protocol_getMethodDescription(NSApplicationDelegate, sel, NO, YES)`
+// answers for all three and the required table answers for none of them.
+//
+// `applicationShouldTerminate:` returns `usize`, not `Bool`, and the runtime is
+// the authority for that: `NSApplicationDelegate` declares it `Q24@0:8@16` — an
+// eight-byte `NSApplicationTerminateReply`, the same shape `draggingEntered:`
+// was corrected to. Upstream typed it `NSUInteger`, which agrees; the `-> bool`
+// trap that bit `draggingEntered:` is not present here, and the check is the
+// same one either way.
+aterm_objc::declare_class! {
+    /// The `NSApplicationDelegate` this backend installs on `NSApp`, and the
+    /// owner of the whole event-loop state machine.
+    ///
+    /// The protocol list is not decoration: objc2's `unsafe impl <Proto> for X
+    /// {}` called `class_addProtocol` for each one, so dropping either would
+    /// make `-conformsToProtocol:` start answering NO to AppKit for the class
+    /// whose whole job is to be the application's delegate. `NSObject` is in
+    /// the list because that is what objc2's
+    /// `unsafe impl NSObjectProtocol for ApplicationDelegate {}` added.
     #[derive(Debug)]
-    pub(super) struct ApplicationDelegate;
-
-    unsafe impl ClassType for ApplicationDelegate {
-        type Super = NSObject;
-        type Mutability = mutability::MainThreadOnly;
-        const NAME: &'static str = "WinitApplicationDelegate";
-    }
-
-    impl DeclaredClass for ApplicationDelegate {
+    pub(super) struct ApplicationDelegate: NSObject {
+        const NAME: &str = "WinitApplicationDelegate";
         type Ivars = AppState;
-    }
+        protocols: [NSObject, NSApplicationDelegate];
 
-    unsafe impl NSObjectProtocol for ApplicationDelegate {}
-
-    unsafe impl NSApplicationDelegate for ApplicationDelegate {
-        #[method(applicationDidFinishLaunching:)]
-        fn app_did_finish_launching(&self, notification: &NSNotification) {
-            self.did_finish_launching(notification)
+        @sel(applicationDidFinishLaunching:)
+        fn app_did_finish_launching(&self, _notification: Id) {
+            self.did_finish_launching()
         }
 
-        #[method(applicationWillTerminate:)]
-        fn app_will_terminate(&self, notification: &NSNotification) {
-            self.will_terminate(notification)
+        @sel(applicationWillTerminate:)
+        fn app_will_terminate(&self, _notification: Id) {
+            self.will_terminate()
         }
 
-        #[method(applicationShouldTerminate:)]
-        fn app_should_terminate(&self, _sender: &NSApplication) -> NSUInteger {
+        @sel(applicationShouldTerminate:)
+        fn app_should_terminate(&self, _sender: Id) -> usize {
             // NSApplicationTerminateReply: NSTerminateCancel = 0, NSTerminateNow = 1.
             // Lets an embedder veto a `terminate:` that did NOT pass through the app
             // menu's Quit item — the Dock-icon "Quit", AppleScript `quit`, and
@@ -109,7 +138,7 @@ declare_class!(
             }
         }
     }
-);
+}
 
 impl ApplicationDelegate {
     pub(super) fn new(
@@ -117,12 +146,19 @@ impl ApplicationDelegate {
         activation_policy: Option<NSApplicationActivationPolicy>,
         default_menu: bool,
         activate_ignoring_other_apps: bool,
-    ) -> Retained<Self> {
-        let this = mtm.alloc().set_ivars(AppState {
+    ) -> aterm_objc::Retained<Self> {
+        // LOCAL PATCH (aterm): `alloc_init` is `+alloc`, store the ivars,
+        // `-init` — the same three steps and the same ORDER as the objc2 pair
+        // it replaces (`mtm.alloc().set_ivars(..)` then
+        // `msg_send_id![super(this), init]`), against a `MainThread` witness.
+        // `-init` IS the designated initializer here: the superclass is
+        // `NSObject` and this class declares no `-init` of its own, so
+        // `[self init]` and `[super init]` reach the same IMP.
+        ApplicationDelegate::alloc_init(aterm_objc_seam::witness(mtm), AppState {
             activation_policy,
             default_menu,
             activate_ignoring_other_apps,
-            run_loop: RunLoop::main(mtm),
+            run_loop: RunLoop::main(aterm_objc_seam::witness(mtm)),
             event_handler: EventHandler::new(),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
@@ -136,17 +172,17 @@ impl ApplicationDelegate {
             start_time: Cell::new(None),
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
-        });
-        unsafe { msg_send_id![super(this), init] }
+        })
+        .expect("couldn't create `WinitApplicationDelegate`")
     }
 
     // NOTE: This will, globally, only be run once, no matter how many
     // `EventLoop`s the user creates.
-    fn did_finish_launching(&self, _notification: &NSNotification) {
+    fn did_finish_launching(&self) {
         trace_scope!("applicationDidFinishLaunching:");
         self.ivars().is_launched.set(true);
 
-        let mtm = MainThreadMarker::from(self);
+        let mtm = self.mtm();
         let app = NSApplication::sharedApplication(mtm);
         // We need to delay setting the activation policy and activating the app
         // until `applicationDidFinishLaunching` has been called. Otherwise the
@@ -201,24 +237,94 @@ impl ApplicationDelegate {
         }
     }
 
-    fn will_terminate(&self, _notification: &NSNotification) {
+    fn will_terminate(&self) {
         trace_scope!("applicationWillTerminate:");
-        let mtm = MainThreadMarker::from(self);
+        let mtm = self.mtm();
         let app = NSApplication::sharedApplication(mtm);
         notify_windows_of_exit(&app);
         self.internal_exit();
     }
 
-    pub fn get(mtm: MainThreadMarker) -> Retained<Self> {
-        let app = NSApplication::sharedApplication(mtm);
+    /// The delegate `NSApp` is holding, as this class.
+    ///
+    /// LOCAL PATCH (aterm): objc2's `is_kind_of::<Self>()` + `Retained::cast`
+    /// became the same two steps against the registered class — an
+    /// `-isKindOfClass:` send and a `Retained::retain`. `-isKindOfClass:` is
+    /// the SUBCLASS-tolerant question objc2 asked and is deliberately kept:
+    /// nothing subclasses this today, and narrowing it to class identity would
+    /// be a behaviour change smuggled into a mechanical port.
+    ///
+    /// LOCAL PATCH (aterm), W9: takes `aterm_objc::MainThread`. Both callers
+    /// (`observer.rs`'s two run-loop handlers and `app.rs`) hold a witness, and
+    /// this signature is the only reason `observer.rs` was still on the objc2
+    /// list. The marker is re-derived at the one line that consumes one; THIS
+    /// file stays on the list, pinned by eight `NSApplication::sharedApplication`
+    /// calls that a signature change cannot move.
+    pub fn get(w: aterm_objc::MainThread) -> aterm_objc::Retained<Self> {
+        let app = NSApplication::sharedApplication(aterm_objc_seam::marker(w));
         let delegate =
             unsafe { app.delegate() }.expect("a delegate was not configured on the application");
-        if delegate.is_kind_of::<Self>() {
-            // SAFETY: Just checked that the delegate is an instance of `ApplicationDelegate`
-            unsafe { Retained::cast(delegate) }
-        } else {
-            panic!("tried to get a delegate that was not the one Winit has registered")
-        }
+        let delegate = Id::from_ptr(std::ptr::from_ref(&*delegate).cast_mut().cast());
+        // SAFETY: `delegate` is the live object `-[NSApplication delegate]` just
+        // answered, and `-isKindOfClass:` is `B@:#` on every Apple runtime.
+        let is_ours = unsafe {
+            let send: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::ClassPtr) -> Bool =
+                aterm_objc::msg();
+            send(
+                delegate,
+                aterm_objc::sel!(isKindOfClass:),
+                <Self as aterm_objc::ClassType>::class(),
+            )
+        };
+        assert!(
+            is_ours.as_bool(),
+            "tried to get a delegate that was not the one Winit has registered"
+        );
+        // SAFETY: just checked that the delegate is an instance of
+        // `ApplicationDelegate`; `retain` takes the borrowed reference to +1.
+        unsafe { aterm_objc::Retained::retain(delegate) }
+            .expect("a non-null delegate retains")
+    }
+
+    /// The main-thread witness objc2's `mutability::MainThreadOnly` used to
+    /// derive from the receiver's type.
+    ///
+    /// It is a real question, not `new_unchecked`, for the reason `view.rs`
+    /// gives: AppKit delivers every one of this class's rows on the main
+    /// thread, so the check is expected to be free of failures rather than free
+    /// of cost, and a delegate method reached off it is a bug this names at the
+    /// frame that noticed.
+    #[track_caller]
+    fn mtm(&self) -> MainThreadMarker {
+        MainThreadMarker::new().expect(
+            "a WinitApplicationDelegate method ran off the main thread; AppKit delivers on it",
+        )
+    }
+
+    /// A +1 handle to this delegate — objc2's `NSObjectProtocol::retain`, which
+    /// this class no longer inherits.
+    // LOCAL PATCH (aterm).
+    pub(super) fn retained(&self) -> aterm_objc::Retained<Self> {
+        // SAFETY: `self` borrows a live instance of this class, so `as_id()` is
+        // a live non-null receiver for `objc_retain`.
+        unsafe { aterm_objc::Retained::retain(self.as_id()) }
+            .expect("retaining a live ApplicationDelegate")
+    }
+
+    /// This delegate as the `NSApplicationDelegate` protocol object
+    /// `-[NSApplication setDelegate:]` takes.
+    // LOCAL PATCH (aterm): objc2's `ProtocolObject::from_ref` is generic over
+    // `T: NSApplicationDelegate`, a trait `unsafe impl NSApplicationDelegate
+    // for ApplicationDelegate {}` used to supply. The conformance is now made
+    // by `class_addProtocol` from the `protocols:` list above, so the crossing
+    // is explicit and the obligation is the one `objc2_ref` states.
+    pub(super) fn as_protocol_object(&self) -> &ProtocolObject<dyn NSApplicationDelegate> {
+        // SAFETY: `self` borrows a live instance of a class whose `protocols:`
+        // list names `NSApplicationDelegate`, so `class_addProtocol` made
+        // `-conformsToProtocol:` answer YES for it (the live-class audit checks
+        // that on the running instance); `ProtocolObject` is a zero-sized
+        // binding marker and borrows none of the instance's bytes.
+        unsafe { aterm_objc_seam::objc2_ref(self.as_id()) }
     }
 
     /// Place the event handler in the application delegate for the duration
@@ -313,7 +419,7 @@ impl ApplicationDelegate {
     }
 
     pub fn handle_redraw(&self, window_id: WindowId) {
-        let mtm = MainThreadMarker::from(self);
+        let mtm = self.mtm();
         // Redraw request might come out of order from the OS.
         // -> Don't go back into the event handler when our callstack originates from there
         if !self.ivars().event_handler.in_use() {
@@ -352,14 +458,14 @@ impl ApplicationDelegate {
             self.handle_event(event);
         } else {
             tracing::debug!(?event, "had to queue event since another is currently being handled");
-            let this = self.retain();
+            let this = self.retained();
             self.ivars().run_loop.queue_closure(move || this.handle_event(event));
         }
     }
 
     #[track_caller]
     fn handle_event(&self, event: Event<HandlePendingUserEvents>) {
-        self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retain()))
+        self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retained()))
     }
 
     /// dispatch `NewEvents(Init)` + `Resumed`
@@ -372,7 +478,7 @@ impl ApplicationDelegate {
 
     // Called by RunLoopObserver after finishing waiting for new events
     pub fn wakeup(&self, panic_info: Weak<PanicInfo>) {
-        let mtm = MainThreadMarker::from(self);
+        let mtm = self.mtm();
         let panic_info = panic_info
             .upgrade()
             .expect("The panic info must exist here. This failure indicates a developer error.");
@@ -405,7 +511,7 @@ impl ApplicationDelegate {
 
     // Called by RunLoopObserver before waiting for new events
     pub fn cleared(&self, panic_info: Weak<PanicInfo>) {
-        let mtm = MainThreadMarker::from(self);
+        let mtm = self.mtm();
         let panic_info = panic_info
             .upgrade()
             .expect("The panic info must exist here. This failure indicates a developer error.");

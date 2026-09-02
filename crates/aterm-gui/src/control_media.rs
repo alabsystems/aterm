@@ -3822,11 +3822,38 @@ mod video_parse_tests {
         drop(frame);
         drop(oldest);
 
-        let mut reply = video_frames_for_instance(
-            &tmp,
-            super::control_auth::process_instance_id(),
-            std::iter::empty(),
-        );
+        // BOUNDED BACK-OFF on the transient budget class, not a bare call. The
+        // retention budget is a process-global 32-slot counter under cfg(test)
+        // (`ARTIFACT_CLEANUP_TEST_LIMIT`), so under full-suite parallelism a
+        // sibling test can transiently hold the last slot and this reserve
+        // answers "retention sweep is in progress". Measured 2026-09-01:
+        // 2/2 failures under the parallel suite, 31/31 green module-alone,
+        // 4265/0 green single-threaded — a race, not a leak. The catalog files
+        // this reply beside `ERR busy` as a TRANSIENT class where "existing
+        // back-off code already does the right thing"; this is that back-off,
+        // doing the right thing.
+        let mut reply = {
+            let mut tries = 0;
+            loop {
+                let r = video_frames_for_instance(
+                    &tmp,
+                    super::control_auth::process_instance_id(),
+                    std::iter::empty(),
+                );
+                let transient = r.contains("retention sweep is in progress")
+                    || r.contains(crate::control::ARTIFACT_HANDOFF_BUSY);
+                if !transient {
+                    break r;
+                }
+                tries += 1;
+                assert!(
+                    tries < 200,
+                    "the retention budget never freed in 10s — that is a leak, \
+                     not the race this loop absorbs: {r:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
         assert!(reply.starts_with("OK 1\n"), "{reply:?}");
         assert!(reply.contains(oldest_path.to_string_lossy().as_ref()));
 

@@ -66,13 +66,12 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
 
-use objc2::msg_send;
-use objc2::runtime::{AnyClass, AnyObject};
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
+use aterm_objc::{CGPoint, CGRect, Id, Obj, Sel, class, sel};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use super::{CpuFrameBuffer, CpuPresenter, DamageRect};
+use crate::appkit::{self, MainThread};
 // Two CoreGraphics releasers are ALREADY declared for the `window` verb's
 // full-window capture. Reuse those declarations rather than adding a second
 // spelling of the same symbols: `platform::layer_colorspace` needs
@@ -164,7 +163,7 @@ unsafe extern "C" {
     /// Pins unrescaled contents to the layer's MINIMUM-Y left corner in a
     /// geometry-flipped layer — i.e. the visual top-left, which is the corner a
     /// terminal grid grows from.
-    static kCAGravityTopLeft: *const AnyObject;
+    static kCAGravityTopLeft: *const c_void;
 }
 
 /// CoreGraphics hands the presented buffer back here when the last reference to
@@ -196,23 +195,13 @@ unsafe extern "C" fn release_pixel_box(_info: *mut c_void, data: *const c_void, 
 // Owning wrappers. Every +1 reference this module takes lives in one of these.
 // ---------------------------------------------------------------------------
 
-/// A +1 Objective-C reference, released exactly once on drop.
-struct OwnedObject(*mut AnyObject);
-
-impl Drop for OwnedObject {
-    fn drop(&mut self) {
-        if self.0.is_null() {
-            return;
-        }
-        // SAFETY: `self.0` is the +1 reference produced by `alloc`/`init` in
-        // `MacCpuPresenter::new` and never released anywhere else, so this
-        // balances that single create-rule retain. Runs on the main thread,
-        // where the presenter is owned and dropped.
-        unsafe {
-            let _: () = msg_send![self.0, release];
-        }
-    }
-}
+// The +1 Objective-C reference that used to live in a hand-rolled
+// `OwnedObject` here is now `aterm_objc::Obj`, which is the same wrapper with
+// the same single-release Drop — and DELETING it is a small instance of the
+// thing the whole campaign is about. The crate docs open by naming `CfOwned`,
+// duplicated byte-for-byte between `net_connections/keychain.rs` and
+// `aterm-http/src/verifier/apple.rs`, as the tree's demonstrated answer to not
+// having a shared layer. `OwnedObject` was a third copy of that shape.
 
 /// A +1 `CGColorSpaceRef`, released exactly once on drop.
 struct OwnedColorSpace(CGColorSpaceRef);
@@ -307,10 +296,10 @@ pub(crate) struct MacCpuPresenter {
     /// A sublayer, not the view's own layer, for the reason `softbuffer` gives:
     /// setting `contents` on a layer the view controls is brittle — AppKit may
     /// overwrite it on any redisplay.
-    layer: OwnedObject,
+    layer: Obj,
     /// The view's backing layer. BORROWED: owned by the `NSView`, which is kept
     /// alive by `_window`. Never released here.
-    root_layer: *mut AnyObject,
+    root_layer: Id,
     /// Created once, reused by every image, released with the presenter.
     color_space: OwnedColorSpace,
     /// Backing-store width in physical pixels, from [`CpuPresenter::resize`].
@@ -348,8 +337,8 @@ impl MacCpuPresenter {
         // alive). `bounds` and `contentsScale` are side-effect-free reads;
         // `setFrame:` and `setContentsScale:` are plain property writes.
         unsafe {
-            let bounds: NSRect = msg_send![self.root_layer, bounds];
-            let scale: CGFloat = msg_send![self.root_layer, contentsScale];
+            let bounds = appkit::send_rect(self.root_layer, sel!(bounds));
+            let scale: CGFloat = appkit::send_f64(self.root_layer, sel!(contentsScale));
             let geometry = (
                 bounds.origin.x,
                 bounds.origin.y,
@@ -360,11 +349,13 @@ impl MacCpuPresenter {
             if self.applied_geometry == Some(geometry) {
                 return;
             }
-            let _: () = msg_send![self.layer.0, setFrame: bounds];
+            let set_frame: unsafe extern "C" fn(Id, Sel, CGRect) = aterm_objc::msg();
+            set_frame(self.layer.id(), sel!(setFrame:), bounds);
             // A non-positive scale would divide the contents to nothing; keep
             // whatever the layer already had rather than blank the window.
             if scale > 0.0 {
-                let _: () = msg_send![self.layer.0, setContentsScale: scale];
+                let set_scale: unsafe extern "C" fn(Id, Sel, f64) = aterm_objc::msg();
+                set_scale(self.layer.id(), sel!(setContentsScale:), scale);
             }
             self.applied_geometry = Some(geometry);
         }
@@ -373,12 +364,13 @@ impl MacCpuPresenter {
 
 impl Drop for MacCpuPresenter {
     fn drop(&mut self) {
-        // SAFETY: `self.layer.0` is our live +1 `CALayer`; unparenting it before
-        // `OwnedObject` releases our reference is what keeps a downgraded-then-
-        // rebuilt window from stacking dead layers over the live one. Runs on
-        // the main thread, where the presenter is owned.
+        // SAFETY: `self.layer` is our live +1 `CALayer`; unparenting it before
+        // `Obj`'s Drop releases our reference is what keeps a downgraded-then-
+        // rebuilt window from stacking dead layers over the live one.
+        // `-removeFromSuperlayer` is `-(void)`. Runs on the main thread, where
+        // the presenter is owned.
         unsafe {
-            let _: () = msg_send![self.layer.0, removeFromSuperlayer];
+            appkit::send_v(self.layer.id(), sel!(removeFromSuperlayer));
         }
     }
 }
@@ -393,7 +385,7 @@ impl CpuPresenter for MacCpuPresenter {
     fn new(window: Arc<Window>) -> Result<Self, Self::Error> {
         // AppKit views and CoreAnimation layers may only be touched from the
         // main thread; refuse rather than corrupt AppKit state off it.
-        let _main = MainThreadMarker::new().ok_or(MacPresentError::NotMainThread)?;
+        let _main = MainThread::new().ok_or(MacPresentError::NotMainThread)?;
         // Scoped so the borrow of `window` ends before `window` is moved into
         // `Self`. `ns_view` is a plain `NonNull` and borrows nothing.
         let ns_view = {
@@ -405,10 +397,14 @@ impl CpuPresenter for MacCpuPresenter {
                 _ => return Err(MacPresentError::NoAppKitHandle),
             }
         };
-        // Dynamic lookup, not `class!`: a process somehow without QuartzCore
-        // reports a typed error instead of aborting.
-        let layer_class =
-            AnyClass::get("CALayer").ok_or(MacPresentError::MissingClass("CALayer"))?;
+        // Dynamic lookup: a process somehow without QuartzCore reports a typed
+        // error instead of aborting. `aterm_objc::class` is `objc_getClass`,
+        // which answers null rather than panicking, so the check is the same
+        // one `AnyClass::get`'s `Option` made.
+        let layer_class = class(c"CALayer");
+        if layer_class.is_null() {
+            return Err(MacPresentError::MissingClass("CALayer"));
+        }
 
         // SAFETY: `ns_view` points at this window's live `NSView` — winit owns
         // it for the window's lifetime and `window` (moved into `Self` below)
@@ -421,35 +417,43 @@ impl CpuPresenter for MacCpuPresenter {
         // outlives the process, and the setter retains it); `addSublayer:`
         // retains our layer, which is why our own +1 must still be released.
         unsafe {
-            let view = ns_view.as_ptr().cast::<AnyObject>();
-            let _: () = msg_send![view, setWantsLayer: true];
-            let root_layer: *mut AnyObject = msg_send![view, layer];
+            let view = Id::from_ptr(ns_view.as_ptr().cast());
+            appkit::send_v_bool(view, sel!(setWantsLayer:), true);
+            let root_layer = appkit::send_id(view, sel!(layer));
             if root_layer.is_null() {
                 return Err(MacPresentError::NoRootLayer);
             }
 
-            let allocated: *mut AnyObject = msg_send![layer_class, alloc];
-            let layer: *mut AnyObject = msg_send![allocated, init];
-            if layer.is_null() {
-                // A failing `init` has already released the allocation per Cocoa
-                // convention — touching it here would be an over-release.
+            let raw = appkit::send_id(appkit::alloc(layer_class), sel!(init));
+            // A failing `init` has already released the allocation per Cocoa
+            // convention — touching it here would be an over-release, which is
+            // exactly what `Obj::from_owned`'s `None` arm expresses.
+            let Some(layer) = Obj::from_owned(raw) else {
                 return Err(MacPresentError::LayerAlloc);
-            }
-            let layer = OwnedObject(layer);
+            };
 
             // Top-left origin, matching the frontend's framebuffer coordinates.
-            let _: () = msg_send![layer.0, setAnchorPoint: NSPoint::new(0.0, 0.0)];
-            let _: () = msg_send![layer.0, setGeometryFlipped: true];
+            let set_anchor: unsafe extern "C" fn(Id, Sel, CGPoint) = aterm_objc::msg();
+            set_anchor(
+                layer.id(),
+                sel!(setAnchorPoint:),
+                CGPoint { x: 0.0, y: 0.0 },
+            );
+            appkit::send_v_bool(layer.id(), sel!(setGeometryFlipped:), true);
             if !kCAGravityTopLeft.is_null() {
-                let _: () = msg_send![layer.0, setContentsGravity: kCAGravityTopLeft];
+                appkit::send_v_id(
+                    layer.id(),
+                    sel!(setContentsGravity:),
+                    Id::from_ptr(kCAGravityTopLeft.cast_mut()),
+                );
             }
-            let _: () = msg_send![root_layer, addSublayer: layer.0];
+            appkit::send_v_id(root_layer, sel!(addSublayer:), layer.id());
 
             let color_space = CGColorSpaceCreateDeviceRGB();
             if color_space.is_null() {
                 // Unparent before `layer`'s drop releases our reference, so a
                 // failed construction leaves the view exactly as it was found.
-                let _: () = msg_send![layer.0, removeFromSuperlayer];
+                appkit::send_v(layer.id(), sel!(removeFromSuperlayer));
                 return Err(MacPresentError::ColorSpace);
             }
 
@@ -569,7 +573,7 @@ impl MacCpuFrame<'_> {
             return Err(MacPresentError::Image);
         }
 
-        let transaction = AnyClass::get("CATransaction");
+        let transaction = class(c"CATransaction");
         // SAFETY: `CATransaction`'s begin/setDisableActions:/commit are the
         // documented class-method triple and are balanced here on every path
         // (nothing between them can return early). `setContents:` takes an `id`;
@@ -577,14 +581,18 @@ impl MacCpuFrame<'_> {
         // retains it, which is why our create-reference is released immediately
         // after the commit. Main thread, as checked in `new`.
         unsafe {
-            if let Some(class) = transaction {
-                let _: () = msg_send![class, begin];
-                let _: () = msg_send![class, setDisableActions: true];
+            if !transaction.is_null() {
+                appkit::send_v(transaction.as_id(), sel!(begin));
+                appkit::send_v_bool(transaction.as_id(), sel!(setDisableActions:), true);
             }
             presenter.sync_layer_geometry();
-            let _: () = msg_send![presenter.layer.0, setContents: image.cast::<AnyObject>()];
-            if let Some(class) = transaction {
-                let _: () = msg_send![class, commit];
+            appkit::send_v_id(
+                presenter.layer.id(),
+                sel!(setContents:),
+                Id::from_ptr(image),
+            );
+            if !transaction.is_null() {
+                appkit::send_v(transaction.as_id(), sel!(commit));
             }
             CGImageRelease(image);
         }

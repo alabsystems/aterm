@@ -849,14 +849,19 @@ fn fs_glyph_color(in: GlyphVsOut) -> @location(0) vec4<f32> {
 // Sparkle-word decorations sample a coverage sprite from the deco atlas and use
 // the per-instance `color.a` as an opacity multiplier (text glyphs leave a unused
 // at 1.0; these set it to the decoration's alpha). The effective coverage is
-// `cov * color.a` — the float twin of the CPU `(cov * alpha + 127) / 255`.
+// QUANTIZED to the CPU's byte lattice — `round(cov·color.a·255)/255`, the
+// float twin of the CPU `(cov * alpha + 127) / 255` — because the CPU stamp
+// rounds that intermediate to a byte before it premultiplies/blends, and the
+// un-quantized f32 product landed ±1 code value off it on ~12% of interior
+// (cov, alpha) pairs (fs_sprite_over's own fix, extended here 2026-09-01;
+// ties are unreachable by parity, so round() reproduces the byte exactly).
 //
 // OVER (the feline cat-paw): output (rgb, a) into ALPHA_BLENDING ⇒
 //   dst*(1-a) + rgb*a  == the CPU `blend(dst, color, a)`.
 @fragment
 fn fs_deco_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
     let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    let a = cov * in.color.a;
+    let a = round(cov * in.color.a * 255.0) / 255.0;
     return vec4<f32>(s2l(in.color.rgb), a);
 }
 
@@ -865,7 +870,7 @@ fn fs_deco_over(in: GlyphVsOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_deco_add(in: GlyphVsOut) -> @location(0) vec4<f32> {
     let cov = textureSample(atlas_tex, atlas_samp, in.uv).r;
-    let a = cov * in.color.a;
+    let a = round(cov * in.color.a * 255.0) / 255.0;
     return vec4<f32>(in.color.rgb * a, a);
 }
 
@@ -1375,7 +1380,14 @@ fn fs_shimmer(in: VsOut) -> @location(0) vec4<f32> {
     // interior (the ClampToEdge sampler is the second fence).
     let sp = clamp(p + d, vec2<f32>(0.5, 0.5), su.frame - vec2<f32>(0.5, 0.5));
     let c = textureSampleLevel(shimmer_src, shimmer_samp, sp / su.frame, 0.0);
-    return vec4<f32>(c.rgb, 1.0);
+    // The WHOLE displaced sample, alpha included. Refracting rgb while the
+    // alpha byte kept the UNDISPLACED pixel's value left the two describing
+    // different source pixels; on the translucent (M5 glass) present the blit
+    // publishes that alpha, so glyph-edge flecks presented opaque bg and ink
+    // presented at bg opacity inside the haze band (2026-09-01 audit). On an
+    // opaque present the offscreen alpha is uniform inside the grid, so
+    // carrying it is byte-identical there.
+    return c;
 }
 "#;
 

@@ -317,10 +317,18 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             "crates/aterm-effects/src/word_decorations.rs",
         ],
         rationale: "§3.2 two-way burst mutex: MAX_ACTIVE_SUPERNOVAE = 1 is what keeps the \
-            combined `nova_add` channel under MAX_NOVA_QUADS = 1536. Two live supernovae \
-            make it 2 x 900 = 1800, or 3 x 392 + 900 = 2076 mixed — and the const-assert \
-            derivation in supernova.rs is falsified SILENTLY, because that assert is over \
-            CONSTANTS and can never observe a second instance.",
+            DECORATION share of the shared `nova_add` channel inside MAX_NOVA_QUADS = 1536 \
+            WITHOUT the funding clamp ever binding. Two live supernovae make that share \
+            2 x 900 = 1800, or 3 x 392 + 900 = 2076 mixed, so \
+            `MAX_NOVA_QUADS.saturating_sub(nova.len())` would start TRUNCATING a live \
+            effect mid-emission — and the const-assert derivation in supernova.rs is \
+            falsified SILENTLY, because that assert is over CONSTANTS and can never \
+            observe a second instance. 1536 is a FUNDING ceiling, not a channel total: \
+            PRISM WAKE (aterm-effects/src/output_streak.rs) is a second producer whose \
+            per-pane quads the host appends AFTER this pass has finished spending, so they \
+            are neither funded by the budget nor counted by it. That overrun is measured, \
+            and shown to truncate nothing and allocate nothing per frame, in \
+            aterm-effects/tests/nova_channel_budget.rs.",
     },
 ];
 

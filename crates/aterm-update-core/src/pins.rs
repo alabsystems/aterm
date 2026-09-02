@@ -174,7 +174,9 @@
 ///    arming a trust anchor is a reviewed act, so it edits the working tree, prints
 ///    exactly what is and is not now true, and stops. Read `git diff` over this file, and
 ///    delete the tripwire assertions the tool names in its closing output — they exist so
-///    this step cannot be taken by accident.
+///    this step cannot be taken by accident. Done here on 2026-08-15: this tree's two
+///    empty-anchor tripwires went with the arming commit, so the tool's output names them
+///    as a record and only a fork still has any to delete.
 ///
 /// 4. **On EVERY LATER publishing machine:**
 ///    ```text
@@ -478,10 +480,14 @@ pub const fn update_channel_signing_pubkey() -> &'static str {
 ///
 /// 4. **Set the value below** to your 10-character Team ID (it is public — it
 ///    already appears in the `subject.OU` of every Developer-ID signature you
-///    ship), and delete the tripwire assertion in
-///    `crates/aterm-release/tests/apple_tier.rs`
-///    (`the_shipped_anchor_is_unset_so_the_tier_is_inert`), which exists to make
-///    this step impossible to take by accident. One reviewed diff.
+///    ship). This step was taken on 2026-08-15, and taking it DELETED the tripwire
+///    assertion this checklist used to send the operator to remove
+///    (`the_shipped_anchor_is_unset_so_the_tier_is_inert`, in
+///    `crates/aterm-release/tests/apple_tier.rs`) — the instruction outlived the test it
+///    named, which is now defined nowhere in the tree. Its replacement,
+///    `the_shipped_anchor_is_armed_and_an_empty_anchor_still_resolves_inert`, asserts the
+///    ARMED value directly, so a fork re-arming this anchor updates that assertion rather
+///    than deleting one. One reviewed diff.
 ///
 /// 5. **Cut a rehearsal first.** `--rehearse` and `--dry-run` deliberately sign
 ///    and notarize for real, so the rehearsal is a true proof that the whole path

@@ -536,17 +536,13 @@ pub fn update(_handle: &StatusItemHandle, _glance: &FleetGlance) {}
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
-    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, sel};
-    use objc2_app_kit::{
-        NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
-    };
-    use objc2_foundation::{MainThreadMarker, NSString};
+    use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
     use winit::event_loop::EventLoopProxy;
 
     use super::{FleetGlance, OperatorAction};
     use crate::Wake;
+    use crate::appkit::consts::NS_VARIABLE_STATUS_ITEM_LENGTH;
+    use crate::appkit::{self, MainThread};
 
     /// What [`install`] returns. BOTH fields are load-bearing retentions:
     /// releasing an `NSStatusItem` REMOVES it from the menu bar, and AppKit holds
@@ -556,71 +552,66 @@ mod macos {
         /// The single `statusAction:` relay target every item is wired to.
         target: Retained<StatusTarget>,
         /// The bar item itself; dropping it would vanish the icon.
-        item: Retained<NSStatusItem>,
+        item: Obj,
     }
 
-    declare_class!(
+    aterm_objc::declare_class! {
         /// The target object for every status-menu item. Owns the
         /// `EventLoopProxy<Wake>` and exposes one `statusAction:` selector that
         /// decodes the sender's tag to an [`OperatorAction`] and posts
         /// [`Wake::OperatorAction`] — a pure relay from AppKit into the `Wake`
         /// channel, exactly like `menu.rs`'s `MenuTarget`.
-        pub(crate) struct StatusTarget;
-
-        // SAFETY:
-        // - NSObject imposes no subclassing requirements.
-        // - MainThreadOnly is required by the NSMenuDelegate protocol bound
-        //   (`NSMenuDelegate: IsMainThreadOnly`) and is sound: the target is
-        //   created and only ever messaged on the main thread.
-        // - StatusTarget has no Drop impl beyond the auto-generated ivar drop.
-        unsafe impl ClassType for StatusTarget {
-            type Super = objc2::runtime::NSObject;
-            type Mutability = mutability::MainThreadOnly;
-            const NAME: &'static str = "ATermStatusTarget";
-        }
-
-        impl DeclaredClass for StatusTarget {
+        ///
+        /// Declared with [`aterm_objc::declare_class!`]. The class name, the
+        /// superclass, the two selectors, the declared protocols and the
+        /// behaviour are unchanged from the `objc2` declaration this replaces;
+        /// `a_real_menu_and_a_real_notification_reach_the_declared_class`
+        /// drives both selectors — through `-performSelector:withObject:` and
+        /// `NSNotificationCenter`, i.e. the runtime's and Foundation's own
+        /// dispatch, on a probe class. NOT AppKit's: a status item's menu
+        /// needs a modal menu-tracking run loop, which libtest cannot start
+        /// (a judge measured `popUpMenuPositioningItem:` hanging, and that
+        /// `pthread_main_np()` is 0 inside a `#[test]` even under
+        /// `--test-threads=1`). An earlier version of this sentence named a
+        /// test that does not exist and claimed AppKit's dispatch; in a
+        /// campaign whose stated trap is "compiles, does nothing, reports
+        /// success", an overstated proof is the defect that matters.
+        ///
+        /// What objc2 spelled `type Mutability = MainThreadOnly` is carried by
+        /// [`MainThread`] at the two entry points plus
+        /// [`aterm_objc::Retained`]'s unconditional `!Send` — see the note on
+        /// [`MainThread`].
+        pub(crate) struct StatusTarget: NSObject {
+            const NAME: &str = "ATermStatusTarget";
             type Ivars = EventLoopProxy<Wake>;
-        }
+            protocols: [NSObject, NSMenuDelegate];
 
-        unsafe impl StatusTarget {
             /// `statusAction:` — the one selector wired to every actionable item.
             /// A tag that doesn't decode is inert (never fires a wrong command).
-            #[method(statusAction:)]
-            fn status_action(&self, sender: Option<&NSMenuItem>) {
-                let Some(item) = sender else { return };
-                // SAFETY: `item` is the live NSMenuItem AppKit passed as the
-                // action sender; `tag` is a plain getter with no side effects.
-                let tag = unsafe { item.tag() };
+            @sel(statusAction:)
+            fn status_action(&self, sender: Id) {
+                if sender.is_null() {
+                    return;
+                }
+                // SAFETY: `sender` is the live NSMenuItem AppKit passed as the
+                // action sender; `-tag` is `-(NSInteger)` with no side effects.
+                let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
                 if let Some(action) = OperatorAction::from_tag(tag) {
                     // Fire-and-forget: a closed loop (app shutting down) just
                     // drops the event — mirrors menu.rs.
                     let _ = self.ivars().send_event(Wake::OperatorAction { action });
                 }
             }
-        }
 
-        unsafe impl NSObjectProtocol for StatusTarget {}
-
-        unsafe impl NSMenuDelegate for StatusTarget {
             /// The menu is about to track: RELAY ONLY. This runs inside
             /// AppKit's nested menu-tracking run loop, so it must never touch
             /// `App` — it posts a wake and the event loop kicks the background
             /// sibling scan, whose result freshens the NEXT open (the
             /// `toolbar.rs` mid-track discipline).
-            #[method(menuWillOpen:)]
-            fn menu_will_open(&self, _menu: &NSMenu) {
+            @sel(menuWillOpen:)
+            fn menu_will_open(&self, _menu: Id) {
                 let _ = self.ivars().send_event(Wake::OperatorMenuOpening);
             }
-        }
-    );
-
-    impl StatusTarget {
-        /// Allocate a target owning `proxy`, on the main thread (`mtm`).
-        fn new(mtm: MainThreadMarker, proxy: EventLoopProxy<Wake>) -> Retained<Self> {
-            let this = mtm.alloc().set_ivars(proxy);
-            // SAFETY: plain `[super init]` on a freshly allocated instance.
-            unsafe { msg_send_id![super(this), init] }
         }
     }
 
@@ -629,13 +620,28 @@ mod macos {
     /// the retained handle for `App` to keep alive; best-effort `None` off the
     /// main thread — never a panic (the `menu::install` contract).
     pub fn install(proxy: &EventLoopProxy<Wake>, glance: &FleetGlance) -> Option<StatusItemHandle> {
-        let mtm = MainThreadMarker::new()?;
-        let target = StatusTarget::new(mtm, proxy.clone());
-        // SAFETY: systemStatusBar/statusItemWithLength are main-thread AppKit
-        // calls (proved by `mtm`); the returned item is retained in the handle.
-        let item: Retained<NSStatusItem> = unsafe {
-            NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength)
-        };
+        let main = MainThread::new()?;
+        let target = StatusTarget::alloc_init(main, proxy.clone())?;
+        let item = autoreleasepool(|_| {
+            // SAFETY: `+systemStatusBar` is a `-(id)` singleton accessor and
+            // `-statusItemWithLength:` is `-(id)(CGFloat)`; both are main-thread
+            // AppKit calls (proved by `main`). The item comes back AUTORELEASED
+            // (+0), so it is retained into the handle here — releasing an
+            // `NSStatusItem` removes it from the menu bar, which is why the
+            // handle owns one.
+            unsafe {
+                let bar = appkit::send_id(class(c"NSStatusBar").as_id(), sel!(systemStatusBar));
+                if bar.is_null() {
+                    return None;
+                }
+                let raw = appkit::send_id_f64(
+                    bar,
+                    sel!(statusItemWithLength:),
+                    NS_VARIABLE_STATUS_ITEM_LENGTH,
+                );
+                Obj::retain(raw)
+            }
+        })?;
         let handle = StatusItemHandle { target, item };
         update(&handle, glance);
         Some(handle)
@@ -645,96 +651,440 @@ mod macos {
     /// `glance` — the `update_version_menu` mutation pattern. Main-thread
     /// guarded: a call off the main thread is a silent no-op.
     pub fn update(handle: &StatusItemHandle, glance: &FleetGlance) {
-        let Some(mtm) = MainThreadMarker::new() else {
+        let Some(_main) = MainThread::new() else {
             return;
         };
-        // SAFETY: all calls are plain AppKit setters/constructors on live
-        // receivers, on the main thread. The button exists for a bar item we
-        // created with a variable length; the delegate (the retained target)
-        // outlives the menu because the handle retains it.
-        unsafe {
-            if let Some(button) = handle.item.button(mtm) {
-                button.setTitle(&NSString::from_str(glance.button_title()));
+        autoreleasepool(|_| {
+            // SAFETY: all sends are plain AppKit accessors/setters on live
+            // receivers, on the main thread. `-button` is `-(id)` and returns
+            // the bar button for an item created with a variable length;
+            // `-setTitle:`/`-setDelegate:`/`-setMenu:` are `-(void)(id)`. The
+            // delegate is the retained target, which outlives the menu because
+            // the handle owns it.
+            unsafe {
+                let button = appkit::send_id(handle.item.id(), sel!(button));
+                if !button.is_null()
+                    && let Some(title) = appkit::nsstring(glance.button_title())
+                {
+                    appkit::send_v_id(button, sel!(setTitle:), title.id());
+                }
+                let Some(menu) = build_menu(&handle.target, glance) else {
+                    return;
+                };
+                appkit::send_v_id(menu.id(), sel!(setDelegate:), handle.target.as_id());
+                appkit::send_v_id(handle.item.id(), sel!(setMenu:), menu.id());
             }
-            let menu = build_menu(mtm, &handle.target, glance);
-            menu.setDelegate(Some(ProtocolObject::from_ref(&*handle.target)));
-            handle.item.setMenu(Some(&menu));
-        }
+        });
     }
 
     /// Build the status menu for `glance` by PAINTING the pure model from
     /// `compose_status_menu` — native code renders rows, never decides them.
     /// Auto-enable is off so the model's `enabled` flags are authoritative.
-    fn build_menu(
-        mtm: MainThreadMarker,
-        target: &StatusTarget,
-        glance: &FleetGlance,
-    ) -> Retained<NSMenu> {
-        let menu = NSMenu::new(mtm);
-        // SAFETY: plain setter on the fresh menu, on the main thread.
-        unsafe { menu.setAutoenablesItems(false) };
+    fn build_menu(target: &Retained<StatusTarget>, glance: &FleetGlance) -> Option<Obj> {
+        // SAFETY: `+alloc` on `NSMenu` gives a +1 uninitialised instance and
+        // `-init` consumes it, so `Obj::from_owned` adopts exactly one +1;
+        // `-setAutoenablesItems:` is `-(void)(BOOL)` on the fresh menu.
+        let menu = unsafe {
+            let raw = appkit::send_id(appkit::alloc(class(c"NSMenu")), sel!(init));
+            let menu = Obj::from_owned(raw)?;
+            appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), false);
+            menu
+        };
         for row in super::compose_status_menu(glance) {
             match row {
-                super::StatusRow::Info(text) => add_info(mtm, &menu, &text),
-                super::StatusRow::Separator => add_separator(mtm, &menu),
+                super::StatusRow::Info(text) => add_info(&menu, &text),
+                super::StatusRow::Separator => add_separator(&menu),
                 super::StatusRow::Action {
                     label,
                     action,
                     enabled,
-                } => add_action(mtm, &menu, target, &label, action, enabled),
+                } => add_action(&menu, target, &label, action, enabled),
             }
         }
-        menu
+        Some(menu)
+    }
+
+    /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`, +1, or `None`
+    /// if Foundation refused either string. `action` is [`Sel::NULL`] for a row
+    /// that is a label rather than a command.
+    fn new_item(title: &str, action: Sel) -> Option<Obj> {
+        let title = appkit::nsstring(title)?;
+        let empty = appkit::nsstring("")?;
+        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's
+        // designated initializer, `-(id)(NSString *, SEL, NSString *)`, and a
+        // nil SEL is its documented "no action" value. `+alloc` is +1 and the
+        // initializer consumes it, so `Obj::from_owned` adopts one +1. Both
+        // strings are live +1 NSStrings the initializer copies.
+        unsafe {
+            let raw = appkit::send_id_id_sel_id(
+                appkit::alloc(class(c"NSMenuItem")),
+                sel!(initWithTitle:action:keyEquivalent:),
+                title.id(),
+                action,
+                empty.id(),
+            );
+            Obj::from_owned(raw)
+        }
     }
 
     /// Append an actionable item wired to `target` carrying `action`'s tag.
     fn add_action(
-        mtm: MainThreadMarker,
-        menu: &NSMenu,
-        target: &StatusTarget,
+        menu: &Obj,
+        target: &Retained<StatusTarget>,
         title: &str,
         action: OperatorAction,
         enabled: bool,
     ) {
-        let title = NSString::from_str(title);
-        let sel: Sel = sel!(statusAction:);
-        // SAFETY: standard NSMenuItem construction + plain setters on a fresh
-        // instance, all on the main thread (`mtm`) — the menu.rs add_item shape.
+        let Some(item) = new_item(title, sel!(statusAction:)) else {
+            return;
+        };
+        // SAFETY: plain setters on a fresh NSMenuItem, then `-addItem:` on the
+        // live menu — `-setTarget:` is `-(void)(id)` (AppKit holds the target
+        // WEAKLY, which is why the handle retains it), `-setTag:` is
+        // `-(void)(NSInteger)` and `-setEnabled:` is `-(void)(BOOL)`.
         unsafe {
-            let item: Retained<NSMenuItem> = NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc(),
-                &title,
-                Some(sel),
-                &NSString::from_str(""),
-            );
-            let target_obj: &AnyObject = target;
-            item.setTarget(Some(target_obj));
-            item.setTag(action.tag());
-            item.setEnabled(enabled);
-            menu.addItem(&item);
+            appkit::send_v_id(item.id(), sel!(setTarget:), target.as_id());
+            appkit::send_v_isize(item.id(), sel!(setTag:), action.tag());
+            appkit::send_v_bool(item.id(), sel!(setEnabled:), enabled);
+            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
         }
     }
 
     /// Append a disabled information row (explicit — auto-enable is off).
-    fn add_info(mtm: MainThreadMarker, menu: &NSMenu, title: &str) {
-        let title = NSString::from_str(title);
-        // SAFETY: plain item construction with no action, on the main thread.
+    fn add_info(menu: &Obj, title: &str) {
+        let Some(item) = new_item(title, Sel::NULL) else {
+            return;
+        };
+        // SAFETY: as `add_action`, on an item with no action.
         unsafe {
-            let item: Retained<NSMenuItem> = NSMenuItem::initWithTitle_action_keyEquivalent(
-                mtm.alloc(),
-                &title,
-                None,
-                &NSString::from_str(""),
-            );
-            item.setEnabled(false);
-            menu.addItem(&item);
+            appkit::send_v_bool(item.id(), sel!(setEnabled:), false);
+            appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
         }
     }
 
     /// Append a separator line.
-    fn add_separator(mtm: MainThreadMarker, menu: &NSMenu) {
-        let sep = NSMenuItem::separatorItem(mtm);
-        menu.addItem(&sep);
+    fn add_separator(menu: &Obj) {
+        // SAFETY: `+separatorItem` is `-(id)` and returns a shared,
+        // AUTORELEASED item — borrowed here for the length of `-addItem:`,
+        // which retains it into the menu, inside the caller's pool.
+        unsafe {
+            let sep = appkit::send_id(class(c"NSMenuItem").as_id(), sel!(separatorItem));
+            if !sep.is_null() {
+                appkit::send_v_id(menu.id(), sel!(addItem:), sep);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use aterm_objc::{
+            ClassType, Obj, Sel, autoreleasepool, class, class_name, method_types, sel,
+        };
+
+        use super::{StatusTarget, new_item};
+        use crate::appkit;
+        use crate::appkit::consts::NS_VARIABLE_STATUS_ITEM_LENGTH;
+
+        /// How many `statusAction:` / `menuWillOpen:` deliveries the probe saw.
+        ///
+        /// A real `StatusTarget`'s ivar is an `EventLoopProxy<Wake>`, and one of
+        /// those can only be minted from a live winit `EventLoop`, which on
+        /// macOS must be built on the process main thread and only once — so it
+        /// cannot exist on a libtest thread. The probe is a SECOND
+        /// `declare_class!` expansion of the identical shape (same superclass,
+        /// same two selectors, same declared protocols, same trampoline
+        /// generation) whose bodies count instead of posting, which is what
+        /// makes it a fair stand-in: everything under test is the macro's
+        /// output, not the relay.
+        static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
+
+        aterm_objc::declare_class! {
+            struct StatusProbe: NSObject {
+                const NAME: &str = "ATermStatusProbe";
+                type Ivars = ();
+                protocols: [NSObject, NSMenuDelegate];
+
+                @sel(statusAction:)
+                fn status_action(&self, sender: aterm_objc::Id) {
+                    // Read the tag exactly as the ported body does, so a wrong
+                    // `-tag` prototype would show up here too.
+                    // SAFETY: AppKit passed the live sending NSMenuItem;
+                    // `-tag` is `-(NSInteger)` and side-effect free.
+                    let tag = unsafe { appkit::send_isize(sender, sel!(tag)) };
+                    DISPATCHES.fetch_add(1 + usize::try_from(tag).unwrap_or(0), Ordering::SeqCst);
+                }
+
+                @sel(menuWillOpen:)
+                fn menu_will_open(&self, _menu: aterm_objc::Id) {
+                    DISPATCHES.fetch_add(1000, Ordering::SeqCst);
+                }
+            }
+        }
+
+        /// The sentinel is the SDK header's value, exactly. It cannot be
+        /// linked (see the constant's own note), so this is the only check
+        /// available and it is a pin rather than a proof.
+        #[test]
+        fn status_item_length_sentinel_matches_the_sdk() {
+            assert!(
+                (NS_VARIABLE_STATUS_ITEM_LENGTH + 1.0).abs() < f64::EPSILON,
+                "NSVariableStatusItemLength is -1.0 in AppKit/Headers/NSStatusBar.h"
+            );
+        }
+
+        /// The registered class is what the RUNTIME says it is: right name,
+        /// right superclass, both selectors present on instances, and it
+        /// CONFORMS to `NSMenuDelegate` — the property objc2 spelled
+        /// `unsafe impl NSMenuDelegate for StatusTarget`, and the one
+        /// `-[NSMenu setDelegate:]` reads before it will ever call back.
+        #[test]
+        fn the_registered_class_is_what_the_runtime_reports() {
+            let cls = StatusTarget::class();
+            assert!(!cls.is_null());
+            assert_eq!(class(c"ATermStatusTarget"), cls);
+            // SAFETY: `cls` is the class this module registered, so it and its
+            // superclass are live, immortal class objects.
+            unsafe {
+                assert_eq!(class_name(cls), c"ATermStatusTarget");
+                assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
+            }
+            let proto = aterm_objc::protocol(c"NSMenuDelegate");
+            assert!(!proto.is_null(), "AppKit is linked, so is its protocol");
+            // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:`
+            // are side-effect-free NSObject queries on a live class object.
+            unsafe {
+                assert!(
+                    appkit::send_bool_id(
+                        cls.as_id(),
+                        sel!(conformsToProtocol:),
+                        aterm_objc::Id::from_ptr(proto.as_ptr()),
+                    ),
+                    "the declared class does not answer NSMenuDelegate"
+                );
+                assert!(appkit::send_bool_sel(
+                    cls.as_id(),
+                    sel!(instancesRespondToSelector:),
+                    sel!(statusAction:)
+                ));
+                assert!(appkit::send_bool_sel(
+                    cls.as_id(),
+                    sel!(instancesRespondToSelector:),
+                    sel!(menuWillOpen:)
+                ));
+            }
+        }
+
+        /// THE PROOF for the ENCODINGS: what `class_addMethod` actually
+        /// registered, read back out of the runtime with
+        /// `method_getTypeEncoding`, against the verified table. Both selectors
+        /// are `- (void)x:(id)y`, so both are `"v@:@"`; the generated `-dealloc`
+        /// is `"v@:"`.
+        #[test]
+        fn the_runtime_reports_the_encodings_the_table_says() {
+            let cls = StatusTarget::class();
+            // SAFETY: `cls` is the live registered class.
+            unsafe {
+                assert_eq!(
+                    method_types(cls, sel!(statusAction:)).as_deref(),
+                    Some("v@:@")
+                );
+                assert_eq!(
+                    method_types(cls, sel!(menuWillOpen:)).as_deref(),
+                    Some("v@:@")
+                );
+                assert_eq!(method_types(cls, sel!(dealloc)).as_deref(), Some("v@:"));
+            }
+        }
+
+        /// THE PROOF for BEHAVIOUR — not "the macro expands", and not our own
+        /// typed cast either.
+        ///
+        /// Three legs, none of which is the thing under test:
+        ///
+        /// 1. **AppKit stored the wiring.** A real `NSMenu` takes the probe as
+        ///    its delegate and a real `NSMenuItem` is built through the ported
+        ///    `new_item`; `-delegate`, `-target` and `-action` are read back
+        ///    out of AppKit and must name the declared class and its selector.
+        /// 2. **Foundation dispatches one selector.** `NSNotificationCenter`
+        ///    is handed `menuWillOpen:` as an observer selector and the
+        ///    notification is posted — Foundation's own machinery finds the IMP
+        ///    in the registered class's method table and calls the Rust body,
+        ///    exactly as `platform.rs`'s W1 test does for the reduce-motion
+        ///    target. Registration itself is a check: the centre reads the
+        ///    encoding to build the call.
+        /// 3. **The runtime dispatches the other.** `-performSelector:
+        ///    withObject:` is `objc_msgSend` off the class's method table —
+        ///    what `-[NSApplication sendAction:to:from:]` ultimately performs
+        ///    for a menu click — handed the REAL `NSMenuItem`, so the body's
+        ///    `-tag` read is exercised against a real item that AppKit itself
+        ///    tagged.
+        ///
+        /// `-[NSMenu performActionForItemAtIndex:]` is deliberately NOT the
+        /// leg used, and the reason is measured rather than assumed: it routes
+        /// through `NSApp`, there is no `NSApplication` in a libtest process
+        /// (and one cannot be made — libtest runs every test on a spawned
+        /// thread, and `+sharedApplication` is main-thread-only), and the call
+        /// silently does nothing. It was the first shape tried and it counted
+        /// zero.
+        #[test]
+        fn a_real_menu_and_a_real_notification_reach_the_declared_class() {
+            const NOTE: &str = "ATermStatusProbeWillOpen";
+            DISPATCHES.store(0, Ordering::SeqCst);
+            let probe = StatusProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
+            autoreleasepool(|_| {
+                // SAFETY: standard NSMenu/NSNotificationCenter construction and
+                // plain accessors, every send through the same prototypes the
+                // ported module uses. `-action` is `-(SEL)`, `-target` and
+                // `-delegate` are `-(id)`, `-addObserver:selector:name:object:`
+                // is `-(void)(id, SEL, id, id)` and `-postNotificationName:
+                // object:` is `-(void)(id, id)`.
+                unsafe {
+                    let menu = Obj::from_owned(appkit::send_id(
+                        appkit::alloc(class(c"NSMenu")),
+                        sel!(init),
+                    ))
+                    .expect("NSMenu");
+                    appkit::send_v_bool(menu.id(), sel!(setAutoenablesItems:), false);
+                    appkit::send_v_id(menu.id(), sel!(setDelegate:), probe.as_id());
+
+                    let item = new_item("row", sel!(statusAction:)).expect("item");
+                    appkit::send_v_id(item.id(), sel!(setTarget:), probe.as_id());
+                    appkit::send_v_isize(item.id(), sel!(setTag:), 7);
+                    appkit::send_v_bool(item.id(), sel!(setEnabled:), true);
+                    appkit::send_v_id(menu.id(), sel!(addItem:), item.id());
+
+                    // (1) what AppKit stored.
+                    assert_eq!(
+                        appkit::send_id(menu.id(), sel!(delegate)),
+                        probe.as_id(),
+                        "NSMenu refused the declared class as its delegate"
+                    );
+                    let target_of: unsafe extern "C" fn(aterm_objc::Id, Sel) -> aterm_objc::Id =
+                        aterm_objc::msg();
+                    assert_eq!(target_of(item.id(), sel!(target)), probe.as_id());
+                    let action_of: unsafe extern "C" fn(aterm_objc::Id, Sel) -> Sel =
+                        aterm_objc::msg();
+                    assert_eq!(action_of(item.id(), sel!(action)), sel!(statusAction:));
+                    assert_eq!(appkit::send_isize(item.id(), sel!(tag)), 7);
+
+                    // (2) Foundation's own dispatch of `menuWillOpen:`.
+                    let centre = appkit::send_id(
+                        class(c"NSNotificationCenter").as_id(),
+                        sel!(defaultCenter),
+                    );
+                    assert!(!centre.is_null());
+                    let name = appkit::nsstring(NOTE).expect("NSString");
+                    let add: unsafe extern "C" fn(
+                        aterm_objc::Id,
+                        Sel,
+                        aterm_objc::Id,
+                        Sel,
+                        aterm_objc::Id,
+                        aterm_objc::Id,
+                    ) = aterm_objc::msg();
+                    add(
+                        centre,
+                        sel!(addObserver:selector:name:object:),
+                        probe.as_id(),
+                        sel!(menuWillOpen:),
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+                    appkit::send_v_id_id(
+                        centre,
+                        sel!(postNotificationName:object:),
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+                    appkit::send_v_id(centre, sel!(removeObserver:), probe.as_id());
+                    // Removed: a further post must NOT reach it.
+                    appkit::send_v_id_id(
+                        centre,
+                        sel!(postNotificationName:object:),
+                        name.id(),
+                        aterm_objc::Id::NIL,
+                    );
+
+                    // (3) the runtime's dispatch of `statusAction:`, with the
+                    // REAL tagged NSMenuItem as the sender.
+                    let perform_sel: unsafe extern "C" fn(
+                        aterm_objc::Id,
+                        Sel,
+                        Sel,
+                        aterm_objc::Id,
+                    ) -> aterm_objc::Id = aterm_objc::msg();
+                    perform_sel(
+                        probe.as_id(),
+                        sel!(performSelector:withObject:),
+                        sel!(statusAction:),
+                        item.id(),
+                    );
+                }
+            });
+            assert_eq!(
+                DISPATCHES.load(Ordering::SeqCst),
+                1008,
+                "the declared class did not receive menuWillOpen: exactly once \
+                 (1000) and statusAction: with the item's tag 7 (1 + 7)"
+            );
+        }
+
+        /// An item built with [`Sel::NULL`] really has no action — the shape
+        /// `add_info` needs, and the one the crate could not express before
+        /// this wave.
+        #[test]
+        fn an_information_row_has_a_nil_action() {
+            autoreleasepool(|_| {
+                let item = new_item("info", Sel::NULL).expect("item");
+                let wired = new_item("cmd", sel!(statusAction:)).expect("item");
+                // SAFETY: `-action` is `-(SEL)` on a live NSMenuItem, and
+                // `-title` is `-(NSString *)`.
+                unsafe {
+                    let action: unsafe extern "C" fn(aterm_objc::Id, Sel) -> Sel =
+                        aterm_objc::msg();
+                    assert!(action(item.id(), sel!(action)).is_null());
+                    assert_eq!(action(wired.id(), sel!(action)), sel!(statusAction:));
+                    assert_eq!(
+                        appkit::nsstring_to_rust(appkit::send_id(item.id(), sel!(title))),
+                        "info"
+                    );
+                }
+            });
+        }
+
+        /// The generated `-dealloc` drops the Rust ivars, on an ivar SHAPE that
+        /// owns something with a `Drop` — which the real site's
+        /// `EventLoopProxy<Wake>` is.
+        #[test]
+        fn dropping_a_declared_instance_drops_its_ivars() {
+            static DROPS: AtomicUsize = AtomicUsize::new(0);
+            struct Spy;
+            impl Drop for Spy {
+                fn drop(&mut self) {
+                    DROPS.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            aterm_objc::declare_class! {
+                struct StatusDropProbe: NSObject {
+                    const NAME: &str = "ATermStatusDropProbe";
+                    type Ivars = Spy;
+
+                    @sel(ping)
+                    fn ping(&self) {}
+                }
+            }
+            DROPS.store(0, Ordering::SeqCst);
+            let t = StatusDropProbe::alloc_init(crate::appkit::test_witness(), Spy).expect("probe");
+            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+            drop(t);
+            assert_eq!(
+                DROPS.load(Ordering::SeqCst),
+                1,
+                "the generated -dealloc did not drop the ivars"
+            );
+        }
     }
 }
 

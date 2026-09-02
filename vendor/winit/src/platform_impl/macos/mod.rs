@@ -5,6 +5,7 @@ mod util;
 
 mod app;
 mod app_state;
+mod aterm_objc_seam;
 mod cursor;
 mod event;
 mod event_handler;

@@ -638,8 +638,13 @@ pub(crate) fn report_next_before_cut(r: &atpkg_keys::provision::Report) -> Vec<S
         out.push(format!("review: git diff -- {}", r.paths.pins));
     }
     if r.verb == Verb::Setup {
+        // WRONG BEFORE: both tests named here were deleted by the 2026-08-15 arming
+        // commit, so this step sent an operator hunting for work that does not exist. A
+        // fork arming from an empty anchor may carry its own tripwires, so the step
+        // stays — the two names are now given as a record.
         out.push(
-            "delete the tripwire tests that assert an empty anchor:\n  \
+            "delete any tripwire test that asserts an empty anchor — a fork's own; this \
+             tree's two went with the 2026-08-15 arming commit. For the record:\n  \
              crates/aterm-update-core/src/pins.rs::tests::\
              the_paper_master_is_unset_so_the_roster_tier_is_inert\n  \
              crates/atpkg-keys/tests/paper_master_to_client.rs::\

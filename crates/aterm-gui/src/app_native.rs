@@ -5749,6 +5749,15 @@ impl App {
                 let first_exhaustion =
                     cooling_down && intent.attempts == MAX_AUTOMATIC_UPDATE_CYCLES;
                 self.auto_apply_intent = Some(intent);
+                // THE BAR MAY NOT OUTLIVE THE PROMISE — the physical arm's law,
+                // owed here too now that admission refusals route through this
+                // lane (2026-09-01): the refusal is synchronous, so it runs
+                // inside the Staged bar's hold with "applies in place within
+                // ~2 min" possibly still on screen while the gate's posture
+                // says the lane is off. Recompute the posture onto the bar; for
+                // an ordinary close-preflight block the posture is unchanged
+                // and this is a no-op restatement.
+                self.restate_staged_bar_posture(intent.build);
                 if intent.attempts == 1 {
                     // The FIRST block of an intent is always logged (the pill below
                     // stays gated on `announce`, which is the UI's business): a
@@ -6373,6 +6382,25 @@ impl App {
                             self.publish_native_update_state();
                         }
                         UpdateOutcome::Deferred { reason: message }
+                    }
+                    // An admission REFUSAL: nothing was attempted, so nothing
+                    // failed. The stage is re-armed exactly like a deferral,
+                    // and the outcome routes to the Blocked lane — the ledger's
+                    // non-streak Refused slot and the disposition's cooldown —
+                    // instead of the failure streak + physical budget the
+                    // `Failed` arm below spends (the field's failing_applies=23
+                    // were all this shape; 2026-09-01 audit).
+                    Err(error) if error.is_refused() => {
+                        let message = error.into_message();
+                        if self
+                            .native_updater_service
+                            .abort_apply(&attempt, message.clone())
+                        {
+                            self.publish_native_update_state();
+                        }
+                        UpdateOutcome::Blocked {
+                            reasons: vec![message],
+                        }
                     }
                     // Submission failed before the worker could touch disk. Re-arm the
                     // exact authority directly; physical failures always return through
@@ -11024,26 +11052,41 @@ mod tests {
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
 
-        let landed = app
-            .notice
-            .as_ref()
-            .map(crate::notice::TransientNotice::text)
-            .expect("the attempt past the preflight reports its physical outcome");
-        assert_eq!(
-            landed, "↑ Update delayed — retries on its own",
-            "the cleared blocker must let the attempt reach PHYSICAL replacement. \
-             A close-preflight refusal would have painted the Blocked pill \
-             (\"Update waiting …\") or, inside its cooldown, nothing at all"
+        // The cleared blocker lets the attempt past the close preflight to the
+        // ADMISSION gate, which this process can never pass (no seamless lane,
+        // a live session vetoes cold). That refusal is a refusal, not a failed
+        // attempt (2026-09-01): past the spent budget it re-probes silently on
+        // the standing cooldown — no new pill (the one exhaustion pill already
+        // fired), no manual-only latch, no physical failure booked, the intent
+        // retained.
+        assert!(
+            app.notice.is_none(),
+            "a refused re-probe past the exhaustion pill paints nothing: {:?}",
+            app.notice
+                .as_ref()
+                .map(crate::notice::TransientNotice::text)
+        );
+        let refusal = app
+            .native_updater_service
+            .snapshot()
+            .error
+            .clone()
+            .expect("the refused attempt records why it stopped");
+        assert!(
+            refusal.starts_with("Update kept"),
+            "the receipt that the attempt got PAST the close preflight to the \
+             admission gate, got {refusal:?}"
         );
         assert!(
-            app.auto_apply_intent.is_none()
-                && app
-                    .auto_apply_manual_only
-                    .is_some_and(|latch| latch.build == build && latch.retry_at.is_some()),
-            "reaching the physical lane retires the transient cooldown intent and \
-             hands the artifact to the strict physical-failure budget; still being \
-             refused by the close preflight would have kept a live intent and no \
-             latch"
+            app.auto_apply_intent.is_some_and(
+                |intent| intent.build == build && intent.retry_at > std::time::Instant::now()
+            ),
+            "the admission refusal keeps the intent armed on its cooldown"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none() && app.auto_apply_physical_retry.is_none(),
+            "an admission refusal neither latches manual-only nor books a \
+             physical failure"
         );
         assert_no_probe_disturbance(&app, wid, working_tab);
     }
@@ -11274,26 +11317,28 @@ mod tests {
         assert_no_probe_disturbance(&app, wid, working_tab);
 
         // ACT TWO — THE USER STOPS BEING BUSY, and the next cooldown probe is
-        // AUTHORIZED: it leaves the close-preflight lane entirely and is handed to
-        // physical replacement. In this process that replacement cannot land (see
-        // the doc comment), so the lane books it as a physical failure and
-        // schedules its own comeback — which is what act three arrives on.
+        // AUTHORIZED: it leaves the close-preflight lane and reaches the
+        // ADMISSION gate, which this process can never pass (no seamless lane;
+        // a live session vetoes cold). That is a REFUSAL, not a failed attempt
+        // (2026-09-01): the lane retains the intent on its standing cooldown —
+        // no manual-only latch, no physical failure booked, no budget spent on
+        // an attempt that never started. (Booking these as physical failures
+        // is what marched the field machine to failing_applies=23 and, at nine,
+        // would have retired the automatic lane outright.)
         discard_settings_drafts(&mut app, settings);
         app.notice = None;
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
-        assert_eq!(
+        assert!(
+            app.notice.is_none(),
+            "a refused re-probe past the exhaustion pill paints nothing: {:?}",
             app.notice
                 .as_ref()
                 .map(crate::notice::TransientNotice::text)
-                .as_deref(),
-            Some("↑ Update delayed — retries on its own"),
-            "a cleared blocker must take the attempt past the close preflight; a \
-             refusal there paints the Blocked pill or nothing at all"
         );
         // WHICH GATE REFUSED IS PART OF THE PREMISE, not decoration. The fixture's
         // candidate carries a PASSED pre-park verification, so a real attempt is
-        // carried all the way to physical replacement; a `passed: false` fixture
+        // carried all the way to the admission gate; a `passed: false` fixture
         // would be short-circuited by `start_unix_update_handoff` before anything
         // parked, and every act below it would be describing an artifact production
         // refuses outright. The refusal recorded here must therefore be the
@@ -11304,7 +11349,7 @@ mod tests {
             .snapshot()
             .error
             .clone()
-            .expect("a returned physical failure records why it stopped");
+            .expect("a refused attempt records why it stopped");
         // Both `native_update_admission` refusals open this way ("…could not be
         // prepared" for the seamless lane a headless `App` cannot offer, "…could not
         // be proven safe" for the cold lane's foreground probe). Which of the two
@@ -11319,66 +11364,49 @@ mod tests {
             "the staged candidate must be one production would carry to the gate, \
              not one the pre-park verification cache already refused: {refusal:?}"
         );
-        let comeback = app
-            .auto_apply_manual_only
-            .expect("the physical lane latches with its own schedule")
-            .retry_at
-            .expect("and that latch always carries a deadline on its first failure");
+        let after_gate = app
+            .auto_apply_intent
+            .expect("the admission refusal RETAINS the intent");
+        assert_eq!(after_gate.build, build);
         assert!(
-            comeback > std::time::Instant::now(),
-            "the lane is scheduled to come back, not finished"
+            after_gate.retry_at > std::time::Instant::now(),
+            "the lane is scheduled to come back on its cooldown, not finished"
         );
-        assert_eq!(
-            app.auto_apply_physical_retry.map(|retry| retry.cycles),
-            Some(1),
-            "exactly one physical failure has been booked against these bytes"
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "an admission refusal must not latch manual-only"
+        );
+        assert!(
+            app.auto_apply_physical_retry.is_none(),
+            "no physical failure may be booked for an attempt that never started"
         );
         assert_no_probe_disturbance(&app, wid, working_tab);
 
         // ACT THREE — THE COMEBACK IS REAL, NOT A PROMISE ON A STRUCT. Only the
-        // clock is forced: the deadline is moved into the past and then production's
-        // own `about_to_wait` sequence runs verbatim (lapse the latch, re-arm from
-        // the reducer's stage, poll). Nothing here hand-builds an intent.
-        let mut latch = app
-            .auto_apply_manual_only
-            .expect("act two latched the comeback");
-        latch.retry_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-        app.auto_apply_manual_only = Some(latch);
-        assert!(
-            app.lapse_expired_auto_apply_manual_only(),
-            "an ACTIVITY-or-physical latch with a passed deadline must lapse; this \
-             is the release that the old `retry_at: None` made impossible"
-        );
-        app.rearm_native_auto_apply_after_lapse();
-        assert!(
-            app.auto_apply_intent
-                .is_some_and(|intent| intent.build == build),
-            "the lapse must re-arm automatic apply for the same staged artifact"
-        );
+        // clock is forced: the retained intent's own deadline is moved into the
+        // past and the production poll runs verbatim. The receipt that the lane
+        // genuinely re-ATTEMPTED — rather than merely re-reading its struct —
+        // is the monotone `attempts` counter advancing across the gate.
+        let attempts_before = after_gate.attempts;
         app.notice = None;
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
-        // THE DISCRIMINATOR: a SECOND failure was booked, and the new deadline is the
-        // second rung of the physical schedule (1800 s), not the first (600 s). A
-        // test that only re-read the latch would pass just as well if the lane had
-        // never re-attempted at all.
+        let re_probed = app
+            .auto_apply_intent
+            .expect("the second refusal retains the intent too");
         assert_eq!(
-            app.auto_apply_physical_retry.map(|retry| retry.cycles),
-            Some(2),
-            "the re-armed lane must actually ATTEMPT again — a second physical \
-             failure is the receipt for a second park/spawn round trip"
+            re_probed.attempts,
+            attempts_before + 1,
+            "the re-armed lane must actually ATTEMPT again — the monotone \
+             attempts counter is the receipt for a second admission round trip"
         );
-        let second = app
-            .auto_apply_manual_only
-            .expect("the second failure latches again")
-            .retry_at
-            .expect("and it is still inside its budget, so it still has a deadline")
-            .saturating_duration_since(std::time::Instant::now());
         assert!(
-            second > std::time::Duration::from_secs(1700)
-                && second <= std::time::Duration::from_secs(1800),
-            "the comeback must advance to the SECOND physical rung (~1800s), got \
-             {second:?} — the first rung again would mean the budget was replayed"
+            re_probed.retry_at > std::time::Instant::now(),
+            "…and the cooldown is re-armed, not exhausted"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none() && app.auto_apply_physical_retry.is_none(),
+            "refusals stay refusals on every repeat — no latch, no physical booking"
         );
         assert_no_probe_disturbance(&app, wid, working_tab);
 
@@ -11842,20 +11870,29 @@ mod tests {
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
 
+        // An admission refusal is a REFUSAL, not a failed attempt (2026-09-01):
+        // the intent stays armed on its own cooldown, no manual-only latch is
+        // minted, and no physical failure is booked — the lane keeps retrying
+        // by itself while the bar tells the truth below.
         assert!(
-            app.auto_apply_intent.is_none(),
-            "the refused attempt retires the intent"
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build),
+            "the refused attempt RETAINS the intent on its cooldown"
         );
-        let latched = app
-            .auto_apply_manual_only
-            .expect("a refused physical handoff latches manual-only");
-        assert_eq!(latched.build, build);
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "an admission refusal must not latch manual-only"
+        );
+        assert!(
+            app.auto_apply_physical_retry.is_none(),
+            "an admission refusal books no physical failure"
+        );
         let refusal = app
             .native_updater_service
             .snapshot()
             .error
             .clone()
-            .expect("a returned physical failure records why it stopped");
+            .expect("a refused attempt records why it stopped");
         assert!(
             refusal.starts_with("Update kept"),
             "the attempt must reach the physical admission gate, got {refusal:?}"
@@ -11876,15 +11913,9 @@ mod tests {
                 && !detail.contains("Version menu"),
             "{detail}"
         );
-        // …and the Version-menu row states the lane's own fact.
-        assert_eq!(
-            app.apply_retry_for(Some(build)),
-            if latched.retry_at.is_some() {
-                ApplyRetry::Scheduled
-            } else {
-                ApplyRetry::ManualOnly
-            }
-        );
+        // …and the Version-menu row states the lane's own fact: the retained
+        // intent IS a scheduled retry.
+        assert_eq!(app.apply_retry_for(Some(build)), ApplyRetry::Scheduled);
     }
 
     /// The same law at the reaped-abort completion: a handoff worker that killed

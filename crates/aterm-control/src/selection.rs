@@ -288,10 +288,10 @@ const WORD_WINDOW_ROWS: usize = 2;
 
 /// The widest a double-click will ever look, in rows of the wrapped line.
 ///
-/// The window widens while the match still runs off an edge, which is right for a long
+/// The window grows while the match still runs off an edge, which is right for a long
 /// URL or path — but a line can be ONE unbroken token (`cat` of a minified bundle is
-/// 320 kB with no break in it), and there the widening reads the whole thing on every
-/// call, twice per pointer move, under the terminal mutex. So the widening STOPS here and
+/// 320 kB with no break in it), and there the growth reads the whole thing on every
+/// call, twice per pointer move, under the terminal mutex. So the growth STOPS here and
 /// the gesture returns the bounded span it found.
 ///
 /// 64 rows is ~5 kB at 80 columns: past any identifier, URL, path or hash a person

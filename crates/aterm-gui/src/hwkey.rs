@@ -372,29 +372,39 @@ fn usage() -> String {
 /// Returns the number of press events posted.
 #[cfg(target_os = "macos")]
 pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> {
-    use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send, msg_send_id};
-    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
-    use objc2_foundation::{NSPoint, NSString};
+    use aterm_objc::{Bool, CGPoint, Id, Sel, autoreleasepool, class, sel};
+
+    use crate::appkit;
+
+    /// `NSEvent.h` — `NSEventTypeKeyDown = 10`, `NSEventTypeKeyUp = 11`.
+    /// Values, not names: `NSEventType` is an `NS_ENUM(NSUInteger, …)` in a
+    /// header, so there is no symbol to link (see `appkit::consts`).
+    const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
+    const NS_EVENT_TYPE_KEY_UP: usize = 11;
 
     if window_number == 0 {
         return Err("ERR hwkey: no frontmost AppKit window to post into\n".to_string());
     }
-    let chars = NSString::from_str(&spec.chars);
-    let ignoring = NSString::from_str(&spec.chars_ignoring);
-    // `NSUInteger` is `usize` in objc2; every flag bit used here is below 1<<24, so
-    // the cast is exact on every macOS target (both 64-bit and the 32-bit past).
-    let flags = NSEventModifierFlags(spec.flags as usize);
+    let (Some(chars), Some(ignoring)) = (
+        appkit::nsstring(&spec.chars),
+        appkit::nsstring(&spec.chars_ignoring),
+    ) else {
+        return Err("ERR hwkey: could not build the key strings\n".to_string());
+    };
+    // `NSEventModifierFlags` is an `NSUInteger` bitmask; every flag bit used
+    // here is below 1<<24, so the cast is exact on every macOS target.
+    let flags = spec.flags as usize;
 
-    // SAFETY: `+[NSApplication sharedApplication]` is called only after the event
+    // SAFETY: `+sharedApplication` is `-(id)` and is called only after the event
     // loop has already created it on the main thread (the caller resolved a live
     // window number through the main thread first, which cannot happen before
     // `NSApp` exists), so this returns the existing singleton and does not
     // construct AppKit's application object off-main. The returned object is
-    // retained by the runtime for the process lifetime.
-    let app: Retained<AnyObject> =
-        unsafe { msg_send_id![class!(NSApplication), sharedApplication] };
+    // retained by the runtime for the process lifetime, so it is borrowed here.
+    let app = unsafe { appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
+    if app.is_null() {
+        return Err("ERR hwkey: no shared NSApplication\n".to_string());
+    }
 
     let mut posted = 0u32;
     for i in 0..spec.count {
@@ -405,54 +415,89 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
         // hold five thousand autoreleased NSEvents alive for the whole run, and a
         // control thread with no pool at all makes Cocoa log-and-leak every one of
         // them. Draining per key keeps a long paced burst flat.
-        objc2::rc::autoreleasepool(|_| {
+        autoreleasepool(|_| {
             // The timestamp is read HERE, immediately before the post, on the same
             // seconds-since-boot clock `current_event_queue_age_ns` subtracts it
             // from. That is what makes the backdate honest: the age it computes is
             // the real interval this event spent sitting in the queue, exactly as
             // for a key the window server delivered.
             //
-            // SAFETY: `systemUptime` is a plain scalar getter (unsafe only under
-            // objc2's blanket policy for unaudited methods).
-            let ts = unsafe { objc2_foundation::NSProcessInfo::processInfo().systemUptime() };
-            // SAFETY: the AppKit event factory with a non-nil characters pair (winit
-            // dereferences both unconditionally) and a nil graphics context, exactly
-            // as winit's own `replace_event` builds a synthetic key event.
-            // `postEvent:atStart:` is documented thread-safe — it is AppKit's
-            // sanctioned way for a secondary thread to hand work to the main run
-            // loop — and posting from this thread is the POINT: it lets the event
-            // arrive, and wait, while the main thread is parked in `nextDrawable`.
-            let key_event = |kind| unsafe {
-                NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            // SAFETY: `+processInfo` is `-(id)`, an immortal singleton, and
+            // `-systemUptime` is `-(NSTimeInterval)`, a plain scalar getter.
+            let ts = unsafe {
+                let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+                if info.is_null() {
+                    return Err("ERR hwkey: no NSProcessInfo\n".to_string());
+                }
+                appkit::send_f64(info, sel!(systemUptime))
+            };
+            // THE WIDEST SEND IN THE TREE: ten arguments plus the implicit
+            // `self`/`_cmd`, i.e. twelve of `MsgFn`'s sixteen parameters — and a
+            // 16-byte `NSPoint` BY VALUE in the second argument slot, which is
+            // where a wrong prototype would shift every later argument by a
+            // register on both ABIs. Written out once, as the crate's rule
+            // requires; there is no shared helper for a shape used once.
+            //
+            // SAFETY: the AppKit event factory with a non-nil characters pair
+            // (winit dereferences both unconditionally) and a nil graphics
+            // context, exactly as winit's own `replace_event` builds a
+            // synthetic key event. The returned event is AUTORELEASED into this
+            // per-key pool. `postEvent:atStart:` is documented thread-safe — it
+            // is AppKit's sanctioned way for a secondary thread to hand work to
+            // the main run loop — and posting from this thread is the POINT: it
+            // lets the event arrive, and wait, while the main thread is parked
+            // in `nextDrawable`.
+            let key_event = |kind: usize| unsafe {
+                let make: unsafe extern "C" fn(
+                    Id,
+                    Sel,
+                    usize,
+                    CGPoint,
+                    usize,
+                    f64,
+                    isize,
+                    Id,
+                    Id,
+                    Id,
+                    Bool,
+                    u16,
+                ) -> Id = aterm_objc::msg();
+                make(
+                    class(c"NSEvent").as_id(),
+                    sel!(
+                        keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+                        context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+                    ),
                     kind,
-                    NSPoint::ZERO,
+                    CGPoint { x: 0.0, y: 0.0 },
                     flags,
                     ts,
                     window_number as isize,
-                    None,
-                    &chars,
-                    &ignoring,
-                    false,
+                    Id::NIL,
+                    chars.id(),
+                    ignoring.id(),
+                    Bool::NO,
                     spec.keycode,
                 )
             };
-            let Some(down) = key_event(NSEventType::KeyDown) else {
+            let down = key_event(NS_EVENT_TYPE_KEY_DOWN);
+            if down.is_null() {
                 return Err("ERR hwkey: NSEvent construction failed\n".to_string());
-            };
-            // SAFETY: `postEvent:atStart:` on the shared application with a live
-            // event; see the thread-safety note above.
-            unsafe {
-                let _: () = msg_send![&*app, postEvent: &*down, atStart: false];
             }
-            // The release too: a real key always produces one, and leaving the press
-            // unmatched would drift AppKit's notion of the pressed-key set across a
-            // long run. winit maps it to `ElementState::Released`, which the metrics
-            // arm ignores (released keys do not echo), so it costs a dispatch and
-            // changes no measurement.
-            if let Some(up) = key_event(NSEventType::KeyUp) {
-                // SAFETY: as above.
-                unsafe {
-                    let _: () = msg_send![&*app, postEvent: &*up, atStart: false];
+            // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the
+            // shared application with a live event; see the thread-safety note.
+            unsafe {
+                let post: unsafe extern "C" fn(Id, Sel, Id, Bool) = aterm_objc::msg();
+                post(app, sel!(postEvent:atStart:), down, Bool::NO);
+                // The release too: a real key always produces one, and leaving
+                // the press unmatched would drift AppKit's notion of the
+                // pressed-key set across a long run. winit maps it to
+                // `ElementState::Released`, which the metrics arm ignores
+                // (released keys do not echo), so it costs a dispatch and
+                // changes no measurement.
+                let up = key_event(NS_EVENT_TYPE_KEY_UP);
+                if !up.is_null() {
+                    post(app, sel!(postEvent:atStart:), up, Bool::NO);
                 }
             }
             Ok(())

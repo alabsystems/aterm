@@ -224,9 +224,11 @@ pub const S_MAX_BOUND: usize = 900;
 // GLOBAL BURST MUTEX — TWO-WAY: classic ignitions are limiter-deferred while
 // a supernova is live AND `super_prepass` defers a supernova grant behind any
 // live classic window (word_decorations.rs busy scan keyed on
-// `Episode::burst_kind`) — keeps the combined `nova_add` channel under
+// `Episode::burst_kind`) — keeps the DECORATION SHARE of `nova_add` under
 // `MAX_NOVA_QUADS`: the "never binds" claim re-derived, not silently
-// falsified.
+// falsified. Not a statement about the channel TOTAL — PRISM WAKE appends its
+// own per-pane quads after this budget is spent, outside it (see
+// `crate::nova::MAX_NOVA_QUADS`).
 const _: () = {
     assert!(S_MAX_BOUND <= MAX_SUPER_QUADS_PER);
     assert!(MAX_SUPER_QUADS_PER <= crate::nova::MAX_NOVA_QUADS);
@@ -777,7 +779,13 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 stamped += 1;
             }
         }
-        // Dark crown: stamps along the 8 star axes.
+        // Dark crown: stamps along the 8 star axes. Off-grid stamps are
+        // CULLED, the same discipline as the charge motes above and the
+        // debris below — the old truncating `/` plus `.max(0)`/`.clamp` PINNED
+        // them instead, so a word near the viewport top piled several crown
+        // stamps onto row 0 (two on the same cell, double-compositing the
+        // Over shade) at columns the crown's geometry never reaches
+        // (2026-09-01 audit).
         for point in 0..8 {
             let ang = core::f32::consts::TAU * point as f32 / 8.0;
             for seg in 1..=3 {
@@ -785,9 +793,12 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                     break;
                 }
                 let d = env.r_max * 0.3 * seg as f32;
-                let col = ((env.cx + (ang.cos() * d) as i32) / env.cell_w.max(1))
-                    .clamp(0, i32::from(env.cols) - 1);
-                let row = ((env.cy + (ang.sin() * d * 0.75) as i32) / env.cell_h.max(1)).max(0);
+                let x = env.cx + (ang.cos() * d) as i32;
+                let y = env.cy + (ang.sin() * d * 0.75) as i32;
+                if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
+                    continue;
+                }
+                let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
                 out.push(WordDecoration {
                     row: row as u16,
                     col: col as u16,
@@ -812,12 +823,17 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
                 break;
             }
             let ang = core::f32::consts::TAU * k as f32 / n as f32;
-            let col = ((env.cx + (ang.cos() * r) as i32) / env.cell_w.max(1))
-                .clamp(0, i32::from(env.cols) - 1);
-            let row = (env.cy + (ang.sin() * r * 0.75) as i32) / env.cell_h.max(1);
-            if row < 0 {
+            // Cull off-grid fringe stamps by RAW px (the crown's law above):
+            // the old truncating `/` mapped the whole (-cell_h, 0) band onto
+            // row 0, so ring-top stamps up to a cell ABOVE the grid lingered
+            // as isolated dark cells in the top row while the ring's true
+            // circumference was already off-screen.
+            let x = env.cx + (ang.cos() * r) as i32;
+            let y = env.cy + (ang.sin() * r * 0.75) as i32;
+            if x < 0 || y < 0 || x >= env.grid_w || y >= env.grid_h {
                 continue;
             }
+            let (row, col) = (y / env.cell_h.max(1), x / env.cell_w.max(1));
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,

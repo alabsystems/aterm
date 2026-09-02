@@ -428,8 +428,24 @@ fn spec_link() -> ExitCode {
     eprintln!("--- trust-ir spec-link (xtask always-run node) ---\n{report}");
     let structurally_clean =
         aterm_spec::ir::spec_link_report_is_clean(out.status.success(), &report);
-    let proof_evidence = report.contains("harness manifest")
-        && report.contains(&format!("checked {} proof binding", proofs.len()));
+    // BUG (fixed): the count is load-bearing (it must be EVERY anchor, not
+    // some of them) but it was scored with two loose `contains` calls over the
+    // whole report — "harness manifest" could match any line, including an
+    // `error: harness manifest ... is structurally invalid` one, and the count
+    // phrase matched as a PREFIX, so any longer sentence that merely BEGAN
+    // "checked <n> proof binding..." was accepted as proof that all <n>
+    // resolved. Anchor on ONE whole line that carries both facts and require
+    // the count phrase to END it, exactly as trust-ir prints it:
+    //   spec-link: harness manifest <path> (<n> harness(es)), checked <k> proof binding(s)
+    let want_proofs = format!(
+        "checked {} proof binding{}",
+        proofs.len(),
+        if proofs.len() == 1 { "" } else { "s" }
+    );
+    let proof_evidence = report
+        .lines()
+        .map(str::trim)
+        .any(|line| line.contains("harness manifest") && line.ends_with(&want_proofs));
     if structurally_clean && proof_evidence {
         eprintln!(
             "xtask spec-link: GREEN (STRUCTURAL, DESIGN-ONLY) — trust-ir checked S0/S1 + \

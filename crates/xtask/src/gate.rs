@@ -1236,6 +1236,15 @@ fn needle_present(root: &Path, needle: &str) -> bool {
 /// that reference `symbol` as a USE, not its definition. The `fn <symbol>`
 /// definition line is excluded so pointing the check at the crate that also
 /// DEFINES the symbol still measures real consumers.
+///
+/// "non-test" is BOTH file-level and region-level. DEFECT (fixed): the exclusion
+/// was `is_test_file` alone, which is a FILE filter, so a `#[cfg(test)] mod
+/// tests` inside an ordinary source file counted as a live consumer — a symbol
+/// used only by its own unit tests read as load-bearing, and `gate dormant`
+/// reported a wiring the shipped build does not have. [`live_reference_lines`]
+/// skips the regions too. (`aterm-census`'s shared masker,
+/// `lock_order::mask_gated_items`, is `pub(crate)`; hence a local window here
+/// rather than a reuse.)
 fn consumer_count(root: &Path, symbol: &str, consumer_path: &str) -> usize {
     let target = root.join(consumer_path);
     let mut files = Vec::new();
@@ -1248,12 +1257,55 @@ fn consumer_count(root: &Path, symbol: &str, consumer_path: &str) -> usize {
     let mut count = 0;
     for file in files.into_iter().filter(|p| !is_test_file(p)) {
         if let Ok(text) = std::fs::read_to_string(&file) {
-            for l in text.lines() {
-                let t = l.trim_start();
-                if !t.starts_with("//") && l.contains(symbol) && !l.contains(&def_marker) {
-                    count += 1;
-                }
+            count += live_reference_lines(&text, symbol, &def_marker);
+        }
+    }
+    count
+}
+
+/// The lines of ONE source file that reference `symbol` outside a comment,
+/// outside its `fn <symbol>` definition, and OUTSIDE every `#[cfg(test)]`
+/// region — that last exclusion being the one a file filter cannot make.
+///
+/// The window opens on a line whose trimmed form starts `#[cfg(test)]` and
+/// closes at the end of the gated item: brace depth back to zero on a line that
+/// closed a brace, a `;`-terminated line (a body-less item), or a `,`-terminated
+/// line AT THE ATTRIBUTE'S OWN INDENT (an enum variant, a match arm — the indent
+/// equality is what keeps a wrapped signature's parameter lines out).
+///
+/// Braces are counted lexically, literals INCLUDED, so an unbalanced `'{'` in
+/// test code over-extends the window. That direction HIDES consumers and turns
+/// `gate dormant` RED, never green, which is the safe way round for a check
+/// whose red means "this symbol has no live consumer". MEASURED on this tree:
+/// identical counts for all five registry entries, and every region except each
+/// file's trailing test module closes exactly.
+fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
+    let mut count = 0;
+    let mut depth = 0usize;
+    let mut gate_indent = 0;
+    let mut in_test = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if !in_test && trimmed.starts_with("#[cfg(test)]") {
+            in_test = true;
+            depth = 0;
+            gate_indent = indent;
+        }
+        if !in_test {
+            if !trimmed.starts_with("//") && line.contains(symbol) && !line.contains(def_marker) {
+                count += 1;
             }
+            continue;
+        }
+        let opens = line.matches('{').count();
+        let closes = line.matches('}').count();
+        depth = depth.saturating_add(opens).saturating_sub(closes);
+        let item_ended = closes > 0
+            || trimmed.ends_with(';')
+            || (trimmed.ends_with(',') && indent == gate_indent);
+        if depth == 0 && item_ended {
+            in_test = false;
         }
     }
     count
@@ -1905,6 +1957,20 @@ fn judge_kernel_certification(stderr: &str) -> Result<usize, String> {
     }
     let mut certified = 0;
     for (i, b) in blocks.iter().enumerate() {
+        // EVIDENCE, not merely CONSISTENCY. DEFECT (fixed): a block reporting
+        // `0 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of
+        // 0 obligation(s)` plus `of which 0 kernel-certified` satisfied every
+        // test below — nothing failed, `proved == obligations`, `kc ==
+        // obligations` — so a corpus file that raises NO obligation passed as
+        // evidence of kernel certification and printed CERTIFIED over `Ok(0)`.
+        if b.obligations == 0 {
+            return Err(format!(
+                "block {i}: 0 obligation(s) — VACUOUS, so it is not evidence of anything. \
+                 Nothing was proved and nothing was kernel-certified. Either this file raises \
+                 no Level-0 obligation under {CERTIFY_FLAG} (give it code that does, or drop it \
+                 from the corpus), or the driver stopped attributing obligations to it."
+            ));
+        }
         let Some(kc) = b.kernel_certified else {
             return Err(format!(
                 "PARSE CONTRACT BROKEN — verification block {i} reported no `of which N \
@@ -3933,9 +3999,32 @@ impl LaneVerdict {
 /// rather than `Finding` — a distinction with no effect on whether the verdict
 /// is blocked (every NOT RUN blocks; see [`LintLane`]) and every effect on what
 /// the operator is told to go fix, which is a checkout, not the code.
+///
+/// AND A GUARD THAT EXITS 0 WITHOUT MEASURING IS NAMED. `paint_guard` and
+/// `spin_guard` each honour a `<tree fingerprint>` escape that prints
+/// `SKIPPED by …` and exits 0; all three cache-backed guards can print
+/// `: INHERITED …` (a green earned by an EARLIER process — `proof_cache` for
+/// part of its own work); and both matrix guards print `: NOT CHECKED` off
+/// their platform. DEFECT (fixed): read on the exit code alone — the old
+/// `run_shell`, whose stdio the guards inherited — an unproven tree was
+/// byte-identical to a measured one, so this lane reported `Clean` ("the lane
+/// RAN, over the real tree, and found nothing") about work that never happened.
+/// Their stdout is captured now (see [`guard_announced_skip`]), and every such
+/// guard is named on this lane's last line.
+///
+/// It still does not BLOCK, and that part is a POLICY CALL left exactly where it
+/// was: the escapes are fingerprint-scoped emergency levers and the cache
+/// inheritance is provenance-checked by the `proof_cache` tooth below, so both
+/// are deliberate passes rather than accidents. What was never deliberate was
+/// going unmentioned. Turning either into `NotRun`, or carrying the names up
+/// into `gate lint: GREEN — but NOT CHECKED: …` (which needs
+/// [`LintLanes::run`] to return more than a [`LaneVerdict`]), is the owner's.
 fn run_repo_guards(root: &Path) -> LaneVerdict {
     let root_str = root.to_string_lossy().into_owned();
+    // One argv for every guard: each takes the repo root and nothing else.
+    let args = [root_str.as_str()];
     let mut verdict = LaneVerdict::Clean;
+    let mut not_vouched: Vec<&str> = Vec::new();
     for (label, rel) in [
         ("grep_guard", "tools/grep_guard.sh"),
         ("license_check", "tools/license_check.sh"),
@@ -3992,7 +4081,16 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
     ] {
         let script = root.join(rel);
         let lane = if script.exists() {
-            if run_shell(label, &script.to_string_lossy(), &[&root_str]) {
+            // CAPTURED, not inherited: the same helper the fmt lane uses, so a
+            // guard's own announcement can be read instead of just its exit
+            // code. The repo ROOT is the no-op PATH prefix this helper requires
+            // — it holds no executables, so prepending it cannot change what a
+            // guard resolves — and both streams are still teed verbatim.
+            let (ok, stdout, stderr) = run_capturing_both(label, &script, &args, root, root);
+            if guard_announced_skip(&stdout) || guard_announced_skip(&stderr) {
+                not_vouched.push(label);
+            }
+            if ok {
                 LaneVerdict::Clean
             } else {
                 LaneVerdict::Finding
@@ -4006,7 +4104,36 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         };
         verdict = verdict.worst(lane);
     }
+    if !not_vouched.is_empty() {
+        eprintln!(
+            "  guards: NOT VOUCHED FOR BY THIS RUN — {}. Each exited 0 while announcing \
+             (SKIPPED by / INHERITED / NOT CHECKED) that some or all of its checks DID NOT RUN \
+             in this process, so its subject is unproven BY THIS RUN and the verdict speaks \
+             only for the guards that measured the tree.",
+            not_vouched.join(", ")
+        );
+    }
     verdict
+}
+
+/// How a guard announces, on its own stdout, that it exited 0 WITHOUT measuring
+/// the tree: `<word>: SKIPPED by …` (the fingerprint-scoped escape),
+/// `<word>: INHERITED …` (a cached green earned by an earlier process) or
+/// `<word>: NOT CHECKED …` (the platform escape).
+///
+/// Matched only after the `<word>: ` prefix every guard puts on its report
+/// lines, and only at the START of the tail. Both restrictions are load-bearing:
+/// a bare `contains("INHERITED")` reads the `NOT INHERITED` line — printed on
+/// the path where the guard DOES measure — exactly backwards, and an unanchored
+/// match could be fed a line of TREE TEXT that a guard like `grep_guard` echoes
+/// out of the sources it scans.
+fn guard_announced_skip(transcript: &str) -> bool {
+    const NOT_VOUCHED: [&str; 3] = ["SKIPPED by ", "INHERITED", "NOT CHECKED"];
+    transcript.lines().any(|line| {
+        line.trim()
+            .split_once(": ")
+            .is_some_and(|(_, tail)| NOT_VOUCHED.iter().any(|shape| tail.starts_with(shape)))
+    })
 }
 
 /// The three lanes `gate lint` folds into one verdict, in run order.

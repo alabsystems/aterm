@@ -26,6 +26,22 @@ use aterm_objc::{
     declare_class, method_encoding, msg, protocol, sel, sel_uncached,
 };
 
+/// The [`MainThread`](aterm_objc::MainThread) witness every instantiation owes,
+/// for a test that is not on the main thread and does not need to be.
+///
+/// libtest runs every test on a worker (`pthread_main_np()` is 0 there even
+/// under `--test-threads=1`), so `MainThread::new()` correctly answers `None`
+/// here and the checked constructor is unusable. Every class in this file is an
+/// `NSObject`/`NSView` subclass that touches no AppKit state, is instantiated
+/// and released on the SAME worker, and whose `Ivars` are therefore dropped on
+/// the thread that made them — which is the second form of `new_unchecked`'s
+/// obligation, written once instead of at every call site.
+fn mtm() -> aterm_objc::MainThread {
+    // SAFETY: see this function's doc comment — the class has no main-thread
+    // affinity and its ivars are born and dropped on this one worker.
+    unsafe { aterm_objc::MainThread::new_unchecked() }
+}
+
 /// `SIGABRT`, spelled out: this crate has ZERO dependencies by construction.
 const SIGABRT: i32 = 6;
 
@@ -125,7 +141,7 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
 
     // The dynamic half: send each one, so the prototypes are exercised and not
     // merely written.
-    let obj = Shapes::alloc_init(()).expect("+alloc/-init");
+    let obj = Shapes::alloc_init(mtm(), ()).expect("+alloc/-init");
     // SAFETY: each prototype below is exactly the declared method's signature,
     // on a live instance of the class that declares it.
     unsafe {
@@ -233,7 +249,7 @@ fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
     // And the class works end to end through the SAFE `ivars()` accessor, which
     // is the caller that could not discharge `IvarSlot::get`'s alignment
     // precondition and now can, because no over-aligned class exists.
-    let obj = Aligned16::alloc_init(AtTheCeiling(20, 22)).expect("+alloc/-init");
+    let obj = Aligned16::alloc_init(mtm(), AtTheCeiling(20, 22)).expect("+alloc/-init");
     // SAFETY: `-sum` is declared on this class with exactly this prototype.
     let sum = unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> i64 = msg();
@@ -322,7 +338,7 @@ fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
     assert_eq!(size_of::<NSRange>(), 16);
     assert_eq!(align_of::<NSRange>(), 8);
 
-    let obj = TextInput::alloc_init(()).expect("+alloc/-init");
+    let obj = TextInput::alloc_init(mtm(), ()).expect("+alloc/-init");
     let mut actual = NSRange::default();
     // SAFETY: the three prototypes are exactly the declared signatures. The
     // out-pointer addresses a live local for the duration of the send.
@@ -451,7 +467,7 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
             use std::io::Write as _;
             let _ = std::io::stdout().flush();
         }));
-        let obj = Panicker::alloc_init(()).expect("+alloc/-init");
+        let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
         // Point fd 2 at a pipe and then close BOTH ends of it: every write to
         // stderr now fails with `EPIPE` (Rust ignores `SIGPIPE`, so it is an
         // error rather than a signal). MEASURED to be the reliable way to do

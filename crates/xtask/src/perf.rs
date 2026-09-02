@@ -472,6 +472,30 @@ pub(crate) fn gate_scroll_scrub(trend: &mut Vec<TrendSample>) -> bool {
     let path = scroll_baseline_path();
 
     if record_requested() {
+        // BUG (fixed): the record branch handed `medians` straight to the
+        // renderer, and `scroll_baseline_json` substitutes 0.0 for any phase it
+        // cannot find (it also passes a measured 0.0 through unchanged). A
+        // non-positive floor is exactly the input `compare` answers
+        // `NoBaseline` to, which `compare_scroll_against_baseline` then prints
+        // as GREEN — so recording an unmeasured or dead phase RETIRED its floor
+        // while the gate kept saying the phase was within bounds. Refuse to
+        // write instead, naming the phase; the committed baseline is left as it
+        // was, so the previous floor keeps being enforced.
+        if let Some((phase, reason)) = SCROLL_PHASES.iter().find_map(|(name, _)| {
+            match medians.iter().find(|(n, _)| n == name).map(|&(_, v)| v) {
+                Some(v) if v.is_finite() && v > 0.0 => None,
+                Some(v) => Some((*name, format!("measured {v}"))),
+                None => Some((*name, "was not measured".to_string())),
+            }
+        }) {
+            eprintln!(
+                "  scroll-scrub: REFUSING to record — phase {phase} {reason}; a \
+                 non-positive floor reads back as `NoBaseline`, i.e. as GREEN forever. \
+                 Baseline {} left untouched.",
+                path.display()
+            );
+            return false;
+        }
         let json = scroll_baseline_json(&medians, PASS_RATIO);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -551,7 +575,35 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
 /// ambient state. `--record` has to be typed, and it shows up in the shell
 /// history of the run that moved the numbers.
 pub(crate) fn record_requested() -> bool {
-    std::env::args().any(|a| a == "--record")
+    // BUG (fixed), two of them:
+    //   1. this scanned the WHOLE process argv with no subcommand scoping, so
+    //      `xtask gate all --record` — or any argv that merely carried the word
+    //      — rewrote every committed baseline from that run's own numbers and
+    //      reported the roster green. Recording is now scoped to the one verb
+    //      the baselines themselves document: `xtask gate perf --record`
+    //      (argv[1]/argv[2], per main.rs's dispatch).
+    //   2. every lane's record branch writes and returns `true` WITHOUT
+    //      comparing anything, and the verb then printed "GREEN — ... within
+    //      bounds". A recording run enforces NO floor, so say so through the
+    //      existing honesty channel: the verdict prints it under NOT MEASURED.
+    let args: Vec<String> = std::env::args().collect();
+    let on = args.get(1).map(String::as_str) == Some("gate")
+        && args.get(2).map(String::as_str) == Some("perf")
+        && args
+            .get(3..)
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a == "--record");
+    thread_local! {
+        static NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if on && !NOTED.with(|n| n.replace(true)) {
+        note_unmeasured(
+            "EVERY LANE (--record run: the baselines were REWRITTEN from this run's own \
+             numbers; nothing was compared against a floor)",
+        );
+    }
+    on
 }
 
 /// The wall-clock throughput sub-gate. Returns `true` (PASS) on success, including
@@ -824,6 +876,67 @@ fn measure_example_json(example: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{example} produced no JSON report:\n{stdout}"))
 }
 
+/// Byte range of a flat-JSON string value's RAW source — the span between the
+/// value's delimiting quotes, escapes left exactly as written. Raw (never
+/// unescaped) so a value can move verbatim between two JSON texts with no
+/// re-escaping pass. `None` if the key is absent or its value is not a string.
+fn json_string_span(src: &str, key: &str) -> Option<std::ops::Range<usize>> {
+    let needle = format!("\"{key}\"");
+    let start = src.find(&needle)? + needle.len();
+    let after_colon = src[start..].find(':')? + start + 1;
+    let quote = after_colon + src[after_colon..].find('"')?;
+    // Only whitespace may sit between the colon and the opening quote; anything
+    // else means this key's value is not a string.
+    if !src[after_colon..quote].trim().is_empty() {
+        return None;
+    }
+    let body = quote + 1;
+    let mut escaped = false;
+    for (i, c) in src[body..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return Some(body..body + i);
+        }
+    }
+    None
+}
+
+/// Carry a committed baseline's `_comment` into a freshly rendered one, growing
+/// it by a dated re-record marker. Returns `(json, carried)`, where `carried`
+/// says whether there was a previous note to keep.
+///
+/// WHAT THE OLD WRITER GOT WRONG: `--record` rendered `_comment` from the lane's
+/// terse const and wrote it straight over the committed file, so every
+/// hand-written provenance note — which box, which date, which ratchet and WHY
+/// (see the paragraph in tools/golden/perf-baseline-wasm.json, or the re-record
+/// history in perf-baseline-search.json) — was DESTROYED by a re-record, with no
+/// line printed and nothing left in the file to explain the numbers above it.
+/// That note is the only record of how a floor was earned, so a writer that
+/// deletes it leaves the next reader trusting a floor with no provenance.
+fn carry_baseline_comment(path: &Path, fresh: &str, date: &str) -> (String, bool) {
+    let previous = std::fs::read_to_string(path).unwrap_or_default();
+    let (Some(prev), Some(slot)) = (
+        json_string_span(&previous, "_comment"),
+        json_string_span(fresh, "_comment"),
+    ) else {
+        return (fresh.to_string(), false);
+    };
+    let carried = previous[prev].trim_end();
+    let marker = format!(" Re-recorded {date}.");
+    let mut out = String::with_capacity(fresh.len() + carried.len() + marker.len());
+    out.push_str(&fresh[..slot.start]);
+    out.push_str(carried);
+    // The history only ever GROWS — and a same-day re-record must not stutter.
+    if !carried.ends_with(&marker) {
+        out.push_str(&marker);
+    }
+    out.push_str(&fresh[slot.end..]);
+    (out, true)
+}
+
 /// Record-or-compare a keyed lane, given its measured raw JSON. Shared by all
 /// four lanes; pushes gated metrics into `trend`. Same contract as the older
 /// lanes: record on request, report-only PASS with no/malformed baseline,
@@ -846,13 +959,28 @@ fn judge_keyed(lane: &FloorLane, json: &str, trend: &mut Vec<TrendSample>) -> bo
     }
     let path = keyed_baseline_path(lane);
     if record_requested() {
-        let jsonout = keyed_baseline_json(lane, &values, PASS_RATIO);
+        // DEFECT: this used to write `keyed_baseline_json`'s output verbatim, and
+        // that spells `_comment` from `lane.comment` — silently overwriting the
+        // committed baseline's hand-written provenance. Carry the note forward.
+        let fresh = keyed_baseline_json(lane, &values, PASS_RATIO);
+        let (jsonout, carried) = carry_baseline_comment(&path, &fresh, &utc_date());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match std::fs::write(&path, &jsonout) {
             Ok(()) => {
                 eprintln!("  {}: RECORDED baseline -> {}", lane.lane, path.display());
+                eprintln!(
+                    "  {}: {}",
+                    lane.lane,
+                    if carried {
+                        "carried the previous baseline's hand-written `_comment` forward \
+                         (the VALUES under it are THIS run's) — amend the note if it no \
+                         longer describes them."
+                    } else {
+                        "no previous `_comment` to carry — wrote the lane's default note."
+                    }
+                );
                 return true;
             }
             Err(e) => {
@@ -954,8 +1082,56 @@ pub(crate) fn gate_restore(trend: &mut Vec<TrendSample>) -> bool {
     }
 }
 
+/// Keys the resize harness reports that are LOWER-IS-BETTER latencies, so they
+/// belong in the same-box trend ledger as INVERTED samples. The two `*_worst_ms`
+/// fence values were already here; the five `deep_*` millisecond keys were
+/// reported by the harness and then dropped on the floor, which is the defect
+/// this const closes.
+const RESIZE_INVERTED_TREND_KEYS: [&str; 7] = [
+    "resize_ring_worst_ms",
+    "resize_tiered_sync_worst_ms",
+    "deep_mixed_pump_total_ms",
+    "deep_mixed_step_worst_ms",
+    "deep_mixed_sync_worst_ms",
+    "deep_wrapall_pump_total_ms",
+    "deep_wrapall_step_worst_ms",
+];
+
+/// Every `"key":` of a flat JSON object, in source order. Dependency-free, and
+/// deliberately read off the MEASUREMENT rather than a const list: a key the
+/// harness grows tomorrow is then named by the UNGATED line the day it appears,
+/// instead of waiting for someone to notice it was never judged.
+fn flat_json_keys(json: &str) -> Vec<&str> {
+    let bytes = json.as_bytes();
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while let Some(open) = json[i..].find('"').map(|o| o + i) {
+        let mut j = open + 1;
+        while j < bytes.len() && bytes[j] != b'"' {
+            j += if bytes[j] == b'\\' { 2 } else { 1 };
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        if json[j + 1..].trim_start().starts_with(':') {
+            keys.push(&json[open + 1..j]);
+        }
+        i = j + 1;
+    }
+    keys
+}
+
 /// RESIZE/REWRAP floors + the 42s-freeze-class ABSOLUTE fences (E0, audit
 /// §5.3). The fences apply even with NO baseline — that is their point.
+///
+/// WHAT THE OLD LANE GOT WRONG: the harness reports NINETEEN keys and this lane
+/// judged FOUR of them — two ratio floors plus two absolute fences — dropping
+/// the other fifteen with no line printed, so nothing in the gate log let a
+/// reader tell a measured-and-cleared key from a measured-and-binned one. The
+/// five `deep_*` millisecond latencies are now same-box trend samples, and every
+/// key still unjudged is NAMED on an UNGATED line. Which of the remainder
+/// deserves a hard floor or a refusal is a POLICY call and is deliberately not
+/// made here.
 pub(crate) fn gate_resize(trend: &mut Vec<TrendSample>) -> bool {
     let json = match measure_example_json(RESIZE_LANE.example) {
         Ok(j) => j,
@@ -965,11 +1141,11 @@ pub(crate) fn gate_resize(trend: &mut Vec<TrendSample>) -> bool {
         }
     };
     let mut ok = judge_keyed(&RESIZE_LANE, &json, trend);
-    // The worst-ms fence values also feed the same-box trend ledger, INVERTED
-    // (lower is better): the absolute caps are catastrophic-only, so a real
-    // same-box latency creep (18 ms -> 60 ms, still under the cap) would
-    // otherwise ship silently. Missing keys are already a fence FAIL below.
-    for key in ["resize_ring_worst_ms", "resize_tiered_sync_worst_ms"] {
+    // The lower-is-better latencies also feed the same-box trend ledger,
+    // INVERTED: the absolute caps are catastrophic-only, so a real same-box
+    // latency creep (18 ms -> 60 ms, still under the cap) would otherwise ship
+    // silently. A missing fence key is ALSO a fence FAIL below.
+    for key in RESIZE_INVERTED_TREND_KEYS {
         if let Some(v) = json_number(&json, key) {
             trend.push(TrendSample {
                 lane: RESIZE_LANE.lane,
@@ -977,9 +1153,33 @@ pub(crate) fn gate_resize(trend: &mut Vec<TrendSample>) -> bool {
                 value: v,
                 inverted: true,
             });
+        } else {
+            eprintln!(
+                "    {key}: NO TREND SAMPLE — absent from the harness report, so same-box \
+                 creep in it cannot be caught this run."
+            );
         }
     }
     ok &= resize_fences(&json);
+    // NAME WHAT WAS NOT JUDGED. Everything in `RESIZE_LANE.keys` (ratio floors),
+    // in RESIZE_INVERTED_TREND_KEYS (fences + trend) is judged; every other key
+    // the harness reported is not, and the gate now says so rather than leaving
+    // its log to imply full coverage.
+    let ungated: Vec<&str> = flat_json_keys(&json)
+        .into_iter()
+        .filter(|k| !RESIZE_LANE.keys.contains(k) && !RESIZE_INVERTED_TREND_KEYS.contains(k))
+        .collect();
+    if !ungated.is_empty() {
+        eprintln!(
+            "    UNGATED — the resize harness reported {} key(s) this gate does not judge: \
+             {}. Several are the run's shape (ring_lines, tiered_fill_lines, n, warmup) and \
+             need no floor; `converge_stale_width` is a CORRECTNESS outcome (non-zero = a \
+             rewrap left stale-width lines behind) that nothing here refuses. Promoting any \
+             of them to a floor or a refusal is an owner policy call.",
+            ungated.len(),
+            ungated.join(", ")
+        );
+    }
     ok
 }
 
@@ -1594,25 +1794,57 @@ pub(crate) struct TrendRow<'a> {
     pub shape: &'a str,
 }
 
+/// Parse the ledger into rows AND COUNT what it had to throw away. Pure
+/// (unit-tested).
+///
+/// WHAT THE OLD PARSER GOT WRONG: the drops were a bare `return None` and an
+/// `.ok()?` inside a `filter_map` — no count, no notice. This is the parser for
+/// the ONE sub-gate that can catch a same-box 2x regression, so a truncated,
+/// mis-tabbed or non-numeric row silently SHRINKS the reference window a metric
+/// is held to, and in the limit empties it — which then prints as "no same-box
+/// history, SKIP" on a box with hundreds of committed rows. That is the same
+/// failure W-1 already fixed once (a rename), reachable a second way.
+///
+/// Returns `(rows, dropped)`; each `dropped` entry names the discarded line by
+/// its 1-based ledger line number and says why it was discarded.
+pub(crate) fn trend_ledger_rows_counted(ledger: &str) -> (Vec<TrendRow<'_>>, Vec<String>) {
+    let mut rows = Vec::new();
+    let mut dropped = Vec::new();
+    for (n, line) in ledger.lines().enumerate() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 5 {
+            dropped.push(format!(
+                "line {}: {} tab-separated column(s), needs at least 5",
+                n + 1,
+                cols.len()
+            ));
+            continue;
+        }
+        let Ok(value) = cols[4].parse::<f64>() else {
+            dropped.push(format!(
+                "line {}: value column `{}` does not parse as a number",
+                n + 1,
+                cols[4]
+            ));
+            continue;
+        };
+        rows.push(TrendRow {
+            token: cols[2],
+            metric: cols[3],
+            value,
+            shape: cols.get(6).copied().unwrap_or("").trim(),
+        });
+    }
+    (rows, dropped)
+}
+
 /// Parse the ledger, skipping comments, blanks and unparseable rows. Pure
 /// (unit-tested).
 pub(crate) fn trend_ledger_rows(ledger: &str) -> Vec<TrendRow<'_>> {
-    ledger
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .filter_map(|l| {
-            let cols: Vec<&str> = l.split('\t').collect();
-            if cols.len() < 5 {
-                return None;
-            }
-            Some(TrendRow {
-                token: cols[2],
-                metric: cols[3],
-                value: cols[4].parse::<f64>().ok()?,
-                shape: cols.get(6).copied().unwrap_or("").trim(),
-            })
-        })
-        .collect()
+    trend_ledger_rows_counted(ledger).0
 }
 
 /// The trend sub-gate's pure verdict over one run's samples.
@@ -1633,14 +1865,28 @@ pub(crate) struct TrendJudgment {
 }
 
 /// Judge `samples` against the same-box history in the ledger text, with
-/// `aliases` deciding which rows are THIS box. Pure (unit-tested).
+/// `aliases` deciding which rows are THIS box. Pure apart from one notice: the
+/// ledger lines it could not parse are counted and named here, because a
+/// silently shrunken reference window is exactly how this sub-gate would report
+/// a pass it did not earn.
 pub(crate) fn judge_trend(
     ledger: &str,
     aliases: &str,
     me: &MachineId,
     samples: &[TrendSample],
 ) -> TrendJudgment {
-    let rows = trend_ledger_rows(ledger);
+    let (rows, dropped) = trend_ledger_rows_counted(ledger);
+    if !dropped.is_empty() {
+        eprintln!(
+            "  trend: NOTE — {} committed ledger line(s) were DISCARDED as unparseable and \
+             anchor nothing; every metric they carried is held to a SMALLER reference \
+             window than the file appears to give it.",
+            dropped.len()
+        );
+        for why in &dropped {
+            eprintln!("         dropped {why}");
+        }
+    }
     let my_chip = chip_of(&me.shape);
 
     // MINE, and only mine. A row is this box's iff its token resolves to this

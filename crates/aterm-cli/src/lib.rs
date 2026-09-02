@@ -442,7 +442,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "validate-config",
-        "Validate the effective config; exit non-zero on error.",
+        "Validate $ATERM_CONTAINMENT_MODE (not aterm.toml); exit non-zero if malformed.",
     ),
     (
         "explain-config",
@@ -1079,6 +1079,10 @@ enum CliAction {
     /// name (one of [`DIAG_COMMANDS`]); `arg` is the optional positional operand
     /// after it (the family for `show-face`).
     Diag { cmd: String, arg: Option<String> },
+    /// `<diag> --help`: print that subcommand's one-line description and usage,
+    /// exit 0 — never run it. The same rule the ctl surface follows: asking a
+    /// verb how it works must never do the thing.
+    DiagHelp { cmd: String },
     /// `help [topic]`: print the AI-facing toolchain manual (via [`manual`]) and exit 0
     /// WITHOUT spawning a shell. `topic` is the optional deep-dive selector; `None`
     /// prints the front page (or, inside an aterm session, the agent brief).
@@ -1150,9 +1154,43 @@ fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
             .any(|(name, _)| *name == first.as_str())
     {
         let cmd = args.next().expect("peeked Some");
-        // The optional positional operand after the subcommand (e.g. the family for
-        // `show-face <family>`). Subcommands that take none simply ignore it.
-        let arg = args.next();
+        let rest: Vec<String> = args.collect();
+        // `<diag> --help` DESCRIBES the subcommand — same rule as `aterm ctl`.
+        // Before this, `-h` after `show-face` became the FAMILY operand and the
+        // report fabricated a plausible, successful, wrong answer for a font
+        // named "-h" (audit D-8).
+        if rest.iter().any(|a| a == "-h" || a == "--help") {
+            return CliAction::DiagHelp { cmd };
+        }
+        // The tail is PARSED, never dropped. These verbs used to run to
+        // completion at exit 0 on any argument — the comment here read
+        // "Subcommands that take none simply ignore it" — so `atpkg doctor
+        // --json`-style probes taught script authors that their flag was
+        // accepted when it was discarded (audit D-12). A caller must be able
+        // to distinguish "takes no flags" from "your flag was wrong".
+        let takes_operand = cmd == "show-face";
+        if !takes_operand && !rest.is_empty() {
+            return CliAction::Usage(format!(
+                "aterm {cmd}: unknown argument {:?} — this command takes none \
+                 (try `aterm {cmd} --help`)",
+                rest[0]
+            ));
+        }
+        if takes_operand && rest.len() > 1 {
+            return CliAction::Usage(format!(
+                "aterm show-face: unknown argument {:?} — usage: aterm show-face <family>",
+                rest[1]
+            ));
+        }
+        if takes_operand
+            && let Some(op) = rest.first()
+            && op.starts_with('-')
+        {
+            return CliAction::Usage(format!(
+                "aterm show-face: {op:?} is not a font family — usage: aterm show-face <family>"
+            ));
+        }
+        let arg = rest.into_iter().next();
         return CliAction::Diag { cmd, arg };
     }
     let mut containment: Option<String> = None;
@@ -1246,6 +1284,21 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
                 "{}",
                 version_text(aterm_update::which_copy::observe().as_ref())
             );
+            std::process::exit(0);
+        }
+        CliAction::DiagHelp { cmd } => {
+            let desc = DIAG_COMMANDS
+                .iter()
+                .find(|(name, _)| *name == cmd)
+                .map(|(_, d)| *d)
+                .unwrap_or("");
+            let usage = if cmd == "show-face" {
+                format!("aterm {cmd} <family>")
+            } else {
+                format!("aterm {cmd}")
+            };
+            println!("{cmd} — {desc}");
+            println!("usage: {usage}");
             std::process::exit(0);
         }
         CliAction::Diag { cmd, arg } => {
@@ -1659,6 +1712,80 @@ mod tests {
         CliAction::Diag {
             cmd: cmd.to_string(),
             arg: arg.map(str::to_string),
+        }
+    }
+
+    /// The diagnostics no longer swallow unknown flags at exit 0 (audit D-12).
+    ///
+    /// `aterm show-config --json` used to print the ordinary report,
+    /// byte-identical to the bare form, and exit 0 — so a script author
+    /// concluded their flag was accepted when it was discarded, and could not
+    /// distinguish "takes no flags" from "your flag was wrong". The dispatch
+    /// comment even said so: "Subcommands that take none simply ignore it."
+    /// No test pinned that behaviour, which is how it survived an audit cycle.
+    #[test]
+    fn a_diag_subcommand_refuses_an_argument_it_would_have_swallowed() {
+        for cmd in [
+            "show-config",
+            "validate-config",
+            "explain-config",
+            "doctor",
+            "list-fonts",
+            "list-themes",
+        ] {
+            match decide(&[cmd, "--json"]) {
+                CliAction::Usage(msg) => {
+                    assert!(
+                        msg.contains(cmd) && msg.contains("--json") && msg.contains("takes none"),
+                        "the refusal must name the verb, the argument, and the \
+                         arity: {msg}"
+                    );
+                }
+                other => panic!("`aterm {cmd} --json` must be a usage error, got {other:?}"),
+            }
+            // The bare form is untouched.
+            assert_eq!(decide(&[cmd]), diag(cmd, None), "bare `{cmd}` still runs");
+        }
+    }
+
+    /// `<diag> --help` DESCRIBES the subcommand instead of running it — the rule
+    /// the ctl surface already follows. Before this, `-h` after `show-face`
+    /// became the FAMILY operand and the report fabricated a plausible,
+    /// successful, wrong answer for a font named "-h" (audit D-8).
+    #[test]
+    fn a_diag_help_request_describes_and_never_runs() {
+        for argv in [
+            vec!["doctor", "--help"],
+            vec!["show-config", "-h"],
+            vec!["show-face", "--help"],
+            vec!["show-face", "-h"],
+        ] {
+            match decide(&argv) {
+                CliAction::DiagHelp { cmd } => assert_eq!(cmd, argv[0]),
+                other => panic!("{argv:?} must be a help request, got {other:?}"),
+            }
+        }
+    }
+
+    /// `show-face` keeps its one operand; a flag-shaped or surplus operand is a
+    /// usage error naming the grammar, never a family lookup.
+    #[test]
+    fn show_face_operand_grammar_is_enforced_at_the_edge() {
+        assert_eq!(
+            decide(&["show-face", "Menlo"]),
+            diag("show-face", Some("Menlo"))
+        );
+        for argv in [
+            vec!["show-face", "--verbose"],
+            vec!["show-face", "Menlo", "extra"],
+        ] {
+            match decide(&argv) {
+                CliAction::Usage(msg) => assert!(
+                    msg.contains("show-face <family>"),
+                    "the refusal must state the grammar: {msg}"
+                ),
+                other => panic!("{argv:?} must be a usage error, got {other:?}"),
+            }
         }
     }
 

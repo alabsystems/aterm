@@ -16,7 +16,7 @@
 //! byte-for-byte between `aterm-gui/src/net_connections/keychain.rs:219` and
 //! `aterm-http/src/verifier/apple.rs:193`.
 //!
-//! This crate is the shared version, plus the three things `metal/ffi.rs`
+//! This crate is the shared version, plus the four things `metal/ffi.rs`
 //! deliberately never needed and the `objc2` + `block2` cluster is being paid
 //! for:
 //!
@@ -26,8 +26,19 @@
 //!    the workspace before this crate; they are what objc2's `declare_class!`
 //!    does, and aterm-gui has seven such sites defining 33 methods.
 //! 2. **[The block ABI](block)** — `_NSConcreteStackBlock`, for aterm-gui's
-//!    three `RcBlock` sites.
-//! 3. **[Cached selectors](sel_cache)** — `metal/ffi.rs` calls
+//!    three `RcBlock` sites, plus [`BlockPtr`] for the `"@?"` encoding a block
+//!    needs when it crosses a boundary this crate DECLARES.
+//! 3. **[Weak references](weak)** — `objc_initWeak`, `objc_loadWeak`,
+//!    `objc_storeWeak`, `objc_destroyWeak`, `objc_copyWeak`. Zero uses of any
+//!    of these existed in the workspace before W9, for the same reason as
+//!    class creation: Metal owns its objects in a TREE and never has a cycle to
+//!    break, while AppKit is a graph — `vendor/winit`'s `view.rs:169` holds a
+//!    weak reference to the window that (transitively) retains it, and that one
+//!    field is what makes `view.rs` the largest remaining port. A weak
+//!    reference is the only handle in this crate whose STORAGE LOCATION is
+//!    load-bearing rather than its value, which is why it is a capability and
+//!    not a wrapper; see [`weak`] for what Rust's `memcpy`-move does to one.
+//! 4. **[Cached selectors](sel_cache)** — `metal/ffi.rs` calls
 //!    `sel_registerName` on every send, on per-frame paths.
 //!
 //! # Zero third-party dependencies
@@ -150,9 +161,25 @@
 //!   exactly this hole — it is why 0.6 introduced `MainThreadOnly` — and every
 //!   declared class in this tree is main-thread AppKit state whose ivars are
 //!   `Cell`/`RefCell`/[`Retained`], so the hole is real and currently
-//!   unexercised. UNCLOSED. Closing it means deciding what aterm's own
-//!   main-thread proof is, which is the same open question the ported site
-//!   names as W2's.
+//!   unexercised. STILL UNCLOSED at the RELEASE end, which is where it was
+//!   named: nothing can make a framework release an object on the thread that
+//!   made it.
+//!
+//!   Its BIRTH end is closed, and it had quietly opened. objc2 0.5 gave every
+//!   class in this port `mutability::MainThreadOnly`, which made `alloc`
+//!   reachable only through a `MainThreadMarker`; this crate's first
+//!   [`declare_class!`] dropped the parameter, reasoning that [`Retained`] is
+//!   `!Send` so it had one useful value. That reasoning is about where an
+//!   instance may TRAVEL. A judge built the counterexample about where one may
+//!   be BORN: a declared class registered, instantiated and deallocated on a
+//!   `std::thread::spawn`ed thread, no witness, NOT ONE `unsafe` token at the
+//!   call site, no diagnostic — the ivar destructor running on a foreign thread
+//!   through the front door rather than through a framework's release. W3 was
+//!   about to multiply that by five, including `NSView` and `NSWindow`
+//!   subclasses. [`MainThread`] is the parameter restored: `alloc_init` and
+//!   `alloc_ivars` take one, `new()` asks `+[NSThread isMainThread]` exactly as
+//!   objc2's marker does, and the escape hatch is `unsafe`. Class REGISTRATION
+//!   is deliberately still ungated — see [`MainThread`] for why.
 //! * **`S4` — nothing `malloc` allocates can out-align 16 bytes. CLOSED, by
 //!   refusal, on BOTH of its paths.** `_Block_copy` allocates with `malloc`,
 //!   which guarantees 16-byte alignment; a closure needing more would land
@@ -192,24 +219,30 @@
 pub mod block;
 pub mod class_macro;
 pub mod declare;
+pub mod dispatch;
 pub mod encode;
 pub mod retained;
 pub mod runtime;
 pub mod sel_cache;
+pub mod send;
+pub mod weak;
 
-pub use block::RcBlock;
+pub use block::{BlockPtr, RcBlock};
 pub use declare::{
-    ClassBuilder, ClassMeta, IVAR_NAME, IvarSlot, abort_on_unwind, begin, send_super_dealloc,
-    super_of,
+    ClassBuilder, ClassMeta, IVAR_NAME, IvarSlot, MainThread, abort_on_unwind, begin,
+    send_super_dealloc, super_of,
 };
-pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange};
+pub use dispatch::run_on_main;
+pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange, strip_method_offsets};
 pub use retained::{ClassType, Retained};
 pub use runtime::{
     AutoreleasePool, ClassPtr, Id, IvarPtr, MsgFn, Obj, ObjcSuper, ProtocolPtr, Sel, autorelease,
-    autoreleasepool, class, class_name, class_of, msg, msg_super, ns_error_string, ns_string,
-    ns_string_to_rust, protocol, returns_indirectly, superclass_of,
+    autoreleasepool, class, class_methods, class_name, class_of, class_protocols, method_imp,
+    method_types, msg, msg_super, ns_error_string, ns_string, ns_string_to_rust, protocol,
+    protocol_method_types, returns_indirectly, superclass_of,
 };
 pub use sel_cache::SelCache;
+pub use weak::{Weak, WeakObj, WeakSlot};
 
 /// The uncached selector lookup, under its full name.
 ///

@@ -647,23 +647,22 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // Cursor field-isolation, plane geometry, and Water ownership/drain tests
     // independently prove why the merged fold moved.
     const GOLDEN: [u64; 9] = [
-        12_541_784_599_013_147_129,
-        1_564_493_126_147_229_498,
-        // RE-BASELINED 2026-09-01 — index 2 (RainbowKitty) ONLY, for the
-        // deliberate repaint the module header sanctions. The owner retired the
-        // no-cyan ruling ("you can have cyan so long as it's a rainbow"), so the
-        // three paling laws became identity and the jump streak's four chroma
-        // folds were removed: the green->blue crossing now emits the arc's own
-        // colour instead of a luminance-preserving fold toward grey. The other
-        // EIGHT entries are byte-identical on this tree, which is the evidence
-        // that the repaint is scoped to the mark it was aimed at.
-        9_540_101_506_406_840_834,
-        5_181_506_246_111_895_746,
+        // RE-BASELINED 2026-09-02 — the jump streak's METEOR dynamics. Owner:
+        // "FAST like meteor and then nicely fade… feeling snappy is important".
+        // The decay went from `1 - u^2` (a HOLD: 75 % bright at the halfway
+        // point) to `(1 - u)^2` (25 % there), and the life from 0.45..1.10 s to
+        // 0.30..0.72 s. SEVEN of the nine entries move because the jump streak's
+        // life is shared by every style that draws one; Fire and Water are
+        // byte-identical because they do not.
+        8_384_014_991_348_537_604,
+        16_554_105_343_338_789_366,
+        1_074_721_155_938_290_065,
+        6_783_487_424_150_533_517,
         17_288_162_128_308_037_669,
-        7_964_602_191_947_693_616,
-        17_267_923_897_133_204_901,
+        14_938_859_424_317_138_785,
+        896_993_405_195_581_747,
         3_816_899_345_458_622_939,
-        11_368_127_483_310_326_334,
+        8_233_860_657_484_358_547,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];

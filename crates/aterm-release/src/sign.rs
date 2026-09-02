@@ -11,8 +11,9 @@
 //!
 //! * **anchor empty → [`AppleTier::Inactive`]**. The bundle is signed ad-hoc
 //!   (`--sign -`), the DMG is not signed, nothing is notarized, and the
-//!   manifest's `team_id` is empty. This is what aterm ships today and this
-//!   change does not move one byte of it.
+//!   manifest's `team_id` is empty. This is what a FORK ships, and what aterm shipped
+//!   before `APPLE_TEAM_ID` was armed on 2026-08-15 — WRONG BEFORE: "what aterm ships
+//!   today" — and the active path does not move one byte of it.
 //! * **anchor set → [`AppleTier::Active`]**. Developer-ID sign, notarize,
 //!   staple and VERIFY — or fail the cut. There is deliberately no third state
 //!   in which the pipeline signs with a Developer-ID identity and then declines
@@ -679,7 +680,8 @@ fn parse_find_identity_line(line: &str) -> Option<DevIdIdentity> {
 #[derive(Debug)]
 pub enum AppleTier {
     /// `pins::APPLE_TEAM_ID` is empty. Ad-hoc signing, no notarization, no
-    /// claim — what aterm ships today.
+    /// claim — what a FORK ships, and what aterm shipped before the anchor was armed on
+    /// 2026-08-15. (WRONG BEFORE: "what aterm ships today".)
     Inactive,
     /// The anchor is set AND everything needed to keep its promise resolved.
     /// Constructing this value is the proof: there is no way to reach the active

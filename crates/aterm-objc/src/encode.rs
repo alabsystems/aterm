@@ -352,6 +352,25 @@ unsafe impl Encode for *const c_void {
 unsafe impl Encode for *const std::ffi::c_char {
     const ENCODING: &'static str = "*";
 }
+// `unsigned char *` — what `-[NSBitmapImageRep bitmapData]` returns, and the
+// SAME letter, which is the part worth writing down. clang collapses all three
+// char-pointer flavours to one encoding:
+//
+// ```text
+// @encode(char *)          = *
+// @encode(signed char *)   = *
+// @encode(unsigned char *) = *
+// ```
+//
+// So this is not "close enough to `*`"; it is the same string clang emits, and
+// the live method agrees (`NSBitmapImageRep -bitmapData` reads `*16@0:8`). A
+// separate impl is still needed because `*mut c_uchar` and `*const c_char` are
+// different Rust types, and writing `^C` — the composition the letters would
+// suggest — would be a string the runtime never produces for this type.
+// SAFETY: measured with clang on this box, both arches; see above.
+unsafe impl Encode for *mut std::ffi::c_uchar {
+    const ENCODING: &'static str = "*";
+}
 
 /// `@encode(BOOL *)` for the target being compiled — and it is NOT `"^"` plus
 /// [`BOOL_ENCODING`] on both arms.
@@ -475,6 +494,69 @@ unsafe impl Encode for *mut NSRange {
 // on `*const c_void`.
 unsafe impl Encode for *const NSRange {
     const ENCODING: &'static str = "^{_NSRange=QQ}";
+}
+
+/// The OFFSET-FREE form of a compiler-emitted method type encoding.
+///
+/// `clang` bakes byte offsets into the string it registers —
+/// `"v24@0:8@16"` for `-(void)foo:(id)a` — while everything this crate writes
+/// through `class_addMethod` is the short form `"v@:@"`, because
+/// `NSMethodSignature` recomputes the offsets from the type letters and ignores
+/// what is written (see this module's header). Comparing a declared row against
+/// the protocol or superclass it must match therefore needs one of the two
+/// normalised, and the short form is the one with no information in it to lose.
+///
+/// ```
+/// # use aterm_objc::strip_method_offsets;
+/// // `-[NSWindowDelegate windowDidResize:]`, as the runtime reports it.
+/// assert_eq!(strip_method_offsets("v24@0:8@16"), "v@:@");
+/// // `-[NSDraggingDestination draggingEntered:]` — an NSUInteger return.
+/// assert_eq!(strip_method_offsets("Q24@0:8@16"), "Q@:@");
+/// // The struct-returning row, offsets and all.
+/// assert_eq!(
+///     strip_method_offsets(
+///         "{CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{_NSRange=QQ}16^{_NSRange=QQ}32"
+///     ),
+///     "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}"
+/// );
+/// ```
+///
+/// # What it does NOT strip, and why the distinction is load-bearing
+///
+/// A digit inside an ARRAY encoding is a COUNT, not an offset: `[16c]` is
+/// "sixteen `char`s", which is the very encoding
+/// [`crate::ClassBuilder::add_rust_ivar`] writes for a Rust ivar. Dropping that
+/// digit would turn a 16-byte array into a syntactically broken `[c]`. So the
+/// digits between `[` and `]` are kept:
+///
+/// ```
+/// # use aterm_objc::strip_method_offsets;
+/// assert_eq!(strip_method_offsets("v20@0:8[4i]16"), "v@:[4i]");
+/// ```
+///
+/// A `const` qualifier (`r`) is NOT stripped either — it is a letter, and this
+/// crate omits it at the write end rather than removing it at the read end, so
+/// a caller comparing `"r^v"` against `"^v"` has a real difference to report
+/// rather than a laundered one.
+#[must_use]
+pub fn strip_method_offsets(types: &str) -> String {
+    let mut out = String::with_capacity(types.len());
+    let mut array_depth = 0_usize;
+    for c in types.chars() {
+        match c {
+            '[' => {
+                array_depth += 1;
+                out.push(c);
+            }
+            ']' => {
+                array_depth = array_depth.saturating_sub(1);
+                out.push(c);
+            }
+            '0'..='9' if array_depth == 0 => {}
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build a method type-encoding string: return type, then the implicit

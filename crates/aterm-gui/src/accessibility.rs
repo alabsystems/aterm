@@ -177,11 +177,11 @@ pub use macos::apply_to_ns_view;
 
 #[cfg(all(target_os = "macos", feature = "a11y-appkit"))]
 mod macos {
-    use super::AccessibleSnapshot;
-    use objc2_app_kit::{NSAccessibility, NSView};
-    use objc2_foundation::{NSRange, NSString};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use aterm_objc::{Id, NSRange, Sel, autoreleasepool, sel};
     use winit::window::Window;
+
+    use super::AccessibleSnapshot;
+    use crate::appkit;
 
     /// Publish `snap` to the window's content `NSView` accessibility attributes so
     /// VoiceOver can read the terminal: role (text area), label, value (the visible
@@ -193,44 +193,53 @@ mod macos {
     /// which the winit event loop guarantees. VoiceOver behavior itself is not
     /// machine-verifiable here and is validated manually.
     pub fn apply_to_ns_view(window: &Window, snap: &AccessibleSnapshot) {
-        let Ok(handle) = window.window_handle() else {
+        let view = crate::platform::ns_view_of(window);
+        if view.is_null() {
             return;
-        };
-        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
-            return;
-        };
-        // SAFETY: `ns_view` points at this window's live NSView (owned by winit for
-        // the window's lifetime); we only borrow it on the main thread to set its
-        // accessibility attributes — the same borrow pattern as
-        // `match_window_colorspace_to_content`.
-        let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-        let role = NSString::from_str(snap.role());
-        let label = NSString::from_str(snap.label());
-        let value = NSString::from_str(snap.value());
-        // accessibilityValue is typed `id` (Option<&AnyObject>); deref-coerce the
-        // NSString (Retained<NSString> → … → AnyObject) at this type-annotated let,
-        // since the coercion cannot reach inside the `Some(..)` at the call.
-        let value_obj: &objc2::runtime::AnyObject = &value;
-        // SAFETY: standard AppKit NSAccessibility setters on a live NSView, on the
-        // main thread. `&*role`/`&*label` produce `&NSString` (NSAccessibilityRole
-        // is an NSString typedef); the coercion to the parameter type happens at the
-        // argument position.
-        unsafe {
-            view.setAccessibilityRole(Some(&*role));
-            view.setAccessibilityLabel(Some(&*label));
-            view.setAccessibilityValue(Some(value_obj));
-            view.setAccessibilityElement(true);
         }
-        // Publish the caret only when the cursor is visible; a hidden cursor
-        // (DECTCEM) yields None, and we must not assert a bogus selection.
-        if let Some(off) = snap.cursor_offset() {
-            // SAFETY: same live main-thread NSView as above; NSRange is a plain
-            // #[repr(C)] {location,length} value passed by copy. A zero-length
-            // range at `off` is the caret (an empty selection at the cursor).
+        autoreleasepool(|_| {
+            let (Some(role), Some(label), Some(value)) = (
+                appkit::nsstring(snap.role()),
+                appkit::nsstring(snap.label()),
+                appkit::nsstring(snap.value()),
+            ) else {
+                return;
+            };
+            // SAFETY: `view` is this window's live NSView (winit owns it for the
+            // window's lifetime), borrowed on the main thread to set its
+            // accessibility attributes. `-setAccessibilityRole:` /
+            // `-setAccessibilityLabel:` are `-(void)(NSString *)` (the role
+            // typedef IS an NSString), `-setAccessibilityValue:` is
+            // `-(void)(id)` — objc2 needed an explicit three-step deref
+            // coercion to reach that erased type and `Id` simply IS it — and
+            // `-setAccessibilityElement:` is `-(void)(BOOL)`.
             unsafe {
-                view.setAccessibilitySelectedTextRange(NSRange::new(off, 0));
+                appkit::send_v_id(view, sel!(setAccessibilityRole:), role.id());
+                appkit::send_v_id(view, sel!(setAccessibilityLabel:), label.id());
+                appkit::send_v_id(view, sel!(setAccessibilityValue:), value.id());
+                appkit::send_v_bool(view, sel!(setAccessibilityElement:), true);
             }
-        }
+            // Publish the caret only when the cursor is visible; a hidden cursor
+            // (DECTCEM) yields None, and we must not assert a bogus selection.
+            if let Some(off) = snap.cursor_offset() {
+                // SAFETY: same live main-thread NSView; `-setAccessibility
+                // SelectedTextRange:` is `-(void)(NSRange)` and `NSRange` is a
+                // plain `#[repr(C)]` `{location,length}` pair passed by copy —
+                // sixteen bytes, so it goes in registers on both ABIs. A
+                // zero-length range at `off` is the caret.
+                unsafe {
+                    let set: unsafe extern "C" fn(Id, Sel, NSRange) = aterm_objc::msg();
+                    set(
+                        view,
+                        sel!(setAccessibilitySelectedTextRange:),
+                        NSRange {
+                            location: off,
+                            length: 0,
+                        },
+                    );
+                }
+            }
+        });
     }
 }
 

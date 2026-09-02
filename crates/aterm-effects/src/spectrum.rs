@@ -2254,5 +2254,4 @@ mod tests {
             "an unreachable falloff weight changed the emitted halo"
         );
     }
-
 }

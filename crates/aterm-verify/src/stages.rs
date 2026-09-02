@@ -20,7 +20,7 @@ use crate::exec::{self, Capture, Cmd};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{StageId, StageSpec};
 use crate::scope::Scope;
-use crate::smoke::debug_bin;
+use crate::smoke::{debug_bin, debug_example};
 use crate::smoke_stages;
 use crate::{Ctx, have_on_path, is_executable_file};
 
@@ -48,6 +48,10 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
         StageId::GuiSmoke => smoke_stages::gui_typing_smoke(ctx, &mut r),
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
+        StageId::ObjcClassAudit => objc_class_audit(ctx, &mut r),
+        StageId::ObjcImeDrive => objc_ime_drive(ctx, &mut r),
+        StageId::ObjcToolbarDrive => objc_toolbar_drive(ctx, &mut r),
+        StageId::ObjcWindowDrive => objc_window_drive(ctx, &mut r),
         StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
@@ -328,6 +332,238 @@ pub fn redraw_conformance_build_args() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// The live-class auditor's target name — the `[[example]]`, the built file and
+/// the argv below all have to agree, so they read it from here.
+pub const OBJC_CLASS_AUDIT_EXAMPLE: &str = "objc_live_class_audit";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_live_class_audit`
+///
+/// NO `required-features`, deliberately, unlike the redraw harness beside it:
+/// the auditor needs nothing aterm-gui does not already compile on macOS, and a
+/// feature would be one more thing that can be forgotten in the argv while the
+/// stage gates on a binary from some previous run.
+#[must_use]
+pub fn objc_class_audit_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_CLASS_AUDIT_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the auditor's exit code (`0` clean / `1` finding / `2`
+/// NOT RUN, declared in `crates/aterm-gui/examples/objc_live_class_audit.rs`).
+///
+/// A FUNCTION, and tested, for the same reason [`redraw_outcome`] is: `2` means
+/// no window server answered or no delegate was installed, and read as green it
+/// would restore exactly the silence this gate exists to remove — the two
+/// plants it was built against both left a GREEN build behind them.
+#[must_use]
+pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc live-class audit: every method the registered WinitWindowDelegate holds agrees with the runtime's own authority, and the class claims the protocols its rows come from".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc live-class audit: a registered encoding disagrees with its authority, a row has no authority at all, or the class does not claim a protocol it implements".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc live-class audit: NOT RUN — no event loop or no delegate was installed, so nothing was proven about the registered class (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc live-class audit: unexpected exit {c} (the auditor answers only 0/1/2)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc live-class audit: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+/// The toolbar driver's target name — the `[[example]]`, the built file and
+/// the argv below all have to agree, so they read it from here.
+pub const OBJC_TOOLBAR_DRIVE_EXAMPLE: &str = "objc_toolbar_drive";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_toolbar_drive`
+///
+/// NO `required-features`, for the same reason the auditor has none: the
+/// driver needs nothing `aterm-gui` does not already compile on macOS, and a
+/// feature is one more thing that can be forgotten in the argv while the stage
+/// gates on a binary from some previous run.
+#[must_use]
+pub fn objc_toolbar_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_TOOLBAR_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// The window driver's target name — the `[[example]]`, the built file and the
+/// argv below all have to agree, so they read it from here.
+pub const OBJC_WINDOW_DRIVE_EXAMPLE: &str = "objc_window_drive";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_window_drive`
+#[must_use]
+pub fn objc_window_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_WINDOW_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the window driver's exit code (`0` clean / `1` finding
+/// / `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_window_drive.rs`).
+///
+/// THREE codes, not the toolbar's four: this driver enters no `-mouseDown:` IMP
+/// and pops no menu, so there is no modal tracking loop to hang in and no
+/// watchdog to report. It drives through winit's public API plus two rows —
+/// `draggingEntered:` and `windowShouldClose:` — that no public API can reach.
+#[must_use]
+pub fn objc_window_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc window drive: the real window answered every question — title round trips through NSString, the style mask against AppKit's own -styleMask, position and size round trips, min/max clamping, visibility, theme through +appearanceNamed:/-bestMatchFromAppearancesWithNames:, shadow and tabs, draggingEntered: answering NSDragOperationCopy as an NSUInteger, windowShouldClose: answering NO, and the fullscreen state machine".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc window drive: the driven window did not behave — a round trip disagreed, a style-mask bit landed in the wrong place, or a delegate row answered the wrong value".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc window drive: NOT RUN — no event loop, no window, or no delegate was installed, so nothing was proven about the window surface (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc window drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of the use-after-free its first run found"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc window drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+/// How the ladder reads the toolbar driver's exit code (`0` clean / `1`
+/// finding / `2` NOT RUN / `3` HUNG, declared in
+/// `crates/aterm-gui/src/toolbar_drive.rs`).
+///
+/// FOUR codes and not three, and the fourth is not decoration. The driver
+/// enters `-mouseDown:` / `-rightMouseDown:` IMPs directly, and a context menu
+/// that actually popped would run `-[NSMenu popUpContextMenu:…]`'s modal
+/// tracking loop and never return. Its watchdog kills the process at 180 s
+/// with `3`, so a hang reaches the ladder as a NAMED could-not-run rather than
+/// as a stage that decided nothing while looking busy.
+#[must_use]
+pub fn objc_toolbar_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc toolbar drive: the real tab strip answered every question — chips, clicks, a drag, both menu routes, a resize, the rename editor's commit and cancel exits, a 200-rebuild ownership ledger, 27 drawn states, and all four declared classes read off live objects against the runtime's own authority".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc toolbar drive: the driven strip did not behave, a drawing state stopped drawing, or a registered encoding disagrees with its authority".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc toolbar drive: NOT RUN — no event loop, no window, or no toolbar was installed, so nothing was proven about the tab strip (exit 2, never a pass)".to_string(),
+        ),
+        Some(3) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc toolbar drive: HUNG — the watchdog fired, so a modal tracking loop never returned and the drive proved nothing (exit 3, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc toolbar drive: unexpected exit {c} (the driver answers only 0/1/2/3)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc toolbar drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+/// The IME driver's target name — the `[[example]]`, the built file and the
+/// argv below all have to agree, so they read it from here.
+pub const OBJC_IME_DRIVE_EXAMPLE: &str = "objc_ime_drive";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_ime_drive`
+#[must_use]
+pub fn objc_ime_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_IME_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the IME driver's exit code (`0` clean / `1` finding /
+/// `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_ime_drive.rs`).
+///
+/// A FUNCTION, and tested, for the same reason [`objc_audit_outcome`] is: `2`
+/// means no window server answered or the view had no input context, and read
+/// as green it would restore exactly the silence these gates exist to remove.
+#[must_use]
+pub fn objc_ime_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc IME drive: a composition ran through the ported WinitView's NSTextInputClient rows — preedit, UTF-16 to UTF-8 cursor conversion, the attributed-string branch, the out-of-range clamp, commit, and the candidate-window rectangle".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc IME drive: a composition did not produce the events winit's API promises, or the candidate-window rectangle was wrong".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc IME drive: NOT RUN — no event loop, no view, or no input context, so nothing was proven about the IME path (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc IME drive: unexpected exit {c} (the driver answers only 0/1/2)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc IME drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
 }
 
 /// `targo --unverified test -p aterm-bench --test differential`
@@ -1057,6 +1293,220 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
+// 5d) OBJC LIVE-CLASS AUDIT — the registered class, read back off a real
+//    NSWindow's delegate. `vendor/winit`'s `WinitWindowDelegate` is declared by
+//    `aterm_objc::declare_class!`, and until this stage NOTHING IN CI READ IT:
+//    the seam census checks a mirror class the test file declares, and two
+//    compile-verified plants (an argument retyped `Id` -> `Bool`, and
+//    `NSWindowDelegate` dropped from `protocols:`) passed that census 6/6 with
+//    the build at exit 0 and the driven event log byte-identical.
+// ---------------------------------------------------------------------------
+
+fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, so the `--selftest` ladder reads the same on every
+    // platform — a mode whose whole contract is "execute nothing" must not
+    // report a different reason per host.
+    if ctx.selftest {
+        r.skip("objc live-class audit (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        // Not a skip for lack of a tool: the class under audit is declared
+        // inside `#[cfg(target_os = "macos")]` and does not exist here at all.
+        r.skip("objc live-class audit (macOS only: the audited class is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc live-class audit (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_class_audit_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --example {OBJC_CLASS_AUDIT_EXAMPLE}"));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_CLASS_AUDIT_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc live-class audit: just-built auditor missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // Driven as a BINARY, never `targo run`, for the same two reasons as the
+    // redraw harness: the driver's lane banner would land in the transcript, and
+    // cargo's own exit codes would collide with the auditor's 0/1/2.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_audit_outcome(out.code);
+    r.record(outcome, label);
+}
+
+// ---------------------------------------------------------------------------
+// 5c) THE IME DRIVE — the auditor's twin, asking the other question.
+//
+//    The audit proves the ported `WinitView` is SHAPED right: 44 registered
+//    encodings against the runtime's own authority. It cannot prove the class
+//    BEHAVES right, and for `view.rs` that is the question that matters — the
+//    eleven `NSTextInputClient` rows are a state machine an input method
+//    drives, and a port that registers all eleven correctly and still drops a
+//    preedit, mis-clamps a cursor range, or forwards UTF-16 indices where
+//    winit's API promises UTF-8 byte offsets passes every shape check in the
+//    tree. It also drives the one row whose wrong encoding would not raise:
+//    `firstRectForCharacterRange:actualRange:` is how an input method asks
+//    where to put its candidate window, so a garbage answer there is a
+//    misplaced window rather than an exception.
+// ---------------------------------------------------------------------------
+
+fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, for the same reason the auditor does it.
+    if ctx.selftest {
+        r.skip("objc IME drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc IME drive (macOS only: the driven class is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc IME drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_ime_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --example {OBJC_IME_DRIVE_EXAMPLE}"));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_IME_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc IME drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, for the same two reasons as the auditor: the
+    // driver lane's banner would land in the transcript, and cargo's own exit
+    // codes would collide with the driver's 0/1/2.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_ime_outcome(out.code);
+    r.record(outcome, label);
+}
+
+// ---------------------------------------------------------------------------
+// 5e) THE TOOLBAR DRIVE — the same obligation as 5d, one file over and on the
+//    LARGEST ported file in the tree. `crates/aterm-gui/src/toolbar.rs` holds
+//    four declared classes and, after W7, every AppKit binding call in the tab
+//    strip; nothing in CI drove it. Its `#[cfg(test)] mod objc_tests` checks
+//    thirty-two registered encodings against a LITERAL IN THE SAME FILE, and a
+//    plant that registered `controlTextDidChange:` as `v@:B` and edited the
+//    table to agree left it green. This stage installs the real toolbar in a
+//    real NSWindow, enters the registered IMPs through AppKit's dispatch,
+//    captures 27 drawing states, and reads all four classes off the live
+//    objects. On its first run it found a spurious commit posted by
+//    `begin_tab_rename` that left both of the rename editor's exits dead.
+// ---------------------------------------------------------------------------
+
+fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, for the same reason the auditor does it: a mode whose
+    // whole contract is "execute nothing" must not report a different reason
+    // per host.
+    if ctx.selftest {
+        r.skip("objc toolbar drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        // Not a skip for lack of a tool: the tab strip and its four declared
+        // classes live inside `#[cfg(target_os = "macos")]`.
+        r.skip("objc toolbar drive (macOS only: the driven strip is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc toolbar drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_toolbar_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!(
+            "targo build --example {OBJC_TOOLBAR_DRIVE_EXAMPLE}"
+        ));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_TOOLBAR_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc toolbar drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, for the same two reasons as its siblings:
+    // the driver lane's banner would land in the transcript, and cargo's own
+    // exit codes would collide with the driver's 0/1/2/3.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_toolbar_outcome(out.code);
+    r.record(outcome, label);
+}
+
+fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as its three siblings do.
+    if ctx.selftest {
+        r.skip("objc window drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc window drive (macOS only: the driven window_delegate.rs is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc window drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_window_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --example {OBJC_WINDOW_DRIVE_EXAMPLE}"));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_WINDOW_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc window drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, for the same two reasons as its siblings:
+    // the driver lane's banner would land in the transcript, and cargo's own
+    // exit codes would collide with the driver's 0/1/2.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_window_outcome(out.code);
+    r.record(outcome, label);
+}
+
+// ---------------------------------------------------------------------------
 // 6) --full ONLY: differential oracle
 // ---------------------------------------------------------------------------
 fn differential_oracle(ctx: &Ctx, r: &mut Report) {
@@ -1157,12 +1607,48 @@ fn kani_floor(ctx: &Ctx, r: &mut Report) {
         return;
     }
     for krate in KANI_CRATES {
-        run_labeled(
-            ctx,
-            r,
-            &format!("verify-kani-proofs.sh ({krate})"),
-            &kani_cmd(&gate, krate, &mc_root, &ay_dir),
-        );
+        // NOT `run_labeled`: that decides from the exit code alone, and this
+        // script exits 0 BOTH when it discharged proofs and when it discharged
+        // NONE — the standing policy is that an all-inconclusive run is a
+        // trust-mc modelling limitation, not an aterm defect, so it must not
+        // fail the build. The old code therefore recorded a lane that proved
+        // ZERO harnesses as `ok`, which every reader takes for coverage. The
+        // script states which case it is on its last line; read that, so a
+        // zero-proof run becomes the NAMED skip it is (counted by the tally,
+        // which forfeits the merge-contract claim) and no run changes verdict.
+        let out = exec::run(&kani_cmd(&gate, krate, &mc_root, &ay_dir), ctx.exec_env());
+        r.raw(out.output.as_str());
+        let (outcome, why) = kani_floor_outcome(out.ok, &out.output);
+        r.record(outcome, format!("verify-kani-proofs.sh ({krate}){why}"));
+    }
+}
+
+/// `scripts/verify-kani-proofs.sh` exit 0 does NOT mean "proofs were
+/// discharged": by that script's deliberate policy an all-inconclusive run
+/// exits 0 too. The two are distinguished only by its verdict line — `PASS: N
+/// config-free Kani proof(s) discharged` versus `NOT PROVED (… NOTHING
+/// discharged)` — so the ladder row has to be decided from the output, not from
+/// the status. Anything else at exit 0 (a rewritten script, a truncated run)
+/// asserted nothing about proofs and is reported the same fail-open-but-honest
+/// way: a skip, which the tally names and the verdict subtracts from the claim.
+/// Which runs FAIL is unchanged — nonzero is still a finding.
+fn kani_floor_outcome(ok: bool, output: &str) -> (Outcome, &'static str) {
+    if !ok {
+        return (Outcome::Fail(Severity::GateFailed), "");
+    }
+    let said = |marker: &str| output.lines().any(|l| l.starts_with(marker));
+    if said("PASS:") {
+        (Outcome::Ok, "")
+    } else if said("NOT PROVED") {
+        (
+            Outcome::Skip,
+            " (0 proofs discharged; nothing verified here)",
+        )
+    } else {
+        (
+            Outcome::Skip,
+            " (exited 0 without a proof-count verdict line; nothing claimed)",
+        )
     }
 }
 

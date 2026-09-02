@@ -305,8 +305,10 @@ fn one_master_and_one_roster_authorize_both_a_release_and_a_toolchain_index() {
 /// installs NOTHING. Every byte here is genuinely signed and would install under the real
 /// master — the only thing missing is the anchor.
 ///
-/// This is the shipped state of the tree (`pins::PAPER_MASTER_PUBKEYS` is `&[]`), so it is
-/// also a description of what a build from this source does today: nothing.
+/// This is a FORK's state, and this tree's own before 2026-08-15. WRONG BEFORE: it called
+/// it "the shipped state of the tree (`pins::PAPER_MASTER_PUBKEYS` is `&[]`)", which the
+/// armed master made false. What it still describes exactly is what an unpinned build
+/// does: nothing — the test passes its own empty anchor and never reads `pins`.
 #[test]
 fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
     let dir = scratch("inert");

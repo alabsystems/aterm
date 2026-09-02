@@ -54,6 +54,10 @@ pub enum StageId {
     ControlSocketSmoke,
     GuiSmoke,
     RedrawConformance,
+    ObjcClassAudit,
+    ObjcImeDrive,
+    ObjcToolbarDrive,
+    ObjcWindowDrive,
     DifferentialOracle,
     KaniFloor,
     CrossCells,
@@ -187,6 +191,66 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "control redraw conformance (a select repaints a real window)",
         Lane::MainTarget,
     ));
+    // AND THE OTHER THING ONLY A `fn main` CAN SEE. `vendor/winit`'s
+    // `WinitWindowDelegate` is declared by `aterm_objc::declare_class!` since
+    // W3, and NOTHING IN CI READ THE REGISTERED CLASS: two compile-verified
+    // plants — an argument retyped `Id` -> `Bool`, and `NSWindowDelegate`
+    // deleted from the `protocols:` list — each left `cargo build` at exit 0,
+    // `cargo test -p aterm-objc --test winit_seam` at 6/6, and the DRIVEN EVENT
+    // LOG byte-identical to clean head. libtest cannot host AppKit
+    // (`pthread_main_np()` is 0 on every worker, `--test-threads=1` included),
+    // so the auditor is an `[[example]]` and this is what invokes it. Never
+    // conditional on the scope, for the same reason the redraw gate is not.
+    v.push(spec(
+        StageId::ObjcClassAudit,
+        "objc live-class audit (the registered WinitWindowDelegate and WinitView, against the runtime)",
+        Lane::MainTarget,
+    ));
+    // The auditor's twin, and a SEPARATE stage because it asks a separate
+    // question. The audit proves the ported `WinitView` is SHAPED right — 44
+    // registered encodings against the runtime's own authority. It cannot prove
+    // the class BEHAVES right, and `view.rs`'s eleven `NSTextInputClient` rows
+    // are a state machine an input method drives: a port that registers all
+    // eleven correctly and still drops a preedit, mis-clamps a cursor range or
+    // forwards UTF-16 indices where winit's API promises UTF-8 byte offsets
+    // passes every shape check in the tree. This drives a whole composition
+    // through the registered IMPs and reads the `WindowEvent::Ime` sequence that
+    // comes out.
+    v.push(spec(
+        StageId::ObjcImeDrive,
+        "objc IME drive (a composition through the ported WinitView's NSTextInputClient rows)",
+        Lane::MainTarget,
+    ));
+    // AND THE SAME OBLIGATION, ONE FILE OVER. Both stages above audit
+    // `vendor/winit`; `crates/aterm-gui/src/toolbar.rs` is the LARGEST ported
+    // file in the tree — four declared classes, and after W7 every AppKit
+    // binding call in it — and until this stage NOTHING IN THE TREE DROVE IT.
+    // Its classes were checked by `#[cfg(test)] mod objc_tests`, whose central
+    // case is thirty-two registered encodings against a literal written in the
+    // same file: a plant that registered `controlTextDidChange:` as `v@:B` AND
+    // edited the table to agree left that test GREEN. The driver installs the
+    // real toolbar in a real NSWindow, enters the registered IMPs through
+    // AppKit's own dispatch, captures 27 drawing states with
+    // `-cacheDisplayInRect:`, and reads all four classes off the live objects.
+    // On its first run it found a defect no encoding check could see — the
+    // rename editor posting a spurious commit at open, which killed both of its
+    // exits — so it is not conditional on the scope either.
+    v.push(spec(
+        StageId::ObjcToolbarDrive,
+        "objc toolbar drive (the real tab strip: 27 drawn states, and all four declared classes off live objects)",
+        Lane::MainTarget,
+    ));
+    // THE WINDOW DRIVER (W8), and it is unconditional for the same reason its
+    // three siblings are. `window_delegate.rs` is the largest file in the
+    // mac-arm endgame and W8 moved all 177 of its AppKit binding calls off
+    // `objc2-app-kit`; on its first run it SEGFAULTED on a use-after-free that
+    // had compiled clean and passed every test in the tree. Nothing else in the
+    // ladder touches the window surface.
+    v.push(spec(
+        StageId::ObjcWindowDrive,
+        "objc window drive (the real window: title, style mask, geometry, limits, theme, tabs, drag-and-drop, close and fullscreen)",
+        Lane::MainTarget,
+    ));
     if ctx.mode == Mode::Full {
         v.push(spec(
             StageId::DifferentialOracle,
@@ -308,6 +372,10 @@ mod tests {
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
                 StageId::RedrawConformance,
+                StageId::ObjcClassAudit,
+                StageId::ObjcImeDrive,
+                StageId::ObjcToolbarDrive,
+                StageId::ObjcWindowDrive,
             ]
         );
     }
@@ -328,6 +396,38 @@ mod tests {
                 assert!(
                     ids(&ctx(mode, scope.clone())).contains(&StageId::RedrawConformance),
                     "{mode:?} / {} lost the redraw gate",
+                    scope.label()
+                );
+            }
+        }
+    }
+
+    /// THE SAME OBLIGATION, for the live-class auditor. It is the only check in
+    /// the tree that reads the class `vendor/winit`'s ported delegate actually
+    /// registered — the seam census checks a mirror it declares itself, and two
+    /// compile-verified plants passed that mirror while the build stayed green.
+    /// A gate nobody invokes is not a gate.
+    #[test]
+    fn the_objc_class_audit_runs_in_every_tier_and_every_scope() {
+        for mode in [Mode::Fast, Mode::Full] {
+            for scope in [
+                Scope::workspace(),
+                Scope::crate_only("aterm-grid"),
+                Scope::changed("main", vec![], true),
+            ] {
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcClassAudit),
+                    "{mode:?} / {} lost the objc live-class audit",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcImeDrive),
+                    "{mode:?} / {} lost the objc IME drive",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcToolbarDrive),
+                    "{mode:?} / {} lost the objc toolbar drive",
                     scope.label()
                 );
             }
@@ -433,6 +533,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 22);
+        assert_eq!(plan(&nothing_installed).len(), 26);
     }
 }

@@ -12,17 +12,25 @@
 //!
 //! # Two kinds of test live here, and both are load-bearing
 //!
-//! **The empty-anchor tests are the ones to read first.** `pins::PAPER_MASTER_PUBKEYS` is
-//! EMPTY in this tree, and `aterm_update::github::select_authoritative_release` picks
-//! exactly one candidate with no fallback to an older release — so a shipped client that
-//! meets a release it cannot verify is not delayed, it is WEDGED permanently. Any change
-//! to the unarmed path is therefore a fleet-bricking bug, and the tests below pin that
-//! path from four directions: the gate's verdict, the emitted manifest bytes, the
-//! required asset set, and the draft asset allow-list.
+//! **The ARMED tests are the ones to read first**, because the armed path is the one every
+//! cut from this tree takes: `pins::PAPER_MASTER_PUBKEYS` has pinned the real paper master
+//! since 2026-08-15 (`atpkg-keys setup --id m3`), which
+//! `the_shipped_paper_master_is_armed_and_has_no_empty_member` below asserts. They drive
+//! the same production code with a SYNTHETIC master, because no test may hold the real
+//! one — its secret half is on paper.
 //!
-//! **The armed tests** drive the same production code with a synthetic master, because
-//! the armed path is unreachable from this tree and an unreachable rule with no test is a
-//! rule that rots for exactly as long as nobody would notice.
+//! **The empty-anchor tests** pin the path a FORK takes, and the exact bytes the
+//! pre-roster installed base was cut with. `aterm_update::github::select_authoritative_release`
+//! picks exactly one candidate with no fallback to an older release — so a shipped client
+//! that meets a release it cannot verify is not delayed, it is WEDGED permanently. Any
+//! change to the unarmed path is therefore a fleet-bricking bug, and those tests pin it
+//! from four directions: the gate's verdict, the emitted manifest bytes, the required
+//! asset set, and the draft asset allow-list. An unarmed anchor really is inert and
+//! authorizes nobody — it just is not this tree's state.
+//!
+//! WRONG BEFORE: this header said the anchor is EMPTY in this tree and that the armed path
+//! is unreachable from it, and it ordered the reading on that basis. Both claims died on
+//! 2026-08-15.
 //!
 //! Each test that kills a specific mutation says which one.
 
@@ -199,7 +207,10 @@ fn anchors<'a>(
     }
 }
 
-/// The INERT evidence — the tier the shipped build carries.
+/// The INERT evidence — the tier a FORK or a pre-v0.21.0 build carries. WRONG BEFORE:
+/// this said "the tier the shipped build carries", which stopped being true when
+/// `PAPER_MASTER_PUBKEYS` was armed on 2026-08-15. Inert still means inert: an empty
+/// master authorizes nobody.
 fn inert<'a>() -> RosterEvidence<'a> {
     RosterEvidence {
         master_pubkeys: &[],
@@ -374,9 +385,11 @@ fn a_cut_may_not_publish_an_older_roster_generation_than_the_channel_head() {
         "{err}"
     );
 
-    // AN UNROSTERED CHANNEL admits everything, which is the shipped state and must stay
-    // free: no head generation means no floor to clear.
-    publish::roster_floor_covered(None, None).expect("every cut this tree makes");
+    // AN UNROSTERED CHANNEL admits everything, which is the FORK / pre-roster state and
+    // must stay free: no head generation means no floor to clear. WRONG BEFORE: this
+    // called it "the shipped state" and the expect below "every cut this tree makes" —
+    // the master has been armed since 2026-08-15, so a cut from this tree IS rostered.
+    publish::roster_floor_covered(None, None).expect("an unrostered channel head");
     publish::roster_floor_covered(Some(4), None).expect("the first rostered release");
     // ...but DROPPING the tier against a rostered head is refused rather than ignored:
     // an armed client refuses an unattributed release structurally.
@@ -549,7 +562,10 @@ fn an_unattributed_release_carries_no_roster_assets() {
             "aterm.dmg".to_string(),
             "aterm.dmg.sha256".to_string(),
         ],
-        "the mirrored set must not grow while the master is unpinned \
+        // WRONG BEFORE: "while the master is unpinned" — armed since 2026-08-15. What
+        // keeps this set frozen is that the CUT is unattributed, which is what the
+        // `rostered: false` argument above asks for.
+        "the mirrored set must not grow for an unattributed cut \
          (the stable download twins and their alias sidecars are \
           version-independent, not roster growth)"
     );
@@ -1240,7 +1256,9 @@ fn the_binary_pin_expectation_follows_the_committed_head_not_the_signer() {
 /// each other.
 #[test]
 fn a_resume_may_not_change_which_machine_cut_the_release() {
-    // The shipped case: nameless journal, nameless verdict. Every cut this tree makes.
+    // The FORK / pre-roster case: nameless journal, nameless verdict. WRONG BEFORE: this
+    // said "the shipped case … every cut this tree makes"; the master has been armed
+    // since 2026-08-15, so a cut from this tree journals a machine id.
     publish::resume_attribution_agrees(None, None).expect("an unattributed cut resumes");
     publish::resume_attribution_agrees(Some("m3"), Some("m3")).expect("same machine resumes");
 
@@ -1316,9 +1334,11 @@ fn the_credentials_profile_names_the_roster_and_the_signature_is_its_sibling() {
 ///
 /// This is the one test that runs the lines between the profile and the gate: reading
 /// the named roster, resolving the declared id, and folding both into the evidence.
-/// Those lines are unreachable from this tree (the master is unpinned), which is
-/// exactly why the anchors are PARAMETERS — the same reason `resolve_apple_tier` takes
-/// its team id rather than reading `pins`.
+/// Those lines run on every cut from this tree (the master has been armed since
+/// 2026-08-15 — WRONG BEFORE: this called them unreachable and the master unpinned), and
+/// the anchors are still PARAMETERS so a test can drive them with a SYNTHETIC master
+/// instead of the real one, whose secret half is on paper — the same reason
+/// `resolve_apple_tier` takes its team id rather than reading `pins`.
 ///
 /// Kills two mutations: "ignore `machine_roster` and pass `roster: None`" (the armed
 /// call then refuses with "names no `machine_roster`"), and "pass
@@ -1507,7 +1527,9 @@ fn inputs(version: &'static str, build: u64) -> manifest_out::ManifestInputs<'st
         zip_sha256: ZIP_SHA,
         repo_slug: "owner/repo",
         min_os: "11.0",
-        // The shipped tier claims no team; this file invents no Apple identity.
+        // This FIXTURE claims no team, and this file invents no Apple identity. WRONG
+        // BEFORE: "the shipped tier claims no team" — `pins::APPLE_TEAM_ID` has been
+        // armed ("A66A9P66Z7") since 2026-08-15.
         team_id: "",
         pub_date: "2026-08-11T00:00:00Z",
         min_build: None,

@@ -1893,8 +1893,17 @@ pub fn render_report(r: &Report) -> Vec<String> {
         out.push(numbered(concat(&["review: git diff -- ", &r.paths.pins])));
     }
     if r.verb == Verb::Setup {
+        // WRONG BEFORE: this step named the two tripwire tests below as live work, and
+        // BOTH were deleted by the 2026-08-15 arming commit — neither
+        // `the_paper_master_is_unset_so_the_roster_tier_is_inert` nor
+        // `the_shipped_master_anchor_is_still_empty` is defined anywhere in the tree. A
+        // fork arming from an empty anchor may still carry its own, so the step stays;
+        // the two names are now given as a record, not as an inventory.
         out.push(numbered(
-            "delete the tripwire tests that assert an empty anchor:".to_string(),
+            "delete any tripwire test that asserts an empty anchor. This tree's own two \
+             went with the 2026-08-15 arming commit; a fork re-armed from an empty anchor \
+             may carry its own. For the record, they were:"
+                .to_string(),
         ));
         out.push(
             "       crates/aterm-update-core/src/pins.rs::tests::\

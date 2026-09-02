@@ -290,8 +290,11 @@ pub const PINNED_UPDATE_PUBKEY: &str = aterm_update_core::pins::update_channel_s
 /// # Only while the paper master is UNPINNED
 ///
 /// This keyset is what authorizes a release in a build whose
-/// `pins::PAPER_MASTER_PUBKEYS` is empty — which is every build shipped so far. Arm the
-/// master and the master-signed machine roster becomes the sole authority
+/// `pins::PAPER_MASTER_PUBKEYS` is empty — every build shipped BEFORE v0.21.0 and every
+/// fork, but NOT a build from this tree, whose master has been armed since 2026-08-15.
+/// (WRONG BEFORE: "which is every build shipped so far", and an imperative "Arm the
+/// master" for something already done.) With the master ARMED the master-signed machine
+/// roster is the sole authority
 /// (`github::fetch_authoritative_release`); this slice then survives as the allowance
 /// held by clients that predate the roster, which is a fact about THEM and is enforced
 /// at the producer, not here.
@@ -368,7 +371,18 @@ pub enum ApplyOutcome {
 /// entry points are unconditional no-ops, so this is false.
 #[must_use]
 pub fn enabled() -> bool {
-    cfg!(target_os = "macos") && std::env::var_os("ATERM_NO_AUTO_UPDATE").is_none()
+    // Value semantics via the shared flag rule (`env_flag_engaged`): unset,
+    // EMPTY and "0" do NOT disable. The old `is_none()` read meant
+    // `ATERM_NO_AUTO_UPDATE=0` — the spelling that says "auto-update ON" under
+    // the documented "=1 disables" contract (README, SECURITY.md,
+    // docs/RELEASING.md) — silently killed the whole updater: no background
+    // checks, no launch-time apply, nothing logged (2026-09-01 audit).
+    cfg!(target_os = "macos")
+        && !aterm_types::control_socket::env_flag_engaged(
+            std::env::var_os("ATERM_NO_AUTO_UPDATE")
+                .map(|v| v.to_string_lossy().into_owned())
+                .as_deref(),
+        )
 }
 
 /// Apply a staged update if one is ready and strictly newer than `current_build`

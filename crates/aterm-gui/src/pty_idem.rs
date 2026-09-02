@@ -598,6 +598,38 @@ fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
 #[cfg(test)]
 mod tests {
 
+    /// `turn`'s help states WHO takes the idempotency key, and the statement is
+    /// bound to [`KEYED_VERBS`] — because the previous wording, "the key, which
+    /// every input verb shares", was FALSE in the dangerous direction: a driver
+    /// that believed it and stamped `id=` on a `paste` had the key delivered as
+    /// LITERAL TEXT into the terminal (pinned below by
+    /// `unkeyed_verbs_deliver_a_leading_id_as_content`), with no exactly-once
+    /// protection at all. The entry must name every keyed verb, must not use
+    /// the "every input verb" wording, and must state that the others take no
+    /// key.
+    #[test]
+    fn the_turn_help_names_exactly_the_keyed_verbs() {
+        let detail = aterm_types::control_verbs::spec("turn")
+            .expect("`turn` is a catalog verb")
+            .detail;
+        for verb in KEYED_VERBS {
+            assert!(
+                detail.contains(&format!("`{verb}`")),
+                "`turn`'s key sentence must name `{verb}` — the roster is \
+                 KEYED_VERBS, stated, not gestured at"
+            );
+        }
+        assert!(
+            !detail.contains("every input verb"),
+            "\"every input verb shares\" was the false claim; it must not return"
+        );
+        assert!(
+            detail.contains("take NO key"),
+            "the entry must say the unkeyed verbs take no key, so a reader \
+             cannot infer coverage the code refuses"
+        );
+    }
+
     /// `send`'s help SPLITS the keyed verbs by framing, and the split is derived
     /// from the table — so the roster in the prose must agree with it.
     ///

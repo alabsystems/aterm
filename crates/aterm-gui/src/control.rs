@@ -3418,6 +3418,45 @@ fn request_head(line: &str) -> (Option<Selector>, &str, &str) {
     }
 }
 
+/// `Some(ERR usage)` when a zero-argument verb was handed a tail, else `None`.
+///
+/// `version`, `sessions`, `who` and `whoami` document no arguments and took
+/// none — and silently DROPPED whatever followed, so `sessions --json` answered
+/// the plain roster at `OK <n>` and a script author read the success as "flag
+/// accepted" (audit D-12, the ctl third of it; the atpkg and aterm-cli thirds
+/// are closed at their own dispatch edges). The usage shape is the server's
+/// ordinary `ERR usage: <verb>` so existing error handling already classifies it.
+fn refuse_stray_args(verb: &str, rest: &str) -> Option<String> {
+    let stray = rest.trim();
+    (!stray.is_empty()).then(|| format!("ERR usage: {verb}\n"))
+}
+
+#[cfg(test)]
+mod stray_args_tests {
+    use super::refuse_stray_args;
+
+    /// `sessions --json` answered the plain roster at `OK <n>` and exit 0 —
+    /// the tail was DROPPED, so a script author read success as "flag
+    /// accepted" (audit D-12). A zero-argument verb refuses its tail with the
+    /// server's ordinary usage error; the bare form is untouched.
+    #[test]
+    fn a_zero_argument_verb_refuses_its_tail_and_passes_bare() {
+        for verb in ["version", "sessions", "who", "whoami"] {
+            assert_eq!(
+                refuse_stray_args(verb, " --json").as_deref(),
+                Some(format!("ERR usage: {verb}\n").as_str()),
+                "`{verb} --json` must be a usage error, not a silent drop"
+            );
+            assert_eq!(refuse_stray_args(verb, ""), None, "bare `{verb}` proceeds");
+            assert_eq!(
+                refuse_stray_args(verb, "   "),
+                None,
+                "whitespace tail is bare"
+            );
+        }
+    }
+}
+
 fn dispatch_meta_verb(
     verb: &str,
     rest: &str,
@@ -3426,7 +3465,9 @@ fn dispatch_meta_verb(
     proxy: &EventLoopProxy<Wake>,
 ) -> Option<String> {
     match verb {
-        "version" => Some(crate::build_info::control_line()),
+        "version" => {
+            Some(refuse_stray_args(verb, rest).unwrap_or_else(crate::build_info::control_line))
+        }
         "update" => Some(cmd_update(rest, scope, proxy)),
         "help" | "verbs" => Some(cmd_help(rest)),
         // `privacy` — the macOS consent posture. Instance-wide and self-scoped:
@@ -3671,8 +3712,14 @@ fn dispatch_before_session(
             return Some("ERR denied\n".into());
         }
         return match verb {
-            "sessions" => Some(control_session::cmd_sessions_store(store, Some(proxy))),
-            "who" => Some(control_session::cmd_who(store, subscribers)),
+            "sessions" => Some(
+                refuse_stray_args(verb, rest)
+                    .unwrap_or_else(|| control_session::cmd_sessions_store(store, Some(proxy))),
+            ),
+            "who" => Some(
+                refuse_stray_args(verb, rest)
+                    .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
+            ),
             // The exit ledger is a store read like `sessions` — the instance's
             // past stays answerable with no terminal at all.
             "exits" => Some(control_session::cmd_exits(store, rest)),
@@ -7466,7 +7513,9 @@ fn handle(
         return match verb {
             // Global build provenance (version/commit/build-time/binary signature); see
             // crate::build_info (also shown in the macOS About panel).
-            "version" => crate::build_info::control_line(),
+            "version" => {
+                refuse_stray_args(verb, rest).unwrap_or_else(crate::build_info::control_line)
+            }
             // The in-app updater's state — enabled, running build, any staged build's
             // version + "what changed". `update check` forces one synchronous check
             // (may block for tens of seconds on network + disk).
@@ -7510,8 +7559,10 @@ fn handle(
             // Production intercepts these before generic dispatch because it owns
             // the durable handle and (for propose) the following binary frame.
             "operator" | "operator-propose-bin" => "ERR operator unavailable\n".to_string(),
-            "sessions" => control_session::cmd_sessions(self_ctx, store, Some(proxy)),
-            "who" => control_session::cmd_who(store, subscribers),
+            "sessions" => refuse_stray_args(verb, rest)
+                .unwrap_or_else(|| control_session::cmd_sessions(self_ctx, store, Some(proxy))),
+            "who" => refuse_stray_args(verb, rest)
+                .unwrap_or_else(|| control_session::cmd_who(store, subscribers)),
             // `exits`: the roster journal's `Exited` rows — `sessions`' past.
             "exits" => control_session::cmd_exits(store, rest),
             // The op-level authority primitives and their connection-grain twins
@@ -7538,7 +7589,8 @@ fn handle(
             // `raise <sid>`: raise the hosting window + select the tab (a
             // main-thread hop; window/tab state is App-owned).
             "raise" => control_session::cmd_raise(proxy, store, scope, rest),
-            "whoami" => control_session::cmd_whoami(self_ctx, scope),
+            "whoami" => refuse_stray_args(verb, rest)
+                .unwrap_or_else(|| control_session::cmd_whoami(self_ctx, scope)),
             // Network-drive meta verbs. `dial <name>` itself is handled earlier in
             // the serve loop (it takes over the connection); these are its
             // normal-response companions.
