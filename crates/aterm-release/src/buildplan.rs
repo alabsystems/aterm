@@ -1246,8 +1246,12 @@ fn publish_verified_symbols(
         true,
         "release output directory",
     )?);
+    // The build-output sentinel atpkg reads (`cli.rs::is_build_output_bundle`), NOT a
+    // Spotlight exclusion: a `.metadata_never_index` file in a subdirectory is INERT,
+    // measured 2026-09-02 (crates/atpkg/src/noindex.rs). The only mechanism measured to
+    // exclude a subtree is a name ending `.noindex`, which `dist/` does not have.
     std::fs::write(out_dir.join(".metadata_never_index"), "")
-        .map_err(|error| format!("mark {} metadata-inert: {error}", out_dir.display()))?;
+        .map_err(|error| format!("mark {} build output: {error}", out_dir.display()))?;
     if let Some(staged) = output.dsym.take() {
         let published = out_dir.join("aterm.dSYM");
         match std::fs::remove_dir_all(&published) {

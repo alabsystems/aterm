@@ -27,6 +27,10 @@
 //!   not-applicable sentinel.
 //! * **Disk** — [`volume_free_bytes`] calls `GetDiskFreeSpaceExW` (dependency-free
 //!   manual FFI) instead of `statvfs`; both fail **OPEN** (`None` on any error).
+//! * **Spotlight** — the index query ([`spotlight_query`],
+//!   [`spotlight_indexing_enabled`]) is macOS only and `None` everywhere else, Windows
+//!   Search having no per-directory opt-out for [`crate::noindex`] to honour or to
+//!   measure. `None` means the question could not be ASKED, never "not indexed".
 //! * **Exec** — [`exec_or_run`] `spawn().wait()` + `process::exit` (Windows has no
 //!   `execve`) instead of replacing the process image.
 //!

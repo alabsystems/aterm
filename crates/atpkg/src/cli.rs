@@ -70,6 +70,7 @@ const VERBS: &[&str] = &[
     "refresh",
     "run",
     "relocate",
+    "noindex",
 ];
 
 /// One usage line per verb — what `atpkg <verb> --help` prints.
@@ -135,6 +136,12 @@ const VERB_USAGE: &[(&str, &str)] = &[
     (
         "repair",
         "atpkg repair            — re-lay shims and shell integration after a broken install",
+    ),
+    (
+        "noindex",
+        "atpkg noindex [scan] [<root>] [--depth <n>]  — cargo target dirs Spotlight indexes\n\
+         atpkg noindex verify <dir>                   — MEASURE whether <dir> is excluded\n\
+         atpkg noindex migrate <dir> [--dry-run]      — rename <dir> to the excluded form",
     ),
 ];
 
@@ -206,6 +213,7 @@ const VERB_TIERS: &[(&str, &[&str])] = &[
             "verify",
             "gc",
             "repair",
+            "noindex",
         ],
     ),
     (
@@ -427,6 +435,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("refresh") => return cmd_refresh(&args[1..]),
         Some("run") => return cmd_run(&args[1..]),
         Some("relocate") => return cmd_relocate(&args[1..]),
+        // Storage hygiene, and deliberately NOT a store mutator: `noindex` writes nothing
+        // under `<prefix>` — its probe file is removed by a `Drop` guard and its one
+        // `rename(2)` lives inside the tree the user named — so it stays out of
+        // `verb_mutates_store` and a scan of a 2 TB home can never queue behind, or
+        // block, an install. `args[1]` here is a SUBCOMMAND, not a program name, which is
+        // why `noindex` is absent from `NAME_TAKING_VERBS` (as `relocate` is): its own
+        // parser owns every `-`-leading token.
+        Some("noindex") => return cmd_noindex(&args[1..]),
         Some(other) => {
             // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the
             // suggestion rides after an em dash so a typo's fix is the FIRST thing on
@@ -1466,6 +1482,455 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("atpkg relocate: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The one non-macOS answer, shared by all three `noindex` subcommands so they cannot
+/// fork. `.noindex` is a behaviour MEASURED on macOS 26.6.2 and nowhere else has a
+/// Spotlight index to hide from — so the verb says "not applicable" rather than
+/// reporting a clean scan. "0 indexed" on Linux would read as a measurement, and this
+/// whole feature exists because a false-clean answer is worse than no answer (the
+/// earlier attempt planted 189 inert `.metadata_never_index` files and reported success).
+const NOINDEX_NOT_APPLICABLE: &str =
+    "atpkg noindex: not applicable — Spotlight is a macOS index; nothing to exclude here";
+
+/// What `atpkg noindex` was asked to do.
+///
+/// A parsed job rather than a bag of `Option`s threaded through the body, so the whole
+/// grammar — including which flag belongs to which subcommand — is decided by a pure
+/// function and pinned by `tests::noindex_grammar_is_exact`, with no filesystem and no
+/// 20-second probe in the loop.
+#[derive(Debug, PartialEq, Eq)]
+enum NoindexJob {
+    /// `noindex [scan] [<root>] [--depth <n>]`. `root: None` means the cwd — resolved in
+    /// the body, not here, so this stays pure.
+    Scan {
+        /// The tree to walk, as the user spelled it.
+        root: Option<String>,
+        /// Directory levels below `root` to descend.
+        depth: usize,
+    },
+    /// `noindex verify <dir>` — the empirical probe.
+    Verify {
+        /// The directory to measure.
+        dir: String,
+    },
+    /// `noindex migrate <dir> [--dry-run]` — the one rename.
+    Migrate {
+        /// The directory to rename.
+        dir: String,
+        /// Print the rename that would happen and touch nothing.
+        dry_run: bool,
+    },
+}
+
+/// One usage refusal for `noindex`: the specific complaint, then the grammar, exit 2.
+///
+/// The grammar comes from [`VERB_USAGE`] rather than a literal here — `relocate` keeps a
+/// second hand-written copy of its usage string in its parser, and a second copy is the
+/// thing that rots. `unwrap_or_default` keeps this total: a missing entry costs a blank
+/// line, never a panic on the error path.
+fn noindex_usage_error(problem: &str) -> ExitCode {
+    eprintln!("atpkg noindex: {problem}");
+    eprintln!("usage: {}", usage_of("noindex").unwrap_or_default());
+    ExitCode::from(2)
+}
+
+/// Parse `noindex`'s argv. `Err(code)` has ALREADY printed the usage error.
+///
+/// Pure apart from those two `eprintln!`s, which is the point: the flag grammar is pinned
+/// by a test rather than discovered by running a verb whose `verify` form takes 20
+/// seconds and whose `migrate` form renames a directory.
+///
+/// A flag on the WRONG subcommand is a usage error, never a silent ignore. `noindex scan
+/// --dry-run` accepted-and-ignored would answer "nothing would change" about a form that
+/// changes nothing anyway — a true sentence and a wrong answer, which is exactly the
+/// shape of bug (audit D-12: `doctor --json` swallowed the flag and exited 0) that the
+/// per-verb arity work closed everywhere else.
+fn parse_noindex(rest: &[String]) -> Result<NoindexJob, ExitCode> {
+    let mut sub: Option<&str> = None;
+    let mut operand: Option<&str> = None;
+    let mut depth: Option<usize> = None;
+    let mut dry_run = false;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dry-run" => dry_run = true,
+            "--depth" => {
+                // Bounded at BOTH ends. `--depth 0` walks nothing and would report
+                // "0 indexed" over a home full of build output — the false-clean answer
+                // again — and a depth past 32 is a request to walk the machine, not a
+                // depth. A non-number is refused rather than defaulted, so a typo'd
+                // `--depth six` cannot silently become the default 6.
+                let Some(n) = it
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|n| (1..=32).contains(n))
+                else {
+                    return Err(noindex_usage_error("--depth wants a whole number 1..=32"));
+                };
+                depth = Some(n);
+            }
+            // The subcommand is only a subcommand in the FIRST operand slot, so a
+            // directory named `scan` still reaches `noindex migrate ./scan` as the thing
+            // to rename.
+            "scan" | "verify" | "migrate" if sub.is_none() && operand.is_none() => {
+                sub = Some(a.as_str());
+            }
+            s if !s.starts_with('-') && operand.is_none() => operand = Some(s),
+            other => {
+                return Err(noindex_usage_error(&format!(
+                    "unexpected argument {other:?}"
+                )));
+            }
+        }
+    }
+    // `scan` is the default subcommand, so bare `atpkg noindex` is a scan of the cwd.
+    let sub = sub.unwrap_or("scan");
+    match sub {
+        "verify" | "migrate" if operand.is_none() => Err(noindex_usage_error(&format!(
+            "`{sub}` names no directory — say which one, e.g. `aterm pkg noindex {sub} ./target`"
+        ))),
+        "scan" | "verify" if dry_run => Err(noindex_usage_error(&format!(
+            "--dry-run belongs to `migrate`, not `{sub}` — `{sub}` never changes anything, \
+             so there is no rename to withhold"
+        ))),
+        "verify" | "migrate" if depth.is_some() => Err(noindex_usage_error(&format!(
+            "--depth belongs to `scan`, not `{sub}` — `{sub}` acts on the one directory you name"
+        ))),
+        "verify" => Ok(NoindexJob::Verify {
+            dir: operand.unwrap_or_default().to_owned(),
+        }),
+        "migrate" => Ok(NoindexJob::Migrate {
+            dir: operand.unwrap_or_default().to_owned(),
+            dry_run,
+        }),
+        _ => Ok(NoindexJob::Scan {
+            root: operand.map(ToOwned::to_owned),
+            depth: depth.unwrap_or(crate::noindex::VERB_DEPTH),
+        }),
+    }
+}
+
+/// `atpkg noindex` — Spotlight exposure of Rust build output (§9, storage hygiene).
+///
+/// The companion to [`crate::freespace`] on the incident of 2026-09-01 01:54, where
+/// `mds` grinding 2.0 TB of build output across 127 target dirs was one of the two
+/// amplifiers that turned a busy build into a killed WindowServer.
+///
+/// The REPORT is exit 0 always: it is a report, not a gate. `verify` is the only form
+/// with a meaningful exit code, and it has THREE because the question has three answers
+/// and collapsing "could not measure" into either of the other two is exactly the bug
+/// this whole feature exists to prevent. Exit 3 is new to atpkg and deliberate: a script
+/// must be able to tell "measured exposed" from "could not measure", and folding
+/// [`crate::noindex::Verdict::Unknown`] into 0 would ship the silent-false-success bug in
+/// exit-code form.
+fn cmd_noindex(rest: &[String]) -> ExitCode {
+    let job = match parse_noindex(rest) {
+        Ok(job) => job,
+        Err(code) => return code,
+    };
+    match job {
+        NoindexJob::Scan { root, depth } => noindex_scan(root.as_deref(), depth),
+        NoindexJob::Verify { dir } => noindex_verify(&dir),
+        NoindexJob::Migrate { dir, dry_run } => noindex_migrate(&dir, dry_run),
+    }
+}
+
+/// `atpkg noindex scan` — which cargo target dirs under `root` Spotlight is free to walk.
+///
+/// Exit 0 whatever it finds; the one exception is having no root at all (a deleted cwd
+/// and no operand), which is a failure to do the thing asked, not a finding.
+fn noindex_scan(root: Option<&str>, depth: usize) -> ExitCode {
+    if !crate::noindex::SUPPORTED {
+        println!("{NOINDEX_NOT_APPLICABLE}");
+        return ExitCode::SUCCESS;
+    }
+    let root = match root {
+        Some(r) => std::path::PathBuf::from(r),
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                eprintln!("atpkg noindex: no current directory to scan ({e}) — name a root");
+                return ExitCode::from(1);
+            }
+        },
+    };
+    // A ROOT THAT CANNOT BE READ IS NOT AN EMPTY TREE. `aterm pkg noindex scan ~/srcc` (a
+    // one-character typo for a `~/src` holding 40 exposed target dirs) must never print
+    // "no cargo target directories under /Users//example/srcc" at exit 0 — that is a
+    // confident false clean over a path nothing walked, the same shape as the 189 inert
+    // `.metadata_never_index` markers this feature exists to prevent. Exit 1, the same
+    // treatment a missing cwd already gets above: it is a failure to do the thing asked.
+    match std::fs::metadata(&root) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            eprintln!(
+                "atpkg noindex: {} is not a directory — name a directory to scan",
+                root.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "atpkg noindex: cannot scan {} ({e}) — check the path",
+                root.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+    println!("atpkg noindex: scanning {} (depth {depth})", root.display());
+    let scan = crate::noindex::scan(&root, depth, &crate::noindex::Budget::VERB);
+    let (n_indexed, n_hidden) = scan.counts();
+    let exposed: Vec<&crate::noindex::Target> = scan.exposed().collect();
+
+    // Sizes for the EXPOSED targets only, under ONE shared wall clock. Three things are
+    // load-bearing here. Sizing a tree we already know is hidden is the expensive half of
+    // the walk for no information, so hidden rows carry no size. Giving each of 127
+    // target dirs the full ceiling is an hour, not a report, so the elapsed time is
+    // subtracted from the budget as the pass proceeds. And the summary is the SUM of the
+    // printed rows rather than an independent walk, so the arithmetic on screen adds up.
+    let started = std::time::Instant::now();
+    let mut sizes: Vec<crate::noindex::Size> = Vec::with_capacity(exposed.len());
+    let mut total_bytes = 0u64;
+    let mut total_complete = true;
+    for target in &exposed {
+        let budget = crate::noindex::Budget {
+            max_entries: crate::noindex::Budget::VERB_SIZE.max_entries,
+            max_wall: crate::noindex::Budget::VERB_SIZE
+                .max_wall
+                .saturating_sub(started.elapsed()),
+        };
+        let size = crate::noindex::size_of(&target.path, &budget);
+        total_bytes = total_bytes.saturating_add(size.bytes);
+        total_complete &= size.complete;
+        sizes.push(size);
+    }
+
+    // Exposed first, then hidden — both already in path order from the scan. The rows
+    // that carry an action go above the rows that do not.
+    // An explicit space between the two columns, never just the field widths: a size of
+    // "at least 41.2 GiB" (or "unmeasured") overruns `{:>11}` and would otherwise abut the
+    // label as `indexedat least 41.2 GiB`.
+    for (target, size) in exposed.iter().zip(&sizes) {
+        println!(
+            "atpkg noindex: {:<7} {:>11}  {}",
+            "indexed",
+            crate::noindex::human_size(size),
+            target.path.display()
+        );
+    }
+    for target in scan.targets.iter().filter(|t| !t.exposed()) {
+        println!(
+            "atpkg noindex: {:<7} {:>11}  {}",
+            "hidden",
+            "",
+            target.path.display()
+        );
+    }
+
+    if scan.targets.is_empty() {
+        println!(
+            "atpkg noindex: no cargo target directories under {} at depth {depth}",
+            root.display()
+        );
+    } else if exposed.is_empty() {
+        println!(
+            "atpkg noindex: {n_indexed} indexed, {n_hidden} hidden — no build output here is \
+             exposed to Spotlight"
+        );
+    } else {
+        let total = crate::noindex::Size {
+            bytes: total_bytes,
+            complete: total_complete,
+        };
+        println!(
+            "atpkg noindex: {n_indexed} indexed, {n_hidden} hidden — {} of build output is in \
+             Spotlight",
+            crate::noindex::human_size(&total)
+        );
+    }
+    if !scan.complete {
+        // A truncated walk that printed a bare count would be read as a census, and
+        // "3 indexed" over a home that holds 127 target dirs is a wrong answer with a
+        // confident shape.
+        println!(
+            "atpkg noindex: the walk stopped at its budget — this list is a floor, not a census"
+        );
+    }
+    // The DISCOVERY walk and the SIZING pass have separate budgets, and the note above
+    // covers only the first. On the motivating machine — 127 target dirs, 2.0 TB — the
+    // shared 30 s sizing clock is spent on the first few trees and every remaining row
+    // gets a zero-length walk. Those rows render `unmeasured` (never `at least 0 B`,
+    // which reads as a small tree), and they need their own floor note, or the reader
+    // takes a truncated sizing pass for a measured one.
+    let sizes_truncated = sizes.iter().any(|s| !s.complete);
+    if sizes_truncated {
+        println!(
+            "atpkg noindex: the sizing pass stopped at its {}s budget — every size above is \
+             a floor, and an `unmeasured` row was not walked at all",
+            crate::noindex::Budget::VERB_SIZE.max_wall.as_secs()
+        );
+    }
+    // The biggest tree is the biggest win, and `min_by_key` over `Reverse` keeps the
+    // FIRST of a tie, so the suggestion is stable across runs rather than dependent on
+    // which equal-sized tree the walk happened to reach last.
+    if let Some(target) = sizes
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, s)| std::cmp::Reverse(s.bytes))
+        .map(|(i, _)| exposed[i])
+    {
+        println!(
+            "atpkg noindex: next — aterm pkg noindex migrate {}",
+            target.path.display()
+        );
+        if sizes_truncated {
+            // "The biggest tree is the biggest win" is only true over rows that were
+            // actually measured: the pick above can name a 2 GiB tree while an 800 GiB one
+            // three rows below reads `unmeasured`.
+            println!(
+                "atpkg noindex:   (the biggest MEASURED tree — an unmeasured row above may \
+                 be larger; name one to `migrate` yourself)"
+            );
+        }
+    }
+    if n_hidden > 0 {
+        // `hidden` above is [`crate::noindex::exclusion_of`] reading the NAME. The name
+        // is not the index: `.metadata_never_index` also looks like an exclusion and is
+        // inert. Only `verify` measures, and the row must not be mistaken for it.
+        println!(
+            "atpkg noindex: `hidden` is what the NAME says; `aterm pkg noindex verify <dir>` \
+             measures it"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// `atpkg noindex verify <dir>` — MEASURE the exclusion, and say so in the exit code.
+///
+/// THREE exits, because the question has three answers: 0 excluded, 1 measured-indexed,
+/// 3 could-not-measure. The verdict's own `Display` is the whole answer line — a second
+/// sentence restating it here is how two spellings of one fact start to drift — so each
+/// arm adds only what `Display` cannot know: the path to migrate, or what exit 3 means.
+fn noindex_verify(dir: &str) -> ExitCode {
+    use crate::noindex::Verdict;
+    let path = std::path::Path::new(dir);
+    // The real directory behind a symlinked operand, when there is one. Every path this
+    // function PRINTS as an act must be that one: `migrate` refuses a symlink (renaming
+    // the link would move the link and leave the build output indexed where it lives), so
+    // a `next` line naming the link would be a dead end the reader cannot get out of.
+    let through_link = std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.file_type().is_symlink())
+        .then(|| std::fs::canonicalize(path).ok())
+        .flatten();
+    let act_on = through_link.as_deref().unwrap_or(path);
+    if crate::noindex::SUPPORTED {
+        // Announce the wait BEFORE it happens. Twenty seconds of a silent cursor reads
+        // as a hang, and the first thing a reader does about a hang is ^C — which kills
+        // the measurement mid-probe and leaves them with no answer at all.
+        println!(
+            "atpkg noindex: probing (up to {}s — the control must index first, and the \
+             margin after it scales with how long that took)",
+            crate::noindex::Timing::DEFAULT.worst_case().as_secs()
+        );
+        // The probe measures the REAL directory (`verify` canonicalizes), so when the
+        // operand is a link, say which tree the answer is about.
+        if let Some(real) = &through_link {
+            println!(
+                "atpkg noindex: {} is a symlink — the probe measures {}",
+                path.display(),
+                real.display()
+            );
+        }
+    }
+    let verdict = crate::noindex::verify(path, &crate::noindex::Timing::DEFAULT);
+    println!("atpkg noindex: {}: {verdict}", path.display());
+    match &verdict {
+        Verdict::Excluded => ExitCode::SUCCESS,
+        Verdict::Indexed => {
+            println!(
+                "atpkg noindex: next — aterm pkg noindex migrate {}",
+                act_on.display()
+            );
+            ExitCode::from(1)
+        }
+        Verdict::Unknown(_) => {
+            println!(
+                "atpkg noindex: could not measure — nothing is claimed either way; this exit \
+                 (3) is neither excluded (0) nor INDEXED (1)"
+            );
+            ExitCode::from(3)
+        }
+        // The verdict line above already IS the not-applicable sentence; a second one
+        // would only say it twice.
+        Verdict::NotApplicable => ExitCode::SUCCESS,
+    }
+}
+
+/// `atpkg noindex migrate <dir> [--dry-run]` — the one `rename(2)`.
+///
+/// Exit 1 on refusal, never 2: the grammar was fine and the operation the user asked for
+/// did not happen, which is a different thing from being asked wrongly. 2 stays reserved
+/// for usage across the whole CLI.
+fn noindex_migrate(dir: &str, dry_run: bool) -> ExitCode {
+    use crate::noindex::Migration;
+    let path = std::path::Path::new(dir);
+    match crate::noindex::migrate(path, dry_run) {
+        Ok(Migration::Migrated { from, to }) => {
+            println!(
+                "atpkg noindex: migrated {} -> {}",
+                from.display(),
+                to.display()
+            );
+            // Say what did NOT happen. A tool that "moves" 41 GiB invites the reader to
+            // wonder what it copied and what it left behind; this one moved a directory
+            // entry inside a single parent, and if it had failed nothing would have
+            // changed.
+            println!(
+                "atpkg noindex: nothing was copied and nothing was deleted — one rename inside \
+                 the parent"
+            );
+            for line in crate::noindex::cargo_hint(&to) {
+                println!("atpkg noindex:   {line}");
+            }
+            println!(
+                "atpkg noindex: next — aterm pkg noindex verify {}",
+                to.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Migration::Planned { from, to }) => {
+            println!(
+                "atpkg noindex: would rename {} -> {}",
+                from.display(),
+                to.display()
+            );
+            // The same hint on the dry run: the rename is the easy half, and re-pointing
+            // cargo is the half a reader wants to have read before committing to it.
+            for line in crate::noindex::cargo_hint(&to) {
+                println!("atpkg noindex:   {line}");
+            }
+            ExitCode::SUCCESS
+        }
+        // Idempotence is a SUCCESS, not a complaint: re-running migrate over a tree that
+        // is already excluded is what a script does, and exit 1 there would fail a loop
+        // that has nothing wrong with it.
+        Ok(Migration::AlreadyExcluded(p)) => {
+            println!(
+                "atpkg noindex: already excluded — {} (nothing to do)",
+                p.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Migration::NotApplicable) => {
+            println!("{NOINDEX_NOT_APPLICABLE}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atpkg noindex: {e}");
             ExitCode::from(1)
         }
     }
@@ -7591,9 +8056,6 @@ mod tests {
         );
     }
 
-    /// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
-    /// a far-fetched guess erodes trust in the near ones.
-    #[test]
     /// `doctor --json` swallowed the flag and exited 0 with the human report
     /// (audit D-12). A zero-arity verb refuses ANY argument at the usage exit,
     /// naming the verb, the argument and the arity — while `--help` still
@@ -7632,7 +8094,6 @@ mod tests {
         assert_eq!(routed_install_note("install", "rustc"), None);
     }
 
-    #[test]
     /// `help <x>` for an `x` that is not a verb must FAIL, not print the roster
     /// at exit 0. Three byte-identical pages at rc 0 for `install`, `gc` and
     /// `zzz-total-nonsense` is what made this a false success: a page of text
@@ -7660,10 +8121,14 @@ mod tests {
         }
     }
 
+    /// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
+    /// a far-fetched guess erodes trust in the near ones.
     #[test]
     fn did_you_mean_suggests_and_gives_up() {
         assert_eq!(did_you_mean("instal"), Some("install"));
         assert_eq!(did_you_mean("udpate"), Some("update"));
+        // The newest verb is in the roster, so a one-slip typo of it gets the fix too.
+        assert_eq!(did_you_mean("noindx"), Some("noindex"));
         assert_eq!(did_you_mean("frobnicate"), None);
     }
 
@@ -9087,8 +9552,8 @@ mod tests {
         }
     }
 
-    /// The two visible option parsers outside the name-operand gate also name
-    /// every accepted flag in their per-verb help. `--progress-file` is omitted
+    /// The visible option parsers outside the name-operand gate also name every
+    /// accepted flag in their per-verb help. `--progress-file` is omitted
     /// deliberately: the GUI strips that hidden machine channel before verb
     /// dispatch, and it is not a user-facing CLI option.
     #[test]
@@ -9096,6 +9561,10 @@ mod tests {
         for (verb, flags) in [
             ("list", &["--porcelain"][..]),
             ("relocate", &["--sign", "--advisory"][..]),
+            // Both of `noindex`'s flags are subcommand-specific, which is precisely why
+            // the usage line has to name them: a reader who cannot see that `--depth`
+            // belongs to `scan` learns it from a usage error instead.
+            ("noindex", &["--depth", "--dry-run"][..]),
         ] {
             let usage = usage_of(verb).expect("visible option parser has usage");
             for flag in flags {
@@ -9105,6 +9574,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The `noindex` grammar, as a table: the default subcommand (`scan`), the default
+    /// root (the cwd — left `None` by the parser so it stays pure), the default depth,
+    /// and the part actually worth pinning — a flag on the WRONG subcommand is a usage
+    /// error, not a silent ignore.
+    ///
+    /// A table rather than a run, because the alternative is discovering this grammar by
+    /// invoking a verb whose `verify` form waits 20 seconds on Spotlight and whose
+    /// `migrate` form renames a directory.
+    #[test]
+    fn noindex_grammar_is_exact() {
+        let argv = |s: &str| -> Vec<String> { s.split_whitespace().map(String::from).collect() };
+        let job = |s: &str| parse_noindex(&argv(s)).ok();
+        let scan = |root: Option<&str>, depth: usize| {
+            Some(NoindexJob::Scan {
+                root: root.map(ToOwned::to_owned),
+                depth,
+            })
+        };
+        // Bare `noindex` is a scan of the cwd at the verb's own depth — the subcommand
+        // and the root are both optional, and `scan` is the default.
+        assert_eq!(job(""), scan(None, crate::noindex::VERB_DEPTH));
+        assert_eq!(job("scan"), scan(None, crate::noindex::VERB_DEPTH));
+        assert_eq!(job("/src"), scan(Some("/src"), crate::noindex::VERB_DEPTH));
+        assert_eq!(job("scan /src --depth 2"), scan(Some("/src"), 2));
+        assert_eq!(job("--depth 2 /src"), scan(Some("/src"), 2));
+        assert_eq!(
+            job("verify /src/target"),
+            Some(NoindexJob::Verify {
+                dir: String::from("/src/target")
+            })
+        );
+        assert_eq!(
+            job("migrate /src/target --dry-run"),
+            Some(NoindexJob::Migrate {
+                dir: String::from("/src/target"),
+                dry_run: true
+            })
+        );
+        // A directory named like a subcommand is still a directory once the subcommand
+        // slot is filled.
+        assert_eq!(
+            job("migrate scan"),
+            Some(NoindexJob::Migrate {
+                dir: String::from("scan"),
+                dry_run: false
+            })
+        );
+        for wrong in [
+            // A flag on the wrong subcommand: refused, never accepted-and-ignored. The
+            // ignored spelling would answer "nothing would change" about a form that
+            // changes nothing anyway — true, and the wrong answer to what was asked.
+            "scan --dry-run",
+            "verify /d --dry-run",
+            "verify /d --depth 3",
+            "migrate /d --depth 3",
+            // The operand these two cannot do without. There is no sensible default
+            // directory to rename or probe.
+            "verify",
+            "migrate",
+            // `--depth` wants a number in range and says so, rather than falling back to
+            // the default: `--depth 0` would walk nothing and report a clean tree.
+            "--depth",
+            "--depth 0",
+            "--depth 33",
+            "--depth six",
+            // Unknown flags and second operands are errors, not leftovers.
+            "--json",
+            "scan /a /b",
+        ] {
+            assert!(
+                parse_noindex(&argv(wrong)).is_err(),
+                "`atpkg noindex {wrong}` must be a usage error, not a silent default"
+            );
+        }
+    }
+
+    /// `noindex`'s `args[1]` is a SUBCOMMAND, not a program name, so it must stay out of
+    /// [`NAME_TAKING_VERBS`] exactly as `relocate` does. In that table the dispatch edge
+    /// refuses any unlisted `-`-leading first operand before the verb body runs, so
+    /// `atpkg noindex --depth 3` would die as "unknown option for `atpkg noindex`" while
+    /// `--depth` is a documented flag of the verb — the same shape as the audit finding
+    /// where `--elevate` was real, documented, and invisible at the edge.
+    #[test]
+    fn noindex_owns_its_own_flags_at_the_dispatch_edge() {
+        assert!(
+            !NAME_TAKING_VERBS.iter().any(|(name, _)| *name == "noindex"),
+            "noindex reads args[1] as a subcommand, not a program name"
+        );
+        assert!(
+            parse_noindex(&[String::from("--depth"), String::from("3")]).is_ok(),
+            "a leading flag is the verb's own business"
+        );
     }
 
     /// Every dispatchable verb must be able to say what it accepts. The audit
@@ -9193,6 +9756,10 @@ mod tests {
             "verify-index",
             "verify-pkg",
             "relocate",
+            // `noindex` writes nothing under <prefix> — its probe file is removed by a
+            // Drop guard and its one rename lives inside the tree the user named — so a
+            // storage-hygiene scan never queues behind an install.
+            "noindex",
             "help",
             "-h",
             "--help",

@@ -317,6 +317,33 @@ OCCASIONAL (recovery and preference)
                              release the hold (pins gate the coherence-group move)
   aterm pkg gc               reclaim superseded builds and interrupted downloads; it
                              says what it swept and why
+  aterm pkg noindex [<root>] [--depth <n>]
+                             storage hygiene, macOS only: list the cargo target dirs
+                             under <root> (default: the current directory) and say which
+                             ones Spotlight is free to walk. `mds` grinding build output
+                             was one of the two amplifiers behind the 2026-09-01
+                             WindowServer watchdog kill, which is why `aterm pkg doctor`
+                             warns when its own shallow scan of $HOME finds exposed ones.
+                             Elsewhere every subcommand is a clean no-op
+  aterm pkg noindex migrate <dir> [--dry-run]
+                             exclude ONE directory, by renaming it to end `.noindex` —
+                             the only mechanism measured to work here. A
+                             `.metadata_never_index` marker file is INERT (it is the
+                             usual advice and it silently does nothing), so nothing
+                             writes one. It renames and nothing else, so re-point cargo
+                             yourself (CARGO_TARGET_DIR, or [build] target-dir) and add
+                             the new name to .gitignore — an existing `target/` line does
+                             NOT match `target.noindex/`; the command prints both hints,
+                             and --dry-run prints them without renaming. Spotlight is
+                             never disabled globally
+  aterm pkg noindex verify <dir>
+                             MEASURE the exclusion rather than assume it: plant a probe
+                             file, ask the live index for it, remove it. `.noindex` is
+                             behaviour observed on this machine, not a documented Apple
+                             API, so a name ending in the right five characters is never
+                             taken as proof. `indexed` is proof; `excluded` is an
+                             inference bounded by a control probe; anything else answers
+                             `unknown` rather than guess
 
 PLUMBING (producer / operator / dev — a first hour never needs these)
   aterm pkg link <prog> <dir> | unlink | refresh

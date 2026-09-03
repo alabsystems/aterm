@@ -6,9 +6,10 @@
 //! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit
 //! with the `-dirty` rule matching aterm-gui/build.rs), copy the static
 //! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns), nest
-//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, drop
-//! `.metadata_never_index`, and write the `dist/aterm-<ver>-build.txt`
-//! provenance record.
+//! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, drop the
+//! `.metadata_never_index` build-output marker (see [`assemble`] — it is NOT a
+//! Spotlight exclusion), and write the `dist/aterm-<ver>-build.txt` provenance
+//! record.
 //!
 //! Port of the layout phase of `apps/aterm-mac/build-app.sh` (steps 2–6c + 8).
 //! PlistBuddy is replaced by [`stamp_info_plist`] — pure string substitution
@@ -343,17 +344,31 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     let mac_dir = spec.repo_root.join("apps/aterm-mac");
     let app = staged_app_path(&spec.out_dir);
 
-    // Keep the BUILD-OUTPUT bundle out of Spotlight: dist/aterm.app is a real,
-    // launchable .app, so without this it shows up as a SECOND "aterm" in
-    // Spotlight/Launchpad next to the installed /Applications copy.
-    // `.metadata_never_index` tells Spotlight to skip this directory (and
-    // everything under it), so only the installed app is offered.
+    // The `.metadata_never_index` marker: a BUILD-OUTPUT SENTINEL, and no longer
+    // claimed to be anything else.
+    //
+    // It was written here to keep dist/aterm.app — a real, launchable .app — from
+    // showing up as a SECOND "aterm" in Spotlight/Launchpad beside the installed
+    // /Applications copy. MEASURED 2026-09-02 on macOS 26.6.2 by A/B test
+    // (crates/atpkg/src/noindex.rs): a `.metadata_never_index` file in a
+    // subdirectory is INERT. It is the answer in most blog posts and it silently
+    // does nothing, so dist/aterm.app IS indexed and that second entry is real.
+    // The only mechanism measured to work is a directory name ending `.noindex`
+    // (`aterm pkg noindex`), which `dist/` cannot take without renaming a path the
+    // scripts, the ignore rules and the docs all spell out.
+    //
+    // The write STAYS because atpkg reads it as the durable "this is build output,
+    // not an install" marker (`cli.rs::is_build_output_bundle`), written by the only
+    // thing that knows — that is what it is for now, and the reason it is not a
+    // Spotlight claim is stated here so the next reader does not re-derive the inert
+    // answer a third time.
     std::fs::create_dir_all(&spec.out_dir)
         .map_err(|e| format!("create {}: {e}", spec.out_dir.display()))?;
     let _ = std::fs::write(spec.out_dir.join(".metadata_never_index"), "");
-    // The assembly directory needs its own marker: Spotlight's exclusion is
-    // per-directory, and this bundle is even less of an install than the dev one
-    // beside it — for most of its life it is not yet signed.
+    // The assembly directory carries its own marker for the same sentinel reason:
+    // this bundle is even less of an install than the dev one beside it — for most
+    // of its life it is not yet signed — and `is_build_output_bundle` looks in the
+    // directory holding the bundle, not at an ancestor.
     let staging_dir = spec.out_dir.join(CUT_APP_DIR);
     std::fs::create_dir_all(&staging_dir)
         .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;

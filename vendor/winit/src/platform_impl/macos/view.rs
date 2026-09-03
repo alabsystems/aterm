@@ -745,10 +745,41 @@ aterm_objc::declare_class! {
             // SAFETY: `+sharedApplication` `@16@0:8` (process-lifetime
             // singleton); `-currentEvent` `@16@0:8`, +0 and valid for this
             // callback; `-isARepeat` `B16@0:8`.
+            // LOCAL PATCH (aterm): `-currentEvent` IS NOT NECESSARILY A KEY
+            // EVENT. `cancelOperation:` reaches here through the key responder
+            // chain on Escape — where it is — but the same action can arrive
+            // from a menu item or programmatically, and then `currentEvent` is
+            // whatever AppKit is dispatching, typically the MOUSE event that
+            // picked the menu. `create_key_event` below reads `-keyCode`,
+            // `-characters` and `-charactersIgnoringModifiers`, all of which
+            // are KEY-ONLY: sending them to a mouse event raises
+            // NSInternalInconsistencyException ("Invalid message sent to
+            // event"), which crosses this class's Rust trampoline as a FOREIGN
+            // exception and ABORTS THE PROCESS. That is exactly how v0.72.0
+            // died on `-keyCode` from the mouse-motion path.
+            //
+            // A nil `currentEvent` was already reachable the same way and was
+            // an `assert!` — a Rust panic inside an ObjC method, which aborts
+            // just as hard. Both are now a quiet return: there is no key event
+            // to report, and refusing to invent one is the whole fix.
             let event = unsafe {
                 let app = send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
                 let event = send_id(app, sel!(currentEvent));
-                assert!(!event.is_null(), "could not find current event");
+                if event.is_null() {
+                    return;
+                }
+                // KeyDown = 10, KeyUp = 11 ONLY. FlagsChanged (12) is NOT
+                // admissible here even though it is a "key" event: MEASURED on
+                // this machine, a FlagsChanged event answers `-keyCode` but
+                // RAISES NSInternalInconsistencyException on `-isARepeat`,
+                // `-characters` AND `-charactersIgnoringModifiers` — and
+                // `create_key_event` below reads all three. `keyCode` being the
+                // one survivor is exactly why `update_modifiers` may read it on
+                // the flags-changed path and this may not.
+                let ty = send_usize(event, sel!(type));
+                if !(10..=11).contains(&ty) {
+                    return;
+                }
                 event
             };
 

@@ -533,6 +533,77 @@ pub fn run_with(
         }
     }
 
+    // (7b) SPOTLIGHT EXPOSURE OF RUST BUILD OUTPUT.
+    //
+    // On 2026-09-01 01:54 WindowServer's main thread blocked 40 s in a synchronous TCC
+    // preflight waiting on tccd; tccd was TH_UNINT on an APFS volume rwlock contended by
+    // 18 rustc processes, syspolicyd and `mds` grinding 2.0 TB of Rust build output across
+    // 127 target dirs. The watchdog killed WindowServer and the GUI session died.
+    // Spotlight indexing of build output is one of the two amplifiers that made a busy
+    // build fatal, and it is the one a per-directory rename removes.
+    //
+    // A WARNING, never a PROBLEM: nothing here is structurally broken, the scan is a
+    // NAME-based heuristic over a depth-limited walk, and doctor must not invent a fault
+    // from evidence it did not measure (`is_problem_state`'s allow-by-prefix rule, above).
+    // And doctor NEVER probes: measuring exclusion means writing a probe file into the
+    // user's tree, and doctor does not mutate. It reports the exposure and names the verb
+    // that measures it.
+    //
+    // Depth 3 under $HOME is the zero-config compromise — it reaches `~/<repo>/target` and
+    // `~/src/<repo>/target`, which is where repos actually live. Dot-directories are
+    // pruned, and that is sound rather than merely cheap: their whole subtree is already
+    // excluded (measured 2026-09-02). Anything deeper is the deliberate
+    // `aterm pkg noindex scan <root>`, which the line below names.
+    //
+    // No `cfg` here by design: `noindex::scan` returns an empty, `complete` scan on
+    // non-macOS, so the whole block prints nothing there — the same discipline as
+    // `store.rs`'s unconditional `platform::exclude_from_backup`.
+    if let Some(home) = home {
+        let found = crate::noindex::scan(
+            home,
+            crate::noindex::DOCTOR_DEPTH,
+            &crate::noindex::Budget::DOCTOR,
+        );
+        let exposed: Vec<&crate::noindex::Target> = found.exposed().collect();
+        if exposed.is_empty() && !found.targets.is_empty() {
+            // The provenance caveat, carried by EVERY other surface that prints this claim
+            // (`noindex scan`'s `hidden` legend, the manual): `exclusion_of` reads the NAME,
+            // and `.noindex` is behaviour observed on this machine, not a documented Apple
+            // API. A bare "ok — 127 hidden" would be this feature's own version of the 189
+            // inert `.metadata_never_index` markers the day macOS changes that behaviour —
+            // and doctor, which never probes, is the last surface that should sound sure.
+            let _ = writeln!(
+                out,
+                "{p}: ok — {} cargo target dir(s) under {} are hidden from Spotlight — that \
+                 is what the NAMES say; `aterm pkg noindex verify <dir>` measures it",
+                found.targets.len(),
+                home.display()
+            );
+        } else if !exposed.is_empty() {
+            let size = crate::noindex::size_of_all(&exposed, &crate::noindex::Budget::DOCTOR_SIZE);
+            let _ = writeln!(
+                out,
+                "{p}: warn — {} of {} cargo target dir(s) under {} are indexed by Spotlight \
+                 ({}) — `mds` grinding build output was one of the two amplifiers behind the \
+                 2026-09-01 WindowServer watchdog kill; `aterm pkg noindex` lists them, \
+                 `aterm pkg noindex migrate <dir>` excludes one, `aterm pkg noindex verify \
+                 <dir>` measures it",
+                exposed.len(),
+                found.targets.len(),
+                home.display(),
+                crate::noindex::human_size(&size)
+            );
+        }
+        if !found.complete {
+            let _ = writeln!(
+                out,
+                "{p}: note — the Spotlight-exposure scan did not cover all of {}; \
+                 `aterm pkg noindex scan <root>` covers a tree it did not reach",
+                home.display()
+            );
+        }
+    }
+
     // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
     if let Some(status) = crate::status::read(layout) {
         match index_age_days(&status.updated_at, now) {
@@ -2388,5 +2459,157 @@ mod tests {
         assert_eq!(text, "atpkg: ok — aterm build 1788077184 installed\n");
 
         let _ = std::fs::remove_dir_all(&base.prefix);
+    }
+    /// Build a directory `scan` will recognize as cargo output by its `RustcInfo` evidence
+    /// — the arm measured off `/Users//example/aterm/target` on 2026-09-02, which had
+    /// `.rustc_info.json` and `debug/` and no `CACHEDIR.TAG`.
+    #[cfg(target_os = "macos")]
+    fn cargo_target(parent: &Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(dir.join("debug")).unwrap();
+        std::fs::write(dir.join(".rustc_info.json"), b"{}\n").unwrap();
+        std::fs::write(dir.join("debug/libay.rlib"), b"0123456789").unwrap();
+        dir
+    }
+
+    /// A Spotlight-exposed target dir is a WARNING and exit stays 0.
+    ///
+    /// The 2026-09-01 01:54 watchdog kill had two amplifiers; `mds` grinding 2.0 TB of
+    /// build output was the one a rename removes, so doctor has to say it out loud. But it
+    /// is NOT structural — every installed tool still runs — and the scan is a name-based
+    /// heuristic over a depth-limited walk, so counting it as a problem would be doctor
+    /// inventing a fault from evidence it did not measure. The only thing that measures
+    /// exclusion is `noindex verify`, which WRITES a probe file; doctor never mutates, so
+    /// doctor never probes — it names the verb instead. This pins all three: the words, the
+    /// stream (`out`, never `err`), and the exit code.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spotlight_exposed_build_output_warns_but_exit_zero() {
+        let l = layout("indexed");
+        install(&l, "ay", 19);
+        // The label must not contain the word the assertions grep for: several other doctor
+        // lines print $HOME, and a home named "spotlight" would satisfy them vacuously.
+        let home = synthetic_home("indexed");
+        let exposed = cargo_target(&home.join("repo-a"), "target");
+        cargo_target(&home.join("repo-b"), "target.noindex");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let run = || {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut err,
+            );
+            (
+                ok,
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        };
+
+        let (ok, out, err) = run();
+        assert!(
+            ok,
+            "an indexed target dir is advisory, never structural:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — 1 of 2 cargo target dir(s) under {} are indexed by Spotlight",
+                home.display()
+            )),
+            "{out}"
+        );
+        // The remedy names the verb that MEASURES, because doctor itself never probes.
+        for want in [
+            "aterm pkg noindex migrate <dir>",
+            "aterm pkg noindex verify <dir>",
+            "2026-09-01 WindowServer watchdog kill",
+        ] {
+            assert!(out.contains(want), "{want:?} missing from:\n{out}");
+        }
+        // Bytes come from `noindex::human_size` → `cost::human_bytes`, never hand-rolled:
+        // cli.rs's source guards reject a `1e9` or a `{:.1} GB` anywhere in production code.
+        // 13 B is the whole synthetic tree — `.rustc_info.json` plus one 10-byte artifact.
+        assert!(
+            out.contains(&format!("({})", crate::cost::human_bytes(13))),
+            "the exposed size must be rendered through cost::human_bytes:\n{out}"
+        );
+        assert!(
+            !err.to_lowercase().contains("spotlight"),
+            "nothing here is a FAIL, so nothing here belongs on stderr:\n{err}"
+        );
+
+        // Once the exposed one is hidden too, the same check says `ok` — and still exit 0.
+        std::fs::rename(&exposed, exposed.with_file_name("target.noindex")).unwrap();
+        let (ok, out, _) = run();
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: ok — 2 cargo target dir(s) under {} are hidden from Spotlight",
+                home.display()
+            )),
+            "{out}"
+        );
+        // `ok` here is `exclusion_of` reading the NAME — doctor never probes. Saying so is
+        // the difference between this line and the 189 inert `.metadata_never_index`
+        // markers: the day macOS changes the `.noindex` behaviour, an unqualified `ok` is a
+        // confident false success on every run.
+        assert!(
+            out.contains("that is what the NAMES say")
+                && out.contains("aterm pkg noindex verify <dir>"),
+            "the ok line must name its provenance and the verb that MEASURES:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A home with no cargo output says NOTHING about Spotlight.
+    ///
+    /// Silence is the answer for a check that does not apply to this machine — the same
+    /// discipline as the `rustup` block. A "not applicable" line on every `doctor` run of a
+    /// non-Rust Mac is noise that trains people to skim the report, which is the one
+    /// failure mode a diagnostic cannot recover from. Portable on purpose: off macOS
+    /// `noindex::scan` returns an empty, `complete` scan, so this asserts the no-`cfg`
+    /// call site really is a clean no-op there.
+    #[test]
+    fn a_home_without_build_output_says_nothing_about_spotlight() {
+        let l = layout("indexed-quiet");
+        install(&l, "ay", 19);
+        let home = synthetic_home("indexed-quiet");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-08-27T00:00:00Z").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let ok = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            None,
+            "doctor",
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let err = String::from_utf8_lossy(&err).into_owned();
+        assert!(ok, "{out}");
+        for text in [&out, &err] {
+            assert!(
+                !text.to_lowercase().contains("spotlight"),
+                "a machine with no build output must hear nothing:\n{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

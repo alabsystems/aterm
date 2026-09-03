@@ -7,9 +7,22 @@
 //! bin shims, per-user `%LOCALAPPDATA%`-ACL privacy (no POSIX mode/owner bits),
 //! `GetDiskFreeSpaceExW` for free space, and `spawn().wait()` + `exit` for exec.
 //!
-//! **This backend has NOT been exercised on a real Windows host** — it is written to
-//! be correct-by-construction and cross-compiles clean for `x86_64-pc-windows-gnu`;
-//! the pure `.cmd` formatting/parsing is unit-tested (on Unix) in [`crate::platform`].
+//! **This backend has NOT been exercised on a real Windows host, and NOTHING IN THIS
+//! WORKSPACE COMPILES IT.** It is written to be correct-by-construction; the pure `.cmd`
+//! formatting/parsing is unit-tested (on Unix) in [`crate::platform`], and that is the
+//! whole of the evidence for it.
+//!
+//! This file used to claim it "cross-compiles clean for `x86_64-pc-windows-gnu`". It does
+//! not, and cannot: `atpkg` depends on `libc` unconditionally, `[patch.crates-io]` resolves
+//! `libc` to `crates/aterm-libc`, and that crate's target whitelist admits Windows only as
+//! `all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")` — every other
+//! Windows target hits its `compile_error!("aterm-libc has no generated ABI cell for this
+//! target")`. `x86_64-pc-windows-gnu` is `target_env = "gnu"`, so the documented lane
+//! (`cargo +stable build --target x86_64-pc-windows-gnu`, `.cargo/config.toml`) stops in
+//! `aterm-libc` before this file is parsed. Verified 2026-09-02 by the analogous failure on
+//! `i686-unknown-linux-gnu`, which is refused by the same whitelist. Generating a
+//! `windows-gnu` ABI cell (or gating `atpkg`'s `libc` dependency per-target) is what would
+//! make the old claim true; until then, treat every line below as UNCOMPILED source.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -66,6 +79,27 @@ pub fn dir_meta_is_private(_meta: &Metadata) -> bool {
 /// backup tooling has no equivalent per-directory opt-out to honour, so this is a
 /// no-op that exists to keep `store::ensure_dir` one shape across platforms.
 pub fn exclude_from_backup(_dir: &Path) {}
+
+/// `None`: there is no Spotlight index to ask. Windows Search exposes no per-directory
+/// opt-out for [`crate::noindex`] to honour or to MEASURE, so both Spotlight primitives
+/// are the not-applicable sentinel here — they exist so `noindex` is one shape across
+/// platforms and no call site needs a `cfg` (in practice
+/// [`crate::noindex::verify`] answers `Verdict::NotApplicable` before it reaches this).
+///
+/// `None` is "the question could not be asked", NEVER "not indexed" — see
+/// `crate::noindex::decide`, which turns every unanswerable question into `Unknown`
+/// rather than into a claim that a directory is excluded.
+#[must_use]
+pub fn spotlight_query(_scope: &Path, _filename: &str) -> Option<bool> {
+    None
+}
+
+/// `None`: there is no per-volume indexing switch this layer can read (`mdutil` has no
+/// Windows analogue). Refines a message only; no verdict depends on it.
+#[must_use]
+pub fn spotlight_indexing_enabled(_path: &Path) -> Option<bool> {
+    None
+}
 
 /// Shared-directory creation. On Windows POSIX modes do not apply, so this is just
 /// `create_dir_all`; the per-directory ACL governs access, exactly as it does for

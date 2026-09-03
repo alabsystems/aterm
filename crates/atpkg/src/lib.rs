@@ -102,6 +102,9 @@ pub mod lock;
 pub mod manifest;
 mod metadata_io;
 pub mod net;
+/// Spotlight exposure of Rust build output: discover target dirs, MEASURE whether one is
+/// really excluded (never assume), and migrate it to the `.noindex` form (§9).
+pub mod noindex;
 pub mod ops;
 pub mod pin;
 pub mod platform;
@@ -175,6 +178,7 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, TARGETS, parse_pkg,
 };
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
+pub use noindex::{Migration, Verdict, migrate, scan, verify};
 pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
 pub use shim_env::ShimEnv;

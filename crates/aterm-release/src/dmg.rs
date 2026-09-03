@@ -66,8 +66,11 @@ pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Package
     // Stage the .app + an /Applications symlink in a scratch dir, so the
     // mounted image offers the standard drag-to-install gesture even without
     // create-dmg's decorated window. The stage lives under dist/ (same
-    // filesystem, already Spotlight-excluded via .metadata_never_index) and is
-    // removed on every exit path.
+    // filesystem, so the moves below are renames) and is removed on every exit
+    // path. Its NAME begins with a dot, which is what actually keeps it out of
+    // Spotlight — measured 2026-09-02, a dot-hidden directory and its whole
+    // subtree are absent from the index, while the `.metadata_never_index` file
+    // dist/ carries is inert (crates/atpkg/src/noindex.rs).
     let stage = out_dir.join(format!(".dmg-stage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;

@@ -993,16 +993,8 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// How many sids [`FabricLink::touched`] currently holds — the number
-/// [`TOUCHED_PRUNE_AT`] bounds. Test-only, and only meaningful inside a
-/// [`with_link_reset`] section, which is what clears it between tests.
-#[cfg(test)]
-pub(crate) fn touched_len() -> usize {
-    LINK.touched.lock().unwrap_or_else(|p| p.into_inner()).len()
-}
-
-/// Whether [`FabricLink::touched`] currently holds `sid`. Test-only. Unlike
-/// [`touched_len`], MEMBERSHIP of a sid this test itself minted is meaningful
+/// Whether [`FabricLink::touched`] currently holds `sid`. Test-only. Unlike an
+/// exact global count, MEMBERSHIP of a sid this test itself minted is meaningful
 /// even while unlocked sibling tests insert THEIR sids concurrently — which is
 /// exactly what they do: 17 tests in `inbox_hold` call `deliver` outside
 /// [`with_link_reset`]'s mutex, so any exact global count raced and the
