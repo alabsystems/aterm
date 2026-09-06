@@ -107,7 +107,7 @@ mod macos {
     use winit::application::ApplicationHandler;
     use winit::event::WindowEvent;
     use winit::event_loop::{ActiveEventLoop, EventLoop};
-    use winit::platform::macos::WindowExtMacOS;
+    use winit::platform::macos::{MonitorHandleExtMacOS, WindowExtMacOS};
     use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use winit::window::{Theme, Window, WindowButtons, WindowId};
@@ -123,6 +123,12 @@ mod macos {
     const NS_DRAG_OPERATION_COPY: usize = 1;
     /// `NSDragOperationNone`, for a pasteboard carrying none.
     const NS_DRAG_OPERATION_NONE: usize = 0;
+
+    /// `NSEventTypeKeyUp` and `NSEventModifierFlagCommand`, spelled here rather
+    /// than imported from the seam so the driver's expectation is not the
+    /// port's constant.
+    const NS_EVENT_TYPE_KEY_UP: usize = 11;
+    const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
     // ------------------------------------------------------------------ sends
     //
@@ -141,7 +147,7 @@ mod macos {
         // SAFETY: the row is registered `Q@:@`, which the live auditor checks
         // against `NSDraggingDestination`'s own description.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> usize = msg();
             f(delegate, sel!(draggingEntered:), info)
         }
     }
@@ -153,7 +159,7 @@ mod macos {
     unsafe fn window_should_close(delegate: Id, sender: Id) -> bool {
         // SAFETY: registered `B@:@`, per `NSWindowDelegate`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
             f(delegate, sel!(windowShouldClose:), sender).as_bool()
         }
     }
@@ -166,7 +172,7 @@ mod macos {
     unsafe fn window_delegate(window: Id) -> Id {
         // SAFETY: `-delegate` is `@16@0:8` on `NSWindow`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             f(window, sel!(delegate))
         }
     }
@@ -178,7 +184,7 @@ mod macos {
     unsafe fn style_mask(window: Id) -> usize {
         // SAFETY: `-styleMask` is `Q16@0:8` on `NSWindow`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(window, sel!(styleMask))
         }
     }
@@ -190,8 +196,236 @@ mod macos {
     unsafe fn window_title(window: Id) -> String {
         // SAFETY: `-title` is `@16@0:8` on `NSWindow` and never answers nil.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             aterm_objc::ns_string_to_rust(f(window, sel!(title)))
+        }
+    }
+
+    // ------------------------------------------------------- the menu reads
+    //
+    // W12, for `vendor/winit`'s `menu.rs`. Same rule as the sends above: each
+    // is a typed `objc_msgSend` cast written here, not a call into
+    // `aterm_objc::send::*`, so the driver and the port cannot agree about a
+    // shape they both got wrong.
+
+    /// `-[NSApplication mainMenu]` / `-[NSApplication servicesMenu]`, read off
+    /// the shared application.
+    ///
+    /// # Safety
+    /// `sel` must be a nullary `@16@0:8` accessor on `NSApplication`.
+    unsafe fn app_menu(sel: Sel) -> Id {
+        // SAFETY: `+sharedApplication` is `@16#0:8`; both accessors are
+        // `@16@0:8`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let app = f(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            f(app, sel)
+        }
+    }
+
+    /// `-[NSMenu numberOfItems]`.
+    ///
+    /// # Safety
+    /// `menu` must be a live `NSMenu`.
+    unsafe fn menu_count(menu: Id) -> isize {
+        // SAFETY: `-numberOfItems` is `q16@0:8`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
+            f(menu, sel!(numberOfItems))
+        }
+    }
+
+    /// `-[NSMenu itemAtIndex:]`.
+    ///
+    /// # Safety
+    /// `menu` must be a live `NSMenu` and `i` in range.
+    unsafe fn menu_item_at(menu: Id, i: isize) -> Id {
+        // SAFETY: `-itemAtIndex:` is `@24@0:8q16`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id = msg();
+            f(menu, sel!(itemAtIndex:), i)
+        }
+    }
+
+    /// One menu row, as the four things `menu.rs` sets on it.
+    struct Row {
+        title: String,
+        separator: bool,
+        action: Sel,
+        key: String,
+        mask: usize,
+        submenu: Id,
+    }
+
+    /// Read a row back off AppKit.
+    ///
+    /// # Safety
+    /// `item` must be a live `NSMenuItem`.
+    unsafe fn read_row(item: Id) -> Row {
+        // SAFETY: `-title` and `-keyEquivalent` are `@16@0:8` and never nil;
+        // `-isSeparatorItem` is `B16@0:8`; `-action` is `:16@0:8`;
+        // `-keyEquivalentModifierMask` is `Q16@0:8`; `-submenu` is `@16@0:8`
+        // and MAY be nil.
+        unsafe {
+            let id_of: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let bool_of: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
+            let sel_of: unsafe extern "C-unwind" fn(Id, Sel) -> Sel = msg();
+            let usize_of: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+            Row {
+                title: aterm_objc::ns_string_to_rust(id_of(item, sel!(title))),
+                separator: bool_of(item, sel!(isSeparatorItem)).as_bool(),
+                action: sel_of(item, sel!(action)),
+                key: aterm_objc::ns_string_to_rust(id_of(item, sel!(keyEquivalent))),
+                mask: usize_of(item, sel!(keyEquivalentModifierMask)),
+                submenu: id_of(item, sel!(submenu)),
+            }
+        }
+    }
+
+    /// `-[NSScreen backingScaleFactor]` for `+[NSScreen mainScreen]`, read
+    /// without the port.
+    fn main_screen_backing_scale() -> Option<f64> {
+        // SAFETY: `+mainScreen` is `@16#0:8` and may answer nil;
+        // `-backingScaleFactor` is `d16@0:8`.
+        unsafe {
+            let id_of: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let f64_of: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = msg();
+            let screen = id_of(class(c"NSScreen").as_id(), sel!(mainScreen));
+            if screen.is_null() {
+                return None;
+            }
+            Some(f64_of(screen, sel!(backingScaleFactor)))
+        }
+    }
+
+    /// `CGMainDisplayID()`, the display the window server calls main.
+    fn cg_main_display_id() -> u32 {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGMainDisplayID() -> u32;
+        }
+        // SAFETY: a nullary CoreGraphics call with no preconditions.
+        unsafe { CGMainDisplayID() }
+    }
+
+    // ----------------------------------------------- the swizzle's own reads
+    //
+    // W12, for `vendor/winit`'s `app.rs`. These do NOT go through
+    // `aterm_objc::swizzle` — the point is to read the runtime's own tables
+    // with the runtime's own C functions, so a bug in that module cannot make
+    // this stage agree with it.
+
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const std::ffi::c_char,
+        fbase: *mut std::ffi::c_void,
+        sname: *const std::ffi::c_char,
+        saddr: *mut std::ffi::c_void,
+    }
+
+    unsafe extern "C" {
+        fn class_getInstanceMethod(cls: *mut std::ffi::c_void, sel: Sel) -> *mut std::ffi::c_void;
+        fn method_getImplementation(m: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn method_getTypeEncoding(m: *mut std::ffi::c_void) -> *const std::ffi::c_char;
+        fn object_getClass(obj: Id) -> *mut std::ffi::c_void;
+        fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> std::ffi::c_int;
+    }
+
+    /// `(the Method handle, its IMP, its registered type encoding)` for an
+    /// instance method, read straight from libobjc.
+    fn live_method(cls: *mut std::ffi::c_void, sel: Sel) -> Option<(usize, usize, String)> {
+        // SAFETY: `cls` is a live class object and `sel` an interned selector;
+        // `class_getInstanceMethod` tolerates a selector the class does not
+        // implement by answering NULL.
+        unsafe {
+            let m = class_getInstanceMethod(cls, sel);
+            if m.is_null() {
+                return None;
+            }
+            let imp = method_getImplementation(m);
+            let types = method_getTypeEncoding(m);
+            let types = if types.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(types)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            Some((m as usize, imp as usize, types))
+        }
+    }
+
+    /// The mach-o image an address lives in, by `dladdr`.
+    fn image_of(addr: usize) -> String {
+        let mut info = DlInfo {
+            fname: std::ptr::null(),
+            fbase: std::ptr::null_mut(),
+            sname: std::ptr::null(),
+            saddr: std::ptr::null_mut(),
+        };
+        // SAFETY: `dladdr` reads the address only to locate its image and
+        // writes into the `DlInfo` we own.
+        let ok = unsafe { dladdr(addr as *const std::ffi::c_void, &mut info) };
+        if ok == 0 || info.fname.is_null() {
+            return "<unknown image>".to_owned();
+        }
+        // SAFETY: a non-null NUL-terminated path owned by dyld.
+        unsafe { std::ffi::CStr::from_ptr(info.fname) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A synthetic key-up carrying a modifier mask, for the one window.
+    ///
+    /// # Safety
+    /// `chars` must be a live `NSString`.
+    unsafe fn key_up_event(window_number: isize, modifiers: usize, chars: Id) -> Id {
+        // SAFETY: the ten-argument factory is
+        // `@@:Q{CGPoint=dd}Qdq@@@BS` — read from `method_getTypeEncoding` and
+        // censused in `winit_sent_prototypes.rs`.
+        unsafe {
+            #[allow(clippy::type_complexity)]
+            let f: unsafe extern "C-unwind" fn(
+                Id,
+                Sel,
+                usize,
+                aterm_objc::CGPoint,
+                usize,
+                f64,
+                isize,
+                Id,
+                Id,
+                Id,
+                Bool,
+                u16,
+            ) -> Id = msg();
+            f(
+                class(c"NSEvent").as_id(),
+                sel!(
+                    keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:
+                ),
+                NS_EVENT_TYPE_KEY_UP,
+                aterm_objc::CGPoint { x: 0.0, y: 0.0 },
+                modifiers,
+                0.0,
+                window_number,
+                Id::NIL,
+                chars,
+                chars,
+                Bool::NO,
+                4, // kVK_ANSI_H
+            )
+        }
+    }
+
+    /// `+[NSProcessInfo processInfo].processName`, which is what the About,
+    /// Hide and Quit titles are built from.
+    fn process_name() -> String {
+        // SAFETY: `+processInfo` is `@16#0:8` and `-processName` is `@16@0:8`.
+        unsafe {
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let pi = f(class(c"NSProcessInfo").as_id(), sel!(processInfo));
+            aterm_objc::ns_string_to_rust(f(pi, sel!(processName)))
         }
     }
 
@@ -203,7 +437,7 @@ mod macos {
         // SAFETY: every send below is a documented Foundation/AppKit selector
         // on the class named, with the prototype cast to match.
         unsafe {
-            let pb: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let pb: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
             let name = ns_string("aterm-objc-window-drive")?;
             let board = pb(
                 class(c"NSPasteboard").as_id(),
@@ -214,7 +448,7 @@ mod macos {
 
             // `+arrayWithObjects:count:` for the declared types, then the
             // property list for `NSFilenamesPboardType`.
-            let arr: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id = msg();
+            let arr: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id = msg();
             let ty = filenames_pboard_type();
             let types = [ty];
             let type_list = arr(
@@ -224,7 +458,7 @@ mod macos {
                 types.len(),
             );
 
-            let declare: unsafe extern "C" fn(Id, Sel, Id, Id) -> isize = msg();
+            let declare: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> isize = msg();
             declare(board.id(), sel!(declareTypes:owner:), type_list, Id::NIL);
 
             if !paths.is_empty() {
@@ -239,7 +473,7 @@ mod macos {
                     ids.as_ptr(),
                     ids.len(),
                 );
-                let set: unsafe extern "C" fn(Id, Sel, Id, Id) -> Bool = msg();
+                let set: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Bool = msg();
                 set(board.id(), sel!(setPropertyList:forType:), list, ty);
             }
 
@@ -311,6 +545,9 @@ mod macos {
         focused: Vec<bool>,
         close_requested: usize,
         hovered: Vec<String>,
+        /// Key-up events that came back through the swizzled `-sendEvent:`.
+        key_ups: usize,
+        posted_cmd_key_up: bool,
         done: bool,
         stage: usize,
     }
@@ -327,7 +564,7 @@ mod macos {
             let view = Id::from_ptr(h.ns_view.as_ptr());
             // SAFETY: `-window` is `@16@0:8` on `NSView`.
             let window = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 f(view, sel!(window))
             };
             if window.is_null() {
@@ -381,6 +618,15 @@ mod macos {
                 WindowEvent::HoveredFile(p) => {
                     self.hovered.push(p.to_string_lossy().into_owned());
                 }
+                // THE SWIZZLE'S WHOLE PURPOSE. AppKit does not deliver a
+                // `keyUp:` to the window while Command is held, so a released
+                // key arriving here is the forwarding the replacement
+                // `-sendEvent:` performs and nothing else.
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == winit::event::ElementState::Released =>
+                {
+                    self.key_ups += 1;
+                }
                 _ => {}
             }
         }
@@ -414,6 +660,9 @@ mod macos {
                 10 => self.stage_fullscreen_enter(),
                 11 => self.stage_fullscreen_exit(),
                 12 => self.stage_weak_references(delegate, ns),
+                13 => self.stage_default_menu(),
+                14 => self.stage_monitors(),
+                15 => self.stage_send_event_swizzle(),
                 _ => {
                     self.done = true;
                     el.exit();
@@ -867,7 +1116,7 @@ mod macos {
             // SAFETY: `-retainCount` is `q16@0:8`; used as a DIFFERENCE only,
             // which is the only thing this number can honestly support.
             let count = |id: Id| unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> isize = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
                 f(id, sel!(retainCount))
             };
             let before = count(view);
@@ -979,8 +1228,9 @@ mod macos {
                 // SAFETY: `+alloc` is `@16#0:8` and `-initWithFrame:` is
                 // `@48@0:8{CGRect=dddd}16` on `NSView`; the pair yields a +1.
                 let view = unsafe {
-                    let alloc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-                    let init: unsafe extern "C" fn(Id, Sel, aterm_objc::CGRect) -> Id = msg();
+                    let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                    let init: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::CGRect) -> Id =
+                        msg();
                     let raw = alloc(class(c"NSView").as_id(), sel!(alloc));
                     Obj::from_owned(init(
                         raw,
@@ -1057,6 +1307,421 @@ mod macos {
                 ),
             );
         }
+
+        /// THE DEFAULT APPLICATION MENU — `vendor/winit`'s `menu.rs`, read back
+        /// off `[NSApp mainMenu]`.
+        ///
+        /// W12 ported that file's twelve `objc2-app-kit` binding calls to typed
+        /// sends. It is the one ported file with NO return value any caller
+        /// checks: `initialize` answers `()`, every object it builds is handed
+        /// to AppKit, and a completely empty menu bar would leave every test in
+        /// this repository green. The prototype census can say the twelve sends
+        /// have the shapes their helpers spell; only this can say the menu they
+        /// build is the menu upstream built.
+        ///
+        /// Eight rows, in order, with the title, the separator flag, the
+        /// action, the key equivalent and the modifier mask each read
+        /// independently — plus the two submenu links (`app_menu_item` ->
+        /// `app_menu`, `services_item` -> `services_menu`) and
+        /// `[NSApp servicesMenu]`, which is what makes the Services row live
+        /// rather than a label.
+        ///
+        /// The three process-name titles are built the same way `menu.rs`
+        /// builds them, which is deliberate: the row that matters is that
+        /// `-stringByAppendingString:` was sent to the right receiver in the
+        /// right order, and "About " + name is the only statement of that.
+        fn stage_default_menu(&mut self) {
+            println!("\n[13] default menu — winit's menu.rs, off [NSApp mainMenu]");
+            let name = process_name();
+            // SAFETY: the shared application is live; both accessors are
+            // `@16@0:8`.
+            let (menubar, services) =
+                unsafe { (app_menu(sel!(mainMenu)), app_menu(sel!(servicesMenu))) };
+            if menubar.is_null() {
+                self.report
+                    .check(false, "[NSApp mainMenu] is nil — no menu was installed");
+                return;
+            }
+            // SAFETY: `menubar` is the live `NSMenu` just read back.
+            let top = unsafe { menu_count(menubar) };
+            self.report.check(
+                top == 1,
+                &format!("the menu bar holds one item (got {top})"),
+            );
+            if top < 1 {
+                return;
+            }
+            // SAFETY: index 0 is in range by the check above.
+            let app_item = unsafe { menu_item_at(menubar, 0) };
+            // SAFETY: `app_item` is a live `NSMenuItem`.
+            let app_row = unsafe { read_row(app_item) };
+            self.report.check(
+                !app_row.submenu.is_null(),
+                "the application item carries a submenu",
+            );
+            if app_row.submenu.is_null() {
+                return;
+            }
+            let app_menu = app_row.submenu;
+            // SAFETY: `app_menu` is the live submenu just read.
+            let n = unsafe { menu_count(app_menu) };
+            self.report.check(
+                n == 8,
+                &format!("the application menu holds eight rows (got {n})"),
+            );
+            if n != 8 {
+                return;
+            }
+
+            // `(title, separator, action, key, mask)`, in `menu.rs`'s order.
+            //
+            // TWO EXPECTATIONS HERE WERE WRONG WHEN THIS STAGE WAS FIRST RUN,
+            // and both are AppKit's behaviour rather than the port's — which is
+            // exactly what a driver is for and what no encoding census could
+            // have told anyone:
+            //
+            //  * `-keyEquivalentModifierMask` DEFAULTS to
+            //    `NSEventModifierFlagCommand`, not to 0. `menu.rs` calls the
+            //    setter only for the one row that wants Option+Command, so
+            //    every other row reads `0x100000` — measured. Expecting 0 would
+            //    have made this stage red against a correct port.
+            //  * The Services row's action is `submenuAction:`, not nil.
+            //    `-setSubmenu:` installs it. Asserting it is strictly better
+            //    than asserting nil: it is AppKit's own receipt that the
+            //    `setSubmenu:` send landed.
+            //
+            // The masks are spelled here rather than imported from the seam, so
+            // the driver's expectation is not the port's constant.
+            const COMMAND: usize = 1 << 20;
+            const OPTION_COMMAND: usize = (1 << 19) | (1 << 20);
+            let expected: [(String, bool, Sel, &str, usize); 8] = [
+                (
+                    format!("About {name}"),
+                    false,
+                    sel!(orderFrontStandardAboutPanel:),
+                    "",
+                    COMMAND,
+                ),
+                (String::new(), true, Sel::NULL, "", 0),
+                (
+                    "Services".to_owned(),
+                    false,
+                    sel!(submenuAction:),
+                    "",
+                    COMMAND,
+                ),
+                (format!("Hide {name}"), false, sel!(hide:), "h", COMMAND),
+                (
+                    "Hide Others".to_owned(),
+                    false,
+                    sel!(hideOtherApplications:),
+                    "h",
+                    OPTION_COMMAND,
+                ),
+                (
+                    "Show All".to_owned(),
+                    false,
+                    sel!(unhideAllApplications:),
+                    "",
+                    COMMAND,
+                ),
+                (String::new(), true, Sel::NULL, "", 0),
+                (
+                    format!("Quit {name}"),
+                    false,
+                    sel!(terminate:),
+                    "q",
+                    COMMAND,
+                ),
+            ];
+
+            for (i, (title, separator, action, key, mask)) in expected.iter().enumerate() {
+                // SAFETY: `i < 8 == numberOfItems`, checked above.
+                let row = unsafe { read_row(menu_item_at(app_menu, i as isize)) };
+                self.report.check(
+                    row.separator == *separator,
+                    &format!("row {i} separator={} (want {separator})", row.separator),
+                );
+                if *separator {
+                    // A separator's title, action and key equivalent are
+                    // AppKit's, not the fork's; asserting them would be
+                    // asserting `+separatorItem`.
+                    continue;
+                }
+                self.report.check(
+                    row.title == *title,
+                    &format!("row {i} title {:?} (want {title:?})", row.title),
+                );
+                self.report.check(
+                    row.action == *action,
+                    &format!(
+                        "row {i} action {:?} (want {:?})",
+                        row.action.name(),
+                        action.name()
+                    ),
+                );
+                self.report.check(
+                    row.key == *key,
+                    &format!("row {i} key equivalent {:?} (want {key:?})", row.key),
+                );
+                self.report.check(
+                    row.mask == *mask,
+                    &format!("row {i} modifier mask {:#x} (want {mask:#x})", row.mask),
+                );
+            }
+
+            // The Services row's submenu, and that `-setServicesMenu:` pointed
+            // NSApp at that same object. Two sends, one identity.
+            // SAFETY: index 2 is in range.
+            let services_row = unsafe { read_row(menu_item_at(app_menu, 2)) };
+            self.report.check(
+                !services_row.submenu.is_null(),
+                "the Services row carries a submenu",
+            );
+            self.report.check(
+                !services.is_null() && services.addr() == services_row.submenu.addr(),
+                &format!(
+                    "[NSApp servicesMenu] IS the Services row's submenu ({:?} vs {:?})",
+                    services, services_row.submenu
+                ),
+            );
+        }
+
+        /// THE MONITOR SURFACE — `vendor/winit`'s `monitor.rs`, W12.
+        ///
+        /// # What it can catch, and what it cannot — measured, not asserted
+        ///
+        /// `monitor.rs`'s reads are a chain: `+[NSScreen screens]`, a walk by
+        /// `-count`/`-objectAtIndex:`, `-deviceDescription`, `-objectForKey:`
+        /// and `-unsignedIntValue`. Every link is checked here against a source
+        /// that is NOT the port — CoreGraphics for the display ID, AppKit's own
+        /// `-backingScaleFactor` for the scale, pointer identity for the screen
+        /// — and two plants were run to see which links the checks really
+        /// cover. Both were caught: a walk that visits no element takes
+        /// `scale_factor` to 1.0 on a Retina display, loses `current_monitor`
+        /// and `ns_screen`, and panics `set_fullscreen`'s `unwrap` (exit 101,
+        /// which the ladder reads as a failure and not a pass); reading the
+        /// WRONG device-description entry produces four findings here.
+        ///
+        /// WHAT IT DOES NOT COVER is the width of the `-unsignedIntValue` read,
+        /// and that is worth stating because the obvious story is wrong. `I`
+        /// against `Q` is not observable on this implementation: the upper word
+        /// of `x0` was measured zero for every value probed, and the caller
+        /// assigns to a `u32` anyway. The census checks the LETTER against the
+        /// runtime; nothing here checks a consequence, because there is not one
+        /// to check.
+        fn stage_monitors(&mut self) {
+            println!("\n[14] monitors — winit's monitor.rs, against CoreGraphics and AppKit");
+            let cg_main = cg_main_display_id();
+
+            let Some(primary) = self.w().primary_monitor() else {
+                self.report.check(false, "there is a primary monitor");
+                return;
+            };
+            self.report.check(
+                primary.native_id() == cg_main,
+                &format!(
+                    "primary_monitor's native id {} is CGMainDisplayID() {cg_main}",
+                    primary.native_id()
+                ),
+            );
+
+            let all: Vec<u32> = self
+                .w()
+                .available_monitors()
+                .map(|m| m.native_id())
+                .collect();
+            self.report.check(
+                all.contains(&cg_main),
+                &format!("available_monitors {all:?} contains the main display {cg_main}"),
+            );
+
+            // THE `get_display_id` PATH. `current_monitor` goes
+            // `-[NSWindow screen]` -> `get_display_id` -> `CGDisplayCreate`
+            // `UUIDFromDisplayID` -> back, so a wrong-width read cannot
+            // survive the round trip.
+            match self.w().current_monitor() {
+                Some(m) => self.report.check(
+                    m.native_id() == cg_main,
+                    &format!(
+                        "the window's current_monitor {} is the main display {cg_main} \
+                         (get_display_id round-trips through the screen's device \
+                         description)",
+                        m.native_id()
+                    ),
+                ),
+                None => self
+                    .report
+                    .check(false, "the window reports a current monitor"),
+            }
+
+            // THE `ns_screen` PATH, twice over: the scale factor it looks the
+            // screen up to read, and the screen pointer itself.
+            match main_screen_backing_scale() {
+                Some(appkit) => self.report.check(
+                    (primary.scale_factor() - appkit).abs() < f64::EPSILON,
+                    &format!(
+                        "primary scale factor {} is AppKit's -backingScaleFactor {appkit} \
+                         (1.0 here would mean ns_screen found no screen)",
+                        primary.scale_factor()
+                    ),
+                ),
+                None => self
+                    .report
+                    .note("no main screen; scale factor not compared"),
+            }
+            // SAFETY: `+mainScreen` is `@16#0:8`.
+            let appkit_main = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                f(class(c"NSScreen").as_id(), sel!(mainScreen))
+            };
+            match primary.ns_screen() {
+                Some(p) => self.report.check(
+                    p as usize == appkit_main.addr(),
+                    &format!(
+                        "MonitorHandleExtMacOS::ns_screen {p:p} IS +[NSScreen mainScreen] {:?}",
+                        appkit_main
+                    ),
+                ),
+                None => self
+                    .report
+                    .check(false, "the primary monitor answers an NSScreen"),
+            }
+
+            let size = primary.size();
+            let pos = primary.position();
+            self.report.check(
+                size.width > 0 && size.height > 0,
+                &format!("the primary monitor has a size ({size:?}, at {pos:?})"),
+            );
+            match primary.refresh_rate_millihertz() {
+                Some(hz) => self.report.note(&format!("refresh rate {hz} mHz")),
+                None => self.report.note("no refresh rate reported"),
+            }
+        }
+
+        /// THE SWIZZLE — `vendor/winit`'s `app.rs`, W12's first consumer of the
+        /// `aterm_objc::swizzle` capability.
+        ///
+        /// # Why the encoding proves nothing here, and what does
+        ///
+        /// `method_setImplementation` takes no `types` argument and PRESERVES
+        /// the row's registered encoding; `class_replaceMethod` ignores the
+        /// types it is given. So `-sendEvent:` reads `v24@0:8@16` whether it
+        /// has been swizzled or not, and the phase-1 measurement of exactly
+        /// this stage confirmed it: with the install removed entirely, an
+        /// encoding-shaped check still reported `ok`. It is printed below as
+        /// context and NOT asserted as evidence of the swizzle.
+        ///
+        /// THE TOOTH IS THE IMP AND `dladdr`. The row's implementation is
+        /// either inside AppKit — nothing happened — or inside this executable,
+        /// which is the only way `send_event` can be there. Both images are
+        /// printed, and the check is on the image, not on an address.
+        ///
+        /// The second half is the swizzle's PURPOSE, end to end. AppKit does
+        /// not deliver `keyUp:` to a window while Command is held — that is the
+        /// bug the override exists to fix — so a synthetic Cmd-modified key-up
+        /// posted to `[NSApp sendEvent:]` reaches winit's handler only via the
+        /// replacement's `-[NSWindow sendEvent:]` forward. It is asserted after
+        /// the pump, beside the drag stage's events.
+        fn stage_send_event_swizzle(&mut self) {
+            println!("\n[15] -sendEvent: swizzle — winit's app.rs, off the runtime's own tables");
+            // SAFETY: `+sharedApplication` is `@16#0:8`.
+            let app = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                f(class(c"NSApplication").as_id(), sel!(sharedApplication))
+            };
+            // SAFETY: `app` is the live shared application.
+            let app_cls = unsafe { object_getClass(app) };
+            let ns_app_cls = class(c"NSApplication").as_ptr();
+
+            let Some((m_via_instance, imp, types)) = live_method(app_cls, sel!(sendEvent:)) else {
+                self.report
+                    .check(false, "-[NSApplication sendEvent:] resolves");
+                return;
+            };
+            let Some((m_via_class, _, _)) = live_method(ns_app_cls, sel!(sendEvent:)) else {
+                self.report
+                    .check(false, "NSApplication implements sendEvent:");
+                return;
+            };
+
+            // THE BLAST RADIUS, measured. `class_getInstanceMethod` on the
+            // running application's class answers the SAME `Method` pointer as
+            // on `NSApplication`, which is why swizzling "the application's
+            // class" patches the ancestor that owns the row.
+            self.report.check(
+                m_via_instance == m_via_class,
+                &format!(
+                    "the row reached through [NSApp class] IS NSApplication's own \
+                     ({m_via_instance:#x} vs {m_via_class:#x})"
+                ),
+            );
+
+            let image = image_of(imp);
+            let appkit = image_of(
+                live_method(class(c"NSWindow").as_ptr(), sel!(sendEvent:)).map_or(0, |(_, i, _)| i),
+            );
+            self.report.note(&format!("IMP {imp:#x} in {image}"));
+            self.report.note(&format!("AppKit's own image is {appkit}"));
+            self.report.note(&format!(
+                "registered encoding {types:?} — UNCHANGED BY A SWIZZLE, and \
+                 therefore not evidence of one"
+            ));
+            self.report.check(
+                !image.contains("/AppKit.framework/"),
+                &format!(
+                    "-[NSApplication sendEvent:] no longer lands in AppKit (it is in {image})"
+                ),
+            );
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.report.check(
+                !exe.is_empty() && image == exe,
+                &format!("…it lands in this executable ({image} vs {exe})"),
+            );
+
+            // THE PURPOSE, end to end. Needs the window to be key; if the
+            // session has no key window this half is reported and skipped
+            // rather than failed.
+            // SAFETY: `-keyWindow` is `@16@0:8` on `NSApplication`.
+            let key_window = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+                f(app, sel!(keyWindow))
+            };
+            if key_window.is_null() {
+                self.report
+                    .note("no key window in this session; the Cmd+keyUp round trip is skipped");
+                return;
+            }
+            // SAFETY: `-windowNumber` is `q16@0:8` on `NSWindow`.
+            let number = unsafe {
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
+                f(key_window, sel!(windowNumber))
+            };
+            let Some(chars) = ns_string("h") else {
+                self.report
+                    .check(false, "Foundation accepts a one-character string");
+                return;
+            };
+            // SAFETY: `chars` owns a +1 to a live `NSString`; the factory's
+            // prototype is censused; `-sendEvent:` is `v24@0:8@16` on
+            // `NSApplication` and the event is +0 autoreleased into this pool.
+            autoreleasepool(|_| unsafe {
+                let ev = key_up_event(number, NS_EVENT_MODIFIER_FLAG_COMMAND, chars.id());
+                if ev.is_null() {
+                    self.report
+                        .check(false, "NSEvent builds a synthetic key-up");
+                    return;
+                }
+                let send: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+                send(app, sel!(sendEvent:), ev);
+                self.posted_cmd_key_up = true;
+            });
+            self.report
+                .note("posted a Cmd-modified keyUp to [NSApp sendEvent:]; checked after the pump");
+        }
     }
 
     /// Drive the loop until every stage has run, then report.
@@ -1076,6 +1741,8 @@ mod macos {
             focused: Vec::new(),
             close_requested: 0,
             hovered: Vec::new(),
+            key_ups: 0,
+            posted_cmd_key_up: false,
             done: false,
             stage: 0,
         };
@@ -1110,6 +1777,25 @@ mod macos {
             driver.close_requested >= 1,
             &format!("CloseRequested arrived {} time(s)", driver.close_requested),
         );
+
+        // The swizzle stage's forwarded key-up, on the same terms.
+        println!("\n[15b] the Cmd+keyUp the swizzled sendEvent: forwarded");
+        if driver.posted_cmd_key_up {
+            driver.report.check(
+                driver.key_ups >= 1,
+                &format!(
+                    "a released-key event arrived {} time(s). AppKit does not deliver \
+                     keyUp: to a window while Command is held, so this is the \
+                     replacement -sendEvent: forwarding to -[NSWindow sendEvent:] and \
+                     nothing else",
+                    driver.key_ups
+                ),
+            );
+        } else {
+            driver
+                .report
+                .note("no key window; nothing was posted, so nothing is asserted");
+        }
 
         drop(driver.window.take());
 

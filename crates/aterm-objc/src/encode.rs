@@ -521,17 +521,54 @@ unsafe impl Encode for *const NSRange {
 /// );
 /// ```
 ///
-/// # What it does NOT strip, and why the distinction is load-bearing
+/// # WHAT IT DOES NOT STRIP, AND THE RULE THAT DECIDES IT
 ///
-/// A digit inside an ARRAY encoding is a COUNT, not an offset: `[16c]` is
-/// "sixteen `char`s", which is the very encoding
-/// [`crate::ClassBuilder::add_rust_ivar`] writes for a Rust ivar. Dropping that
-/// digit would turn a 16-byte array into a syntactically broken `[c]`. So the
-/// digits between `[` and `]` are kept:
+/// **An offset only ever appears at the TOP LEVEL of a method encoding**, after
+/// a complete type. Nothing nested inside a struct, a union, an array or a
+/// quoted class name is an offset, because a member encoding carries no
+/// offsets at all. So the rule is one sentence — *strip a digit only at
+/// nesting depth zero, outside quotes* — and every "exception" below falls out
+/// of it rather than being listed separately.
+///
+/// That matters because a list of exceptions is armed at the spellings someone
+/// thought of. This function's previous rule kept the digits between `[` and
+/// `]` and nothing else, which is one of at least THREE kinds of non-offset
+/// digit, and the other two were reachable from real Apple rows in any process
+/// this crate audits (W15 measured them; `tests/encode_offsets.rs` re-measures
+/// them against the live runtime rather than against a list):
+///
+/// * an ARRAY COUNT — `[16c]` is "sixteen `char`s", the encoding
+///   [`crate::ClassBuilder::add_rust_ivar`] writes for a Rust ivar. Dropping
+///   the digit makes a syntactically broken `[c]`.
+/// * a BITFIELD WIDTH — `-[NSPrinter _getNodeForKey:inTable:]` really takes a
+///   `^{?=b4b1b24(…)}`. The old rule turned that into `^{?=bbb(…)}`, so a
+///   4/1/24 bitfield triple compared EQUAL to a 1/1/1 one: three different
+///   layouts, one string.
+/// * a DIGIT IN A STRUCT, UNION OR TEMPLATE TAG — `{CATransform3D=…}` became
+///   `{CATransformD=…}`, a type name that does not exist, and
+///   `MTLHashMask<4>` became `MTLHashMask<>`, which every other instantiation
+///   also became.
 ///
 /// ```
 /// # use aterm_objc::strip_method_offsets;
+/// // An array count.
 /// assert_eq!(strip_method_offsets("v20@0:8[4i]16"), "v@:[4i]");
+/// // A bitfield width — `NSDecimal`, off `-[NSString decimalValue]`.
+/// assert_eq!(
+///     strip_method_offsets("{?=b8b4b1b1b18[8S]}16@0:8"),
+///     "{?=b8b4b1b1b18[8S]}@:"
+/// );
+/// // A digit in a struct tag.
+/// assert_eq!(
+///     strip_method_offsets("v144@0:8{CATransform3D=dddddddddddddddd}16"),
+///     "v@:{CATransform3D=dddddddddddddddd}"
+/// );
+/// // A digit inside a QUOTED class name, which clang emits for a typed
+/// // object argument.
+/// assert_eq!(
+///     strip_method_offsets("v24@0:8@\"NSISO8601DateFormatter\"16"),
+///     "v@:@\"NSISO8601DateFormatter\""
+/// );
 /// ```
 ///
 /// A `const` qualifier (`r`) is NOT stripped either — it is a letter, and this
@@ -541,18 +578,27 @@ unsafe impl Encode for *const NSRange {
 #[must_use]
 pub fn strip_method_offsets(types: &str) -> String {
     let mut out = String::with_capacity(types.len());
-    let mut array_depth = 0_usize;
+    // ONE counter for all three bracket kinds, because the rule does not care
+    // which one you are inside — only whether you are inside anything. A
+    // per-kind counter is the shape that grows an exception per bracket and
+    // misses the fourth.
+    let mut depth = 0_usize;
+    let mut in_quotes = false;
     for c in types.chars() {
         match c {
-            '[' => {
-                array_depth += 1;
+            '"' => {
+                in_quotes = !in_quotes;
                 out.push(c);
             }
-            ']' => {
-                array_depth = array_depth.saturating_sub(1);
+            '{' | '(' | '[' if !in_quotes => {
+                depth += 1;
                 out.push(c);
             }
-            '0'..='9' if array_depth == 0 => {}
+            '}' | ')' | ']' if !in_quotes => {
+                depth = depth.saturating_sub(1);
+                out.push(c);
+            }
+            '0'..='9' if depth == 0 && !in_quotes => {}
             _ => out.push(c),
         }
     }

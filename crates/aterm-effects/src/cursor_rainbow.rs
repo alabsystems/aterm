@@ -3104,41 +3104,6 @@ mod tests {
         bases
     }
 
-    /// **THE RETIRED COMPOSITION** — the block's fill exactly as it shipped
-    /// through v0.61, `mix_rgb(base, shade(band, sat, val), mix)` with no §2.3
-    /// law on the byte.
-    ///
-    /// Written out here rather than reached through a `cfg(test)` seam in the
-    /// emitter because it is a *historical* expression: a seam would have to stay
-    /// live in the module and would be one more thing that could drift into
-    /// agreeing with the fix. The emitter's own arm is pinned against
-    /// `clear_thing_of_cyan(this)` on every sample of the sweep, which is what
-    /// keeps the two honest about being the same composition.
-    /// `e` here is the COLOUR envelope the tick resolved
-    /// ([`RainbowConfig::paint`] folded with the energy), not the raw energy
-    /// argument — the composition it restates is the colour law, and the two
-    /// coincide exactly when no host spine is supplied.
-    fn unruled_caret_fill(base: Option<u32>, dark: bool, field: f32, e: f32) -> u32 {
-        let base = base.unwrap_or(if dark {
-            BASE_DARK_THEME
-        } else {
-            BASE_LIGHT_THEME
-        });
-        let sat = if dark {
-            lerp(SAT_IDLE, SAT_MAX, e)
-        } else {
-            lerp(SAT_IDLE_LIGHT, SAT_MAX, e)
-        };
-        let val = lerp(VAL_IDLE, VAL_MAX, e);
-        let (mix_idle, mix_max) = if dark {
-            (MIX_IDLE, MIX_MAX)
-        } else {
-            (MIX_IDLE_LIGHT, MIX_MAX_LIGHT)
-        };
-        let rainbow = shade(spectrum_at(field, 0.0), sat, val);
-        mix_rgb(base, rainbow, lerp(mix_idle, mix_max, e))
-    }
-
     /// Outer halo rings and the two glitter dots take offsets along the same
     /// spectrum. Every offset must interpolate continuously too; fixing only the
     /// block/head would leave coloured rings popping around an otherwise smooth

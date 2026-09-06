@@ -52,7 +52,7 @@
 //! lift is a change to the GUI modules, not to this one.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use aterm_control::wire::pct_encode;
@@ -112,6 +112,12 @@ pub(crate) const POST_INLINE_MAX: usize = 4 * 1024;
 /// messages of 256 KiB, are the same hazard from opposite directions, and a count
 /// alone would let one session pin 32 MiB behind an unreachable broker.
 ///
+/// AND THE BYTE BOUND COUNTS EVERY CALLER-SIZED FIELD, not the body alone
+/// ([`PostRow::caller_sized_bytes`]).
+/// It once folded `p.body.len()` alone, which left `via=` — the other
+/// caller-chosen string on the same request line, and at the time bounded by
+/// nothing at all — outside the number this constant names.
+///
 /// AND THE OVERFLOW IS REFUSED AT THE DOOR, not evicted. The inbox ring may
 /// drop-oldest because every row it drops is still on the log and its loss is
 /// reported (`dropped=`); a dropped OUTBOUND message has no record anywhere —
@@ -134,9 +140,16 @@ pub(crate) const OUTBOX_BYTES_MAX: usize = 4 * 1024 * 1024;
 const OUTBOX_DRAIN_BYTES_MAX: usize = OUTBOX_BYTES_MAX;
 
 /// How many RETIRED posts (landed or undeliverable) a session keeps after the
-/// bridge is done with them. They carry no body — only (id, to, kind, off) — and
-/// they are kept at all because an incoming answer's `re=<offset>` is resolved to
-/// `re-id=<post id>` through exactly this table.
+/// bridge is done with them. They are kept at all because an incoming answer's
+/// `re=<offset>` is resolved to `re-id=<post id>` through exactly this table.
+///
+/// EVERY CALLER-SIZED FIELD IS DROPPED AT RETIREMENT, which is what makes 512 of
+/// them a bounded cost: [`retire_post`] clears the body AND the `via` chain, so
+/// what survives is the fixed-size half (id, off, re, dl, dead) plus three
+/// individually bounded words — `to` (a principal), `kind` (one of [`KINDS`]) and
+/// `dead_reason` (24 bytes, [`valid_dead_reason`]). This sentence used to say
+/// "only (id, to, kind, off)" while `via` — one unbounded token off the `post`
+/// line — was in fact retained on all 512.
 const RETIRED_KEEP: usize = 512;
 
 /// How many delivered offsets the ring remembers for idempotency BEYOND the rows
@@ -332,6 +345,55 @@ pub(crate) struct Hold {
     pub origin: String,
 }
 
+impl PostRow {
+    /// The bytes this row keeps alive whose SIZE THE CALLER CHOSE — the quantity
+    /// [`OUTBOX_BYTES_MAX`] is a bound on.
+    ///
+    /// TWO FIELDS, AND IT USED TO BE ONE. `body` was folded and `via` was not,
+    /// which was safe only for as long as `via` was small — and nothing made it
+    /// small: it is one whitespace-free token on the `post` request line, so a
+    /// single post could carry ~64 KiB of it and 128 of them ~8 MiB, twice over a
+    /// 4 MiB bound whose own doc says it exists because "there are two ways to
+    /// overflow". `via` is bounded at the door now ([`valid_via`]), and it is
+    /// counted here as well so the number this fold produces is the number the
+    /// constant names.
+    ///
+    /// `to`, `kind` and `dead_reason` are deliberately NOT counted. Each is
+    /// grammar-bounded to tens of bytes ([`valid_principal`], [`KINDS`],
+    /// [`valid_dead_reason`]) and folding them in would make the budget
+    /// unfillable by the bodies it is denominated in — 16 posts of [`BODY_MAX`]
+    /// would no longer fit a bound of exactly `16 * BODY_MAX`, which is a
+    /// different, quieter kind of wrong answer. The rule is "every field a caller
+    /// can make big", not "every field".
+    ///
+    /// `to` IS in that second list ONLY BECAUSE [`cmd_post`] BOUNDS IT. It is a
+    /// caller-typed token like the other two, and its grammar check used to
+    /// begin `to.trim_start_matches('@')` — which strips a RUN of `@`, so
+    /// `@@@…@s-b` validated as `s-b` and was stored, and retired, verbatim. See
+    /// the check itself; the claim on this line is only sound with it.
+    fn caller_sized_bytes(&self) -> usize {
+        caller_sized_bytes(&self.body, self.via.as_deref())
+    }
+}
+
+/// [`PostRow::caller_sized_bytes`] BEFORE THE ROW EXISTS — the same fold, over
+/// the same two fields, for the post [`cmd_post`] is deciding whether to admit.
+///
+/// ONE FUNCTION BECAUSE IT IS ONE QUANTITY. The door and the fold are the two
+/// ends of [`OUTBOX_BYTES_MAX`], and they were computing different numbers: the
+/// fold counted `body + via` while the door added `body.len()` of the RAW frame
+/// bytes and nothing else. Both halves of that were wrong in the same direction.
+/// `via` went uncounted for exactly the row being admitted, and the raw byte
+/// count is not the byte count the row keeps — the body is stored through
+/// `String::from_utf8_lossy`, which turns every invalid byte into three, so a
+/// 128 KiB frame of non-UTF-8 was admitted against a 384 KiB row. A bound whose
+/// two ends are computed by hand in two places has to be re-derived by hand
+/// every time a field or a conversion is added, which is how both halves came to
+/// be wrong; there is one place now, and the caller hands it the STORED body.
+fn caller_sized_bytes(body: &str, via: Option<&str>) -> usize {
+    body.len() + via.map_or(0, str::len)
+}
+
 /// The mutable half of [`SessionFabric`], behind one leaf mutex.
 #[derive(Default)]
 struct Inbox {
@@ -368,18 +430,29 @@ struct Inbox {
 
 impl Inbox {
     /// The outbound load `post` is refused against: how many posts still wait for
-    /// the bridge, and how many bytes of body they hold between them.
+    /// the bridge, and how many CALLER-SIZED bytes they hold between them
+    /// ([`PostRow::caller_sized_bytes`], which is body + `via`).
+    ///
+    /// THE BODY WAS ONCE THE ONLY TERM, and it was not the only caller-sized one.
+    /// `via` is a single whitespace-free token on the same request line and was
+    /// bounded by nothing at all, so 128 queued posts could pin ~8 MiB above a
+    /// stated 4 MiB bound whose own doc says "TWO BOUNDS BECAUSE THERE ARE TWO
+    /// WAYS TO OVERFLOW". It is bounded at the door now ([`valid_via`]) AND
+    /// counted here, because a bound that folds one of a row's two caller-sized
+    /// fields has to be re-derived by hand every time a field is added — which is
+    /// how this one came to be wrong.
     fn queued_load(&self) -> (usize, usize) {
         self.posts
             .iter()
             .filter(|p| p.off.is_none() && !p.dead)
-            .fold((0, 0), |(n, b), p| (n + 1, b + p.body.len()))
+            .fold((0, 0), |(n, b), p| (n + 1, b + p.caller_sized_bytes()))
     }
 
     /// Drop the oldest RETIRED posts past [`RETIRED_KEEP`]. A post still waiting
     /// for the bridge is never dropped here — that is what the refusal at the door
-    /// is for — so this can only ever discard a bodiless (id, to, kind, off) row
-    /// whose only remaining use is resolving an old answer's `re-id=`.
+    /// is for — so this can only ever discard a row [`retire_post`] has already
+    /// stripped of its body and its `via` chain, and whose only remaining use is
+    /// resolving an old answer's `re-id=`.
     fn trim_retired_posts(&mut self) {
         let retired = self
             .posts
@@ -481,12 +554,24 @@ struct FabricLink {
     /// against the live registry once it passes [`TOUCHED_PRUNE_AT`] — so its
     /// size is bounded by the live sessions plus that slack, not by uptime.
     touched: Mutex<BTreeSet<String>>,
+    /// Whether a bridge SUPERVISOR is running in this process.
+    ///
+    /// `state` answers "is a bridge attached RIGHT NOW"; this answers the
+    /// different question a parked `post --wait` needs — "can one ever attach".
+    /// [`FABRIC_ABSENT`] covers both "the first bridge has not finished
+    /// attaching" and "this build has no `[fabric] command`, so no bridge will
+    /// EVER attach", and those two owe a caller opposite advice. Set once by
+    /// [`crate::fabric_launch::spawn_supervisor`]; never cleared, because the
+    /// supervisor relaunches forever and a supervisor that has run is a bridge
+    /// that can come back. See [`fabric_wait_refusal`].
+    supervised: AtomicBool,
 }
 
 static LINK: FabricLink = FabricLink {
     state: AtomicU8::new(FABRIC_ABSENT),
     generation: Mutex::new(0),
     touched: Mutex::new(BTreeSet::new()),
+    supervised: AtomicBool::new(false),
 };
 
 /// How many sids [`FabricLink::touched`] may hold before the next insert prunes
@@ -534,6 +619,22 @@ pub(crate) struct BridgeGeneration(u64);
 pub(crate) fn next_bridge_generation() -> BridgeGeneration {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     BridgeGeneration(NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1))
+}
+
+/// A bridge SUPERVISOR has started in this process — record it once.
+///
+/// Called by [`crate::fabric_launch::spawn_supervisor`] when, and only when, a
+/// supervisor thread really started. It is not a claim that a bridge is up; it
+/// is the claim that one is coming, which is the half [`fabric_state`] cannot
+/// express (`absent` means both "not yet" and "never").
+pub(crate) fn note_bridge_supervised() {
+    LINK.supervised.store(true, Ordering::Relaxed);
+}
+
+/// Whether any bridge can EVER attach to this instance: a supervisor is running,
+/// or one already has and the link is merely down.
+fn bridge_reachable() -> bool {
+    LINK.supervised.load(Ordering::Relaxed) || LINK.state.load(Ordering::Relaxed) != FABRIC_ABSENT
 }
 
 /// The `status` reply's `fabric=` token.
@@ -729,24 +830,61 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
 /// the notice seen, and escalate; and the physical keyboard is not on this seam
 /// at all, so a human at the glass keeps typing. A halt stops DRIVERS.
 ///
-/// THREE MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
-/// `operator-propose-bin` is Owner-only `Meta` and gates at its proposal frame.
-/// `hwkey` is `Target::App` too, and it is the most direct PTY-reaching verb in the
-/// table: it posts a real NSEvent onto the OS event queue, so it takes the SAME winit
-/// path a physical keypress takes. A halt that stopped `send` and `key` but let `hwkey`
-/// through would stop the polite routes and leave the one indistinguishable from
-/// fingers on the keyboard.
-/// `invoke` and `tab` are `Target::App`: they are answered in
-/// `dispatch_before_session`, before any session exists, so the session gate is
-/// structurally unreachable for their bare forms and [`app_halt_refusal`] is
-/// where they are refused instead.
+/// SIX MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
 ///
+/// THE COUNT IN THIS SENTENCE IS NO LONGER PROSE. It said THREE and then named
+/// FOUR (`operator-propose-bin`, `hwkey`, `invoke`, `tab`) while the set held
+/// six: the main merge added `pane` and the round-3 fix added `pointer`, and
+/// neither touched this paragraph, so two members of the set an auditor
+/// enumerates the gates from were named nowhere in it. It is CHECKED now:
+/// `inbox_hold::the_halt_set_is_derived_from_the_verb_table` walks the shipped
+/// table and fails unless EVERY non-`Target::Session` member of this set is
+/// named in this doc block and the count word matches, and
+/// `inbox_hold::the_hold_help_enumerates_exactly_the_halt_set` fails unless the
+/// shipped `help hold` text enumerates the whole set. A verb the main branch
+/// adds to a `Target::App` row therefore cannot land in this gate while the
+/// paragraph explaining the gate, or the help an agent reads, still describes
+/// the old set.
+///
+/// `operator-propose-bin` is Owner-only `Meta` and gates at its proposal frame.
+/// The other five — `hwkey`, `invoke`, `pane`, `pointer` and `tab` — are
+/// `Target::App`: they are answered in `dispatch_before_session`, before any
+/// session exists, so the session gate is structurally unreachable for their
+/// bare forms and [`app_halt_refusal`] is where they are refused instead.
+///
+/// * `hwkey` is the most direct PTY-reaching verb in the table: it posts a real
+///   NSEvent onto the OS event queue, so it takes the SAME winit path a physical
+///   keypress takes. A halt that stopped `send` and `key` but let `hwkey` through
+///   would stop the polite routes and leave the one indistinguishable from
+///   fingers on the keyboard.
 /// * `invoke` belongs here because `invoke Paste` writes the OS clipboard into
 ///   the front tab's PTY through `App::paste_clipboard` ->
 ///   `deliver_paste(.., Source::Human)`, and because `invoke SelectAll` + `copy`
 ///   lets the caller CHOOSE those bytes off the session's own screen first — a
 ///   screen-content-to-PTY path, which is the one thing this design says must
 ///   not exist.
+/// * `pane <left|right|up|down>` puts no bytes anywhere itself: `cmd_pane` ->
+///   `Wake::PaneFocus` -> `App::focus_pane_in` moves the focused leaf, re-syncs
+///   the tab model and repaints, and unlike `focus` it never reaches
+///   `App::input(.., InputEvent::Focus(..))`, the sole DEC 1004 focus-report
+///   egress. It is in the set anyway, for `tab`'s reason rather than `hwkey`'s:
+///   it RE-AIMS the seam that does write. Moving the focused pane changes which
+///   session the window's keyboard drives and which session every flagless,
+///   front-routed socket verb resolves to, so a halted driver could silently
+///   redirect the next keystrokes — the human's included — into a different
+///   session. `tab`'s cost sentence applies verbatim: a driver cannot navigate
+///   panes over the socket while a halt stands, and the human at the glass moves
+///   between panes from the keyboard as always, which the halt never touches.
+/// * `pointer` IS in this set, and was once wrongly exempted from it. The
+///   exemption read "it synthesizes no mouse event — `mouse` is the verb that
+///   writes one to the PTY". That is false: `pointer move` drives
+///   `App::on_cursor_moved`, the same entry point `WindowEvent::CursorMoved`
+///   calls, and under DEC 1000/1002/1003 the terminal REPORTS that motion to the
+///   program on the far side. `control_verbs.rs` says so at the row itself,
+///   which is why the row is `Write`. A halted driver could move the pointer
+///   across a session running vim with mouse reporting on and drive it. The two
+///   verbs differ in the path they take to the PTY, not in whether they reach
+///   it, and the halt asks only the second question.
 /// * `tab` belongs here for the THIRD clause of the sentence above: `tab close
 ///   [N]` reaches `control_input::cmd_tab` -> `Wake::TabCmd` ->
 ///   `App::close_tab_via_verb`, which retires the tab's session with
@@ -757,6 +895,17 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
 ///   tabs over the socket while a halt stands — `app_halt_refusal`'s own "fail
 ///   closed, and cheap in the case it exists for" argument — and the human at
 ///   the glass switches tabs from the keyboard as always.
+///
+/// TWO SEAMS FOR THE APP LANE, NOT ONE. `spawn` and `tab` also have an AIMED
+/// form (`@<sid> tab …`, design S3) which `control::aimed_app_lane` routes PAST
+/// `dispatch_before_session` — the selector is the verb's ARGUMENT, "the window
+/// hosting `<sid>`", and has to survive to the session resolver. The session
+/// dispatch it lands in gates on the AIMED session's hold, which is the wrong
+/// question: `cmd_tab_aimed` drives `hosting_window(sid)`, so `tab close N`
+/// retires whichever session tab N hosts. Under a PARTIAL halt — the ordinary
+/// case, since [`bridge_lost`] halts only the sids in `LINK.touched` —
+/// `@<unheld> tab close N` retired a HELD window-mate. The session dispatch
+/// therefore asks [`app_halt_refusal`] a SECOND time for every aimed App verb.
 ///
 /// TWO RESIDUALS, NAMED RATHER THAN PROMISED AWAY. Neither is in this set and
 /// neither is refused, so the sentence at the top is scoped to a LIVE session
@@ -785,6 +934,7 @@ pub(crate) fn is_pty_reaching(verb: &str) -> bool {
             | "paste"
             | "paste-bin"
             | "mouse"
+            | "pointer"
             | "resize"
             | "focus"
             | "signal"
@@ -817,9 +967,10 @@ pub(crate) fn halt_refusal(ctx: &SessionCtx, verb: &str) -> Option<String> {
 
 /// [`halt_refusal`] for an APP-TARGET verb, which has no session to check.
 ///
-/// `invoke <action>` and `tab <sub-form>` are answered in
-/// `dispatch_before_session`, BEFORE any session is resolved, and what they touch
-/// is whatever window is frontmost at the time — which this thread cannot learn
+/// `invoke <action>`, `hwkey <key>`, `pane <dir>`, `pointer <move|leave>` and
+/// `tab <sub-form>` — the five `Target::App` members of [`is_pty_reaching`] — are
+/// answered in `dispatch_before_session`, BEFORE any session is resolved, and
+/// what they touch is whatever window is frontmost at the time — which this thread cannot learn
 /// without a main-thread hop, and which can change between the check and the
 /// action anyway. So the question asked here is the only one that is both
 /// answerable and honest: is ANY session on this instance held?
@@ -827,12 +978,19 @@ pub(crate) fn halt_refusal(ctx: &SessionCtx, verb: &str) -> Option<String> {
 /// FAIL CLOSED, and cheap in the case it exists for. A fleet halt is a fleet-wide
 /// gesture — the node's bridge writes `hold <sid> on origin=fleet` to every
 /// session it hosts — so when this matters the answer is the same either way.
-/// Over-refusing costs an unheld front tab one clipboard paste and one tab
-/// switch it can still perform from the physical keyboard, which the halt
+/// Over-refusing costs an unheld front tab one clipboard paste and one tab or
+/// pane switch it can still perform from the physical keyboard, which the halt
 /// deliberately never touches. Under-refusing costs the whole property: a
 /// standing halt that let `invoke SelectAll` + `copy` + `invoke Paste` put the
-/// session's own screen text on its own PTY, or let `tab close` retire the very
-/// session `close` had just been refused on.
+/// session's own screen text on its own PTY, that let `hwkey` type the keystroke
+/// `send` had just been refused, or that let `tab close` retire the very session
+/// `close` had just been refused on.
+///
+/// ASKED TWICE. The AIMED forms (`@<sid> tab …`) reach the session dispatch
+/// instead of `dispatch_before_session`, and drive the window HOSTING that
+/// session rather than the session itself, so the session-grain gate there is
+/// not the right question for them. `control::handle` calls this function again
+/// for them; see the last paragraph of [`is_pty_reaching`]'s doc.
 pub(crate) fn app_halt_refusal(store: &Store, verb: &str) -> Option<String> {
     if !is_pty_reaching(verb) {
         return None;
@@ -851,11 +1009,32 @@ pub(crate) fn app_halt_refusal(store: &Store, verb: &str) -> Option<String> {
 // Small wire helpers
 // ---------------------------------------------------------------------------
 
+/// The name half of a principal, in bytes: §3.2 of the fabric design fixes the
+/// grammar at a class prefix plus `[a-z0-9-]{1,32}`.
+///
+/// THE SAME NUMBER AS THE OTHER TWO SPELLINGS OF THIS GRAMMAR, and it was not.
+/// `aterm-link`'s `subject::NAME_MAX` is 32 and exports `PRINCIPAL_MAX = 34` so
+/// that `body::VIA_MAX_BYTES` cannot drift from it; astream's `Grant::parse`
+/// refuses a principal outside the same `{1,32}`. This copy admitted 40 — laxer
+/// in the safe direction TODAY only because every `from=` the endpoint renders
+/// comes from a cap-forced subject segment, but a writer and a reader with two
+/// different limits for one field is the split-bound shape that produced this
+/// project's worst finding: a line one side builds and the other refuses, with
+/// no test failing because neither number was pinned to the other. Widening this
+/// back is a design change to §3.2, not a local one.
+///
+/// `aterm-gui` does not depend on `aterm-link`, so the pin is the design section
+/// plus `inbox_hold::the_principal_grammar_is_section_3_2s`, which walks the
+/// boundary rather than restating the constant.
+const PRINCIPAL_NAME_MAX: usize = 32;
+
 /// A principal segment: class prefix + a bounded lowercase name, optionally
-/// `@<node>` for a session behind a node. Nothing a sender types reaches this —
-/// the bridge renders it from the delivered subject — but the endpoint validates
-/// it anyway, so a compromised bridge cannot smuggle a sentence into a `from=`
-/// field an agent reads as identity.
+/// `@<node>` for a session behind a node. Nothing a sender types reaches this on
+/// the INBOUND side — the bridge renders `from=` from the delivered subject — but
+/// the endpoint validates it anyway, so a compromised bridge cannot smuggle a
+/// sentence into a `from=` field an agent reads as identity. On the OUTBOUND side
+/// a sender DOES choose `to=` and `via=`, and this is the whole grammar those are
+/// held to.
 fn valid_principal(p: &str) -> bool {
     let ok_one = |s: &str| {
         let mut it = s.splitn(2, '-');
@@ -863,7 +1042,7 @@ fn valid_principal(p: &str) -> bool {
             return false;
         };
         matches!(class, "s" | "n" | "h" | "a")
-            && (1..=40).contains(&name.len())
+            && (1..=PRINCIPAL_NAME_MAX).contains(&name.len())
             && name
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
@@ -872,6 +1051,48 @@ fn valid_principal(p: &str) -> bool {
         Some((owner, node)) => ok_one(owner) && ok_one(node),
         None => ok_one(p),
     }
+}
+
+/// The relay chain `post via=` and `deliver via=` accept, BOUNDED WHERE THE TWO
+/// SIDES MEET.
+///
+/// `aterm-link`'s `body::via_ok` is the wire rule — at most 16 comma hops, at
+/// most `16 * (PRINCIPAL_MAX + 1)` bytes, every hop a BARE principal
+/// (`subject::is_principal`, which has no `@<node>` form). Round 2 put it there
+/// so that "the inbound `deliver` line and the outbound `post` line bound it by
+/// one number", and this end — the WRITER of that outbound line — went on
+/// accepting `via=` as one unbounded whitespace-free token: a single `post` could
+/// carry ~64 KiB of it (`control::MAX_REQUEST_LINE`), which no bound here counted
+/// and which the bridge would then refuse, per hop, as a verdict.
+///
+/// SAME TWO NUMBERS, COMPUTED THE SAME WAY, so they cannot drift: the byte cap is
+/// derived from the hop cap and the principal grammar rather than written down
+/// beside it. `aterm-gui` does not depend on `aterm-link`, so the pin is
+/// `inbox_hold::the_via_bound_is_the_wires_bound`, which walks the boundary.
+const VIA_MAX_HOPS: usize = 16;
+const VIA_MAX_BYTES: usize = VIA_MAX_HOPS * (PRINCIPAL_CLASS_PREFIX_LEN + PRINCIPAL_NAME_MAX + 1);
+
+/// The two bytes of class prefix every principal carries (`s-`/`n-`/`h-`/`a-`).
+const PRINCIPAL_CLASS_PREFIX_LEN: usize = 2;
+
+/// Whether a `via=` chain may be accepted — on the way IN (`deliver`) or on the
+/// way OUT (`post`), because it is one field and one grammar.
+///
+/// A HOP IS A BARE PRINCIPAL, not [`valid_principal`]'s `<owner>@<node>` form.
+/// `from=` legitimately names a session behind a node; a `via=` hop is a relayer
+/// on the bus, which is what `subject::is_principal` admits and what the bridge's
+/// `body::via_ok` will re-check. Accepting the wider form here built a line this
+/// endpoint's own bridge refuses.
+///
+/// An EMPTY chain is refused for the reason `via_ok` refuses it: it is a relay
+/// claim naming no relay, and it still demotes the record's kind.
+fn valid_via(via: &str) -> bool {
+    !via.is_empty()
+        && via.len() <= VIA_MAX_BYTES
+        && via.split(',').count() <= VIA_MAX_HOPS
+        && via
+            .split(',')
+            .all(|hop| !hop.contains('@') && valid_principal(hop))
 }
 
 /// Split `k=v` and keep the value, for a token that must be exactly one `k=v`.
@@ -949,6 +1170,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
 
     fn reset_now() {
         LINK.state.store(FABRIC_ABSENT, Ordering::Relaxed);
+        LINK.supervised.store(false, Ordering::Relaxed);
         *LINK.generation.lock().unwrap_or_else(|p| p.into_inner()) = 0;
         LINK.touched
             .lock()
@@ -1162,8 +1384,18 @@ fn retire_post(
             row.dead_reason = reason.to_string();
         }
     }
+    // EVERYTHING THE ROW WAS KEEPING FOR THE BRIDGE GOES WITH THE BODY. `via` is
+    // caller-chosen and rides the same `post` line; it survived retirement while
+    // both of the docs that describe a retired row — [`RETIRED_KEEP`] and
+    // [`Inbox::trim_retired_posts`] — said in as many words that such a row
+    // carries "only (id, to, kind, off)". `RETIRED_KEEP` of them are held for the
+    // life of the session, so the one field the bridge no longer needs is the one
+    // field that stayed. The row's remaining use is resolving an old answer's
+    // `re-id=` from (id, off), and neither the `outbox` drain (queued rows only)
+    // nor the `inbox` post rows read `via`.
     row.body.clear();
     row.body.shrink_to_fit();
+    row.via = None;
     if !already {
         let payload = match off {
             Some(n) => format!("{post_id} off={n}"),
@@ -1376,7 +1608,7 @@ fn deliver_row(ctx: &SessionCtx, toks: &[&str]) -> String {
             }
             demoted = Some(v.to_string());
         } else if let Some(v) = kv(tok, "via") {
-            if !v.split(',').all(valid_principal) {
+            if !valid_via(v) {
                 return DELIVER_USAGE.to_string();
             }
             via = Some(v.to_string());
@@ -1912,11 +2144,23 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     if to == "fleet" {
         return "ERR denied: no to=fleet — an agent may only ask a human to halt\n".to_string();
     }
-    if to != "say" && !valid_principal(to.trim_start_matches('@')) {
+    // ONE OPTIONAL `@`, NOT A RUN OF THEM. `trim_start_matches` strips EVERY
+    // leading `@`, so `@@@…@s-b` — one whitespace-free token, and the request
+    // line runs to `control::MAX_REQUEST_LINE` — validated as `s-b` and was then
+    // kept VERBATIM as the row's `to`. That is the field
+    // [`PostRow::caller_sized_bytes`] declines to fold on the stated ground that
+    // it is "grammar-bounded to tens of bytes", and the field [`retire_post`]
+    // does not clear, so [`RETIRED_KEEP`] held 512 of them for the life of the
+    // session and [`RETIRED_KEEP`]'s own doc called the survivor "a principal".
+    // Neither sentence was true while the padding was accepted, and the padding
+    // is no part of the address grammar the `post` row publishes
+    // (`to=<@<sid>[@<node>]|<principal>|say>`) — so it is REFUSED here rather
+    // than trimmed here and refused by `resolve_to` a publish later.
+    if to != "say" && !valid_principal(to.strip_prefix('@').unwrap_or(&to)) {
         return POST_USAGE.to_string();
     }
     if let Some(v) = &via
-        && !v.split(',').all(valid_principal)
+        && !valid_via(v)
     {
         return POST_USAGE.to_string();
     }
@@ -1944,6 +2188,21 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     if body.len() > BODY_MAX {
         return "ERR too large\n".to_string();
     }
+    // LOSSY FOR NON-UTF-8, and said out loud: the control reply plane is
+    // `String`-typed end to end, so a body that is not UTF-8 is replaced here
+    // exactly as `inbox get`'s is on the way in. `outbox`'s length prefix buys
+    // framing (a body may hold newlines), not byte-exactness; a byte-exact
+    // outbound path needs a bytes-carrying `ControlReply`, which is a wider
+    // change than one verb pair.
+    //
+    // CONVERTED BEFORE THE DOOR, not at the push, because the replacement can
+    // TREBLE the length (every invalid byte becomes a three-byte U+FFFD) and it
+    // is the converted string the row keeps and [`Inbox::queued_load`] folds.
+    // Weighing the frame's raw length against a bound denominated in stored
+    // bytes admitted a 128 KiB frame as if it were not a 384 KiB row. The
+    // declared-size refusal above stays on the RAW bytes: [`BODY_MAX`] is the
+    // wire's "up to 256 KiB", which is a statement about the frame.
+    let body = String::from_utf8_lossy(&body).into_owned();
 
     // `--wait` is ON by default for the two kinds whose whole point is a reply:
     // an `ask`/`task` sender that does not learn its offset cannot recognize the
@@ -1954,8 +2213,14 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
     // REFUSED AT THE DOOR. A full outbox is answered, not absorbed: see
     // [`OUTBOX_CAP`]. Counted over the posts still WAITING for the bridge —
     // retired ones hold no body and cost nothing.
+    //
+    // THE INCOMING ROW IS MEASURED THE WAY THE QUEUED ONES ARE, by the same
+    // function: [`caller_sized_bytes`]. This line used to add `body.len()`
+    // alone, so the one row whose admission was being decided was the one row
+    // whose `via` went uncounted.
     let (queued, queued_bytes) = inbox.queued_load();
-    if queued >= OUTBOX_CAP || queued_bytes.saturating_add(body.len()) > OUTBOX_BYTES_MAX {
+    let incoming = caller_sized_bytes(&body, via.as_deref());
+    if queued >= OUTBOX_CAP || queued_bytes.saturating_add(incoming) > OUTBOX_BYTES_MAX {
         return format!("ERR outbox full queued={queued} bytes={queued_bytes}\n");
     }
     inbox.next_post_id += 1;
@@ -1971,13 +2236,7 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
         via: via.clone(),
         dead: false,
         dead_reason: String::new(),
-        // LOSSY FOR NON-UTF-8, and said out loud: the control reply plane is
-        // `String`-typed end to end, so a body that is not UTF-8 is replaced
-        // here exactly as `inbox get`'s is on the way in. `outbox`'s length
-        // prefix buys framing (a body may hold newlines), not byte-exactness;
-        // a byte-exact outbound path needs a bytes-carrying `ControlReply`,
-        // which is a wider change than one verb pair.
-        body: String::from_utf8_lossy(&body).into_owned(),
+        body,
     });
     inbox.trim_retired_posts();
     let mut payload = format!("{id} to={to_tok} kind={kind}");
@@ -2062,10 +2321,31 @@ pub(crate) fn cmd_post(ctx: &SessionCtx, rest: &str, body: Option<Vec<u8>>) -> S
 /// documented remedy for "not sent" is to send again: `post` carries no
 /// idempotency key, so the peer's inbox ends up holding the same `ask` twice.
 /// This refusal says the only two things the endpoint actually knows — nothing
-/// can report the landing, and the message is still in the outbox — and the
-/// `post` verb row says so as well.
+/// can report the landing, and the message is still in the outbox.
+///
+/// …EXCEPT WHEN NOTHING IS COMING, WHICH IS THE STATE THAT ARGUMENT DOES NOT
+/// REACH. `queued=1`'s whole meaning is "a replacement bridge will publish it",
+/// and on an instance with no `[fabric] command` there is no first bridge, let
+/// alone a replacement: [`crate::fabric_launch::spawn_supervisor`] starts nothing
+/// and `outbox` is never called by anyone. Told `queued=1`, an agent following
+/// the verb row LITERALLY does not re-post and waits for an answer no process
+/// will ever fetch — 128 times, until `ERR outbox full` becomes the first hint
+/// anything is wrong. So that state answers `no-bridge=1` INSTEAD of `queued=1`:
+/// the message is in the outbox and nothing will ever take it out, which is a
+/// different instruction (stop waiting; this instance has no fabric) and is
+/// spelled differently.
+///
+/// `absent` alone would be the wrong test — it is also the state during the
+/// seconds before the FIRST bridge finishes attaching, where `queued=1` is
+/// exactly right. [`bridge_reachable`] asks the question that actually
+/// distinguishes them: has a supervisor started, or has a bridge ever been up.
 fn fabric_wait_refusal(id: u64) -> String {
-    format!("ERR fabric {} id={id} queued=1\n", fabric_state())
+    let state = fabric_state();
+    if bridge_reachable() {
+        format!("ERR fabric {state} id={id} queued=1\n")
+    } else {
+        format!("ERR fabric {state} id={id} no-bridge=1\n")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2218,6 +2498,298 @@ mod inbox_hold {
             store,
             &format!("{sid} off={off} from={from} kind={kind} trust=agent text={text}"),
         )
+    }
+
+    /// ONE PRINCIPAL GRAMMAR, AND IT IS §3.2's.
+    ///
+    /// §3.2 fixes it at a class prefix plus `[a-z0-9-]{1,32}`; `aterm-link`'s
+    /// `subject::is_principal` enforces 32 and exports `PRINCIPAL_MAX = 34` so
+    /// `body::VIA_MAX_BYTES` cannot drift from it; astream's `Grant::parse`
+    /// refuses anything outside the same grammar. This end admitted 1..=40 — a
+    /// third number for one field, in the direction that lets the endpoint BUILD
+    /// an outbound line its own bridge refuses, which is the split-bound shape
+    /// that produced this project's worst finding. `aterm-gui` does not depend on
+    /// `aterm-link`, so the pin is the boundary walked here rather than a
+    /// constant restated.
+    #[test]
+    fn the_principal_grammar_is_section_3_2s() {
+        assert_eq!(PRINCIPAL_NAME_MAX, 32, "§3.2, and `subject::NAME_MAX`");
+        let name = |n: usize| "a".repeat(n);
+        for class in ["s", "n", "h", "a"] {
+            assert!(valid_principal(&format!("{class}-{}", name(1))));
+            assert!(valid_principal(&format!(
+                "{class}-{}",
+                name(PRINCIPAL_NAME_MAX)
+            )));
+            assert!(
+                !valid_principal(&format!("{class}-{}", name(PRINCIPAL_NAME_MAX + 1))),
+                "{class}- with a 33-byte name parses here and is refused at the bridge"
+            );
+            assert!(!valid_principal(&format!("{class}-")));
+        }
+        assert!(!valid_principal("x-ok"), "only the four §3.2 classes");
+        assert!(!valid_principal("s-Upper"), "lowercase, digits and dashes");
+        // The `<owner>@<node>` form bounds BOTH halves by the same number.
+        assert!(valid_principal(&format!(
+            "s-{}@n-{}",
+            name(PRINCIPAL_NAME_MAX),
+            name(PRINCIPAL_NAME_MAX)
+        )));
+        assert!(!valid_principal(&format!(
+            "s-{}@n-{}",
+            name(PRINCIPAL_NAME_MAX),
+            name(PRINCIPAL_NAME_MAX + 1)
+        )));
+        // And it is the grammar `post to=` and `deliver from=` are held to.
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        assert_eq!(
+            cmd_post(
+                &ctx,
+                &format!("to=h-{} kind=note hi", name(PRINCIPAL_NAME_MAX + 1)),
+                None
+            ),
+            POST_USAGE
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!(
+                    "{sid} off=1 from=h-{} kind=note trust=human text=x",
+                    name(PRINCIPAL_NAME_MAX + 1)
+                )
+            ),
+            DELIVER_USAGE
+        );
+    }
+
+    /// THE `via=` BOUND IS THE WIRE'S BOUND, ON BOTH SIDES OF IT.
+    ///
+    /// `aterm-link`'s `body::via_ok` refuses a chain past 16 hops or
+    /// `16 * (PRINCIPAL_MAX + 1)` bytes, every hop a BARE principal, and it is
+    /// applied on the WRITER of both lines — the bridge's `deliver` and the
+    /// mirror's `post`. The endpoint accepted `via=` as one unbounded
+    /// whitespace-free token whose only rule was "every comma element is a
+    /// principal", by a `valid_principal` that also admits `<owner>@<node>`. So
+    /// the endpoint could hold ~64 KiB of `via` per post that no outbox bound
+    /// counted, and could accept a chain shape its own bridge would refuse.
+    #[test]
+    fn the_via_bound_is_the_wires_bound() {
+        // The byte cap is COMPUTED from the hop cap and the principal grammar,
+        // exactly as `body::VIA_MAX_BYTES` is, so the two cannot drift.
+        assert_eq!(VIA_MAX_HOPS, 16);
+        assert_eq!(VIA_MAX_BYTES, VIA_MAX_HOPS * (2 + PRINCIPAL_NAME_MAX + 1));
+
+        let hop = format!("s-{}", "a".repeat(PRINCIPAL_NAME_MAX));
+        let full = vec![hop.clone(); VIA_MAX_HOPS].join(",");
+        assert_eq!(
+            full.len(),
+            VIA_MAX_BYTES - 1,
+            "the longest legal chain fits"
+        );
+        assert!(valid_via(&full));
+        assert!(
+            !valid_via(&vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",")),
+            "seventeen hops"
+        );
+        assert!(
+            !valid_via(""),
+            "a relay claim naming no relay still demotes"
+        );
+        assert!(
+            !valid_via("s-a@n-b"),
+            "a hop is a BARE principal: `subject::is_principal` has no `@node` \
+             form, so the bridge refuses what this used to build"
+        );
+        assert!(valid_via("s-a,n-b,h-c"));
+
+        // BOTH SEAMS, because it is one field: the outbound `post` line the
+        // endpoint WRITES and the inbound `deliver` line it READS.
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let over = vec![hop.as_str(); VIA_MAX_HOPS + 1].join(",");
+        assert_eq!(
+            cmd_post(&ctx, &format!("to=@s-b kind=note via={over} x"), None),
+            POST_USAGE
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@s-b kind=note via=s-a@n-b x", None),
+            POST_USAGE
+        );
+        assert_eq!(
+            cmd_deliver(
+                &store,
+                &format!("{sid} off=1 from=h-a kind=note trust=human via={over} text=x")
+            ),
+            DELIVER_USAGE
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=@s-b kind=note via=s-a x", None),
+            "OK 1\n"
+        );
+    }
+
+    /// THE OUTBOX'S TWO BOUNDS COUNT EVERY CALLER-SIZED FIELD, AND A RETIRED ROW
+    /// KEEPS NONE OF THEM.
+    ///
+    /// `queued_load` folded `p.body.len()` alone, so `via` — the other
+    /// caller-chosen string on the same `post` line — was outside the 4 MiB
+    /// bound; and `retire_post` cleared the body and left `via` on the row, which
+    /// [`RETIRED_KEEP`] then held 512 of for the life of the session, while both
+    /// of the docs describing a retired row said it carries "only (id, to, kind,
+    /// off)".
+    #[test]
+    fn a_queued_post_counts_its_via_and_a_retired_one_keeps_neither() {
+        let store = new_store();
+        let (sid, ctx) = registered(&store);
+        let via = vec!["s-aaaaaaaa"; VIA_MAX_HOPS].join(",");
+        let body = "x".repeat(1000);
+        assert_eq!(
+            cmd_post(&ctx, &format!("to=@s-b kind=note via={via} {body}"), None),
+            "OK 1\n"
+        );
+        let (queued, bytes) = ctx.fabric.lock().queued_load();
+        assert_eq!(queued, 1);
+        assert_eq!(
+            bytes,
+            body.len() + via.len(),
+            "the byte bound counts the body AND the relay chain"
+        );
+
+        // The bridge takes it and retires it.
+        assert!(cmd_outbox(&store, "").contains(&format!("via={via}")));
+        assert_eq!(
+            cmd_outbox_sent(&store, &format!("{sid} 1 off=91")),
+            "OK\n",
+            "the bridge published it"
+        );
+        let inbox = ctx.fabric.lock();
+        let row = inbox.posts.iter().find(|p| p.id == 1).expect("the row");
+        assert_eq!(row.off, Some(91));
+        assert!(row.body.is_empty(), "the body goes at retirement");
+        assert_eq!(
+            row.via, None,
+            "and so does the relay chain: a retired row is kept only to resolve \
+             an old answer's `re-id=`, and 512 of them are held for the life of \
+             the session"
+        );
+        assert_eq!(row.caller_sized_bytes(), 0);
+        drop(inbox);
+        assert_eq!(ctx.fabric.lock().queued_load(), (0, 0));
+    }
+
+    /// AN ADDRESS CARRIES ONE `@`, NOT A RUN OF THEM.
+    ///
+    /// The grammar check began `to.trim_start_matches('@')`, which strips EVERY
+    /// leading `@` — so `@@@…@s-b` passed as `s-b` and the row then kept the
+    /// whole token. `to` is one whitespace-free token on a request line that
+    /// runs to 64 KiB, it is the field `caller_sized_bytes` declines to fold
+    /// because it is "grammar-bounded to tens of bytes", and it is the ONE
+    /// caller-typed field `retire_post` does not clear — so `RETIRED_KEEP` held
+    /// 512 of them for the life of the session, against a `RETIRED_KEEP` doc
+    /// that calls the survivor "a principal". Same shape as the `via` wound one
+    /// field over: a bound stated in a doc and enforced by a grammar that did
+    /// not enforce it.
+    #[test]
+    fn an_address_carries_one_at_sign_and_not_a_run_of_them() {
+        let store = new_store();
+        let (_sid, ctx) = registered(&store);
+        // The address forms the `post` verb row publishes.
+        assert_eq!(cmd_post(&ctx, "to=@s-abc kind=note hi", None), "OK 1\n");
+        assert_eq!(
+            cmd_post(&ctx, "to=@s-abc@n-lab kind=note hi", None),
+            "OK 2\n"
+        );
+        assert_eq!(cmd_post(&ctx, "to=h-andrew kind=note hi", None), "OK 3\n");
+        assert_eq!(cmd_post(&ctx, "to=say kind=note hi", None), "OK 4\n");
+        // And nothing else. Padding is refused rather than trimmed: it is not
+        // in the grammar, and trimming is what let it be stored.
+        assert_eq!(cmd_post(&ctx, "to=@@s-abc kind=note hi", None), POST_USAGE);
+        let padded = format!("{}s-abc", "@".repeat(4096));
+        assert_eq!(
+            cmd_post(&ctx, &format!("to={padded} kind=note hi"), None),
+            POST_USAGE
+        );
+        let inbox = ctx.fabric.lock();
+        assert_eq!(inbox.posts.len(), 4, "the two padded ones never queued");
+        for row in &inbox.posts {
+            assert!(
+                row.to.len() <= 2 * (PRINCIPAL_CLASS_PREFIX_LEN + PRINCIPAL_NAME_MAX) + 2,
+                "`to` is bounded by the principal grammar: {}",
+                row.to.len()
+            );
+        }
+    }
+
+    /// THE DOOR MEASURES THE ROW THE FOLD WILL MEASURE.
+    ///
+    /// [`OUTBOX_BYTES_MAX`] has two ends and they computed different numbers.
+    /// `queued_load` folds `body + via` over the STORED rows; the admission test
+    /// added the raw frame's `body.len()` and nothing else. So the one row whose
+    /// admission was being decided was the one row whose `via` went uncounted,
+    /// and a frame of non-UTF-8 was weighed at its wire length while the row
+    /// keeps `String::from_utf8_lossy`'s — three bytes for every invalid one.
+    /// Both ends call [`caller_sized_bytes`] now.
+    #[test]
+    fn the_door_measures_the_row_the_fold_will_measure() {
+        let store = new_store();
+        let (_sid, ctx) = registered(&store);
+        // Fill to exactly one BODY_MAX short of the bound.
+        let fills = OUTBOX_BYTES_MAX / BODY_MAX - 1;
+        for i in 0..fills {
+            assert_eq!(
+                cmd_post(
+                    &ctx,
+                    &format!("to=@s-abc kind=note len={BODY_MAX}"),
+                    Some(vec![b'x'; BODY_MAX])
+                ),
+                format!("OK {}\n", i + 1)
+            );
+        }
+        assert_eq!(
+            ctx.fabric.lock().queued_load(),
+            (fills, OUTBOX_BYTES_MAX - BODY_MAX)
+        );
+
+        // `via` is part of what the row will keep, so it is part of what the
+        // door weighs: body + via crosses the remaining BODY_MAX by ten bytes.
+        let via = format!("s-{}", "a".repeat(18));
+        assert_eq!(via.len(), 20);
+        assert!(
+            cmd_post(
+                &ctx,
+                &format!("to=@s-abc kind=note via={via} len={}", BODY_MAX - 10),
+                Some(vec![b'x'; BODY_MAX - 10])
+            )
+            .starts_with("ERR outbox full"),
+            "the incoming row's relay chain counts too"
+        );
+
+        // And the row keeps the LOSSY body: 100 KiB of invalid bytes is a
+        // 300 KiB row, which does not fit the remaining 256 KiB.
+        assert!(
+            cmd_post(
+                &ctx,
+                &format!("to=@s-abc kind=note len={}", 100 * 1024),
+                Some(vec![0xff; 100 * 1024])
+            )
+            .starts_with("ERR outbox full"),
+            "a frame of non-UTF-8 is weighed as the row it becomes"
+        );
+
+        // The bound is not merely closed: the same body without the chain fits.
+        assert_eq!(
+            cmd_post(
+                &ctx,
+                &format!("to=@s-abc kind=note len={}", BODY_MAX - 10),
+                Some(vec![b'x'; BODY_MAX - 10])
+            ),
+            format!("OK {}\n", fills + 1)
+        );
+        assert_eq!(
+            ctx.fabric.lock().queued_load(),
+            (fills + 1, OUTBOX_BYTES_MAX - 10)
+        );
     }
 
     /// The header's `<n>` and the rows that follow it.
@@ -2509,6 +3081,21 @@ mod inbox_hold {
             "paste",
             "paste-bin",
             "mouse",
+            // `pointer` sits here with `mouse` and NOT in `HALT_EXEMPT`, where it
+            // spent a rung on the false premise that it "synthesizes no mouse
+            // event". `pointer move` drives `App::on_cursor_moved` — winit's own
+            // `CursorMoved` entry point — and under DEC 1000/1002/1003 that motion
+            // is reported straight to the program on the PTY. A halted driver could
+            // steer a mouse-reporting TUI with it.
+            //
+            // NOTE THE SHAPE OF THE MISS: `the_halt_set_is_derived_from_the_verb_table`
+            // passes with `pointer` on EITHER side, because `HALT_EXEMPT` is a hand
+            // list and satisfying it only requires writing a sentence. Derivation
+            // proves every verb was CLASSIFIED; it cannot prove the classification is
+            // true. That check needs a fact the table does not carry — whether a verb's
+            // effect is observable by the program on the far side of the PTY — so
+            // until the table carries it, this row is the assertion.
+            "pointer",
             "resize",
             // `focus` writes the DEC 1004 focus reports to the PTY (`input.rs`,
             // the SOLE focus-report egress) and sat outside this set for two
@@ -2570,9 +3157,12 @@ mod inbox_hold {
         // And the exempt verbs really answer. The `ask` is the one that matters:
         // it defaults to `--wait`, and with no bridge attached it reports the
         // MISSING BRIDGE — never `ERR halted`, which is the whole exemption.
+        // `no-bridge=1` rather than `queued=1`: no supervisor started in this
+        // process, so nothing will ever drain the outbox (see
+        // [`fabric_wait_refusal`]).
         assert_eq!(
             cmd_post(&ctx, "to=h-andrew kind=ask why am I halted?", None),
-            "ERR fabric absent id=1 queued=1\n"
+            "ERR fabric absent id=1 no-bridge=1\n"
         );
         assert_eq!(
             cmd_post(&ctx, "to=h-andrew kind=note halted", None),
@@ -2794,7 +3384,7 @@ mod inbox_hold {
             // `--wait` is ON by default for ask/task — the kinds whose whole point
             // is a reply — and with no bridge it refuses instead of parking.
             let reply = cmd_post(&ctx, "to=@s-b kind=ask where?", None);
-            assert_eq!(reply, "ERR fabric absent id=2 queued=1\n");
+            assert_eq!(reply, "ERR fabric absent id=2 no-bridge=1\n");
             assert!(
                 cmd_inbox(&ctx, "--peek").contains("post 2 to=@s-b kind=ask off=-"),
                 "the refused wait still queued the post"
@@ -3466,13 +4056,13 @@ mod inbox_hold {
             let id = i + 1;
             let reply = cmd_post(&ctx, &format!("to=@s-peer kind={kind} hi"), None);
             // `ask` and `task` default to `--wait`, and under `with_link` there is
-            // deterministically no bridge, so those two are answered `ERR fabric
-            // absent id=<n> queued=1`. Either way the post was ACCEPTED and queued
-            // — which is what the id in both replies names, and what `queued=1`
-            // says in as many words — while the refusal under test is the usage
-            // line, which names no id at all.
+            // deterministically no bridge AND no supervisor, so those two are
+            // answered `ERR fabric absent id=<n> no-bridge=1`. Either way the post
+            // was ACCEPTED and queued — which is what the id in both replies names
+            // — while the refusal under test is the usage line, which names no id
+            // at all.
             let expected = if matches!(*kind, "ask" | "task") {
-                format!("ERR fabric absent id={id} queued=1\n")
+                format!("ERR fabric absent id={id} no-bridge=1\n")
             } else {
                 format!("OK {id}\n")
             };
@@ -3642,6 +4232,30 @@ mod inbox_hold {
         assert!(
             production.contains("walks EVERY [`aterm_types::control_verbs::VERBS`] row"),
             "the doc must state the rule the test actually enforces"
+        );
+
+        // EVERY CITATION, not just the one this test was written for. The docs in
+        // this module answer "who checks that?" by naming a test, and a name is
+        // only a citation while it resolves — so every `inbox_hold::<name>` in the
+        // production half is looked up here. Three more were added the round the
+        // halt-set doc, the principal grammar and the `via=` bound each grew one.
+        let mut cited_names = 0;
+        for (i, _) in production.match_indices("inbox_hold::") {
+            let tail = &production[i + "inbox_hold::".len()..];
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(!name.is_empty(), "a bare `inbox_hold::` cites nothing");
+            assert!(
+                tests.contains(&format!("fn {name}(")),
+                "`inbox_hold::{name}` is cited in this module's docs and no test                  carries that name"
+            );
+            cited_names += 1;
+        }
+        assert!(
+            cited_names >= 3,
+            "the doc citations vanished rather than being checked"
         );
     }
 
@@ -3916,10 +4530,26 @@ mod inbox_hold {
             let store = new_store();
             let (sid, ctx) = registered(&store);
 
-            // The ENTRY check: no bridge has ever attached.
+            // NO FABRIC AT ALL, which is a DIFFERENT instruction and is spelled
+            // differently. `spawn_supervisor` returns false on an instance with no
+            // `[fabric] command` and starts nothing, so `outbox` is never called
+            // by anyone: `queued=1`'s promise ("a replacement bridge will publish
+            // it") is false here, and an agent that follows the verb row literally
+            // waits forever for an answer no process will fetch — 128 posts, then
+            // `ERR outbox full`. `absent` alone cannot be the test, because it is
+            // also the state in the seconds before the FIRST bridge attaches.
+            assert_eq!(
+                cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 no fabric?", None),
+                "ERR fabric absent id=1 no-bridge=1\n"
+            );
+
+            // The ENTRY check on a CONFIGURED instance whose first bridge has not
+            // attached yet: same `absent` state, opposite advice, because one is
+            // coming.
+            note_bridge_supervised();
             assert_eq!(
                 cmd_post(&ctx, "to=@s-peer kind=ask --wait=0 which branch?", None),
-                "ERR fabric absent id=1 queued=1\n"
+                "ERR fabric absent id=2 queued=1\n"
             );
 
             // The PER-WAKE check: a bridge attached, took the post's session, and
@@ -3932,21 +4562,26 @@ mod inbox_hold {
                     // The waiter parks; `bridge_lost` wakes it.
                     assert_eq!(
                         cmd_post(&ctx, "to=@s-peer kind=ask --wait=60000 still?", None),
-                        "ERR fabric disconnected id=2 queued=1\n"
+                        "ERR fabric disconnected id=3 queued=1\n"
                     );
                 });
                 // Park is guaranteed by the condvar protocol, not by sleeping: the
                 // waiter holds the fabric lock while it reads the state, and
                 // `bridge_lost` signals under that same lock.
-                while ctx.fabric.lock().posts.iter().all(|p| p.id != 2) {
+                while ctx.fabric.lock().posts.iter().all(|p| p.id != 3) {
                     std::thread::yield_now();
                 }
                 bridge_lost(&store, generation);
             });
 
-            // AND THE CLAIM IS TRUE: both posts are still in the outbox, bodies
-            // and all, for the replacement bridge to drain.
+            // AND THE CLAIM IS TRUE: every post is still in the outbox, bodies
+            // and all, for the replacement bridge to drain — including the one
+            // answered `no-bridge=1`, whose body is retained exactly the same way.
+            // `no-bridge=1` says nothing will COME for it, not that it was
+            // dropped: that is why the token replaces `queued=1` rather than
+            // claiming the post was refused.
             let drained = cmd_outbox(&store, "");
+            assert!(drained.contains("no fabric?"), "{drained}");
             assert!(drained.contains("which branch?"), "{drained}");
             assert!(drained.contains("still?"), "{drained}");
         });
@@ -4022,37 +4657,21 @@ mod inbox_hold {
     /// the halt it is on.
     #[test]
     fn the_halt_set_is_derived_from_the_verb_table() {
-        use aterm_types::control_verbs::{OpClass, VERBS};
+        use aterm_types::control_verbs::{OpClass, Target, VERBS};
 
         /// Rows that can mutate SOMETHING and still stay answerable under a halt,
         /// each with the reason. A halt stops DRIVERS: it must not stop a halted
         /// agent asking why it is halted, marking the notice seen, or escalating,
         /// and it must not stop the bridge that is the only thing that can LIFT it.
+        // ONE ENTRY PER VERB, and the assertion below enforces it. The main merge
+        // re-added `open`, `act` and `spawn` at the head of this list without
+        // noticing they were already argued further down, so each carried TWO
+        // independently-worded authoritative arguments — and correcting one left
+        // the other standing, which is the "two literals that agree with each
+        // other" shape `is_pty_reaching`'s doc exists to refuse. Only `hwkey`,
+        // `pane` and `pointer` were genuinely new in that merge, and all three
+        // are in the SET, not here.
         const HALT_EXEMPT: &[(&str, &str)] = &[
-            (
-                "pointer",
-                "moves aterm's OWN pointer so `hover` can resolve a cell; it synthesizes no \
-         mouse event — `mouse` is the verb that writes one to the PTY, and that is in \
-         the halt set",
-            ),
-            (
-                "open",
-                "opens a native settings surface in the app; it reaches no session and writes \
-         no byte to any PTY",
-            ),
-            (
-                "act",
-                "dispatches a semantic action against the NATIVE app's own UI surface \
-         (`app/v1 view ...`), not against a terminal session",
-            ),
-            (
-                "spawn",
-                "CREATES a session rather than driving one, and a halt stops drivers. The new \
-         session is itself held the moment the bridge attaches it (`reconcile_halt`), \
-         and a human at the glass can always open one anyway — the physical keyboard \
-         is not on this seam. RESIDUAL, stated rather than hidden: between the spawn \
-         and that attach there is a window in which the new session is ungoverned",
-            ),
             // The session lane.
             (
                 "lease",
@@ -4102,11 +4721,14 @@ mod inbox_hold {
             ("hover", "toggles the drop-target highlight"),
             (
                 "spawn",
-                "MINTS a session rather than driving or retiring one. The residual \
-                 — a session created under a standing halt carries no hold of its \
-                 own — is recorded in `is_pty_reaching`'s doc, not closed here: \
-                 halting `spawn` would refuse a human's `aterm new-tab`, which \
-                 arrives on this same seam",
+                "MINTS a session rather than driving or retiring one, and a halt \
+                 stops drivers. The new session is itself held the moment the \
+                 bridge attaches it (`reconcile_halt`), and halting `spawn` would \
+                 refuse a human's `aterm new-tab`, which arrives on this same seam \
+                 and is indistinguishable from a driver's. RESIDUAL, stated rather \
+                 than hidden and recorded in `is_pty_reaching`'s doc as well: \
+                 between the spawn and that attach there is a window in which the \
+                 new session is ungoverned",
             ),
             // Owner/Meta: privilege and provenance, none of which types.
             ("version", "a build-provenance string"),
@@ -4170,6 +4792,16 @@ mod inbox_hold {
                 !is_pty_reaching(verb),
                 "`{verb}` is both halted and exempt: the two lists disagree"
             );
+            assert_eq!(
+                HALT_EXEMPT.iter().filter(|(v, _)| v == verb).count(),
+                1,
+                "`{verb}` is exempt TWICE. The premise of this list is that an \
+                 exemption is a named, argued decision a later reader can \
+                 re-argue; two authoritative arguments for one verb means \
+                 correcting one leaves the other standing, and deleting one \
+                 leaves the assertion above firing on the survivor as if it were \
+                 an unrelated failure"
+            );
         }
 
         for spec in VERBS {
@@ -4205,6 +4837,108 @@ mod inbox_hold {
                 spec.target
             );
         }
+
+        // AND THE DOC BLOCK THAT MAPS THE SEAMS IS DERIVED TOO. The paragraph
+        // over `is_pty_reaching` exists to tell a reader WHICH members bypass
+        // the session gate and WHICH seam catches them, and it is the list an
+        // auditor enumerates the fenced set from. It has been wrong three times:
+        // it said THREE and named four while five existed, and neither the main
+        // merge (`hwkey`, `pane`) nor the round-3 `pointer` fix touched it. A
+        // count in prose is a claim, and aterm ships no evidence manifest, so it
+        // is checked here rather than re-argued next round.
+        const COUNT_WORD: [&str; 11] = [
+            "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE", "TEN",
+        ];
+        let non_session: Vec<&str> = VERBS
+            .iter()
+            .filter(|s| is_pty_reaching(s.name) && s.target != Target::Session)
+            .map(|s| s.name)
+            .collect();
+        let source = include_str!("fabric.rs");
+        let head = source
+            .split_once("pub(crate) fn is_pty_reaching")
+            .expect("is_pty_reaching is in this file")
+            .0;
+        let doc = &head[head
+            .rfind("/// The verbs a fleet halt refuses")
+            .expect("is_pty_reaching carries its doc block")..];
+        assert!(
+            doc.contains(&format!(
+                "{} MEMBERS ARE NOT `Target::Session` ROWS",
+                COUNT_WORD[non_session.len()]
+            )),
+            "`is_pty_reaching`'s doc miscounts its non-Session members: there are \
+             {} ({non_session:?})",
+            non_session.len(),
+        );
+        for name in &non_session {
+            assert!(
+                doc.contains(&format!("`{name}`")),
+                "`{name}` is a non-Session member of the halt set and is named \
+                 nowhere in `is_pty_reaching`'s doc: an auditor following that \
+                 paragraph's own map of the gates would never check it"
+            );
+        }
+    }
+
+    /// THE SHIPPED `help hold` TEXT ENUMERATES THE HALT SET, SO IT IS PINNED TO
+    /// THE HALT SET.
+    ///
+    /// aterm has no evidence manifest: the `hold` row's detail IS the claim of
+    /// record for what a fleet halt refuses, and a driver author's back-off
+    /// classes are written from it. That enumeration is a THIRD copy of the set
+    /// (the code, this doc, and two golden fixtures that agree with the doc), and
+    /// it had already drifted by three verbs — `hwkey` and `pane` from the main
+    /// merge, `pointer` from the round-3 fix — while
+    /// [`the_halt_set_is_derived_from_the_verb_table`] went on passing, because
+    /// that test binds the set to the TABLE and never reads the help string.
+    ///
+    /// SET EQUALITY, both directions, for the same reason
+    /// `trail_status_help_enumerates_exactly_the_keys_the_row_emits` insists on
+    /// it: a driver that parses a documented verb which is in fact refused, and a
+    /// driver that is refused a verb the documentation placed outside the set,
+    /// are the same outage.
+    ///
+    /// The pin lives HERE and not beside the row, because `aterm-types` is below
+    /// `aterm-gui` and cannot see `is_pty_reaching`.
+    #[test]
+    fn the_hold_help_enumerates_exactly_the_halt_set() {
+        use aterm_types::control_verbs::{VERBS, spec};
+
+        const MARKER: &str = "from ANY scope — `";
+        let hold = spec("hold").expect("hold ships").help_line();
+        let listed: Vec<&str> = hold
+            .split_once(MARKER)
+            .expect("the `hold` detail enumerates the halted set after `from ANY scope — `")
+            .1
+            .split_once('`')
+            .expect("the enumeration is one back-ticked run")
+            .0
+            .split_whitespace()
+            .collect();
+
+        for verb in &listed {
+            assert!(
+                is_pty_reaching(verb),
+                "`help hold` names `{verb}` as refused under a halt and the halt \
+                 does not refuse it"
+            );
+        }
+        for verb in VERBS.iter().map(|s| s.name).filter(|n| is_pty_reaching(n)) {
+            assert!(
+                listed.contains(&verb),
+                "a halt refuses `{verb}` and `help hold` — the only shipped \
+                 statement of what a halt refuses — does not name it"
+            );
+        }
+        let refused = VERBS.iter().filter(|s| is_pty_reaching(s.name)).count();
+        assert_eq!(
+            listed.len(),
+            refused,
+            "the `hold` detail lists {} verbs for a set of {refused}: a repeat \
+             is a second literal in the same sentence",
+            listed.len(),
+        );
     }
 
     /// THE HALT SET COVERS `focus` AND THE APP LANE.

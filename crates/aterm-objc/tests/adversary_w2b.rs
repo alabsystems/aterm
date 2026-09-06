@@ -109,7 +109,7 @@ fn a_sixteen_byte_aligned_ivar_lands_aligned_and_drops_once() {
         .expect("+alloc/-init");
         // SAFETY: `-marker` is `-(unsigned long long)` on a live instance.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> u64 = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> u64 = msg();
             assert_eq!(f(obj.as_id(), sel!(marker)), 0xDEAD_BEEF);
         }
     }
@@ -124,7 +124,7 @@ fn a_class_with_no_methods_and_a_zero_sized_ivar_still_registers() {
     // SAFETY: `-description` is `-(NSString *)` on a live instance; the result
     // is autoreleased and only read inside the pool.
     let d = aterm_objc::autoreleasepool(|_| unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         aterm_objc::ns_string_to_rust(f(obj.as_id(), sel!(description)))
     });
     assert!(d.contains("ATermObjcEmptyW2"), "description was {d:?}");
@@ -135,7 +135,7 @@ fn a_ten_colon_selector_counts_and_dispatches() {
     let obj = Wide::alloc_init(mtm(), ()).expect("+alloc/-init");
     // SAFETY: the exact declared prototype, on a live instance.
     unsafe {
-        let f: unsafe extern "C" fn(
+        let f: unsafe extern "C-unwind" fn(
             Id,
             Sel,
             i64,
@@ -265,11 +265,11 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
         unsafe {
             let cls = class(c"ATermObjcAlignedW2");
             assert!(!cls.is_null());
-            let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
             let raw = alloc(cls, sel!(alloc));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let obj = init(raw, sel!(init));
-            let f: unsafe extern "C" fn(Id, Sel) -> u64 = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> u64 = msg();
             let v = f(obj, sel!(marker));
             println!("SURVIVED-THE-UNWRITTEN-IVAR v={v}");
         }

@@ -164,7 +164,8 @@ pub fn is_cachedir_tag(first_line: &str) -> bool {
 #[must_use]
 pub fn target_evidence(dir: &Path) -> Option<Evidence> {
     let is_dir = |name: &str| dir.join(name).is_dir();
-    if let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&dir.join("CACHEDIR.TAG"), MAX_TAG_BYTES)
+    if let Ok(text) =
+        crate::metadata_io::read_bounded_regular_utf8(&dir.join("CACHEDIR.TAG"), MAX_TAG_BYTES)
         && is_cachedir_tag(text.lines().next().unwrap_or(""))
     {
         return Some(Evidence::CachedirTag);
@@ -206,9 +207,10 @@ pub fn destination(dir: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn cargo_hint(dest: &Path) -> Vec<String> {
     let shown = dest.display();
-    let name = dest
-        .file_name()
-        .map_or_else(|| String::from("target.noindex"), |n| n.to_string_lossy().into_owned());
+    let name = dest.file_name().map_or_else(
+        || String::from("target.noindex"),
+        |n| n.to_string_lossy().into_owned(),
+    );
     vec![
         format!("point cargo at it for this shell: export CARGO_TARGET_DIR={shown}"),
         format!("or durably, in .cargo/config.toml: [build] target-dir = \"{shown}\""),
@@ -687,7 +689,11 @@ impl Timing {
     /// latency the run itself observed.
     #[must_use]
     pub fn settle_after(&self, waited: Duration) -> Duration {
-        if waited > self.settle { waited } else { self.settle }
+        if waited > self.settle {
+            waited
+        } else {
+            self.settle
+        }
     }
 
     /// The worst-case wall clock of one [`verify`]: the control timeout, plus the largest
@@ -1047,10 +1053,8 @@ mod tests {
     /// `/private/var/folders/…/T/`, which is typically not indexed at all, so an index query
     /// there would be meaningless AND flaky. The race logic is tested through [`decide`].
     fn scratch(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "atpkg-noindex-{label}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("atpkg-noindex-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         #[cfg(unix)]
@@ -1097,7 +1101,9 @@ mod tests {
     #[test]
     fn cargos_cachedir_signature_is_pinned_by_its_measured_bytes() {
         // Read off /Users//example/.cargo-target-m7c/CACHEDIR.TAG on 2026-09-02.
-        assert!(is_cachedir_tag("Signature: 8a477f597d28d172789f06886806bc55"));
+        assert!(is_cachedir_tag(
+            "Signature: 8a477f597d28d172789f06886806bc55"
+        ));
         assert!(
             is_cachedir_tag("Signature: 8a477f597d28d172789f06886806bc55\r"),
             "a CRLF-written tag is still cargo's tag"
@@ -1146,7 +1152,8 @@ mod tests {
     fn probe_token_is_one_query_safe_word() {
         let t = probe_token(1_756_000_000_123_456_789, 4242);
         assert!(
-            t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            t.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
             "the token is interpolated into an mdfind predicate with no quoting: {t}"
         );
         assert!((20..=48).contains(&t.len()), "{t} has length {}", t.len());
@@ -1254,7 +1261,11 @@ mod tests {
 
         let d = root.join("d");
         std::fs::create_dir_all(d.join("debug")).unwrap();
-        assert_eq!(target_evidence(&d), None, "debug/ alone is not build output");
+        assert_eq!(
+            target_evidence(&d),
+            None,
+            "debug/ alone is not build output"
+        );
 
         let e = root.join("e");
         std::fs::create_dir_all(&e).unwrap();
@@ -1428,8 +1439,14 @@ mod tests {
         std::fs::write(dest.join("theirs"), b"destination").unwrap();
 
         let e = migrate(&target, false);
-        assert!(matches!(e, Err(MigrateError::DestinationExists(_))), "{e:?}");
-        assert!(target.is_dir() && dest.is_dir(), "never clobber, never merge, never delete");
+        assert!(
+            matches!(e, Err(MigrateError::DestinationExists(_))),
+            "{e:?}"
+        );
+        assert!(
+            target.is_dir() && dest.is_dir(),
+            "never clobber, never merge, never delete"
+        );
         assert_eq!(std::fs::read(target.join("mine")).unwrap(), b"source");
         assert_eq!(
             std::fs::read(dest.join("theirs")).unwrap(),
@@ -1527,7 +1544,10 @@ mod tests {
             "a probe left in someone's repo is exactly the litter that makes a hygiene tool \
              untrusted"
         );
-        assert!(!control.exists() && !control_dir.exists(), "the control dir goes whole");
+        assert!(
+            !control.exists() && !control_dir.exists(),
+            "the control dir goes whole"
+        );
         assert!(candidate.is_dir(), "and nothing else is touched");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1694,7 +1714,10 @@ mod tests {
         let Verdict::Unknown(Unmeasured::ScopeExcluded(p)) = &v else {
             panic!("an excluded scope can only answer Unknown: {v}");
         };
-        assert_eq!(p, &std::fs::canonicalize(root.join("build.noindex")).unwrap());
+        assert_eq!(
+            p,
+            &std::fs::canonicalize(root.join("build.noindex")).unwrap()
+        );
         assert!(
             !v.to_string().contains("INDEXED"),
             "the one answer this must never give: {v}"
@@ -1765,7 +1788,10 @@ mod tests {
             "a no-op renames nothing — the directory is still where it was"
         );
         let s = scan(&root, VERB_DEPTH, &Budget::VERB);
-        assert!(s.targets.is_empty() && s.complete, "an empty, COMPLETE scan");
+        assert!(
+            s.targets.is_empty() && s.complete,
+            "an empty, COMPLETE scan"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -349,7 +349,9 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
 
     // The control token IS the channel-binding key. 64-char hex => 32 bytes.
     let Some(token) = EdgeToken::from_hex(token_hex) else {
-        eprintln!("aterm-gui: control token is not 32-byte hex; network drive disabled");
+        crate::logging::stderr_line!(
+            "aterm-gui: control token is not 32-byte hex; network drive disabled"
+        );
         return;
     };
 
@@ -357,7 +359,7 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
         Ok(Some(prepared)) => prepared,
         Ok(None) => return,
         Err(error) => {
-            eprintln!("aterm-gui: {error}");
+            crate::logging::stderr_line!("aterm-gui: {error}");
             return;
         }
     };
@@ -377,7 +379,7 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
         .parent()
         .and_then(crate::control_auth::load_or_create_network_drive_token)
         .unwrap_or_else(|| {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: persistent network-drive token unavailable; using the \
                  per-launch token (re-provision the client after each restart)"
             );
@@ -389,14 +391,16 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
     let config = match aterm_net::tls::server_config(cert_bytes, key_bytes) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("aterm-gui: server cert/key rejected ({e}); network drive disabled");
+            crate::logging::stderr_line!(
+                "aterm-gui: server cert/key rejected ({e}); network drive disabled"
+            );
             return;
         }
     };
     let listener = match TcpListener::bind(bind_addresses.as_slice()) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("aterm-gui: network drive bind failed at {addr}: {e}");
+            crate::logging::stderr_line!("aterm-gui: network drive bind failed at {addr}: {e}");
             return;
         }
     };
@@ -408,7 +412,7 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
     // crosses the network (only the channel-bound HMAC does). The remote driver then
     // speaks raw control verbs over the already-authenticated relay.
     let auth_line = format!("AUTH {token_hex}\n");
-    eprintln!(
+    crate::logging::stderr_line!(
         "aterm-gui: network drive listening at {addr_owned} \
          (TLS, channel-bound capability, relays to the local control socket)"
     );
@@ -417,13 +421,13 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
     // so echoing it on EVERY restart needlessly multiplies its exposure in logs
     // (CWE-532). On later boots emit only a stable fingerprint + the file location.
     if drive_minted {
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: network-drive capability token (provision the client ONCE): {drive_hex}"
         );
-        eprintln!("aterm-gui:   aterm-ctl dial-token <name> {drive_hex}");
+        crate::logging::stderr_line!("aterm-gui:   aterm-ctl dial-token <name> {drive_hex}");
     } else {
         let fp: String = drive_hex.chars().take(8).collect();
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: network-drive token loaded (fingerprint {fp}…, stored 0600 beside the TLS key); \
              re-run with a fresh key dir to re-provision"
         );
@@ -458,14 +462,14 @@ pub fn maybe_spawn(token_hex: &str, sock_path: &str, saved: &crate::app_config::
                     // rejected upstream), so raw ESC/CR/BEL/C1 could survive and forge
                     // a log record boundary or smuggle a terminal escape to whoever
                     // `cat`s the operator's log (CWE-117). Sanitize both before print.
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: network drive relayed a verified peer (src={}, op={})",
                         aterm_log::sanitize_record(&g.src),
                         aterm_log::sanitize_record(&g.op)
                     );
                 }
                 NetEvent::Rejected(why) => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: network drive rejected a connection: {}",
                         aterm_log::sanitize_record(&why)
                     );

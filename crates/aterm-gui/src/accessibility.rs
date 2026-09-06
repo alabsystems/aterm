@@ -228,7 +228,7 @@ mod macos {
                 // sixteen bytes, so it goes in registers on both ABIs. A
                 // zero-length range at `off` is the caret.
                 unsafe {
-                    let set: unsafe extern "C" fn(Id, Sel, NSRange) = aterm_objc::msg();
+                    let set: unsafe extern "C-unwind" fn(Id, Sel, NSRange) = aterm_objc::msg();
                     set(
                         view,
                         sel!(setAccessibilitySelectedTextRange:),

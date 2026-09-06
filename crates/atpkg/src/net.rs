@@ -48,31 +48,47 @@ pub struct Asset {
     pub url: String,
 }
 
-/// The release-download base for `slug` (`owner/repo`), or `None` if the slug is not
-/// exactly one `owner/repo` pair of non-empty, path-safe segments.
+/// The unmetered download URL for asset `name` of release `tag` in `slug`
+/// (`owner/repo`), or `None` if the slug is not exactly one `owner/repo` pair or any
+/// segment is not path-safe.
 ///
-/// Deliberately strict. These builders synthesize a URL instead of reading one out of an
-/// API response, so a slug carrying a slash, a `..`, an empty half, or a scheme would
-/// otherwise splice into a URL pointing somewhere else entirely. Returning `None` costs
-/// only the enumeration fallback, which is the behaviour that shipped before.
-fn release_download_base(slug: &str) -> Option<String> {
+/// ONE builder for both GitHub clients: this delegates to
+/// [`aterm_update_core::cdn::release_download_url`], the same pure function the app
+/// updater derives its asset URLs from, so the publisher's convention has exactly one
+/// spelling in the tree. Deliberately strict — these URLs are synthesized, not read out
+/// of an API response, and a slug or tag carrying a slash, a `..`, an empty half, or a
+/// scheme would otherwise splice into a URL pointing somewhere else entirely. `None`
+/// costs only the enumeration fallback, which is the behaviour that shipped before.
+fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
     let (owner, repo) = slug.split_once('/')?;
-    let ok = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-    };
-    if !ok(owner) || !ok(repo) {
-        return None;
+    aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
+}
+
+/// The ONE way this fetcher reads bytes from the release download host — and it has
+/// no credential parameter, so "no token is ever presented to `github.com`" is a fact
+/// of the type, not of each call site's discipline. Refuses an API URL outright (that
+/// lane goes through the credential-bearing calls beside it), and the transport refuses
+/// the converse (`aterm_update_core` will not pair a token with a non-API host), so the
+/// two lanes cannot be crossed from either side.
+fn web_fetch_bytes(url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    refuse_api_host(url)?;
+    aterm_update_core::download_bytes(url, None, cap)
+}
+
+/// [`web_fetch_bytes`] for the artifact lane: resumable, to `dest`, no credential.
+fn web_fetch_to(url: &str, dest: &Path, cap: u64) -> Result<(), String> {
+    refuse_api_host(url)?;
+    aterm_update_core::download_to_resumable(url, None, dest, cap)
+}
+
+/// The web helpers' own gate: an API URL is not the download host.
+fn refuse_api_host(url: &str) -> Result<(), String> {
+    if aterm_update_core::cdn::is_api_host(url) {
+        let mut msg = String::from("not the release download host: ");
+        msg.push_str(url);
+        return Err(msg);
     }
-    let mut base = String::from("https://github.com/");
-    base.push_str(owner);
-    base.push('/');
-    base.push_str(repo);
-    base.push_str("/releases/download/");
-    Some(base)
+    Ok(())
 }
 
 /// The `(pkg-<program>-<build>.toml, .sig)` CDN URLs for a build already pinned by the
@@ -82,7 +98,6 @@ fn release_download_base(slug: &str) -> Option<String> {
 /// The publishing tag convention is `atpkg-<program>-<build>` (tools/atpkg-publish.sh),
 /// the same string the pack scripts create the release under.
 fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
-    let base = release_download_base(slug)?;
     if program.is_empty()
         || !program
             .bytes()
@@ -91,17 +106,17 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
         return None;
     }
     let b = crate::dec_u64(build);
-    // `atpkg-<program>-<build>/pkg-<program>-<build>.toml`
-    let mut toml = base;
-    toml.push_str("atpkg-");
-    toml.push_str(program);
-    toml.push('-');
-    toml.push_str(&b);
-    toml.push_str("/pkg-");
-    toml.push_str(program);
-    toml.push('-');
-    toml.push_str(&b);
-    toml.push_str(".toml");
+    // `atpkg-<program>-<build>` / `pkg-<program>-<build>.toml`
+    let mut tag = String::from("atpkg-");
+    tag.push_str(program);
+    tag.push('-');
+    tag.push_str(&b);
+    let mut name = String::from("pkg-");
+    name.push_str(program);
+    name.push('-');
+    name.push_str(&b);
+    name.push_str(".toml");
+    let toml = web_asset_url(slug, &tag, &name)?;
     let mut sig = toml.clone();
     sig.push_str(".sig");
     Some((toml, sig))
@@ -112,7 +127,6 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
 /// its extension removed. `None` when the name has no extension to strip or is not
 /// URL-safe — again falling back to enumeration rather than guessing.
 fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
-    let base = release_download_base(slug)?;
     // Strip the FULL extension: these are `.tar.zst`, and `Path::file_stem` would leave
     // `ty-2973.tar`, naming a tag that does not exist.
     let stem = asset.split_once('.')?.0;
@@ -120,18 +134,12 @@ fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
         || !stem
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        || !asset
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
     {
         return None;
     }
-    let mut url = base;
-    url.push_str("atpkg-");
-    url.push_str(stem);
-    url.push('/');
-    url.push_str(asset);
-    Some(url)
+    let mut tag = String::from("atpkg-");
+    tag.push_str(stem);
+    web_asset_url(slug, &tag, asset)
 }
 
 /// Find the `(name, name.sig)` asset-URL pair in a release's assets, if **both** are
@@ -303,12 +311,76 @@ fn index_pair_urls(releases: &[Release]) -> Vec<CandidateUrls<'_>> {
 /// states share one fingerprint. NUL separators keep the concatenation unambiguous —
 /// neither a git tag nor a URL can contain a NUL byte.
 fn candidate_identity(u: &CandidateUrls<'_>) -> String {
+    identity_of([u.label, u.index, u.index_sig, u.roster, u.roster_sig])
+}
+
+/// The one fold both identity shapes use: the tag, then the four URLs, NUL-separated.
+fn identity_of(parts: [&str; 5]) -> String {
     let mut h = aterm_digest::Sha256::new();
-    for part in [u.label, u.index, u.index_sig, u.roster, u.roster_sig] {
+    for part in parts {
         h.update(part.as_bytes());
         h.update([0u8]);
     }
     crate::tree::hex(&h.finalize())
+}
+
+// ---------------------------------------------------------------------------------
+// THE EVERGREEN POINTER — index discovery without the releases API
+// ---------------------------------------------------------------------------------
+
+/// The index publisher's tag grammar for the pointer: exactly `atpkg-index-<build>` with
+/// a non-empty all-digit build (`tools/atpkg-index.sh`, `tools/atpkg-publish-lib.sh`).
+/// An app release (`v0.74.0`), a package release (`atpkg-ty-2973`) or anything else the
+/// repository's `latest` might name is REFUSED by [`aterm_update_core::pointer`] under
+/// this predicate, so the pointer path can never read an index off a non-index release.
+fn index_pointer_tag(tag: &str) -> bool {
+    tag.strip_prefix("atpkg-index-")
+        .is_some_and(|build| !build.is_empty() && build.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The four DERIVED, tag-specific download URLs of one index release — the web lane's
+/// [`CandidateUrls`], owned because nothing server-sent backs them.
+#[derive(Debug)]
+struct PointerQuad {
+    label: String,
+    index: String,
+    index_sig: String,
+    roster: String,
+    roster_sig: String,
+}
+
+/// Derive the quad for `tag` in `slug`. `None` when the slug or tag is not URL-safe (the
+/// caller then takes the listing path, exactly as [`web_asset_url`]'s callers do).
+fn pointer_quad(slug: &str, tag: &str) -> Option<PointerQuad> {
+    let roster = aterm_update_core::roster::ROSTER_ASSET;
+    let mut roster_sig = String::from(roster);
+    roster_sig.push_str(".sig");
+    Some(PointerQuad {
+        label: tag.to_string(),
+        index: web_asset_url(slug, tag, "index.toml")?,
+        index_sig: web_asset_url(slug, tag, "index.toml.sig")?,
+        roster: web_asset_url(slug, tag, roster)?,
+        roster_sig: web_asset_url(slug, tag, &roster_sig)?,
+    })
+}
+
+/// The pointer lane's memoized answer (see `GithubFetcher::pointer`).
+type PointerMemo = std::sync::Mutex<Option<Result<Option<std::sync::Arc<PointerQuad>>, String>>>;
+
+/// The identity of a pointer-lane candidate, in the SAME fold as
+/// [`candidate_identity`]: the tag and the four URLs it was fetched from.
+///
+/// On this lane the URLs are derived from the tag, so the identity moves with the TAG
+/// and only with it. That is the publication identity by construction of the index
+/// publisher: every publish mints a fresh `atpkg-index-<build>` release
+/// (`tools/atpkg-index.sh`), and the public mirror HARD-FAILS on a same-tag release
+/// whose bytes differ from staging (`tools/atpkg-mirror-public.sh`, `mirror_release`)
+/// rather than re-uploading under an existing tag. The fold keeps the same
+/// change-detector standing as the listing lane's (see `candidate_identity`): a stale
+/// match can only suppress — serve already-verified older bytes that still face the
+/// whole trust chain — never authorize.
+fn pointer_identity(q: &PointerQuad) -> String {
+    identity_of([&q.label, &q.index, &q.index_sig, &q.roster, &q.roster_sig])
 }
 
 /// The `(slug, program, build)` triple that fully determines which asset pair a
@@ -351,6 +423,14 @@ pub struct GithubFetcher {
     /// pair (up to 20 × 2 asset downloads). `install_inner` re-resolves it once per
     /// recursive dependency and `install_default_set` once per ungrouped member.
     index: std::sync::Mutex<Option<std::sync::Arc<Vec<Candidate>>>>,
+    /// Per-invocation memo of the EVERGREEN POINTER's answer for the index repo — the
+    /// web lane's discovery step ([`GithubFetcher::index_pointer`]): `None` = not yet
+    /// asked; `Some(Ok(None))` = the listing path is the answer; `Some(Ok(quad))` = the
+    /// tag GitHub's `latest` names carries an index; `Some(Err)` = the pointer failed
+    /// or refused, and so does this resolution. At most one HEAD per process, and
+    /// `index_identities` + `index_candidates` are guaranteed to see the same answer,
+    /// which is the pairing contract the §14 cache relies on.
+    pointer: PointerMemo,
     /// Per-invocation memo of the RAW `(pkg-<program>-<build>.toml, .sig)` bytes, keyed
     /// by `(slug, program, build)` — the triple that fully determines which asset pair is
     /// downloaded. Each miss is two more `download_bytes` round-trips, and the same
@@ -374,6 +454,7 @@ impl GithubFetcher {
             overrides: std::collections::BTreeMap::new(),
             releases: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             index: std::sync::Mutex::new(None),
+            pointer: std::sync::Mutex::new(None),
             manifests: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
@@ -456,34 +537,121 @@ impl GithubFetcher {
         slug.push_str(repo);
         self.releases_at(&slug)
     }
-}
 
-impl crate::flow::Fetcher for GithubFetcher {
-    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-        // Memoized per invocation: the flow resolves the candidates once per program AND
-        // once per transitive dependency, and each miss is a listing plus TWO asset
-        // downloads per carrying release. The bytes are returned by value (a few KB of
-        // TOML + 64-byte sigs — free next to the network), so the trait signature and
-        // every downstream gate are untouched: the same raw bytes still flow through
-        // `select_index` → `admit_roster` → `authorize_index` → `parse_index` → floor →
-        // freshness.
-        if let Ok(memo) = self.index.lock()
-            && let Some(hit) = memo.as_ref()
+    /// The index repo's own `owner/repo`, built the same way `slug_for` builds a
+    /// program's (manual concat — see `releases_at` on `format!` and the Trust gate).
+    fn index_slug(&self) -> String {
+        let mut s = self.owner.clone();
+        s.push('/');
+        s.push_str(&crate::discovery::index_repo());
+        s
+    }
+
+    /// THE WEB LANE'S DISCOVERY: one anonymous, redirect-refusing HEAD of
+    /// `https://github.com/<index slug>/releases/latest/download/index.toml`
+    /// ([`aterm_update_core::pointer`]), whose `Location` names the newest PUBLISHED
+    /// release — and is accepted only when it is exactly this repository's download URL
+    /// under an `atpkg-index-<n>` tag ([`index_pointer_tag`]). `Ok(Some(quad))` is the
+    /// four tag-specific URLs to fetch; every byte then moves over the unmetered host
+    /// and no `api.github.com` request is made at all.
+    ///
+    /// Memoized per fetcher (see the `pointer` field) so the identity probe and the
+    /// candidate fetch agree, and the HEAD is spent at most once. The decision itself
+    /// is [`index_lane`], which says when the pointer is not even asked.
+    fn index_pointer(&self) -> Result<Option<std::sync::Arc<PointerQuad>>, String> {
+        if let Ok(memo) = self.pointer.lock()
+            && let Some(answer) = memo.as_ref()
         {
-            return Ok((**hit).clone());
+            return answer.clone();
         }
+        let answer = self.index_lane(
+            &crate::discovery::index_repo(),
+            &mut aterm_update_core::head_no_redirect,
+        );
+        if let Ok(mut memo) = self.pointer.lock() {
+            *memo = Some(answer.clone());
+        }
+        answer
+    }
+
+    /// The lane decision behind [`index_pointer`], pure over the injected HEAD so it
+    /// is measurable without a network: `Ok(Some)` = the pointer path (no listing);
+    /// `Ok(None)` = the LISTING path (one API request per page); `Err` = this
+    /// resolution fails, as the listing would in its place.
+    ///
+    /// The pointer is NOT ASKED — no HEAD at all — where it cannot resolve by
+    /// construction: on the TOKEN lane (a credential keeps today's API path, the same
+    /// split the app updater makes), and when the index rides the APP repository
+    /// (the shipped configuration: index releases are published there as prereleases
+    /// precisely so `latest` stays the app release the app's own pointer discovers by,
+    /// `tools/atpkg-publish-lib.sh`). Spending a guaranteed-404 HEAD on every
+    /// credential-less `atpkg` process would be a round-trip for nothing. The lane
+    /// becomes live when `ATPKG_INDEX_REPO` names a dedicated index repository.
+    ///
+    /// When it IS asked: a 404 (`NoRelease`) — the dedicated repo has no published
+    /// non-prerelease index release — falls back to the listing, which then diagnoses
+    /// the real state exactly as before; an unsafe slug likewise (the listing refuses
+    /// it on its own terms). A refused redirect (a non-index tag holding `latest`) or
+    /// an unexpected status is a VERDICT about that host, and a 429/5xx or a transport
+    /// failure is a failed resolution: neither is quietly turned into an API listing
+    /// the web lane promises not to make.
+    fn index_lane(
+        &self,
+        index_repo: &str,
+        head: &mut dyn FnMut(
+            &str,
+        )
+            -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError>,
+    ) -> Result<Option<std::sync::Arc<PointerQuad>>, String> {
+        use aterm_update_core::pointer::{PointerError, resolve_with};
+        if self.credential().is_some() || index_repo == aterm_update_core::DEFAULT_REPO {
+            return Ok(None);
+        }
+        let mut slug = self.owner.clone();
+        slug.push('/');
+        slug.push_str(index_repo);
+        match resolve_with(
+            &self.owner,
+            index_repo,
+            "index.toml",
+            &index_pointer_tag,
+            head,
+        ) {
+            Ok(p) => Ok(pointer_quad(&slug, &p.tag).map(std::sync::Arc::new)),
+            Err(PointerError::NoRelease { .. } | PointerError::UnsafeName) => Ok(None),
+            Err(error) => {
+                let mut msg = String::from("index pointer for ");
+                msg.push_str(&slug);
+                msg.push_str(": ");
+                msg.push_str(&error.to_string());
+                Err(msg)
+            }
+        }
+    }
+
+    /// The pointer lane's candidate set: the ONE release `latest` names, its four assets
+    /// fetched from their derived URLs with no API fallback — a failure here is a failure
+    /// of the unmetered host itself, and is reported as such rather than spent against a
+    /// budget this lane does not have.
+    fn pointer_candidates(&self, q: &PointerQuad) -> Result<Vec<Candidate>, String> {
+        Ok(vec![Candidate {
+            label: q.label.clone(),
+            index_bytes: web_fetch_bytes(&q.index, MANIFEST_CAP)?,
+            sig: web_fetch_bytes(&q.index_sig, SIG_CAP)?,
+            roster_bytes: web_fetch_bytes(&q.roster, ROSTER_CAP)?,
+            roster_sig: web_fetch_bytes(&q.roster_sig, SIG_CAP)?,
+        }])
+    }
+
+    /// The LISTING path's candidate set — the historical walk: the index repo's releases
+    /// (one API request per page, the credential when there is one), then the four
+    /// assets of each of the newest [`INDEX_CANDIDATE_CAP`] carrying releases from their
+    /// derived web URLs with the listing's API URL as the fallback.
+    fn listed_candidates(&self, slug: &str) -> Result<Vec<Candidate>, String> {
         let releases = self.releases(&crate::discovery::index_repo())?;
         let mut out = Vec::new();
         // Newest-first, capped ([`index_pair_urls`]): the paginated listing may now span
         // hundreds of releases, and only the newest carrying releases can win selection.
-        // The index repo's own `owner/repo`, built the same way `slug_for` builds a
-        // program's (manual concat — see its note on `format!` and the Trust gate).
-        let slug = {
-            let mut s = self.owner.clone();
-            s.push('/');
-            s.push_str(&crate::discovery::index_repo());
-            s
-        };
         for u in index_pair_urls(&releases) {
             // ZERO-API ASSET FETCH, same derivation as `pkg_manifest`/`download_for`.
             // `u.label` IS the release tag, so each of these four assets has a
@@ -496,14 +664,12 @@ impl crate::flow::Fetcher for GithubFetcher {
             // the slug is not URL-safe or the download fails, so a private mirror or an
             // unusual asset host keeps working exactly as before.
             let direct = |asset: &str, api_url: &str, cap: u64| -> Result<Vec<u8>, String> {
-                if let Some(base) = release_download_base(&slug) {
-                    let mut url = base;
-                    url.push_str(u.label);
-                    url.push('/');
-                    url.push_str(asset);
-                    if let Ok(bytes) = aterm_update_core::download_bytes(&url, None, cap) {
-                        return Ok(bytes);
-                    }
+                // `u.label` is a server-supplied tag: the shared builder refuses one
+                // outside the strict charset rather than splicing it into a path.
+                if let Some(url) = web_asset_url(slug, u.label, asset)
+                    && let Ok(bytes) = web_fetch_bytes(&url, cap)
+                {
+                    return Ok(bytes);
                 }
                 aterm_update_core::download_bytes(api_url, self.credential(), cap)
             };
@@ -526,6 +692,33 @@ impl crate::flow::Fetcher for GithubFetcher {
                 roster_sig,
             });
         }
+        Ok(out)
+    }
+}
+
+impl crate::flow::Fetcher for GithubFetcher {
+    fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+        // Memoized per invocation: the flow resolves the candidates once per program AND
+        // once per transitive dependency, and each miss is a listing plus TWO asset
+        // downloads per carrying release. The bytes are returned by value (a few KB of
+        // TOML + 64-byte sigs — free next to the network), so the trait signature and
+        // every downstream gate are untouched: the same raw bytes still flow through
+        // `select_index` → `admit_roster` → `authorize_index` → `parse_index` → floor →
+        // freshness.
+        if let Ok(memo) = self.index.lock()
+            && let Some(hit) = memo.as_ref()
+        {
+            return Ok((**hit).clone());
+        }
+        let slug = self.index_slug();
+        // THE POINTER PATH FIRST (web lane, dedicated index repo only): when GitHub's
+        // `latest` names an index release, that release IS the candidate set and no
+        // listing is made.
+        let out = if let Some(q) = self.index_pointer()? {
+            self.pointer_candidates(&q)?
+        } else {
+            self.listed_candidates(&slug)?
+        };
         // Successes only — a partial fetch that errored above never reaches here, so a
         // transient failure stays retryable.
         let out = std::sync::Arc::new(out);
@@ -536,6 +729,15 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 
     fn index_identities(&self) -> Option<Vec<String>> {
+        // The pointer lane's identity is the pointer's own answer — the same memoized
+        // HEAD `index_candidates` discovers by, so the two cannot straddle a publish.
+        // A pointer failure yields `None` like a listing failure below: the candidate
+        // fetch then surfaces the real reason.
+        match self.index_pointer() {
+            Ok(Some(q)) => return Some(vec![pointer_identity(&q)]),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         // ONE request, and it is the request `index_candidates` was going to make anyway:
         // `releases_at` memoizes per process, so whichever of the two runs first pays the
         // listing and the other is free. That is what makes this probe honest — it cannot
@@ -615,10 +817,13 @@ impl crate::flow::Fetcher for GithubFetcher {
         //
         // Falls back to enumeration on ANY failure — a repo whose tags predate the
         // convention, or a private mirror that names releases differently, keeps working.
+        //
+        // NO CREDENTIAL on the download host, ever: `github.com` is not the API host,
+        // a token buys nothing there (a private repo answers 404 on this URL shape —
+        // measured 2026-09-02), and a credential belongs only on `api.github.com`.
         if let Some((toml_url, sig_url)) = direct_manifest_urls(&slug, program, build)
-            && let Ok(toml) =
-                aterm_update_core::download_bytes(&toml_url, self.credential(), MANIFEST_CAP)
-            && let Ok(sig) = aterm_update_core::download_bytes(&sig_url, self.credential(), SIG_CAP)
+            && let Ok(toml) = web_fetch_bytes(&toml_url, MANIFEST_CAP)
+            && let Ok(sig) = web_fetch_bytes(&sig_url, SIG_CAP)
         {
             let pair = std::sync::Arc::new((toml, sig));
             if let Ok(mut memo) = self.manifests.lock() {
@@ -650,6 +855,18 @@ impl crate::flow::Fetcher for GithubFetcher {
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        // DIRECT FIRST, exactly as `download_for`: the asset name carries the build, so
+        // its unmetered download URL follows from the name alone and the listing — one
+        // metered request PER PAGE, and the one a drained IP answers 403 to — is only
+        // consulted when the derived URL fails. No credential on the web host.
+        let mut slug = self.owner.clone();
+        slug.push('/');
+        slug.push_str(repo);
+        if let Some(url) = direct_asset_url(&slug, asset)
+            && web_fetch_to(&url, dest, ARTIFACT_CAP).is_ok()
+        {
+            return Ok(());
+        }
         let releases = self.releases(repo)?;
         for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
@@ -701,8 +918,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         // complete file refuses it, which costs exactly what a failed download costs
         // today.
         if let Some(url) = direct_asset_url(&slug, asset)
-            && aterm_update_core::download_to_resumable(&url, self.credential(), dest, ARTIFACT_CAP)
-                .is_ok()
+            && web_fetch_to(&url, dest, ARTIFACT_CAP).is_ok()
         {
             return Ok(());
         }
@@ -1131,6 +1347,105 @@ mod tests {
         assert!(super::direct_manifest_urls("a/b", "", 1).is_none());
         assert!(super::direct_asset_url("a/b", "../x.tar.zst").is_none());
         assert!(super::direct_asset_url("a/b", "noextension").is_none());
+        // The shared builder's own refusals reach here too: a server-supplied tag with
+        // a query, a fragment, an escape or whitespace derives nothing.
+        for tag in ["v1?x", "v1#x", "v1%2f", "v 1", "", ".."] {
+            assert!(
+                super::web_asset_url("a/b", tag, "index.toml").is_none(),
+                "{tag:?}"
+            );
+        }
+        assert_eq!(
+            super::web_asset_url("alabsystems/atpkg-index", "atpkg-index-41", "index.toml")
+                .as_deref(),
+            Some(
+                "https://github.com/alabsystems/atpkg-index/releases/download/atpkg-index-41/index.toml"
+            )
+        );
+    }
+
+    /// Every direct URL is on the UNMETERED web host and none is on the API host — the
+    /// property that makes the direct lane free — and the same string the app updater
+    /// would derive for the same four inputs (one builder, one convention).
+    #[test]
+    fn direct_urls_are_on_the_web_host_never_the_api_and_match_the_shared_builder() {
+        let (toml, sig) = super::direct_manifest_urls("alabsystems/ty", "ty", 2973).unwrap();
+        let artifact = super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst").unwrap();
+        for url in [&toml, &sig, &artifact] {
+            assert!(url.starts_with("https://github.com/"), "{url}");
+            assert!(!aterm_update_core::cdn::is_api_host(url), "{url}");
+        }
+        assert_eq!(
+            Some(toml.as_str()),
+            aterm_update_core::cdn::release_download_url(
+                "alabsystems",
+                "ty",
+                "atpkg-ty-2973",
+                "pkg-ty-2973.toml"
+            )
+            .as_deref()
+        );
+        assert_eq!(
+            Some(artifact.as_str()),
+            aterm_update_core::cdn::release_download_url(
+                "alabsystems",
+                "ty",
+                "atpkg-ty-2973",
+                "ty-2973.tar.zst"
+            )
+            .as_deref()
+        );
+    }
+
+    /// `download` derives the same direct URL `download_for` does from the owner and
+    /// repo it is given, so the artifact that moves hundreds of megabytes is tried on
+    /// the unmetered host BEFORE the listing is consulted — for every asset name the
+    /// publisher emits, and for none that could splice the URL elsewhere.
+    #[test]
+    fn download_tries_the_direct_url_before_listing() {
+        let f = super::GithubFetcher::new("alabsystems".into(), String::new());
+        let mut slug = f.owner.clone();
+        slug.push('/');
+        slug.push_str("ty");
+        assert_eq!(
+            super::direct_asset_url(&slug, "ty-2973.tar.zst").as_deref(),
+            Some(
+                "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
+            )
+        );
+        assert!(super::direct_asset_url(&slug, "../ty-2973.tar.zst").is_none());
+        assert!(super::direct_asset_url("alabsystems/ty/extra", "ty-2973.tar.zst").is_none());
+    }
+
+    /// No credential on the web host, pinned STRUCTURALLY from both sides: the only
+    /// functions this fetcher reads `github.com` through (`web_fetch_bytes`,
+    /// `web_fetch_to`) have no token parameter and refuse an API URL before any
+    /// request; and the transport underneath refuses a token paired with a non-API
+    /// host. Neither refusal needs the network, so both are asserted here.
+    #[test]
+    fn direct_fetches_present_no_credential_to_the_web_host() {
+        let api = "https://api.github.com/repos/alabsystems/ty/releases/assets/1";
+        let web =
+            "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst";
+        let dest = std::env::temp_dir().join("atpkg-web-fetch-gate");
+        let refused = super::web_fetch_bytes(api, 1024).unwrap_err();
+        assert!(
+            refused.contains("not the release download host"),
+            "{refused}"
+        );
+        let refused = super::web_fetch_to(api, &dest, 1024).unwrap_err();
+        assert!(
+            refused.contains("not the release download host"),
+            "{refused}"
+        );
+        assert!(super::refuse_api_host(web).is_ok());
+        // The converse gate, in the transport every lane shares.
+        let refused = aterm_update_core::download_bytes(web, Some("ghp_x"), 1024).unwrap_err();
+        assert!(refused.contains("non-API host"), "{refused}");
+        let refused =
+            aterm_update_core::download_to_resumable(web, Some("ghp_x"), &dest, 1024).unwrap_err();
+        assert!(refused.contains("non-API host"), "{refused}");
+        assert!(!dest.exists(), "nothing was spawned");
     }
 
     #[test]
@@ -1635,5 +1950,268 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(a);
         let _ = std::fs::remove_dir_all(b);
+    }
+
+    // ------------------------------------------------------------------------------
+    // THE EVERGREEN POINTER PATH
+    // ------------------------------------------------------------------------------
+
+    /// Only an `atpkg-index-<digits>` tag may be read off the pointer: an app release,
+    /// a package release, an empty or non-numeric build are all refused by the grammar.
+    #[test]
+    fn the_pointer_accepts_only_index_tags() {
+        assert!(index_pointer_tag("atpkg-index-41"));
+        assert!(index_pointer_tag("atpkg-index-6"));
+        for bad in [
+            "v0.74.0",
+            "atpkg-ty-2973",
+            "atpkg-index-",
+            "atpkg-index-41-rc1",
+            "atpkg-index-x",
+            "index-41",
+            "",
+        ] {
+            assert!(!index_pointer_tag(bad), "{bad}");
+        }
+    }
+
+    /// The pointer's quad is the four DERIVED tag-specific web URLs — the same builder
+    /// the listing lane's `direct` fetch uses — and an unsafe slug derives nothing.
+    #[test]
+    fn the_pointer_quad_is_the_four_derived_web_urls() {
+        let q = pointer_quad("alabsystems/aterm", "atpkg-index-41").unwrap();
+        let base = "https://github.com/alabsystems/aterm/releases/download/atpkg-index-41/";
+        assert_eq!(q.label, "atpkg-index-41");
+        assert_eq!(q.index, format!("{base}index.toml"));
+        assert_eq!(q.index_sig, format!("{base}index.toml.sig"));
+        assert_eq!(q.roster, format!("{base}aterm-machines.toml"));
+        assert_eq!(q.roster_sig, format!("{base}aterm-machines.toml.sig"));
+        for url in [&q.index, &q.index_sig, &q.roster, &q.roster_sig] {
+            assert!(!aterm_update_core::cdn::is_api_host(url), "{url}");
+            assert!(!url.contains("/releases/latest/"), "{url}");
+        }
+        assert!(pointer_quad("a/b/c", "atpkg-index-41").is_none());
+        assert!(pointer_quad("alabsystems/aterm", "atpkg-index-4/1").is_none());
+    }
+
+    /// The pointer identity is the same fold as the listing identity over the same
+    /// five strings, moves with the tag, and — because a tag pins its four derived
+    /// URLs — with the tag only.
+    #[test]
+    fn the_pointer_identity_moves_with_the_tag_and_matches_the_listing_fold() {
+        let q = pointer_quad("alabsystems/aterm", "atpkg-index-41").unwrap();
+        let id = pointer_identity(&q);
+        assert_eq!(id.len(), 64);
+        assert_eq!(
+            id,
+            pointer_identity(&pointer_quad("alabsystems/aterm", "atpkg-index-41").unwrap())
+        );
+        assert_ne!(
+            id,
+            pointer_identity(&pointer_quad("alabsystems/aterm", "atpkg-index-42").unwrap())
+        );
+        // A listing that names the same tag with the same (derived) URLs fingerprints
+        // identically: one fold, two lanes.
+        let listed = Release {
+            tag_name: q.label.clone(),
+            assets: vec![
+                asset("index.toml", q.index.clone()),
+                asset("index.toml.sig", q.index_sig.clone()),
+                asset("aterm-machines.toml", q.roster.clone()),
+                asset("aterm-machines.toml.sig", q.roster_sig.clone()),
+            ],
+        };
+        assert_eq!(
+            id,
+            candidate_identity(&index_pair_urls(std::slice::from_ref(&listed))[0])
+        );
+    }
+
+    /// End to end through the shared pointer resolver with a counting transport: the
+    /// answer GitHub gives for an index release yields the tag in ONE HEAD; an app
+    /// release holding `latest` (the shipped configuration, where index releases are
+    /// prereleases) is REFUSED rather than read; a 404 is the loud standing state. None
+    /// of these makes an API request.
+    #[test]
+    fn the_pointer_resolves_an_index_tag_in_one_head_and_refuses_an_app_release() {
+        use aterm_update_core::pointer::{PointerError, resolve_with};
+        use aterm_update_core::{HeadAnswer, HttpError};
+        let mut asked = Vec::new();
+        let mut head = |url: &str| -> Result<HeadAnswer, HttpError> {
+            asked.push(url.to_string());
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(
+                    "https://github.com/alabsystems/aterm/releases/download/atpkg-index-41/index.toml"
+                        .into(),
+                ),
+            })
+        };
+        let p = resolve_with(
+            "alabsystems",
+            "aterm",
+            "index.toml",
+            &index_pointer_tag,
+            &mut head,
+        )
+        .unwrap();
+        assert_eq!(p.tag, "atpkg-index-41");
+        assert_eq!(
+            asked,
+            vec!["https://github.com/alabsystems/aterm/releases/latest/download/index.toml"]
+        );
+        assert!(
+            asked
+                .iter()
+                .all(|u| !aterm_update_core::cdn::is_api_host(u))
+        );
+        let mut app_release = |_: &str| -> Result<HeadAnswer, HttpError> {
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(
+                    "https://github.com/alabsystems/aterm/releases/download/v0.74.0/index.toml"
+                        .into(),
+                ),
+            })
+        };
+        assert!(matches!(
+            resolve_with(
+                "alabsystems",
+                "aterm",
+                "index.toml",
+                &index_pointer_tag,
+                &mut app_release
+            ),
+            Err(PointerError::Refused { .. })
+        ));
+        let mut none = |_: &str| -> Result<HeadAnswer, HttpError> {
+            Ok(HeadAnswer {
+                code: 404,
+                location: None,
+            })
+        };
+        assert!(matches!(
+            resolve_with(
+                "alabsystems",
+                "aterm",
+                "index.toml",
+                &index_pointer_tag,
+                &mut none
+            ),
+            Err(PointerError::NoRelease { .. })
+        ));
+    }
+
+    /// THE LANE DECISION, measured through a counting HEAD. A dedicated index repo
+    /// whose `latest` names an index release resolves the pointer path in ONE HEAD and
+    /// no API request; its 404 falls back to the listing (one API request per page, by
+    /// `listed_candidates`); a refused redirect, a throttle and a transport failure are
+    /// errors, never a quiet listing. And the pointer is not asked at all — zero
+    /// HEADs — on the token lane or where the index rides the app repository, which
+    /// is the shipped configuration.
+    #[test]
+    fn the_index_lane_is_decided_by_one_head_and_never_by_a_quiet_api_listing() {
+        use aterm_update_core::{HeadAnswer, HttpError};
+        let f = GithubFetcher::new("alabsystems".into(), String::new());
+        let mut asked: Vec<String> = Vec::new();
+        let answer = |code: u16, location: Option<&str>| -> Result<HeadAnswer, HttpError> {
+            Ok(HeadAnswer {
+                code,
+                location: location.map(str::to_string),
+            })
+        };
+        // 302 to an index tag: the pointer path, one HEAD of the evergreen URL.
+        let mut head = |url: &str| {
+            asked.push(url.to_string());
+            answer(
+                302,
+                Some(
+                    "https://github.com/alabsystems/toolchain-index/releases/download/atpkg-index-41/index.toml",
+                ),
+            )
+        };
+        let quad = f
+            .index_lane("toolchain-index", &mut head)
+            .unwrap()
+            .expect("the pointer path");
+        assert_eq!(quad.label, "atpkg-index-41");
+        assert_eq!(
+            asked,
+            vec![
+                "https://github.com/alabsystems/toolchain-index/releases/latest/download/index.toml"
+            ]
+        );
+        for url in [&quad.index, &quad.index_sig, &quad.roster, &quad.roster_sig] {
+            assert!(url.starts_with(
+                "https://github.com/alabsystems/toolchain-index/releases/download/atpkg-index-41/"
+            ));
+            assert!(!aterm_update_core::cdn::is_api_host(url));
+        }
+        // 404: the listing path, after exactly one HEAD.
+        asked.clear();
+        let mut head = |url: &str| {
+            asked.push(url.to_string());
+            answer(404, None)
+        };
+        assert!(
+            f.index_lane("toolchain-index", &mut head)
+                .unwrap()
+                .is_none(),
+            "a 404 falls back to the listing"
+        );
+        assert_eq!(asked.len(), 1);
+        // A refused redirect (an app release holding `latest`), a throttle, a
+        // transport failure: this resolution fails; nothing is listed instead.
+        for (why, reply) in [
+            (
+                "an app tag",
+                answer(
+                    302,
+                    Some(
+                        "https://github.com/alabsystems/toolchain-index/releases/download/v0.74.0/index.toml",
+                    ),
+                ),
+            ),
+            ("a throttle", answer(429, None)),
+            ("a proxy", answer(200, None)),
+            (
+                "a transport failure",
+                Err(HttpError::Transport("curl: (6) DNS".into())),
+            ),
+        ] {
+            let mut reply = Some(reply);
+            let mut head = |_: &str| reply.take().expect("one HEAD");
+            let error = f.index_lane("toolchain-index", &mut head).expect_err(why);
+            assert!(
+                error.starts_with("index pointer for alabsystems/toolchain-index: "),
+                "{why}: {error}"
+            );
+        }
+        // Not asked at all: the app repository (the shipped configuration), and the
+        // token lane.
+        let mut never =
+            |url: &str| -> Result<HeadAnswer, HttpError> { panic!("the pointer was asked: {url}") };
+        assert!(
+            f.index_lane(aterm_update_core::DEFAULT_REPO, &mut never)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::manifest::INDEX_REPO,
+            aterm_update_core::DEFAULT_REPO,
+            "the shipped index repo IS the app repo; when that changes, the pointer lane \
+             goes live by itself"
+        );
+        let token = GithubFetcher::new("alabsystems".into(), "ghp_x".into());
+        assert!(
+            token
+                .index_lane("toolchain-index", &mut never)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            token.pointer.lock().unwrap().is_none(),
+            "nothing was memoized: the memo is `index_pointer`'s, and it was not called"
+        );
     }
 }

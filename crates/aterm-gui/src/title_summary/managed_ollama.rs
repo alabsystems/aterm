@@ -403,6 +403,9 @@ pub(super) fn terminate_unadmitted_managed_child(
     if std::thread::Builder::new()
         .name("aterm-ollama-admission-reaper".to_string())
         .spawn(move || {
+            // QoS (port of 61a6c8b62): a reaper is `Background`, not
+            // `Housekeeping` — it owes a kill-and-reap on a deadline.
+            crate::qos::set_self(crate::qos::Role::Background);
             if let Some((child, private_home)) = reaper_pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -479,6 +482,8 @@ fn terminate_owned_ollama(mut owned: OwnedOllamaChild) {
         let _ = std::thread::Builder::new()
             .name("aterm-ollama-group-reaper".to_string())
             .spawn(move || {
+                // QoS (port of 61a6c8b62): reaper — `Background`, see `qos::Role`.
+                crate::qos::set_self(crate::qos::Role::Background);
                 let _ = child.wait();
                 cleanup_private_managed_home(home.as_deref());
             });
@@ -514,6 +519,8 @@ fn terminate_owned_ollama_nonblocking(mut owned: OwnedOllamaChild) {
     if std::thread::Builder::new()
         .name("aterm-ollama-revocation".to_string())
         .spawn(move || {
+            // QoS (port of 61a6c8b62): reaper — `Background`, see `qos::Role`.
+            crate::qos::set_self(crate::qos::Role::Background);
             let owned = reaper_pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1031,6 +1038,41 @@ pub(super) fn configure_dedicated_process_session(command: &mut std::process::Co
     }
 }
 
+/// The SHORT-LIVED probe's isolation: its own process GROUP, and no `pre_exec`.
+///
+/// [`configure_dedicated_process_session`] is correct for the long-lived model
+/// daemon, which must leave the session entirely. It is the wrong tool for a
+/// sub-second `lsof`/`codesign` probe, and expensively so: any `pre_exec`
+/// closure disqualifies `Command` from the `posix_spawn` fast path and forces a
+/// real `fork()`. Forking copies the parent's page tables, so the cost scales
+/// with how large aterm's address space happens to be — which is why a probe
+/// whose actual work takes ~90 ms could blow a 250 ms budget on a loaded host,
+/// fail the attestation closed, and silently switch smart titles off on exactly
+/// the busy machine where they help most.
+///
+/// `process_group(0)` asks for the same thing the group-kill actually needs —
+/// PGID == the child's own PID, so `kill(-pid)` still reaps the whole subtree,
+/// a re-parented grandchild included — but expresses it as a spawn ATTRIBUTE
+/// (`POSIX_SPAWN_SETPGROUP`) rather than as code that must run between fork
+/// and exec. `posix_spawn` is preserved, and the probe costs a spawn instead of
+/// a copy of aterm.
+///
+/// The deliberate difference from the daemon path is the SESSION: this child
+/// keeps the parent's. That is the right trade for a probe that runs a fixed
+/// absolute system binary with a cleared environment and null stdio, and never
+/// outlives its bounded wait — while the daemon, which outlives the call and
+/// serves a socket, keeps full session detachment.
+///
+/// PROVENANCE: hand-port of commit `61a6c8b62` (`fix/event-loop-wake-spin-v2`,
+/// 2026-08-11). A port and not a merge because main is ~2100 commits past that
+/// branch's base and nothing in it applies textually; this function and its
+/// use in [`run_command_bounded`] are re-expressed against today's file.
+#[cfg(unix)]
+pub(super) fn configure_dedicated_process_group(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.process_group(0);
+}
+
 /// The environment surface [`configure_managed_ollama_environment`] writes
 /// through: a real [`std::process::Command`] in production.
 ///
@@ -1242,8 +1284,11 @@ pub(super) fn run_command_bounded(
         } else {
             std::process::Stdio::piped()
         });
+    // Own process group (for the group-kill below) WITHOUT a `pre_exec`, so this
+    // bounded probe keeps the `posix_spawn` fast path instead of forking a copy
+    // of aterm's address space. See `configure_dedicated_process_group`.
     #[cfg(unix)]
-    configure_dedicated_process_session(command);
+    configure_dedicated_process_group(command);
     let mut child = command
         .spawn()
         .map_err(|_| format!("could not run {label}"))?;
@@ -1262,7 +1307,9 @@ pub(super) fn run_command_bounded(
     let terminate = |child: &mut std::process::Child| {
         #[cfg(unix)]
         if let Ok(group) = i32::try_from(child.id()) {
-            // SAFETY: setsid above made the exact child PID its private group ID.
+            // SAFETY: `process_group(0)` above (POSIX_SPAWN_SETPGROUP) made the
+            // exact child PID its private group ID, so the negative target names
+            // that group and nothing outside it.
             let _ = unsafe { libc::kill(-group, libc::SIGKILL) };
         }
         #[cfg(not(unix))]
@@ -1449,7 +1496,36 @@ pub(super) fn established_server_pid(stream: &std::net::TcpStream) -> Result<u32
     // concurrently between fork(2) and exec(2) can likewise expose a second,
     // inherited view of that exact FD for one snapshot. Retry both transient
     // shapes, but still require one unique server owner within the tight bound.
-    let deadline = Instant::now() + Duration::from_secs(1);
+    //
+    // BOUNDS SIZED FOR A BUSY MACHINE, not an idle one (port of 61a6c8b62). These
+    // cap how long the OWNER LOOKUP may take; they are not part of the trust
+    // decision, which is the unique-owner requirement below plus the ancestry
+    // and codesign checks the caller runs. Loosening them cannot admit an
+    // unverified process — it only stops a slow answer from being read as no
+    // answer.
+    //
+    // The previous 250 ms per attempt / 1 s overall was tight enough to fail on
+    // a loaded host: `lsof` itself returns in ~90 ms here, but the budget also
+    // has to cover spawn and dyld for the child, and under CPU saturation that
+    // overshot 250 ms and the attestation failed closed. The user-visible result
+    // was smart titles quietly not working on exactly the busy machine where a
+    // slow build makes a descriptive tab title most useful.
+    //
+    // The probe's TYPICAL cost is ~90 ms; what the budget has to survive is its
+    // VARIANCE. Measured on a saturated host (load ~84) the same call is usually
+    // ~90 ms but intermittently exceeds half a second, so a bound picked from the
+    // typical cost turns a busy machine into a silent feature outage. 2 s per
+    // attempt × 6 s overall is sized for the tail instead, still admits three
+    // FULL-TIMEOUT attempts (the loop below is deadline-driven, retrying every
+    // 10 ms until the total elapses) for the connect/accept race above, and
+    // still fails closed.
+    //
+    // Being generous here is cheap: this runs on the smart-title WORKER thread
+    // (`qos::Role::Background`), never the UI thread, so a slow answer delays a
+    // tab label and nothing else.
+    const OWNER_PROBE_ATTEMPT: Duration = Duration::from_secs(2);
+    const OWNER_PROBE_TOTAL: Duration = Duration::from_secs(6);
+    let deadline = Instant::now() + OWNER_PROBE_TOTAL;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1461,7 +1537,7 @@ pub(super) fn established_server_pid(stream: &std::net::TcpStream) -> Result<u32
                 .args(["-nP", "-a"])
                 .arg(&selector)
                 .args(["-sTCP:ESTABLISHED", "-FpnT"]),
-            remaining.min(Duration::from_millis(250)),
+            remaining.min(OWNER_PROBE_ATTEMPT),
             64 * 1024,
             "managed Ollama listener inspection",
         )?;

@@ -13970,7 +13970,7 @@ mod terminal_cursor_color_tests {
         assert_eq!(terminal_cursor_rgb(&term), [0xfe, 0x01, 0x7f]);
 
         let Some(mut renderer) = aterm_render::Renderer::from_system(16.0, Theme::default()) else {
-            eprintln!("SKIP: no system monospace font");
+            crate::logging::stderr_line!("SKIP: no system monospace font");
             return;
         };
         let (cw, ch) = renderer.cell_size();
@@ -22535,7 +22535,7 @@ impl App {
             let e = *EPOCH.get_or_init(std::time::Instant::now);
             let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
             if *last != Some(cur) {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "SPAWNSRC t_us={} cur={:?} vis={}",
                     frame_started.saturating_duration_since(e).as_micros(),
                     cur,
@@ -25274,7 +25274,19 @@ impl App {
             FONT_WARM.call_once(|| {
                 std::thread::Builder::new()
                     .name("aterm-font-warm".into())
-                    .spawn(aterm_render::warm_font_coverage_index)
+                    .spawn(|| {
+                        // QoS (port of 61a6c8b62): `Responsive`, NOT `Background`
+                        // as the branch had it. The warm initialises the
+                        // `font_coverage_index` `OnceLock`, and the UI thread's
+                        // first fallback-glyph miss (`runtime_fallback_scan_
+                        // candidates`) blocks on that same init if it lands
+                        // mid-scan. An in-progress `OnceLock` is a lock the UI
+                        // thread contends; demoting its initialiser below the UI
+                        // thread is a priority inversion, so it keeps the PTY
+                        // drain's class rather than dropping to UTILITY.
+                        crate::qos::set_self(crate::qos::Role::Responsive);
+                        aterm_render::warm_font_coverage_index();
+                    })
                     .ok();
             });
         }
@@ -29115,7 +29127,7 @@ impl App {
             .backend
             .gpu_mut()
             .and_then(|gpu| gpu.device_loss_reason());
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: GPU device lost{} — downgrading to the CPU renderer so windows keep rendering",
             loss_reason
                 .as_deref()
@@ -29131,7 +29143,7 @@ impl App {
         #[cfg(windows)]
         if aterm_gpu::dx12_visual_swapchain_requested() {
             aterm_gpu::withdraw_dx12_visual_swapchain();
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: this session's windows were created for the background_material \
                  backdrop (no redirection bitmap); the CPU fallback cannot draw into them — \
                  open a new window or restart aterm"
@@ -29158,7 +29170,7 @@ impl App {
         {
             Ok(cpu) => cpu,
             Err(error) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: could not rebuild the resident CPU fallback after GPU loss: {error}"
                 );
                 return GpuRecoveryOutcome::BackendUnavailable;
@@ -29212,7 +29224,7 @@ impl App {
                     }
                 }
                 Err(reason) => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: CPU surface creation failed during GPU recovery; retrying with bounded backoff"
                     );
                     if let Some(ws) = self.windows.get_mut(&wid) {
@@ -29944,7 +29956,7 @@ impl App {
             }
         }
         if dt_max != 0 && self.trace_latency {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-latency output->present: {:.2} ms",
                 dt_max as f64 / 1e6
             );
@@ -41029,7 +41041,7 @@ mod find_panel_visual_tests {
             .expect("png header")
             .write_image_data(&rgb)
             .expect("png data");
-        eprintln!(
+        crate::logging::stderr_line!(
             "wrote {} ({}x{})",
             path.display(),
             frame.width,
@@ -41071,7 +41083,7 @@ mod find_panel_visual_tests {
         content(&app, &lines);
         app.search_enter();
         if !capture(&mut app, wid, &dir, "1-empty") {
-            eprintln!("no system font — visual capture skipped");
+            crate::logging::stderr_line!("no system font — visual capture skipped");
             return;
         }
 
@@ -42510,11 +42522,11 @@ mod strip_lane_oracle {
             scrolled_frames >= 2,
             "the corpus never presented a SCROLLED-BACK viewport ({scrolled_frames}) — the              offset clause is untested"
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "STRIP-LANE ORACLE: scoped_on={scoped_on} full_on={full_on} scoped_off={scoped_off} \
              lane_on={lane_on} lane_work={lane_reported_work}"
         );
-        eprintln!("STRIP-LANE ORACLE full-arm causes: {cause_tally:?}");
+        crate::logging::stderr_line!("STRIP-LANE ORACLE full-arm causes: {cause_tally:?}");
         // The attribution must DISCRIMINATE. A corpus that drives find-bar
         // overwrites, scrollback, strip-count changes and settled steady states
         // and still reports one single clause would mean the cause is a
@@ -42580,13 +42592,15 @@ mod strip_lane_oracle {
 
         let (before_scoped, before_full, before_causes) = steady_state_share(false);
         let (after_scoped, after_full, after_causes) = steady_state_share(true);
-        eprintln!(
+        crate::logging::stderr_line!(
             "STRIP SCOPED SHARE  before: scoped={before_scoped} full={before_full} \
              ({:.0}%)  after: scoped={after_scoped} full={after_full} ({:.0}%)",
             100.0 * before_scoped as f64 / (before_scoped + before_full) as f64,
             100.0 * after_scoped as f64 / (after_scoped + after_full) as f64,
         );
-        eprintln!("STRIP FULL-ARM CAUSES  before: {before_causes:?}  after: {after_causes:?}");
+        crate::logging::stderr_line!(
+            "STRIP FULL-ARM CAUSES  before: {before_causes:?}  after: {after_causes:?}"
+        );
         // THE ATTRIBUTION THIS ITEM EXISTS FOR, pinned on the shape that
         // motivated it — and it corrected a guess, which is the point of
         // measuring rather than reasoning. The pre-fix reclaim leaves the
@@ -43859,7 +43873,9 @@ mod dmg1_full_arm_attribution {
             let _ = steady_state(&mut app, wid, focus, 4);
             const FRAMES: usize = 32;
             let d = steady_state(&mut app, wid, focus, FRAMES);
-            eprintln!("SPLIT({panes}) steady state (exact only under --exact): {d:?}");
+            crate::logging::stderr_line!(
+                "SPLIT({panes}) steady state (exact only under --exact): {d:?}"
+            );
             assert!(
                 d.painted >= FRAMES - 2,
                 "the workload must actually present: {d:?}"
@@ -43937,7 +43953,7 @@ mod dmg1_full_arm_attribution {
             rows,
             cols,
         );
-        eprintln!("SPLIT focused-leaf carrier state, settled: {settled:?}");
+        crate::logging::stderr_line!("SPLIT focused-leaf carrier state, settled: {settled:?}");
         assert!(
             matches!(settled, FrameRefill::Scoped { .. }),
             "the composed focused leaf must arrive with its continuity chain intact — it \
@@ -43961,7 +43977,7 @@ mod dmg1_full_arm_attribution {
             rows,
             cols,
         );
-        eprintln!("SPLIT focused-leaf carrier state, one echo: {echoed:?}");
+        crate::logging::stderr_line!("SPLIT focused-leaf carrier state, one echo: {echoed:?}");
         let refilled = match echoed {
             FrameRefill::Scoped { rows_refilled } => rows_refilled,
             FrameRefill::Full { cause } => panic!(

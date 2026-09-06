@@ -10638,7 +10638,16 @@ fn step_flip(ctx: &mut CutCtx) -> Result<()> {
             // process-local guard obtained at step entry.
             let endpoint = format!("repos/{}/releases/{release_id}", ctx.slug);
             gh_retry_guarded(
-                &["api", "--method", "PATCH", &endpoint, "-F", "draft=false"],
+                &[
+                    "api",
+                    "--method",
+                    "PATCH",
+                    &endpoint,
+                    "-F",
+                    "draft=false",
+                    "-f",
+                    "make_latest=true",
+                ],
                 || {
                     prove_draft_artifacts(ctx)?;
                     let current = release_object_by_id(&ctx.slug, release_id)?;
@@ -10669,6 +10678,7 @@ fn step_flip(ctx: &mut CutCtx) -> Result<()> {
                 &ctx.commit,
                 false,
             )?;
+            prove_latest_release_is_this_cut(&ctx.slug, &ctx.tag)?;
             step("", &format!("draft release ID {release_id} → live"));
         }
         Some(release) => {
@@ -11161,6 +11171,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
                 // an unauthenticated GET of the DMG still 404s — the silent
                 // never-updates state this probe was added after v0.8.0 to remove.
                 prove_channel_is_anonymously_readable(ctx, &slug)?;
+                prove_evergreen_pointer_serves_this_cut(ctx, &slug)?;
                 step(
                     "mirror",
                     &format!(
@@ -11237,7 +11248,16 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     } else {
         let endpoint = format!("repos/{slug}/releases/{release_id}");
         gh_retry_guarded(
-            &["api", "--method", "PATCH", &endpoint, "-F", "draft=false"],
+            &[
+                "api",
+                "--method",
+                "PATCH",
+                &endpoint,
+                "-F",
+                "draft=false",
+                "-f",
+                "make_latest=true",
+            ],
             || {
                 let current = release_object_by_id(&slug, release_id)?;
                 validate_mirror_release_capability(current.as_ref(), release_id, &ctx.tag, true)?;
@@ -11256,6 +11276,7 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     // authenticated proof above and is invisible to every real client, which is the
     // silent never-updates failure the mirror was built to remove.
     prove_channel_is_anonymously_readable(ctx, &slug)?;
+    prove_evergreen_pointer_serves_this_cut(ctx, &slug)?;
     step(
         "mirror",
         &format!(
@@ -11355,6 +11376,227 @@ fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
         }
     }
     Ok(last.expect("at least one attempt"))
+}
+
+/// What the EVERGREEN POINTER `https://github.com/<slug>/releases/latest/download/<asset>`
+/// answers a credential-less client — read with redirects REFUSED, by the deployed
+/// web-lane updater's OWN resolver (`aterm_update_core::pointer::resolve`: the same
+/// transport, the same strict `Location` parse, the same classification), so the
+/// publisher cannot drift from the client it is proving something about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PointerProbe {
+    /// A 3xx whose `Location` is exactly this repository's tag-specific download URL
+    /// for `asset` under a tag the deployed client accepts.
+    Tag { tag: String, location: String },
+    /// 404: no published (non-draft, non-prerelease) release — or a private repository,
+    /// which GitHub renders identically on this host.
+    NoRelease,
+    /// Anything else the client would not read as a tag — a refused redirect (another
+    /// repository, a non-canonical tag), a non-redirect status, a throttle — worded as
+    /// the client words it.
+    Other(String),
+}
+
+/// One anonymous, redirect-refusing HEAD of the evergreen pointer for `asset` in
+/// `slug`, classified under `accept` (the deployed client's tag grammar). The core
+/// resolver attaches no credential to any request (a token never reaches `github.com`
+/// by its transport's own gate), so this is what a STRANGER's updater resolves. A
+/// transport failure is an error, never a verdict.
+pub fn probe_evergreen_pointer(
+    slug: &str,
+    asset: &str,
+    accept: &dyn Fn(&str) -> bool,
+) -> Result<PointerProbe> {
+    let (owner, repo) = slug
+        .split_once('/')
+        .ok_or_else(|| Error::new(format!("not an owner/repo slug: {slug}")))?;
+    pointer_probe_from(
+        slug,
+        aterm_update_core::pointer::resolve(owner, repo, asset, accept),
+    )
+}
+
+/// The client resolver's answer, mapped onto the three arms the cut reasons about.
+/// Split out so the mapping is testable without a network.
+fn pointer_probe_from(
+    slug: &str,
+    resolved: std::result::Result<
+        aterm_update_core::pointer::Pointer,
+        aterm_update_core::pointer::PointerError,
+    >,
+) -> Result<PointerProbe> {
+    use aterm_update_core::pointer::PointerError;
+    match resolved {
+        Ok(p) => Ok(PointerProbe::Tag {
+            tag: p.tag,
+            location: p.location,
+        }),
+        Err(PointerError::NoRelease { .. }) => Ok(PointerProbe::NoRelease),
+        Err(PointerError::Transport(message)) => Err(Error::new(format!(
+            "anonymous HEAD of the evergreen pointer of {slug} failed: {message}"
+        ))),
+        Err(PointerError::UnsafeName) => Err(Error::new(format!(
+            "{slug} is not a URL-safe release source"
+        ))),
+        Err(
+            other @ (PointerError::Refused { .. }
+            | PointerError::Transient { .. }
+            | PointerError::Unexpected { .. }),
+        ) => Ok(PointerProbe::Other(other.to_string())),
+    }
+}
+
+/// THE POINTER GATE (public channel). The deployed web-lane updater discovers the
+/// channel head from one anonymous HEAD of the evergreen appcast pointer and fetches
+/// nothing unless that tag moved — so a cut whose pointer does not name it is a cut no
+/// credential-less install will ever see, however correct its assets. This proves, against
+/// what GitHub actually serves a stranger, that (1) the pointer resolves to THIS cut's tag
+/// under the client's own strict parse, and (2) the appcast served at that tag-specific
+/// URL is byte-identical to the one this cut uploaded.
+///
+/// Retried on the same budget as the other anonymous probes: GitHub recomputes `latest`
+/// moments after the flip, and a client arriving seconds later is the real case.
+fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<()> {
+    let asset = manifest_out::MANIFEST_ASSET;
+    let mut last = PointerProbe::NoRelease;
+    let mut location = None;
+    for attempt in 1..=ANON_PROBE_ATTEMPTS {
+        last =
+            probe_evergreen_pointer(slug, asset, &aterm_update_core::pointer::canonical_app_tag)?;
+        if let PointerProbe::Tag { tag, location: loc } = &last
+            && tag == &ctx.tag
+        {
+            location = Some(loc.clone());
+            break;
+        }
+        if attempt < ANON_PROBE_ATTEMPTS {
+            std::thread::sleep(ANON_PROBE_DELAY);
+        }
+    }
+    let Some(location) = location else {
+        let observed = match &last {
+            PointerProbe::Tag { tag, .. } => format!("names {tag}"),
+            PointerProbe::NoRelease => {
+                "answers 404 (no published non-prerelease release, or the repository is \
+                 private)"
+                    .to_string()
+            }
+            PointerProbe::Other(reason) => format!("answers: {reason}"),
+        };
+        return Err(Error::new(format!(
+            "the evergreen pointer https://github.com/{slug}/releases/latest/download/{asset} \
+             {observed}, not {} — every credential-less install discovers the channel head \
+             from that pointer and would never see this cut. Make this release the latest \
+             (`gh release edit {} -R {slug} --latest`), then `cargo ship cut --resume`.",
+            ctx.tag, ctx.tag
+        )));
+    };
+    // (2) the bytes at the tag-specific URL the pointer named are the uploaded appcast.
+    let local = fs::read(ctx.manifest_path()).map_err(|error| {
+        Error::new(format!(
+            "read journaled manifest {} for the pointer gate: {error}",
+            ctx.manifest_path().display()
+        ))
+    })?;
+    let served = anon_probe(&[
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--location",
+        "--proto-redir",
+        "=https",
+        "--max-time",
+        "60",
+        &location,
+    ])?;
+    if !served.status.success() {
+        return Err(Error::new(format!(
+            "the evergreen pointer names {} but an unauthenticated GET of {location} failed \
+             ({}) after {ANON_PROBE_ATTEMPTS} attempts",
+            ctx.tag,
+            String::from_utf8_lossy(&served.stderr).trim()
+        )));
+    }
+    if served.stdout != local {
+        return Err(Error::new(format!(
+            "the appcast served at {location} ({} bytes) is not byte-identical to the one \
+             this cut uploaded ({} bytes) — someone republished under {}, or the upload was \
+             clobbered; investigate before trusting this release",
+            served.stdout.len(),
+            local.len(),
+            ctx.tag
+        )));
+    }
+    // (3) THE URL BIND. The web-lane client refuses a manifest whose `url` is not
+    // exactly the tag-specific download URL of its own `dmg` under the tag the pointer
+    // named (`aterm_update::github::web_container_url_agrees`) — so a mis-set
+    // `update_channel` (the slug `manifest_out.rs` writes into `url`) must fail THIS
+    // cut, not every credential-less install.
+    let served_text = std::str::from_utf8(&served.stdout)
+        .map_err(|_| Error::new(format!("the appcast served at {location} is not UTF-8")))?;
+    let manifest = Manifest::parse(served_text).map_err(|error| {
+        Error::new(format!(
+            "the appcast served at {location} does not parse as a manifest: {error}"
+        ))
+    })?;
+    assert_manifest_url_binds(slug, &ctx.tag, &manifest)?;
+    step(
+        "",
+        &format!(
+            "evergreen pointer → {} and serves the uploaded {asset} byte-identically, whose \
+             url binds it to {} and {}",
+            ctx.tag, ctx.tag, manifest.dmg
+        ),
+    );
+    Ok(())
+}
+
+/// The publisher-side statement of the client's URL bind: `manifest.url` must be
+/// exactly `aterm_update_core::cdn::release_download_url(slug, tag, manifest.dmg)`.
+fn assert_manifest_url_binds(slug: &str, tag: &str, manifest: &Manifest) -> Result<()> {
+    let (owner, repo) = slug
+        .split_once('/')
+        .ok_or_else(|| Error::new(format!("not an owner/repo slug: {slug}")))?;
+    let want = aterm_update_core::cdn::release_download_url(owner, repo, tag, &manifest.dmg)
+        .ok_or_else(|| {
+            Error::new(format!(
+                "no download URL can be derived for {:?} of {tag} in {slug}",
+                manifest.dmg
+            ))
+        })?;
+    match manifest.url.as_deref() {
+        Some(url) if url == want => Ok(()),
+        other => Err(Error::new(format!(
+            "the appcast's url is {}, not {want} — the credential-less updater refuses a \
+             manifest whose url does not bind it to its tag and container; check \
+             `[workspace.metadata.aterm] update_channel` (manifest_out.rs writes it into \
+             `url`) before cutting again",
+            other.map_or_else(|| "absent".to_string(), |url| format!("{url:?}"))
+        ))),
+    }
+}
+
+/// THE POINTER GATE (origin, authenticated). The origin repository is private, so its
+/// pointer answers a stranger 404 by design; what `make_latest=true` must have achieved
+/// there is visible only through the API. `releases/latest` must be this cut, or the
+/// mirror step would flip a public release whose origin twin GitHub does not consider
+/// latest — a state the yank/abandon tooling reasons from.
+fn prove_latest_release_is_this_cut(slug: &str, tag: &str) -> Result<()> {
+    let out = gh_retry(&[
+        "api",
+        &format!("repos/{slug}/releases/latest"),
+        "--jq",
+        ".tag_name",
+    ])?;
+    let latest = out.stdout_utf8().trim().to_string();
+    if latest != tag {
+        return Err(Error::new(format!(
+            "{slug} reports releases/latest = {latest:?} after flipping {tag} live with \
+             make_latest=true — GitHub did not make this cut the latest release; make it so \
+             (`gh release edit {tag} -R {slug} --latest`) and `cargo ship cut --resume`"
+        )));
+    }
+    Ok(())
 }
 
 fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()> {
@@ -12488,5 +12730,107 @@ mod lean_dmg_ceiling_tests {
             message.contains(&(LEAN_DMG_CEILING_BYTES + 1).to_string()),
             "the refusal must report the retained file's size: {message}"
         );
+    }
+
+    /// The publisher's pointer gate is a thin map over the deployed client's own
+    /// resolver: a tag is a tag, a 404 is "no release", a transport failure is an
+    /// ERROR (never a verdict), and everything the client refuses to read as a tag is
+    /// `Other`, worded as the client words it.
+    #[test]
+    fn the_pointer_probe_preserves_the_client_resolvers_three_arms() {
+        use aterm_update_core::pointer::{Pointer, PointerError};
+        let good =
+            "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-appcast.toml";
+        assert_eq!(
+            pointer_probe_from(
+                "alabsystems/aterm",
+                Ok(Pointer {
+                    tag: "v0.74.0".into(),
+                    location: good.into()
+                })
+            )
+            .unwrap(),
+            PointerProbe::Tag {
+                tag: "v0.74.0".into(),
+                location: good.into()
+            }
+        );
+        assert_eq!(
+            pointer_probe_from(
+                "alabsystems/aterm",
+                Err(PointerError::NoRelease { url: "x".into() })
+            )
+            .unwrap(),
+            PointerProbe::NoRelease
+        );
+        assert!(
+            pointer_probe_from(
+                "alabsystems/aterm",
+                Err(PointerError::Transport("curl: (6) DNS".into()))
+            )
+            .is_err(),
+            "a transport failure is an error, never a verdict"
+        );
+        assert!(pointer_probe_from("alabsystems/aterm", Err(PointerError::UnsafeName)).is_err());
+        for refused in [
+            PointerError::Refused {
+                why: "the redirect's tag is not a release tag this client installs from",
+            },
+            PointerError::Transient {
+                code: 429,
+                url: "x".into(),
+            },
+            PointerError::Unexpected {
+                code: 200,
+                url: "x".into(),
+            },
+        ] {
+            let text = refused.to_string();
+            assert_eq!(
+                pointer_probe_from("alabsystems/aterm", Err(refused)).unwrap(),
+                PointerProbe::Other(text)
+            );
+        }
+    }
+
+    /// The cut refuses an appcast whose `url` is not the client's derived download URL
+    /// for its tag and container — the bind the web-lane client enforces, proven at
+    /// the publisher so a mis-set `update_channel` fails the cut and not the fleet.
+    #[test]
+    fn the_cut_asserts_the_manifests_url_bind() {
+        let parse = |url: &str| {
+            Manifest::parse(&format!(
+                "schema = 1\nversion = \"0.74.0\"\nbuild_number = 74\n\
+                 sha256 = \"{}\"\ndmg = \"aterm-0.74.0.dmg\"\n{url}",
+                "ab".repeat(32)
+            ))
+            .unwrap()
+        };
+        let bound = parse(
+            "url = \"https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-0.74.0.dmg\"\n",
+        );
+        assert_manifest_url_binds("alabsystems/aterm", "v0.74.0", &bound).unwrap();
+        for (why, url) in [
+            ("absent", ""),
+            (
+                "another channel",
+                "url = \"https://github.com/private/origin/releases/download/v0.74.0/aterm-0.74.0.dmg\"\n",
+            ),
+            (
+                "another tag",
+                "url = \"https://github.com/alabsystems/aterm/releases/download/v0.73.0/aterm-0.74.0.dmg\"\n",
+            ),
+            (
+                "another container",
+                "url = \"https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm.dmg\"\n",
+            ),
+        ] {
+            let error = assert_manifest_url_binds("alabsystems/aterm", "v0.74.0", &parse(url))
+                .expect_err(why);
+            assert!(
+                error.to_string().contains("update_channel"),
+                "{why}: {error}"
+            );
+        }
     }
 }

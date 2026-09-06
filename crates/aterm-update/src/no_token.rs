@@ -150,11 +150,13 @@ pub(crate) fn announce_unreadable(staging: &Staging, current_build: u64, explana
 /// that nonetheless succeeded (the channel is public, so the machine still updates).
 ///
 /// This is not a stranded state and must not arm [`is_stranded`] — but "you
-/// provisioned a token and I threw it away" is still worth saying: it costs this
-/// machine the 5000-requests/hour authenticated budget and leaves it sharing the
-/// ~60/hour per-IP anonymous one. Throttled like the stranded warning; silent when
-/// nothing was rejected (an absent source is just "not configured", which on a public
-/// channel is a perfectly normal state and must stay quiet).
+/// provisioned a token and I threw it away" is still worth saying: it puts this
+/// REPOINTED source on the credential-less web lane (a 30-minute cadence instead of
+/// 75 s, and a private repository is unreadable there) instead of the token lane it
+/// was provisioned for. Throttled like the stranded warning; silent when nothing was
+/// rejected (an absent source is just "not configured", which is a perfectly normal
+/// state and must stay quiet). Only a repointed source reaches here: the compiled-in
+/// public channel never consults the chain at all.
 pub(crate) fn note_unusable_token(source: &crate::Source, diagnosis: &Diagnosis) {
     let rejections = diagnosis.rejections();
     if rejections.is_empty() {
@@ -163,14 +165,14 @@ pub(crate) fn note_unusable_token(source: &crate::Source, diagnosis: &Diagnosis)
     warn_throttled(
         last_rejection_warned(),
         &format!(
-            "an update token is present but unusable ({}) — updates still work over the \
-             public channel, but this machine shares the anonymous ~60 requests/hour per IP \
-             budget instead of its own 5000/hour. Fix it with: {}",
+            "an update token is present but unusable ({}) — github.com/{}/{} is being \
+             read over the credential-less web lane instead (a 30-minute cadence, and \
+             unreadable there if the repository is private). Fix it with: {}",
             rejections.join("; "),
-            // THE RUNG THIS SOURCE ACTUALLY CONSULTS. This path is public-channel by
-            // construction (its own doc: "a check that nonetheless succeeded"), and
-            // there the chain reads only `$ATERM_UPDATE_TOKEN` — so naming the 0600
-            // file sent the operator to fix something that is never read
+            source.owner,
+            source.repo,
+            // THE RUNG THIS SOURCE ACTUALLY CONSULTS — naming a rung the chain never
+            // reads sent the operator to fix something that is never read
             // (2026-08-19, third instance of the class).
             aterm_update_core::token::provision_remedy(&source.owner, &source.repo)
         ),

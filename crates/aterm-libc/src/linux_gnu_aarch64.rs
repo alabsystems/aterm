@@ -1169,6 +1169,7 @@ pub const RTLD_DEFAULT: *mut c_void = 0x0 as *mut c_void;
 pub const RTLD_LAZY: c_int = 1;
 pub const R_OK: c_int = 4;
 pub const SA_NOCLDSTOP: c_int = 0x00000001;
+pub const SA_ONSTACK: c_int = 0x08000000;
 pub const SA_RESTART: c_int = 0x10000000;
 pub const SA_SIGINFO: c_int = 0x00000004;
 pub const SECURITYFS_MAGIC: c_long = 0x73636673;

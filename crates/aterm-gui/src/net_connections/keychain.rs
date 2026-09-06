@@ -637,7 +637,7 @@ mod tests {
         let _oracle_scratch = Scratch(oracle_service.clone(), account.to_owned());
 
         if let Err(code) = oracle_can_write(&oracle_service, account) {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "SKIP keychain differential: the oracle itself cannot write to this \
                  machine's keychain (OSStatus {code}) — no login session, or it is locked"
             );
@@ -731,7 +731,7 @@ mod tests {
         let _scratch = Scratch(service.clone(), account.to_owned());
 
         if let Err(code) = oracle_can_write(&service, account) {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "SKIP keychain cross-read differential: the oracle itself cannot write \
                  to this machine's keychain (OSStatus {code})"
             );
@@ -820,7 +820,7 @@ mod tests {
         let _s4 = Scratch(oracle_upd.clone(), account.to_owned());
 
         if let Err(code) = oracle_can_write(&oracle_add, account) {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "SKIP keychain empty-password differential: the oracle itself cannot \
                  write to this machine's keychain (OSStatus {code})"
             );

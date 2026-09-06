@@ -556,6 +556,17 @@ mod output_echo_tracker_tests {
         let sink = SinkWriter::new(pipe[1]);
         let term = Mutex::new(Terminal::new(24, 80));
         let tracker = Arc::new(OutputEchoTracker::default());
+        // EVERY SAMPLE ANCHORS ON A FRESH CLOCK, as the host's frame loop does.
+        // `sample(sink, now)` maps the tracker's microsecond stamps onto
+        // `now - (clock_at_sample - stamp)`; two samples anchored on ONE stale
+        // `now` but read through two different clocks do not preserve the
+        // order of their stamps under scheduler jitter. MEASURED (gate runs
+        // 7 and the containment gate, 2026-09-02/05, each under the full
+        // 4,300-test parallel suite): the Enter boundary mapped BEFORE the
+        // paste receipt, `note_turn_boundary` kept the shadow, and the
+        // response after Enter was discounted as echo — 0/20 failures in
+        // isolation, where every age is microseconds. A stale anchor is the
+        // test's own construction; the host never reuses one.
         let now = std::time::Instant::now();
         let mut streak = aterm_effects::output_streak::OutputStreak::new(1);
         assert!(!streak.note_output(1, &[(2, 0, 0)], now, false));
@@ -579,6 +590,7 @@ mod output_echo_tracker_tests {
         let receipt =
             input::seam_egress_receipt(&term, &sink, &typed, input::EgressMode::Interactive);
         write.finish(receipt, &sink);
+        let now = std::time::Instant::now();
         let echo = tracker.sample(&sink, now);
         streak.note_keystroke(echo.last_accepted_at.expect("accepted editor input"));
         assert!(!streak.note_output(2, &[(2, 0, 0)], now, echo.input_hot));
@@ -588,6 +600,7 @@ mod output_echo_tracker_tests {
         let receipt =
             input::seam_egress_receipt(&term, &sink, &paste, input::EgressMode::Backpressured);
         write.finish(receipt, &sink);
+        let now = std::time::Instant::now();
         let paste_echo = tracker.sample(&sink, now);
         streak.note_keystroke(paste_echo.last_accepted_at.expect("accepted paste receipt"));
         assert!(!streak.note_output(3, &[(2, 0, 0)], now, paste_echo.input_hot));
@@ -597,6 +610,7 @@ mod output_echo_tracker_tests {
         let receipt =
             input::seam_egress_receipt(&term, &sink, &boundary, input::EgressMode::Interactive);
         write.finish(receipt, &sink);
+        let now = std::time::Instant::now();
         let turn = tracker.sample(&sink, now);
         assert!(turn.last_accepted_at.is_none());
         assert!(!turn.input_hot);
@@ -956,7 +970,19 @@ pub(crate) mod paste_order {
         let (tx, rx) = channel::<Job>();
         std::thread::Builder::new()
             .name("aterm-egress-order".into())
-            .spawn(move || run(rx))
+            .spawn(move || {
+                // macOS (port of 61a6c8b62): this thread performs the REAL PTY
+                // write for keystrokes the UI thread handed off (see `enqueue`,
+                // which transfers the key-arrival stamp with the job precisely
+                // because the write lands here). It is input egress wearing a
+                // worker thread's clothes, so it inherits the UI thread's urgency
+                // rather than the default QoS a plain `spawn` would leave it at —
+                // otherwise a keystroke queued behind a paste waits on an
+                // E-core-parked thread, and the deferred write is exactly the case
+                // the arrival stamp exists to measure.
+                crate::qos::set_self(crate::qos::Role::Interactive);
+                run(rx);
+            })
             .ok()?;
         let pending = Arc::new(AtomicUsize::new(0));
         reg.insert(
@@ -3444,7 +3470,7 @@ impl App {
                         // the input seam instead of inferred from downstream
                         // silence.
                         if crate::app_render::trace_spawn_enabled() && typed_forward.is_some() {
-                            eprintln!(
+                            crate::logging::stderr_line!(
                                 "PRESS fwd={typed_forward:?} typed={typed:?} gen={}",
                                 t.pipeline_timestamps().process_sequence,
                             );
@@ -8884,6 +8910,12 @@ impl App {
     /// native document opener. This helper deliberately does not read the path: the
     /// document host canonicalizes it, validates a regular bounded UTF-8 file, and
     /// mints the sole grant consumed by the Markdown/editor runtime.
+    ///
+    /// Two-phase (`App::request_document_tab`): with an event loop the read runs on
+    /// an `aterm-document-admit` worker and the tab lands via
+    /// `Wake::DocumentAdmitted`, so the returned line only says the admission was
+    /// started; in the headless harness the admission is inline and the line is
+    /// the installed tab's, exactly as before.
     fn open_local_document_path(
         &mut self,
         kind: crate::native_app::AppKind,
@@ -8891,7 +8923,8 @@ impl App {
     ) -> Result<String, String> {
         let uri = crate::native_document_host::path_to_file_uri(path)
             .map_err(|error| format!("document open failed: {error}"))?;
-        self.open_document_tab(kind, &uri)
+        let admission = self.request_document_tab(kind, &uri)?;
+        Ok(admission.message(&crate::app_documents::DocumentAdmissionKey { uri, kind }))
     }
 
     fn choose_and_open_document(&mut self, kind: crate::native_app::AppKind) {
@@ -8903,8 +8936,11 @@ impl App {
         let Some(path) = menu::choose_local_file(title, prompt) else {
             return;
         };
+        // An error HERE is a request-shape problem (no window, bad path). The
+        // read itself runs off this thread; its failure — including an evicted
+        // iCloud Drive file — is reported by the `Wake::DocumentAdmitted` arm.
         if let Err(error) = self.open_local_document_path(kind, &path) {
-            eprintln!("aterm-gui: selected document was not opened: {error}");
+            crate::logging::stderr_line!("aterm-gui: selected document was not opened: {error}");
             menu::notify("Couldn’t Open File", &error);
         }
     }
@@ -11808,7 +11844,7 @@ pub(crate) mod input_release_pairing_conformance {
             "NEGATIVE CONTROL: current-focus release route must be rejected\n{out}"
         );
 
-        eprintln!(
+        crate::logging::stderr_line!(
             "InputReleasePairing Tier-1: consumed, encoded, literal, and local A→focus-B \
              repeat/release routes conform; original identities preserved; mutants rejected."
         );
@@ -14225,7 +14261,7 @@ mod press_path_lock_elision_tests {
         stop.store(true, Ordering::Relaxed);
         holder.join().expect("holder thread");
 
-        eprintln!(
+        crate::logging::stderr_line!(
             "hidden-session inert press x200: uncontended={uncontended:?} contended={contended:?}"
         );
         // A generous bound: the point is that the critical section is EMPTY for an

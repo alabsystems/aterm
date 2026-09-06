@@ -120,63 +120,63 @@ mod macos {
     unsafe fn s_v_id(r: Id, s: Sel, a: Id) {
         // SAFETY: as above, for `void (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
             f(r, s, a);
         }
     }
     unsafe fn s_v_bool(r: Id, s: Sel, a: bool) {
         // SAFETY: as above, for `void (id, SEL, BOOL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Bool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Bool) = msg();
             f(r, s, Bool::new(a));
         }
     }
     unsafe fn s_id(r: Id, s: Sel) -> Id {
         // SAFETY: as above, for `id (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             f(r, s)
         }
     }
     unsafe fn s_id_id(r: Id, s: Sel, a: Id) -> Id {
         // SAFETY: as above, for `id (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
             f(r, s, a)
         }
     }
     unsafe fn s_id_usize(r: Id, s: Sel, a: usize) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSUInteger)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = msg();
             f(r, s, a)
         }
     }
     unsafe fn s_usize(r: Id, s: Sel) -> usize {
         // SAFETY: as above, for `NSUInteger (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(r, s)
         }
     }
     unsafe fn s_isize(r: Id, s: Sel) -> isize {
         // SAFETY: as above, for `NSInteger (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> isize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
             f(r, s)
         }
     }
     unsafe fn s_bool(r: Id, s: Sel) -> bool {
         // SAFETY: as above, for `BOOL (id, SEL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
             f(r, s).as_bool()
         }
     }
     unsafe fn s_bool_id(r: Id, s: Sel, a: Id) -> bool {
         // SAFETY: as above, for `BOOL (id, SEL, id)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
             f(r, s, a).as_bool()
         }
     }
@@ -184,35 +184,35 @@ mod macos {
         // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in
         // registers on both Apple ABIs for this shape.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> CGRect = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
             f(r, s)
         }
     }
     unsafe fn s_id_point(r: Id, s: Sel, p: CGPoint) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSPoint)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, CGPoint) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) -> Id = msg();
             f(r, s, p)
         }
     }
     unsafe fn s_point_point_id(r: Id, s: Sel, p: CGPoint, v: Id) -> CGPoint {
         // SAFETY: as above, for `NSPoint (id, SEL, NSPoint, id)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, CGPoint, Id) -> CGPoint = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGPoint, Id) -> CGPoint = msg();
             f(r, s, p, v)
         }
     }
     unsafe fn s_v_rect_id(r: Id, s: Sel, a: CGRect, b: Id) {
         // SAFETY: as above, for `void (id, SEL, NSRect, id)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, CGRect, Id) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Id) = msg();
             f(r, s, a, b);
         }
     }
     unsafe fn s_id_rect(r: Id, s: Sel, a: CGRect) -> Id {
         // SAFETY: as above, for `id (id, SEL, NSRect)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, CGRect) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> Id = msg();
             f(r, s, a)
         }
     }
@@ -221,21 +221,21 @@ mod macos {
         // (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast
         // because both are one pointer-sized return in the same register.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             f(r, s).as_ptr().cast_const().cast::<u8>()
         }
     }
     unsafe fn s_v_rect_bool(r: Id, s: Sel, a: CGRect, b: bool) {
         // SAFETY: as above, for `void (id, SEL, NSRect, BOOL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, CGRect, Bool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, CGRect, Bool) = msg();
             f(r, s, a, Bool::new(b));
         }
     }
     unsafe fn s_v_id_bool(r: Id, s: Sel, a: Id, b: bool) {
         // SAFETY: as above, for `void (id, SEL, id, BOOL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, Bool) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = msg();
             f(r, s, a, Bool::new(b));
         }
     }
@@ -253,7 +253,7 @@ mod macos {
         // SAFETY: a class method on `NSEvent` (linked), cast to the exact
         // prototype above; every argument is a plain scalar or nil.
         unsafe {
-            let f: unsafe extern "C" fn(
+            let f: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,
                 usize,
@@ -287,7 +287,7 @@ mod macos {
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
         // SAFETY: as [`mouse_event`], against the measured signature above.
         unsafe {
-            let f: unsafe extern "C" fn(
+            let f: unsafe extern "C-unwind" fn(
                 Id,
                 Sel,
                 usize,
@@ -906,14 +906,16 @@ mod macos {
         // so it gets its own code.
         std::thread::spawn(|| {
             std::thread::sleep(Duration::from_secs(180));
-            eprintln!("WATCHDOG: the drive hung (a modal tracking loop never returned)");
+            crate::logging::stderr_line!(
+                "WATCHDOG: the drive hung (a modal tracking loop never returned)"
+            );
             std::process::exit(HUNG);
         });
 
         let mut el = match EventLoop::<Wake>::with_user_event().build() {
             Ok(el) => el,
             Err(e) => {
-                eprintln!("objc-toolbar-drive: NOT RUN — no event loop: {e}");
+                crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no event loop: {e}");
                 return NOT_RUN;
             }
         };
@@ -931,23 +933,25 @@ mod macos {
             }
         }
         let Some(win) = d.window.as_ref() else {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "objc-toolbar-drive: NOT RUN — {}",
                 d.blocked.unwrap_or_else(|| "no window".to_owned())
             );
             return NOT_RUN;
         };
         let Some(handle) = toolbar::install_window_toolbar(win, &proxy, WindowId(1)) else {
-            eprintln!("objc-toolbar-drive: NOT RUN — install_window_toolbar returned None");
+            crate::logging::stderr_line!(
+                "objc-toolbar-drive: NOT RUN — install_window_toolbar returned None"
+            );
             return NOT_RUN;
         };
         let ns_view = {
             let Ok(h) = win.window_handle() else {
-                eprintln!("objc-toolbar-drive: NOT RUN — no window handle");
+                crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no window handle");
                 return NOT_RUN;
             };
             let RawWindowHandle::AppKit(a) = h.as_raw() else {
-                eprintln!("objc-toolbar-drive: NOT RUN — not an AppKit window");
+                crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — not an AppKit window");
                 return NOT_RUN;
             };
             Id::from_ptr(a.ns_view.as_ptr().cast())

@@ -3623,19 +3623,9 @@ mod tests {
     static SEQ: AtomicU32 = AtomicU32::new(0);
 
     fn temp_staging() -> (Staging, std::path::PathBuf) {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("aterm-rr-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(root.join("staged")).unwrap();
-        std::fs::create_dir_all(root.join("download")).unwrap();
-        let s = Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged").join("aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root: root.clone(),
-        };
+        let s = Staging::scratch("rr");
+        std::fs::create_dir_all(s.staged_dir()).unwrap();
+        let root = s.root.clone();
         (s, root)
     }
 

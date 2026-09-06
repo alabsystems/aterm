@@ -80,26 +80,16 @@ impl Staging {
         self.root.join("failed.toml")
     }
 
-    /// The release-listing memo (`catalog.json`): the per-page `ETag`s of the last
-    /// COMPLETE listing plus the selection those exact bytes produced. See
-    /// `github::CatalogMemo` — it is a CACHE, not state: deleting it costs one full
-    /// listing, and nothing in it is trusted (every artifact it names is still fetched
-    /// and signature-verified).
-    ///
-    /// It lives in the `0700` Updates root beside `floor.toml` and `failed.toml` for the
-    /// same reason they do: it is per-user updater bookkeeping, owner-only.
-    pub fn catalog_memo(&self) -> PathBuf {
-        self.root.join("catalog.json")
-    }
-
-    /// Where curl dumps the release listing's RESPONSE HEADERS (`catalog.headers`), so
-    /// the `ETag` can be read back.
+    /// Where curl dumps the TOKEN-LANE release listing's RESPONSE HEADERS
+    /// (`list.headers`), so the `x-ratelimit-*` block can be read back and a rate-limited
+    /// check can hold until the server's own reset.
     ///
     /// A file, not `-D -`: the body is captured from curl's stdout with the status
     /// trailer appended to it, so headers on the same stream would corrupt both. It is
     /// overwritten by every request and read immediately; nothing durable lives here.
-    pub fn catalog_headers(&self) -> PathBuf {
-        self.root.join("catalog.headers")
+    /// The web lane writes nothing here — its one HEAD carries its answer on stdout.
+    pub fn list_headers(&self) -> PathBuf {
+        self.root.join("list.headers")
     }
 
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside
@@ -131,8 +121,42 @@ impl Staging {
     /// publication transaction. Deliberately do not touch `download/` or an
     /// unpublished incoming bundle: those belong to a possibly in-flight producer
     /// holding [`Self::stage_lock`].
+    ///
+    /// Also forgets the ledger's authorized tag ([`crate::status::clear_latest_tag`]):
+    /// every caller retires "so the next check re-stages", and on the web lane a check
+    /// whose pointer still names the retired stage's tag would otherwise stop at its
+    /// HEAD with "up to date" forever — the machine stranded on the old build until the
+    /// publisher cut a NEW tag.
     pub fn retire_published(&self) {
         let _ = std::fs::remove_file(&self.ready);
         let _ = std::fs::remove_dir_all(&self.staged_app);
+        crate::status::clear_latest_tag(self);
+    }
+
+    /// A `Staging` rooted at a fresh, unique temp dir with `download/` created — the
+    /// one scratch layout every test module in this crate builds. Field-by-field
+    /// rather than through [`Self::resolve`] + `$ATERM_UPDATE_ROOT`, because
+    /// `std::env::set_var` is `unsafe` in edition 2024 and a data race under a
+    /// multi-threaded test runner — and because a test must never be able to touch
+    /// the real per-user ledgers. The caller removes `root` when done.
+    #[cfg(test)]
+    pub(crate) fn scratch(label: &str) -> Self {
+        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "aterm-update-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("download")).expect("scratch staging root");
+        Self {
+            apply_lock: root.join("apply.lock"),
+            stage_lock: root.join("stage.lock"),
+            download: root.join("download"),
+            staged_app: root.join("staged").join("aterm.app"),
+            ready: root.join("ready.toml"),
+            status: root.join("status.toml"),
+            root,
+        }
     }
 }

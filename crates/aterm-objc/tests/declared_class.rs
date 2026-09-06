@@ -158,7 +158,7 @@ declare_class! {
             // below, and `sup` names this class's superclass as the place to
             // start lookup.
             unsafe {
-                let f: unsafe extern "C" fn(*const ObjcSuper, Sel) -> usize = msg_super();
+                let f: unsafe extern "C-unwind" fn(*const ObjcSuper, Sel) -> usize = msg_super();
                 f(&raw const sup, sel!(hash))
             }
         }
@@ -204,7 +204,7 @@ fn an_instance_is_of_that_class_and_responds_to_its_selectors() {
     // `respondsToSelector:` are plain side-effect-free runtime queries.
     unsafe {
         assert_eq!(class_of(obj.as_id()), Probe::class());
-        let responds: unsafe extern "C" fn(Id, Sel, Sel) -> Bool = msg();
+        let responds: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Bool = msg();
         for name in [
             c"bump",
             c"bumpBy:",
@@ -249,11 +249,11 @@ fn messages_reach_the_rust_bodies_through_objc_msg_send() {
     // SAFETY: every prototype below is the exact C signature of the selector
     // declared above, and `obj` is a live instance of the class that declares it.
     unsafe {
-        let void0: unsafe extern "C" fn(Id, Sel) = msg();
-        let void_i64: unsafe extern "C" fn(Id, Sel, i64) = msg();
-        let ret_i64: unsafe extern "C" fn(Id, Sel) -> i64 = msg();
-        let ret_bool: unsafe extern "C" fn(Id, Sel, i64) -> Bool = msg();
-        let ret_f64: unsafe extern "C" fn(Id, Sel, CGRect) -> f64 = msg();
+        let void0: unsafe extern "C-unwind" fn(Id, Sel) = msg();
+        let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
+        let ret_i64: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
+        let ret_bool: unsafe extern "C-unwind" fn(Id, Sel, i64) -> Bool = msg();
+        let ret_f64: unsafe extern "C-unwind" fn(Id, Sel, CGRect) -> f64 = msg();
 
         void0(obj.as_id(), sel!(bump));
         void0(obj.as_id(), sel!(bump));
@@ -280,7 +280,7 @@ fn the_super_send_starts_above_this_class() {
     let obj = probe(&drops);
     // SAFETY: `-hash` and `-superHash` are both `-(NSUInteger)`; `obj` is live.
     unsafe {
-        let hash: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let hash: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         let ours = hash(obj.as_id(), sel!(hash));
         let supers = hash(obj.as_id(), sel!(superHash));
         assert_ne!(supers, 0, "NSObject's -hash returned 0");
@@ -342,7 +342,8 @@ fn the_declared_protocol_is_registered() {
     // SAFETY: `conformsToProtocol:` is a side-effect-free class-level query and
     // `NSObject` is a protocol libobjc always defines.
     unsafe {
-        let conforms: unsafe extern "C" fn(ClassPtr, Sel, aterm_objc::ProtocolPtr) -> Bool = msg();
+        let conforms: unsafe extern "C-unwind" fn(ClassPtr, Sel, aterm_objc::ProtocolPtr) -> Bool =
+            msg();
         assert!(
             conforms(
                 cls,
@@ -361,7 +362,7 @@ fn dealloc_drops_the_rust_ivars_exactly_once() {
         let obj = probe(&drops);
         // SAFETY: a live instance; `-bump` is `-(void)`.
         unsafe {
-            let void0: unsafe extern "C" fn(Id, Sel) = msg();
+            let void0: unsafe extern "C-unwind" fn(Id, Sel) = msg();
             void0(obj.as_id(), sel!(bump));
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0, "dropped while still alive");
@@ -394,10 +395,10 @@ fn ivars_survive_a_round_trip_through_the_runtime() {
     // SAFETY: `-self` returns the receiver; the result is the same live
     // instance, so re-adopting it as a borrowed reference is sound.
     unsafe {
-        let identity: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let identity: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         let back = identity(obj.as_id(), sel!(self));
         assert_eq!(back, obj.as_id());
-        let void_i64: unsafe extern "C" fn(Id, Sel, i64) = msg();
+        let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
         void_i64(back, sel!(bumpBy:), 7);
     }
     assert_eq!(obj.ivars().calls.get(), 7);
@@ -414,13 +415,13 @@ fn two_and_three_argument_methods_reach_their_bodies_with_the_arguments_in_order
     // SAFETY: each prototype below is the exact C signature of the selector
     // declared above, on a live instance of the class that declares it.
     unsafe {
-        let two: unsafe extern "C" fn(Id, Sel, i64, i64) -> i64 = msg();
+        let two: unsafe extern "C-unwind" fn(Id, Sel, i64, i64) -> i64 = msg();
         assert_eq!(two(obj.as_id(), sel!(addFirst:second:), 40, 2), 42);
         // Order matters and subtraction would hide it, so the check is
         // asymmetric on purpose.
         assert_eq!(two(obj.as_id(), sel!(addFirst:second:), -1, 100), 99);
 
-        let three: unsafe extern "C" fn(Id, Sel, f64, f64, f64) -> f64 = msg();
+        let three: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64) -> f64 = msg();
         let blended = three(obj.as_id(), sel!(blendRed:green:blue:), 1.0, 2.0, 3.0);
         assert!(
             (blended - 123.0).abs() < f64::EPSILON,
@@ -428,7 +429,7 @@ fn two_and_three_argument_methods_reach_their_bodies_with_the_arguments_in_order
         );
 
         // The real `toolbar.rs:3990` shape: object, object, selector, BOOL out.
-        let cmd: unsafe extern "C" fn(Id, Sel, Id, Id, Sel) -> Bool = msg();
+        let cmd: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Sel) -> Bool = msg();
         assert!(
             cmd(
                 obj.as_id(),
@@ -465,7 +466,7 @@ fn an_object_returning_method_hands_back_a_plus_zero_reference() {
         // `-(id)toolbar:(id)t itemForItemIdentifier:(id)i willBeInsertedIntoToolbar:(BOOL)b`,
         // exactly as declared, on a live instance.
         let returned = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Bool) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Bool) -> Id = msg();
             f(
                 obj.as_id(),
                 sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:),
@@ -487,9 +488,9 @@ fn an_object_returning_method_hands_back_a_plus_zero_reference() {
         // SAFETY: `returned` is the live autoreleased instance built above.
         unsafe {
             assert_eq!(class_of(returned), Probe::class());
-            let void_i64: unsafe extern "C" fn(Id, Sel, i64) = msg();
+            let void_i64: unsafe extern "C-unwind" fn(Id, Sel, i64) = msg();
             void_i64(returned, sel!(bumpBy:), 5);
-            let ret_i64: unsafe extern "C" fn(Id, Sel) -> i64 = msg();
+            let ret_i64: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
             assert_eq!(ret_i64(returned, sel!(callCount)), 5);
         }
     });
@@ -514,7 +515,7 @@ fn a_thirty_two_byte_struct_comes_back_intact() {
     let obj = probe(&drops);
     // SAFETY: `-bigRect` is `-(NSRect)` with no arguments, on a live instance.
     let r = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> CGRect = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
         f(obj.as_id(), sel!(bigRect))
     };
     assert_eq!(
@@ -682,7 +683,7 @@ fn the_conformance_claim_is_readable_and_is_the_classs_own() {
     // SAFETY: `-conformsToProtocol:` is `B@:@`; `obj` is a live instance and
     // `protocol` answers a live protocol object.
     let conforms: Bool = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool = msg();
         f(
             obj.as_id(),
             sel!(conformsToProtocol:),

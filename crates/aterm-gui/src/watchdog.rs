@@ -137,6 +137,17 @@ pub enum Breadcrumb {
     /// beating every poll tick. Park point — a frozen heartbeat here is the
     /// designed wait, not a stall (the wait itself is deadline-bounded).
     UpdateHandoff = 6,
+    /// A NESTED MODAL RUN LOOP spun from inside a work root — `-[NSAlert
+    /// runModal]` (`menu::confirm`, `menu::notify`) and `-[NSOpenPanel
+    /// runModal]` (`menu::choose_local_file`). AppKit is running the loop and
+    /// the user is looking at a dialog; winit's observers fire but bail because
+    /// its handler cell is borrowed for the outer event, so no App root runs and
+    /// nothing beats. Park point — the freeze lasts exactly as long as the user
+    /// takes to answer. Found by the 2026-09-02 abort audit: without it every
+    /// confirm/notify/open dialog left open past the threshold logged a spurious
+    /// `MAIN-THREAD STALL`, and aborted the process under `ATERM_WATCHDOG=abort`.
+    /// Entered and left through [`park_modal`], never by a bare [`beat`].
+    Modal = 7,
 }
 
 impl Breadcrumb {
@@ -150,6 +161,7 @@ impl Breadcrumb {
             4 => Breadcrumb::NewEvents,
             5 => Breadcrumb::ResizeSettle,
             6 => Breadcrumb::UpdateHandoff,
+            7 => Breadcrumb::Modal,
             _ => Breadcrumb::Startup,
         }
     }
@@ -164,6 +176,7 @@ impl Breadcrumb {
             Breadcrumb::NewEvents => "NewEvents",
             Breadcrumb::ResizeSettle => "ResizeSettle",
             Breadcrumb::UpdateHandoff => "UpdateHandoff",
+            Breadcrumb::Modal => "Modal",
         }
     }
 
@@ -172,7 +185,10 @@ impl Breadcrumb {
     fn is_park_point(self) -> bool {
         matches!(
             self,
-            Breadcrumb::Startup | Breadcrumb::AboutToWait | Breadcrumb::UpdateHandoff
+            Breadcrumb::Startup
+                | Breadcrumb::AboutToWait
+                | Breadcrumb::UpdateHandoff
+                | Breadcrumb::Modal
         )
     }
 }
@@ -277,6 +293,40 @@ pub fn beat(bc: Breadcrumb) {
     HEARTBEAT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The breadcrumb the main thread last stamped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn current() -> Breadcrumb {
+    Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed))
+}
+
+/// Park the watchdog for the duration of a nested modal run loop.
+///
+/// Stamps [`Breadcrumb::Modal`] on entry and, on drop, restores the breadcrumb
+/// that was current when the modal opened WITH a fresh beat — the outer work
+/// root resumes from a heartbeat that says "now", not from one frozen since
+/// before the dialog. Must be held on the main thread across the `runModal`
+/// send and nothing else; a guard that outlives its dialog is a park that
+/// never ends, which is exactly the wedge the sampler exists to name.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[must_use = "the park lasts only as long as the guard lives"]
+pub fn park_modal() -> ModalPark {
+    let previous = current();
+    beat(Breadcrumb::Modal);
+    ModalPark { previous }
+}
+
+/// The RAII half of [`park_modal`].
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub struct ModalPark {
+    previous: Breadcrumb,
+}
+
+impl Drop for ModalPark {
+    fn drop(&mut self) {
+        beat(self.previous);
+    }
+}
+
 /// Whether the watchdog sampler should run. EVERY build, unless explicitly
 /// switched off with `ATERM_WATCHDOG=off` — see the module header for why a
 /// release binary is the build that needs this most.
@@ -357,6 +407,44 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The modal park point never reports, however long the dialog stays up:
+    /// a user reading a confirm sheet for a minute is not a stall.
+    #[test]
+    fn a_modal_park_never_reports_however_long_it_lasts() {
+        assert!(!is_stall_at(
+            Breadcrumb::Modal,
+            Duration::from_secs(600),
+            STALL_THRESHOLD
+        ));
+        assert!(!is_stall_at(
+            Breadcrumb::Modal,
+            Duration::from_secs(600),
+            RELEASE_STALL_THRESHOLD
+        ));
+        // …while the work root it interrupted still does.
+        assert!(is_stall_at(
+            Breadcrumb::WindowEvent,
+            Duration::from_secs(600),
+            STALL_THRESHOLD
+        ));
+    }
+
+    /// `park_modal` round-trips: the outer root's breadcrumb comes back when
+    /// the guard drops, and it comes back with a fresh beat.
+    #[test]
+    fn park_modal_restores_the_outer_root_with_a_fresh_beat() {
+        beat(Breadcrumb::WindowEvent);
+        let before = HEARTBEAT.load(Ordering::Relaxed);
+        {
+            let _park = park_modal();
+            assert_eq!(current(), Breadcrumb::Modal);
+        }
+        assert_eq!(current(), Breadcrumb::WindowEvent);
+        assert!(HEARTBEAT.load(Ordering::Relaxed) >= before + 2);
+        assert_eq!(Breadcrumb::from_u8(7), Breadcrumb::Modal);
+        assert_eq!(Breadcrumb::Modal.name(), "Modal");
+    }
 
     /// LIVE end-to-end proof that the REAL background sampler thread wakes, sees a
     /// frozen heartbeat sitting on the `ResizeSettle` breadcrumb, and emits the

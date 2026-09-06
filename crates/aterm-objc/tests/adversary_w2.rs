@@ -43,6 +43,9 @@ unsafe impl Encode for B16 {
     const ENCODING: &'static str = "{B16=QQ}";
 }
 
+// SAFETY: two `u64`s; all-zero is a valid `B16`.
+unsafe impl aterm_objc::InertZero for B16 {}
+
 /// 17 bytes — the first size that must go through `objc_msgSend_stret`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +54,8 @@ pub struct B17(pub [u8; 17]);
 unsafe impl Encode for B17 {
     const ENCODING: &'static str = "{B17=[17c]}";
 }
+// SAFETY: a byte array; all-zero is a valid `B17`.
+unsafe impl aterm_objc::InertZero for B17 {}
 
 struct Ivars {
     calls: Cell<i64>,
@@ -198,11 +203,11 @@ fn arity_four_five_and_six_reach_their_bodies_with_arguments_in_order() {
     // SAFETY: each prototype is the exact C signature declared above, on a
     // live instance of the declaring class.
     unsafe {
-        let f4: unsafe extern "C" fn(Id, Sel, i64, i64, i64, i64) -> i64 = msg();
+        let f4: unsafe extern "C-unwind" fn(Id, Sel, i64, i64, i64, i64) -> i64 = msg();
         assert_eq!(f4(obj.as_id(), sel!(a:b:c:d:), 1, 2, 3, 4), 1234);
         assert_eq!(f4(obj.as_id(), sel!(a:b:c:d:), 9, 0, 0, 1), 9001);
 
-        let f5: unsafe extern "C" fn(Id, Sel, i64, f64, Id, Sel, f32) -> f64 = msg();
+        let f5: unsafe extern "C-unwind" fn(Id, Sel, i64, f64, Id, Sel, f32) -> f64 = msg();
         let got = f5(
             obj.as_id(),
             sel!(i:d:o:s:f:),
@@ -217,7 +222,8 @@ fn arity_four_five_and_six_reach_their_bodies_with_arguments_in_order() {
             "arity-5 arguments arrived as {got}"
         );
 
-        let f6: unsafe extern "C" fn(Id, Sel, i8, i16, i32, i64, Bool, CGPoint) -> f64 = msg();
+        let f6: unsafe extern "C-unwind" fn(Id, Sel, i8, i16, i32, i64, Bool, CGPoint) -> f64 =
+            msg();
         let got6 = f6(
             obj.as_id(),
             sel!(p:q:r:s:t:u:),
@@ -266,7 +272,7 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
     // instance. On x86_64 the 17-byte pair goes through `objc_msgSend_stret`
     // and the 16-byte pair does not; `msg` picks, not this call site.
     unsafe {
-        let g16: unsafe extern "C" fn(Id, Sel) -> B16 = msg();
+        let g16: unsafe extern "C-unwind" fn(Id, Sel) -> B16 = msg();
         assert_eq!(
             g16(obj.as_id(), sel!(sixteen)),
             B16 {
@@ -274,18 +280,18 @@ fn sixteen_and_seventeen_byte_returns_both_round_trip() {
                 hi: 0x1112_1314_1516_1718
             }
         );
-        let g17: unsafe extern "C" fn(Id, Sel) -> B17 = msg();
+        let g17: unsafe extern "C-unwind" fn(Id, Sel) -> B17 = msg();
         assert_eq!(
             g17(obj.as_id(), sel!(seventeen)),
             B17([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
         );
         // Arguments AND return of each size, so a shifted register shows up.
-        let e16: unsafe extern "C" fn(Id, Sel, B16) -> B16 = msg();
+        let e16: unsafe extern "C-unwind" fn(Id, Sel, B16) -> B16 = msg();
         assert_eq!(
             e16(obj.as_id(), sel!(echoSixteen:), B16 { lo: 11, hi: 22 }),
             B16 { lo: 22, hi: 11 }
         );
-        let e17: unsafe extern "C" fn(Id, Sel, B17) -> B17 = msg();
+        let e17: unsafe extern "C-unwind" fn(Id, Sel, B17) -> B17 = msg();
         let mut expect = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
         expect.reverse();
         assert_eq!(
@@ -304,9 +310,9 @@ fn a_thirty_two_byte_send_and_a_sixteen_byte_send_agree_with_the_c_abi() {
     // Entry-point identity, at the exact boundary rather than at 32 bytes.
     // SAFETY: no pointer here is called; only its address is read.
     let (plain, b16, b17) = unsafe {
-        let a: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-        let b: unsafe extern "C" fn(Id, Sel) -> B16 = msg();
-        let c: unsafe extern "C" fn(Id, Sel) -> B17 = msg();
+        let a: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let b: unsafe extern "C-unwind" fn(Id, Sel) -> B16 = msg();
+        let c: unsafe extern "C-unwind" fn(Id, Sel) -> B17 = msg();
         (a as usize, b as usize, c as usize)
     };
     assert_eq!(plain, b16, "a 16-byte return never needs _stret");
@@ -328,12 +334,12 @@ fn an_autoreleased_return_is_at_plus_one_owned_by_the_pool() {
     // SAFETY: `-retainCount` is `-(NSUInteger)`, `-makeChild` is `-(id)`, both
     // on live instances of the declaring class.
     unsafe {
-        let rc: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let rc: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(rc(obj.as_id(), sel!(retainCount)), 1, "alloc/init is +1");
 
         autoreleasepool(|_| {
             let child = {
-                let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 f(obj.as_id(), sel!(makeChild))
             };
             assert!(!child.is_null());
@@ -354,7 +360,7 @@ fn an_autoreleased_return_is_at_plus_one_owned_by_the_pool() {
 
         // The +1 form, for contrast: it survives the pool, which is the leak.
         let leaked = autoreleasepool(|_| {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             f(obj.as_id(), sel!(makeLeakedChild))
         });
         assert_eq!(
@@ -364,7 +370,7 @@ fn an_autoreleased_return_is_at_plus_one_owned_by_the_pool() {
              D5 names, kept here so the difference is measured"
         );
         // Clean it up so the test leaks nothing.
-        let rel: unsafe extern "C" fn(Id, Sel) = msg();
+        let rel: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         rel(leaked, sel!(release));
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
@@ -378,7 +384,7 @@ fn a_caller_may_retain_an_autoreleased_return_across_the_pool() {
     // the body of the pool and is retained before the pool pops.
     unsafe {
         let retained = autoreleasepool(|_| {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let child = f(obj.as_id(), sel!(makeChild));
             aterm_objc::Obj::retain(child).expect("live")
         });
@@ -387,7 +393,7 @@ fn a_caller_may_retain_an_autoreleased_return_across_the_pool() {
             0,
             "the retained object died with the pool — the return was under-retained"
         );
-        let rc: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let rc: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(rc(retained.id(), sel!(retainCount)), 1);
         drop(retained);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -407,7 +413,7 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
     // SAFETY: every prototype below is the documented signature of the
     // Foundation method being sent, on live objects.
     unsafe {
-        let sig_for: unsafe extern "C" fn(ClassPtr, Sel, Sel) -> Id = msg();
+        let sig_for: unsafe extern "C-unwind" fn(ClassPtr, Sel, Sel) -> Id = msg();
         let sig = sig_for(
             cls,
             sel!(instanceMethodSignatureForSelector:),
@@ -415,7 +421,7 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
         );
         assert!(!sig.is_null(), "Foundation refused our type encoding");
 
-        let n_args: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let n_args: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(
             n_args(sig, sel!(numberOfArguments)),
             5,
@@ -423,7 +429,7 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
              arity from, and the one D1 could not even express"
         );
 
-        let arg_type: unsafe extern "C" fn(Id, Sel, usize) -> *const c_char = msg();
+        let arg_type: unsafe extern "C-unwind" fn(Id, Sel, usize) -> *const c_char = msg();
         assert_eq!(
             CStr::from_ptr(arg_type(sig, sel!(getArgumentTypeAtIndex:), 0)),
             c"@"
@@ -439,33 +445,33 @@ fn nsinvocation_reads_our_arity_and_types_and_invokes_correctly() {
                 "argument {i} is not a double"
             );
         }
-        let ret_type: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let ret_type: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
         assert_eq!(CStr::from_ptr(ret_type(sig, sel!(methodReturnType))), c"d");
-        let ret_len: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let ret_len: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         assert_eq!(ret_len(sig, sel!(methodReturnLength)), 8);
 
         // Now actually INVOKE through NSInvocation.
         autoreleasepool(|_| {
-            let inv_with: unsafe extern "C" fn(ClassPtr, Sel, Id) -> Id = msg();
+            let inv_with: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id) -> Id = msg();
             let inv = inv_with(
                 class(c"NSInvocation"),
                 sel!(invocationWithMethodSignature:),
                 sig,
             );
             assert!(!inv.is_null());
-            let set_target: unsafe extern "C" fn(Id, Sel, Id) = msg();
+            let set_target: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
             set_target(inv, sel!(setTarget:), obj.as_id());
-            let set_sel: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+            let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
             set_sel(inv, sel!(setSelector:), sel!(blendRed:green:blue:));
-            let set_arg: unsafe extern "C" fn(Id, Sel, *const c_void, usize) = msg();
+            let set_arg: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize) = msg();
             let (r, g, b) = (1.0_f64, 2.0_f64, 3.0_f64);
             set_arg(inv, sel!(setArgument:atIndex:), (&raw const r).cast(), 2);
             set_arg(inv, sel!(setArgument:atIndex:), (&raw const g).cast(), 3);
             set_arg(inv, sel!(setArgument:atIndex:), (&raw const b).cast(), 4);
-            let invoke: unsafe extern "C" fn(Id, Sel) = msg();
+            let invoke: unsafe extern "C-unwind" fn(Id, Sel) = msg();
             invoke(inv, sel!(invoke));
             let mut out = 0.0_f64;
-            let get_ret: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
+            let get_ret: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
             get_ret(inv, sel!(getReturnValue:), (&raw mut out).cast());
             assert!(
                 (out - 123.0).abs() < f64::EPSILON,
@@ -483,7 +489,7 @@ fn nsmethodsignature_agrees_with_foundation_on_what_bool_is() {
     let cls = Adv::class();
     // SAFETY: documented Foundation signatures on live class objects.
     unsafe {
-        let sig_for: unsafe extern "C" fn(ClassPtr, Sel, Sel) -> Id = msg();
+        let sig_for: unsafe extern "C-unwind" fn(ClassPtr, Sel, Sel) -> Id = msg();
         let ours = sig_for(
             cls,
             sel!(instanceMethodSignatureForSelector:),
@@ -495,7 +501,7 @@ fn nsmethodsignature_agrees_with_foundation_on_what_bool_is() {
             sel!(isEqual:),
         );
         assert!(!ours.is_null() && !theirs.is_null());
-        let ret_type: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let ret_type: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
         let a = CStr::from_ptr(ret_type(ours, sel!(methodReturnType))).to_owned();
         let b = CStr::from_ptr(ret_type(theirs, sel!(methodReturnType))).to_owned();
         assert_eq!(
@@ -615,7 +621,8 @@ fn a_block_handed_to_a_real_framework_api_survives_and_is_released_once() {
         unsafe {
             let s = aterm_objc::ns_string("x").expect("NSString");
             let objs = [s.id(), s.id(), s.id()];
-            let arr_with: unsafe extern "C" fn(ClassPtr, Sel, *const Id, usize) -> Id = msg();
+            let arr_with: unsafe extern "C-unwind" fn(ClassPtr, Sel, *const Id, usize) -> Id =
+                msg();
             let arr = arr_with(
                 class(c"NSArray"),
                 sel!(arrayWithObjects:count:),
@@ -623,7 +630,7 @@ fn a_block_handed_to_a_real_framework_api_survives_and_is_released_once() {
                 3,
             );
             assert!(!arr.is_null());
-            let enumerate: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
+            let enumerate: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
             enumerate(arr, sel!(enumerateObjectsUsingBlock:), block.as_ptr());
         }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
@@ -698,7 +705,7 @@ fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation(
         // SAFETY: `-performSelector:` is `-(id)performSelector:(SEL)`, and the
         // target is a live instance that declares `-boom`.
         unsafe {
-            let perform: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+            let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
             perform(obj.as_id(), sel!(performSelector:), sel!(boom));
         }
         println!("SURVIVED-THE-PANIC");

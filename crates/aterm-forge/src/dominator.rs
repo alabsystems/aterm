@@ -343,6 +343,29 @@ mod tests {
             !s.third_party().any(|id| id.name == "libc"),
             "libc is patched to crates/aterm-libc and must not be third-party"
         );
+
+        // THE objc2 EXIT (2026-09-05, measured.rs note (6)), in the same
+        // shape: `objc2-app-kit` (1 / 82,976) and `objc2-foundation`
+        // (2 / 60,733) were mac-arm anchors until the W12 + W13 merge ported
+        // the winit fork's and aterm-gui's last family files onto aterm-objc
+        // and retired every family row. Asserted as ABSENCE for the reason
+        // above: a zero-cost row would also be reported for a package forge
+        // failed to see.
+        for gone in [
+            "objc2",
+            "objc2-app-kit",
+            "objc2-foundation",
+            "objc2-encode",
+            "objc-sys",
+            "block2",
+            "dispatch",
+        ] {
+            assert!(
+                !s.third_party().any(|id| id.name == gone),
+                "`{gone}` must not be in the mac-arm normal graph after the objc2 exit \
+                 (crates/aterm-objc/tests/objc2_exit_condition.rs holds both halves at zero)"
+            );
+        }
     }
 
     /// The linux anchors. `accesskit_unix` and `accesskit_winit` used to be

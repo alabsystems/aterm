@@ -174,7 +174,7 @@ mod tests {
     fn device() -> Option<Device> {
         let d = Device::system_default();
         if d.is_none() {
-            eprintln!("SKIP: no Metal device on this machine");
+            crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
     }
@@ -809,7 +809,7 @@ mod tests {
                     }
                 }
             }
-            eprintln!("  write mask {label}: alpha {} -> {}", DST[3], got[3]);
+            crate::stderr_line!("  write mask {label}: alpha {} -> {}", DST[3], got[3]);
         }
     }
 
@@ -1168,7 +1168,7 @@ mod tests {
             "the language version must be PINNED to the macOS 11 floor, not \
              inherited from whatever compiler the running OS ships"
         );
-        eprintln!(
+        crate::stderr_line!(
             "  MTLCompileOptions default languageVersion on this OS: {:#x}; aterm pins {:#x}",
             CompileOptions::new()
                 .expect("MTLCompileOptions")
@@ -1737,7 +1737,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -1918,7 +1918,7 @@ mod tests {
                 let mb = MetalBlit::new(metal_format(c.target)).unwrap_or_else(|e| {
                     panic!("the Metal blit pipeline must build for {:?}: {e}", c.target)
                 });
-                eprintln!("blit differential on {} — {:?}", mb.device_name(), c.target);
+                crate::stderr_line!("blit differential on {} — {:?}", mb.device_name(), c.target);
                 blits.push((c.target, mb));
             }
             let mb = &blits
@@ -1967,7 +1967,7 @@ mod tests {
                     expected.len() / texel
                 );
             }
-            eprintln!(
+            crate::stderr_line!(
                 "  [{}] {dw}x{dh} {:?}: byte-identical over {} texels",
                 c.name,
                 c.target,
@@ -2041,7 +2041,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -2179,7 +2179,7 @@ mod tests {
                 W * H
             );
         }
-        eprintln!(
+        crate::stderr_line!(
             "bg differential on {}: byte-identical over {} texels",
             dev.name(),
             W * H
@@ -2232,7 +2232,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -2450,7 +2450,7 @@ mod tests {
                     W * H
                 );
             }
-            eprintln!(
+            crate::stderr_line!(
                 "glyph differential (text_blend={text_blend}) on {}: byte-identical \
                  over {} texels",
                 dev.name(),
@@ -2496,7 +2496,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -2700,7 +2700,7 @@ mod tests {
                 W * H
             );
         }
-        eprintln!(
+        crate::stderr_line!(
             "colour-glyph differential on {}: byte-identical over {} texels",
             dev.name(),
             W * H
@@ -2742,7 +2742,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -2995,7 +2995,7 @@ mod tests {
                 W * H
             );
         }
-        eprintln!(
+        crate::stderr_line!(
             "deco over+add differential on {}: byte-identical over {} texels \
              (both views of one storage)",
             dev.name(),
@@ -3023,7 +3023,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -3085,7 +3085,7 @@ mod tests {
             wg_win.metal_offscreen.is_none(),
             "the wgpu twin never touches the Metal arm"
         );
-        eprintln!(
+        crate::stderr_line!(
             "armed production differential: byte-identical over {} px x {N} runs",
             ROWS * COLS
         );
@@ -3115,7 +3115,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -3252,7 +3252,7 @@ mod tests {
                 ),
             }
         }
-        eprintln!(
+        crate::stderr_line!(
             "armed inline-image differential: byte-identical x {N} runs x 3 \
              inputs (dims-moving rebuild, SAME-DIMS texel rebuild via the \
              epoch salt, translucent image — all armed)"
@@ -3281,7 +3281,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -3423,7 +3423,7 @@ mod tests {
             "tray-off must change the armed frame — the card bake painted \
              nothing (vacuous differential)"
         );
-        eprintln!(
+        crate::stderr_line!(
             "armed readback-effects differential: byte-identical x {N} runs + \
              changed-card run; bloom/shimmer/tray each proven live; card \
              uploads (1 then 2) mirrored on both arms"
@@ -3453,7 +3453,7 @@ mod tests {
         let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no renderer/font: {e}");
+                crate::stderr_line!("SKIP: no renderer/font: {e}");
                 return;
             }
         };
@@ -3537,11 +3537,12 @@ mod tests {
             snap.rgba, presented[0],
             "the one-shot must capture the FIRST armed present byte-for-byte"
         );
-        eprintln!(
+        crate::stderr_line!(
             "armed tap-ring differential: {N} status-polled harvests + the \
              one-shot, all byte-identical to their Submit B destinations \
              ({}x{} letterboxed)",
-            dw, dh
+            dw,
+            dh
         );
     }
 
@@ -3567,7 +3568,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -3695,7 +3696,7 @@ mod tests {
              armed arm (took {} of >= 2)",
             armed.scroll_rescues()
         );
-        eprintln!(
+        crate::stderr_line!(
             "armed scissor differential: {} steps byte-identical; cadence \
              scissor={} full={} rescues={} on BOTH arms",
             step,
@@ -3723,7 +3724,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -3758,7 +3759,7 @@ mod tests {
                  prior frames' submits (the shared-storage discipline)"
             );
         }
-        eprintln!(
+        crate::stderr_line!(
             "armed pipelining: {N} frames byte-identical; Submit A held in \
              flight each frame; staging awaited exactly N-1 priors"
         );
@@ -3785,7 +3786,7 @@ mod tests {
         let mut armed = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no renderer/font: {e}");
+                crate::stderr_line!("SKIP: no renderer/font: {e}");
                 return;
             }
         };
@@ -3845,7 +3846,7 @@ mod tests {
         let mut never_armed: Option<crate::metal::present::MetalWindowSurface> = None;
         armed.metal_disarm_sweep(&mut never_armed);
         assert!(never_armed.is_none());
-        eprintln!(
+        crate::stderr_line!(
             "disarm edge: attach parented, failed attach disarmed, the sweep \
              unparented the stale layer (sublayers 1 -> 0)"
         );
@@ -3910,7 +3911,7 @@ mod tests {
             let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
                 Ok(g) => g,
                 Err(e) => {
-                    eprintln!("SKIP: no wgpu renderer/font: {e}");
+                    crate::stderr_line!("SKIP: no wgpu renderer/font: {e}");
                     return;
                 }
             };
@@ -3988,7 +3989,7 @@ mod tests {
             }
             if translucent {
                 assert!(translucent_alpha_seen);
-                eprintln!(
+                crate::stderr_line!(
                     "translucent present differential: byte-identical (alpha included) \
                      over {} texels x {N} runs at opacity {opacity}",
                     (dw * dh) as usize
@@ -4017,7 +4018,7 @@ mod tests {
         let mut wg = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -4101,7 +4102,7 @@ mod tests {
             wg_win.metal_virtual_off.is_none(),
             "the wgpu twin never touches the Metal arm"
         );
-        eprintln!("armed virtual-present tap differential: byte-identical x {N} runs");
+        crate::stderr_line!("armed virtual-present tap differential: byte-identical x {N} runs");
     }
 
     /// W4 item 4 — THE FULL-FRAME DIFFERENTIAL: `render_input`'s frame, wgpu
@@ -4145,7 +4146,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -4479,7 +4480,7 @@ mod tests {
             for run in 0..N {
                 match gpu.frame_differential_for_test(win, input) {
                     Ok(None) => {
-                        eprintln!("SKIP: no Metal device");
+                        crate::stderr_line!("SKIP: no Metal device");
                         return false;
                     }
                     Err(e) => panic!("{name} run {run}: {e}"),
@@ -4569,7 +4570,7 @@ mod tests {
             return;
         }
         for line in &results {
-            eprintln!("{line}");
+            crate::stderr_line!("{line}");
         }
     }
 
@@ -4601,7 +4602,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -4714,7 +4715,7 @@ mod tests {
         for run in 0..N {
             match gpu.frame_differential_for_test(&mut win, &input) {
                 Ok(None) => {
-                    eprintln!("SKIP: no Metal device");
+                    crate::stderr_line!("SKIP: no Metal device");
                     return;
                 }
                 Err(e) => panic!("run {run}: {e}"),
@@ -4762,7 +4763,7 @@ mod tests {
                         );
                     }
                     if run == N - 1 {
-                        eprintln!(
+                        crate::stderr_line!(
                             "worst-case 5-pass plan: byte-identical over {} pixels x {N} runs",
                             expected.pixels.len()
                         );
@@ -4801,7 +4802,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -4880,7 +4881,7 @@ mod tests {
             );
             let actual = match gpu.metal_replay_recorded_plan_for_test(&b, (w, h), Some(&seed)) {
                 Ok(None) => {
-                    eprintln!("SKIP: no Metal device");
+                    crate::stderr_line!("SKIP: no Metal device");
                     return;
                 }
                 Err(e) => panic!("run {run}: {e}"),
@@ -4926,7 +4927,7 @@ mod tests {
             // Restore A as the prior frame (another dirty present) and reseed.
             seed = gpu.present_input_readback(&mut win, &a);
         }
-        eprintln!("scissored Load frame: byte-identical + isolated x {N} runs");
+        crate::stderr_line!("scissored Load frame: byte-identical + isolated x {N} runs");
     }
 
     /// W5 — THE PRESENT-PATH DIFFERENTIAL: one cropped, LETTERBOXED present
@@ -4968,7 +4969,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -5101,10 +5102,11 @@ mod tests {
                 }
             }
             presented.push((name, first.expect("N > 0")));
-            eprintln!(
+            crate::stderr_line!(
                 "present differential ({name}): byte-identical x {N} runs at \
                  {}x{} (letterboxed +9/+7)",
-                dest.0, dest.1
+                dest.0,
+                dest.1
             );
         }
 
@@ -5138,7 +5140,7 @@ mod tests {
             corner, want,
             "the letterbox band must hold the live terminal background"
         );
-        eprintln!(
+        crate::stderr_line!(
             "present differential: {moved} px moved by the effect passes; the \
              letterbox band holds the live bg"
         );
@@ -5213,7 +5215,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -5321,7 +5323,7 @@ mod tests {
         // SAFETY: shared storage, terminal above.
         let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
         assert_row_bytes_identical("BLOOM", W, 4, &expected, &actual);
-        eprintln!(
+        crate::stderr_line!(
             "bloom differential on {}: byte-identical over {} texels (half-res \
              LINEAR minification + SCREEN blend + scissored Load)",
             dev.name(),
@@ -5349,7 +5351,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -5502,7 +5504,7 @@ mod tests {
         // SAFETY: shared storage, terminal above.
         let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
         assert_row_bytes_identical("SHIMMER", W, 4, &expected, &actual);
-        eprintln!(
+        crate::stderr_line!(
             "shimmer differential on {}: byte-identical over {} texels \
              (displaced sub-texel LINEAR sampling, scissored Load, pinned phase)",
             dev.name(),
@@ -5532,7 +5534,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -5683,7 +5685,7 @@ mod tests {
             // SAFETY: shared storage, terminal above.
             let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
             assert_row_bytes_identical(name, W, texel, expected, &actual);
-            eprintln!(
+            crate::stderr_line!(
                 "{name} differential on {}: byte-identical over {} texels \
                  ({} target, 3 instances, scissored Load, content_off armed)",
                 dev.name(),
@@ -5716,7 +5718,7 @@ mod tests {
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font to differentiate against: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font to differentiate against: {e}");
                 return;
             }
         };
@@ -5831,7 +5833,7 @@ mod tests {
         // SAFETY: shared storage, terminal above.
         let actual = unsafe { ffi::buffer_bytes(&rb, row * H) };
         assert_row_bytes_identical("TRAY", W, 4, &expected, &actual);
-        eprintln!(
+        crate::stderr_line!(
             "tray differential on {}: byte-identical over {} texels (strip \
              quad, vertex uniform at slot 2, straight-alpha ramp 0..=255)",
             dev.name(),

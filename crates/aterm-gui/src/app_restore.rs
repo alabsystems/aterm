@@ -731,7 +731,9 @@ impl App {
                 // half-built window — the "adopt into the pool first, then build windows"
                 // rework — deferred; window-surface failure on an already-running app is
                 // exceptional.
-                eprintln!("aterm-gui: session restore: could not create a window; stopping here");
+                crate::logging::stderr_line!(
+                    "aterm-gui: session restore: could not create a window; stopping here"
+                );
                 self.surface_gesture_failure(
                     "✕ Restore stopped early — some saved tabs were not reopened",
                 );
@@ -818,7 +820,7 @@ impl App {
         let (Some(wid), Some(proxy)) = (self.frontmost_window, self.proxy.clone()) else {
             // No window/proxy to place them in (should not happen post-restore): drop the
             // Adopted holders — their raw fds close with the process, ending the shells.
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: seamless: no front window to adopt {} orphan shell(s) into",
                 orphans.len()
             );
@@ -861,7 +863,9 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    eprintln!("aterm-gui: seamless: could not adopt an orphan shell: {e}");
+                    crate::logging::stderr_line!(
+                        "aterm-gui: seamless: could not adopt an orphan shell: {e}"
+                    );
                     self.surface_gesture_failure(&format!(
                         "✕ A live shell was lost across the update: {e}"
                     ));
@@ -886,7 +890,9 @@ impl App {
             return;
         }
         let Some(order) = wl.canonical_order() else {
-            eprintln!("aterm-gui: session restore: invalid mixed-tab ordering; keeping bootstrap");
+            crate::logging::stderr_line!(
+                "aterm-gui: session restore: invalid mixed-tab ordering; keeping bootstrap"
+            );
             return;
         };
         let active_item = wl.canonical_active(&order);
@@ -943,7 +949,7 @@ impl App {
         // Remaining tabs: every leaf spawns fresh in its persisted cwd.
         for layout in tabs {
             let Some(tree) = self.restore_build_tree(wid, &layout, None) else {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: session restore: could not respawn a tab; keeping what restored"
                 );
                 break;
@@ -966,7 +972,7 @@ impl App {
             let candidate = self.restore_native_tab_into_window(wid, descriptor);
             let aliases_prior = candidate.is_some_and(|id| native_ids.contains(&Some(id)));
             if aliases_prior {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: session restore: native descriptor aliased an existing tab; skipped"
                 );
                 native_ids.push(None);
@@ -1091,7 +1097,7 @@ impl App {
                 LeafIds::Retired,
             ) {
                 Ok(tab) => built.push(tab),
-                Err(error) => eprintln!(
+                Err(error) => crate::logging::stderr_line!(
                     "aterm-gui: session restore: could not allocate a recovered tab: {error}"
                 ),
             }
@@ -2018,7 +2024,9 @@ impl App {
         let result = match descriptor {
             restore::NativeTabRestore::Settings { route } => {
                 let Some(route) = crate::native_settings::SettingsRoute::from_path(route) else {
-                    eprintln!("aterm-gui: session restore: invalid Settings route");
+                    crate::logging::stderr_line!(
+                        "aterm-gui: session restore: invalid Settings route"
+                    );
                     return None;
                 };
                 self.open_settings_tab(route)
@@ -2035,7 +2043,9 @@ impl App {
         match result {
             Ok(()) => self.windows.get(&wid)?.tab_set.active_id(),
             Err(error) => {
-                eprintln!("aterm-gui: session restore: native tab skipped: {error}");
+                crate::logging::stderr_line!(
+                    "aterm-gui: session restore: native tab skipped: {error}"
+                );
                 None
             }
         }
@@ -2139,7 +2149,7 @@ impl App {
                     fresh.push(s);
                 }
                 Err(e) => {
-                    eprintln!("aterm-gui: session restore: spawn failed: {e}");
+                    crate::logging::stderr_line!("aterm-gui: session restore: spawn failed: {e}");
                     self.surface_gesture_failure(&format!(
                         "✕ A restored tab could not start its shell: {e}"
                     ));

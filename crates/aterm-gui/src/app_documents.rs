@@ -15,8 +15,8 @@ use crate::native_app::{
     NativeApp, TextInputEvent,
 };
 use crate::native_document_host::{
-    DEFAULT_DOCUMENT_LIMIT, DocumentGrant, DocumentGrantStore, DocumentPersistenceStore,
-    GrantAccess,
+    AdmittedDocument, DEFAULT_DOCUMENT_LIMIT, DocumentGrant, DocumentGrantStore,
+    DocumentPersistenceStore, GrantAccess,
 };
 use crate::native_document_journal::{
     DocumentJournalStore, JournalCompletion, JournalEffect, JournalLockPatience,
@@ -428,6 +428,16 @@ pub(crate) struct DocumentHostRuntime {
     /// Whole-app Quit waits on one process-wide plan before update application or
     /// event-loop exit. It supersedes (without partially applying) window plans.
     pending_quit: Option<DocumentClosePlan>,
+    /// Document admissions currently running on an `aterm-document-admit` worker
+    /// (the two-phase open; see [`App::begin_document_admission`]). Keyed by the
+    /// requesting WINDOW and the exact request, so a second gesture for the same
+    /// file in the same window while the first is still reading coalesces onto
+    /// it instead of spawning a second read — while the same file requested from
+    /// another window is its own read, delivered to that window; a completion for
+    /// a window that closed meanwhile can therefore never swallow a live
+    /// window's tab. A completion is matched by ticket and never applied twice.
+    admissions: BTreeMap<(WindowId, DocumentAdmissionKey), PendingDocumentAdmission>,
+    next_admission: u64,
 }
 
 impl Default for DocumentHostRuntime {
@@ -455,6 +465,103 @@ impl DocumentHostRuntime {
             pending_closes: BTreeMap::new(),
             pending_window_closes: BTreeMap::new(),
             pending_quit: None,
+            admissions: BTreeMap::new(),
+            next_admission: 1,
+        }
+    }
+}
+
+/// Identity of one two-phase document open while its admission is in flight:
+/// the exact URI the caller asked for and the app that will host it. Two
+/// requests with the same key IN THE SAME WINDOW are the same read and
+/// coalesce; a Markdown and an Editor open of one file are two different tabs
+/// and do not, and neither do requests from two different windows (each window
+/// gets the tab it asked for). The two-phase path is for DOCUMENTS only — the
+/// Manual config editor, the one caller that binds config symlinks, stays
+/// synchronous by design — so the symlink rule is not part of the identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DocumentAdmissionKey {
+    pub(crate) uri: String,
+    pub(crate) kind: AppKind,
+}
+
+/// One in-flight admission (see [`DocumentHostRuntime::admissions`]).
+#[derive(Debug)]
+struct PendingDocumentAdmission {
+    ticket: DocumentAdmissionTicket,
+    started: std::time::Instant,
+}
+
+/// Monotonic identity of one admission request. A completion carries the
+/// ticket it was started with; the main thread applies it only while the
+/// pending entry still holds that ticket, so a superseded or already-finished
+/// admission's result is dropped rather than applied twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentAdmissionTicket(u64);
+
+/// An `aterm-document-admit` worker that has run this long without reporting is
+/// treated as abandoned for COALESCING purposes only: a new request for the same
+/// file starts a fresh read rather than joining a wait that may never end (an
+/// unreachable network volume, a download that stalled). If the old worker does
+/// return later, its ticket no longer matches and its result is dropped.
+const DOCUMENT_ADMISSION_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What the worker hands back through `Wake::DocumentAdmitted`: the request it
+/// was given, verbatim, plus the admitted file or the error text. Plain owned
+/// data; it crosses from the worker to the main thread by move.
+#[derive(Debug)]
+pub(crate) struct DocumentAdmissionOutcome {
+    pub(crate) ticket: DocumentAdmissionTicket,
+    pub(crate) wid: WindowId,
+    pub(crate) key: DocumentAdmissionKey,
+    pub(crate) result: Result<Box<AdmittedDocument>, String>,
+}
+
+/// How a two-phase open request was disposed of on the calling thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentAdmission {
+    /// A worker is reading the file; the tab appears when it reports back.
+    InFlight(DocumentAdmissionTicket),
+    /// The same request was already in flight; this one rides on it.
+    Coalesced(DocumentAdmissionTicket),
+    /// No event-loop proxy exists to report back to (the headless test harness),
+    /// so the admission ran inline and the tab is already open. Carries the
+    /// same `app <kind> <uri> view=<n>` line the synchronous opener returns.
+    Opened(String),
+}
+
+impl DocumentAdmission {
+    /// One status line for callers that report a string either way.
+    pub(crate) fn message(&self, key: &DocumentAdmissionKey) -> String {
+        match self {
+            Self::Opened(line) => line.clone(),
+            Self::InFlight(_) | Self::Coalesced(_) => {
+                format!("admitting {} {}", key.kind.as_str(), key.uri)
+            }
+        }
+    }
+}
+
+/// Why a worker's completion did NOT install a tab. The split is what the
+/// `Wake::DocumentAdmitted` arm needs: a dropped completion is bookkeeping and
+/// goes to the log only; a failed one answers a gesture the user made and is
+/// shown to them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentAdmissionRejected {
+    /// Nothing to tell the user: the ticket was superseded or already consumed,
+    /// or the requesting window closed while the worker was reading. The result
+    /// is discarded without registering anything.
+    Dropped(String),
+    /// The read or the grant refused — an evicted iCloud Drive file, a missing
+    /// or oversize file, a non-UTF-8 one. The user asked for this file and gets
+    /// the reason in words they can act on.
+    Failed(String),
+}
+
+impl DocumentAdmissionRejected {
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::Dropped(detail) | Self::Failed(detail) => detail,
         }
     }
 }
@@ -2607,8 +2714,55 @@ impl App {
         }
     }
 
-    /// Open or focus one canonical local document in the requesting window.
-    /// Ordinary repeated opens never pull focus to another window.
+    /// Two-phase open of one local document in the FRONTMOST window (File ▸ Open
+    /// Markdown / Open File in Editor). See [`Self::request_document_tab_in_window`].
+    pub(crate) fn request_document_tab(
+        &mut self,
+        kind: AppKind,
+        uri: &str,
+    ) -> Result<DocumentAdmission, String> {
+        let wid = self
+            .frontmost_window
+            .ok_or_else(|| "no requesting window".to_string())?;
+        self.request_document_tab_in_window(wid, kind, uri)
+    }
+
+    /// Two-phase open of one local document in one exact host window — the form
+    /// every MAIN-THREAD gesture uses (file drop, the Open… menu items).
+    ///
+    /// Phase one, here, validates the window/kind/URI and hands the read to an
+    /// `aterm-document-admit` worker. Phase two, `Wake::DocumentAdmitted` →
+    /// [`Self::complete_document_admission`], mints the grant and installs the
+    /// tab. The event loop never blocks on the read: an evicted iCloud Drive
+    /// item downloads on the worker (which opts INTO materialization for
+    /// itself), an unreachable network volume times out on the worker, and the
+    /// main-thread watchdog sees neither. Without an event-loop proxy (the
+    /// headless test harness) the admission runs inline and the result is
+    /// [`DocumentAdmission::Opened`].
+    pub(crate) fn request_document_tab_in_window(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+    ) -> Result<DocumentAdmission, String> {
+        Self::validate_document_request(kind, false)?;
+        if !self.windows.contains_key(&wid) {
+            return Err("requesting window disappeared".to_string());
+        }
+        self.begin_document_admission(
+            wid,
+            DocumentAdmissionKey {
+                uri: uri.to_string(),
+                kind,
+            },
+        )
+    }
+
+    /// Synchronous open in the FRONTMOST window: the control socket's `app open
+    /// markdown|editor` verb (`app_control::open_app`), which answers its client
+    /// with the installed view. Same caller rules as
+    /// [`Self::open_document_tab_in_window`]; user gestures use
+    /// [`Self::request_document_tab`].
     pub(crate) fn open_document_tab(&mut self, kind: AppKind, uri: &str) -> Result<String, String> {
         let wid = self
             .frontmost_window
@@ -2616,11 +2770,25 @@ impl App {
         self.open_document_tab_in_window(wid, kind, uri)
     }
 
-    /// Open or focus a canonical local document in one exact host window.
+    /// Open or focus a canonical local document in one exact host window,
+    /// SYNCHRONOUSLY: the bounded read runs on the calling thread.
     ///
     /// Window-system gestures such as file drops carry the window they landed on.
     /// Keeping that identity through grant acquisition and tab installation prevents
     /// a late focus change from redirecting the document into another window.
+    ///
+    /// WHO MAY CALL THIS. Callers that need the installed tab before they can
+    /// continue — session restore (tab order and the active tab are read back
+    /// immediately), the Markdown ▸ Edit effect and the Recovery tab's reopen
+    /// (each completes a native operation with the outcome), and the unit
+    /// tests — plus the Manual config editor, whose caller binds the config
+    /// service to the freshly-opened document in the same call. User GESTURES
+    /// must not: `drop_file` and `choose_and_open_document` go through
+    /// [`Self::request_document_tab_in_window`] so the event loop never waits
+    /// on a download. On the main thread this form still cannot hang on a
+    /// dataless file — the main thread's materialization policy is OFF
+    /// ([`crate::dataless_files`]), so such a read fails fast as
+    /// `NotDownloaded` — but it does wait out a network volume's timeout.
     pub(crate) fn open_document_tab_in_window(
         &mut self,
         wid: WindowId,
@@ -2637,30 +2805,204 @@ impl App {
         uri: &str,
         allow_config_symlinks: bool,
     ) -> Result<String, String> {
+        Self::validate_document_request(kind, allow_config_symlinks)?;
+        if !self.windows.contains_key(&wid) {
+            return Err("requesting window disappeared".to_string());
+        }
+        let admitted = Self::admit_document_now(uri, allow_config_symlinks)?;
+        self.install_admitted_document(wid, kind, uri, admitted)
+    }
+
+    fn validate_document_request(kind: AppKind, allow_config_symlinks: bool) -> Result<(), String> {
         if !matches!(kind, AppKind::Markdown | AppKind::Editor) {
             return Err("document tabs must be Markdown or Editor".to_string());
         }
         if allow_config_symlinks && kind != AppKind::Editor {
             return Err("only the Manual config editor may bind config symlinks".to_string());
         }
-        if !self.windows.contains_key(&wid) {
-            return Err("requesting window disappeared".to_string());
+        Ok(())
+    }
+
+    /// The blocking half of an open, on the CALLING thread: resolve, read,
+    /// validate. Pure with respect to `App`, so a worker can run it.
+    fn admit_document_now(
+        uri: &str,
+        allow_config_symlinks: bool,
+    ) -> Result<AdmittedDocument, String> {
+        crate::native_document_host::admit_local_file(
+            uri,
+            DEFAULT_DOCUMENT_LIMIT,
+            allow_config_symlinks,
+        )
+        .map_err(|error| format!("document open failed: {error}"))
+    }
+
+    /// Phase one of the two-phase open. The caller has validated `wid` and the
+    /// key. Returns without touching the filesystem when a proxy exists.
+    fn begin_document_admission(
+        &mut self,
+        wid: WindowId,
+        key: DocumentAdmissionKey,
+    ) -> Result<DocumentAdmission, String> {
+        // Coalescing is PER WINDOW: the caller has checked that `wid` exists, so
+        // a hit here is a live window's own in-flight read. Another window's
+        // read of the same file is a different entry and never joined — its
+        // completion installs there (or is dropped if it closed), not here.
+        if let Some(pending) = self.native_documents.admissions.get(&(wid, key.clone()))
+            && pending.started.elapsed() < DOCUMENT_ADMISSION_STALE_AFTER
+        {
+            return Ok(DocumentAdmission::Coalesced(pending.ticket));
         }
+        let Some(proxy) = self.proxy.clone() else {
+            // No event loop to report back to: the headless harness. Admit
+            // inline so the tests that read the tab straight back keep their
+            // synchronous contract; the state machine above is exercised by its
+            // own tests through `complete_document_admission`.
+            let admitted = Self::admit_document_now(&key.uri, false)?;
+            return self
+                .install_admitted_document(wid, key.kind, &key.uri, admitted)
+                .map(DocumentAdmission::Opened);
+        };
+        let ticket = self.mint_document_admission(wid, key.clone());
+        let worker_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aterm-document-admit".to_string())
+            .spawn(move || {
+                // THIS thread may wait for a download: the user asked for the
+                // file, and this thread is nobody's event loop. The policy is
+                // thread-scoped, so the main thread's OFF is untouched.
+                if let Err(errno) = crate::dataless_files::set_thread_materialize_policy(
+                    crate::dataless_files::MaterializePolicy::On,
+                ) {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: document admission worker could not enable \
+                         dataless-file materialization (errno {errno}); an evicted \
+                         file will be reported as not downloaded"
+                    );
+                }
+                let result = Self::admit_document_now(&worker_key.uri, false).map(Box::new);
+                let _ = proxy.send_event(crate::Wake::DocumentAdmitted(Box::new(
+                    DocumentAdmissionOutcome {
+                        ticket,
+                        wid,
+                        key: worker_key,
+                        result,
+                    },
+                )));
+            });
+        if let Err(error) = spawned {
+            self.native_documents.admissions.remove(&(wid, key));
+            return Err(format!(
+                "could not start the document admission worker: {error}"
+            ));
+        }
+        Ok(DocumentAdmission::InFlight(ticket))
+    }
+
+    /// Record one admission as pending and mint its ticket. Split from
+    /// [`Self::begin_document_admission`] so the completion state machine can be
+    /// tested without a worker thread or an event loop.
+    fn mint_document_admission(
+        &mut self,
+        wid: WindowId,
+        key: DocumentAdmissionKey,
+    ) -> DocumentAdmissionTicket {
+        let raw = self.native_documents.next_admission;
+        self.native_documents.next_admission = raw.wrapping_add(1).max(1);
+        let ticket = DocumentAdmissionTicket(raw);
+        self.native_documents.admissions.insert(
+            (wid, key),
+            PendingDocumentAdmission {
+                ticket,
+                started: std::time::Instant::now(),
+            },
+        );
+        ticket
+    }
+
+    /// Phase two of the two-phase open, on the main thread: the worker's
+    /// verdict arrives through `Wake::DocumentAdmitted`. Applies it only when
+    /// the pending entry still holds the same ticket (a superseded read is
+    /// dropped), only when the requesting window still exists (a closed window
+    /// drops it cleanly — the pending entry is retired and nothing is
+    /// registered), and otherwise mints the grant and installs the tab exactly
+    /// as the synchronous opener does. `Ok` carries the opener's status line;
+    /// `Err` says whether the outcome was silently dropped or failed for a reason
+    /// the user should see.
+    pub(crate) fn complete_document_admission(
+        &mut self,
+        outcome: DocumentAdmissionOutcome,
+    ) -> Result<String, DocumentAdmissionRejected> {
+        let DocumentAdmissionOutcome {
+            ticket,
+            wid,
+            key,
+            result,
+        } = outcome;
+        let slot = (wid, key);
+        match self.native_documents.admissions.get(&slot) {
+            Some(pending) if pending.ticket == ticket => {}
+            _ => {
+                return Err(DocumentAdmissionRejected::Dropped(format!(
+                    "stale document admission for {} ignored",
+                    slot.1.uri
+                )));
+            }
+        }
+        // Retire the entry BEFORE any early return: a failed or orphaned
+        // admission must never keep a later open of the same file coalescing
+        // onto a result that has already been consumed.
+        self.native_documents.admissions.remove(&slot);
+        let (wid, key) = slot;
+        // The outcome names the window the request was made in (it is part of
+        // the pending entry's identity); a window that closed while the worker
+        // was reading drops the result — nothing is minted or registered.
+        if !self.windows.contains_key(&wid) {
+            return Err(DocumentAdmissionRejected::Dropped(format!(
+                "requesting window closed before {} was admitted",
+                key.uri
+            )));
+        }
+        let admitted = *result.map_err(DocumentAdmissionRejected::Failed)?;
+        self.install_admitted_document(wid, key.kind, &key.uri, admitted)
+            .map_err(DocumentAdmissionRejected::Failed)
+    }
+
+    /// Whether an admission for exactly this request is still pending (test /
+    /// diagnostic seam).
+    #[cfg(test)]
+    fn document_admission_pending(
+        &self,
+        wid: WindowId,
+        key: &DocumentAdmissionKey,
+    ) -> Option<DocumentAdmissionTicket> {
+        self.native_documents
+            .admissions
+            .get(&(wid, key.clone()))
+            .map(|pending| pending.ticket)
+    }
+
+    /// The main-thread tail of every open: mint (or upgrade) the grant, register
+    /// the document with recovery and persistence, then create or focus the tab.
+    /// No filesystem read happens here beyond the cheap binding revalidation of
+    /// an already-minted grant.
+    fn install_admitted_document(
+        &mut self,
+        wid: WindowId,
+        kind: AppKind,
+        uri: &str,
+        admitted: AdmittedDocument,
+    ) -> Result<String, String> {
         let access = if kind == AppKind::Editor {
             GrantAccess::ReadWrite
         } else {
             GrantAccess::ReadOnly
         };
-        let granted = if allow_config_symlinks {
-            self.native_documents
-                .grants
-                .open_local_config(uri, access, DEFAULT_DOCUMENT_LIMIT)
-        } else {
-            self.native_documents
-                .grants
-                .open_local(uri, access, DEFAULT_DOCUMENT_LIMIT)
-        }
-        .map_err(|error| format!("document open failed: {error}"))?;
+        let granted = self
+            .native_documents
+            .grants
+            .grant_admitted(admitted, access)
+            .map_err(|error| format!("document open failed: {error}"))?;
         let existing = self.document_store.id_for_uri(&granted.grant.canonical_uri);
         let mut recovery_notice = None;
         let document = if let Some(document) = existing {
@@ -3228,6 +3570,259 @@ mod tests {
             panic!("expected editor view");
         };
         state.buffer.as_ref().expect("attached editor buffer")
+    }
+
+    fn admission_fixture(name: &str, bytes: &[u8]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-document-admission-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dropped.md");
+        fs::write(&path, bytes).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        (dir, uri)
+    }
+
+    fn admission_key(uri: &str, kind: AppKind) -> DocumentAdmissionKey {
+        DocumentAdmissionKey {
+            uri: uri.to_string(),
+            kind,
+        }
+    }
+
+    /// Exactly what the `aterm-document-admit` worker produces, minus the thread
+    /// and the proxy: the outcome for one minted ticket.
+    fn worker_outcome(
+        ticket: DocumentAdmissionTicket,
+        wid: WindowId,
+        key: &DocumentAdmissionKey,
+    ) -> DocumentAdmissionOutcome {
+        DocumentAdmissionOutcome {
+            ticket,
+            wid,
+            key: key.clone(),
+            result: App::admit_document_now(&key.uri, false).map(Box::new),
+        }
+    }
+
+    /// The worker's payload, built the way the worker builds it and applied the
+    /// way the `Wake::DocumentAdmitted` arm applies it, installs the same tab
+    /// the synchronous opener would — and retires its pending entry.
+    #[test]
+    fn document_admission_outcome_round_trips_into_an_installed_tab() {
+        let (dir, uri) = admission_fixture("round-trip", b"# dropped\n");
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let key = admission_key(&uri, AppKind::Markdown);
+        let ticket = app.mint_document_admission(wid, key.clone());
+        assert_eq!(app.document_admission_pending(wid, &key), Some(ticket));
+
+        let outcome = worker_outcome(ticket, wid, &key);
+        let line = app
+            .complete_document_admission(outcome)
+            .expect("a live window installs the admitted document");
+        assert!(line.starts_with("app markdown file://"), "{line}");
+        assert_eq!(app.document_admission_pending(wid, &key), None);
+        let (instance, _) = app
+            .active_native_view(wid)
+            .expect("the Markdown tab is active");
+        assert_eq!(
+            app.native_runtime.app(instance).map(|app| app.kind()),
+            Some(AppKind::Markdown)
+        );
+        let canonical = crate::native_document_host::path_to_file_uri(
+            &fs::canonicalize(dir.join("dropped.md")).unwrap(),
+        )
+        .unwrap();
+        assert!(app.document_store.id_for_uri(&canonical).is_some());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A second request for the same file while the first is still reading joins
+    /// it: one ticket, one worker, one completion, one document.
+    #[test]
+    fn duplicate_in_flight_admission_is_coalesced_onto_the_first() {
+        let (dir, uri) = admission_fixture("coalesce", b"# once\n");
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let key = admission_key(&uri, AppKind::Editor);
+        let ticket = app.mint_document_admission(wid, key.clone());
+        assert_eq!(
+            app.begin_document_admission(wid, key.clone()),
+            Ok(DocumentAdmission::Coalesced(ticket)),
+            "same uri, same kind: rides on the in-flight read"
+        );
+        assert_eq!(
+            app.begin_document_admission(wid, key.clone()),
+            Ok(DocumentAdmission::Coalesced(ticket))
+        );
+        // A DIFFERENT kind for the same file is a different tab, not a duplicate:
+        // in the headless harness it admits inline.
+        let other = admission_key(&uri, AppKind::Markdown);
+        assert!(
+            matches!(
+                app.begin_document_admission(wid, other.clone()),
+                Ok(DocumentAdmission::Opened(_))
+            ),
+            "no proxy: the non-coalesced request admits inline"
+        );
+        assert_eq!(app.document_admission_pending(wid, &other), None);
+
+        let outcome = worker_outcome(ticket, wid, &key);
+        app.complete_document_admission(outcome).unwrap();
+        assert_eq!(app.document_admission_pending(wid, &key), None);
+        let canonical = crate::native_document_host::path_to_file_uri(
+            &fs::canonicalize(dir.join("dropped.md")).unwrap(),
+        )
+        .unwrap();
+        let document = app.document_store.id_for_uri(&canonical).unwrap();
+        assert_eq!(
+            app.document_native_views(document).len(),
+            2,
+            "one document, one Editor view and one Markdown view — never a duplicate registration"
+        );
+        // The coalesced duplicates produced no second completion to apply: the
+        // ticket has been consumed, and a replay is refused, not re-installed.
+        let replay = worker_outcome(ticket, wid, &key);
+        assert!(matches!(
+            app.complete_document_admission(replay),
+            Err(DocumentAdmissionRejected::Dropped(_))
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The requesting window closed while the worker was reading: the result is
+    /// dropped cleanly — nothing registered, nothing installed, the pending entry
+    /// retired so the file can be opened again afterwards.
+    #[test]
+    fn admission_completion_for_a_closed_window_is_dropped_cleanly() {
+        let (dir, uri) = admission_fixture("closed-window", b"# orphan\n");
+        let mut app = App::headless_for_test();
+        let gone = WindowId(4242);
+        assert!(!app.windows.contains_key(&gone));
+        let key = admission_key(&uri, AppKind::Markdown);
+        let ticket = app.mint_document_admission(gone, key.clone());
+        let outcome = worker_outcome(ticket, gone, &key);
+        let error = app
+            .complete_document_admission(outcome)
+            .expect_err("a closed window cannot receive the tab");
+        assert!(
+            matches!(&error, DocumentAdmissionRejected::Dropped(detail) if detail.contains("window closed")),
+            "a closed window drops silently, it does not alert: {error:?}"
+        );
+        assert_eq!(app.document_admission_pending(gone, &key), None);
+        let canonical = crate::native_document_host::path_to_file_uri(
+            &fs::canonicalize(dir.join("dropped.md")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.id_for_uri(&canonical), None);
+        assert_eq!(app.native_documents.grants.id_for_uri(&canonical), None);
+        // And the file is openable again in a window that exists.
+        assert!(matches!(
+            app.request_document_tab_in_window(WindowId(0), AppKind::Markdown, &uri),
+            Ok(DocumentAdmission::Opened(_))
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Coalescing is per window. The same file requested from a second window
+    /// while the first window's read is in flight is its OWN admission — so when
+    /// the first window closes before its worker returns, its completion is
+    /// dropped and the second window still gets the tab it asked for. Without
+    /// the window in the key the second request would have joined the first
+    /// window's read and been dropped along with it.
+    #[test]
+    fn same_file_from_another_window_is_its_own_admission_not_a_coalesce() {
+        let (dir, uri) = admission_fixture("two-windows", b"# twice\n");
+        let mut app = App::headless_for_test();
+        let live = WindowId(0);
+        let gone = WindowId(4243);
+        let key = admission_key(&uri, AppKind::Markdown);
+        let first = app.mint_document_admission(gone, key.clone());
+        // The live window's request does not ride on the closed window's read:
+        // in the headless harness it admits inline and installs its own tab.
+        let second = app
+            .request_document_tab_in_window(live, AppKind::Markdown, &uri)
+            .unwrap();
+        assert!(
+            matches!(second, DocumentAdmission::Opened(_)),
+            "a different window is a different admission: {second:?}"
+        );
+        assert_eq!(
+            app.document_admission_pending(gone, &key),
+            Some(first),
+            "the first window's read is still pending, untouched"
+        );
+        assert!(app.active_native_view(live).is_some());
+        // The first window's worker reports after that window closed: dropped,
+        // and the live window's tab is unaffected.
+        let orphan = worker_outcome(first, gone, &key);
+        assert!(matches!(
+            app.complete_document_admission(orphan),
+            Err(DocumentAdmissionRejected::Dropped(_))
+        ));
+        assert_eq!(app.document_admission_pending(gone, &key), None);
+        let canonical = crate::native_document_host::path_to_file_uri(
+            &fs::canonicalize(dir.join("dropped.md")).unwrap(),
+        )
+        .unwrap();
+        let document = app.document_store.id_for_uri(&canonical).unwrap();
+        assert_eq!(app.document_native_views(document).len(), 1);
+        // A duplicate gesture in the live window, while ITS read is in flight,
+        // is the case that coalesces.
+        let ticket = app.mint_document_admission(live, key.clone());
+        assert_eq!(
+            app.begin_document_admission(live, key.clone()),
+            Ok(DocumentAdmission::Coalesced(ticket))
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A ticket that no longer matches the pending entry (superseded by a fresh
+    /// request, or already consumed) is ignored; a failed read retires the entry
+    /// and reports the worker's error text.
+    #[test]
+    fn stale_and_failed_admissions_never_register_a_document() {
+        let (dir, uri) = admission_fixture("stale", b"# stale\n");
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let key = admission_key(&uri, AppKind::Markdown);
+        let old = app.mint_document_admission(wid, key.clone());
+        let fresh = app.mint_document_admission(wid, key.clone());
+        assert_ne!(old, fresh);
+        let stale = worker_outcome(old, wid, &key);
+        let error = app.complete_document_admission(stale).unwrap_err();
+        assert!(
+            matches!(&error, DocumentAdmissionRejected::Dropped(detail) if detail.contains("stale")),
+            "{error:?}"
+        );
+        assert_eq!(
+            app.document_admission_pending(wid, &key),
+            Some(fresh),
+            "a stale completion leaves the live admission pending"
+        );
+
+        let failed = DocumentAdmissionOutcome {
+            ticket: fresh,
+            wid,
+            key: key.clone(),
+            result: Err("document open failed: dropped.md is evicted from iCloud Drive and must be downloaded in Finder first".to_string()),
+        };
+        let error = app.complete_document_admission(failed).unwrap_err();
+        assert!(
+            matches!(&error, DocumentAdmissionRejected::Failed(detail) if detail.contains("evicted from iCloud Drive")),
+            "a read failure is the user's to see: {error:?}"
+        );
+        assert_eq!(app.document_admission_pending(wid, &key), None);
+        let canonical = crate::native_document_host::path_to_file_uri(
+            &fs::canonicalize(dir.join("dropped.md")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(app.document_store.id_for_uri(&canonical), None);
+        assert!(app.active_native_view(wid).is_none());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

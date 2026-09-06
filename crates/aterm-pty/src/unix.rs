@@ -823,12 +823,19 @@ fn note_racy_exec_status_carrier(why: &io::Error) {
     use std::sync::atomic::Ordering;
     let prior = RACY_EXEC_STATUS_CARRIERS.fetch_add(1, Ordering::Relaxed);
     if prior == 0 {
-        eprintln!(
-            "aterm-pty: the atomic exec-status channel could not be created ({why}); falling \
-             back to pipe(2)+fcntl, which leaves both ends briefly inheritable by a concurrent \
-             spawn. The spawn's status wait stays bounded at {EXEC_STATUS_BUDGET:?}, so this \
-             degrades to a slow visible failure rather than a hang."
-        );
+        // Best-effort: `eprintln!` PANICS when stderr is closed or its reader is gone
+        // (EPIPE/EIO), and this runs inside the GUI process where that panic would
+        // abort a spawn. Found by the 2026-09-02 abort audit.
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "aterm-pty: the atomic exec-status channel could not be created ({why}); falling \
+                 back to pipe(2)+fcntl, which leaves both ends briefly inheritable by a concurrent \
+                 spawn. The spawn's status wait stays bounded at {EXEC_STATUS_BUDGET:?}, so this \
+                 degrades to a slow visible failure rather than a hang."
+            );
+        }
     }
 }
 

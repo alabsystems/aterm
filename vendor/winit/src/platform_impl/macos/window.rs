@@ -1,15 +1,17 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
 // (The window delegate AND the window class are now declared with
 //  `aterm_objc::declare_class!`, so the handles this file stores for them are
-//  that crate's `Retained`, not objc2's.)
+//  that crate's `Retained`, not objc2's — and since W12 the thread-affinity
+//  container holding them is `aterm_objc::MainThreadBound` and the one AppKit
+//  send left is a typed one.)
 #![allow(clippy::unnecessary_cast)]
 
-use aterm_objc::{Bool, Id};
-use objc2::rc::autoreleasepool;
-use objc2_app_kit::NSWindow;
-use objc2_foundation::{MainThreadBound, MainThreadMarker};
-
-use super::aterm_objc_seam;
+// LOCAL PATCH (aterm): objc2's `autoreleasepool`, its `NSWindow` binding,
+// `MainThreadBound` and `MainThreadMarker` are all gone. `NSWindow` was only
+// needed for the `ns_window()` crossing this file no longer has —
+// `declare_class!` takes its superclass as a NAME, not as a Rust type.
+use aterm_objc::send::send_v;
+use aterm_objc::{Bool, Id, MainThread, MainThreadBound, autoreleasepool, sel};
 
 use super::event_loop::ActiveEventLoop;
 use super::window_delegate::WindowDelegate;
@@ -22,16 +24,37 @@ pub(crate) struct Window {
     ///
     // LOCAL PATCH (aterm): `aterm_objc::Retained`, not objc2's — `WindowDelegate`
     // is declared by `aterm_objc::declare_class!` and so is no longer an objc2
-    // `ClassType`. `MainThreadBound<T>` is generic over any `T` (its `Send`/`Sync`
-    // come from the marker it is constructed with, not from `T`), and
-    // `aterm_objc::Retained<T>` derefs to `T` exactly as objc2's does, so
-    // `get_on_main`'s callers below are unchanged.
+    // `ClassType`.
+    //
+    // LOCAL PATCH (aterm), W12: and `MainThreadBound` is `aterm_objc`'s, which
+    // is the LAST capability this backend was waiting on. The substitution is
+    // faithful rather than approximate, and the point that matters is the
+    // `Drop`: objc2's reschedules through `run_on_main` and so does this one,
+    // so a `Window` moved to another thread and dropped there still releases
+    // its two `Retained`s — and runs `WindowDelegate`'s Rust ivar destructor —
+    // on the main thread. (Both implementations even need the same odd
+    // rebinding inside the closure, `let this = self`, because edition-2021
+    // captures DISJOINT FIELDS and `&mut ManuallyDrop<T>` is `Send` only if `T`
+    // is. Two independent authors, one workaround.)
     delegate: MainThreadBound<aterm_objc::Retained<WindowDelegate>>,
 }
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.window.get_on_main(|window| autoreleasepool(|_| window.ns_window().close()))
+        // LOCAL PATCH (aterm), W12: `window.ns_window().close()` was this
+        // file's only AppKit send and `ns_window()`'s only remaining caller —
+        // so porting it deletes BOTH, and with them the last `seam::objc2_ref`
+        // in `window.rs`.
+        self.window.get_on_main(|window| {
+            autoreleasepool(|_| {
+                // SAFETY: `window` borrows a live `WinitWindow`, which is
+                // registered with `NSWindow` as its superclass; `-close` is
+                // `v16@0:8` on `NSWindow`. `get_on_main` has put this on the
+                // main thread, which is where a window teardown — and the
+                // `windowWillClose:` it dispatches — must run.
+                unsafe { send_v(window.as_id(), sel!(close)) };
+            })
+        })
     }
 }
 
@@ -40,17 +63,15 @@ impl Window {
         window_target: &ActiveEventLoop,
         attributes: WindowAttributes,
     ) -> Result<Self, RootOsError> {
+        // LOCAL PATCH (aterm), W12: `window_target.mtm` IS an
+        // `aterm_objc::MainThread` now. That field was a CROSS-FILE
+        // CONSUMPTION with no `objc2` token on the line that read it — this
+        // file needed `objc2_foundation` because a struct field in
+        // `event_loop.rs` had that type, not because of anything written here.
         let mtm = window_target.mtm;
         let delegate = autoreleasepool(|_| {
             // LOCAL PATCH (aterm), W9: `WindowDelegate::new` takes a witness now.
-            // This file keeps `MainThreadMarker` as its currency because
-            // `MainThreadBound` — an objc2 CONTAINER, not a marker — consumes one
-            // in `new` and `get`; see the note above `Window`.
-            WindowDelegate::new(
-                window_target.app_delegate(),
-                attributes,
-                aterm_objc_seam::witness(mtm),
-            )
+            WindowDelegate::new(window_target.app_delegate(), attributes, mtm)
         })?;
         Ok(Window {
             window: MainThreadBound::new(delegate.window().retained(), mtm),
@@ -75,7 +96,7 @@ impl Window {
     pub(crate) fn raw_window_handle_rwh_06(
         &self,
     ) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
-        if let Some(mtm) = MainThreadMarker::new() {
+        if let Some(mtm) = MainThread::new() {
             Ok(self.delegate.get(mtm).raw_window_handle_rwh_06())
         } else {
             Err(rwh_06::HandleError::Unavailable)
@@ -181,13 +202,19 @@ aterm_objc::declare_class! {
         // rule is the same in both cases and only the outcome differs: the
         // encoding comes from the authority the runtime holds, never from the
         // Rust signature that happens to be there.
-        @sel(canBecomeMainWindow)
+        //
+        // NOT CONTAINED, both rows: the real answer is YES and the contained
+        // answer would be NO, which makes the window unfocusable — a real
+        // answer, not an inert one. Neither body makes a send, so no raise can
+        // reach them today; the marker keeps the policy visible at the
+        // declaration rather than implied by the body being send-free.
+        @sel(canBecomeMainWindow) @abort_on_exception
         fn can_become_main_window(&self) -> Bool {
             trace_scope!("canBecomeMainWindow");
             Bool::YES
         }
 
-        @sel(canBecomeKeyWindow)
+        @sel(canBecomeKeyWindow) @abort_on_exception
         fn can_become_key_window(&self) -> Bool {
             trace_scope!("canBecomeKeyWindow");
             Bool::YES
@@ -234,15 +261,15 @@ impl WinitWindow {
     // projected geometry conversions were.
     // ---------------------------------------------------------------------
 
-    /// This window through objc2's `NSWindow` binding — the receiver for every
-    /// AppKit method the backend sends it.
-    pub(super) fn ns_window(&self) -> &NSWindow {
-        // SAFETY: `self` borrows a live instance of `WinitWindow`, which is
-        // registered with `NSWindow` as its superclass (the live audit reads
-        // the chain), so it IS an `NSWindow`; `NSWindow` is a zero-sized
-        // binding marker and borrows none of the instance's bytes.
-        unsafe { aterm_objc_seam::objc2_ref(self.as_id()) }
-    }
+    // ---------------------------------------------------------------------
+    // `ns_window()` IS GONE, and it went the way `seam::id_of` and five of the
+    // seam's six geometry conversions went: not because it was over-projected,
+    // but because THE OTHER SIDE STOPPED NEEDING IT. It answered an objc2
+    // `&NSWindow` and had three callers under W8 — two in `view.rs`, which W9
+    // phase 2 ported, and one in this file's `Drop`, which W12 ports. A
+    // crossing dies when either side stops needing it, and a count of call
+    // sites says nothing about which.
+    // ---------------------------------------------------------------------
 
     /// A +1 handle to this window — objc2's `NSObjectProtocol::retain`, which
     /// this class no longer inherits.

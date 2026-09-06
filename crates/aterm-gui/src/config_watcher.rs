@@ -569,7 +569,11 @@ fn config_failure_kind(error: &crate::native_document_host::DocumentHostError) -
         DocumentHostError::TooLarge { .. } => WatchFailureKind::ConfigTooLarge,
         DocumentHostError::NotAFile => WatchFailureKind::ConfigNotRegular,
         DocumentHostError::ChangedWhileReading => WatchFailureKind::ConfigChangedWhileReading,
-        DocumentHostError::Io { .. } => WatchFailureKind::ConfigUnreadable,
+        // An evicted (dataless) config file cannot be read on a thread whose
+        // materialization policy is OFF; to the watcher that is "unreadable".
+        DocumentHostError::Io { .. } | DocumentHostError::NotDownloaded { .. } => {
+            WatchFailureKind::ConfigUnreadable
+        }
         DocumentHostError::UnsupportedScheme
         | DocumentHostError::RemoteAuthority
         | DocumentHostError::MalformedUri

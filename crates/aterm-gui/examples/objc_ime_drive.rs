@@ -135,7 +135,7 @@ mod macos {
         // SAFETY: the row is registered `v@:@{_NSRange=QQ}{_NSRange=QQ}`, which
         // the auditor checks against `NSTextInputClient`'s own description.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, NSRange, NSRange) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange, NSRange) = msg();
             f(
                 view,
                 sel!(setMarkedText:selectedRange:replacementRange:),
@@ -153,7 +153,7 @@ mod macos {
     unsafe fn insert_text(view: Id, string: Id, replacement: NSRange) {
         // SAFETY: the row is registered `v@:@{_NSRange=QQ}`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Id, NSRange) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Id, NSRange) = msg();
             f(
                 view,
                 sel!(insertText:replacementRange:),
@@ -170,7 +170,7 @@ mod macos {
     unsafe fn has_marked_text(view: Id) -> bool {
         // SAFETY: the row is registered `B@:`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
             f(view, sel!(hasMarkedText)).as_bool()
         }
     }
@@ -182,7 +182,7 @@ mod macos {
     unsafe fn marked_range(view: Id) -> NSRange {
         // SAFETY: the row is registered `{_NSRange=QQ}@:`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> NSRange = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
             f(view, sel!(markedRange))
         }
     }
@@ -194,7 +194,7 @@ mod macos {
     unsafe fn send_void(view: Id, s: Sel) {
         // SAFETY: the caller pins `s` as a `v@:` row on a live receiver.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = msg();
             f(view, s);
         }
     }
@@ -208,7 +208,7 @@ mod macos {
         // argument — the encoding that would silently become `v@:@` if a port
         // typed the argument as an object.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
             f(view, sel!(doCommandBySelector:), command);
         }
     }
@@ -225,7 +225,7 @@ mod macos {
         // the auditor has already made Foundation agree that its return is 32
         // bytes.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
             f(
                 view,
                 sel!(firstRectForCharacterRange:actualRange:),
@@ -244,9 +244,9 @@ mod macos {
         // `inner` is a live `NSString` borrowed for the length of the call and
         // copied by the initialiser.
         unsafe {
-            let alloc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let raw = alloc(class(c"NSAttributedString").as_id(), sel!(alloc));
-            let init: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
             Obj::from_owned(init(raw, sel!(initWithString:), inner.id()))
         }
     }
@@ -288,6 +288,8 @@ mod macos {
         report: Report,
         /// Every `Ime` event winit has delivered since the last drain.
         ime: Vec<Ime>,
+        /// The non-IME window events stage 8 needs, as short names.
+        mouse: Vec<&'static str>,
         done: bool,
         stage: usize,
         /// Expectations a stage queued for AFTER the next pump, because the
@@ -349,8 +351,14 @@ mod macos {
         }
 
         fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, e: WindowEvent) {
-            if let WindowEvent::Ime(ime) = e {
-                self.ime.push(ime);
+            match e {
+                WindowEvent::Ime(ime) => self.ime.push(ime),
+                // Stage 8's evidence that its synthetic events really reached
+                // `view.rs`'s mouse path, and were not dropped by
+                // `mouse_motion`'s outside-the-client-area early return.
+                WindowEvent::CursorMoved { .. } => self.mouse.push("CursorMoved"),
+                WindowEvent::MouseInput { .. } => self.mouse.push("MouseInput"),
+                _ => {}
             }
         }
 
@@ -394,6 +402,7 @@ mod macos {
                 5 => self.stage_leave_preedit(view),
                 6 => self.stage_candidate_rect(view),
                 7 => self.stage_dead_key(view),
+                8 => self.stage_mouse_paths(view),
                 _ => {
                     self.done = true;
                     el.exit();
@@ -674,7 +683,7 @@ mod macos {
             // outcome on a machine with no window server rather than a defect.
             // SAFETY: `-inputContext` is `@@:` on `NSResponder`; `view` is live.
             let ctx: Id = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 f(view, sel!(inputContext))
             };
             if ctx.is_null() {
@@ -816,7 +825,7 @@ mod macos {
             // and `unmarkText` on a view with none is the only failure mode,
             // guarded here the same way.
             let ctx: Id = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 f(view, sel!(inputContext))
             };
             if ctx.is_null() {
@@ -838,7 +847,7 @@ mod macos {
             // and is what AppKit itself passes on modern macOS. The result is
             // autoreleased.
             let event: Id = unsafe {
-                let f: unsafe extern "C" fn(
+                let f: unsafe extern "C-unwind" fn(
                     Id,
                     Sel,
                     usize,
@@ -878,7 +887,7 @@ mod macos {
             // SAFETY: `keyDown:` is registered `v@:@` and `event` is the live
             // autoreleased `NSEvent` just built — exactly what AppKit delivers.
             unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Id) = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
                 f(view, sel!(keyDown:), event);
             }
             println!(
@@ -908,6 +917,138 @@ mod macos {
                 );
             }));
         }
+
+        /// STAGE 8 — THE MOUSE PATHS THROUGH `update_modifiers`, which is not an
+        /// IME question and is here because this is `view.rs`'s driver.
+        ///
+        /// # The defect this exists for, which aborted the process
+        ///
+        /// `update_modifiers` sends `-[NSEvent keyCode]`. Seven of its eight
+        /// callers pass `is_flags_changed_event = false`, and FOUR of those hand it
+        /// a NON-KEY event: `mouse_motion` (reached from `mouseMoved:`,
+        /// `mouseDragged:`, `mouseDown:`, `mouseUp:`, `scrollWheel:`),
+        /// `mouse_click`, `scroll_wheel` and `cancel_operation`.
+        ///
+        /// `-[NSEvent keyCode]` RAISES for every one of those types — measured with
+        /// clang on this box: `LeftMouseDown`, `MouseMoved`, `RightMouseDown` and
+        /// `LeftMouseDragged` all answer `NSInternalInconsistencyException`,
+        /// "Invalid message sent to event". An Objective-C exception thrown inside
+        /// a registered IMP cannot be caught by the `catch_unwind` the class macro
+        /// wraps the body in, so the process ABORTS: *"fatal runtime error: Rust
+        /// cannot catch foreign exceptions"*.
+        ///
+        /// The `objc2` line the port replaced short-circuited —
+        /// `if is_flags_changed_event && unsafe { ns_event.keyCode() } != 0` — and
+        /// the port hoisted the send into a `let` above the `if`, which reads like
+        /// a pure tidy-up and is not.
+        ///
+        /// # Why no instrument had it
+        ///
+        /// The PROTOTYPE IS RIGHT (`S16@0:8`, `send_u16`), so a census agrees with
+        /// it. libtest cannot host AppKit. And the existing drivers reach the
+        /// mouse path only when the PHYSICAL cursor happens to sit over the drive
+        /// window — `objc_toolbar_drive` passed once and then aborted 6 times out
+        /// of 6 an hour later, on identical code. A stage that ENTERS the IMPs
+        /// itself does not depend on where anybody's mouse is.
+        ///
+        /// # Non-vacuity
+        ///
+        /// `mouse_motion` returns EARLY when the point is outside the client area
+        /// and no button is down — before it reaches `update_modifiers` — so a
+        /// stage that only checked "we are still alive" could pass without ever
+        /// touching the line. The deferred check therefore requires winit to have
+        /// delivered `CursorMoved` and `MouseInput`, which only happens on the far
+        /// side of that return.
+        fn stage_mouse_paths(&mut self, view: Id) {
+            println!("\n=== 8. THE MOUSE PATHS: a non-key event through update_modifiers ===");
+            self.mouse.clear();
+            // A point in WINDOW base coordinates that lands inside a 480x320
+            // content view, so `mouse_motion` does not take its early return.
+            let inside = aterm_objc::CGPoint { x: 100.0, y: 100.0 };
+            let mut built = 0_usize;
+            for (label, ty, imp) in [
+                ("mouseMoved:", 5_usize, sel!(mouseMoved:)),
+                ("mouseDragged:", 6, sel!(mouseDragged:)),
+                ("mouseDown:", 1, sel!(mouseDown:)),
+                ("mouseUp:", 2, sel!(mouseUp:)),
+            ] {
+                // SAFETY: `+[NSEvent mouseEventWithType:location:modifierFlags:
+                // timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`
+                // is `@88@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88` — a class
+                // method whose `context:` is the always-nil graphics context.
+                let event = unsafe {
+                    #[allow(clippy::type_complexity)]
+                    let f: unsafe extern "C-unwind" fn(
+                        Id,
+                        Sel,
+                        usize,
+                        aterm_objc::CGPoint,
+                        usize,
+                        f64,
+                        isize,
+                        Id,
+                        isize,
+                        isize,
+                        f32,
+                    )
+                        -> Id = msg();
+                    f(
+                        class(c"NSEvent").as_id(),
+                        sel!(
+                            mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:
+                        ),
+                        ty,
+                        inside,
+                        0,
+                        0.0,
+                        0,
+                        Id::NIL,
+                        0,
+                        1,
+                        1.0,
+                    )
+                };
+                if event.is_null() {
+                    self.report.fail(format!(
+                        "+[NSEvent mouseEventWithType:…] answered nil for {label}"
+                    ));
+                    continue;
+                }
+                built += 1;
+                // ENTERED AT THE IMP, exactly as AppKit enters it. If
+                // `update_modifiers` sends `-keyCode` to this event, AppKit raises
+                // and THIS PROCESS DIES HERE — there is no softer failure to
+                // report, which is why the stage's own survival is the first
+                // assertion.
+                // SAFETY: every one of these rows is registered `v@:@`, checked by
+                // `objc_live_class_audit`.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
+                    f(view, imp, event);
+                }
+            }
+            self.report.expect(
+                "the four non-key mouse IMPs were entered and returned",
+                built == 4,
+                format!("{built} of 4, with no foreign exception raised"),
+            );
+            self.pending = Some(Box::new(|d: &mut Driver| {
+                let saw = std::mem::take(&mut d.mouse);
+                d.report.expect(
+                    "CursorMoved arrived, so update_modifiers really ran with a mouse event",
+                    saw.contains(&"CursorMoved"),
+                    format!(
+                        "{saw:?} — CursorMoved is on the FAR SIDE of `mouse_motion`'s \
+                         outside-the-client-area early return"
+                    ),
+                );
+                d.report.expect(
+                    "MouseInput arrived, so `mouse_click` ran with one too",
+                    saw.contains(&"MouseInput"),
+                    format!("{saw:?}"),
+                );
+            }));
+        }
     }
 
     /// Drive the loop until every stage has run, then report.
@@ -923,6 +1064,7 @@ mod macos {
             window: None,
             report: Report::default(),
             ime: Vec::new(),
+            mouse: Vec::new(),
             done: false,
             stage: 0,
             pending: None,

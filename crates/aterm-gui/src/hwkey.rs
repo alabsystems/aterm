@@ -448,7 +448,7 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             // lets the event arrive, and wait, while the main thread is parked
             // in `nextDrawable`.
             let key_event = |kind: usize| unsafe {
-                let make: unsafe extern "C" fn(
+                let make: unsafe extern "C-unwind" fn(
                     Id,
                     Sel,
                     usize,
@@ -487,7 +487,7 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             // SAFETY: `-postEvent:atStart:` is `-(void)(NSEvent *, BOOL)` on the
             // shared application with a live event; see the thread-safety note.
             unsafe {
-                let post: unsafe extern "C" fn(Id, Sel, Id, Bool) = aterm_objc::msg();
+                let post: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) = aterm_objc::msg();
                 post(app, sel!(postEvent:atStart:), down, Bool::NO);
                 // The release too: a real key always produces one, and leaving
                 // the press unmatched would drift AppKit's notion of the

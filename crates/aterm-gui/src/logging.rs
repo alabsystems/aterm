@@ -23,8 +23,32 @@
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+/// `eprintln!` that CANNOT panic — for every stderr line the windowed app
+/// writes at runtime.
+///
+/// `eprintln!` panics when the write fails ("failed printing to stderr"), and a
+/// GUI app's stderr fails in ordinary ways: launched from a terminal that has
+/// since closed (EIO on the pty), piped to a reader that went away (EPIPE —
+/// Rust ignores SIGPIPE, so the write errors instead), or fd 2 closed outright.
+/// Under aterm's `declare_class!` trampoline policy a panic inside any AppKit
+/// callback is a process abort, and inside the PANIC HOOK below it is "thread
+/// panicked while processing panic. aborting." — which turns a survivable
+/// worker-thread panic into a crash of the whole terminal. The 2026-09-02
+/// abort audit routed 243 sites in this crate through this macro (and 124 in
+/// aterm-gpu through its twin); only cli.rs and the *_conformance.rs harness
+/// lanes keep a bare `eprintln!`. It
+/// writes and drops the result, exactly what `aterm_objc::abort_on_unwind`
+/// already does for the same reason.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
+    }};
+}
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+pub(crate) use stderr_line;
 
 use aterm_log::{LevelFilter, Log, Metadata, Record};
 
@@ -35,7 +59,9 @@ use aterm_log::{LevelFilter, Log, Metadata, Record};
 /// discard-everything default and say why on stderr.
 pub fn init() {
     let Some(dir) = log_dir() else {
-        eprintln!("aterm-gui: no private log dir (set HOME); logging + crash reports disabled");
+        crate::logging::stderr_line!(
+            "aterm-gui: no private log dir (set HOME); logging + crash reports disabled"
+        );
         return;
     };
     // Crash reporting is independent of $ATERM_LOG — panics are always worth
@@ -55,7 +81,7 @@ pub fn init() {
     let file = match open_log_file(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: cannot open {}: {e}; logging disabled",
                 path.display()
             );
@@ -68,6 +94,39 @@ pub fn init() {
     if aterm_log::set_logger(logger).is_ok() {
         aterm_log::set_max_level(level);
     }
+}
+
+/// Route `aterm_objc`'s exception-containment reports into `aterm.log`.
+///
+/// A containment is an `NSException` AppKit raised inside a declared
+/// Objective-C method (or a block, a dispatch trampoline, the `sendEvent:`
+/// override) that `aterm_objc::exception` caught instead of letting it abort
+/// the process. Each one is an ERROR record naming the method, the
+/// exception's class, name and reason, and its call stack on one line —
+/// and, because the file logger may be off (`ATERM_LOG=off`) or not yet up,
+/// the same line still goes to stderr through the crate's default sink.
+///
+/// Installed right after [`init`], before any window exists, so the first
+/// containment of the process is on record. [`crate::App`] reads the count
+/// every turn and treats a change as an event (a redraw, the modifier state
+/// re-read).
+#[cfg(target_os = "macos")]
+pub fn install_objc_containment_sink() {
+    aterm_objc::exception::set_sink(objc_containment_sink);
+}
+
+#[cfg(target_os = "macos")]
+fn objc_containment_sink(e: &aterm_objc::ContainedException<'_>) {
+    aterm_log::error!(
+        "objc: contained {} ({}) in Objective-C method `{}` (containment #{}): {} | stack: {}",
+        e.name,
+        e.class,
+        e.method,
+        e.ordinal,
+        e.reason,
+        e.call_stack
+    );
+    aterm_objc::exception::default_sink(e);
 }
 
 /// Route panics to `crash-<pid>.log` next to the main log: panic message +
@@ -138,7 +197,7 @@ fn file_panic_report(
     // are the only buffers; the report streams straight to the fd.
     let path = dir.join(format!("crash-{}.log", std::process::id()));
     let _ = write_crash_report(&path, info, backtrace);
-    eprintln!("aterm-gui: panic — crash report at {}", path.display());
+    crate::logging::stderr_line!("aterm-gui: panic — crash report at {}", path.display());
     Some(path)
 }
 

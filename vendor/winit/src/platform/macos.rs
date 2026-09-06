@@ -31,8 +31,15 @@
 //! Instead, Winit guarantees that it will not register an application delegate, so the solution is
 //! to register your own application delegate, as outlined in the following example (see
 //! `objc2-app-kit` for more detailed information).
-#![cfg_attr(target_os = "macos", doc = "```")]
-#![cfg_attr(not(target_os = "macos"), doc = "```ignore")]
+//!
+//! **The example below is upstream's, and it does not build in this fork.** It is written
+//! against the `objc2` family, which this fork stopped depending on at the `objc2` exit
+//! condition (2026-09-03; see the retirement note in this fork's `Cargo.toml`). It is kept as
+//! upstream's statement of the delegate contract and fenced `ignore` on every platform — it
+//! used to be a live doctest on macOS. The fork's own delegates are built on `aterm-objc`;
+//! `platform_impl/macos/app_state.rs` is the shape to copy.
+//!
+//! ```ignore
 //! use objc2::rc::Retained;
 //! use objc2::runtime::ProtocolObject;
 //! use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
@@ -91,6 +98,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::event_loop::{ActiveEventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
+use crate::keyboard::ModifiersState;
 use crate::window::{Window, WindowAttributes};
 
 /// Register a handler consulted before the application terminates via AppKit's
@@ -177,6 +185,12 @@ pub trait WindowExtMacOS {
     /// Getter for the [`WindowExtMacOS::set_option_as_alt`].
     fn option_as_alt(&self) -> OptionAsAlt;
 
+    /// LOCAL PATCH (aterm): the modifier state winit last derived from an
+    /// event for this window — its own cache, written before the matching
+    /// `ModifiersChanged` is queued. For re-syncing after a contained
+    /// `NSException`; never a WindowServer-backed probe.
+    fn cached_modifiers(&self) -> ModifiersState;
+
     /// Disable the Menu Bar and Dock in Simple or Borderless Fullscreen mode. Useful for games.
     /// The effect is applied when [`WindowExtMacOS::set_simple_fullscreen`] or
     /// [`Window::set_fullscreen`] is called.
@@ -255,6 +269,11 @@ impl WindowExtMacOS for Window {
     #[inline]
     fn option_as_alt(&self) -> OptionAsAlt {
         self.window.maybe_wait_on_main(|w| w.option_as_alt())
+    }
+
+    #[inline]
+    fn cached_modifiers(&self) -> ModifiersState {
+        self.window.maybe_wait_on_main(|w| w.cached_modifiers())
     }
 
     #[inline]
@@ -498,21 +517,29 @@ impl MonitorHandleExtMacOS for MonitorHandle {
         // taken by `MonitorHandle::ns_screen_ptr` now, at the same +0 and with
         // the same lifetime wart.
         //
-        // ONE BEHAVIOUR DIFFERENCE, and it is stated rather than absorbed: the
-        // backend re-derives an objc2 marker through `aterm_objc_seam::marker`,
-        // which ASKS. Called off the main thread this used to reach
-        // `+[NSScreen screens]` on the strength of upstream's "SAFETY: We only use
-        // the marker to get a pointer" — which is not what the marker means — and
-        // now panics with the thread named instead. Nothing in this tree calls this
-        // trait method (`grep MonitorHandleExtMacOS` finds only its declaration and
-        // this impl); it is kept for winit API compatibility, so the difference is
-        // reachable only by a downstream user who was already doing the unsound
-        // thing.
+        // ONE BEHAVIOUR DIFFERENCE, and it is stated rather than absorbed:
+        // called off the main thread this used to reach `+[NSScreen screens]`
+        // on the strength of upstream's "SAFETY: We only use the marker to get
+        // a pointer" — which is not what a main-thread marker means — and it
+        // panics with the thread named instead. Nothing in this tree calls this
+        // trait method (`grep MonitorHandleExtMacOS` finds only its declaration
+        // and this impl); it is kept for winit API compatibility, so the
+        // difference is reachable only by a downstream user who was already
+        // doing the unsound thing.
         //
-        // SAFETY: unchanged from upstream — the caller of this public trait method
-        // is the one asserting the main thread, and this mint records that rather
-        // than establishing it.
-        let mtm = unsafe { aterm_objc::MainThread::new_unchecked() };
+        // W12 MOVED THE CHECK RATHER THAN LOSING IT. The panic was never
+        // written here: it came from `MonitorHandle::ns_screen` re-deriving an
+        // objc2 marker through `seam::marker`, which ASKS
+        // `+[NSThread isMainThread]`. Porting `monitor.rs` deletes that
+        // crossing, so an unchecked mint here would have quietly restored
+        // upstream's undefined behaviour with every test green. A CROSSING'S
+        // SIDE EFFECT IS PART OF THE CROSSING — and this is the one place in
+        // the tree that asserts the thread without knowing it, so the check
+        // belongs here and now contains no `unsafe` token.
+        let mtm = aterm_objc::MainThread::new().expect(
+            "MonitorHandleExtMacOS::ns_screen was called off the main thread; it reaches \
+             +[NSScreen screens], which is main-thread only",
+        );
         self.inner.ns_screen_ptr(mtm)
     }
 }

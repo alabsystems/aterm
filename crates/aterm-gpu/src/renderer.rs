@@ -2518,7 +2518,7 @@ fn metal_arm_note(what: &str) {
         .expect("the note set is never poisoned (no panics under the lock)")
         .insert(what.to_owned())
     {
-        eprintln!("aterm-gpu (metal arm): {what}");
+        crate::stderr_line!("aterm-gpu (metal arm): {what}");
     }
 }
 
@@ -7421,7 +7421,7 @@ impl GpuRenderer {
                 true
             }
             Err(e) => {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: Metal selected but the arm failed to mint \
                      ({e}); DISARMED — this renderer degrades to the fail-soft path"
                 );
@@ -8311,7 +8311,7 @@ impl GpuRenderer {
         if on && self.ctx.visual_swapchain {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: hdr_glow is unavailable while background_material is active \
                      (the DirectComposition backdrop swapchain and the scRGB EDR swapchain \
                      are mutually exclusive); keeping the backdrop — restart with \
@@ -8763,7 +8763,9 @@ impl GpuRenderer {
             return self
                 .metal_read_back_offscreen(win, width, height)
                 .unwrap_or_else(|e| {
-                    eprintln!("aterm-gpu: metal readback failed ({e}); returning blank frame");
+                    crate::stderr_line!(
+                        "aterm-gpu: metal readback failed ({e}); returning blank frame"
+                    );
                     Frame {
                         width: width as usize,
                         height: height as usize,
@@ -8781,7 +8783,9 @@ impl GpuRenderer {
             let _ = texture;
             // Disarmed on a wgpu-free build: nothing drew. Blank frame — the
             // infallible method's historical best-effort contract.
-            eprintln!("aterm-gpu: disarmed render_input on a wgpu-free build; blank frame");
+            crate::stderr_line!(
+                "aterm-gpu: disarmed render_input on a wgpu-free build; blank frame"
+            );
             Frame {
                 width: width as usize,
                 height: height as usize,
@@ -9664,7 +9668,7 @@ impl GpuRenderer {
                 // perf drill needs to know what pacing the layer actually
                 // holds, not what the config asked for.
                 let (sync, fb_only, max_dr, edr) = ms.layer_state();
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu (metal arm): attached swapchain live state: \
                      display_sync={sync} framebuffer_only={fb_only} \
                      max_drawables={max_dr} edr={edr}"
@@ -9943,7 +9947,7 @@ impl GpuRenderer {
             Some(crate::metal::loss::ERROR_PAGE_FAULT),
         );
         cell.live_mut().session.latch().record(&outcome);
-        eprintln!(
+        crate::stderr_line!(
             "aterm-gpu: ATERM_METAL_INJECT_LOSS fired — recorded the synthetic \
              MTLCommandBufferErrorPageFault into the armed loss latch (drill lever)"
         );
@@ -11101,7 +11105,7 @@ impl GpuRenderer {
                 latch,
             )?;
             let (sync, fb_only, max_dr, edr) = ms.layer_state();
-            eprintln!(
+            crate::stderr_line!(
                 "aterm-gpu (metal arm): attached swapchain live state: \
                  display_sync={sync} framebuffer_only={fb_only} \
                  max_drawables={max_dr} edr={edr}"
@@ -11207,7 +11211,7 @@ impl GpuRenderer {
                 // management.
                 if Self::tag_swapchain_scrgb(&surface) {
                     if std::env::var_os("ATERM_VERBOSE").is_some() {
-                        eprintln!(
+                        crate::stderr_line!(
                             "aterm-gpu: EDR swapchain (Rgba16Float, scRGB), present mode = {:?}",
                             config.present_mode
                         );
@@ -11226,7 +11230,7 @@ impl GpuRenderer {
                     });
                 }
                 if std::env::var_os("ATERM_VERBOSE").is_some() {
-                    eprintln!(
+                    crate::stderr_line!(
                         "aterm-gpu: f16 requested but scRGB unsupported (Windows HDR off?) — SDR swapchain"
                     );
                 }
@@ -11295,7 +11299,7 @@ impl GpuRenderer {
         };
         self.configure_first_attach(&surface, &config)?;
         if std::env::var_os("ATERM_VERBOSE").is_some() {
-            eprintln!("aterm-gpu: present mode = {:?}", config.present_mode);
+            crate::stderr_line!("aterm-gpu: present mode = {:?}", config.present_mode);
         }
         Ok(GpuSurface {
             surface,
@@ -11540,7 +11544,7 @@ impl GpuRenderer {
         let forced = std::env::var("ATERM_GPU_PRESENT_MODE").ok();
         match forced.as_deref().map(str::trim) {
             Some("fifo") => {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: $ATERM_GPU_PRESENT_MODE=fifo — forcing Fifo present. \
                      This RE-ARMS the unbounded nextDrawable() park the default \
                      avoids; input latency regressions of ~84ms have been measured \
@@ -11549,14 +11553,14 @@ impl GpuRenderer {
                 return wgpu::PresentMode::Fifo;
             }
             Some("immediate") if caps.present_modes.contains(&wgpu::PresentMode::Immediate) => {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: $ATERM_GPU_PRESENT_MODE=immediate — forcing Immediate \
                      present (the shipped default on macOS; an override elsewhere)."
                 );
                 return wgpu::PresentMode::Immediate;
             }
             Some(other) => {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: unknown ATERM_GPU_PRESENT_MODE {other:?} \
                      (want fifo|immediate); using the default"
                 );
@@ -11602,7 +11606,7 @@ impl GpuRenderer {
         // whose non-default values move keystroke latency must say so rather than
         // let a stale export make a shipped binary slower than the tested one.
         if forced != default {
-            eprintln!(
+            crate::stderr_line!(
                 "aterm-gpu: $ATERM_GPU_FRAME_LATENCY={forced} overrides the \
                  measured default of {default}. Lower values shrink the drawable \
                  pool and can park the event loop on nextDrawable() under a repaint \
@@ -11835,7 +11839,7 @@ impl GpuRenderer {
             // gamma-2.2 default so DWM reads it as ordinary sRGB.
             self.cached_surface_format = Some(surf.sdr_format);
             if std::env::var_os("ATERM_VERBOSE").is_some() {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: scRGB re-tag failed after {reason}; fell back to {:?}",
                     surf.sdr_format
                 );
@@ -14457,7 +14461,7 @@ impl GpuRenderer {
                 self.metal_read_back_offscreen(win, w, h)
             };
             return read.unwrap_or_else(|e| {
-                eprintln!(
+                crate::stderr_line!(
                     "aterm-gpu: armed present readback failed ({e}); returning \
                      blank frame"
                 );
@@ -22151,7 +22155,7 @@ mod tests {
         // OBJC_DEBUG_MISSING_POOLS=YES) is zero first-party unpooled objects.
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Some(mdev) = MtlDevice::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let latch = Arc::new(LossLatch::new());
@@ -22301,11 +22305,11 @@ mod tests {
 
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Ok(gpu) = GpuRenderer::new(18.0, Theme::default()) else {
-            eprintln!("SKIP: no wgpu device");
+            crate::stderr_line!("SKIP: no wgpu device");
             return;
         };
         let Some(mdev) = MtlDevice::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let latch = Arc::new(LossLatch::new());
@@ -23545,7 +23549,7 @@ mod tests {
     #[test]
     fn atlas_texel_bytes_match_cpu_glyph_bytes_exactly() {
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            eprintln!("SKIP: no system monospace font");
+            crate::stderr_line!("SKIP: no system monospace font");
             return;
         };
 
@@ -23605,7 +23609,9 @@ ab\r\n",
             }
             keys.extend(fitted_warning_keys.iter().copied());
         } else {
-            eprintln!("SKIP warning atlas extension: no mono fallback warning ({warning:?})");
+            crate::stderr_line!(
+                "SKIP warning atlas extension: no mono fallback warning ({warning:?})"
+            );
         }
         keys.sort_unstable();
         keys.dedup();
@@ -23698,15 +23704,15 @@ ab\r\n",
         // OBJC_DEBUG_MISSING_POOLS=YES.
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            eprintln!("SKIP: no system monospace font");
+            crate::stderr_line!("SKIP: no system monospace font");
             return;
         };
         let Ok(gpu) = GpuRenderer::new(18.0, Theme::default()) else {
-            eprintln!("SKIP: no wgpu device");
+            crate::stderr_line!("SKIP: no wgpu device");
             return;
         };
         let Some(mdev) = MtlDevice::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let latch = Arc::new(LossLatch::new());
@@ -23917,7 +23923,7 @@ ab\r\n",
             metal_bytes, data3,
             "step 3 (overflow rebuild): the METAL texture diverged from the repack"
         );
-        eprintln!(
+        crate::stderr_line!(
             "atlas grow parity: {} keys -> {h1} rows, +{} keys appended rows \
              {}..{} in place, y-offset band at {q}..{}, overflow rebuilt at \
              {h3} rows — wgpu and Metal byte-identical to the CPU atlas at \
@@ -23955,14 +23961,16 @@ ab\r\n",
     #[test]
     fn vs15_text_and_default_emoji_pack_distinct_one_and_two_cell_atlas_entries() {
         let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
-            eprintln!("SKIP: no system monospace font");
+            crate::stderr_line!("SKIP: no system monospace font");
             return;
         };
         let grin = '\u{1F600}';
         cpu.debug_block_on_lazy_fallbacks();
         let default_key = cpu.glyph_key(grin);
         if default_key.source != FaceId::ColorEmoji || default_key.glyph_class != GlyphClass::Rgba {
-            eprintln!("SKIP: a mono face outranks colour for 😀 on this host: {default_key:?}");
+            crate::stderr_line!(
+                "SKIP: a mono face outranks colour for 😀 on this host: {default_key:?}"
+            );
             return;
         }
 
@@ -24210,7 +24218,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24245,7 +24253,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24268,7 +24276,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24320,7 +24328,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24354,7 +24362,7 @@ ab\r\n",
         let ctx = match GpuContext::new() {
             Ok(ctx) => ctx,
             Err(error) => {
-                eprintln!("SKIP: no GPU available: {error}");
+                crate::stderr_line!("SKIP: no GPU available: {error}");
                 return;
             }
         };
@@ -24382,7 +24390,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24411,7 +24419,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(px, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24471,7 +24479,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(px, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24523,7 +24531,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(px, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24618,7 +24626,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(px, theme) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24697,7 +24705,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24822,7 +24830,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24922,7 +24930,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -24998,7 +25006,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -25065,7 +25073,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -25132,7 +25140,7 @@ ab\r\n",
         let mut gpu = match GpuRenderer::new(18.0, Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no GPU/font available: {e}");
+                crate::stderr_line!("SKIP: no GPU/font available: {e}");
                 return;
             }
         };
@@ -25536,7 +25544,7 @@ mod pipeline_table_wgsl_tests {
         let gpu = match crate::GpuRenderer::new(18.0, aterm_render::Theme::default()) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("SKIP: no wgpu renderer/font on this machine: {e}");
+                crate::stderr_line!("SKIP: no wgpu renderer/font on this machine: {e}");
                 return;
             }
         };

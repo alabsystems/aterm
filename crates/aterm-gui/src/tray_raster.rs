@@ -146,6 +146,13 @@ impl SemanticPrewarmWorker {
         std::thread::Builder::new()
             .name("aterm-semantic-font-prewarm".into())
             .spawn(move || {
+                // QoS (port of 61a6c8b62): cosmetic — it warms a PRIVATE renderer
+                // clone. The process-global font interns it publishes into parse
+                // OUTSIDE their locks (`intern_parsed_font_keyed`), the job queue
+                // mutex is dropped before any work, and `SEMANTIC_PREWARM_GATE`
+                // serialises only prewarm workers; the UI thread contends none of
+                // them for longer than a scan, so demotion is safe here.
+                crate::qos::set_self(crate::qos::Role::Background);
                 let mut base: Option<(u64, Renderer)> = None;
                 let mut faces = CandidateFaceCache::new();
                 loop {

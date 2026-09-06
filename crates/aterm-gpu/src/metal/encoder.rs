@@ -950,7 +950,7 @@ mod tests {
     fn device() -> Option<Device> {
         let d = Device::system_default();
         if d.is_none() {
-            eprintln!("SKIP: no Metal device on this machine");
+            crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
     }
@@ -1628,7 +1628,7 @@ mod tests {
             "THE AUX TARGET DIVERGED: a mid-command-buffer Clear that failed to \
              erase pass 3's cover (or an erased small quad) lands here"
         );
-        eprintln!(
+        crate::stderr_line!(
             "multi-pass proof on {}: 4 passes / 9 draws / 7 pipeline sets / 2 atlas \
              switches / decoy binds at slot 1 byte-identical to 8 one-shot draws \
              over 2x{} texels",
@@ -1754,7 +1754,7 @@ mod tests {
             unique,
             "the Unorm->sRGB alias pair must copy raw bytes, not re-encode them"
         );
-        eprintln!(
+        crate::stderr_line!(
             "copy proof on {}: full, 5x6 sub-rect (3,2)->(8,7) and alias-pair copies \
              all byte-exact over {} texels",
             dev.name(),

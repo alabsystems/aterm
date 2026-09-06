@@ -58,6 +58,10 @@ pub enum StageId {
     ObjcImeDrive,
     ObjcToolbarDrive,
     ObjcWindowDrive,
+    ObjcEventDrive,
+    ObjcAlertDrive,
+    ObjcSwizzleDrive,
+    ObjcBoundDrive,
     DifferentialOracle,
     KaniFloor,
     CrossCells,
@@ -251,6 +255,71 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "objc window drive (the real window: title, style mask, geometry, limits, theme, tabs, drag-and-drop, close and fullscreen)",
         Lane::MainTarget,
     ));
+    // THE EVENT DRIVER, unconditional for the same reason as its three
+    // siblings — and it is the row they were missing. The auditor proved the
+    // ported `WinitView` was SHAPED right, the IME drive composed through it,
+    // the window drive resized and focused it, and v0.72.0 still aborted on
+    // the FIRST `mouseMoved:` AppKit delivered: `update_modifiers` sent
+    // `-keyCode` to a mouse event, AppKit raised, and the trampoline's
+    // `catch_unwind` cannot catch a foreign exception. No gate had ever sent
+    // a mouse event through a mouse IMP. This one builds a real `NSEvent` of
+    // every type each event-taking row can receive, enters the IMP as AppKit
+    // does, sends the same shapes through `-[NSApplication sendEvent:]`, and
+    // re-executes itself as a control child that makes the v0.72.0 send
+    // inside a trampoline and must die by SIGABRT. Measured against the
+    // v0.72.0 `view.rs`: exit 134 at the first `mouseMoved:`.
+    v.push(spec(
+        StageId::ObjcEventDrive,
+        "objc event drive (every NSEvent-taking WinitView row and sendEvent:, with a real NSEvent of every type AppKit can deliver)",
+        Lane::MainTarget,
+    ));
+    // THE MODAL DRIVER (W13), unconditional like the five above it. W13 ported
+    // `aterm-gui`'s last five `objc2` files, and four of them are one
+    // subsystem — `alert_keys.rs`, `menu::confirm`, the paste sheet and
+    // `app_introspect.rs` — that NONE of the drivers above touches: no
+    // `NSAlert`, no sheet, no completion block, no local event monitor, no
+    // `NSBitmapImageRep`. Its cheaper half, `gui_sent_prototypes.rs`, reads
+    // the encoding of every selector those files send; a census cannot see a
+    // correct send of the wrong selector, a block whose ABI is right and whose
+    // ownership is wrong, or a capture that answers bytes which are not a PNG.
+    // This one presents the real alert, reads the first button's key
+    // equivalent off AppKit, attaches the sheet, drives a keyDown through the
+    // swizzled `-sendEvent:` into the installed monitor, clicks, and reads the
+    // response the copied completion block was handed.
+    v.push(spec(
+        StageId::ObjcAlertDrive,
+        "objc alert drive (the real NSAlert: its buttons and key equivalent, the sheet and its copied completion block, the local key monitor, the menu bar walk and the chrome capture)",
+        Lane::MainTarget,
+    ));
+    // THE SWIZZLE DRIVER (W12), unconditional for the reason its module
+    // states: NO ENCODING CHECK CAN SEE A SWIZZLE. `SwizzleSite` is what
+    // installs the fork's `-[NSApplication sendEvent:]` override — the row
+    // the containment's stop-outside/contain-inside order lives on — and
+    // `tests/swizzle.rs` can only measure it on classes of its own making.
+    // This one runs it against the live AppKit class: Apple's own encoding
+    // for the row, the IMP's Mach-O image moving from AppKit into this
+    // executable (part A2 of the live-class audit, drawn on the capability
+    // itself), a real `NSEvent` through both halves of the chain, and the
+    // prototype check refusing a wrong prototype.
+    v.push(spec(
+        StageId::ObjcSwizzleDrive,
+        "objc swizzle drive (SwizzleSite against the live -[NSApplication sendEvent:]: Apple's encoding, the IMP's image, a real NSEvent through both halves of the chain, and the refusal)",
+        Lane::MainTarget,
+    ));
+    // THE CONTAINER DRIVER (W12), unconditional because its obligation has no
+    // type-system half. `MainThreadBound<T>` is `Send + Sync` for every `T`
+    // on the strength of a `Drop` that reschedules to the main thread, and
+    // libtest cannot exercise that in either direction: it runs every test on
+    // a worker and parks its main thread. This one measures the thread the
+    // destructor lands on — against an UNSOUND twin declared in the same file
+    // that lands it on the worker — with a plain `T` and with a declared
+    // class whose `-dealloc` carries a Rust destructor, and proves the
+    // `needs_drop` short-circuit is load-bearing with a child that must hang.
+    v.push(spec(
+        StageId::ObjcBoundDrive,
+        "objc bound drive (MainThreadBound's main-thread drop against an unsound twin, a declared class's -dealloc, and the needs_drop hang differential)",
+        Lane::MainTarget,
+    ));
     if ctx.mode == Mode::Full {
         v.push(spec(
             StageId::DifferentialOracle,
@@ -376,6 +445,10 @@ mod tests {
                 StageId::ObjcImeDrive,
                 StageId::ObjcToolbarDrive,
                 StageId::ObjcWindowDrive,
+                StageId::ObjcEventDrive,
+                StageId::ObjcAlertDrive,
+                StageId::ObjcSwizzleDrive,
+                StageId::ObjcBoundDrive,
             ]
         );
     }
@@ -428,6 +501,26 @@ mod tests {
                 assert!(
                     ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcToolbarDrive),
                     "{mode:?} / {} lost the objc toolbar drive",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcEventDrive),
+                    "{mode:?} / {} lost the objc event drive",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcAlertDrive),
+                    "{mode:?} / {} lost the objc alert drive",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcSwizzleDrive),
+                    "{mode:?} / {} lost the objc swizzle drive",
+                    scope.label()
+                );
+                assert!(
+                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcBoundDrive),
+                    "{mode:?} / {} lost the objc bound drive",
                     scope.label()
                 );
             }
@@ -533,6 +626,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 26);
+        assert_eq!(plan(&nothing_installed).len(), 30);
     }
 }

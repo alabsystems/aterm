@@ -1007,6 +1007,7 @@ pub const RLIM_INFINITY: rlim_t = 0x7fff_ffff_ffff_ffff;
 pub const RTLD_DEFAULT: *mut c_void = 0xfffffffffffffffe as *mut c_void;
 pub const R_OK: c_int = 4;
 pub const SA_NOCLDSTOP: c_int = 0x0008;
+pub const SA_ONSTACK: c_int = 0x0001;
 pub const SA_RESTART: c_int = 0x0002;
 pub const SA_SIGINFO: c_int = 0x0040;
 pub const SEEK_CUR: c_int = 1;

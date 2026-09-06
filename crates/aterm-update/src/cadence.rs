@@ -45,14 +45,14 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 ///
 /// The ceiling used to be [`MAX_BACKOFF`] alone, raised to the base so that an
 /// operator's long interval could never be silently SHORTENED by it:
-/// `min(MAX_BACKOFF.max(base))`. On the anonymous lane that expression is
-/// arithmetically inert — its base is 15 minutes, which IS `MAX_BACKOFF`, so the
-/// ceiling equalled the base and every doubling was clamped straight back down to it.
-/// The one lane that most needs to retreat while failing (a ~60 requests/hour budget
-/// shared by every machine behind one NAT) was the one lane with no backoff at all,
-/// and the same silent no-op applied to any operator interval at or above the cap.
+/// `min(MAX_BACKOFF.max(base))`. On the slow (then anonymous, now web) lane that
+/// expression was arithmetically inert — its base was 15 minutes, which IS
+/// `MAX_BACKOFF`, so the ceiling equalled the base and every doubling was clamped
+/// straight back down to it: the one lane that most needed to retreat while failing
+/// was the one lane with no backoff at all, and the same silent no-op applied to any
+/// operator interval at or above the cap.
 /// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
-/// retreat (30 min → 60 → 120 on today's anonymous lane) while bounding the worst
+/// retreat (30 min → 60 → 120 on today's web lane) while bounding the worst
 /// case at 4× a cadence the lane or the operator has already accepted — and a wake,
 /// or one healthy check, still snaps all the way back to the base, so recovery is
 /// never rate-limited by the cap.
@@ -74,39 +74,64 @@ pub(crate) const WAKE_SETTLE: Duration = Duration::from_secs(20);
 /// How long an unchanged failure message stays suppressed before being repeated.
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
 
-/// The base interval for a check on the AUTHENTICATED lane: a token buys 5000 GitHub
-/// requests/hour, and ~5 requests per steady-state check on the armed tier (list +
-/// manifest + roster + roster.sig + appcast.sig — 6 with a container download) is
-/// ~240/hour — comfortably inside it, so the cadence can be the fast one the owner
-/// asked for.
-pub(crate) const AUTHENTICATED_INTERVAL_SECS: u64 = 75;
+/// The base interval for a check on the TOKEN lane: a token buys 5000 GitHub API
+/// requests/hour, and ~5 requests per steady-state check on the armed tier (ONE per
+/// listing PAGE — a single page for any channel under 100 releases — plus manifest +
+/// roster + roster.sig + appcast.sig through the asset API; 6 with a container
+/// download) is ~240/hour — comfortably inside it, so the cadence can be the fast one
+/// the owner asked for. The WEB lane spends zero: see [`WEB_INTERVAL_SECS`].
+pub(crate) const TOKEN_INTERVAL_SECS: u64 = 75;
 
-/// The base interval for a check on the ANONYMOUS lane.
+/// The base interval for a check on the WEB lane — the public channel, and any source
+/// with no token.
 ///
-/// Unauthenticated GitHub allows ~60 requests/hour PER IP — shared by every machine
-/// behind one NAT, and by anything else on that address using the API. At 75 s a
-/// single machine would spend ~240 requests/hour and live permanently rate-limited: it
-/// would not update FASTER, it would not update at all. Since PAPER_MASTER_PUBKEYS
-/// armed (2026-08-15) every production check costs 5 requests, not the pre-armed 3
-/// this comment used to count — at 15 minutes that was 20/hour per machine, and
-/// three or four Macs behind one NAT (the exact fleet the budget test protects)
-/// blew the whole allowance and lived in rate-limit deferrals. Two checks an hour
-/// costs ~10 requests/hour, leaving room for several machines and the retry budget,
-/// while still picking a release up well inside the "one launch behind" bound the
-/// crate docs promise. Provisioning a token restores the 75 s cadence automatically.
-pub(crate) const ANONYMOUS_INTERVAL_SECS: u64 = 30 * 60;
+/// A web-lane check spends ZERO metered requests: its steady state is one HEAD of
+/// `github.com/…/releases/latest/download/aterm-appcast.toml` (a 302 with no
+/// `x-ratelimit-*` header at all — measured 2026-09-03), and a moved pointer adds only
+/// tag-specific GETs on the same unmetered host. There is no per-IP budget to share,
+/// so the interval is a courtesy to the web host and a bound on how stale a
+/// terminal-only machine can be, not an arithmetic constraint: two checks an hour picks
+/// a release up well inside the "one launch behind" bound the crate docs promise, and
+/// a resolved token on a repointed source restores the 75 s cadence automatically.
+pub(crate) const WEB_INTERVAL_SECS: u64 = 30 * 60;
 
-/// The interval schedule: a base cadence plus the current consecutive-failure count.
+/// The floor on a HELD wait that is still in force. A hold a few seconds out (the
+/// server's reset was nearly here when the check ran) must not become a near-zero
+/// wait: the loop would re-check at once, read its own fresh ledger stamp as a
+/// sibling's, skip, and spin through `wait` with nothing to wait for. A hold whose
+/// epoch has already PASSED is not floored — it is simply over, and the ordinary
+/// ladder (base × the failure count, which a hold never raised) applies.
+pub(crate) const HOLD_FLOOR: Duration = Duration::from_secs(60);
+
+/// The interval schedule: a base cadence plus the current consecutive-failure count,
+/// and — after a rate limit whose reset the server named — the exact instant to hold
+/// until.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cadence {
     base: Duration,
     failures: u32,
+    /// When set and still in the future, the next wait ends HERE (bounded by
+    /// [`Self::cap`], floored by [`HOLD_FLOOR`], un-jittered — the epoch already
+    /// carries the loop's 0–60 s scatter) instead of on the doubling ladder. The
+    /// server told us when the window renews; waiting for anything else is a guess.
+    hold: Option<Instant>,
 }
 
 impl Cadence {
     /// A schedule at the configured base interval, starting healthy.
     pub(crate) fn new(base: Duration) -> Self {
-        Self { base, failures: 0 }
+        Self {
+            base,
+            failures: 0,
+            hold: None,
+        }
+    }
+
+    /// Hold the next check until `until` — a rate limit whose reset the server named.
+    /// Does NOT count as a failure: the doubling ladder is for outages of unknown
+    /// length, and this one's length is known.
+    pub(crate) fn hold_until(&mut self, until: Instant) {
+        self.hold = Some(until);
     }
 
     /// Re-point the base interval (the credential lane is only known after the first
@@ -122,21 +147,34 @@ impl Cadence {
         self.base
     }
 
-    /// Note a failed check (lengthens the next wait).
+    /// Note a failed check (lengthens the next wait). A failure of unknown length
+    /// supersedes a hold of known length.
     pub(crate) fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
+        self.hold = None;
     }
 
     /// Note a successful check — the next wait returns to the base interval
     /// immediately. Recovery must not be rate-limited by how long the outage was.
     pub(crate) fn succeeded(&mut self) {
         self.failures = 0;
+        self.hold = None;
     }
 
     /// A wake resets the backoff: the network the failures were about is gone, and
-    /// the machine is in a genuinely new state.
+    /// the machine is in a genuinely new state — and so, likely, is its IP, whose
+    /// budget the hold was about.
     pub(crate) fn woke(&mut self) {
         self.failures = 0;
+        self.hold = None;
+    }
+
+    /// The remaining hold, if one is set and still in the future at `now`; an expired
+    /// hold is simply over (the ladder below applies).
+    fn hold_remaining(&self, now: Instant) -> Option<Duration> {
+        let until = self.hold?;
+        let remaining = until.checked_duration_since(now)?;
+        Some(remaining.max(HOLD_FLOOR).min(self.cap()))
     }
 
     /// The ceiling on [`Self::nominal`] for THIS base: at least [`MAX_BACKOFF`], at
@@ -148,10 +186,33 @@ impl Cadence {
         MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
     }
 
+    /// The consecutive-failure count — what the doubling ladder is keyed on. Exposed
+    /// for tests, so "a hold is not a failure" is assertable on the count itself.
+    #[cfg(test)]
+    pub(crate) fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Whether a hold is set (expired or not). Exposed for tests.
+    #[cfg(test)]
+    pub(crate) fn is_holding(&self) -> bool {
+        self.hold.is_some()
+    }
+
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
     /// clamped to [`Self::cap`]. Exposed for tests; [`Self::delay`] is what the
     /// loop uses.
+    #[cfg(test)]
     pub(crate) fn nominal(&self) -> Duration {
+        self.nominal_at(Instant::now())
+    }
+
+    /// [`Self::nominal`] at an injected `now`, so a hold's arithmetic is testable
+    /// without waiting.
+    pub(crate) fn nominal_at(&self, now: Instant) -> Duration {
+        if let Some(held) = self.hold_remaining(now) {
+            return held;
+        }
         // `1 << 20` already exceeds any sane base × ceiling ratio; the shift is
         // clamped so a long outage can never overflow the multiply.
         let doublings = self.failures.saturating_sub(1).min(20);
@@ -160,8 +221,19 @@ impl Cadence {
 
     /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%. `entropy` is a
     /// uniformly random byte; the caller supplies it so this stays pure and testable.
+    /// A HELD wait is not spread: the epoch is the server's, already scattered by the
+    /// loop's own 0–60 s, and −20 % of it would wake this machine before the window
+    /// renews — the one thing a hold exists to avoid.
     pub(crate) fn delay(&self, entropy: u8) -> Duration {
-        jitter(self.nominal(), entropy)
+        self.delay_at(Instant::now(), entropy)
+    }
+
+    /// [`Self::delay`] at an injected `now`.
+    pub(crate) fn delay_at(&self, now: Instant, entropy: u8) -> Duration {
+        if let Some(held) = self.hold_remaining(now) {
+            return held;
+        }
+        jitter(self.nominal_at(now), entropy)
     }
 }
 
@@ -177,8 +249,8 @@ fn jitter(d: Duration, entropy: u8) -> Duration {
 
 /// One random byte from the audited entropy surface, or a fixed midpoint if it is
 /// unavailable. A missing byte must degrade to "no jitter", never to a panic or a
-/// hand-rolled `/dev/urandom` read.
-fn entropy_byte() -> u8 {
+/// hand-rolled `/dev/urandom` read. Shared with the hold epoch's scatter.
+pub(crate) fn entropy_byte() -> u8 {
     let mut b = [128u8; 1];
     let _ = aterm_uds::rand::fill(&mut b);
     b[0]
@@ -364,46 +436,33 @@ mod tests {
         );
     }
 
-    /// The anonymous lane's budget is the whole reason `set_base` exists: at the
-    /// authenticated 75 s cadence an unauthenticated machine spends ~150 GitHub
-    /// requests/hour against a ~60/hour per-IP allowance and never gets a clean
-    /// check. Adopting the lane's interval must not disturb a backoff in progress.
+    /// The token lane's 75 s cadence fits its own 5000/hour budget, and `set_base` is
+    /// what lets a process adopt the lane's interval after its first completed check
+    /// without disturbing a backoff in progress. (The web lane's cost — ZERO API
+    /// requests per check — is not arithmetic on a constant; it is MEASURED by the
+    /// counting-transport tests in `github.rs`,
+    /// `a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets` and
+    /// `every_web_lane_failure_path_ends_without_an_api_request`.)
     #[test]
-    fn the_anonymous_lane_fits_inside_githubs_unauthenticated_budget() {
-        // 5 requests per steady-state check on the ARMED tier (releases list +
-        // manifest + roster + roster.sig + appcast.sig — authorize_by_roster runs
-        // before the downgrade gate on every production check since
-        // PAPER_MASTER_PUBKEYS armed, 2026-08-15). A check that also fetches a
-        // container spends 6, but that is the rare stage, not the steady state
-        // this budget must sustain.
-        const REQUESTS_PER_CHECK: u64 = 5;
-        const ANON_BUDGET_PER_HOUR: u64 = 60;
-        let anon_per_hour = (3600 / ANONYMOUS_INTERVAL_SECS) * REQUESTS_PER_CHECK;
-        assert!(
-            anon_per_hour * 4 <= ANON_BUDGET_PER_HOUR,
-            "the anonymous cadence must leave headroom for several machines behind one \
-             NAT: {anon_per_hour}/hour against a {ANON_BUDGET_PER_HOUR}/hour budget"
-        );
-        // Every operand is a constant, so this is decided at COMPILE time — the
-        // split stops being meaningful the moment it stops holding, and a const
-        // block says so by failing the build rather than one test run. The rate
-        // is named rather than interpolated into the message: a const panic takes
-        // a literal, so the number has to be readable in the source instead.
-        const AUTHENTICATED_PER_HOUR: u64 =
-            (3600 / AUTHENTICATED_INTERVAL_SECS) * REQUESTS_PER_CHECK;
+    fn the_token_lane_fits_its_budget_and_owns_the_fast_cadence() {
+        // The TOKEN lane spends 5 on a one-page channel (one LIST request PER PAGE —
+        // one page under 100 releases — plus the four assets through the asset API,
+        // byte-for-byte the historical request), against its own 5000/hour.
+        const TOKEN_REQUESTS_PER_CHECK: u64 = 5;
+        const TOKEN_BUDGET_PER_HOUR: u64 = 5000;
         const {
             assert!(
-                AUTHENTICATED_PER_HOUR > ANON_BUDGET_PER_HOUR,
-                "…and the authenticated cadence must genuinely be too fast for it, or this \
-                 whole split is pointless"
+                (3600 / TOKEN_INTERVAL_SECS) * TOKEN_REQUESTS_PER_CHECK * 4
+                    <= TOKEN_BUDGET_PER_HOUR,
+                "the token cadence must leave headroom in its own 5000/hour budget"
             )
         };
 
-        let mut c = Cadence::new(Duration::from_secs(AUTHENTICATED_INTERVAL_SECS));
+        let mut c = Cadence::new(Duration::from_secs(TOKEN_INTERVAL_SECS));
         c.failed();
         c.failed();
         let backed_off = c.nominal();
-        c.set_base(Duration::from_secs(ANONYMOUS_INTERVAL_SECS));
+        c.set_base(Duration::from_secs(WEB_INTERVAL_SECS));
         assert!(
             c.nominal() > backed_off,
             "adopting the slower lane must not shorten a wait"
@@ -411,7 +470,7 @@ mod tests {
         c.succeeded();
         assert_eq!(
             c.nominal(),
-            Duration::from_secs(ANONYMOUS_INTERVAL_SECS),
+            Duration::from_secs(WEB_INTERVAL_SECS),
             "a healthy check returns to the LANE's interval, not the original one"
         );
     }
@@ -445,14 +504,16 @@ mod tests {
     }
 
     /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and
-    /// [`ANONYMOUS_INTERVAL_SECS`] were BOTH 15 minutes at the time, so the old
+    /// [`WEB_INTERVAL_SECS`] were BOTH 15 minutes at the time, so the old
     /// `min(MAX_BACKOFF.max(base))` clamp returned the base for every failure count —
-    /// a tokenless client that could not reach GitHub retried at full speed forever,
-    /// against the very ~60 requests/hour per-IP budget the slow lane exists to
-    /// respect. The lane with the least request headroom had the least backoff.
+    /// a credential-less client that could not reach GitHub retried at full speed
+    /// forever. The web lane has no API budget to protect any more, but its interval
+    /// is still the courtesy-and-staleness trade [`WEB_INTERVAL_SECS`] describes, and
+    /// a host that is failing deserves a genuine retreat from it, not a clamp back to
+    /// full speed.
     #[test]
-    fn the_anonymous_lane_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
-        let anon = Duration::from_secs(ANONYMOUS_INTERVAL_SECS);
+    fn the_web_lane_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
+        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
         let mut c = Cadence::new(anon);
         c.failed();
         assert_eq!(
@@ -476,6 +537,70 @@ mod tests {
         );
         c.succeeded();
         assert_eq!(c.nominal(), anon, "recovery snaps back to the lane's base");
+    }
+
+    /// A rate limit whose reset the server named is waited out EXACTLY — not doubled,
+    /// not jittered — however many failures preceded it.
+    #[test]
+    fn a_hold_waits_until_the_reset_not_a_doubling() {
+        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
+        let mut c = Cadence::new(anon);
+        for _ in 0..3 {
+            c.failed();
+        }
+        assert_eq!(c.nominal(), anon * 4, "precondition: the ladder is at 4×");
+        let now = Instant::now();
+        let reset = now + Duration::from_secs(5 * 60);
+        c.hold_until(reset);
+        assert_eq!(
+            c.nominal_at(now),
+            Duration::from_secs(5 * 60),
+            "the wait is the time to the reset, not the 4× rung"
+        );
+        assert_eq!(
+            c.delay_at(now, 0),
+            c.delay_at(now, 255),
+            "a held wait is not spread: −20 % would wake before the window renews"
+        );
+        assert_eq!(c.delay_at(now, 0), Duration::from_secs(5 * 60));
+        // A hold still in force but within the floor waits the floor, never ~zero.
+        c.hold_until(now + Duration::from_secs(1));
+        assert_eq!(c.nominal_at(now), HOLD_FLOOR);
+        // A hold already in the past (a reset the clock skewed behind us) is over:
+        // the ladder applies again — and a hold never raised it, so this is still 4×.
+        c.hold_until(now - Duration::from_secs(1));
+        assert_eq!(c.nominal_at(now), anon * 4);
+    }
+
+    /// A hold can never exceed the ladder's own ceiling, and every event that clears
+    /// the ladder clears the hold too.
+    #[test]
+    fn a_hold_is_bounded_by_the_cap_and_cleared_by_success_or_wake() {
+        let anon = Duration::from_secs(WEB_INTERVAL_SECS);
+        let now = Instant::now();
+        let mut c = Cadence::new(anon);
+        c.hold_until(now + Duration::from_secs(10 * 3600));
+        assert_eq!(c.nominal_at(now), anon * MAX_BACKOFF_INTERVALS, "capped");
+        c.succeeded();
+        assert_eq!(c.nominal_at(now), anon, "a success clears the hold");
+        c.hold_until(now + Duration::from_secs(600));
+        c.woke();
+        assert_eq!(c.nominal_at(now), anon, "a wake clears the hold");
+        c.hold_until(now + Duration::from_secs(600));
+        c.failed();
+        assert_eq!(
+            c.nominal_at(now),
+            anon,
+            "a failure of unknown length supersedes it"
+        );
+        // An expired hold is simply over: the ladder applies again.
+        let mut expired = Cadence::new(anon);
+        expired.hold_until(now + Duration::from_secs(600));
+        assert_eq!(
+            expired.nominal_at(now + Duration::from_secs(601)),
+            anon,
+            "past the epoch the base interval is back"
+        );
     }
 
     #[test]

@@ -9,12 +9,14 @@ use std::rc::Weak;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use aterm_objc::{Bool, Id};
-use objc2::runtime::ProtocolObject;
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
+// LOCAL PATCH (aterm): objc2's `ProtocolObject`, its four `NSApplication`,
+// `NSApplicationActivationPolicy`, `NSApplicationDelegate` and
+// `NSRunningApplication` bindings and `MainThreadMarker` are all gone. The
+// activation-policy values are the seam's, at the SDK's own (SIGNED) values.
+use aterm_objc::send::{
+    send_bool, send_bool_isize, send_id, send_id_usize, send_usize, send_v_bool, send_v_id,
 };
-use objc2_foundation::MainThreadMarker;
+use aterm_objc::{Bool, Id, MainThread, autoreleasepool, class, sel};
 
 /// An optional handler consulted from `applicationShouldTerminate:` — see
 /// [`set_quit_confirm_hook`]. Returns `true` to ALLOW termination, `false` to CANCEL.
@@ -39,14 +41,17 @@ fn quit_confirm_allows() -> bool {
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
-use super::{aterm_objc_seam, menu, WindowId, DEVICE_ID};
+use super::aterm_objc_seam::consts::NS_APPLICATION_ACTIVATION_POLICY_REGULAR;
+use super::{menu, WindowId, DEVICE_ID};
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
 use crate::window::WindowId as RootWindowId;
 
 #[derive(Debug)]
 pub(super) struct AppState {
-    activation_policy: Option<NSApplicationActivationPolicy>,
+    /// LOCAL PATCH (aterm): the raw `NSApplicationActivationPolicy`, which is
+    /// an `NSInteger` — see the seam's `NS_APPLICATION_ACTIVATION_POLICY_*`.
+    activation_policy: Option<isize>,
     default_menu: bool,
     activate_ignoring_other_apps: bool,
     run_loop: RunLoop,
@@ -113,12 +118,23 @@ aterm_objc::declare_class! {
         type Ivars = AppState;
         protocols: [NSObject, NSApplicationDelegate];
 
-        @sel(applicationDidFinishLaunching:)
+        // NOT CONTAINED, either of the next two rows. `did_finish_launching`
+        // makes its AppKit sends (`setActivationPolicy:`, the activation
+        // hack, the menu) BEFORE it sets `is_running`, starts the waker and
+        // dispatches `NewEvents(Init)`/`Resumed`; a contained raise there
+        // would return `()` with `is_running` still false, and `wakeup`/
+        // `cleared` would return early on every turn forever — a windowless
+        // process with one log line, which is not a state the loop can
+        // continue from. `will_terminate` has the mirror: a raise in
+        // `notify_windows_of_exit` would skip `internal_exit`. A launch or a
+        // termination that half-ran is not "nothing happened", so both keep
+        // the abort.
+        @sel(applicationDidFinishLaunching:) @abort_on_exception
         fn app_did_finish_launching(&self, _notification: Id) {
             self.did_finish_launching()
         }
 
-        @sel(applicationWillTerminate:)
+        @sel(applicationWillTerminate:) @abort_on_exception
         fn app_will_terminate(&self, _notification: Id) {
             self.will_terminate()
         }
@@ -142,8 +158,8 @@ aterm_objc::declare_class! {
 
 impl ApplicationDelegate {
     pub(super) fn new(
-        mtm: MainThreadMarker,
-        activation_policy: Option<NSApplicationActivationPolicy>,
+        mtm: MainThread,
+        activation_policy: Option<isize>,
         default_menu: bool,
         activate_ignoring_other_apps: bool,
     ) -> aterm_objc::Retained<Self> {
@@ -154,11 +170,11 @@ impl ApplicationDelegate {
         // `-init` IS the designated initializer here: the superclass is
         // `NSObject` and this class declares no `-init` of its own, so
         // `[self init]` and `[super init]` reach the same IMP.
-        ApplicationDelegate::alloc_init(aterm_objc_seam::witness(mtm), AppState {
+        ApplicationDelegate::alloc_init(mtm, AppState {
             activation_policy,
             default_menu,
             activate_ignoring_other_apps,
-            run_loop: RunLoop::main(aterm_objc_seam::witness(mtm)),
+            run_loop: RunLoop::main(mtm),
             event_handler: EventHandler::new(),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
@@ -183,37 +199,58 @@ impl ApplicationDelegate {
         self.ivars().is_launched.set(true);
 
         let mtm = self.mtm();
-        let app = NSApplication::sharedApplication(mtm);
+        let ns_app = app();
         // We need to delay setting the activation policy and activating the app
         // until `applicationDidFinishLaunching` has been called. Otherwise the
         // menu bar is initially unresponsive on macOS 10.15.
         // If no activation policy is explicitly provided, do not set it at all
         // to allow the package manifest to define behavior via LSUIElement.
-        if let Some(activation_policy) = self.ivars().activation_policy {
-            app.setActivationPolicy(activation_policy);
-        } else {
-            // If no activation policy is explicitly provided, and the application
-            // is bundled, do not set the activation policy at all, to allow the
-            // package manifest to define the behavior via LSUIElement.
-            //
-            // See:
-            // - https://github.com/rust-windowing/winit/issues/261
-            // - https://github.com/rust-windowing/winit/issues/3958
-            let is_bundled =
-                unsafe { NSRunningApplication::currentApplication().bundleIdentifier().is_some() };
-            if !is_bundled {
-                app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        //
+        // SAFETY (for this whole block): `ns_app` is the live shared
+        // `NSApplication`. `-setActivationPolicy:` is `B24@0:8q16` — it ANSWERS
+        // whether the policy was accepted, and the fork ignores that answer
+        // exactly as it did through `objc2-app-kit`'s binding;
+        // `+currentApplication` is `@16#0:8` on `NSRunningApplication` and
+        // `-bundleIdentifier` is `@16@0:8` and MAY answer nil;
+        // `-activateIgnoringOtherApps:` is `v20@0:8B16`.
+        unsafe {
+            if let Some(activation_policy) = self.ivars().activation_policy {
+                send_bool_isize(ns_app, sel!(setActivationPolicy:), activation_policy);
+            } else {
+                // If no activation policy is explicitly provided, and the application
+                // is bundled, do not set the activation policy at all, to allow the
+                // package manifest to define the behavior via LSUIElement.
+                //
+                // See:
+                // - https://github.com/rust-windowing/winit/issues/261
+                // - https://github.com/rust-windowing/winit/issues/3958
+                let running = send_id(
+                    class(c"NSRunningApplication").as_id(),
+                    sel!(currentApplication),
+                );
+                let is_bundled = !send_id(running, sel!(bundleIdentifier)).is_null();
+                if !is_bundled {
+                    send_bool_isize(
+                        ns_app,
+                        sel!(setActivationPolicy:),
+                        NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
+                    );
+                }
             }
-        }
 
-        window_activation_hack(&app);
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(self.ivars().activate_ignoring_other_apps);
+            window_activation_hack(ns_app);
+            send_v_bool(
+                ns_app,
+                sel!(activateIgnoringOtherApps:),
+                self.ivars().activate_ignoring_other_apps,
+            );
+        }
 
         if self.ivars().default_menu {
             // The menubar initialization should be before the `NewEvents` event, to allow
             // overriding of the default menu even if it's created
-            menu::initialize(&app);
+            // SAFETY: `ns_app` is the live shared `NSApplication`.
+            unsafe { menu::initialize(ns_app, mtm) };
         }
 
         self.ivars().waker.borrow_mut().start();
@@ -232,16 +269,16 @@ impl ApplicationDelegate {
             // effectively ignored the attempt to stop the RunLoop and re-started it).
             //
             // So we return from `pump_events` by stopping the application.
-            let app = NSApplication::sharedApplication(mtm);
-            stop_app_immediately(&app);
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe { stop_app_immediately(app()) };
         }
     }
 
     fn will_terminate(&self) {
         trace_scope!("applicationWillTerminate:");
-        let mtm = self.mtm();
-        let app = NSApplication::sharedApplication(mtm);
-        notify_windows_of_exit(&app);
+        let _ = self.mtm();
+        // SAFETY: `app()` is the live shared `NSApplication`.
+        unsafe { notify_windows_of_exit(app()) };
         self.internal_exit();
     }
 
@@ -257,18 +294,24 @@ impl ApplicationDelegate {
     /// LOCAL PATCH (aterm), W9: takes `aterm_objc::MainThread`. Both callers
     /// (`observer.rs`'s two run-loop handlers and `app.rs`) hold a witness, and
     /// this signature is the only reason `observer.rs` was still on the objc2
-    /// list. The marker is re-derived at the one line that consumes one; THIS
-    /// file stays on the list, pinned by eight `NSApplication::sharedApplication`
-    /// calls that a signature change cannot move.
+    /// list.
+    ///
+    /// LOCAL PATCH (aterm), W12: the eight `NSApplication::sharedApplication`
+    /// calls that pinned this file to `objc2-app-kit` — and made the marker
+    /// cross back here — are one `app()` helper over a typed send, so the
+    /// crossing is gone.
     pub fn get(w: aterm_objc::MainThread) -> aterm_objc::Retained<Self> {
-        let app = NSApplication::sharedApplication(aterm_objc_seam::marker(w));
-        let delegate =
-            unsafe { app.delegate() }.expect("a delegate was not configured on the application");
-        let delegate = Id::from_ptr(std::ptr::from_ref(&*delegate).cast_mut().cast());
+        let _ = w;
+        // SAFETY: `-delegate` is `@16@0:8` on `NSApplication` and answers +0.
+        let delegate = unsafe { send_id(app(), sel!(delegate)) };
+        assert!(
+            !delegate.is_null(),
+            "a delegate was not configured on the application"
+        );
         // SAFETY: `delegate` is the live object `-[NSApplication delegate]` just
         // answered, and `-isKindOfClass:` is `B@:#` on every Apple runtime.
         let is_ours = unsafe {
-            let send: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::ClassPtr) -> Bool =
+            let send: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel, aterm_objc::ClassPtr) -> Bool =
                 aterm_objc::msg();
             send(
                 delegate,
@@ -295,8 +338,8 @@ impl ApplicationDelegate {
     /// of cost, and a delegate method reached off it is a bug this names at the
     /// frame that noticed.
     #[track_caller]
-    fn mtm(&self) -> MainThreadMarker {
-        MainThreadMarker::new().expect(
+    fn mtm(&self) -> MainThread {
+        MainThread::new().expect(
             "a WinitApplicationDelegate method ran off the main thread; AppKit delivers on it",
         )
     }
@@ -311,20 +354,47 @@ impl ApplicationDelegate {
             .expect("retaining a live ApplicationDelegate")
     }
 
-    /// This delegate as the `NSApplicationDelegate` protocol object
-    /// `-[NSApplication setDelegate:]` takes.
-    // LOCAL PATCH (aterm): objc2's `ProtocolObject::from_ref` is generic over
-    // `T: NSApplicationDelegate`, a trait `unsafe impl NSApplicationDelegate
-    // for ApplicationDelegate {}` used to supply. The conformance is now made
-    // by `class_addProtocol` from the `protocols:` list above, so the crossing
-    // is explicit and the obligation is the one `objc2_ref` states.
-    pub(super) fn as_protocol_object(&self) -> &ProtocolObject<dyn NSApplicationDelegate> {
-        // SAFETY: `self` borrows a live instance of a class whose `protocols:`
-        // list names `NSApplicationDelegate`, so `class_addProtocol` made
-        // `-conformsToProtocol:` answer YES for it (the live-class audit checks
-        // that on the running instance); `ProtocolObject` is a zero-sized
-        // binding marker and borrows none of the instance's bytes.
-        unsafe { aterm_objc_seam::objc2_ref(self.as_id()) }
+    /// This delegate as the `id` `-[NSApplication setDelegate:]` takes.
+    ///
+    /// LOCAL PATCH (aterm), W12: it answered
+    /// `&ProtocolObject<dyn NSApplicationDelegate>`, which objc2's
+    /// `ProtocolObject::from_ref` produced from an
+    /// `unsafe impl NSApplicationDelegate for ApplicationDelegate {}`. At the
+    /// ABI there is no such thing: `-setDelegate:` takes an `id`, and the
+    /// conformance is a runtime fact made by `class_addProtocol` from the
+    /// `protocols:` list above.
+    ///
+    /// # What was LOST, stated rather than absorbed
+    ///
+    /// `ProtocolObject` was a COMPILE-TIME statement that this class conforms;
+    /// a raw `id` says nothing. The claim is moved rather than dropped: this
+    /// asserts `-conformsToProtocol:` on the instance — the question AppKit
+    /// itself asks before sending an `@optional` row — and the live-class audit
+    /// checks the same on the registered class. All three rows here are
+    /// `@optional`, so a class that failed to claim the protocol would not
+    /// crash; the app would simply never finish launching.
+    pub(super) fn as_delegate_id(&self) -> Id {
+        let id = self.as_id();
+        debug_assert!(
+            {
+                // SAFETY: `id` is a live instance of this class;
+                // `-conformsToProtocol:` is `B24@0:8@16` on `NSObject`.
+                unsafe {
+                    let f: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel, aterm_objc::ProtocolPtr) -> Bool =
+                        aterm_objc::msg();
+                    f(
+                        id,
+                        sel!(conformsToProtocol:),
+                        aterm_objc::protocol(c"NSApplicationDelegate"),
+                    )
+                    .as_bool()
+                }
+            },
+            "WinitApplicationDelegate does not conform to NSApplicationDelegate; \
+             class_addProtocol did not run, and AppKit will never send its three \
+             @optional rows"
+        );
+        id
     }
 
     /// Place the event handler in the application delegate for the duration
@@ -419,7 +489,7 @@ impl ApplicationDelegate {
     }
 
     pub fn handle_redraw(&self, window_id: WindowId) {
-        let mtm = self.mtm();
+        let _ = self.mtm();
         // Redraw request might come out of order from the OS.
         // -> Don't go back into the event handler when our callstack originates from there
         if !self.ivars().event_handler.in_use() {
@@ -432,8 +502,8 @@ impl ApplicationDelegate {
             // events as a way to ensure that `pump_events` can't block an external loop
             // indefinitely
             if self.ivars().stop_on_redraw.get() {
-                let app = NSApplication::sharedApplication(mtm);
-                stop_app_immediately(&app);
+                // SAFETY: `app()` is the live shared `NSApplication`.
+                unsafe { stop_app_immediately(app()) };
             }
         }
     }
@@ -478,7 +548,7 @@ impl ApplicationDelegate {
 
     // Called by RunLoopObserver after finishing waiting for new events
     pub fn wakeup(&self, panic_info: Weak<PanicInfo>) {
-        let mtm = self.mtm();
+        let _ = self.mtm();
         let panic_info = panic_info
             .upgrade()
             .expect("The panic info must exist here. This failure indicates a developer error.");
@@ -489,8 +559,8 @@ impl ApplicationDelegate {
         }
 
         if self.ivars().stop_after_wait.get() {
-            let app = NSApplication::sharedApplication(mtm);
-            stop_app_immediately(&app);
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe { stop_app_immediately(app()) };
         }
 
         let start = self.ivars().start_time.get().unwrap();
@@ -511,7 +581,7 @@ impl ApplicationDelegate {
 
     // Called by RunLoopObserver before waiting for new events
     pub fn cleared(&self, panic_info: Weak<PanicInfo>) {
-        let mtm = self.mtm();
+        let _ = self.mtm();
         let panic_info = panic_info
             .upgrade()
             .expect("The panic info must exist here. This failure indicates a developer error.");
@@ -523,27 +593,60 @@ impl ApplicationDelegate {
             return;
         }
 
-        self.handle_event(Event::UserEvent(HandlePendingUserEvents));
+        // LOCAL PATCH (aterm): each of the three handler dispatches below is
+        // contained ON ITS OWN, so that an `NSException` raised inside the
+        // application's handling of one of them (aterm's `App` makes many
+        // AppKit sends from `RedrawRequested` and `AboutToWait`) is reported
+        // against that event and the REST of this turn still runs — the
+        // remaining redraws, `AboutToWait`, the exit/stop checks and the
+        // waker re-arm at the bottom. The observer's own containment outside
+        // this function is the backstop; caught there, a raise would skip
+        // the tail, and a `ControlFlow::WaitUntil` requested this turn would
+        // not fire until something else woke the loop.
+        let _ = aterm_objc::contain("CFRunLoop observer: UserEvent", || {
+            self.handle_event(Event::UserEvent(HandlePendingUserEvents));
+        });
 
         let redraw = mem::take(&mut *self.ivars().pending_redraw.borrow_mut());
-        for window_id in redraw {
-            self.handle_event(Event::WindowEvent {
-                window_id: RootWindowId(window_id),
-                event: WindowEvent::RedrawRequested,
-            });
+        let handled = Cell::new(0_usize);
+        let contained = aterm_objc::contain("CFRunLoop observer: RedrawRequested", || {
+            for window_id in &redraw {
+                self.handle_event(Event::WindowEvent {
+                    window_id: RootWindowId(*window_id),
+                    event: WindowEvent::RedrawRequested,
+                });
+                handled.set(handled.get() + 1);
+            }
+        });
+        if contained.is_err() {
+            // The window whose redraw raised is dropped (its handler ran and
+            // the app re-requests every window's redraw on its next turn); the
+            // ones after it were never delivered, so they go back to the front
+            // of the queue for the next `cleared`.
+            let mut pending = self.ivars().pending_redraw.borrow_mut();
+            let undelivered = redraw.iter().skip(handled.get() + 1).copied();
+            let mut restored: Vec<WindowId> =
+                undelivered.filter(|w| !pending.contains(w)).collect();
+            restored.append(&mut pending);
+            *pending = restored;
         }
 
-        self.handle_event(Event::AboutToWait);
+        let _ = aterm_objc::contain("CFRunLoop observer: AboutToWait", || {
+            self.handle_event(Event::AboutToWait);
+        });
 
         if self.exiting() {
-            let app = NSApplication::sharedApplication(mtm);
-            stop_app_immediately(&app);
-            notify_windows_of_exit(&app);
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe {
+                let app = app();
+                stop_app_immediately(app);
+                notify_windows_of_exit(app);
+            }
         }
 
         if self.ivars().stop_before_wait.get() {
-            let app = NSApplication::sharedApplication(mtm);
-            stop_app_immediately(&app);
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe { stop_app_immediately(app()) };
         }
         self.ivars().start_time.set(Some(Instant::now()));
         let wait_timeout = self.ivars().wait_timeout.get(); // configured by pump_events
@@ -574,17 +677,50 @@ fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
 ///
 /// If this becomes too bothersome to maintain, it can probably be removed
 /// without too much damage.
-fn window_activation_hack(app: &NSApplication) {
+///
+/// # Safety
+/// `app` must be the live shared `NSApplication`.
+unsafe fn window_activation_hack(app: Id) {
     // TODO: Proper ordering of the windows
-    app.windows().into_iter().for_each(|window| {
-        // Call `makeKeyAndOrderFront` if it was called on the window in `WinitWindow::new`
-        // This way we preserve the user's desired initial visibility status
-        // TODO: Also filter on the type/"level" of the window, and maybe other things?
-        if window.isVisible() {
-            tracing::trace!("Activating visible window");
-            window.makeKeyAndOrderFront(None);
-        } else {
-            tracing::trace!("Skipping activating invisible window");
+    //
+    // LOCAL PATCH (aterm): the array is walked by INDEX, for `monitor.rs`'s
+    // reason. The pool is EXPLICIT — `-windows` answers +0 autoreleased, and
+    // AppKit's own pool around this callback is not this code's to rely on.
+    autoreleasepool(|_| {
+        // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is
+        // `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`, and
+        // no index below the count is out of range; `-isVisible` is `B16@0:8`
+        // and `-makeKeyAndOrderFront:` is `v24@0:8@16` on `NSWindow`, whose
+        // argument is the `nil` sender upstream passed as `None`.
+        unsafe {
+            let windows = send_id(app, sel!(windows));
+            let n = send_usize(windows, sel!(count));
+            for i in 0..n {
+                let window = send_id_usize(windows, sel!(objectAtIndex:), i);
+                // Call `makeKeyAndOrderFront` if it was called on the window in
+                // `WinitWindow::new`. This way we preserve the user's desired
+                // initial visibility status.
+                // TODO: Also filter on the type/"level" of the window, and maybe
+                // other things?
+                if send_bool(window, sel!(isVisible)) {
+                    tracing::trace!("Activating visible window");
+                    send_v_id(window, sel!(makeKeyAndOrderFront:), Id::NIL);
+                } else {
+                    tracing::trace!("Skipping activating invisible window");
+                }
+            }
         }
-    })
+    });
+}
+
+/// `+[NSApplication sharedApplication]`, the process-lifetime singleton.
+///
+/// LOCAL PATCH (aterm): the eight `NSApplication::sharedApplication(mtm)` calls
+/// this file made are this one helper. The marker objc2's binding demanded is
+/// objc2's requirement, not AppKit's, and `mtm()` is still consulted at each
+/// call site. `window_delegate.rs` and `event_loop.rs` have the same helper.
+fn app() -> Id {
+    // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication` and creates
+    // the instance on first call.
+    unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }

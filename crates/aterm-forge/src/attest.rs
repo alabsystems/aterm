@@ -1703,7 +1703,19 @@ mod tests {
         // edit. Counted here, not waived: this pin exists so a change to a
         // vendored fork cannot happen quietly, and it worked — it caught this
         // edit on the run that made it.
-        assert_eq!(patch, 3, "`{LOCAL_PATCH_MARKER}` marker count");
+        // 105 -> 121 on 2026-09-05, the objc2 exit (measured.rs note (6)):
+        // the W12 port of app.rs (SwizzleSite), app_state.rs, event_loop.rs,
+        // menu.rs, monitor.rs, window.rs (MainThreadBound) and the seam, each
+        // raw send that replaced an objc2 binding carrying its marker.
+        // 3 -> 90 on 2026-09-03. The objc port waves (W3-W9: view.rs,
+        // window_delegate.rs, cursor.rs, app_state.rs, window.rs, monitor.rs,
+        // event_loop.rs, event.rs — every raw send that replaced an objc2
+        // binding carries one) took it to 86 without re-pinning it here, and
+        // the 2026-09-02 abort audit's four hardening patches (monitor.rs x2,
+        // window_delegate.rs set_fullscreen and dragged_paths) make 90. The
+        // pin worked exactly as intended: it caught both edits on the runs
+        // that made them, and the count is the honest size of the fork.
+        assert_eq!(patch, 121, "`{LOCAL_PATCH_MARKER}` marker count");
         let by_name: BTreeMap<&str, (u64, u64)> = forks
             .iter()
             .map(|f| (f.name.as_str(), (f.trust_markers, f.patch_markers)))
@@ -1712,7 +1724,7 @@ mod tests {
         assert_eq!(by_name["smol_str"], (4, 0));
         assert_eq!(by_name["libm"], (1, 0));
         assert_eq!(by_name["pkg-config"], (1, 0));
-        assert_eq!(by_name["winit"], (0, 3));
+        assert_eq!(by_name["winit"], (0, 121));
     }
 
     /// The patch table PARTITIONED. Five vendored forks — third-party source

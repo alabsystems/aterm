@@ -97,6 +97,16 @@ pub struct Manifest {
     pub sha256: String,
     /// The DMG asset's file name within the release, e.g. `"aterm-0.2.0.dmg"`.
     pub dmg: String,
+    /// The container's browser download URL as the PUBLISHER wrote it —
+    /// `https://github.com/{owner}/{repo}/releases/download/v{version}/{dmg}`
+    /// (`aterm-release/src/manifest_out.rs`). NEVER followed: the client downloads
+    /// from the URL it DERIVES for the tag the channel head names. On the web lane it
+    /// is the second half of the bind between the evergreen pointer and the signed
+    /// bytes (`github::web_container_url_agrees`): the tag the pointer chose must be
+    /// `v` + [`Self::version`] AND the tag inside this URL, so a signed appcast
+    /// copied onto another tag cannot be elected under it. Absent ⇒ None (a
+    /// hand-written manifest), which the web lane refuses.
+    pub url: Option<String>,
     /// The updater container's file name, e.g. `"aterm-0.2.0-mac.zip"` — the same
     /// signed bundle as the DMG, packed with `ditto` instead of `hdiutil`. PREFERRED
     /// for staging when present (see [`crate::install::stage_from_zip`]): after a
@@ -148,6 +158,7 @@ impl Manifest {
             commit: m.commit,
             sha256: m.sha256,
             dmg: m.dmg,
+            url: m.url,
             zip: m.zip,
             zip_sha256: m.zip_sha256,
             min_build: m.min_build,

@@ -2094,7 +2094,7 @@ impl AppRt for AppRtWindows {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 if aterm_gpu::dx12_visual_swapchain_withdrawn() {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: background_material is styling the caption only \
                          (client=opaque): the client-area backdrop path was withdrawn \
                          this run — see the diagnostic above"
@@ -2105,7 +2105,7 @@ impl AppRt for AppRtWindows {
                     // and re-queueing here would only say "see above" to someone
                     // who has no above.
                 } else {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: background_material is styling the caption only \
                          (client=opaque): the client-area backdrop engages when the material \
                          is set at launch with the GPU renderer and hdr_glow off — restart \

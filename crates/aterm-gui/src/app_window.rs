@@ -564,7 +564,7 @@ impl App {
             Err(e) => {
                 // Spawn failed: do NOT mint a broken (session-less) window. The id is
                 // burned (never reused), which is fine — ids are monotonic, not dense.
-                eprintln!("aterm-gui: could not open a new window: {e}");
+                crate::logging::stderr_line!("aterm-gui: could not open a new window: {e}");
                 self.surface_gesture_failure(&format!("✕ New window failed: {e}"));
                 return None;
             }
@@ -784,7 +784,9 @@ impl App {
         };
         let handle = handle.take().expect("finalize_backend re-entered mid-join");
         let (backend, use_gpu) = handle.join().unwrap_or_else(|_| {
-            eprintln!("aterm-gui: backend-build thread panicked; no renderer — exiting");
+            crate::logging::stderr_line!(
+                "aterm-gui: backend-build thread panicked; no renderer — exiting"
+            );
             std::process::exit(1);
         });
         assert!(
@@ -927,7 +929,7 @@ impl App {
         {
             return Err(first_error);
         }
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: backdrop requested but DirectComposition is unavailable ({first_error}); \
              falling back to the opaque swapchain — background_material styles the caption \
              only this run"
@@ -953,7 +955,7 @@ impl App {
         {
             Some(Ok(g)) => g,
             Some(Err(err)) => {
-                eprintln!("aterm-gui: opaque swapchain rebuild failed: {err}");
+                crate::logging::stderr_line!("aterm-gui: opaque swapchain rebuild failed: {err}");
                 return Err(first_error);
             }
             None => return Err(first_error),
@@ -1248,7 +1250,7 @@ impl App {
             Err(e) => {
                 // Fail soft: decline this one window so the caller rolls back (or, for
                 // the first window, exits) — never unwind the whole process.
-                eprintln!("aterm-gui: OS window creation failed: {e}");
+                crate::logging::stderr_line!("aterm-gui: OS window creation failed: {e}");
                 return false;
             }
         };
@@ -1994,11 +1996,11 @@ impl App {
                         .values()
                         .any(|w| matches!(w.present, Some(PresentTarget::Gpu { .. })));
                     if other_gpu {
-                        eprintln!("aterm-gui: GPU surface creation failed: {e}");
+                        crate::logging::stderr_line!("aterm-gui: GPU surface creation failed: {e}");
                         drop(window);
                         return false;
                     }
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: GPU surface creation failed: {e}; falling back to the CPU renderer"
                     );
                     match self
@@ -2018,7 +2020,9 @@ impl App {
                             // Do NOT return — fall through to the softbuffer path.
                         }
                         Err(error) => {
-                            eprintln!("aterm-gui: resident CPU font fallback failed: {error}");
+                            crate::logging::stderr_line!(
+                                "aterm-gui: resident CPU font fallback failed: {error}"
+                            );
                             drop(window);
                             return false;
                         }
@@ -2035,7 +2039,7 @@ impl App {
         let surface = match crate::present::CpuSurface::new(window.clone()) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("aterm-gui: CPU present surface creation failed: {e}");
+                crate::logging::stderr_line!("aterm-gui: CPU present surface creation failed: {e}");
                 drop(window);
                 return false;
             }

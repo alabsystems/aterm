@@ -145,14 +145,14 @@ fn each_pointer_shaped_runtime_type_carries_its_own_encoding() {
     // SAFETY: each prototype below is exactly the declared method's signature,
     // on a live instance of the class that declares it.
     unsafe {
-        let f_cls: unsafe extern "C" fn(Id, Sel, ClassPtr) -> Bool = msg();
+        let f_cls: unsafe extern "C-unwind" fn(Id, Sel, ClassPtr) -> Bool = msg();
         assert!(!f_cls(obj.as_id(), sel!(setDelegateClass:), Shapes::class()).as_bool());
         assert!(f_cls(obj.as_id(), sel!(setDelegateClass:), ClassPtr::NULL).as_bool());
 
-        let f_proto: unsafe extern "C" fn(Id, Sel, ProtocolPtr) -> Bool = msg();
+        let f_proto: unsafe extern "C-unwind" fn(Id, Sel, ProtocolPtr) -> Bool = msg();
         assert!(!f_proto(obj.as_id(), sel!(takeProtocol:), protocol(c"NSObject")).as_bool());
 
-        let f_ctx: unsafe extern "C" fn(Id, Sel, *mut c_void) -> Bool = msg();
+        let f_ctx: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) -> Bool = msg();
         assert!(f_ctx(obj.as_id(), sel!(takeContext:), std::ptr::null_mut()).as_bool());
     }
 }
@@ -225,7 +225,7 @@ fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
     // deliberately leaked: `-init` never runs, so releasing them is not this
     // test's business, and 4,096 of them is a few hundred kilobytes.
     unsafe {
-        let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
         for _ in 0..4096 {
             let base = alloc(cls, sel!(alloc)).expose_provenance();
             if !base.is_multiple_of(32) {
@@ -252,7 +252,7 @@ fn an_ivar_at_the_sixteen_byte_ceiling_is_aligned_in_every_instance() {
     let obj = Aligned16::alloc_init(mtm(), AtTheCeiling(20, 22)).expect("+alloc/-init");
     // SAFETY: `-sum` is declared on this class with exactly this prototype.
     let sum = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> i64 = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> i64 = msg();
         f(obj.as_id(), sel!(sum))
     };
     assert_eq!(sum, 42);
@@ -343,7 +343,7 @@ fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
     // SAFETY: the three prototypes are exactly the declared signatures. The
     // out-pointer addresses a live local for the duration of the send.
     unsafe {
-        let rect: unsafe extern "C" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
+        let rect: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
         let r = rect(
             obj.as_id(),
             sel!(firstRectForCharacterRange:actualRange:),
@@ -356,7 +356,7 @@ fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
         assert_eq!(r.origin.x, 1.0);
         assert_eq!(r.size.height, 4.0);
 
-        let sel_range: unsafe extern "C" fn(Id, Sel) -> NSRange = msg();
+        let sel_range: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
         assert_eq!(
             sel_range(obj.as_id(), sel!(selectedRange)),
             NSRange {
@@ -365,7 +365,7 @@ fn an_nsrange_crosses_the_boundary_by_value_and_by_pointer() {
             }
         );
 
-        let marked: unsafe extern "C" fn(Id, Sel, NSRange) -> Bool = msg();
+        let marked: unsafe extern "C-unwind" fn(Id, Sel, NSRange) -> Bool = msg();
         assert!(
             marked(
                 obj.as_id(),
@@ -485,7 +485,7 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
         }
         // SAFETY: `-boom` is declared on this class with this exact prototype.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) = msg();
             f(obj.as_id(), sel!(boom));
         }
         unreachable!("the guard must abort");

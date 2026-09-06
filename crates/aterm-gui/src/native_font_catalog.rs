@@ -102,7 +102,12 @@ impl Lane {
         let (tx, rx) = sync_channel(1);
         std::thread::Builder::new()
             .name("aterm-font-catalog".into())
-            .spawn(move || worker(rx, proxy))
+            .spawn(move || {
+                // QoS (port of 61a6c8b62): a font-picker catalogue scan; the
+                // picker shows a spinner meanwhile, the terminal is unaffected.
+                crate::qos::set_self(crate::qos::Role::Background);
+                worker(rx, proxy);
+            })
             .map_err(|error| format!("could not start font catalog worker: {error}"))?;
         Ok(Self { tx, pending: None })
     }

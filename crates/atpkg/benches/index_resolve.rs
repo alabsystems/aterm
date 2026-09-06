@@ -16,10 +16,11 @@
 //! well as timing them.
 //!
 //! What is saved is ROUND-TRIPS, not rate-limit budget — say it precisely or not at all.
-//! Only the listing is an `api.github.com` request; the sixteen asset reads already go to
-//! the release CDN (`release_download_base`, unmetered — `pkg_manifest`'s comment records
+//! Only the listing is an `api.github.com` request (one per page, on the listing lane;
+//! the evergreen-pointer lane makes none); the sixteen asset reads already go to the
+//! release CDN (`release_download_base`, unmetered — `pkg_manifest`'s comment records
 //! measuring HTTP 200 from it with the API at `remaining: 0`). So this removes sixteen
-//! DNS+TLS+HTTP round-trips and leaves the one metered request exactly where it was.
+//! DNS+TLS+HTTP round-trips and leaves the listing's metered requests exactly where they were.
 //!
 //! It deliberately brings NO dependency. atpkg's whole reason for existing is supply
 //! chain: its manifest argues every edge (`ring` promoted to a direct dependency on

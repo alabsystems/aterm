@@ -37,14 +37,14 @@ pub fn resolve() -> Option<String> {
                 // Platform-selected refusal text: the Windows validator only
                 // requires an existing directory (no uid/mode semantics there).
                 #[cfg(unix)]
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: refusing ATERM_SNAPSHOT_PATH {}: its directory must exist, \
                      be owned by uid {}, and not be group/other-writable; snapshot skipped",
                     requested.display(),
                     control_auth::our_uid()
                 );
                 #[cfg(windows)]
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: refusing ATERM_SNAPSHOT_PATH {}: its directory must exist; \
                      snapshot skipped",
                     requested.display()
@@ -60,7 +60,7 @@ pub fn resolve() -> Option<String> {
                 .into_owned(),
         ),
         None => {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: no per-user runtime dir (set XDG_RUNTIME_DIR, HOME, or \
                  ATERM_SNAPSHOT_PATH); snapshot skipped"
             );

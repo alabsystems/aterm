@@ -349,12 +349,12 @@ impl MacCpuPresenter {
             if self.applied_geometry == Some(geometry) {
                 return;
             }
-            let set_frame: unsafe extern "C" fn(Id, Sel, CGRect) = aterm_objc::msg();
+            let set_frame: unsafe extern "C-unwind" fn(Id, Sel, CGRect) = aterm_objc::msg();
             set_frame(self.layer.id(), sel!(setFrame:), bounds);
             // A non-positive scale would divide the contents to nothing; keep
             // whatever the layer already had rather than blank the window.
             if scale > 0.0 {
-                let set_scale: unsafe extern "C" fn(Id, Sel, f64) = aterm_objc::msg();
+                let set_scale: unsafe extern "C-unwind" fn(Id, Sel, f64) = aterm_objc::msg();
                 set_scale(self.layer.id(), sel!(setContentsScale:), scale);
             }
             self.applied_geometry = Some(geometry);
@@ -433,7 +433,7 @@ impl CpuPresenter for MacCpuPresenter {
             };
 
             // Top-left origin, matching the frontend's framebuffer coordinates.
-            let set_anchor: unsafe extern "C" fn(Id, Sel, CGPoint) = aterm_objc::msg();
+            let set_anchor: unsafe extern "C-unwind" fn(Id, Sel, CGPoint) = aterm_objc::msg();
             set_anchor(
                 layer.id(),
                 sel!(setAnchorPoint:),

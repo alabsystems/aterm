@@ -73,25 +73,30 @@
 //! | [`WINDOW`] `WinitWindow` | `-[view window]` | 2 + `dealloc` |
 //! | [`APP`] `NSApplication` | `NSApp` | 1 of 791 — see [`Rows::Patched`] |
 //!
-//! # THE ONE EXCEPTION TO "THE GATE MUST READ THE REGISTERED CLASS"
+//! # THE ONE EXCEPTION TO "THE GATE MUST READ THE REGISTERED CLASS" — CLOSED
 //!
 //! That rule — every declared row is read off the live class, never off a
-//! table — has exactly one exception in this tree, and nothing named it until
-//! W6. `vendor/winit/src/platform_impl/macos/app.rs:185` declares a
-//! `sendEvent:` row on a `TestApplication` class, and it is NOT PRODUCT CODE:
-//! it sits inside `#[cfg(test)] mod tests`, in `fn test_custom_class()`, with a
-//! `todo!()` body, instantiated by that one test and by nothing else. No
-//! live-class audit can ever read it, because no instance of it exists in a
-//! shipping process — `declare_class!` registers lazily on first `::class()`,
-//! so the class is not even present. A roadmap that priced it as a sixth
-//! remaining declared row was pricing a row that cannot be audited and whose
-//! port would move nothing off `objc2`; the number was FIVE.
+//! table — had exactly one exception in this tree from W6 until W12.
+//! `vendor/winit/src/platform_impl/macos/app.rs` declared a `sendEvent:` row on
+//! a `TestApplication` class that was NOT PRODUCT CODE: it sat inside
+//! `#[cfg(test)] mod tests`, in `fn test_custom_class()`, with a `todo!()`
+//! body, instantiated by that one test and by nothing else. No live-class audit
+//! could ever read it, because no instance of it exists in a shipping process —
+//! `declare_class!` registers lazily on first `::class()`, so the class was not
+//! even present. A roadmap that priced it as a sixth remaining declared row was
+//! pricing a row that cannot be audited and whose port would move nothing off
+//! `objc2`; the number was FIVE.
 //!
-//! The exception is narrow and it is ENFORCED rather than trusted:
-//! `crates/aterm-objc/tests/winit_seam.rs` asserts that the remaining
-//! declaration sits after `#[cfg(test)]` in the file, so promoting it to
-//! product code goes RED and re-incurs both the port and a target here. And
-//! what `app.rs` really SHIPS is audited — see [`APP`].
+//! W12 DELETED THE MODULE rather than porting it, and the reason is the same
+//! fact one step further: the test could never RUN here either. `winit` is a
+//! path dependency and not a workspace member, so `cargo test -p winit` answers
+//! *"package `winit` cannot be tested because it requires dev-dependencies and
+//! is not a member of the workspace"*. Porting it would have produced objc2-free
+//! code that no compiler in this repository ever sees, which is worse than
+//! none. `crates/aterm-objc/tests/winit_seam.rs` now asserts that `app.rs`
+//! declares NOTHING, so a row reappearing there is product code and re-incurs
+//! both a port and a target here. What `app.rs` really SHIPS is audited — see
+//! [`APP`].
 //!
 //! # WHERE THE AUTHORITY LIST COMES FROM, and the false universal it printed
 //!
@@ -547,20 +552,17 @@ mod macos {
     /// `app.rs`'s ONE row, and the only target here that is not a class this
     /// fork declares.
     ///
-    /// # Why `NSApplication` is audited at all, and what the exception is
+    /// # Why `NSApplication` is audited at all
     ///
-    /// This file's rule is "the gate must read the REGISTERED CLASS", and
-    /// `app.rs` has a `declare_class!` in it — `TestApplication`, an
-    /// `NSApplication` subclass with one `sendEvent:` row whose body is
-    /// `todo!()`. It is NOT PRODUCT CODE: it sits inside `#[cfg(test)] mod
-    /// tests`, in `fn test_custom_class()`, and it is instantiated with
-    /// `msg_send_id![TestApplication::class(), new]` by that test and by
-    /// nothing else. NO LIVE-CLASS AUDIT CAN EVER READ IT, because no instance
-    /// of it exists in a shipping process — the class is not even registered
-    /// there, since `declare_class!`'s registration is lazy on first
-    /// `::class()`. That is the exception to the rule, and it is named HERE,
-    /// beside the rule, rather than left for a future wave to rediscover as a
-    /// gap.
+    /// This file's rule is "the gate must read the REGISTERED CLASS", and until
+    /// W12 `app.rs` had a `declare_class!` in it that broke the rule harmlessly
+    /// — `TestApplication`, an `NSApplication` subclass with one `sendEvent:`
+    /// row whose body was `todo!()`, inside `#[cfg(test)] mod tests`. NO
+    /// LIVE-CLASS AUDIT COULD EVER READ IT, because no instance of it exists in
+    /// a shipping process; the class was not even registered there, since
+    /// `declare_class!`'s registration is lazy on first `::class()`. W12 deleted
+    /// it (it could not be compiled here either — see the header), so the
+    /// exception is closed and this target now audits only what ships.
     ///
     /// A related claim was checked and is FALSE for this tree, so it is written
     /// down rather than repeated: an `NSApplication` subclass installed through
@@ -1559,8 +1561,11 @@ mod macos {
                 // runtime; `instance` is live and `protocol` answers a live
                 // protocol or nil (for which the runtime answers NO).
                 let conforms: Bool = unsafe {
-                    let send: unsafe extern "C" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool =
-                        msg();
+                    let send: unsafe extern "C-unwind" fn(
+                        Id,
+                        Sel,
+                        aterm_objc::ProtocolPtr,
+                    ) -> Bool = msg();
                     send(instance, sel!(conformsToProtocol:), protocol(p))
                 };
                 let informal = target.informal.iter().find(|(n, _)| *n == name.as_str());
@@ -1610,8 +1615,11 @@ mod macos {
                 // runtime; `delegate` is a live object and `protocol` answers a
                 // live protocol or nil (for which the runtime answers NO).
                 let conforms: Bool = unsafe {
-                    let send: unsafe extern "C" fn(Id, Sel, aterm_objc::ProtocolPtr) -> Bool =
-                        msg();
+                    let send: unsafe extern "C-unwind" fn(
+                        Id,
+                        Sel,
+                        aterm_objc::ProtocolPtr,
+                    ) -> Bool = msg();
                     send(instance, sel!(conformsToProtocol:), protocol(p))
                 };
                 println!("  -conformsToProtocol:{name} = {}", conforms.as_bool());
@@ -1656,7 +1664,7 @@ mod macos {
             // SAFETY: `windowShouldClose:` is registered `B@:@` (audited in part
             // A); `delegate` and `window` are live objects.
             let should_close: Bool = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel, Id) -> Bool = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Bool = msg();
                 send(delegate, sel!(windowShouldClose:), window)
             };
             println!("  -windowShouldClose: = {}", should_close.as_bool());
@@ -1676,7 +1684,7 @@ mod macos {
             // proposed options unchanged unless the window is in EXCLUSIVE
             // fullscreen, which a freshly created window is not.
             let echoed: usize = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel, Id, usize) -> usize = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel, Id, usize) -> usize = msg();
                 send(
                     delegate,
                     sel!(window:willUseFullScreenPresentationOptions:),
@@ -1739,7 +1747,7 @@ mod macos {
             // SAFETY: `hasMarkedText` is registered `B@:` (audited in part A)
             // and `view` is the live view AppKit handed back.
             let has_marked: Bool = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Bool = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Bool = msg();
                 send(view, sel!(hasMarkedText))
             };
             println!("  -hasMarkedText = {}", has_marked.as_bool());
@@ -1758,7 +1766,7 @@ mod macos {
             //    swapped return cannot produce it by accident.
             // SAFETY: `markedRange` is registered `{_NSRange=QQ}@:`.
             let marked: aterm_objc::NSRange = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> aterm_objc::NSRange = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::NSRange = msg();
                 send(view, sel!(markedRange))
             };
             println!(
@@ -1777,7 +1785,8 @@ mod macos {
             // SAFETY: `characterIndexForPoint:` is registered
             // `Q@:{CGPoint=dd}`; the fork answers 0 for every point.
             let idx: usize = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel, aterm_objc::CGPoint) -> usize = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::CGPoint) -> usize =
+                    msg();
                 send(
                     view,
                     sel!(characterIndexForPoint:),
@@ -1837,7 +1846,7 @@ mod macos {
             // `-(id)(SEL)` on NSObject and returns an autoreleased signature or
             // nil.
             let sig: Id = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                 f(view, sel!(methodSignatureForSelector:), sel)
             };
             if sig.is_null() {
@@ -1862,8 +1871,8 @@ mod macos {
             // `-(const char *)` and its buffer belongs to the signature, which
             // is alive for this scope.
             let (ret_len, argc, foundation_ret) = unsafe {
-                let n: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-                let t: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char = msg();
+                let n: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+                let t: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char = msg();
                 (
                     n(sig, sel!(methodReturnLength)),
                     n(sig, sel!(numberOfArguments)),
@@ -1909,7 +1918,7 @@ mod macos {
             // null `actualRange:` is what AppKit itself passes when it does not
             // want one back, and the fork ignores the argument entirely.
             let direct: aterm_objc::CGRect = unsafe {
-                let send: unsafe extern "C" fn(
+                let send: unsafe extern "C-unwind" fn(
                     Id,
                     Sel,
                     aterm_objc::NSRange,
@@ -1998,7 +2007,7 @@ mod macos {
             // `-(id)(SEL)` on NSObject, answering an autoreleased signature or
             // nil.
             let sig: Id = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                 f(instance, sel!(methodSignatureForSelector:), sel)
             };
             if sig.is_null() {
@@ -2020,8 +2029,8 @@ mod macos {
             // `-getArgumentTypeAtIndex:` is `-(const char *)(NSUInteger)`, all
             // on a live signature whose buffers outlive this scope.
             let (argc, foundation_ret) = unsafe {
-                let n: unsafe extern "C" fn(Id, Sel) -> usize = msg();
-                let t: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char = msg();
+                let n: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
+                let t: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char = msg();
                 (
                     n(sig, sel!(numberOfArguments)),
                     CStr::from_ptr(t(sig, sel!(methodReturnType)))
@@ -2047,7 +2056,8 @@ mod macos {
             for (i, want) in args.iter().enumerate() {
                 // SAFETY: as above; `i` is below `numberOfArguments`.
                 let got = unsafe {
-                    let g: unsafe extern "C" fn(Id, Sel, usize) -> *const std::ffi::c_char = msg();
+                    let g: unsafe extern "C-unwind" fn(Id, Sel, usize) -> *const std::ffi::c_char =
+                        msg();
                     CStr::from_ptr(g(sig, sel!(getArgumentTypeAtIndex:), i))
                         .to_string_lossy()
                         .into_owned()
@@ -2124,7 +2134,7 @@ mod macos {
             // SAFETY: `+alloc`/`-init` on a freshly registered `NSObject`
             // subclass whose only ivar is a zero-sized Rust payload.
             let obj = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(send(probe.class().as_id(), sel!(alloc)), sel!(init))
             };
             if obj.is_null() {
@@ -2167,19 +2177,19 @@ mod macos {
             let claimer = builder.register();
             // SAFETY: as above.
             let obj = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(send(claimer.class().as_id(), sel!(alloc)), sel!(init))
             };
             // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an
             // autoreleased signature or nil, and `-methodReturnType` is
             // `-(const char *)` on it.
             let answered = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                 let sig = f(obj, sel!(methodSignatureForSelector:), sel);
                 if sig.is_null() {
                     None
                 } else {
-                    let t: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char = msg();
+                    let t: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char = msg();
                     Some(
                         CStr::from_ptr(t(sig, sel!(methodReturnType)))
                             .to_string_lossy()
@@ -2231,12 +2241,12 @@ mod macos {
             // autoreleased signature or nil, and `-methodReturnType` is
             // `-(const char *)` on it.
             let answered_undeclared = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                 let sig = f(obj, sel!(methodSignatureForSelector:), undeclared);
                 if sig.is_null() {
                     None
                 } else {
-                    let t: unsafe extern "C" fn(Id, Sel) -> *const std::ffi::c_char = msg();
+                    let t: unsafe extern "C-unwind" fn(Id, Sel) -> *const std::ffi::c_char = msg();
                     Some(
                         CStr::from_ptr(t(sig, sel!(methodReturnType)))
                             .to_string_lossy()
@@ -2277,13 +2287,13 @@ mod macos {
             // COMPILER's view of the row, which is correct for both
             // registrations because both are backed by that one function.
             let direct: aterm_objc::CGRect = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> aterm_objc::CGRect = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGRect = msg();
                 send(obj, sel)
             };
             // SAFETY: `obj` is live; `-methodSignatureForSelector:` answers an
             // autoreleased signature or nil.
             let sig: Id = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                 f(obj, sel!(methodSignatureForSelector:), sel)
             };
             if sig.is_null() {
@@ -2300,7 +2310,7 @@ mod macos {
             // which is 32 for both of these encodings, into a 32-byte
             // `CGRect`.
             let through: aterm_objc::CGRect = unsafe {
-                let new: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+                let new: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
                 let inv = new(
                     class(c"NSInvocation").as_id(),
                     sel!(invocationWithMethodSignature:),
@@ -2312,14 +2322,14 @@ mod macos {
                     );
                     return false;
                 }
-                let set_id: unsafe extern "C" fn(Id, Sel, Id) = msg();
+                let set_id: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
                 set_id(inv, sel!(setTarget:), obj);
-                let set_sel: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+                let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
                 set_sel(inv, sel!(setSelector:), sel);
-                let go: unsafe extern "C" fn(Id, Sel) = msg();
+                let go: unsafe extern "C-unwind" fn(Id, Sel) = msg();
                 go(inv, sel!(invoke));
                 let mut out = aterm_objc::CGRect::default();
-                let get: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) = msg();
+                let get: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) = msg();
                 get(
                     inv,
                     sel!(getReturnValue:),
@@ -2361,7 +2371,7 @@ mod macos {
             // SAFETY: `instance` is a live object; `-class` is `#@:` on every
             // Apple runtime and `object_getClass` reads the isa directly.
             let (reported, isa) = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
                 (send(instance, sel!(class)), class_of(instance))
             };
             if reported.is_null() {
@@ -2541,16 +2551,19 @@ mod macos {
         /// THE RESIDUAL, on the record rather than assumed away: if a future
         /// AppKit changed `-[NSApplication sendEvent:]`'s OWN signature, part A
         /// would compare `NSApplication` against `NSApplication`, agree, and
-        /// pass — while `override_send_event`'s Rust `extern "C" fn` kept the
-        /// old shape — `app.rs:16`'s
-        /// `extern "C" fn(&NSApplication, Sel, &NSEvent)`. Nothing in this file
-        /// can see that, because both sides of the comparison move together. The
-        /// instrument that can is `crates/aterm-objc/tests/winit_seam.rs`'s
-        /// `no_declared_row_disagrees_with_the_runtimes_own_authority`, whose
-        /// `app.rs:185` row carries `v@:@` as a WRITTEN-DOWN transcription and
-        /// compares it against `-[NSApplication sendEvent:]`'s live encoding —
-        /// two readings that do NOT move together, which is the whole reason
-        /// that census still earns its place after the port.
+        /// pass — while `override_send_event`'s Rust function-pointer type kept
+        /// the old shape. Nothing in this file can see that, because both sides
+        /// of the comparison move together.
+        ///
+        /// TWO INSTRUMENTS CAN, and W12 replaced the weaker one with the
+        /// stronger. `crates/aterm-objc/tests/winit_seam.rs`'s
+        /// `the_swizzled_row_still_encodes_the_way_app_rs_types_it` DERIVES the
+        /// expected string from the same `unsafe extern "C" fn(Id, Sel, Id)`
+        /// the fork installs — through `aterm_objc::MethodFn`, the same
+        /// derivation `SwizzleSite::install` performs — and compares it against
+        /// the live encoding. (It used to be a transcribed `v@:@` in a table
+        /// row attached to the deleted test class.) And the install itself now
+        /// REFUSES on a mismatch at launch, so the drift cannot silently ship.
         ///
         /// The evidence is WHOSE CODE the runtime will call. `override_send_event`
         /// is on every keystroke and every device event in the process and it
@@ -2673,7 +2686,7 @@ mod macos {
             // SAFETY: `-[NSView window]` is `@@:`; `view` is the live NSView
             // winit just handed out.
             let ns_window: Id = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(view, sel!(window))
             };
             if ns_window.is_null() {
@@ -2683,7 +2696,7 @@ mod macos {
             }
             // SAFETY: `-[NSWindow delegate]` is `@@:` and `ns_window` is live.
             let delegate: Id = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(ns_window, sel!(delegate))
             };
             if delegate.is_null() {
@@ -2698,7 +2711,7 @@ mod macos {
             // documented accessor for the one global application object; it is
             // called on the main thread, which is where this driver runs.
             let app: Id = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(class(c"NSApplication").as_id(), sel!(sharedApplication))
             };
             if app.is_null() {
@@ -2708,7 +2721,7 @@ mod macos {
             }
             // SAFETY: `-[NSApplication delegate]` is `@@:` and `app` is live.
             let app_delegate: Id = unsafe {
-                let send: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+                let send: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
                 send(app, sel!(delegate))
             };
             if app_delegate.is_null() {

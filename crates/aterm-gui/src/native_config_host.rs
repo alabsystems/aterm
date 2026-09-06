@@ -53,7 +53,12 @@ impl HostDiagnosticsLane {
         let (request_tx, request_rx) = sync_channel(REQUEST_CAPACITY);
         std::thread::Builder::new()
             .name("aterm-config-diagnostics".into())
-            .spawn(move || worker_loop(request_rx, proxy))
+            .spawn(move || {
+                // QoS (port of 61a6c8b62): Manual diagnostics are read on a
+                // settings screen; they answer through the proxy, hold no lock.
+                crate::qos::set_self(crate::qos::Role::Background);
+                worker_loop(request_rx, proxy);
+            })
             .map_err(|error| format!("could not start Manual diagnostics worker: {error}"))?;
         Ok(Self {
             request_tx,

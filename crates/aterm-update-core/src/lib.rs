@@ -7,11 +7,13 @@
 //! This crate holds the parts of the updater that are NOT tied to the macOS `.app`
 //! shape: resolving the GitHub release source (owner/repo) under
 //! env > config > default precedence with a URL-safety allowlist; an advisory
-//! [`FileLock`] and a [`same_volume`] check; token-optional `curl` plumbing to the
-//! GitHub Releases API ([`api_get`], [`api_get_conditional`], [`download_bytes`],
-//! [`download_to`] — anonymous when no token is provisioned, so a PUBLIC channel needs
-//! no credential; conditional so a steady-state check costs a 304 instead of the whole
-//! release history); the
+//! [`FileLock`] and a [`same_volume`] check; `curl` plumbing for two GitHub hosts —
+//! the unmetered web host every public-channel byte moves over ([`cdn`] derives the
+//! tag-specific `github.com/…/releases/download/…` URL, [`pointer`] learns the newest
+//! release's tag from ONE redirect-refusing HEAD of `…/releases/latest/download/…`,
+//! [`download_bytes`]/[`download_to`] fetch with no credential ever attached), and the
+//! metered Releases API a DEDICATED token buys on a repointed private channel
+//! ([`api_get`], [`api_get_with_headers`] — the token on stdin, never argv); the
 //! per-machine [`token`] resolution chain; private-dir hardening
 //! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; the release-tag
 //! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
@@ -33,8 +35,10 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
+pub mod cdn;
 pub mod manifest;
 pub mod pins;
+pub mod pointer;
 pub mod roster;
 pub mod seal_guard;
 pub mod tag;
@@ -49,9 +53,10 @@ mod sys;
 
 pub use hash::sha256_file;
 pub use http::{
-    ApiResponse, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get, api_get_classified,
-    api_get_conditional, download_bytes, download_error_is_rate_limit, download_to,
-    download_to_resumable, download_to_resumable_https_only, validator_safe,
+    HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, RateLimitHeaders, api_get,
+    api_get_classified, api_get_with_headers, download_bytes, download_error_is_rate_limit,
+    download_to, download_to_resumable, download_to_resumable_https_only, head_no_redirect,
+    parse_rate_limit_headers, rate_limit_from_header_dump,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

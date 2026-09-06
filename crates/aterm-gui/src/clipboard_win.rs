@@ -246,7 +246,7 @@ mod tests {
     fn set_then_get_round_trips_including_multibyte() {
         let marker = format!("aterm-clip-test-{}-✓ 例", std::process::id());
         if !set(&marker) {
-            eprintln!("SKIP: clipboard unavailable (held by another process?)");
+            crate::logging::stderr_line!("SKIP: clipboard unavailable (held by another process?)");
             return;
         }
         assert_eq!(get().as_deref(), Some(marker.as_str()));

@@ -2739,7 +2739,7 @@ impl App {
                         }
                         self.refresh_operator_status_item();
                     }
-                    Err(e) => eprintln!("aterm-gui: start operator failed: {e}"),
+                    Err(e) => crate::logging::stderr_line!("aterm-gui: start operator failed: {e}"),
                 }
             }
             crate::status_item::OperatorAction::Show => {
@@ -3083,7 +3083,7 @@ impl App {
                 }
             }
             Err(e) => {
-                eprintln!("aterm-gui: could not open a new tab: {e}");
+                crate::logging::stderr_line!("aterm-gui: could not open a new tab: {e}");
                 self.surface_gesture_failure(&format!("✕ New tab failed: {e}"));
             }
         }

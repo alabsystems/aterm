@@ -109,16 +109,23 @@
 //!
 //! # Build surface
 //!
-//! This uses the TYPED `NSWorkspace` bindings, so `objc2-app-kit` needs its
-//! `NSWorkspace` feature enabled (the crate's list already carries the other two
-//! that `openApplicationAtURL:configuration:completionHandler:` is gated on,
-//! `NSRunningApplication` and `block2`, and the feature pulls the
-//! `NSURL`/`NSError`/`NSArray`/`NSDictionary` bindings it needs from
-//! `objc2-foundation` itself). `menu.rs` and `platform.rs` reach NSWorkspace
-//! through `class!` + `msg_send!` precisely because that feature was off; an
-//! untyped `msg_send!` is a poor trade here, where the call takes a URL, a
-//! configuration object, a dictionary and a block whose signature must match
-//! what AppKit invokes.
+//! **There is no build surface left to describe, and that is the W13 change.**
+//! This section used to say that the typed `NSWorkspace` bindings needed
+//! `objc2-app-kit`'s `NSWorkspace` feature enabled, and that `menu.rs` and
+//! `platform.rs` reached NSWorkspace through `class!` + `msg_send!` *precisely
+//! because that feature was off* — a real cost, paid in untyped sends, to avoid
+//! widening a third-party feature list.
+//!
+//! That trade no longer exists in either direction. Every call here goes
+//! through `aterm_objc` — `class(c"NSWorkspace")`, the
+//! `NSWorkspaceOpenConfiguration` class, `aterm_objc::msg()` for each
+//! prototype and `RcBlock` for the completion handler — and `aterm-gui`'s
+//! four `objc2` family rows were retired in the same wave. A binding is now
+//! reachable because it was written, not because a feature flag was set, so
+//! the untyped/typed choice is made per call site on its merits: this one
+//! takes a URL, a configuration object, a dictionary and a block whose
+//! signature must match what AppKit invokes, and it declares every one of
+//! those prototypes explicitly.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -567,7 +574,7 @@ fn launch_validated(
             } else if app.is_null() {
                 Err(LaunchError::NoApplication)
             } else {
-                let pid_of: unsafe extern "C" fn(Id, Sel) -> i32 = aterm_objc::msg();
+                let pid_of: unsafe extern "C-unwind" fn(Id, Sel) -> i32 = aterm_objc::msg();
                 admit_launched_pid(pid_of(app, sel!(processIdentifier)), own_pid)
             }
         };
@@ -632,14 +639,15 @@ fn launch_validated(
     // `-(void)(BOOL)` or `-(void)(id)` on it. Everything returned here is
     // AUTORELEASED into the pool this whole body runs in.
     autoreleasepool(|_| unsafe {
-        let array_with: unsafe extern "C" fn(Id, Sel, *const Id, usize) -> Id = aterm_objc::msg();
+        let array_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, usize) -> Id =
+            aterm_objc::msg();
         let arguments = array_with(
             class(c"NSArray").as_id(),
             sel!(arrayWithObjects:count:),
             arg_ids.as_ptr(),
             arg_ids.len(),
         );
-        let dict_with: unsafe extern "C" fn(Id, Sel, *const Id, *const Id, usize) -> Id =
+        let dict_with: unsafe extern "C-unwind" fn(Id, Sel, *const Id, *const Id, usize) -> Id =
             aterm_objc::msg();
         let environment = dict_with(
             class(c"NSDictionary").as_id(),
@@ -648,7 +656,7 @@ fn launch_validated(
             key_ids.as_ptr(),
             key_ids.len(),
         );
-        let file_url: unsafe extern "C" fn(Id, Sel, Id, Bool) -> Id = aterm_objc::msg();
+        let file_url: unsafe extern "C-unwind" fn(Id, Sel, Id, Bool) -> Id = aterm_objc::msg();
         let url = file_url(
             class(c"NSURL").as_id(),
             sel!(fileURLWithPath:isDirectory:),
@@ -695,7 +703,7 @@ fn launch_validated(
         // `@`. It does not matter for a SEND — nothing reads an encoding here —
         // but writing it as an object would be the shape that, in a DECLARED
         // method, registers the wrong letter.
-        let open: unsafe extern "C" fn(Id, Sel, Id, Id, *mut c_void) = aterm_objc::msg();
+        let open: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut c_void) = aterm_objc::msg();
         open(
             workspace,
             sel!(openApplicationAtURL:configuration:completionHandler:),

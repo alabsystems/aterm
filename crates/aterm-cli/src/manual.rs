@@ -845,6 +845,15 @@ const UPDATE_PAGE: &str = r#"update — check or report aterm's own auto-update 
 
   aterm update status      what this copy knows: the running build, whether a
                            newer one is staged, and why the updater is idle
+                           (`aterm ctl update status` adds, once a check has run,
+                           the lane — `web`, the credential-less download host
+                           the public channel is read from with no GitHub API
+                           request at all, or `token:<rung>` for a repointed
+                           private channel (rung = env, keychain, file,
+                           github-env, gh-env or gh-cli) — plus any hold, a
+                           failed fetch (`blocked` on the web lane, `api-failed`
+                           on the token lane) and, on the token lane, the API
+                           budget it measured: lane= delivery= budget=)
   aterm update check       ask the channel now, instead of waiting for the timer
 
   (`aterm update --help` is a usage error — those two are the whole verb.)

@@ -211,8 +211,8 @@ fn the_unaligned_rule_is_transitive_and_a_wrapper_proves_it() {
     // consequence. Only the arm64 arm executes on this box.
     // SAFETY: neither pointer is called — the test only compares addresses.
     let (plain, wrapped) = unsafe {
-        let plain: unsafe extern "C" fn(Id, Sel) -> B16 = msg();
-        let wrapped: unsafe extern "C" fn(Id, Sel) -> WrapPaddedTo16 = msg();
+        let plain: unsafe extern "C-unwind" fn(Id, Sel) -> B16 = msg();
+        let wrapped: unsafe extern "C-unwind" fn(Id, Sel) -> WrapPaddedTo16 = msg();
         (plain as usize, wrapped as usize)
     };
     if x86 {
@@ -385,9 +385,9 @@ fn the_entry_point_is_chosen_by_the_return_type() {
     // Only the arm64 arm EXECUTES on this box; the x86_64 arm is type-checked.
     // SAFETY: neither pointer is called — the test only compares addresses.
     let (plain, big, point) = unsafe {
-        let plain: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-        let big: unsafe extern "C" fn(Id, Sel) -> CGRect = msg();
-        let point: unsafe extern "C" fn(Id, Sel) -> CGPoint = msg();
+        let plain: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let big: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = msg();
+        let point: unsafe extern "C-unwind" fn(Id, Sel) -> CGPoint = msg();
         (plain as usize, big as usize, point as usize)
     };
     if cfg!(target_arch = "x86_64") {

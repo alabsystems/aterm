@@ -121,10 +121,21 @@ pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
     let Some(argv) = configured_command(config) else {
         return false;
     };
-    std::thread::Builder::new()
+    let started = std::thread::Builder::new()
         .name("aterm-fabric-launch".to_string())
         .spawn(move || supervise(&argv))
-        .is_ok()
+        .is_ok();
+    if started {
+        // TELL THE ENDPOINT A BRIDGE IS COMING. `fabric=absent` means both "the
+        // first bridge has not attached yet" and "no bridge will ever attach",
+        // and a `post --wait` parked in those two states is owed opposite advice:
+        // wait, versus stop waiting — this instance has no fabric. Recorded here
+        // rather than inferred from the config at the far end, because THIS is
+        // the one place that knows a supervisor really started (a config with a
+        // `[fabric] command` whose thread failed to spawn is the `false` case).
+        crate::fabric::note_bridge_supervised();
+    }
+    started
 }
 
 /// Launch, wait, back off, launch again — forever, because the fabric is a

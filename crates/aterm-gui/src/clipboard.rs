@@ -70,7 +70,8 @@ pub(crate) fn pbcopy(text: &str) -> bool {
                 return false;
             }
             let _ = appkit::send_isize(pb, sel!(clearContents));
-            let set: unsafe extern "C" fn(Id, Sel, Id, Id) -> aterm_objc::Bool = aterm_objc::msg();
+            let set: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> aterm_objc::Bool =
+                aterm_objc::msg();
             set(
                 pb,
                 sel!(setString:forType:),

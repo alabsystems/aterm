@@ -1098,15 +1098,20 @@ pub fn spawn_background_check(
             // immediate" directive). This cadence buys a fast STAGE; the in-session
             // lane applies it (see the module docs' delivery model — the next-launch
             // swap is only the fallback for a stage no handoff ever completed).
-            // Cost honesty: a steady-state check on the armed tier spends 5 requests
-            // (list + manifest + roster + both signatures; 6 with a container). WITH
-            // a token that is ~240/h against the 5000/h budget; WITHOUT one (the
-            // public channel, no credential provisioned) the budget is ~60/h PER IP
-            // and the cadence has to be far slower or every check is rate-limited —
-            // hence the
-            // per-lane interval below, adopted as soon as a check reveals which lane
-            // this machine is on. `ATERM_UPDATE_INTERVAL_SECS` overrides BOTH (and is
-            // then never second-guessed); 0 means check once and stop.
+            // Cost honesty. TOKEN lane (a repointed source with a credential): a
+            // steady-state check spends one metered API request PER LISTING PAGE
+            // (one page for any channel under 100 releases) plus four for the
+            // assets (manifest + roster + both signatures; five with a container),
+            // ~240/h against the 5000/h budget. WEB lane (the public channel, and
+            // any source with no token): ZERO metered requests — one HEAD of the evergreen
+            // github.com/…/releases/latest/download/aterm-appcast.toml, whose 302
+            // names the newest tag, and tag-specific GETs on the same unmetered host
+            // only when that tag moved. There is no per-IP budget to share on the web
+            // lane; its slower interval is a courtesy to the download host and a
+            // bound on staleness — hence the per-lane interval below, adopted as soon
+            // as a check reveals which lane this machine is on.
+            // `ATERM_UPDATE_INTERVAL_SECS` overrides BOTH (and is then never
+            // second-guessed); 0 means check once and stop.
             //
             // This is the BASE interval only. The wait actually taken is jittered and
             // backs off while checks fail, and returns early when the Mac turns out to
@@ -1114,7 +1119,7 @@ pub fn spawn_background_check(
             let configured = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok());
-            let interval = configured.unwrap_or(cadence::AUTHENTICATED_INTERVAL_SECS);
+            let interval = configured.unwrap_or(cadence::TOKEN_INTERVAL_SECS);
             let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
             let mut failures = cadence::FailureLog::default();
             // Once per process: a channel this machine cannot read is a configuration
@@ -1226,18 +1231,18 @@ pub fn spawn_background_check(
                         });
                         // THE WINDOW MUST BE SIZED FOR THE LANE THIS MACHINE IS
                         // ACTUALLY ON (2026-08-24 audit). `Cadence` is always
-                        // constructed at the AUTHENTICATED base, and only adopts the
-                        // anonymous one after a check has completed and revealed the
-                        // lane — but `github::lane()` is a process-local static, so a
-                        // freshly spawned process ALWAYS starts on the fast base, and
-                        // every terminal session runs this loop. Sizing the dedup
-                        // window off 75 s meant each new session more than ~52 s after
-                        // the last one spent a full 5-request check: twelve launches in
-                        // an hour is the whole ~60/hour anonymous per-IP budget, which
-                        // is precisely the "update check deferred: GitHub rate limit"
-                        // an owner sees. Guessing FAST costs the shared budget;
-                        // guessing SLOW only delays a first check a sibling has already
-                        // made — so while the lane is unknown, assume the slow one.
+                        // constructed at the TOKEN base, and only adopts the web one
+                        // after a check has completed and revealed the lane — but
+                        // `github::lane()` is a process-local static, so a freshly
+                        // spawned process ALWAYS starts on the fast base, and every
+                        // terminal session runs this loop. Sizing the dedup window off
+                        // 75 s meant each new session more than ~52 s after the last
+                        // one spent a full check: on the API-driven lane this replaced,
+                        // twelve launches in an hour was the whole ~60/hour anonymous
+                        // per-IP budget; on the web lane it is a dozen needless HEADs
+                        // of the download host. Guessing FAST costs requests; guessing
+                        // SLOW only delays a first check a sibling has already made —
+                        // so while the lane is unknown, assume the slow one.
                         //
                         // This cannot starve the process: it has not completed a check
                         // yet, so it has no stamp of its own in the ledger to mistake
@@ -1248,10 +1253,26 @@ pub fn spawn_background_check(
                             github::lane(),
                             schedule.base(),
                         );
-                        if let Some(reason) =
-                            checker_staging.as_ref().and_then(|s| checker_skip(s, dedup_base))
+                        let now_unix = unix_now_secs();
+                        if let Some((reason, held)) = checker_staging
+                            .as_ref()
+                            .and_then(|s| checker_skip_at(s, dedup_base, now_unix))
                         {
-                            log(reason);
+                            log(&reason);
+                            // A HELD ledger names the epoch, so this sibling's own
+                            // timer is pointed at it too: released exactly at the
+                            // reset (the epoch carries the writer's jitter), not at
+                            // the next tick of an unrelated base interval. One clock
+                            // read and one parse decided both the skip and the epoch,
+                            // so the two cannot disagree across the reset.
+                            if let Some(until) = held {
+                                schedule.hold_until(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(
+                                            until.saturating_sub(now_unix),
+                                        ),
+                                );
+                            }
                             // Release the flock BEFORE sleeping — holding it through
                             // the wait would serialize every other process on OUR
                             // timer — then take the same jittered wait the loop tail
@@ -1302,18 +1323,35 @@ pub fn spawn_background_check(
                                 // token) mid-session is noticed within one backoff
                                 // ceiling at worst — `max(MAX_BACKOFF,
                                 // MAX_BACKOFF_INTERVALS × base)`, i.e. ~15 min on the
-                                // authenticated lane and ~1 h on the slow anonymous
-                                // one, which is the lane a missing token puts you on.
+                                // token lane and ~1 h on the slow web one, which is
+                                // the lane a missing token puts you on.
                                 schedule.failed();
                             }
                             Ok(None) if github::rate_limited() => {
                                 // GitHub asked us to slow down. That is a CADENCE
                                 // problem, not a broken updater: lengthen the wait
                                 // (the entire remedy) but emit no failure line and no
-                                // ledger entry, so a machine sharing an IP's ~60/hour
-                                // anonymous budget never accrues the streak that
-                                // fires "your update pipeline is likely broken".
-                                schedule.failed();
+                                // ledger entry, so a machine whose token budget ran
+                                // out — or whose download host answered 429 — never
+                                // accrues the streak that fires "your update pipeline
+                                // is likely broken".
+                                //
+                                // When the server said WHEN the window renews, wait
+                                // exactly that long (the loop's jitter is already in
+                                // the epoch): the doubling ladder retried a 13-minute
+                                // window 72 minutes later. Without a reset, the ladder.
+                                if let Some(until) = after_deferred(
+                                    &mut schedule,
+                                    github::rate_limit_reset(),
+                                    unix_now_secs(),
+                                    std::time::Instant::now(),
+                                ) {
+                                    log(&format!(
+                                        "GitHub's API budget for this token renews at {} — \
+                                         holding the next check until then",
+                                        aterm_types::rfc3339::format_rfc3339(until)
+                                    ));
+                                }
                             }
                             Ok(None) => {
                                 // A completed check that found nothing to do is a
@@ -1454,9 +1492,9 @@ pub fn spawn_background_check(
                 if configured.is_none() {
                     schedule.set_base(std::time::Duration::from_secs(
                         match github::lane() {
-                            github::Lane::Anonymous => cadence::ANONYMOUS_INTERVAL_SECS,
-                            github::Lane::Authenticated | github::Lane::Unknown => {
-                                cadence::AUTHENTICATED_INTERVAL_SECS
+                            github::Lane::Web => cadence::WEB_INTERVAL_SECS,
+                            github::Lane::Token | github::Lane::Unknown => {
+                                cadence::TOKEN_INTERVAL_SECS
                             }
                         },
                     ));
@@ -1833,14 +1871,15 @@ fn reconcile_status_outcome(
 /// The base interval the cross-process dedup window is measured against.
 ///
 /// NOT always `schedule.base()`. [`cadence::Cadence`] is always constructed at
-/// the AUTHENTICATED interval and only adopts the anonymous one once a completed
-/// check has revealed the lane — and the lane lives in a PROCESS-LOCAL static, so
-/// every freshly spawned process starts on the fast base no matter what this
-/// machine has already learned. Since the one-binary era each terminal SESSION
-/// runs the check loop, so sizing the window off 75 s made every launch more than
-/// ~52 s after the last one spend a full 5-request check: a dozen launches in an
-/// hour is the entire ~60/hour anonymous per-IP budget, and the machine lives in
-/// "update check deferred: GitHub rate limit" — the invariant the loop's own
+/// the TOKEN interval and only adopts the web one once a completed check has
+/// revealed the lane — and the lane lives in a PROCESS-LOCAL static, so every
+/// freshly spawned process starts on the fast base no matter what this machine
+/// has already learned. Since the one-binary era each terminal SESSION runs the
+/// check loop, so sizing the window off 75 s made every launch more than ~52 s
+/// after the last one spend a full check: on the API-driven lane this replaced, a
+/// dozen launches in an hour was the entire ~60/hour anonymous per-IP budget and
+/// the machine lived in "update check deferred: GitHub rate limit"; on the web
+/// lane it is a dozen needless HEADs — either way the invariant the loop's own
 /// comment promises ("N processes cost one check per interval, not N") failing
 /// for precisely the check every short-lived process makes.
 ///
@@ -1864,7 +1903,7 @@ fn dedup_window_base(
     if configured || lane != github::Lane::Unknown {
         return base;
     }
-    std::time::Duration::from_secs(cadence::ANONYMOUS_INTERVAL_SECS).max(base)
+    std::time::Duration::from_secs(cadence::WEB_INTERVAL_SECS).max(base)
 }
 
 /// How much a RECORDED DEFERRAL widens the machine-wide freshness window, as a
@@ -1895,13 +1934,65 @@ const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 /// widened window is still bounded — the next healthy check overwrites the
 /// outcome and the window returns to the base — so the retreat self-heals
 /// exactly as the per-process backoff does.
+///
+/// A HELD ledger (`held_until`, written when the rate-limited check knew the
+/// server's reset) is read FIRST and honoured EXACTLY: every process skips until
+/// that epoch and none skips past it. Neither the widened window nor the base one
+/// applies to such a record — the server said when the budget renews, and holding
+/// siblings 42 minutes on a 13-minute window (the widened rule) or releasing them
+/// 21 minutes into a 50-minute one (the base) are both wrong by the same amount
+/// the ledger already knows.
+#[cfg(all(target_os = "macos", test))]
+fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<String> {
+    checker_skip_at(staging, base, unix_now_secs()).map(|(reason, _)| reason)
+}
+
+/// [`checker_skip`] at an injected `now`, also returning the hold epoch when the skip
+/// IS a hold — the instant a skipping sibling points its own timer at. One clock read
+/// and one parse decide both, so "skip because held" and "hold until" cannot fall on
+/// different sides of the reset.
+///
+/// The hold is BOUNDED on the read side as well as the write side. The writer clamps
+/// `held_until` to `now + 1 h + jitter` ([`github::HOLD_HORIZON_SECS`] +
+/// [`github::HOLD_JITTER_SECS`]); a reader honours a stamp only when it parses as the
+/// ledger's own RFC3339 shape AND sits within that horizon past the EARLIER of the
+/// record's own `updated_at` and `now` (`now` alone, if the stamp is unreadable).
+/// Anything else — a corrupt or hand-edited field, a stamp written by a clock that was
+/// later corrected backwards, a record whose `updated_at` is itself in the future —
+/// is treated as absent and falls through to the `deferred`/base rule, which
+/// self-heals. Without this bound, every background loop on the machine would skip on
+/// such a record forever, and — because every loop skipped — nothing would ever
+/// overwrite it.
 #[cfg(target_os = "macos")]
-fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<&'static str> {
+fn checker_skip_at(
+    staging: &paths::Staging,
+    base: std::time::Duration,
+    now: u64,
+) -> Option<(String, Option<u64>)> {
     let text = read_ledger_text(&staging.status)?;
     let v = text.parse::<aterm_toml::Value>().ok()?;
     let updated = v.get("updated_at").and_then(aterm_toml::Value::as_str)?;
     if updated.is_empty() {
         return None;
+    }
+    let held = v.get("held_until").and_then(aterm_toml::Value::as_str);
+    match ledger_hold(held, updated, now) {
+        LedgerHold::InForce(until) => {
+            return Some((
+                format!(
+                    "the shared update ledger records a GitHub-budget hold until {} — this \
+                     machine is holding off GitHub until its API budget renews",
+                    aterm_types::rfc3339::format_rfc3339(until)
+                ),
+                Some(until),
+            ));
+        }
+        LedgerHold::Expired => {
+            // The epoch passed: the budget renewed, and this record says nothing
+            // more about whether GitHub should be asked now.
+            return None;
+        }
+        LedgerHold::Absent => {}
     }
     let deferred = v
         .get("outcome")
@@ -1916,12 +2007,221 @@ fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<&
     if rfc3339_older_than(updated, fresh_window) {
         return None;
     }
-    Some(if deferred {
-        "the shared update ledger records a deferred check — this machine is \
-         holding off GitHub for the rest of the backoff"
+    Some((
+        String::from(if deferred {
+            "the shared update ledger records a deferred check — this machine is \
+             holding off GitHub for the rest of the backoff"
+        } else {
+            "another aterm process completed this interval's update check"
+        }),
+        None,
+    ))
+}
+
+/// How far past the server's reset a hold may be scattered, so N siblings released
+/// by the same epoch do not all LIST in the same second: 0–60 s, from one entropy byte.
+/// Shared by the writer (`github::hold_epoch`) and the readers ([`ledger_hold`]).
+pub(crate) const HOLD_JITTER_SECS: u64 = 60;
+
+/// The longest a hold is ever believed, on either side: GitHub's window is an hour, so
+/// a reset further out than that is a skewed clock or a mangled header, and holding on
+/// it would keep a healthy machine off its channel for no reason.
+pub(crate) const HOLD_HORIZON_SECS: u64 = 3600;
+
+/// What a ledger's `held_until` says at `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerHold {
+    /// No usable hold: the field is absent, does not parse as the ledger's own RFC3339
+    /// shape, or lies past the horizon a writer could honestly have written.
+    Absent,
+    /// A hold still ahead of `now`, ending at this epoch.
+    InForce(u64),
+    /// A hold that was honest but has passed.
+    Expired,
+}
+
+/// Parse and BOUND a ledger hold (see [`checker_skip_at`]): `held` must parse
+/// strictly, and must be no further past `min(updated_at, now)` (`now` alone, when
+/// `updated_at` does not parse) than the writer's clamp allows.
+///
+/// The anchor is the EARLIER of the two, never `updated_at` alone: a record stamped
+/// by a fast clock — or hand-edited forward — would otherwise carry its own horizon
+/// with it, and a hold no honest writer could have produced at this instant would be
+/// honoured by every loop on the machine (2026-09-04 audit of `d15e9ff47`).
+fn ledger_hold(held: Option<&str>, updated_at: &str, now: u64) -> LedgerHold {
+    let Some(until) = held.and_then(rfc3339_to_unix) else {
+        return LedgerHold::Absent;
+    };
+    let anchor = rfc3339_to_unix(updated_at).map_or(now, |updated| updated.min(now));
+    let horizon = anchor
+        .saturating_add(HOLD_HORIZON_SECS)
+        .saturating_add(HOLD_JITTER_SECS);
+    if until > horizon {
+        return LedgerHold::Absent;
+    }
+    if until > now {
+        LedgerHold::InForce(until)
     } else {
-        "another aterm process completed this interval's update check"
-    })
+        LedgerHold::Expired
+    }
+}
+
+/// Unix seconds now, `0` when the clock cannot be read (every hold then reads as
+/// expired, which only releases).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What the loop does after a check the server rate-limited: when the check recorded
+/// a hold epoch still ahead of `now_unix`, the schedule holds to EXACTLY that instant
+/// and the failure count is untouched (no doubling ladder — the wait's length is
+/// known); otherwise the historical back-off (`failed`). Returns the epoch held to,
+/// for the log line. Pure in the schedule, so the dispatch invariant (f) hangs on is
+/// pinned without the loop.
+#[cfg(target_os = "macos")]
+fn after_deferred(
+    schedule: &mut cadence::Cadence,
+    reset: Option<u64>,
+    now_unix: u64,
+    now: std::time::Instant,
+) -> Option<u64> {
+    match reset {
+        Some(until) if until > now_unix => {
+            schedule.hold_until(now + std::time::Duration::from_secs(until - now_unix));
+            Some(until)
+        }
+        _ => {
+            schedule.failed();
+            None
+        }
+    }
+}
+
+/// What the status ledger says about HOW updates reach this machine: the credential
+/// lane, whether it is holding off GitHub and until when, how the last check's assets
+/// were delivered, and the API budget the last LIST measured. Every field is `None`
+/// when the ledger did not record it — a pre-lane ledger yields all-`None`, and
+/// [`Self::status_line_suffix`] then adds nothing, so a healthy line from an older
+/// record is byte-identical to what it was.
+///
+/// Read separately from [`UpdateStatus`] (rather than as new fields on it) so every
+/// consumer that constructs an `UpdateStatus` by hand keeps compiling; the two are
+/// read from the same file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Delivery {
+    /// `web` (the unmetered download host, no credential) or `token:<rung>`. An OLDER
+    /// ledger may carry `anonymous`; readers pass the string through unchanged.
+    pub lane: Option<String>,
+    /// RFC3339 epoch this machine holds off GitHub until, if the last check set one.
+    pub held_until: Option<String>,
+    /// `deferred` (the host asked us to wait), `blocked` (web lane: the download host
+    /// did not serve an asset the release names) or `api-failed` (token lane: the
+    /// releases API did not), when the last check did not simply succeed. An older
+    /// ledger may carry `api-fallback`; readers pass the string through unchanged.
+    pub note: Option<String>,
+    /// `x-ratelimit-remaining` / `-limit` / `-reset` (RFC3339) from the last LIST.
+    pub budget_remaining: Option<u32>,
+    pub budget_limit: Option<u32>,
+    pub budget_reset: Option<String>,
+}
+
+impl Delivery {
+    /// Parse the delivery fields out of a `status.toml` text; unknown or absent keys
+    /// are `None`.
+    #[must_use]
+    pub fn from_ledger_text(text: &str) -> Self {
+        let Ok(v) = text.parse::<aterm_toml::Value>() else {
+            return Self::default();
+        };
+        let string = |key: &str| {
+            v.get(key)
+                .and_then(aterm_toml::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let number = |key: &str| {
+            v.get(key)
+                .and_then(aterm_toml::Value::as_integer)
+                .and_then(|n| u32::try_from(n).ok())
+        };
+        Self {
+            lane: string("lane"),
+            held_until: string("held_until"),
+            note: string("delivery"),
+            budget_remaining: number("budget_remaining"),
+            budget_limit: number("budget_limit"),
+            budget_reset: string("budget_reset"),
+        }
+    }
+
+    /// Whether the recorded hold is still in force: an epoch that parses as the
+    /// ledger's own shape, has not passed, and lies within the horizon a writer could
+    /// honestly have written (see [`ledger_hold`] — the same bound the checker gate
+    /// applies, anchored at now since this reader holds no `updated_at`).
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        matches!(
+            ledger_hold(self.held_until.as_deref(), "", unix_now_secs()),
+            LedgerHold::InForce(_)
+        )
+    }
+
+    /// The `lane=… delivery=… budget=…` tokens for the `aterm ctl update status`
+    /// line, each present ONLY when the ledger recorded it, with a leading space so
+    /// the caller can splice it onto the line as-is. Empty for a ledger with no lane.
+    ///
+    /// `delivery=` is `held:<rfc3339>` while a hold is in force, else the recorded
+    /// note (`deferred` / `blocked` / `api-failed`), else `ok` — and it is emitted only when the
+    /// lane is known, because a delivery verdict without a lane would be a guess.
+    #[must_use]
+    pub fn status_line_suffix(&self) -> String {
+        let mut out = String::new();
+        let Some(lane) = self.lane.as_deref() else {
+            return out;
+        };
+        out.push_str(" lane=");
+        out.push_str(lane);
+        out.push_str(" delivery=");
+        if self.is_held() {
+            out.push_str("held:");
+            out.push_str(self.held_until.as_deref().unwrap_or_default());
+        } else {
+            out.push_str(self.note.as_deref().unwrap_or("ok"));
+        }
+        if let Some(remaining) = self.budget_remaining {
+            out.push_str(" budget=");
+            out.push_str(&remaining.to_string());
+            if let Some(limit) = self.budget_limit {
+                out.push('/');
+                out.push_str(&limit.to_string());
+            }
+            if let Some(reset) = self.budget_reset.as_deref() {
+                out.push('@');
+                out.push_str(reset);
+            }
+        }
+        out
+    }
+}
+
+/// The [`Delivery`] facts in this machine's status ledger, or `None` when there is no
+/// ledger to read. No network I/O.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn delivery() -> Option<Delivery> {
+    let staging = paths::Staging::resolve()?;
+    let text = read_ledger_text(&staging.status)?;
+    Some(Delivery::from_ledger_text(&text))
+}
+
+/// Non-macOS stub: no ledger.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn delivery() -> Option<Delivery> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -2021,6 +2321,42 @@ pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
         .unwrap_or(0);
     let threshold = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(secs));
     !threshold.is_empty() && *stamp < *threshold
+}
+
+/// The unix epoch a ledger stamp names — the exact inverse of
+/// [`aterm_types::rfc3339::format_rfc3339`]'s fixed `YYYY-MM-DDTHH:MM:SSZ` shape, and
+/// nothing looser: an offset, a fraction or a missing `Z` is `None`. The ledger writes
+/// only that shape, and a hold epoch read from anything else would be a guess.
+#[must_use]
+pub fn rfc3339_to_unix(stamp: &str) -> Option<u64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let field = |from: usize, to: usize| -> Option<i64> {
+        let text = std::str::from_utf8(&bytes[from..to]).ok()?;
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<i64>().ok()
+    };
+    let (y, m, d) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
+    let (hh, mm, ss) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let days = aterm_types::rfc3339::days_from_civil(y, m, d);
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(hh * 3600 + mm * 60 + ss)?;
+    u64::try_from(secs).ok()
 }
 
 /// Run ONE update check + stage synchronously and return the resulting [`UpdateStatus`]
@@ -2141,24 +2477,22 @@ mod checker_gate_tests {
     use crate::cadence;
     use crate::github::Lane;
 
-    const AUTH: Duration = Duration::from_secs(cadence::AUTHENTICATED_INTERVAL_SECS);
-    const ANON: Duration = Duration::from_secs(cadence::ANONYMOUS_INTERVAL_SECS);
+    const AUTH: Duration = Duration::from_secs(cadence::TOKEN_INTERVAL_SECS);
+    const ANON: Duration = Duration::from_secs(cadence::WEB_INTERVAL_SECS);
 
-    /// THE LAUNCH-COST OBLIGATION the steady-state budget test cannot express.
+    /// THE LAUNCH-COST OBLIGATION the steady-state cost test cannot express.
     /// A process that has not completed a check does not know its lane, and its
-    /// `Cadence` is still on the authenticated base — so the dedup window it is
-    /// judged against must be the SLOW one, or N launches cost N × 5 anonymous
-    /// requests instead of one.
+    /// `Cadence` is still on the token base — so the dedup window it is judged
+    /// against must be the SLOW one, or N launches cost N checks instead of one.
     #[test]
-    fn an_unknown_lane_is_deduped_at_the_anonymous_interval() {
+    fn an_unknown_lane_is_deduped_at_the_web_interval() {
         assert_eq!(
             dedup_window_base(false, Lane::Unknown, AUTH),
             ANON,
-            "a freshly spawned process must not spend the shared budget on a guess"
+            "a freshly spawned process must not spend a check on a guess"
         );
-        // Twelve launches in an hour, against the ~60 req/hour anonymous budget:
-        // the freshness window (70% of the base) must exceed the spacing, so at
-        // most one of them reaches the network.
+        // Twelve launches in an hour: the freshness window (70% of the base) must
+        // exceed the spacing, so at most one of them reaches the network.
         let window = dedup_window_base(false, Lane::Unknown, AUTH).as_secs() * 7 / 10;
         let spacing = 3600 / 12;
         assert!(
@@ -2169,8 +2503,8 @@ mod checker_gate_tests {
 
     #[test]
     fn a_known_lane_and_a_configured_interval_are_taken_at_face_value() {
-        assert_eq!(dedup_window_base(false, Lane::Authenticated, AUTH), AUTH);
-        assert_eq!(dedup_window_base(false, Lane::Anonymous, ANON), ANON);
+        assert_eq!(dedup_window_base(false, Lane::Token, AUTH), AUTH);
+        assert_eq!(dedup_window_base(false, Lane::Web, ANON), ANON);
         // An operator interval owns its own consequence, fast or slow.
         let configured = Duration::from_secs(10);
         assert_eq!(
@@ -2183,7 +2517,7 @@ mod checker_gate_tests {
     /// gate can never shorten a cadence the lane or the operator already accepted.
     #[test]
     fn the_dedup_window_never_undercuts_the_schedules_own_base() {
-        for lane in [Lane::Unknown, Lane::Authenticated, Lane::Anonymous] {
+        for lane in [Lane::Unknown, Lane::Token, Lane::Web] {
             for base in [
                 Duration::from_secs(1),
                 AUTH,
@@ -2205,24 +2539,20 @@ mod checker_gate_tests {
 mod checker_skip_tests {
     use std::time::Duration;
 
-    use super::{checker_skip, paths::Staging};
+    use super::{checker_skip, checker_skip_at, paths::Staging};
+
+    /// The hold epoch a sibling would point its timer at, as the loop reads it: the
+    /// second half of `checker_skip_at`'s answer.
+    fn ledger_hold_epoch(s: &Staging) -> Option<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        checker_skip_at(s, BASE, now).and_then(|(_, held)| held)
+    }
 
     fn staging(name: &str) -> Staging {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-checker-{}-{name}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&root).expect("scratch root");
-        Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged").join("aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root,
-        }
+        Staging::scratch(&format!("checker-{name}"))
     }
 
     fn write_ledger(s: &Staging, age_secs: u64, outcome: &str) {
@@ -2306,6 +2636,365 @@ updated_at = \"\"
         std::fs::write(&s.status, "not toml at all {{{").expect("write");
         assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
         let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    fn write_held_ledger(s: &Staging, age_secs: u64, held_until: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let stamp = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(age_secs));
+        let held = aterm_types::rfc3339::format_rfc3339(held_until);
+        std::fs::write(
+            &s.status,
+            format!(
+                "schema = 1
+updated_at = \"{stamp}\"
+outcome = \"update check deferred: GitHub rate limit hit\"
+held_until = \"{held}\"
+lane = \"anonymous\"
+"
+            ),
+        )
+        .expect("write ledger");
+    }
+
+    /// A HELD ledger is honoured EXACTLY: siblings skip up to the epoch — even past the
+    /// widened deferred window — and none skips one second beyond it, however fresh the
+    /// stamp. The epoch is also what a skipping sibling points its own timer at.
+    #[test]
+    fn a_held_ledger_releases_siblings_exactly_at_the_reset() {
+        let s = staging("held");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        // Held 15 min out on a 45-min-old stamp (an hour past the record, inside the
+        // writer's horizon): the widened window (42 min) has passed, and the hold
+        // still stands.
+        write_held_ledger(&s, 45 * 60, now + 15 * 60);
+        let reason = checker_skip(&s, BASE).expect("held: skip");
+        assert!(
+            reason.contains("GitHub-budget hold until") && !reason.contains("deferred check"),
+            "the log line names the hold, not the widened window: {reason}"
+        );
+        assert_eq!(
+            ledger_hold_epoch(&s),
+            Some(now + 15 * 60),
+            "the sibling learns the exact epoch to hold its own timer to"
+        );
+        // Held 1 s ago on a 1-min-old stamp: the epoch passed, so the record says
+        // nothing more about now — the check is this process's to make. (A plain
+        // fresh stamp would skip; the hold's expiry outranks it.)
+        write_held_ledger(&s, 60, now - 1);
+        assert!(
+            checker_skip(&s, BASE).is_none(),
+            "past the epoch every process is released — not held to the base window"
+        );
+        assert_eq!(ledger_hold_epoch(&s), None);
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// The READ-SIDE bound. A `held_until` that does not parse as the ledger's own
+    /// shape (`"3"`, `"99"`), or that lies further past `updated_at` than the writer's
+    /// clamp (1 h + jitter) could honestly have put it — a hand-edited ledger, or a
+    /// clock corrected backwards after the record was written — is treated as ABSENT:
+    /// the record falls through to the `deferred`/base rule and self-heals, instead of
+    /// every background loop on the machine skipping on it forever.
+    #[test]
+    fn a_malformed_or_far_future_hold_is_not_honoured() {
+        let s = staging("bogus-hold");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        // Fresh stamp (1 min) so a bogus hold that fell through still hits the
+        // deferred rule — proving it fell THROUGH rather than short-circuiting.
+        for bogus in ["3", "99", "2999-01-01T00:00:00Z", "not a stamp"] {
+            let stamp = aterm_types::rfc3339::format_rfc3339(now - 60);
+            std::fs::write(
+                &s.status,
+                format!(
+                    "schema = 1\nupdated_at = \"{stamp}\"\noutcome = \"update check \
+                     deferred: GitHub rate limit hit\"\nheld_until = \"{bogus}\"\n"
+                ),
+            )
+            .expect("write ledger");
+            let (reason, held) = checker_skip_at(&s, BASE, now)
+                .unwrap_or_else(|| panic!("{bogus:?}: the fresh deferred stamp still skips"));
+            assert!(
+                reason.contains("deferred") && !reason.contains("hold until"),
+                "{bogus:?} fell through to the deferred rule: {reason}"
+            );
+            assert_eq!(held, None, "{bogus:?} hands a sibling no epoch");
+        }
+        // Every stamp below is written from the test's OWN `now`, so the boundary
+        // cases cannot drift by a clock tick between the write and the read.
+        let write_held_at = |updated_at: u64, held_until: u64| {
+            let stamp = aterm_types::rfc3339::format_rfc3339(updated_at);
+            let held = aterm_types::rfc3339::format_rfc3339(held_until);
+            std::fs::write(
+                &s.status,
+                format!(
+                    "schema = 1\nupdated_at = \"{stamp}\"\noutcome = \"update check \
+                     deferred: GitHub rate limit hit\"\nheld_until = \"{held}\"\n"
+                ),
+            )
+            .expect("write ledger");
+        };
+        // 48 h past `updated_at` is past the horizon even though it is a valid stamp
+        // and ahead of now; and on a STALE stamp it must not skip at all.
+        write_held_at(now - 45 * 60, now + 48 * 3600);
+        assert_eq!(
+            checker_skip_at(&s, BASE, now),
+            None,
+            "past the widened window with an unbelievable hold: check"
+        );
+        // Exactly at the horizon is still believed (the writer can put it there).
+        let horizon = now + super::HOLD_HORIZON_SECS + super::HOLD_JITTER_SECS;
+        write_held_at(now, horizon);
+        let (reason, held) = checker_skip_at(&s, BASE, now).expect("a hold at the horizon");
+        assert!(reason.contains("hold until"), "{reason}");
+        assert_eq!(held, Some(horizon));
+        // One second past it is not.
+        write_held_at(now, horizon + 1);
+        let (reason, held) = checker_skip_at(&s, BASE, now).expect("fresh stamp: skip");
+        assert!(reason.contains("deferred"), "{reason}");
+        assert_eq!(held, None);
+        // `Delivery::is_held` applies the same bound, anchored at now.
+        for (held_until, expect) in [
+            ("3", false),
+            ("2999-01-01T00:00:00Z", false),
+            (
+                aterm_types::rfc3339::format_rfc3339(now + 600).as_str(),
+                true,
+            ),
+            (
+                aterm_types::rfc3339::format_rfc3339(now - 1).as_str(),
+                false,
+            ),
+        ] {
+            let d = super::Delivery::from_ledger_text(&format!(
+                "lane = \"anonymous\"\nheld_until = \"{held_until}\"\n"
+            ));
+            assert_eq!(d.is_held(), expect, "{held_until}");
+        }
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// A hold is bounded against the EARLIER of the record's `updated_at` and now. A
+    /// record stamped by a fast clock (`updated_at` two hours ahead) cannot carry its
+    /// horizon with it: a `held_until` that is honest relative to that stamp but past
+    /// now's horizon is ABSENT — the sibling gate falls through to the ordinary
+    /// deferred-window rule and hands out no epoch — while a hold that is inside now's
+    /// horizon is still honoured even under the fast stamp.
+    #[test]
+    fn a_hold_stamped_by_a_fast_clock_is_bounded_by_now_not_by_its_own_stamp() {
+        use super::{LedgerHold, ledger_hold};
+        // The live clock: the gate's freshness window is measured against it, not
+        // against the injected `now`, so the fast stamp must be ahead of the REAL now.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let fmt = aterm_types::rfc3339::format_rfc3339;
+        let fast = fmt(now + 2 * 3600);
+        // Honest relative to the fast stamp, dishonest relative to now: Absent.
+        assert_eq!(
+            ledger_hold(Some(&fmt(now + 2 * 3600 + 30 * 60)), &fast, now),
+            LedgerHold::Absent,
+            "a hold past now's horizon is not believed because its stamp is in the future"
+        );
+        // Under the same fast stamp, a hold inside now's horizon is still a hold.
+        assert_eq!(
+            ledger_hold(Some(&fmt(now + 30 * 60)), &fast, now),
+            LedgerHold::InForce(now + 30 * 60)
+        );
+        // And the sibling gate agrees: the fast-stamped record with the unbelievable
+        // hold hands out NO epoch, only the deferred-window skip its outcome earns.
+        let s = staging("fast-clock");
+        std::fs::write(
+            &s.status,
+            format!(
+                "schema = 1\nupdated_at = \"{fast}\"\noutcome = \"update check deferred: \
+                 GitHub rate limit hit\"\nheld_until = \"{}\"\n",
+                fmt(now + 2 * 3600 + 30 * 60)
+            ),
+        )
+        .expect("write ledger");
+        let (reason, held) = checker_skip_at(&s, BASE, now).expect("a fresh deferred stamp skips");
+        assert!(reason.contains("deferred"), "{reason}");
+        assert_eq!(held, None, "no epoch is handed to a sibling");
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// The loop's dispatch after a rate-limited check, invariant (f)'s "no doubling
+    /// ladder": a hold epoch ahead of now holds the schedule to it and leaves the
+    /// failure count at 0; no epoch (or one already passed) takes the historical
+    /// back-off.
+    #[test]
+    fn after_a_deferral_a_known_reset_holds_and_an_unknown_one_backs_off() {
+        use super::cadence::Cadence;
+        let now = 1_788_390_000u64;
+        let instant = std::time::Instant::now();
+        let mut held = Cadence::new(BASE);
+        assert_eq!(
+            super::after_deferred(&mut held, Some(now + 13 * 60), now, instant),
+            Some(now + 13 * 60)
+        );
+        assert_eq!(held.failures(), 0, "a hold is not a failure");
+        assert!(held.is_holding());
+        assert_eq!(
+            held.nominal_at(instant),
+            std::time::Duration::from_secs(13 * 60),
+            "the next wait is exactly the reset"
+        );
+        let mut unknown = Cadence::new(BASE);
+        assert_eq!(
+            super::after_deferred(&mut unknown, None, now, instant),
+            None
+        );
+        assert_eq!(unknown.failures(), 1, "no reset: the doubling ladder");
+        assert!(!unknown.is_holding());
+        let mut stale = Cadence::new(BASE);
+        assert_eq!(
+            super::after_deferred(&mut stale, Some(now - 1), now, instant),
+            None,
+            "a reset already passed is no hold — it backs off like no reset at all"
+        );
+        assert_eq!(stale.failures(), 1);
+        assert_eq!(
+            super::after_deferred(&mut stale, Some(now), now, instant),
+            None
+        );
+        assert_eq!(stale.failures(), 2);
+    }
+
+    /// Compatibility: a deferred outcome WITHOUT a `held_until` (a check whose headers
+    /// carried no reset, or a pre-lane ledger) still widens the window as it always did.
+    #[test]
+    fn a_deferred_outcome_without_held_until_still_widens_the_window() {
+        let s = staging("deferred-compat");
+        write_ledger(&s, 35 * 60, "update check deferred: GitHub rate limit");
+        let reason = checker_skip(&s, BASE).expect("35 min is inside the widened 42-min window");
+        assert!(reason.contains("deferred"), "{reason}");
+        assert_eq!(ledger_hold_epoch(&s), None, "no epoch to hand a sibling");
+        write_ledger(&s, 45 * 60, "update check deferred: GitHub rate limit");
+        assert!(checker_skip(&s, BASE).is_none());
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// The ledger gate reads the `deferred` substring; every sentence the check lane
+    /// writes for a rate-limit-class outcome must carry it, and the held sentence the
+    /// GATE logs must not (it is not a ledger outcome and must not be mistaken for one
+    /// if it is ever echoed into a record).
+    #[test]
+    fn every_new_outcome_sentence_keeps_or_avoids_the_deferred_substring_as_intended() {
+        let deferrals = [
+            "update check deferred: GitHub rate limit hit while fetching a release asset — \
+             backing off, will retry on the next check",
+            "update check deferred: GitHub rate limit hit while downloading the DMG — \
+             backing off, will retry on the next check",
+            "update check deferred: the release host answered HTTP 429 to HEAD \
+             https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml; \
+             transient — backing off, will retry on the next check",
+        ];
+        let s = staging("sentences");
+        for sentence in deferrals {
+            write_ledger(&s, 35 * 60, sentence);
+            let reason = checker_skip(&s, BASE)
+                .unwrap_or_else(|| panic!("{sentence:?} must widen the window"));
+            assert!(reason.contains("deferred"), "{reason}");
+        }
+        assert!(
+            !"the shared update ledger records a GitHub-budget hold until 2026-09-03T00:00:00Z — \
+              this machine is holding off GitHub until its API budget renews"
+                .contains("deferred")
+        );
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// The `lane= delivery= budget=` tokens appear ONLY when the ledger recorded them,
+    /// so a healthy line from a pre-lane ledger is byte-identical to before.
+    #[test]
+    fn the_status_line_carries_lane_delivery_and_budget_only_when_known() {
+        use super::Delivery;
+        assert_eq!(
+            Delivery::from_ledger_text("schema = 1\noutcome = \"up to date\"\n")
+                .status_line_suffix(),
+            ""
+        );
+        assert_eq!(
+            Delivery::from_ledger_text("not toml {{{").status_line_suffix(),
+            ""
+        );
+        let healthy = Delivery::from_ledger_text(
+            "schema = 1\nlane = \"anonymous\"\nbudget_remaining = 57\nbudget_limit = 60\n\
+             budget_reset = \"2026-09-03T01:02:03Z\"\n",
+        );
+        assert_eq!(
+            healthy.status_line_suffix(),
+            " lane=anonymous delivery=ok budget=57/60@2026-09-03T01:02:03Z"
+        );
+        let soon = aterm_types::rfc3339::format_rfc3339(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 600,
+        );
+        let held = Delivery::from_ledger_text(&format!(
+            "schema = 1\nlane = \"anonymous\"\nheld_until = \"{soon}\"\n\
+             budget_remaining = 0\n"
+        ));
+        assert!(held.is_held());
+        assert_eq!(
+            held.status_line_suffix(),
+            format!(" lane=anonymous delivery=held:{soon} budget=0")
+        );
+        let expired = Delivery::from_ledger_text(
+            "schema = 1\nlane = \"token:env\"\nheld_until = \"2020-01-01T00:00:00Z\"\n\
+             delivery = \"deferred\"\n",
+        );
+        assert!(!expired.is_held(), "a passed epoch is not a hold");
+        assert_eq!(
+            expired.status_line_suffix(),
+            " lane=token:env delivery=deferred"
+        );
+        // A NEW ledger's lane and its `latest_tag` — a key this reader does not know —
+        // pass through and are ignored respectively: the file stays schema 1.
+        let web = Delivery::from_ledger_text(
+            "schema = 1\nlane = \"web\"\nlatest_tag = \"v0.74.0\"\noutcome = \"up to date\"\n",
+        );
+        assert_eq!(web.status_line_suffix(), " lane=web delivery=ok");
+        let blocked = Delivery::from_ledger_text("lane = \"anonymous\"\ndelivery = \"blocked\"\n");
+        assert_eq!(
+            blocked.status_line_suffix(),
+            " lane=anonymous delivery=blocked"
+        );
+        // Budget without a lane is not reported: a delivery verdict needs its lane.
+        let laneless = Delivery::from_ledger_text("budget_remaining = 3\n");
+        assert_eq!(laneless.status_line_suffix(), "");
+    }
+
+    #[test]
+    fn rfc3339_round_trips_through_the_ledgers_own_shape_and_refuses_looser_ones() {
+        for secs in [0u64, 1_788_392_970, 4_102_444_800] {
+            let stamp = aterm_types::rfc3339::format_rfc3339(secs);
+            assert_eq!(super::rfc3339_to_unix(&stamp), Some(secs), "{stamp}");
+        }
+        for bad in [
+            "",
+            "2026-09-03T00:00:00",
+            "2026-09-03T00:00:00+00:00",
+            "2026-09-03T00:00:00.000Z",
+            "2026-13-03T00:00:00Z",
+            "2026-09-03T24:00:00Z",
+            "2026-09-0xT00:00:00Z",
+            "not a stamp at all!",
+        ] {
+            assert_eq!(super::rfc3339_to_unix(bad), None, "{bad:?}");
+        }
     }
 }
 

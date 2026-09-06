@@ -973,7 +973,7 @@ pub(crate) fn take_from(path: &Path) -> Option<RestoreManifest> {
     match take_from_result(path) {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!("aterm-gui: restore manifest not consumed: {error}");
+            crate::logging::stderr_line!("aterm-gui: restore manifest not consumed: {error}");
             None
         }
     }
@@ -1041,7 +1041,7 @@ fn take_from_result(path: &Path) -> Result<Option<RestoreManifest>, String> {
         let parsed = match fs::read_to_string(&claim) {
             Ok(text) => RestoreManifest::from_toml(&text),
             Err(error) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: claimed restore read {} failed: {error}",
                     claim.display()
                 );
@@ -1049,12 +1049,12 @@ fn take_from_result(path: &Path) -> Result<Option<RestoreManifest>, String> {
             }
         };
         if let Err(error) = fs::remove_file(&claim) {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: claimed restore cleanup {} failed: {error}",
                 claim.display()
             );
         } else if let Err(error) = sync_restore_directory(parent) {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: claimed restore cleanup sync {} failed: {error}",
                 parent.display()
             );
@@ -1375,7 +1375,7 @@ pub(crate) fn store_cell_metrics(
     std::thread::spawn(move || {
         if let Err(error) = store_cell_metrics_to(&path, &font_key, scale, font_px, cell_w, cell_h)
         {
-            eprintln!("aterm-gui: cell-metrics cache not written: {error}");
+            crate::logging::stderr_line!("aterm-gui: cell-metrics cache not written: {error}");
         }
     });
 }

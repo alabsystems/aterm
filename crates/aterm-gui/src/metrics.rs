@@ -1989,7 +1989,7 @@ pub fn note_pty_write_at(key: u64) {
     MAX_KEY_WRITE_NS.fetch_max(d, Ordering::Relaxed);
     H_KEY_WRITE.record(d);
     if lat_trace_on() {
-        eprintln!(
+        crate::logging::stderr_line!(
             "KEYWRITE key->write={:.2}ms (UI encode + term_locks + blocking WriteFile)",
             d as f64 / 1_000_000.0
         );

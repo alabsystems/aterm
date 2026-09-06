@@ -278,11 +278,19 @@ pub(crate) fn which_copy_rows(
 #[must_use]
 pub fn control_line() -> String {
     let update_pin_sha256 = aterm_update::compiled_update_pin_sha256();
+    // `objc_contained=` — how many NSExceptions `aterm_objc::exception` has
+    // caught inside declared Objective-C methods in THIS process (each one is
+    // also an ERROR line in aterm.log). Additive, per the rule above; `0` off
+    // macOS, where no such method exists.
+    #[cfg(target_os = "macos")]
+    let objc_contained = aterm_objc::contained_count();
+    #[cfg(not(target_os = "macos"))]
+    let objc_contained = 0u64;
     format!(
         "OK version={} build={BUILD_NUMBER} commit={GIT_COMMIT} built={BUILD_TIME} \
          arch={} trustc={} trustc_commit={} trustc_host={COMPILER_HOST} flavor={COMPILER_FLAVOR} \
          profile={BUILD_PROFILE} trust_verify={TRUST_VERIFY} update_pin_sha256={update_pin_sha256} \
-         signature={}\n",
+         objc_contained={objc_contained} signature={}\n",
         version_display(),
         std::env::consts::ARCH,
         compiler_release(),

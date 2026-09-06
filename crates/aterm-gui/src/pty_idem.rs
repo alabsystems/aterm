@@ -45,12 +45,24 @@
 //!
 //! | Outcome | Answer | Meaning |
 //! |---|---|---|
-//! | above the mark | the verb's own reply | fresh; it ran |
+//! | above the mark, producer idle | the verb's own reply | fresh; it ran |
+//! | above the mark, an attempt in flight | `ERR busy idem=<running seq>` | one attempt per producer; nothing consumed |
 //! | at/below the mark, applied | `OK dup=1` | already typed; nothing written |
 //! | at the mark, still running | `ERR busy idem=<seq>` | another connection holds it; transient |
 //! | at the mark, outcome unknown | `ERR in-doubt seq=<seq>` | it may have typed; DO NOT replay |
 //!
-//! The fourth row is the point of the rung. An attempt whose reply was not `OK`
+//! Five rows, four answers: `ERR busy idem=` is given twice, and the SECOND row
+//! is a bound rather than an outcome. A producer may have only ONE attempt in
+//! flight, because a claim that displaced a still-`Running` mark left the
+//! displaced attempt unable to settle its own outcome and, on release, could
+//! reinstate a `Running` tip no live claim stood behind. The refusal names the
+//! sequence actually running rather than the caller's, and consumes nothing, so
+//! the retry a transient `ERR busy` invites is a FIRST attempt — see
+//! [`PtyIdem::claim`], which carries the whole argument. (A realm whose
+//! [`PRODUCER_CAP`] producers are ALL in flight answers the same string naming
+//! the caller's own sequence, for the same reason.)
+//!
+//! The LAST row is the point of the rung. An attempt whose reply was not `OK`
 //! may still have reached the PTY — `cmd_turn` can type its text and then fail to
 //! submit — so the mark is kept and the outcome is recorded as UNKNOWN. A retry
 //! of that exact sequence is told so, in those words, and the session's
@@ -364,6 +376,48 @@ impl PtyIdem {
             return Claimed::Answer(answer);
         }
         if let Some(mark) = own {
+            // ONE IN-FLIGHT ATTEMPT PER PRODUCER, and the reason is that a
+            // displaced RUNNING mark has no way back.
+            //
+            // This branch used to overwrite ANY existing mark whose sequence the
+            // key was above, `Tip::Running` included — another connection's
+            // attempt still inside the seam — and stash it in `Claim::prior`. Two
+            // things then went wrong at once, and the second has no exit:
+            //
+            // * the displaced claim's own [`PtyIdem::settle`] is a no-op, because
+            //   `settle` writes only while `high_water == key.seq`. Its `Applied`
+            //   was discarded, so a replay of a keystroke that DID type answered
+            //   as if it had not.
+            // * if the displacing attempt was then refused before any write
+            //   (`ERR busy` from the drive lease), [`PtyIdem::release`] reinstated
+            //   that mark BYTE FOR BYTE — a `Running` tip for an attempt that had
+            //   already finished. Nothing can leave that state: `consumed_answer`
+            //   answers `ERR busy idem=<seq>` for it forever (a TRANSIENT class,
+            //   so a well-behaved driver retries indefinitely), `settle` and
+            //   `release` both need a live claim that no longer exists, and the
+            //   LRU eviction at [`PRODUCER_CAP`] explicitly skips `Running`, so
+            //   the slot is not even collectable. Repeat on 64 producer ids and
+            //   the whole `Realm::Local` namespace is wedged for the life of the
+            //   process.
+            //
+            // So a producer with an attempt in flight is REFUSED rather than
+            // displaced — the same rule the eviction already applies one branch
+            // down ("a producer whose attempt is still RUNNING is never evicted"),
+            // and the invariant the single-slot bridge journal already assumes.
+            // The refusal names the sequence that is actually running, not the
+            // caller's, so a driver can see which attempt it is waiting behind.
+            // Nothing is written and no sequence is consumed, so the retry a
+            // transient `ERR busy` invites is a FIRST attempt; the displaced
+            // claim settles its own mark, because with this branch closed nothing
+            // can move `high_water` out from under a `Running` tip.
+            //
+            // The `Realm` doc's stated residual — "two `Local` drivers still
+            // share a namespace, so one can still burn the other's sequence" —
+            // survives and is unchanged: burning a sequence is recoverable by
+            // advancing past it. Wedging the slot was not.
+            if mark.tip == Tip::Running {
+                return Claimed::Answer(format!("ERR busy idem={}\n", mark.high_water));
+            }
             marks.insert(
                 slot,
                 Mark {
@@ -416,9 +470,19 @@ impl PtyIdem {
         })
     }
 
-    /// Move this claim's tip, but ONLY while the claim still owns the mark. A
-    /// second claim from the same producer at a HIGHER sequence supersedes this
-    /// one, and must not be clobbered by a laggard settling underneath it.
+    /// Move this claim's tip, but ONLY while the claim still owns the mark.
+    ///
+    /// A LIVE CLAIM ALWAYS OWNS ITS MARK NOW, so this guard cannot fire: a
+    /// `Tip::Running` mark is never displaced ([`PtyIdem::claim`]'s in-flight
+    /// refusal), never evicted ([`PRODUCER_CAP`]) and never written by any
+    /// [`PtyIdem::release`] but its own claim's. The guard is kept as the second
+    /// lock on that invariant, not because a case reaches it.
+    ///
+    /// IT USED TO FIRE, AND THAT WAS THE WOUND. A second claim from the same
+    /// producer at a HIGHER sequence displaced this one; this settle then wrote
+    /// nothing, so a keystroke that DID type answered its replay as if it had
+    /// not. Closing the displacement is what makes the sentence above true; this
+    /// check alone only stopped the laggard from clobbering the newer mark.
     fn settle(&self, realm: Realm, key: Key, tip: Tip) {
         let used = self.tick();
         let mut marks = self.marks.lock().unwrap_or_else(|p| p.into_inner());
@@ -443,8 +507,30 @@ impl PtyIdem {
             return;
         }
         match prior {
+            // A RESTORED MARK IS NEVER `Running`, and this is the second lock on
+            // that rather than a second policy. `claim` refuses to displace a
+            // running attempt, so a `prior` is always already settled; if one ever
+            // reached here it would be an attempt whose owner can no longer settle
+            // it, and reinstating it verbatim would pin the slot at `ERR busy`
+            // forever. `Tip::Unknown` is the honest restoration: fail-visible,
+            // evictable, and it answers a replay `ERR in-doubt` — "ask, then
+            // decide" — instead of a transient class that never clears.
             Some(prior) => {
-                marks.insert(slot, prior);
+                debug_assert!(
+                    prior.tip != Tip::Running,
+                    "`claim` must not have displaced a running mark"
+                );
+                marks.insert(
+                    slot,
+                    Mark {
+                        tip: if prior.tip == Tip::Running {
+                            Tip::Unknown
+                        } else {
+                            prior.tip
+                        },
+                        ..prior
+                    },
+                );
             }
             None => {
                 marks.remove(&slot);
@@ -454,7 +540,13 @@ impl PtyIdem {
 }
 
 /// The answer `mark` gives for `key`, or `None` when `key` is ABOVE the mark and
-/// is therefore a fresh attempt. Every answer this returns is a refusal to write.
+/// this mark has nothing to say about it. Every answer this returns is a refusal
+/// to write.
+///
+/// ABOVE THE MARK IS NOT THE SAME AS FRESH, and this doc used to say it was:
+/// [`PtyIdem::claim`] refuses an above-the-mark key anyway while the producer
+/// has an attempt in flight. `None` means only that the DECISION is the
+/// caller's.
 fn consumed_answer(mark: Mark, key: Key, dup: &str) -> Option<String> {
     if key.seq < mark.high_water {
         // The producer has moved past this sequence, so it was consumed. Its
@@ -686,6 +778,82 @@ mod tests {
 
     fn nonce() -> LaunchNonce {
         LaunchNonce::generate()
+    }
+
+    /// A PRODUCER WITH AN ATTEMPT IN FLIGHT IS REFUSED, NOT DISPLACED — and the
+    /// displaced attempt's own outcome is therefore never lost.
+    ///
+    /// `claim` used to overwrite any mark the incoming sequence was above,
+    /// `Tip::Running` included. The lower attempt's `settle` then found a
+    /// high-water that had moved and did nothing, so a keystroke that DID type
+    /// answered a replay as if it had not; and if the displacing attempt was
+    /// refused before any write (`ERR busy` from the drive lease), `release`
+    /// reinstated the `Running` mark byte for byte — a tip whose owner had
+    /// already finished, which `consumed_answer` answers `ERR busy` for FOREVER,
+    /// which `settle`/`release` cannot reach without a live claim, and which the
+    /// LRU eviction skips because it is `Running`. Sixty-four of those and the
+    /// whole `Realm::Local` namespace is wedged for the life of the process.
+    ///
+    /// Two connections sharing one producer number is not exotic: `Realm`'s own
+    /// doc names it as the residual ("two `Local` drivers still share a
+    /// namespace"), and a driver that shells out to `aterm-ctl` per request makes
+    /// every request its own connection.
+    #[test]
+    fn a_running_producer_is_refused_rather_than_displaced() {
+        const DUP: &str = "OK dup=1\n";
+        let idem = PtyIdem::default();
+        let a = Key {
+            producer: 7,
+            seq: 5,
+        };
+        let b = Key {
+            producer: 7,
+            seq: 9,
+        };
+
+        let running = match idem.claim(Realm::Local, a, DUP) {
+            Claimed::Fresh(claim) => claim,
+            Claimed::Answer(reply) => panic!("a fresh sequence must claim: {reply}"),
+        };
+        // B arrives at a HIGHER sequence while A is still inside the seam.
+        match idem.claim(Realm::Local, b, DUP) {
+            Claimed::Answer(reply) => assert_eq!(
+                reply, "ERR busy idem=5\n",
+                "the refusal names the sequence actually in flight, not the caller's"
+            ),
+            Claimed::Fresh(_) => {
+                panic!("a running mark was displaced: A can no longer settle its own outcome")
+            }
+        }
+
+        // A's outcome survives, which is the half a displacement discarded.
+        running.applied();
+        match idem.claim(Realm::Local, a, DUP) {
+            Claimed::Answer(reply) => {
+                assert_eq!(reply, DUP, "the replay of an applied seq is a dup")
+            }
+            Claimed::Fresh(_) => panic!("an applied sequence must not run twice"),
+        }
+
+        // And the producer is not wedged: B proceeds now, and a refusal before any
+        // write hands the sequence back rather than leaving an unsettleable tip.
+        let b_claim = match idem.claim(Realm::Local, b, DUP) {
+            Claimed::Fresh(claim) => claim,
+            Claimed::Answer(reply) => panic!("B must proceed once A has settled: {reply}"),
+        };
+        b_claim.released();
+        match idem.claim(Realm::Local, b, DUP) {
+            Claimed::Fresh(claim) => claim.applied(),
+            Claimed::Answer(reply) => {
+                panic!("a released sequence is a FIRST attempt, not a duplicate: {reply}")
+            }
+        }
+        // The restored mark is A's settled one, so A still answers a duplicate
+        // rather than the permanent `ERR busy` a reinstated `Running` tip gave.
+        match idem.claim(Realm::Local, a, DUP) {
+            Claimed::Answer(reply) => assert_eq!(reply, DUP),
+            Claimed::Fresh(_) => panic!("A's sequence is consumed"),
+        }
     }
 
     #[test]

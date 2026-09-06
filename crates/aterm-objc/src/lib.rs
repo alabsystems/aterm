@@ -40,6 +40,21 @@
 //!    not a wrapper; see [`weak`] for what Rust's `memcpy`-move does to one.
 //! 4. **[Cached selectors](sel_cache)** — `metal/ffi.rs` calls
 //!    `sel_registerName` on every send, on per-frame paths.
+//! 5. **[Method swizzling](swizzle)** — `method_setImplementation`, for the one
+//!    place in the tree that PATCHES a framework class instead of declaring
+//!    one: `vendor/winit`'s `app.rs` replaces `-[NSApplication sendEvent:]`'s
+//!    IMP. `class_addMethod` cannot substitute — [`ClassBuilder::add_method`]
+//!    asserts on the `NO` an existing row returns, and an existing row is the
+//!    PREMISE of a swizzle. It is also the only capability here whose effect
+//!    NO ENCODING CHECK CAN SEE, which is why [`swizzle`] opens by saying what
+//!    a guard on it can and cannot prove.
+//! 6. **[A thread-affinity container](main_thread_bound)** —
+//!    [`MainThreadBound<T>`][MainThreadBound], for `vendor/winit`'s
+//!    `window.rs`, whose `Window` must be `Send + Sync` while the two
+//!    [`Retained`]s it owns are unconditionally `!Send`. This crate had the
+//!    [`MainThread`] witness and [`run_on_main`], which are exactly the two
+//!    pieces such a container is built from, and nothing that put them
+//!    together.
 //!
 //! # Zero third-party dependencies
 //!
@@ -109,9 +124,18 @@
 //!   [`std::ptr::with_exposed_provenance`] from an address the runtime handed
 //!   across FFI, rather than by `offset`-ing a reference out of its own
 //!   allocation.
-//! * **Panic guards on every trampoline** — unwinding out of an Objective-C
-//!   frame is undefined behaviour. `metal/ffi.rs` never defines a method, so it
-//!   never had the problem; every method this crate declares aborts instead.
+//! * **Panic guards on every trampoline, and exception CONTAINMENT inside
+//!   them** — unwinding out of an Objective-C frame is undefined behaviour.
+//!   `metal/ffi.rs` never defines a method, so it never had the problem; every
+//!   method this crate declares aborts on a Rust panic, with its name. An
+//!   `NSException` raised inside the method is a different thing and gets a
+//!   different answer: it is caught by the `@try` wrapper in [`exception`]
+//!   after every Rust `Drop` on the unwound frames has run, reported once with
+//!   the selector, the exception's name, reason and call stack, counted, and
+//!   the method answers its inert zero. `-dealloc` and any method declared
+//!   `@abort_on_exception` keep the abort. The order — `catch_unwind` outside,
+//!   `@try` inside — and the cost (+1.0 ns per declared call, nothing on a
+//!   send) were measured before the design was decided.
 //! * **Cached selectors** — see [`sel_cache`].
 //! * **The indirect-return entry point is chosen by the TYPE SYSTEM.**
 //!   `metal/ffi.rs` binds `objc_msgSend` alone and argues the case from the
@@ -146,10 +170,29 @@
 //!   an object's base address *legitimately* addresses bytes beyond itself.
 //!   objc2 has the same shape and the same question. Miri cannot adjudicate it
 //!   because it cannot run the Objective-C runtime at all.
-//! * **Message sends are not `unwind`-safe in the other direction.** An
-//!   Objective-C exception raised inside a send unwinds through the Rust frame
-//!   as a foreign exception. `metal/ffi.rs` states this becomes an abort;
-//!   nothing here changes it, and nothing here catches it.
+//! * **Message sends ARE unwind-capable in the other direction — and must
+//!   be.** An Objective-C exception raised inside a send unwinds through the
+//!   Rust frame as a foreign exception. `metal/ffi.rs` declares its own
+//!   `objc_msgSend` as `extern "C"` and states this becomes an abort; this
+//!   crate's entry points are `extern "C-unwind"` and [`MsgFn`] refuses the
+//!   `"C"` spelling, because a `nounwind` callee on the path a raise takes was
+//!   MEASURED to skip that frame's `Drop`s or abort with `failed to initiate
+//!   panic`. What catches the raise is [`exception`], at the trampoline. What
+//!   is still open, in two places: `aterm-gpu`'s private `metal/ffi.rs` sends
+//!   keep the `"C"` spelling, so a Metal raise inside a frame of that crate
+//!   skips that frame's destructors on its way to the containment above it;
+//!   and every send still made through an `objc2` binding or `msg_send!` in
+//!   the vendored winit macOS backend and in `aterm-gui` is `"C"` too —
+//!   `objc-sys 0.3.5` spells `objc_msgSend` `extern "C"` unless its
+//!   `unstable-c-unwind` feature is on, and that feature enables
+//!   `#![feature(c_unwind)]`, a nightly gate the release's x86_64 compat
+//!   slice (built on upstream stable) refuses with E0554. MEASURED against
+//!   this tree: a raise through such a send is still contained above, but the
+//!   frame that made it skips its own `Drop`s. `tests/send_prototype_census.rs`
+//!   pins the number of those lines so it only goes down. Third-party BLOCKS
+//!   are gone from every raise path: `block2`'s `nounwind` invoke was measured
+//!   to abort the process on a raise beneath it even with a containment
+//!   outside, and its three sites are [`RcBlock`] now.
 //! * **`S3` — `dealloc` runs on whatever thread performs the last release.**
 //!   [`ClassBuilder::register`] hands the object to the Objective-C runtime,
 //!   and nothing in that runtime promises the final `release` comes from the
@@ -161,9 +204,22 @@
 //!   exactly this hole — it is why 0.6 introduced `MainThreadOnly` — and every
 //!   declared class in this tree is main-thread AppKit state whose ivars are
 //!   `Cell`/`RefCell`/[`Retained`], so the hole is real and currently
-//!   unexercised. STILL UNCLOSED at the RELEASE end, which is where it was
-//!   named: nothing can make a framework release an object on the thread that
-//!   made it.
+//!   unexercised. STILL UNCLOSED at the RELEASE end IN GENERAL, which is where
+//!   it was named: nothing can make a framework release an object on the thread
+//!   that made it.
+//!
+//!   NARROWED, by W12, and the narrowing is measured rather than argued. For a
+//!   value held in a [`MainThreadBound`] the release end IS closed: that
+//!   container's `Drop` reschedules through [`run_on_main`], so the
+//!   [`Retained`] is released — and any resulting `-dealloc` and Rust ivar
+//!   destructor run — on the main thread, wherever the container itself
+//!   happened to die. `examples/objc_bound_drive.rs` measures both sides
+//!   against a `NaiveBound<T>` that carries the identical `unsafe impl<T> Send`
+//!   with an ordinary drop: the naive one runs a declared class's ivar
+//!   destructor on a spawned thread through 100% safe code, and the compiler
+//!   cannot tell the two types apart. This is a narrowing and not a closure —
+//!   an object AppKit holds elsewhere is still released wherever AppKit
+//!   releases it.
 //!
 //!   Its BIRTH end is closed, and it had quietly opened. objc2 0.5 gave every
 //!   class in this port `mutability::MainThreadOnly`, which made `alloc`
@@ -221,10 +277,13 @@ pub mod class_macro;
 pub mod declare;
 pub mod dispatch;
 pub mod encode;
+pub mod exception;
+pub mod main_thread_bound;
 pub mod retained;
 pub mod runtime;
 pub mod sel_cache;
 pub mod send;
+pub mod swizzle;
 pub mod weak;
 
 pub use block::{BlockPtr, RcBlock};
@@ -232,8 +291,10 @@ pub use declare::{
     ClassBuilder, ClassMeta, IVAR_NAME, IvarSlot, MainThread, abort_on_unwind, begin,
     send_super_dealloc, super_of,
 };
-pub use dispatch::run_on_main;
+pub use dispatch::{ContainedInRunOnMain, run_on_main};
 pub use encode::{Bool, CGPoint, CGRect, CGSize, Encode, NSRange, strip_method_offsets};
+pub use exception::{Contained, ContainedException, InertZero, contain, contained_count, objc_try};
+pub use main_thread_bound::MainThreadBound;
 pub use retained::{ClassType, Retained};
 pub use runtime::{
     AutoreleasePool, ClassPtr, Id, IvarPtr, MsgFn, Obj, ObjcSuper, ProtocolPtr, Sel, autorelease,
@@ -242,6 +303,7 @@ pub use runtime::{
     protocol_method_types, returns_indirectly, superclass_of,
 };
 pub use sel_cache::SelCache;
+pub use swizzle::{Imp, MethodFn, Swizzle, SwizzleError, SwizzleSite, owning_class};
 pub use weak::{Weak, WeakObj, WeakSlot};
 
 /// The uncached selector lookup, under its full name.

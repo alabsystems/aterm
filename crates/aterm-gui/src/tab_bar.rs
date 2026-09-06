@@ -6012,7 +6012,9 @@ pub(crate) mod pixel_band {
                     && crate::tray_raster::strip_band_run_coverable(&ch.to_string())
             });
             let Some(odd) = odd else {
-                eprintln!("no cascade-only char on this host; nothing to regress");
+                crate::logging::stderr_line!(
+                    "no cascade-only char on this host; nothing to regress"
+                );
                 crate::tray_raster::clear_ui_fonts_for_test();
                 return;
             };
@@ -6842,7 +6844,7 @@ pub(crate) mod pixel_band {
         #[ignore = "visual capture: needs a system UI face; run with --ignored"]
         fn band_strip_visual_capture() {
             if !with_ui_faces() {
-                eprintln!("no UI face — visual capture skipped");
+                crate::logging::stderr_line!("no UI face — visual capture skipped");
                 return;
             }
             let dir = std::env::var("BAND_PNG_DIR").map_or_else(
@@ -6935,7 +6937,12 @@ pub(crate) mod pixel_band {
                         .expect("png header")
                         .write_image_data(&rgb)
                         .expect("png data");
-                    eprintln!("wrote {} ({}x{})", path.display(), w * ZOOM, h * ZOOM);
+                    crate::logging::stderr_line!(
+                        "wrote {} ({}x{})",
+                        path.display(),
+                        w * ZOOM,
+                        h * ZOOM
+                    );
                 }
             }
             crate::tray_raster::clear_ui_fonts_for_test();

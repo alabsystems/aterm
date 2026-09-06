@@ -375,8 +375,26 @@ pub struct ObjcSuper {
     pub super_class: ClassPtr,
 }
 
+// THE SEND ENTRY POINTS ARE `"C-unwind"`, AND THAT IS LOAD-BEARING.
+//
+// An `NSException` raised inside a send is a foreign exception unwinding
+// through the Rust frame that made the send. Declared `extern "C"` — rustc's
+// `nounwind` — the frame has no landing pad for that call, and what happens
+// next was MEASURED (docs/measured/2026-09-03-delivery-and-objc-exception-
+// containment.md, §2) to be one of three things, all bad: the frame's `Drop`s
+// are silently skipped, the process aborts with `failed to initiate panic,
+// error 3`, or LLVM DELETES a `catch_unwind` whose body only calls nounwind
+// functions. `"C-unwind"` gives the frame its landing pad, so a raise runs
+// every Rust destructor on the way to whoever catches it — the containment
+// in [`crate::exception`] — and it costs NOTHING on the hot path: the same
+// benchmark read 1.534 ns/send under both spellings.
+//
+// The prototype every send is cast to must carry the same ABI, which is why
+// [`MsgFn`] is implemented for `unsafe extern "C-unwind" fn(..)` ONLY: the
+// tree cannot keep both spellings live, because ONE `"C"` callee on the path
+// a raise takes is enough to lose the frames above it.
 #[link(name = "objc")]
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     /// Declared with NO parameter list on purpose — see the crate docs. Every
     /// call goes through [`msg`], which casts this to the exact prototype of
     /// the selector being sent.
@@ -384,6 +402,10 @@ unsafe extern "C" {
     /// Same discipline as [`objc_msgSend`], but the first argument is a
     /// `*const ObjcSuper` rather than the receiver. Cast through [`msg_super`].
     fn objc_msgSendSuper();
+}
+
+#[link(name = "objc")]
+unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> ClassPtr;
     fn objc_getProtocol(name: *const c_char) -> ProtocolPtr;
     fn object_getClass(obj: Id) -> ClassPtr;
@@ -440,8 +462,8 @@ unsafe extern "C" {
     // "it compiles" is precisely the trap this campaign has already been caught
     // by, and the runtime's own answer to "what did you register?" is the
     // cheapest evidence there is. ---
-    fn class_getInstanceMethod(cls: ClassPtr, name: Sel) -> *const c_void;
-    fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
+    pub(crate) fn class_getInstanceMethod(cls: ClassPtr, name: Sel) -> *const c_void;
+    pub(crate) fn method_getTypeEncoding(method: *const c_void) -> *const c_char;
 
     // --- and the IMP behind a row, which is a different question from its
     // ENCODING and the only one that can answer "whose code will run?".
@@ -451,7 +473,31 @@ unsafe extern "C" {
     // construction. So every encoding check in the tree passes whether that
     // swizzle happened or not, and the only live evidence that it did is the
     // address of the function the runtime will call. ---
-    fn method_getImplementation(method: *const c_void) -> *const c_void;
+    pub(crate) fn method_getImplementation(method: *const c_void) -> *const c_void;
+
+    // --- and the WRITE half of that same question, which is the W12
+    // capability. `method_setImplementation` is the ONE runtime call that can
+    // replace an implementation the class already has; `class_addMethod`
+    // CANNOT substitute for it, because `declare.rs`'s `add_method` asserts on
+    // the `NO` it returns for an existing row and an existing row is the
+    // premise of a swizzle. MEASURED, on this box, against a throwaway class
+    // (`crates/aterm-objc/tests/swizzle.rs` re-measures all three in Rust):
+    //
+    // * `method_setImplementation` takes NO `types` argument. It returns the
+    //   previous IMP and leaves the encoding byte-identical — `i@:` before and
+    //   after.
+    // * `class_replaceMethod` given a deliberately lying `{_Lie=qqqq}@:B`
+    //   IGNORES it when the class already has the row directly; the encoding
+    //   stays as registered.
+    // * `class_addMethod` with the same lie returns `NO` and changes nothing.
+    //
+    // So no swizzle this crate can perform is able to corrupt a type encoding,
+    // which is exactly why no encoding-shaped guard in this tree can SEE one.
+    // See [`crate::swizzle`] for what that costs and what is checked instead.
+    pub(crate) fn method_setImplementation(
+        method: *const c_void,
+        imp: *const c_void,
+    ) -> *const c_void;
 
     // --- and the WHOLE table, which is the only way to ask a question about a
     // class that does not begin by naming what you expect to find. Every
@@ -521,8 +567,9 @@ struct ObjcMethodDescription {
 // per-return-type codegen and the boundary at 16 bytes.
 #[cfg(target_arch = "x86_64")]
 #[link(name = "objc")]
-unsafe extern "C" {
-    /// Same discipline as [`objc_msgSend`]: no parameter list, cast per send.
+unsafe extern "C-unwind" {
+    /// Same discipline as [`objc_msgSend`]: no parameter list, cast per send —
+    /// and the same `"C-unwind"` ABI, for the same reason.
     fn objc_msgSend_stret();
     /// Same, against the super entry point.
     fn objc_msgSendSuper_stret();
@@ -543,7 +590,7 @@ unsafe extern "C" {}
 /// A message-send prototype, decomposed far enough that [`msg`] can read its
 /// RETURN TYPE and pick the right entry point.
 ///
-/// Implemented for `unsafe extern "C" fn(..) -> R` up to SIXTEEN parameters,
+/// Implemented for `unsafe extern "C-unwind" fn(..) -> R` up to SIXTEEN parameters,
 /// INCLUDING the implicit `self` and `_cmd` — so up to a fourteen-colon
 /// selector. Counting the implicit pair is the whole of the correction: the
 /// ceiling used to be twelve parameters and was described as "every arity this
@@ -587,22 +634,38 @@ unsafe extern "C" {}
 /// ```compile_fail
 /// # use aterm_objc::{Id, Sel, msg};
 /// // 17 parameters: `self`, `_cmd`, and fifteen arguments.
-/// let _: unsafe extern "C" fn(
+/// let _: unsafe extern "C-unwind" fn(
 ///     Id, Sel,
 ///     i64, i64, i64, i64, i64, i64, i64, i64,
 ///     i64, i64, i64, i64, i64, i64, i64,
 /// ) -> i64 = unsafe { msg() };
 /// ```
 ///
+/// # The ABI is `"C-unwind"`, and ONLY `"C-unwind"`
+///
+/// There is deliberately no impl for `unsafe extern "C" fn(..)`. A send
+/// declared `"C"` is `nounwind` to rustc, so the frame making it has no
+/// landing pad for the `NSException` AppKit may raise inside it — its `Drop`s
+/// are skipped, or the process aborts with `failed to initiate panic`, or LLVM
+/// deletes the `catch_unwind` above it (all three MEASURED; see the note on
+/// `objc_msgSend`). One such callee on the path a raise takes is enough, so
+/// the old spelling is refused at the type level rather than discouraged:
+///
+/// ```compile_fail
+/// # use aterm_objc::{Id, Sel, msg};
+/// let _: unsafe extern "C" fn(Id, Sel) -> Id = unsafe { msg() };
+/// ```
+///
 /// # Safety
-/// An implementor must be a bare `unsafe extern "C"` function pointer whose
-/// return type is `Ret`. Nothing else may implement it: [`msg`] transmutes a
-/// raw symbol address into `Self` and dispatches on `size_of::<Self::Ret>()`,
-/// so a lying `Ret` picks the wrong `objc_msgSend` variant.
+/// An implementor must be a bare `unsafe extern "C-unwind"` function pointer
+/// whose return type is `Ret`. Nothing else may implement it: [`msg`]
+/// transmutes a raw symbol address into `Self` and dispatches on
+/// `size_of::<Self::Ret>()`, so a lying `Ret` picks the wrong `objc_msgSend`
+/// variant — and a `"C"` implementor would reopen the unwinding hole above.
 #[diagnostic::on_unimplemented(
     message = "`{Self}` is not a message-send prototype `aterm-objc` can build",
-    label = "not an `unsafe extern \"C\" fn(..) -> R` of at most 16 parameters",
-    note = "a prototype must be a bare `unsafe extern \"C\"` function pointer whose             first two parameters are the implicit `self` and `_cmd` — e.g.             `unsafe extern \"C\" fn(Id, Sel, i64) -> Bool`",
+    label = "not an `unsafe extern \"C-unwind\" fn(..) -> R` of at most 16 parameters",
+    note = "a prototype must be a bare `unsafe extern \"C-unwind\"` function pointer whose             first two parameters are the implicit `self` and `_cmd` — e.g.             `unsafe extern \"C-unwind\" fn(Id, Sel, i64) -> Bool`. Plain `extern \"C\"`             is refused on purpose: an NSException raised inside such a send skips             the frame's destructors (measured; see `aterm_objc::exception`)",
     note = "the ceiling is SIXTEEN parameters INCLUDING `self` and `_cmd`, i.e. a             fourteen-colon selector; a wider one has no `MsgFn` impl and             `declare_class!` refuses to register it for the same reason"
 )]
 pub unsafe trait MsgFn: Copy {
@@ -612,10 +675,10 @@ pub unsafe trait MsgFn: Copy {
 
 macro_rules! impl_msg_fn {
     ($($arg:ident),*) => {
-        // SAFETY: the implementing type IS an `unsafe extern "C"` function
-        // pointer and `Ret` is written from its own return position, so it
-        // cannot disagree with itself.
-        unsafe impl<Ret, $($arg),*> MsgFn for unsafe extern "C" fn($($arg),*) -> Ret {
+        // SAFETY: the implementing type IS an `unsafe extern "C-unwind"`
+        // function pointer and `Ret` is written from its own return position,
+        // so it cannot disagree with itself.
+        unsafe impl<Ret, $($arg),*> MsgFn for unsafe extern "C-unwind" fn($($arg),*) -> Ret {
             type Ret = Ret;
         }
     };
@@ -748,14 +811,14 @@ fn super_stret_entry() -> *const c_void {
 /// // Nine bytes, so `size_of` says "registers"; clang says
 /// // `_objc_msgSend_stret`. Without an `Encode` impl stating which, this is
 /// // `E0277` rather than a wrong entry point.
-/// let _: unsafe extern "C" fn(Id, Sel) -> Packed = unsafe { msg() };
+/// let _: unsafe extern "C-unwind" fn(Id, Sel) -> Packed = unsafe { msg() };
 /// ```
 ///
 /// Nor does a `BOOL` return spelled as a Rust `bool`:
 ///
 /// ```compile_fail
 /// # use aterm_objc::{Id, Sel, msg};
-/// let _: unsafe extern "C" fn(Id, Sel) -> bool = unsafe { msg() };
+/// let _: unsafe extern "C-unwind" fn(Id, Sel) -> bool = unsafe { msg() };
 /// ```
 ///
 /// # Safety
@@ -1439,12 +1502,12 @@ pub fn ns_string(s: &str) -> Option<Obj> {
     // +1 object (or nil, which `from_owned` maps to `None`). The byte pointer
     // is only read for `len` bytes during the call and is not retained.
     unsafe {
-        let alloc: unsafe extern "C" fn(ClassPtr, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = msg();
         let raw = alloc(cls, sel(c"alloc"));
         if raw.is_null() {
             return None;
         }
-        let init: unsafe extern "C" fn(Id, Sel, *const u8, usize, usize) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel, *const u8, usize, usize) -> Id = msg();
         let obj = init(
             raw,
             sel(c"initWithBytes:length:encoding:"),
@@ -1470,7 +1533,7 @@ pub unsafe fn ns_string_to_rust(s: Id) -> String {
         // an interior pointer valid until the enclosing pool pops; the bytes
         // are copied into an owned `String` before that happens.
         unsafe {
-            let utf8: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+            let utf8: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
             let p = utf8(s, sel(c"UTF8String"));
             if p.is_null() {
                 return String::new();
@@ -1494,7 +1557,7 @@ pub unsafe fn ns_error_string(err: Id) -> String {
         // autoreleased object valid until the pool pops, and its bytes are
         // copied into an owned `String` before that happens.
         unsafe {
-            let desc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let desc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let d = desc(err, sel(c"localizedDescription"));
             if d.is_null() {
                 return "(no localizedDescription)".to_owned();

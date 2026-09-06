@@ -1,16 +1,25 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The network layer: `curl` calls to the GitHub Releases API, authenticated when a
-//! token is available and ANONYMOUS when one is not. Artifact-agnostic — these fetch
-//! arbitrary API JSON and asset bytes; the consuming crate decides what the bytes
-//! mean.
+//! The network layer: `curl` calls to GitHub — the Releases API when a token is
+//! available, and the unmetered web host (`github.com/…/releases/…`) with no
+//! credential at all. Artifact-agnostic — these fetch arbitrary API JSON, asset bytes
+//! and redirect headers; the consuming crate decides what the bytes mean.
 //!
-//! Both repo shapes require the API (the `releases/latest/download/…` browser
-//! shortcut needs web auth even for public repos), and asset bytes are downloaded via
-//! the asset API URL with `Accept: application/octet-stream` (curl `-L` follows the
-//! 302 to storage and drops the `Authorization` header on the cross-host redirect by
-//! default).
+//! Two HOSTS, MEASURED 2026-09-02/03 against the shipped channel. `api.github.com` is
+//! metered (~60 requests/hour per IP anonymously, 5000 with a token) and is used ONLY on
+//! the token lane: the releases LIST and the asset API URL (`…/releases/assets/<id>`,
+//! `Accept: application/octet-stream`, the credential on stdin; curl `-L` follows the 302
+//! to storage and drops the `Authorization` header on the cross-host redirect by default).
+//! `github.com` is not metered at all: for a PUBLIC repo
+//! `https://github.com/{owner}/{repo}/releases/download/{tag}/{name}` answers 200
+//! anonymously via a 302 to `release-assets.githubusercontent.com` with no
+//! `x-ratelimit-*` headers, `…/releases/latest/download/{name}` answers a 302 whose
+//! `Location` names the newest published release's tag ([`head_no_redirect`]), a missing
+//! asset answers 404, and a PRIVATE repo answers 404 on both URL shapes (no credential is
+//! accepted there — and none is ever sent: [`refuse_credential_off_api`]). This module
+//! classifies the answer PER HOST — a 403 is a rate limit on the API host and a blocked
+//! host on the web one.
 //!
 //! # Why the token is OPTIONAL
 //!
@@ -30,9 +39,10 @@
 //!   end-of-options marker — because those defend against a hostile curlrc and a
 //!   server-controlled URL, which have nothing to do with authentication.
 //!
-//! An anonymous caller is rate-limited to ~60 requests/hour PER IP (5000/hour with a
-//! token), so [`HttpError`] classifies that state separately: a rate limit is not an
-//! auth failure and must not be reported as one.
+//! An anonymous API caller is rate-limited to ~60 requests/hour PER IP (5000/hour with
+//! a token), so [`HttpError`] classifies that state separately: a rate limit is not an
+//! auth failure and must not be reported as one. The web lane never meets it — the only
+//! throttle `github.com` has is a 429 of its own.
 
 use std::path::Path;
 use std::process::Command;
@@ -85,9 +95,11 @@ impl std::fmt::Display for HttpError {
                 "GitHub rate limit hit (HTTP {code}) for {url}; transient (the token is \
                  valid) — backing off, will retry on the next check"
             ),
-            // The authenticated wording ("the token is valid") would be a lie on the
-            // anonymous lane, where there IS no token and the ~60/hour per-IP budget
-            // is the whole story — including for several machines behind one NAT.
+            // The authenticated wording ("the token is valid") would be a lie for a
+            // credential-less API caller (atpkg's index listing when no pointer
+            // resolves — the app updater never calls the API without a token), where
+            // the ~60/hour per-IP budget is the whole story, including for several
+            // machines behind one NAT.
             Self::RateLimited {
                 code,
                 url,
@@ -372,95 +384,20 @@ fn api_get_args() -> [&'static str; 11] {
 // Audited (update-atpkg); droppable with the byte-exact contract lane.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, HttpError> {
-    // The unconditional lane, spelled as the degenerate conditional one: no validator,
-    // no header sink, therefore an argv that is EXACTLY `api_get_args()` (asserted in
-    // `the_unconditional_lane_argv_is_unchanged`). Every existing caller's bytes,
-    // errors, retries and wording are the historical ones.
-    match api_get_conditional(url, token, None, None)? {
-        ApiResponse::Body { bytes, .. } => Ok(bytes),
-        // Unreachable: a 304 is only ever honoured when we SENT a validator, and this
-        // lane never does. Fail closed on a proxy that invents one rather than handing
-        // the caller an empty body it would parse as an empty release list.
-        ApiResponse::NotModified => Err(HttpError::Malformed(format!(
-            "GitHub API returned HTTP 304 for {url} without a conditional request"
-        ))),
-    }
+    // No header sink, therefore an argv that is EXACTLY `api_get_args()` (asserted in
+    // `the_plain_lane_argv_is_unchanged`). Every existing caller's bytes, errors,
+    // retries and wording are the historical ones.
+    api_get_with_headers(url, token, None)
 }
 
-/// What a conditional API GET came back with.
+/// [`api_get_args`] plus the response-header dump, when the caller wants one.
 ///
-/// The 304 arm is the whole point: it is the SERVER asserting that the representation
-/// the caller already holds is current, which is the only kind of freshness this layer
-/// will ever act on — there is no TTL, no heuristic expiry, and no offline path that
-/// serves a cached answer without a fresh 304 for it on THIS request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApiResponse {
-    /// HTTP 304: unchanged since the validator the caller supplied. No body was
-    /// transferred and none is returned.
-    NotModified,
-    /// A fresh 2xx body, plus the response's `ETag` when the server offered one and it
-    /// is safe to echo back ([`validator_safe`]).
-    Body {
-        bytes: Vec<u8>,
-        etag: Option<String>,
-    },
-}
-
-/// Whether a server-supplied `ETag` may be echoed back on a later request.
-///
-/// This value is fully SERVER-CONTROLLED and, unlike a response body, it goes back out
-/// on curl's ARGV as an `If-None-Match:` header value — so it gets the same treatment
-/// the token and the asset URL get elsewhere in this module. The grammar (RFC 9110
-/// §8.8.3) is an optional `W/` prefix then a quoted string of visible ASCII; anything
-/// carrying a control character, a space, a newline, or an interior quote is refused,
-/// which makes header injection through this channel structurally impossible.
-///
-/// Refusal is not a failure: an unusable validator simply means the next request goes
-/// out unconditionally, i.e. exactly what the caller did before this existed.
-#[must_use]
-pub fn validator_safe(validator: &str) -> bool {
-    let body = validator.strip_prefix("W/").unwrap_or(validator);
-    if validator.len() > 128 || body.len() < 2 {
-        return false;
-    }
-    if !(body.starts_with('"') && body.ends_with('"')) {
-        return false;
-    }
-    // Every byte visible ASCII (no CTL, no space, no DEL) — checked over the whole
-    // value, prefix included.
-    if !validator.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        return false;
-    }
-    // …and no interior quote, which would close the header value early.
-    body.get(1..body.len().saturating_sub(1))
-        .is_some_and(|inner| !inner.contains('"'))
-}
-
-/// Whether an HTTP status is the "you already have it" answer — and ONLY when we asked.
-///
-/// The `sent_validator` half is load-bearing, not defensive dressing: a captive portal
-/// or a broken proxy that answers 304 to an UNCONDITIONAL request would otherwise be
-/// telling this client "nothing changed" about a resource it never described, which is
-/// precisely the shape of "a stale cache hides a real update". Without a validator on
-/// the wire there is nothing for a 304 to be relative to, so it is a malformed answer
-/// and falls through to the fail-closed classification below.
-fn is_not_modified(code: &str, sent_validator: bool) -> bool {
-    code == "304" && sent_validator
-}
-
-/// The extra curl options a conditional GET adds to [`api_get_args`], in order.
-///
-/// Kept as its own function so a unit test can assert BOTH sides: with neither a
-/// validator nor a sink the list is byte-identical to the historical `api_get_args()`,
-/// and with them the two flags appear exactly once each and still BEFORE the `--`
-/// end-of-options marker `curl_argv` appends (a caller-side `--` is the v0.5.10
-/// auto-update-bricking regression).
-fn conditional_args<'a>(inm_header: Option<&'a str>, header_dump: Option<&'a str>) -> Vec<&'a str> {
+/// Kept as its own function so a unit test can assert BOTH sides: with no sink the list
+/// is byte-identical to the historical `api_get_args()`, and with one the flag pair
+/// appears exactly once and still BEFORE the `--` end-of-options marker `curl_argv`
+/// appends (a caller-side `--` is the v0.5.10 auto-update-bricking regression).
+fn api_get_args_dumping(header_dump: Option<&str>) -> Vec<&str> {
     let mut args: Vec<&str> = api_get_args().to_vec();
-    if let Some(header) = inm_header {
-        args.push("-H");
-        args.push(header);
-    }
     if let Some(dump) = header_dump {
         // `--dump-header`, not `-D -`: the body is captured from stdout and the status
         // trailer is appended to it, so response headers must land in a FILE or they
@@ -472,74 +409,108 @@ fn conditional_args<'a>(inm_header: Option<&'a str>, header_dump: Option<&'a str
     args
 }
 
-/// The last `ETag` in a curl `--dump-header` capture, if it is safe to echo back.
+/// The `x-ratelimit-*` block of a GitHub API response, read back from a curl
+/// `--dump-header` capture.
 ///
-/// LAST rather than first: a redirect chain writes one header block per hop, and the
-/// validator that matters is the one belonging to the response whose body we kept.
-/// A missing, malformed or unsafe value yields `None`, which degrades the next check to
-/// an unconditional GET — never to a wrong answer.
-fn etag_from_header_dump(path: &Path) -> Option<String> {
-    let raw = std::fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    let mut found: Option<String> = None;
+/// Every field is optional because every field is server-supplied: a proxy may strip
+/// any of them, and a consumer that needs one must treat its absence as "unknown", never
+/// as "plenty". `reset` is a unix epoch, already clamped by the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RateLimitHeaders {
+    /// `x-ratelimit-limit`: the hourly allowance (~60 anonymous, 5000 with a token).
+    pub limit: Option<u32>,
+    /// `x-ratelimit-remaining`: what is left in the current window.
+    pub remaining: Option<u32>,
+    /// `x-ratelimit-used`: what this window has already spent.
+    pub used: Option<u32>,
+    /// `x-ratelimit-reset`: when the window renews, unix seconds — clamped to
+    /// `now + 3600`, because the window is an hour and a value past that is a lie
+    /// (a skewed clock, a mangled header) that would otherwise hold a machine off
+    /// GitHub indefinitely.
+    pub reset: Option<u64>,
+}
+
+/// How far past `now` a server-supplied reset epoch is believed. GitHub's window is an
+/// hour, so nothing honest can be further out.
+const RATE_LIMIT_RESET_HORIZON_SECS: u64 = 3600;
+
+/// Parse the rate-limit headers out of a header dump's LAST block (the response whose
+/// body was kept — a redirect chain writes one block per hop, and a block boundary is
+/// an `HTTP/` status line). Names are matched case-insensitively (GitHub emits them
+/// lowercase; a proxy may not); a non-numeric value is treated as absent, never as 0 or
+/// as a guess. `None` when the last block carries none of the four.
+///
+/// `now` is injected so the clamp is testable without a clock.
+#[must_use]
+pub fn parse_rate_limit_headers(text: &str, now: u64) -> Option<RateLimitHeaders> {
+    let mut found = RateLimitHeaders::default();
+    let mut any = false;
     for line in text.lines() {
+        // A new hop: everything read so far belonged to a response we did not keep.
+        if line.starts_with("HTTP/") {
+            found = RateLimitHeaders::default();
+            any = false;
+            continue;
+        }
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("etag") {
-            found = Some(value.trim().to_string());
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("x-ratelimit-limit") {
+            found.limit = value.parse().ok();
+            any |= found.limit.is_some();
+        } else if name.eq_ignore_ascii_case("x-ratelimit-remaining") {
+            found.remaining = value.parse().ok();
+            any |= found.remaining.is_some();
+        } else if name.eq_ignore_ascii_case("x-ratelimit-used") {
+            found.used = value.parse().ok();
+            any |= found.used.is_some();
+        } else if name.eq_ignore_ascii_case("x-ratelimit-reset") {
+            found.reset = value
+                .parse::<u64>()
+                .ok()
+                .map(|reset| reset.min(now.saturating_add(RATE_LIMIT_RESET_HORIZON_SECS)));
+            any |= found.reset.is_some();
         }
     }
-    found.filter(|e| validator_safe(e))
+    any.then_some(found)
 }
 
-/// [`api_get_classified`], made CONDITIONAL: when `validator` is a stored `ETag`, the
-/// request carries `If-None-Match` and the server may answer 304 with no body at all.
+/// [`parse_rate_limit_headers`] over the file curl dumped headers into, against the
+/// wall clock. Absent or unreadable file ⇒ `None`.
+#[must_use]
+pub fn rate_limit_from_header_dump(path: &Path) -> Option<RateLimitHeaders> {
+    let raw = std::fs::read(path).ok()?;
+    parse_rate_limit_headers(&String::from_utf8_lossy(&raw), unix_now_secs())
+}
+
+/// Unix seconds now, `0` on a clock before the epoch (which only makes the reset clamp
+/// tighter — the safe direction).
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// [`api_get_classified`], additionally dumping the response HEADERS into
+/// `header_sink` so the caller can read the `x-ratelimit-*` block back
+/// ([`rate_limit_from_header_dump`]) — the token lane's evidence for holding a check
+/// until the server's own reset instead of guessing.
 ///
-/// # Why this exists
-///
-/// The app updater's check re-downloaded and re-parsed the ENTIRE GitHub release
-/// history to learn one tag, every 75 s, forever. MEASURED 2026-08-20 against the real
-/// channel (`alabsystems/aterm`, anonymous lane): page 1 = **594,708 bytes** for 42
-/// releases / 200 assets — ~14.2 KB per release, because each asset object embeds a full
-/// uploader user block — i.e. ~28.5 MB/hour ≈ 685 MB/day per running instance, growing
-/// with every cut and by a whole page per 100. The same probe with `If-None-Match`
-/// returned **HTTP 304 with `size_download=0`**: no body, nothing to parse.
-///
-/// The saving is BYTES and CPU, not requests. The same probe showed the 304 still
-/// consuming one unit of `x-ratelimit-used`, so the request budget the cadence constant
-/// was chosen against is unchanged — do not claim otherwise.
-///
-/// # Freshness is the SERVER's word, never ours
-///
-/// There is no TTL and no offline reuse. `NotModified` can only be returned when this
-/// very request carried the caller's validator and this very response said 304
-/// ([`is_not_modified`]). A server that ignores `If-None-Match`, a proxy that strips
-/// the header, a validator we refuse as unsafe, an absent memo — every one of those
-/// lands on a 200 and therefore on the byte-for-byte historical path. The failure
-/// direction is "no saving", never "stale answer".
-///
-/// `header_sink` is where curl dumps the response headers so the `ETag` can be read
-/// back; pass `None` (and no validator) for the unconditional lane, which then spawns
-/// the exact historical argv.
+/// The sink is unlinked before every attempt: a reset epoch a later hold rides on must
+/// describe THIS response, never a previous one's. `None` spawns the exact
+/// historical argv and touches no file.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn api_get_conditional(
+pub fn api_get_with_headers(
     url: &str,
     token: Option<&str>,
-    validator: Option<&str>,
     header_sink: Option<&Path>,
-) -> Result<ApiResponse, HttpError> {
-    // An unusable validator is dropped HERE, so everything below sees a single truth
-    // about whether a conditional request went out.
-    let validator = validator.filter(|v| validator_safe(v));
-    let inm = validator.map(|v| {
-        let mut header = String::from("If-None-Match: ");
-        header.push_str(v);
-        header
-    });
+) -> Result<Vec<u8>, HttpError> {
     let sink = header_sink.and_then(|p| p.to_str());
-    let args = conditional_args(inm.as_deref(), sink);
+    let args = api_get_args_dumping(sink);
     // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns
     // there, so the loop cannot run more than `CURL_ATTEMPTS` times.
     let mut attempt: u32 = 0;
@@ -552,12 +523,10 @@ pub fn api_get_conditional(
         let last = attempt >= CURL_ATTEMPTS;
         if let Some(sink) = header_sink {
             // Never let a PREVIOUS response's headers be read as THIS one's. curl
-            // truncates the dump file on open, so this is belt-and-suspenders — but the
-            // validator it yields is what a later 304 is relative to, and a validator
-            // describing a response we did not receive is the one way a conditional
-            // request could be told "unchanged" about the wrong bytes. Owning the
-            // invariant here costs one `unlink` per request; a failure to remove is
-            // harmless (worst case: no validator, i.e. an unconditional next check).
+            // truncates the dump file on open, so this is belt-and-suspenders — but a
+            // reset epoch read out of a response we did not receive is the one way a
+            // hold could be pointed at the wrong window. A failure to remove is
+            // harmless (worst case: no headers, i.e. no hold, the historical back-off).
             let _ = std::fs::remove_file(sink);
         }
         // The token is passed in unchanged on every attempt — never re-read or
@@ -583,19 +552,7 @@ pub fn api_get_conditional(
             None => ("", text.trim()),
         };
         if code.starts_with('2') {
-            return Ok(ApiResponse::Body {
-                bytes: body.as_bytes().to_vec(),
-                // Only read back when we asked for a dump; a caller on the
-                // unconditional lane spawns no `--dump-header` and touches no file.
-                etag: header_sink.and_then(etag_from_header_dump),
-            });
-        }
-        // The steady state this function exists for: no body was transferred, no JSON
-        // will be parsed, and the caller keeps what it already had. Placed AFTER the
-        // 2xx arm and BEFORE every failure arm, and gated on having actually sent a
-        // validator (see [`is_not_modified`]).
-        if is_not_modified(code, validator.is_some()) {
-            return Ok(ApiResponse::NotModified);
+            return Ok(body.as_bytes().to_vec());
         }
         if !last && transient_api_status(code) {
             // Discard this attempt's bytes ENTIRELY — that discarding is the whole
@@ -606,9 +563,7 @@ pub fn api_get_conditional(
         // (primary or secondary) rate limit. That is TRANSIENT — the credential (or its
         // absence) is not the problem — so it must not be reported as an auth failure
         // ("rotate the token"), and retrying it here would only spend a budget that is
-        // already gone; we surface it as back-off-and-retry-next-cycle (F11). It is the
-        // ROUTINE outcome on the anonymous lane, whose budget is ~60 requests/hour per
-        // IP.
+        // already gone; we surface it as back-off-and-retry-next-cycle (F11).
         let rate_limited =
             code == "429" || (code == "403" && body.to_ascii_lowercase().contains("rate limit"));
         let Ok(numeric) = code.parse::<u16>() else {
@@ -638,6 +593,117 @@ pub fn api_get_conditional(
     }
 }
 
+/// What a redirect-refusing HEAD came back with: the status the web host answered
+/// with, and its `Location` header when it sent one.
+///
+/// Deliberately NOT classified here. A 302 is the evergreen pointer's ordinary answer
+/// (`Location` names the newest release), a 404 is "no published release" on this host
+/// and a 5xx/429 is weather — but WHICH of those is a verdict is the caller's business
+/// ([`crate::pointer`]), and this layer only reports what the wire said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadAnswer {
+    /// The HTTP status of the FIRST hop (no redirect is followed).
+    pub code: u16,
+    /// The `Location` header of that hop, trimmed, if present. Server-controlled text:
+    /// the caller validates it under a strict predicate before deriving anything.
+    pub location: Option<String>,
+}
+
+/// The option list for [`head_no_redirect`], extracted so the flag set is assertable
+/// in a unit test.
+///
+/// `-I` asks for headers only; `--max-redirs 0` makes curl STOP at the first hop and
+/// report it (with `-L` absent curl would not follow anyway — the flag pins the intent
+/// against a later "helpful" `-L`); the headers land on stdout, followed by the `-w`
+/// status trailer, so no file sink is needed. No `-f`: a 404 is an answer this lane
+/// reads, not a failure. No `--retry`: the stdout capture is retried per process like
+/// the API lane's (a concatenated hop would be parsed as one).
+fn head_args() -> [&'static str; 8] {
+    [
+        "-sS",
+        "-I",
+        "--max-redirs",
+        "0",
+        "--max-time",
+        "30",
+        "-w",
+        "\n%{http_code}",
+    ]
+}
+
+/// The status and `Location` of ONE hop of `url`, anonymously, without following it.
+///
+/// This is the whole cost of a steady-state check on the web lane: one HEAD to
+/// `…/releases/latest/download/<name>`, whose 302 names the newest published release's
+/// tag. No credential is ever attached (the argument is not even accepted — `github.com`
+/// reads no `Authorization` header and must never be shown one), the scheme must be
+/// `https`, and a transport failure or a transient 5xx is retried in-process exactly as
+/// [`api_get_classified`] retries, for the same fresh-pipe reason.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn head_no_redirect(url: &str) -> Result<HeadAnswer, HttpError> {
+    require_https_url(url).map_err(HttpError::Transport)?;
+    let args = head_args();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
+        }
+        let last = attempt >= CURL_ATTEMPTS;
+        let out = curl_fetch(&args, url, None).map_err(HttpError::Transport)?;
+        if !out.status.success() {
+            if !last {
+                continue;
+            }
+            return Err(HttpError::Transport(format!(
+                "curl HEAD {} failed ({}): {}",
+                url,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let (headers, code) = match text.rfind('\n') {
+            Some(i) => (&text[..i], text[i + 1..].trim()),
+            None => ("", text.trim()),
+        };
+        if !last && transient_api_status(code) {
+            continue;
+        }
+        let Ok(numeric) = code.parse::<u16>() else {
+            return Err(HttpError::Malformed(format!(
+                "the release host answered HTTP {code} to HEAD {url}"
+            )));
+        };
+        return Ok(HeadAnswer {
+            code: numeric,
+            location: location_header(headers),
+        });
+    }
+}
+
+/// The LAST `Location:` header in a header capture, trimmed. (A single hop is captured
+/// — `--max-redirs 0` — but the scan is written for the last block regardless, the same
+/// way the rate-limit reader is.) `None` when absent or empty.
+fn location_header(headers: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in headers.lines() {
+        if line.starts_with("HTTP/") {
+            found = None;
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("location") {
+            let value = value.trim();
+            found = (!value.is_empty()).then(|| value.to_string());
+        }
+    }
+    found
+}
+
 /// Reject any asset URL that is not plain `https://…`. The asset URL comes from the
 /// releases JSON's `assets[].url` — the one fully server-controlled string that
 /// reaches curl — so, like the API host and the token charset elsewhere in this
@@ -663,11 +729,29 @@ fn require_https_url(url: &str) -> Result<(), String> {
 /// attempts' fragments in one buffer — and the buffer is exactly what the Ed25519
 /// check reads. [`download_bytes`] retries the subprocess instead.
 ///
+/// Refuse to pair a credential with any host but `api.github.com` — STRUCTURALLY, at
+/// the one place every asset download passes through, rather than by each caller's
+/// discipline. A GitHub token belongs on GitHub's API and nowhere else: the release
+/// download host (`github.com/…/releases/download`) 302s to object storage and reads no
+/// `Authorization` header, a vendor host is not GitHub at all, and a caller that reached
+/// here with `Some(token)` and a web URL has a bug that would otherwise leak the secret
+/// silently. `require_https_url` is the scheme gate; this is the host gate.
+fn refuse_credential_off_api(asset_url: &str, token: Option<&str>) -> Result<(), String> {
+    if token.is_some() && !crate::cdn::is_api_host(asset_url) {
+        return Err(format!(
+            "refusing to send a credential to a non-API host: {asset_url}"
+        ));
+    }
+    Ok(())
+}
+
 /// NOTE: no `-w "\n%{http_code}"` here (and none in [`download_to_args`]). These carry
 /// `-f`, so curl's exit status already reports a non-2xx, and appending the status to
 /// stdout would CORRUPT the downloaded bytes — including the appcast the Ed25519
 /// signature covers. Asset downloads therefore stay unclassified; every public/private
-/// verdict is taken from the releases LIST, which always runs first.
+/// verdict is taken from the discovery step that always runs first — the evergreen
+/// pointer's HEAD on the web lane ([`head_no_redirect`]), the releases LIST on the
+/// token lane.
 fn download_bytes_args(cap: &str) -> [&str; 9] {
     [
         "-fsSL",
@@ -704,6 +788,7 @@ pub fn download_bytes(
     max_filesize: u64,
 ) -> Result<Vec<u8>, String> {
     require_https_url(asset_url)?;
+    refuse_credential_off_api(asset_url, token)?;
     let cap = max_filesize.to_string();
     // Bounded exactly as `api_get_classified`'s loop is: the final attempt returns on
     // both arms.
@@ -723,15 +808,14 @@ pub fn download_bytes(
         // A RATE LIMIT is not a broken download. `-f` folds "429" / "403 rate limit"
         // into exit 22 with the status in curl's own message; name it, so the check
         // lane can take its deferred, no-ledger path instead of booking a
-        // `pipeline` failure and — three checks later on a saturated anonymous IP —
-        // the loud "download pipeline is likely broken" notice (2026-08-19 audit).
-        // On the asset endpoint the only 403 an anonymous public-channel client
-        // ever meets is the rate limit (a private asset answers 404), and with a
-        // token an auth failure has already been classified by the releases list.
-        if let Some(code) = curl_http_error_code(&stderr)
-            && (code == 429 || code == 403)
-        {
-            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+        // `pipeline` failure (2026-08-19 audit). On the API asset endpoint the only
+        // 403 a client ever meets is the rate limit (a private asset answers 404),
+        // and with a token an auth failure has already been classified by the
+        // releases list. On the WEB host a 403 is a blocked host and a 404 a
+        // missing/private asset — both verdicts, named per host by
+        // `classify_asset_failure`.
+        if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
+            return Err(verdict);
         }
         if attempt >= CURL_ATTEMPTS {
             return Err(format!(
@@ -747,11 +831,47 @@ pub fn download_bytes(
 /// caller holding only the error string can classify it ([`download_error_is_rate_limit`]).
 const RATE_LIMIT_ERROR_PREFIX: &str = "rate limited (HTTP ";
 
-/// Whether a [`download_bytes`] error describes a GitHub rate limit (HTTP 429/403 on
-/// the asset endpoint) rather than a broken download.
+/// Whether a [`download_bytes`] / [`download_to`] error describes a GitHub rate limit
+/// (HTTP 429 on either host, 403 on the API host) rather than a broken download.
 #[must_use]
 pub fn download_error_is_rate_limit(error: &str) -> bool {
     error.contains(RATE_LIMIT_ERROR_PREFIX)
+}
+
+/// Whether an HTTP status on `url` is GitHub telling this client to slow down. PER HOST:
+/// a 429 is that on every host; a 403 is that ONLY on `api.github.com`, whose asset
+/// endpoint never answers 403 for any other reason to an anonymous public-channel
+/// client. On `github.com` a 403 is a blocked host or a filtering proxy (an unpublished,
+/// draft or private asset answers 404 there — measured 2026-09-02), and calling it a
+/// rate limit would make the check lane defer, three times, on a host that is not
+/// going to change its mind.
+fn rate_limit_shaped(url: &str, code: u16) -> bool {
+    code == 429 || (code == 403 && crate::cdn::is_api_host(url))
+}
+
+/// The VERDICT a `-f` failure carries, if it is one: a rate limit on either host, or a
+/// web-host 403/404 — both of which are answers about THIS asset on THIS host, not
+/// blips, so the caller returns them on the first attempt instead of retrying. `None`
+/// is the historical path (retry, then the generic curl message).
+fn classify_asset_failure(url: &str, stderr: &str) -> Option<String> {
+    let code = curl_http_error_code(stderr)?;
+    if rate_limit_shaped(url, code) {
+        return Some(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+    }
+    if crate::cdn::is_api_host(url) {
+        return None;
+    }
+    match code {
+        403 => Some(format!(
+            "HTTP 403 from the release download host (a blocked host or proxy, not \
+             GitHub's rate limit): {url}"
+        )),
+        404 => Some(format!(
+            "HTTP 404: the release does not carry this asset (unpublished, draft, or \
+             private): {url}"
+        )),
+        _ => None,
+    }
 }
 
 /// The HTTP status curl reports for a `-f` failure ("The requested URL returned
@@ -870,6 +990,7 @@ pub fn download_to(
     max_filesize: u64,
 ) -> Result<(), String> {
     require_https_url(asset_url)?;
+    refuse_credential_off_api(asset_url, token)?;
     let dest_s = dest.to_str().ok_or("non-UTF-8 destination path")?;
     let cap = max_filesize.to_string();
     // Both must outlive the argv array, which borrows them as `&str`.
@@ -877,13 +998,11 @@ pub fn download_to(
     let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url, token)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        // Same classification as `download_bytes`: a 429/403 on the asset lane is
-        // named as a rate limit so the check lane can defer instead of booking a
-        // broken pipeline (the caller bounds how long that classification is trusted).
-        if let Some(code) = curl_http_error_code(&stderr)
-            && (code == 429 || code == 403)
-        {
-            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+        // Same per-host classification as `download_bytes`: a rate limit is named so
+        // the check lane can defer instead of booking a broken pipeline; a web-host
+        // 403/404 is named for what it is.
+        if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
+            return Err(verdict);
         }
         return Err(format!(
             "curl download failed ({}): {}",
@@ -1064,9 +1183,10 @@ pub fn download_to_resumable(
 /// lifecycle and cap arithmetic, with curl's own scheme pin (`--proto =https`) added
 /// beside the redirect pin so neither the first hop nor any redirect can leave https.
 ///
-/// Intended to be called with `token = None` — a vendor host is never GitHub, and the
-/// GitHub credential must not be presented to it. The lane does not enforce that (the
-/// caller's fetcher owns "which credential goes where"), but it documents it.
+/// Must be called with `token = None` — a vendor host is never GitHub, and the GitHub
+/// credential must not be presented to it. The transport ENFORCES that
+/// (`refuse_credential_off_api`): a credential paired with any non-API host is refused
+/// before curl is spawned.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable_https_only(
@@ -1090,6 +1210,7 @@ fn download_to_resumable_with(
     https_only: bool,
 ) -> Result<(), String> {
     require_https_url(asset_url)?;
+    refuse_credential_off_api(asset_url, token)?;
     let Some(part) = part_path(dest) else {
         return Err("destination has no file name".to_string());
     };
@@ -1140,13 +1261,10 @@ fn download_to_resumable_with(
             if !keep_partial(existing, after) {
                 let _ = std::fs::remove_file(&part);
             }
-            // Same classification as `download_to`: a 429/403 on the asset lane is named
-            // as a rate limit so the check lane can defer instead of booking a broken
-            // pipeline.
-            if let Some(code) = curl_http_error_code(&stderr)
-                && (code == 429 || code == 403)
-            {
-                return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+            // Same per-host classification as `download_to`: a rate limit is named so
+            // the check lane can defer instead of booking a broken pipeline.
+            if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
+                return Err(verdict);
             }
             return Err(format!(
                 "curl download failed ({}): {}",
@@ -1166,12 +1284,21 @@ fn download_to_resumable_with(
 
 #[cfg(test)]
 mod tests {
+    const API_ASSET: &str = "https://api.github.com/repos/alabsystems/aterm/releases/assets/1";
+    const WEB_ASSET: &str =
+        "https://github.com/alabsystems/aterm/releases/download/v0.74.0/aterm-machines.toml";
+
+    fn curl_err(code: u16) -> String {
+        format!("curl: (22) The requested URL returned error: {code}")
+    }
+
+    /// The classification is PER HOST. On the API host a 403 is the rate limit (the
+    /// only 403 an anonymous public-channel client meets there); on the web host a 403
+    /// is a blocked host, a 404 a missing/private asset, and only a 429 is GitHub's
+    /// throttle. A transport failure is none of these on either host.
     #[test]
     fn a_rate_limited_asset_fetch_is_named_and_a_broken_one_is_not() {
-        assert_eq!(
-            super::curl_http_error_code("curl: (22) The requested URL returned error: 429"),
-            Some(429)
-        );
+        assert_eq!(super::curl_http_error_code(&curl_err(429)), Some(429));
         assert_eq!(
             super::curl_http_error_code(
                 "curl: (22) The requested URL returned error: 403 rate limit exceeded"
@@ -1186,15 +1313,136 @@ mod tests {
         assert!(!super::download_error_is_rate_limit(
             "curl asset download failed (exit status: 22): 404"
         ));
+
+        // API host: 403 and 429 are the rate limit; 404 is the historical retry path.
+        for code in [403, 429] {
+            let verdict =
+                super::classify_asset_failure(API_ASSET, &curl_err(code)).expect("a verdict");
+            assert!(super::download_error_is_rate_limit(&verdict), "{verdict}");
+        }
+        assert_eq!(
+            super::classify_asset_failure(API_ASSET, &curl_err(404)),
+            None
+        );
+
+        // Web host: 429 is a rate limit; 403 is forbidden; 404 is not found; neither of
+        // the last two is rate-limit shaped, so the check lane books rather than defers.
+        let throttled = super::classify_asset_failure(WEB_ASSET, &curl_err(429)).unwrap();
+        assert!(super::download_error_is_rate_limit(&throttled));
+        let forbidden = super::classify_asset_failure(WEB_ASSET, &curl_err(403)).unwrap();
+        assert!(
+            forbidden.contains("blocked host or proxy") && forbidden.contains(WEB_ASSET),
+            "{forbidden}"
+        );
+        assert!(!super::download_error_is_rate_limit(&forbidden));
+        let missing = super::classify_asset_failure(WEB_ASSET, &curl_err(404)).unwrap();
+        assert!(
+            missing.contains("does not carry this asset") && missing.contains(WEB_ASSET),
+            "{missing}"
+        );
+        assert!(!super::download_error_is_rate_limit(&missing));
+        // A 5xx on the web host is still the retry path, not a verdict.
+        assert_eq!(
+            super::classify_asset_failure(WEB_ASSET, &curl_err(502)),
+            None
+        );
+        assert_eq!(
+            super::classify_asset_failure(WEB_ASSET, "curl: (56) Recv failure"),
+            None
+        );
+    }
+
+    /// The LAST block wins (a redirect chain writes one per hop), names match
+    /// case-insensitively, a non-numeric value is absent, and the reset is clamped to
+    /// one hour past `now` — the window is an hour, so anything further is a lie.
+    #[test]
+    fn rate_limit_headers_are_read_from_the_last_block_and_clamped() {
+        let now = 1_788_390_000;
+        let dump = "HTTP/2 302
+x-ratelimit-limit: 60
+x-ratelimit-remaining: 59
+                    x-ratelimit-used: 1
+x-ratelimit-reset: 1788390100
+
+                    HTTP/2 403
+X-RateLimit-Limit: 60
+X-RateLimit-Remaining: 1
+                    X-RateLimit-Used: 23
+X-RateLimit-Reset: 1788392970
+
+";
+        let h = super::parse_rate_limit_headers(dump, now).expect("headers present");
+        assert_eq!(
+            h,
+            super::RateLimitHeaders {
+                limit: Some(60),
+                remaining: Some(1),
+                used: Some(23),
+                reset: Some(1_788_392_970),
+            }
+        );
+        // A reset beyond the horizon is clamped to now + 3600.
+        let far = "HTTP/2 403
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 9999999999
+";
+        let h = super::parse_rate_limit_headers(far, now).unwrap();
+        assert_eq!(h.reset, Some(now + 3600));
+        assert_eq!(h.remaining, Some(0));
+        // A later hop WITHOUT the headers yields none — the kept response had none.
+        let stripped = "HTTP/2 302
+x-ratelimit-remaining: 40
+
+HTTP/2 200
+                        content-type: text/plain
+";
+        assert_eq!(super::parse_rate_limit_headers(stripped, now), None);
+        // Non-numeric values are absent, not zero.
+        let junk = "HTTP/2 200
+x-ratelimit-remaining: lots
+x-ratelimit-limit: 60
+";
+        let h = super::parse_rate_limit_headers(junk, now).unwrap();
+        assert_eq!(h.remaining, None);
+        assert_eq!(h.limit, Some(60));
+        assert_eq!(super::parse_rate_limit_headers("", now), None);
+    }
+
+    /// The web lane is the SAME request as the API lane with a different URL: same
+    /// flags, same header, same `--` guard, no auth channel. Nothing about the transfer
+    /// changes with the host — only where the bytes come from.
+    #[test]
+    fn the_asset_argv_for_a_web_url_differs_from_the_api_argv_only_in_the_url() {
+        let args = super::download_bytes_args("5000000");
+        let api = super::curl_argv(&args, API_ASSET, false);
+        let web = super::curl_argv(&args, WEB_ASSET, false);
+        assert_eq!(api.len(), web.len());
+        let differing: Vec<(usize, &String, &String)> = api
+            .iter()
+            .zip(web.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (a, b))| (i, a, b))
+            .collect();
+        assert_eq!(differing.len(), 1, "{differing:?}");
+        assert_eq!(
+            differing[0].0,
+            api.len() - 1,
+            "only the URL, and it is last"
+        );
+        assert!(
+            !web.iter().any(|a| a == "--config"),
+            "no credential channel on the web lane"
+        );
     }
 
     use super::{
-        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, conditional_args, curl_argv,
+        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, api_get_args_dumping, curl_argv,
         curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
         download_resume_args, download_resume_args_https_only, download_to_args,
-        download_to_resumable, download_to_resumable_https_only, etag_from_header_dump,
-        is_not_modified, keep_partial, part_path, range_refused, resume_plan, token_config_safe,
-        transient_api_status, validator_safe,
+        download_to_resumable, download_to_resumable_https_only, head_args, keep_partial,
+        location_header, part_path, range_refused, resume_plan, token_config_safe,
+        transient_api_status,
     };
     use std::process::Command;
 
@@ -1515,6 +1763,42 @@ mod tests {
         assert_eq!(download_max_time_secs(0), 600);
     }
 
+    /// Invariant (b), pinned at the TRANSPORT: a credential paired with any host but
+    /// `api.github.com` is refused before curl is spawned, on every download entry point
+    /// — the byte lane, the file-sink lane, both resumable lanes. The anonymous web
+    /// fetch and the authenticated API fetch are the only two pairings that pass the
+    /// gate (asserted on the gate itself, so no network request is made here).
+    #[test]
+    fn a_credential_is_refused_for_any_non_api_host() {
+        const SECRET: &str = concat!("gh", "p_TOPSECRETtokenvalue0123456789ABCD");
+        const VENDOR: &str = "https://vendor.example/toolchain/trust-5520.tar.zst";
+        assert!(super::refuse_credential_off_api(API_ASSET, Some(SECRET)).is_ok());
+        assert!(super::refuse_credential_off_api(WEB_ASSET, None).is_ok());
+        assert!(super::refuse_credential_off_api(VENDOR, None).is_ok());
+        for url in [WEB_ASSET, VENDOR, "https://api.github.com.evil.example/x"] {
+            let refused = super::refuse_credential_off_api(url, Some(SECRET)).unwrap_err();
+            assert!(refused.contains("non-API host"), "{refused}");
+            assert!(
+                !refused.contains(SECRET),
+                "never echo the secret: {refused}"
+            );
+        }
+        let dest = std::env::temp_dir().join("aterm-http-credential-gate");
+        let refusals = [
+            super::download_bytes(WEB_ASSET, Some(SECRET), 1024).unwrap_err(),
+            super::download_to(WEB_ASSET, Some(SECRET), &dest, 1024).unwrap_err(),
+            download_to_resumable(WEB_ASSET, Some(SECRET), &dest, 1024).unwrap_err(),
+            download_to_resumable_https_only(VENDOR, Some(SECRET), &dest, 1024).unwrap_err(),
+        ];
+        for refused in refusals {
+            assert!(
+                refused.contains("non-API host"),
+                "the gate must be the refusal, not a network error: {refused}"
+            );
+        }
+        assert!(!dest.exists(), "nothing was spawned, nothing was written");
+    }
+
     /// "No stall" must not be spelled as "no bound". The asset download bounds the
     /// CONNECT and the STALL, and keeps a wall clock that is derived rather than fixed.
     #[test]
@@ -1586,138 +1870,100 @@ mod tests {
             );
         }
     }
-    /// The historical lane must be BYTE-IDENTICAL. `api_get_classified` now delegates to
-    /// the conditional form, so the one thing that could regress every existing caller is
-    /// the argv growing a flag; with no validator and no sink it must be exactly the list
-    /// it always was.
+    /// The historical lane must be BYTE-IDENTICAL. `api_get_classified` delegates to the
+    /// header-dumping form, so the one thing that could regress every existing caller is
+    /// the argv growing a flag; with no sink it must be exactly the list it always was.
     #[test]
-    fn the_unconditional_lane_argv_is_unchanged() {
+    fn the_plain_lane_argv_is_unchanged() {
         assert_eq!(
-            conditional_args(None, None),
+            api_get_args_dumping(None),
             api_get_args().to_vec(),
-            "an unconditional GET must spawn the historical option list, unchanged"
+            "a plain GET must spawn the historical option list, unchanged"
         );
     }
 
-    /// …and a conditional one adds EXACTLY two flag pairs, in front of the `--` marker
+    /// …and a header-dumping one adds EXACTLY one flag pair, in front of the `--` marker
     /// `curl_argv` appends (callers must never place their own — the v0.5.10 bricking
     /// regression).
     #[test]
-    fn a_conditional_request_adds_exactly_the_validator_and_the_sink() {
-        let args = conditional_args(
-            Some("If-None-Match: W/\"deadbeef\""),
-            Some("/tmp/aterm-updates/catalog.headers"),
-        );
+    fn a_header_dump_adds_exactly_the_sink() {
+        let args = api_get_args_dumping(Some("/tmp/aterm-updates/list.headers"));
         let base = api_get_args().len();
         assert_eq!(
             args.len(),
-            base + 4,
-            "two flag pairs and nothing else: {args:?}"
+            base + 2,
+            "one flag pair and nothing else: {args:?}"
         );
-        assert_eq!(args[base], "-H");
-        assert_eq!(args[base + 1], "If-None-Match: W/\"deadbeef\"");
-        assert_eq!(args[base + 2], "--dump-header");
-        assert_eq!(args[base + 3], "/tmp/aterm-updates/catalog.headers");
+        assert_eq!(args[base], "--dump-header");
+        assert_eq!(args[base + 1], "/tmp/aterm-updates/list.headers");
         assert!(
             !args.contains(&"--"),
             "no caller-side end-of-options marker: {args:?}"
         );
         // The base list survives verbatim underneath.
         assert_eq!(&args[..base], &api_get_args()[..]);
-        // Each half is independently optional.
-        assert_eq!(
-            conditional_args(Some("If-None-Match: \"x\""), None).len(),
-            base + 2
-        );
-        assert_eq!(conditional_args(None, Some("/tmp/h")).len(), base + 2);
+        // No conditional-request machinery survives: a 304 can never be produced
+        // because nothing is ever asked conditionally.
+        assert!(!args.iter().any(|a| a.starts_with("If-None-Match")));
     }
 
-    /// A 304 may ONLY be believed when this request carried a validator. A captive
-    /// portal or proxy answering 304 to an unconditional GET would otherwise be telling
-    /// the updater "nothing changed" about a resource it never described — the exact
-    /// shape of "a stale cache hides a real update".
+    /// THE web-lane steady-state request: headers only, ONE hop, no credential channel,
+    /// no `-f` (a 404 is an answer), no `-L` (the redirect is the answer), and the `--`
+    /// guard still last before the URL.
     #[test]
-    fn only_a_request_that_sent_a_validator_may_be_told_nothing_changed() {
-        assert!(is_not_modified("304", true));
-        assert!(
-            !is_not_modified("304", false),
-            "unsolicited 304 must not be honoured"
-        );
-        for code in ["200", "301", "403", "404", "500", "3040", "", "30"] {
-            assert!(!is_not_modified(code, true), "{code} is not a 304");
-        }
-    }
-
-    /// The validator goes back out on ARGV as a header value, so it gets the token's
-    /// treatment: a strict grammar, and refusal degrades to an unconditional request
-    /// rather than to anything unsafe.
-    #[test]
-    fn only_well_formed_validators_are_echoed_back() {
-        for good in [
-            "\"6f1c8b1e5f0a\"",
-            "W/\"6f1c8b1e5f0a\"",
-            "W/\"gzip-4d2-8ab\"",
-        ] {
-            assert!(validator_safe(good), "real ETag rejected: {good:?}");
-        }
-        for bad in [
-            "",                   // absent
-            "6f1c8b1e",           // unquoted
-            "\"a",                // unterminated
-            "\"a\"\r\nX-Evil: 1", // CRLF header injection
-            "\"a\nb\"",           // newline
-            "\"a b\"",            // space (would split the header)
-            "\"a\"b\"",           // interior quote closes the value early
-            "\"a\tb\"",           // control character
-            "W/",                 // prefix only
-        ] {
+    fn the_head_argv_stops_at_the_first_hop_and_carries_no_credential() {
+        let args = head_args();
+        assert!(args.contains(&"-I"), "{args:?}");
+        let i = args
+            .iter()
+            .position(|a| *a == "--max-redirs")
+            .expect("redirects are refused explicitly");
+        assert_eq!(args[i + 1], "0");
+        for absent in ["-L", "--location", "-f", "--fail", "--retry", "--config"] {
             assert!(
-                !validator_safe(bad),
-                "injection-shaped validator accepted: {bad:?}"
+                !args.contains(&absent),
+                "{absent} must not be on the HEAD lane"
             );
         }
-        // Absurdly long values are refused too (bounded argv).
-        let long = format!("\"{}\"", "a".repeat(200));
-        assert!(!validator_safe(&long));
+        let v = curl_argv(
+            &args,
+            "https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml",
+            false,
+        );
+        assert_eq!(v[0], "-q");
+        assert!(!v.iter().any(|a| a == "--config"));
+        let dashdash = v.iter().position(|a| a == "--").expect("`--` present");
+        assert_eq!(dashdash, v.len() - 2);
+        // The scheme gate runs before any spawn.
+        let err = super::head_no_redirect("http://github.com/x").unwrap_err();
+        assert!(err.to_string().contains("non-https"), "{err}");
     }
 
-    /// The header dump is parsed for the LAST `ETag` (a redirect chain writes one block
-    /// per hop) and an unsafe value is dropped rather than echoed.
+    /// The `Location` reader takes the LAST block's value (the hop we kept), matches
+    /// the name case-insensitively, trims, and yields nothing for an absent or empty
+    /// header — the pointer module then refuses rather than guesses.
     #[test]
-    fn the_last_safe_etag_is_read_back_from_the_dump() {
-        let dir = std::env::temp_dir().join(format!("aterm-http-etag-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("headers");
-
-        std::fs::write(
-            &p,
-            "HTTP/2 301\r\nETag: \"first-hop\"\r\n\r\nHTTP/2 200\r\netag: W/\"final\"\r\n\
-             Content-Type: application/json\r\n\r\n",
-        )
-        .unwrap();
+    fn the_location_header_is_read_from_the_kept_hop() {
         assert_eq!(
-            etag_from_header_dump(&p).as_deref(),
-            Some("W/\"final\""),
-            "the LAST block's validator is the one describing the body we kept"
+            location_header(
+                "HTTP/2 302 \r\nlocation: https://github.com/o/r/releases/download/v1.2.3/a\r\n\r\n"
+            )
+            .as_deref(),
+            Some("https://github.com/o/r/releases/download/v1.2.3/a")
         );
-
-        std::fs::write(&p, "HTTP/2 200\r\nContent-Type: application/json\r\n\r\n").unwrap();
         assert_eq!(
-            etag_from_header_dump(&p),
-            None,
-            "no ETag ⇒ no conditional next time"
+            location_header("HTTP/1.1 301\r\nLocation: https://first/\r\n\r\nHTTP/2 302\r\nLOCATION:   https://second/  \r\n")
+                .as_deref(),
+            Some("https://second/")
         );
-
-        std::fs::write(&p, "HTTP/2 200\r\nETag: not-quoted\r\n\r\n").unwrap();
         assert_eq!(
-            etag_from_header_dump(&p),
-            None,
-            "an unsafe validator is dropped"
+            location_header("HTTP/2 404\r\ncontent-type: text/plain\r\n"),
+            None
         );
-
-        assert_eq!(etag_from_header_dump(&dir.join("absent")), None);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(location_header("HTTP/2 302\r\nlocation:\r\n"), None);
+        assert_eq!(location_header(""), None);
     }
+
     // -----------------------------------------------------------------------------
     // RESUMABLE ARTIFACT DOWNLOAD (aup-3)
     //

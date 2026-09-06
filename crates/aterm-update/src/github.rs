@@ -1,146 +1,269 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The DMG/.app-specific orchestration of a background update check: find the
-//! newest release carrying an `aterm-appcast.toml`, and — if it is strictly newer
-//! than the running build — download + verify its DMG and stage it. The portable
-//! GitHub plumbing it drives (token-optional `curl` GET/download, the per-machine
-//! token chain) lives in `aterm-update-core` (`api_get_classified`/`download_bytes`/
-//! `download_to`, [`aterm_update_core::token`]).
+//! The DMG/.app-specific orchestration of a background update check: learn which
+//! release is the channel head, and — if it is strictly newer than the running build —
+//! download + verify its container and stage it. The portable GitHub plumbing it
+//! drives (the redirect-refusing HEAD, `curl` GET/download on either host, the
+//! per-machine token chain) lives in `aterm-update-core`.
 //!
-//! Requests go through the API (the `releases/latest/download/…` browser shortcut
-//! needs web auth even on a public repo) and asset bytes are downloaded via the asset
-//! API URL with `Accept: application/octet-stream` (curl `-L` follows the 302 to
-//! storage and drops the `Authorization` header on the cross-host redirect by
-//! default). When a token IS available it is fed to curl through STDIN
-//! (`curl --config -`), never on argv, so it is not exposed to same-user processes
-//! via `ps`.
+//! # Two lanes, chosen by the SOURCE
 //!
-//! # The credential ladder (token-first, anonymous fallback)
+//! **The web lane** — the compiled-in public channel, and any repointed source for
+//! which no token resolves — never touches `api.github.com`. Not on a happy path, not on
+//! a failure path: there is no budget on this lane, so there is nothing to hold, reserve
+//! or fall back to. A check is:
 //!
-//! The token is RESOLVED, never gated on, and the first releases-LIST response is
-//! the sole classifier, because a network answer is the only real evidence about
-//! whether this machine can read the channel:
+//! 1. ONE unmetered `HEAD …/releases/latest/download/aterm-appcast.toml` with redirects
+//!    refused ([`aterm_update_core::pointer`]). Its `Location` names the newest
+//!    published release's tag — drafts and prereleases excluded by GitHub itself — and
+//!    is accepted only when it is exactly the derived tag-specific URL of this
+//!    repository under a canonical `vMAJOR.MINOR.PATCH` tag.
+//! 2. If that tag is the one the ledger last AUTHORIZED (`latest_tag` in
+//!    `status.toml`), the check is complete: "up to date", no other request.
+//! 3. Otherwise every asset is fetched from the TAG-SPECIFIC
+//!    `…/releases/download/<tag>/<name>` — never through `latest` again, so a pointer
+//!    that moves mid-check cannot mix two releases — and meets exactly the checks the
+//!    LIST-based election met: the Ed25519 appcast signature under the pinned keyset or
+//!    the master-signed machine roster ([`authorize_by_roster`], fail-closed), the
+//!    manifest `version` == the tag minus its `v`, the manifest's container `url` ==
+//!    the DERIVED download URL (the manifest field is cross-checked, never followed),
+//!    then the build-number, `min_build`, high-water and roster-floor gates, the
+//!    sha256 and the codesign/Team-ID verification on the staged bundle.
 //!
-//! * a token resolved → use it (5000 requests/hour instead of the shared ~60/hour
-//!   per-IP anonymous budget, and a private channel keeps working exactly as before);
-//! * no token → ask anonymously anyway;
-//! * 401/403 WITH a token → retry once anonymously, so a stale ambient `gh auth
-//!   token` cannot brick a machine whose channel is public;
-//! * 401/403/404 WITHOUT a token → [`unreadable_explanation`]: loud, actionable, and
-//!   never a silent idle;
-//! * 429 / rate-limited 403 → back off; not a failure, not a broken pipeline.
+//! **The token lane** — a repointed source for which the token chain
+//! ([`aterm_update_core::token`], dedicated rungs first, ambient rungs last) resolves a
+//! credential — keeps the API path: the paginated releases LIST (draft filter,
+//! unique-appcast proof, max canonical tag) and the asset API URLs with the token on
+//! stdin (never argv), and holds until the server's own `x-ratelimit-reset` when the
+//! LIST is rate-limited. A token GitHub rejects drops the check onto the web lane, once,
+//! with a throttled warning: the source then has no usable credential, which is the
+//! web lane's definition.
 //!
-//! Dropping auth is NOT a trust downgrade: artifact trust is the pinned Ed25519 key,
-//! the pinned Team ID and the manifest sha256 — none of which this lane touches.
+//! On the default channel every token rung is IGNORED — a credential buys nothing on
+//! a host that reads none — and the status surfaces say so.
+//!
+//! Neither lane is a trust decision. Artifact trust is the pinned Ed25519 keyset / the
+//! master-signed roster, the pinned Team ID and the manifest sha256 — none of which
+//! either lane touches.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use aterm_update_core::tag::{TagError, TagKind};
-use aterm_update_core::{HttpError, token};
+use aterm_update_core::{HeadAnswer, HttpError, token};
 
 use crate::manifest::{Manifest, Ready};
 use crate::{Source, bundle, install, paths::Staging, sig};
 
-/// Which credential lane the last COMPLETED releases-LIST request used. Read by the
-/// background loop to pick a check cadence the lane's rate-limit budget can afford
-/// (see `crate::spawn_background_check`).
+/// Which lane the last COMPLETED check ran on. Read by the background loop to pick a
+/// check cadence (see `crate::spawn_background_check`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
     /// No check has completed yet in this process.
     Unknown,
-    /// A token was accepted.
-    Authenticated,
-    /// The channel answered with no credential at all — a public repo.
-    Anonymous,
+    /// The releases API, with a resolved token (a repointed source only).
+    Token,
+    /// The unmetered web host, with no credential at all.
+    Web,
 }
 
 /// [`Lane`] of the last completed check, as a `u8` so it can live in an atomic.
 static LANE: AtomicU8 = AtomicU8::new(0);
 
-/// Whether the last check ended in a GitHub rate limit. Read by the background loop
-/// to LENGTHEN the next wait without recording a failure: a rate limit means "you
-/// asked too often", which is a cadence problem, not a broken updater.
+/// Whether the last check ended in a deferral — GitHub asked us to slow down (a token
+/// lane rate limit, or a `github.com` 429/5xx). Read by the background loop to
+/// LENGTHEN the next wait without recording a failure: weather, not a broken updater.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
-/// Consecutive checks whose ASSET fetch (manifest/signature/roster/container) met an
-/// HTTP 429/403 while the releases list itself succeeded. GitHub's real rate limit
-/// answers the LIST first (it is the first request of every check and is classified
-/// by body), so a long run of asset-only 4xx with a healthy list is not a rate limit
-/// — it is a blocked object host (a filtering proxy) or a rejected signed URL, and
-/// after [`ASSET_RATE_LIMIT_DEFERRALS`] such checks it is booked as the `pipeline`
-/// failure it is, so the persistent notice can still reach the user. Reset by any
-/// successful asset fetch. Process-local on purpose: it bounds a misdiagnosis, it is
-/// not a ledger.
-static ASSET_RATE_LIMIT_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// The CONTAINER download's own streak (zip/DMG via `download_to`), kept apart from
-/// the small-asset streak: the two legs fail independently (a filtering proxy may
-/// pass a 4 KB manifest and refuse a 30 MB object), and a single counter reset by
-/// one leg's success could never bound the other's (2026-08-19 round-2 audit: the
-/// reset sat before the container fetch, so the container leg was unbounded).
-static CONTAINER_RATE_LIMIT_STREAK: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-/// How many consecutive asset-lane 429/403 checks are trusted as "rate limit" before
-/// they are booked as a broken download path. Three checks at the anonymous cadence
-/// spans ~45 min, well past a shared IP's hourly budget renewing.
-const ASSET_RATE_LIMIT_DEFERRALS: u32 = 3;
 
-/// Whether a rate-limit shaped failure on `streak`'s leg should still be treated as
-/// a deferral (true) or has persisted long enough to be a broken download path
-/// (false). Each leg resets its own streak when that leg succeeds — the small assets
-/// when the authoritative release's manifest/roster/signature fetched without a rate
-/// limit (every check, including "up to date" ones), the container when it arrives.
-fn rate_limit_still_deferrable(streak: &std::sync::atomic::AtomicU32) -> bool {
-    let consecutive = streak.fetch_add(1, Ordering::Relaxed) + 1;
-    consecutive <= ASSET_RATE_LIMIT_DEFERRALS
-}
+/// Whether this process has already logged which lane it is on. Once per process: it
+/// is a standing condition, not an event.
+static ANNOUNCED_LANE: AtomicBool = AtomicBool::new(false);
 
-/// Whether this process has already logged that it is updating without a token. Once
-/// per process: it is a standing condition, not an event.
-static ANNOUNCED_ANONYMOUS: AtomicBool = AtomicBool::new(false);
-
-/// Whether the anonymous lane was entered because a PROVISIONED token was
-/// rejected by GitHub (the one-shot `RetryAnonymous` path) rather than because no
-/// token exists. The healthy-status lane note must tell those apart: "provision a
-/// token" is exactly wrong advice for a machine whose problem is a stale token
-/// that needs ROTATING. Cleared by an authenticated read (a working token is the
-/// end of the story either way).
+/// Whether the web lane was entered because a PROVISIONED token was rejected by
+/// GitHub rather than because no token exists. The healthy-status lane note must tell
+/// those apart: "provision a token" is exactly wrong advice for a machine whose
+/// problem is a stale token that needs ROTATING. Cleared by a token-lane read (a
+/// working token is the end of the story either way).
 static TOKEN_REJECTED: AtomicBool = AtomicBool::new(false);
 
 /// The lane the last completed check used.
 #[must_use]
 pub fn lane() -> Lane {
     match LANE.load(Ordering::Relaxed) {
-        1 => Lane::Authenticated,
-        2 => Lane::Anonymous,
+        1 => Lane::Token,
+        2 => Lane::Web,
         _ => Lane::Unknown,
     }
 }
 
-/// Whether the last check was cut short by a GitHub rate limit.
+/// Whether the last check was cut short by a deferral.
 #[must_use]
 pub fn rate_limited() -> bool {
     RATE_LIMITED.load(Ordering::Relaxed)
 }
 
-/// Record that a releases-LIST request SUCCEEDED on `lane`. This — not the token
-/// chain — is what clears the "this machine cannot update" latch: reading the channel
-/// is the property that matters, and on a public repo it holds with no credential.
-fn note_readable(authenticated: bool, source: &Source) {
-    LANE.store(if authenticated { 1 } else { 2 }, Ordering::Relaxed);
+/// The unix epoch until which the last rate-limited TOKEN-LANE check asked this
+/// machine to HOLD — the server's own `x-ratelimit-reset` from this check's LIST
+/// headers, jittered and clamped ([`hold_until_reset`]) — or 0 when the last check
+/// recorded no hold. Read by the background loop beside [`rate_limited`]: a known
+/// reset is honoured exactly, instead of the doubling ladder.
+static RATE_LIMIT_RESET: AtomicU64 = AtomicU64::new(0);
+
+/// The hold epoch of the last check, if it recorded one. See [`RATE_LIMIT_RESET`].
+#[must_use]
+pub fn rate_limit_reset() -> Option<u64> {
+    match RATE_LIMIT_RESET.load(Ordering::Relaxed) {
+        0 => None,
+        until => Some(until),
+    }
+}
+
+/// The writer's side of the hold bound the readers (`crate::ledger_hold`) also apply.
+use crate::{HOLD_HORIZON_SECS, HOLD_JITTER_SECS};
+
+/// Unix seconds now as `u64`, saturating the same way [`unix_now`] does (a clock we
+/// cannot read is `i64::MAX`, which only makes every clamp below bind).
+fn unix_now_secs() -> u64 {
+    u64::try_from(unix_now()).unwrap_or(u64::MAX)
+}
+
+/// The epoch a rate-limited check holds until, derived from `reset` (the server's own
+/// `x-ratelimit-reset`) at `now`: `min(reset, now + 1 h) + jitter(0..60 s)`. Pure, so
+/// the clamp and the jitter band are testable without a clock or a header file.
+///
+/// `None` for a reset that is not ahead of `now`: a stale or skewed epoch names no
+/// future to wait for, and jittering it forward would manufacture a short hold out of
+/// nothing — the caller keeps the historical deferred record instead.
+fn hold_epoch(reset: u64, now: u64, entropy: u8) -> Option<u64> {
+    if reset <= now {
+        return None;
+    }
+    let jitter = u64::from(entropy) * HOLD_JITTER_SECS / 256;
+    Some(
+        reset
+            .min(now.saturating_add(HOLD_HORIZON_SECS))
+            .saturating_add(jitter),
+    )
+}
+
+/// Record — process-wide, for the loop — that this machine is to hold off GitHub
+/// until the budget the LIST just measured renews, and return that epoch. `None` when
+/// this check's `list.headers` carries no `x-ratelimit-reset` (a proxy stripped it, or
+/// the failure was not the API's), in which case the caller keeps the historical
+/// back-off. The reset comes from the server's OWN answer to this very check, so
+/// waiting for it IS the oracle — no `/rate_limit` probe (itself a request), no
+/// machine-wide accountant file. TOKEN LANE ONLY: the web host carries no such header
+/// and no budget to renew.
+fn hold_until_reset(staging: &Staging) -> Option<u64> {
+    let reset = aterm_update_core::rate_limit_from_header_dump(&staging.list_headers())?.reset?;
+    let until = hold_epoch(reset, unix_now_secs(), crate::cadence::entropy_byte())?;
+    RATE_LIMIT_RESET.store(until, Ordering::Relaxed);
+    Some(until)
+}
+
+/// Write a TOKEN-LANE rate-limit deferral to the status ledger: HELD until the
+/// server's reset when this check's headers name one (siblings and the cadence then
+/// release exactly there), else the plain deferred record every sibling widens its
+/// window on. Neither arm touches `health.toml` — a rate limit is weather, not a fault.
+fn record_deferral(staging: &Staging, current_build: u64, outcome: &str) {
+    RATE_LIMITED.store(true, Ordering::Relaxed);
+    crate::status::set_delivery_note("deferred");
+    match hold_until_reset(staging) {
+        Some(until) => crate::status::record_held(staging, current_build, until, outcome),
+        None => crate::status::record(staging, current_build, outcome),
+    }
+}
+
+/// Write a WEB-LANE deferral: the plain deferred record (the loop's back-off ladder
+/// applies; there is no budget window to hold to), no `health.toml` entry.
+fn record_web_deferral(staging: &Staging, current_build: u64, outcome: &str) {
+    RATE_LIMITED.store(true, Ordering::Relaxed);
+    crate::status::set_delivery_note("deferred");
+    crate::status::record(staging, current_build, outcome);
+}
+
+/// Tell the status ledger which lane this check is on and — on the token lane — what
+/// budget its LIST measured, so `aterm ctl update status` can say `lane=… budget=…`
+/// from the file alone. Only what the headers actually carried is recorded: an absent
+/// header is an absent field, never a guess.
+///
+/// The token lane is recorded as `token:<rung id>` — the rung's FIXED identifier
+/// ([`token::rung_id`]: `env`, `keychain`, `file`, `github-env`, `gh-env`, `gh-cli`),
+/// never its operator-facing label. Three labels contain spaces, and `lane=` is one
+/// token of a space-separated status line; a label there split the line into three
+/// (2026-09-04 audit).
+fn note_delivery(staging: &Staging, lane: Lane, token_source: Option<&str>) {
+    let (label, budget) = match lane {
+        Lane::Token => {
+            let mut label = String::from("token");
+            if let Some(source) = token_source {
+                label.push(':');
+                label.push_str(token::rung_id(source));
+            }
+            (
+                label,
+                aterm_update_core::rate_limit_from_header_dump(&staging.list_headers()),
+            )
+        }
+        Lane::Web | Lane::Unknown => (String::from("web"), None),
+    };
+    crate::status::set_delivery(
+        label,
+        budget.and_then(|b| b.remaining),
+        budget.and_then(|b| b.limit),
+        budget.and_then(|b| b.reset),
+    );
+}
+
+/// Whether `source` is the compiled-in public channel — the one source on which a
+/// token is ignored outright (see the module doc). GitHub slugs are case-insensitive,
+/// so `ATERM_UPDATE_OWNER=Alabsystems` is the public channel too — not a "repointed"
+/// source that walks the token chain every check and puts an ambient `gh auth token`
+/// on the API lane (2026-09-04 review).
+fn is_default_channel(source: &Source) -> bool {
+    is_slug(source, crate::DEFAULT_OWNER, crate::DEFAULT_REPO)
+}
+
+/// Whether `source` names `owner/repo`, the way GitHub compares slugs (ASCII
+/// case-insensitively).
+fn is_slug(source: &Source, owner: &str, repo: &str) -> bool {
+    source.owner.eq_ignore_ascii_case(owner) && source.repo.eq_ignore_ascii_case(repo)
+}
+
+/// Record that the channel head was READ on `lane`. This — not the token chain — is
+/// what clears the "this machine cannot update" latch: reading the channel is the
+/// property that matters, and on the web lane it holds with no credential.
+fn note_readable(lane: Lane, source: &Source) {
+    LANE.store(
+        match lane {
+            Lane::Token => 1,
+            Lane::Web => 2,
+            Lane::Unknown => 0,
+        },
+        Ordering::Relaxed,
+    );
     RATE_LIMITED.store(false, Ordering::Relaxed);
-    if authenticated {
+    RATE_LIMIT_RESET.store(0, Ordering::Relaxed);
+    if lane == Lane::Token {
         TOKEN_REJECTED.store(false, Ordering::Relaxed);
     }
     crate::no_token::clear();
-    if !authenticated && !ANNOUNCED_ANONYMOUS.swap(true, Ordering::Relaxed) {
+    if lane == Lane::Web && !ANNOUNCED_LANE.swap(true, Ordering::Relaxed) {
         crate::log(&format!(
-            "updating from github.com/{}/{} without a token (public channel) — \
-             unauthenticated checks share ~60 GitHub requests/hour per IP address, so \
-             this machine checks on a longer interval",
-            source.owner, source.repo
+            "updating from github.com/{}/{} over its unmetered download host with no \
+             credential — {}; nothing on this lane touches the GitHub API, and it checks \
+             on a {}-minute interval",
+            source.owner,
+            source.repo,
+            if is_default_channel(source) {
+                "the public channel ignores every update-token rung"
+            } else {
+                "no update token resolved for this source"
+            },
+            crate::cadence::WEB_INTERVAL_SECS / 60
         ));
     }
 }
@@ -148,28 +271,25 @@ fn note_readable(authenticated: bool, source: &Source) {
 /// The lane annotation appended to a HEALTHY status outcome, so `status.toml` /
 /// `aterm-ctl update status` answers "why is this machine slow to update?" on its own.
 ///
-/// Empty on the authenticated lane (the default, and the one the 75-second cadence
-/// documents), so no existing status wording changes for a provisioned machine.
+/// Empty on the token lane (the 75-second cadence the crate docs describe), so no
+/// existing status wording changes for a provisioned repointed machine.
 ///
-/// The anonymous wording is per-channel because the token chain is per-channel
-/// (the walk in `aterm_update_core::token`): the compiled-in PUBLIC channel reads only
-/// `$ATERM_UPDATE_TOKEN` and never the `update-token` file — so a status that
-/// said "no update token provisioned" NEXT TO a file the installer wrote read
-/// as a contradiction, and the file-writing "fix" it suggested is a no-op
-/// there. A REPOINTED channel walks the whole chain, so for it the missing
-/// token stays the named, remediable cause. Two round-11 additions: the note
-/// reports the interval ACTUALLY in effect (an operator's
-/// `ATERM_UPDATE_INTERVAL_SECS` wins over the lane default and must not be
-/// misreported as it), and a REJECTED provisioned token names rotation — the
-/// opposite remedy from provisioning — via the `TOKEN_REJECTED` latch.
+/// The web-lane wording is per-channel: on the compiled-in PUBLIC channel a token is
+/// ignored outright, so a status that said "no update token provisioned" NEXT TO a
+/// file the installer wrote read as a contradiction, and the file-writing "fix" it
+/// suggested is a no-op there. A REPOINTED channel walks the whole chain, so for it the
+/// missing token stays the named, remediable cause. The note reports the interval
+/// ACTUALLY in effect (an operator's `ATERM_UPDATE_INTERVAL_SECS` wins over the lane
+/// default and must not be misreported as it), and a REJECTED provisioned token names
+/// rotation — the opposite remedy from provisioning — via the `TOKEN_REJECTED` latch.
 fn lane_note(source: &Source) -> String {
-    if lane() != Lane::Anonymous {
+    if lane() != Lane::Web {
         return String::new();
     }
     let secs = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(crate::cadence::ANONYMOUS_INTERVAL_SECS);
+        .unwrap_or(crate::cadence::WEB_INTERVAL_SECS);
     let every = if secs >= 120 && secs.is_multiple_of(60) {
         format!("{}-minute", secs / 60)
     } else {
@@ -177,25 +297,26 @@ fn lane_note(source: &Source) -> String {
     };
     let why = if TOKEN_REJECTED.load(Ordering::Relaxed) {
         "a provisioned update token was rejected by GitHub — rotate it"
-    } else if source.owner == crate::DEFAULT_OWNER && source.repo == crate::DEFAULT_REPO {
-        "the public channel reads no token file — a provisioned update-token file \
-         serves only a repointed updater"
+    } else if is_default_channel(source) {
+        "the public channel is read with no credential and ignores every update-token \
+         rung, so a provisioned update-token file serves only a repointed updater"
     } else {
         "no update token provisioned"
     };
     format!(
-        " — checking anonymously on a {every} interval ({why}; the unauthenticated \
-         GitHub budget is ~60 requests/hour per IP)"
+        " — checking over the unmetered web lane on a {every} interval ({why}; no GitHub \
+         API request is made)"
     )
 }
 
-/// What the releases-LIST response says the check should do. Split out as a pure
-/// function of the classified error so the whole ladder is unit-testable without a
+/// What a failed token-lane releases-LIST response says the check should do. Split out
+/// as a pure function of the classified error so the ladder is unit-testable without a
 /// network, a token, or an installed `.app`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ListDecision {
-    /// Re-issue the SAME request with no token (a resolved token was rejected).
-    RetryAnonymous,
+    /// GitHub rejected the resolved token: drop this check onto the web lane (the
+    /// source now has no usable credential, which is that lane's definition).
+    TokenRejected,
     /// This machine cannot read the channel and never will until an operator acts.
     /// Carries the full explanation; NOT a health failure — a configuration state is
     /// not a transient fault, and recording it as one would bury the real signal.
@@ -210,8 +331,8 @@ pub(crate) enum ListDecision {
 ///
 /// TOTAL BY CONSTRUCTION, and that is the entire point: there is no "stop" value it
 /// can return. The absence of a token is not evidence that this machine cannot
-/// update — aterm's channel is public and readable anonymously — so only a network
-/// response may decide that, in [`classify_list_error`].
+/// update — a source with no token is simply on the web lane — so only a network
+/// response may decide that, in [`resolve_web_head`] and [`classify_list_error`].
 ///
 /// The `Err` arm keeps the diagnosis rather than discarding it: it is what
 /// `unreadable_explanation` uses to say "a token is present but was refused: …"
@@ -230,31 +351,17 @@ fn plan_credential(
     }
 }
 
-/// Classify a failed releases-LIST request.
-///
-/// `had_token` is whether the TOKEN CHAIN produced one at the start of this check —
-/// deliberately not "did this particular request carry one", so the anonymous retry's
-/// own failure is still reported as the auth problem it is, rather than being
-/// mistaken for an unprovisioned machine.
-pub(crate) fn classify_list_error(
-    error: &HttpError,
-    had_token: bool,
-    already_retried: bool,
-    source: &Source,
-    diagnosis: Option<&token::Diagnosis>,
-) -> ListDecision {
+/// Classify a failed TOKEN-LANE releases-LIST request. Every request on this lane
+/// carried the resolved token, so a 401/403 is about that token and a 404 is a token
+/// that cannot see the repo (a real, actionable auth problem — never the no-token
+/// wording, which belongs to the web lane's pointer).
+pub(crate) fn classify_list_error(error: &HttpError, source: &Source) -> ListDecision {
     match error {
         HttpError::RateLimited { .. } => ListDecision::RateLimited(error.to_string()),
-        // GitHub answers 404 for a private repo an anonymous caller cannot see AND
-        // for a repo that does not exist — `GET /repos/{o}/{r}` is 404 in both cases
-        // too, so NO probe distinguishes them. Do not guess: name all three causes.
-        HttpError::NotFound { .. } | HttpError::Unauthorized { .. } if !had_token => {
-            ListDecision::Blocked(unreadable_explanation(error, source, diagnosis))
-        }
         // A resolved token that GitHub rejects must not brick a machine whose channel
         // is public: the ambient `gh auth token` the chain may have picked up can be
-        // stale, scoped elsewhere, or revoked. One anonymous retry, then give up.
-        HttpError::Unauthorized { .. } if !already_retried => ListDecision::RetryAnonymous,
+        // stale, scoped elsewhere, or revoked. The web lane needs no credential.
+        HttpError::Unauthorized { .. } => ListDecision::TokenRejected,
         // A renamed/transferred repository: the REST API answers a permanent
         // redirect on the OLD slug forever (git-level redirects keep clones
         // working, so nothing else on the machine breaks visibly), and api_get
@@ -266,88 +373,117 @@ pub(crate) fn classify_list_error(
         // once, with the remedy.
         HttpError::Status {
             code: 301 | 308, ..
-        } => ListDecision::Blocked(format!(
-            "aterm's release channel github.com/{}/{} answers HTTP 301 (moved \
-             permanently): the repository was renamed or transferred, and this machine \
-             will keep asking the OLD name — and never receive an update — until an \
-             operator repoints it: set `[update] owner`/`repo` in aterm's config, or \
-             $ATERM_UPDATE_OWNER / $ATERM_UPDATE_REPO, to the repository's new location.",
-            source.owner, source.repo
-        )),
-        // Everything else — including 404 WITH a token (a token that cannot see the
-        // repo is a real, actionable auth problem) — is today's failure path.
+        } => ListDecision::Blocked(moved_explanation(source)),
+        // Everything else — including 404 WITH a token — is today's failure path.
         _ => ListDecision::Failed(error.to_string()),
     }
 }
 
+/// The standing-state wording for a renamed or transferred repository.
+fn moved_explanation(source: &Source) -> String {
+    format!(
+        "aterm's release channel github.com/{}/{} answers HTTP 301 (moved permanently): \
+         the repository was renamed or transferred, and this machine will keep asking the \
+         OLD name — and never receive an update — until an operator repoints it: set \
+         `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
+         $ATERM_UPDATE_REPO, to the repository's new location.",
+        source.owner, source.repo
+    )
+}
+
 /// The one message an operator gets when this machine cannot read its release
-/// channel and has no credential to try. It must survive being read months later out
-/// of `status.toml`, so it names the consequence, every possible cause, and the exact
-/// remedy for each.
+/// channel — the evergreen pointer answered 404 and there is no credential to try. It
+/// must survive being read months later out of `status.toml`, so it names the
+/// consequence, every possible cause, and the exact remedy for each.
+///
+/// GitHub renders "no published release", "private" and "does not exist" identically
+/// on the web host, so all three are named. On the compiled-in public channel a token
+/// is IGNORED, so the remedy for the private case is not offered there — a user who
+/// followed it would watch nothing change and have no way to tell why (2026-08-19).
 fn unreadable_explanation(
-    error: &HttpError,
+    code: u16,
     source: &Source,
     diagnosis: Option<&token::Diagnosis>,
 ) -> String {
-    let code = match error {
-        HttpError::Unauthorized { code } => *code,
-        HttpError::NotFound { .. } => 404,
-        _ => 0,
-    };
+    if is_default_channel(source) {
+        return format!(
+            "aterm cannot read its release channel github.com/{}/{} (HTTP {code}): the \
+             channel has no published release, or the repository was made private, renamed \
+             or removed. The public channel is read with no credential — every update-token \
+             rung is ignored for it — so this machine will NEVER receive an update until \
+             the channel is repaired at github.com/{}/{}, or the updater is repointed via \
+             `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
+             $ATERM_UPDATE_REPO.",
+            source.owner, source.repo, source.owner, source.repo
+        );
+    }
     // A token that was PRESENT and refused by our own chain ("chmod 600 it") is the
-    // actionable case and must never be collapsed into "not configured".
+    // actionable case and must never be collapsed into "not configured" — and neither
+    // may a token the chain resolved and GITHUB rejected, which is why this check is on
+    // the web lane at all (`Listing::TokenRejected`): the `TOKEN_REJECTED` latch, not
+    // the diagnosis (the chain kept none: it succeeded), carries that fact, and the
+    // remedy is rotation, the opposite of provisioning (2026-09-04 review).
     let rejections = diagnosis
         .map(token::Diagnosis::rejections)
         .unwrap_or_default();
-    let chain = if rejections.is_empty() {
-        "no update token is provisioned".to_string()
+    let remedy = token::provision_remedy(&source.owner, &source.repo);
+    let (chain, private) = if TOKEN_REJECTED.load(Ordering::Relaxed) {
+        (
+            "a provisioned update token was rejected by GitHub".to_string(),
+            format!("rotate the token, then re-provision it by running: {remedy}"),
+        )
+    } else if rejections.is_empty() {
+        (
+            "no update token is provisioned".to_string(),
+            format!("provision a token by running: {remedy}"),
+        )
     } else {
-        format!(
-            "a token is present but was refused: {}",
-            rejections.join("; ")
+        (
+            format!(
+                "a token is present but was refused: {}",
+                rejections.join("; ")
+            ),
+            format!("repair it, or provision a token by running: {remedy}"),
         )
     };
     format!(
         "aterm cannot read its release channel github.com/{}/{} (HTTP {code}) and {chain}, \
          so this machine will NEVER receive an update until it is fixed. GitHub answers the \
-         same way for every cause and cannot tell them apart, so check all three: (1) the \
-         channel is PRIVATE — provision a token by running: {}; (2) the repository does not \
-         exist; (3) the configured channel is wrong — check `[update] owner`/`repo` in \
-         aterm's config, or $ATERM_UPDATE_OWNER / $ATERM_UPDATE_REPO.",
-        source.owner,
-        source.repo,
-        // The rung THIS source actually consults: on the default public channel the
-        // 0600 file is never read, so telling the user to write one would send them
-        // to watch nothing happen.
-        token::provision_remedy(&source.owner, &source.repo)
+         same way for every cause and cannot tell them apart, so check all four: (1) the \
+         channel is PRIVATE — {private}; (2) the channel has no published release yet; (3) \
+         the repository does not exist; (4) the configured channel is wrong — check \
+         `[update] owner`/`repo` in aterm's config, or $ATERM_UPDATE_OWNER / \
+         $ATERM_UPDATE_REPO.",
+        source.owner, source.repo,
     )
 }
 
-/// A GitHub Release (subset). Unknown fields are ignored.
-///
-/// `Serialize` is here for ONE consumer: [`CatalogMemo`], which persists the SELECTED
-/// release so a steady-state check can skip re-listing and re-parsing the whole history.
-/// Round-tripping is lossless with respect to everything downstream reads, because these
-/// three fields are everything this crate ever reads out of a release.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A GitHub Release (subset). Unknown fields are ignored. On the token lane it is
+/// parsed out of the LIST; on the web lane it is SYNTHESIZED from the pointer's tag
+/// ([`web_release`]) with the derived tag-specific URLs, so the election, the roster
+/// chain and the staging tail consume one shape on both lanes.
+#[derive(Clone, Debug, Deserialize)]
 struct Release {
     /// Release-list order is not a GitHub REST contract. The canonical tag is
     /// therefore the updater's explicit ordering key.
     tag_name: String,
     /// Draft (unpublished) releases are visible to a write-capable token but must
-    /// never be staged to the fleet — skip them (F12).
+    /// never be staged to the fleet — skip them (F12). (The web lane never sees one:
+    /// GitHub's `latest` excludes drafts and prereleases by construction.)
     #[serde(default)]
     draft: bool,
     #[serde(default)]
     assets: Vec<Asset>,
 }
 
-/// A release asset (subset). `Serialize` for [`CatalogMemo`] — see [`Release`].
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A release asset (subset).
+#[derive(Clone, Debug, Deserialize)]
 struct Asset {
     name: String,
-    /// The asset's API URL (`…/releases/assets/<id>`), used for the octet download.
+    /// Where the bytes come from: the asset's API URL (`…/releases/assets/<id>`) on
+    /// the token lane, the derived `…/releases/download/<tag>/<name>` on the web lane.
     url: String,
+    /// The API's reported size on the token lane; `0` ("unknown") on the web lane.
     #[serde(default)]
     size: u64,
 }
@@ -530,6 +666,7 @@ fn select_stage_artifact(
     })
 }
 
+#[derive(Debug)]
 struct AuthoritativeRelease {
     tag: Vec<u64>,
     version: String,
@@ -700,8 +837,8 @@ struct AuthoritativeFetch {
     selected: Option<(Manifest, Release, StageArtifact)>,
     appcast_fetch_error: bool,
     /// The `appcast_fetch_error` was a GitHub RATE LIMIT on an asset fetch, not a
-    /// broken download: the anonymous lane's ordinary weather, and never a
-    /// `pipeline`-class failure.
+    /// broken download: a token's API window running out, or a `github.com` 429 —
+    /// weather on either lane, and never a `pipeline`-class failure.
     asset_fetch_rate_limited: bool,
     manifest_rejected: bool,
     /// Candidate-manifest fetches only. Detached-signature downloads are a
@@ -1388,10 +1525,8 @@ fn stage_backoff(
     })
 }
 
-/// One release-listing page (GitHub's maximum) and the page-walk safety cap. Hoisted to
-/// module scope from inside [`fetch_release_catalog`] so [`CatalogMemo`] can key on them:
-/// a memo written under a different page size describes different page boundaries and
-/// must never be revalidated against the current ones.
+/// One release-listing page (GitHub's maximum) and the page-walk safety cap, for the
+/// TOKEN lane's LIST.
 const PER_PAGE: u32 = 100;
 // 30 pages = 3000 releases — parity with tools/install.sh's anonymous walk, whose
 // comment calls a catalog past that "not a real state". The old cap of 10 was
@@ -1408,457 +1543,133 @@ fn releases_page_url(source: &Source, page: u32) -> String {
     )
 }
 
-/// The exact appcast asset names a candidate release must carry, restated here so a
-/// tampered or corrupted [`CatalogMemo`] cannot smuggle in an index pointing at some
-/// other asset: a memo whose recorded indices do not land on these names is discarded and
-/// the catalog is re-listed from scratch.
+/// The exact asset names a release carries for the updater. The election and the
+/// roster chain look them up by name on both lanes; the web lane also DERIVES its
+/// URLs from them ([`web_release`]).
 const APPCAST_ASSET: &str = "aterm-appcast.toml";
 const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 
-/// The memo's format version. Bump on ANY shape change: an older/newer memo is discarded
-/// rather than reinterpreted, which costs one full listing and nothing else.
-const CATALOG_MEMO_SCHEMA: u32 = 1;
+/// The injected TOKEN-LANE page fetcher: `(url, token) → body`. Production passes
+/// [`aterm_update_core::api_get_with_headers`] with the header sink; tests pass a
+/// counting fake.
+type ListFetch<'a> = &'a mut dyn FnMut(&str, &str) -> Result<Vec<u8>, HttpError>;
 
-/// The selection [`select_authoritative_release`] computed, in a form that survives a
-/// process restart.
-///
-/// It holds the OUTPUT of the selection, not the input catalog, because the selection is
-/// a pure function of (catalog bytes, pinned keyset) and both are pinned by the memo's
-/// own keys: the bytes by a per-page `ETag` the server itself revalidates, the keyset by
-/// `client_build` (the pinned keyset is compiled in, so a different keyset is a different
-/// build). Nothing about TRUST is memoized — the appcast, its signature, the roster and
-/// the roster's signature are still fetched and verified on every single check.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct MemoSelection {
-    version: String,
-    tag: Vec<u64>,
-    release: Release,
-    manifest_index: usize,
-    signature_index: Option<usize>,
-}
-
-impl MemoSelection {
-    /// Everything about a memoized selection that can be re-derived and re-checked
-    /// locally, checked. A memo that fails ANY of these is discarded (→ full listing),
-    /// never repaired: the point is that a corrupted, truncated, hand-edited or
-    /// substituted memo file cannot steer the check anywhere the fresh path would not go.
-    ///
-    /// This is defence in depth, not the trust boundary — the memo lives in the same
-    /// `0700` owner-only Updates directory as the staged bundle and the ready marker, and
-    /// every artifact it names is still signature-verified downstream. It is cheap, so it
-    /// is done.
-    fn is_coherent(&self, pinned_update_pubkeys: &[&str]) -> bool {
-        if self.release.draft || self.version.is_empty() || self.tag.is_empty() {
-            return false;
-        }
-        // The tag grammar and the canonical SPELLING, re-derived — so a memo naming
-        // `v01.2.3` (or a tag that is not a candidate at all) cannot be admitted beside
-        // `v1.2.3`.
-        let Ok(TagKind::Candidate(tag)) =
-            aterm_update_core::tag::parse_release_tag(&self.release.tag_name)
-        else {
-            return false;
-        };
-        if tag != self.tag
-            || aterm_update_core::tag::canonical_version(&self.release.tag_name, &tag).as_deref()
-                != Some(self.version.as_str())
-        {
-            return false;
-        }
-        // The recorded indices must still land on the EXACT appcast asset names, unique
-        // in the release — the same two properties `select_authoritative_release` proved.
-        if unique_asset_index(&self.release, APPCAST_ASSET) != Ok(Some(self.manifest_index)) {
-            return false;
-        }
-        let expected_sig = if pinned_update_pubkeys.is_empty() {
-            None
-        } else {
-            match unique_asset_index(&self.release, APPCAST_SIG_ASSET) {
-                Ok(Some(index)) => Some(index),
-                _ => return false,
-            }
-        };
-        self.signature_index == expected_sig
-    }
-
-    /// Back into the shape the rest of the check consumes. Only ever called on a
-    /// selection that passed [`Self::is_coherent`].
-    fn into_authoritative(self) -> AuthoritativeRelease {
-        AuthoritativeRelease {
-            tag: self.tag,
-            version: self.version,
-            release: self.release,
-            manifest_index: self.manifest_index,
-            signature_index: self.signature_index,
-        }
-    }
-
-    fn from_authoritative(candidate: &AuthoritativeRelease) -> Self {
-        Self {
-            version: candidate.version.clone(),
-            tag: candidate.tag.clone(),
-            release: candidate.release.clone(),
-            manifest_index: candidate.manifest_index,
-            signature_index: candidate.signature_index,
-        }
-    }
-}
-
-/// What the last COMPLETE release listing looked like, and what it selected.
-///
-/// # The cost this deletes
-///
-/// The background check ticks every 75 s on the authenticated lane (`cadence.rs`), and
-/// every tick used to re-download and re-parse the ENTIRE release history to learn one
-/// tag. MEASURED 2026-08-20 against the shipped channel: page 1 = **594,708 bytes** for
-/// 42 releases / 200 assets (every asset object embeds a full uploader user block, so
-/// ~14.2 KB per release), i.e. ~28.5 MB/hour ≈ 685 MB/day per running instance, growing
-/// ~14 KB per cut and one whole page per 100 cuts. The catalog only moves when something
-/// is published, so the steady state is answerable with a conditional request: the same
-/// probe with `If-None-Match` answered HTTP 304 with `size_download=0` — no body, no
-/// `serde` parse, no `Vec<Release>`.
-///
-/// It buys BYTES and CPU, not requests: the measured 304 still consumed one unit of
-/// `x-ratelimit-used`, so the per-check request budget is unchanged.
-///
-/// # Everything that could make these bytes mean something else is a KEY
-///
-/// * `owner`/`repo` — a reconfigured channel is a different catalog.
-/// * `authenticated` — a credentialed client and an anonymous one can see DIFFERENT
-///   release sets (drafts), so the two lanes never share a memo, and a lane that FLIPS
-///   mid-walk (a rejected token falling back to anonymous) refuses to memoize at all.
-/// * `client_build` — the pinned keyset and the selection rules are compiled in.
-/// * `per_page` — page boundaries.
-/// * `etags` — one per page, and EVERY one must revalidate 304 on the current check
-///   before the selection is reused. There is no TTL and no offline reuse.
-///
-/// # Why a torn snapshot is impossible
-///
-/// A memo is only written when the walk ended on a SHORT page (so there is no page N+1
-/// that could appear unseen) and when EVERY page offered an `ETag`. On revalidation, the
-/// first page that answers 200 abandons the memo entirely and the whole listing is
-/// re-walked unconditionally from page 1 — pages are never stitched across generations.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct CatalogMemo {
-    schema: u32,
-    owner: String,
-    repo: String,
-    authenticated: bool,
-    client_build: u64,
-    per_page: u32,
-    etags: Vec<String>,
-    selection: Option<MemoSelection>,
-}
-
-impl CatalogMemo {
-    /// Read the memo, if there is one that is USABLE for this exact check. Every failure
-    /// — absent, unreadable, wrong schema, wrong channel, wrong lane, wrong build, an
-    /// unsafe validator, an incoherent selection — returns `None`, which means "list the
-    /// catalog the way we always did".
-    fn read(
-        path: &Path,
-        source: &Source,
-        authenticated: bool,
-        client_build: u64,
-        pinned_update_pubkeys: &[&str],
-    ) -> Option<Self> {
-        let raw = std::fs::read(path).ok()?;
-        let memo: Self = aterm_json::from_slice(&raw).ok()?;
-        if memo.schema != CATALOG_MEMO_SCHEMA
-            || memo.owner != source.owner
-            || memo.repo != source.repo
-            || memo.authenticated != authenticated
-            || memo.client_build != client_build
-            || memo.per_page != PER_PAGE
-        {
-            return None;
-        }
-        if memo.etags.is_empty() || memo.etags.len() > MAX_PAGES as usize {
-            return None;
-        }
-        // Every validator must be echo-safe — this value goes back out as a curl header.
-        if !memo
-            .etags
-            .iter()
-            .all(|etag| aterm_update_core::validator_safe(etag))
-        {
-            return None;
-        }
-        if memo
-            .selection
-            .as_ref()
-            .is_some_and(|selection| !selection.is_coherent(pinned_update_pubkeys))
-        {
-            return None;
-        }
-        Some(memo)
-    }
-
-    /// Persist the memo (temp + rename, so a torn file is never read).
-    ///
-    /// Best-effort by construction: a memo that cannot be written costs the next check a
-    /// full listing, which is exactly what every check used to cost. Failures are silent
-    /// for that reason — this is a cache, and a cache that shouts is a new failure mode.
-    fn write(
-        path: &Path,
-        source: &Source,
-        authenticated: bool,
-        client_build: u64,
-        etags: Vec<String>,
-        selection: Option<&AuthoritativeRelease>,
-    ) {
-        let memo = Self {
-            schema: CATALOG_MEMO_SCHEMA,
-            owner: source.owner.clone(),
-            repo: source.repo.clone(),
-            authenticated,
-            client_build,
-            per_page: PER_PAGE,
-            etags,
-            selection: selection.map(MemoSelection::from_authoritative),
-        };
-        let Ok(text) = aterm_json::to_vec(&memo) else {
-            return;
-        };
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            return;
-        }
-        // Sweep on EVERY failing path — a failing rename is precisely the case that
-        // repeats forever (a full disk, a read-only remount), and one leaked
-        // `catalog.json.<pid>.tmp` per check is how the floor file once littered the
-        // 0700 dir.
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    /// Drop a memo that this check proved wrong (a page moved, or the lane flipped).
-    /// Removing it is not required for correctness — a stale memo simply fails to
-    /// revalidate — but it stops a permanently-unusable file from being re-read forever.
-    fn discard(path: &Path) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// The outcome of learning what the channel currently offers.
-enum Catalog {
-    /// EVERY listing page revalidated 304 against the memo's stored validators on THIS
-    /// check, so the catalog is byte-identical to the one the memoized selection was
-    /// computed from — and the selection is therefore the same answer the full walk
-    /// would have produced, for a few hundred header bytes instead of ~685 KB.
-    Unchanged(Option<AuthoritativeRelease>),
-    /// Freshly listed. `validators` is `Some` only when the walk is memoizable: every
-    /// page offered an `ETag`, the walk ended on a SHORT page, and the credential lane
-    /// never flipped mid-walk.
-    Fresh {
-        releases: Vec<Release>,
-        validators: Option<Vec<String>>,
-    },
-}
-
-/// The injected page fetcher. Production passes
-/// [`aterm_update_core::api_get_conditional`]; tests pass a counting fake, which is what
-/// makes "bytes and requests per check" measurable at all (there is no other seam — the
-/// walk used to call the HTTP layer directly).
-///
-/// Arguments: `(url, validator, token)`. The token is a PARAMETER rather than a capture
-/// because the credential ladder may clear it mid-walk, and the fetcher must ride
-/// whatever lane the walk has settled on.
-type CatalogFetch<'a> = &'a mut dyn FnMut(
-    &str,
-    Option<&str>,
-    Option<&str>,
-) -> Result<aterm_update_core::ApiResponse, HttpError>;
-
-/// Everything one listing-page GET needs beside the URL: the staging surfaces it reports
-/// into, the credential ladder's mutable state, and the injected fetcher. Bundled so the
-/// page helper takes three arguments rather than ten.
+/// Everything one listing-page GET needs beside the URL: the staging surfaces it
+/// reports into, the credential, and the injected fetcher.
 struct ListContext<'a> {
     staging: &'a Staging,
     current_build: u64,
     source: &'a Source,
-    tok: &'a mut Option<String>,
-    diagnosis: Option<&'a token::Diagnosis>,
-    had_token: bool,
-    /// At most one anonymous retry per check, and only after a token was REJECTED.
-    /// Latches, so `RetryAnonymous` can be taken only once for the whole check — and
-    /// once it has latched the walk is no longer memoizable (the pages either side of
-    /// the flip were listed on different lanes).
-    already_retried: bool,
-    fetch: CatalogFetch<'a>,
+    tok: &'a str,
+    /// Which rung of the token chain produced `tok`, for the ledger's `lane=` — so a
+    /// LIST that is rate-limited on the token lane records the same `token:<rung>`
+    /// spelling a readable one does.
+    token_source: Option<&'a str>,
+    fetch: ListFetch<'a>,
+}
+
+/// How a token-lane LIST ended.
+enum Listing {
+    /// Every page, in listing order.
+    Releases(Vec<Release>),
+    /// A NON-failure end — channel unreadable (announced) or rate limited (status
+    /// recorded). The check is over.
+    Ended,
+    /// GitHub rejected the token: the check continues on the web lane.
+    TokenRejected,
+}
+
+/// What one page GET produced.
+enum Page {
+    Body(Vec<u8>),
+    Ended,
+    TokenRejected,
 }
 
 impl ListContext<'_> {
-    /// GET one listing page, running the credential ladder exactly as the walk always
-    /// has. `Ok(None)` is one of the two NON-failure ends of a check — channel unreadable
-    /// (announced) or rate limited (status recorded); `Err` is a real failure, already
-    /// recorded in the health ledger.
-    ///
-    /// The inner loop runs at most twice: `already_retried` latches, so `RetryAnonymous`
-    /// can be taken only once.
-    fn page(
-        &mut self,
-        url: &str,
-        validator: Option<&str>,
-    ) -> Result<Option<aterm_update_core::ApiResponse>, String> {
-        loop {
-            // A failed releases LIST is `network`-class: GitHub unreachable / auth broken.
-            // (The transient/persistent distinction the ledger needs lives in the CLASS
-            // split — an asset that provably exists but can't be fetched is `pipeline`,
-            // recorded by the caller — so a broken download build can't hide behind
-            // "transient".) The two states that are NOT failures — "cannot read the
-            // channel at all" and "rate limited" — leave the ledger alone and say so.
-            // The token borrow is SCOPED to the call: the credential ladder below may
-            // clear `*self.tok` in place, and a live shared borrow of it would be a
-            // borrow-check conflict rather than a subtle bug.
-            let outcome = {
-                let token = self.tok.as_deref();
-                (self.fetch)(url, validator, token)
-            };
-            let error = match outcome {
-                Ok(response) => {
-                    note_readable(self.tok.is_some(), self.source);
-                    // A token that our own chain refused (a chmod 644 file, a mangled
-                    // paste) still costs this machine the 5000/hour budget even though
-                    // the public channel works. Say so, throttled, once in a while.
-                    if let Some(diagnosis) = self.diagnosis {
-                        crate::no_token::note_unusable_token(self.source, diagnosis);
-                    }
-                    return Ok(Some(response));
-                }
-                Err(error) => error,
-            };
-            let decision = classify_list_error(
-                &error,
-                self.had_token,
-                self.already_retried,
-                self.source,
-                self.diagnosis,
-            );
-            match decision {
-                ListDecision::RetryAnonymous => {
-                    self.already_retried = true;
-                    *self.tok = None;
-                    // The lane note must say "rotate the token", not "provision
-                    // one" — a credential exists; GitHub refused it.
-                    TOKEN_REJECTED.store(true, Ordering::Relaxed);
-                    // Throttled: this is a STANDING condition (a stale token stays
-                    // stale), re-observed on every check, so an unthrottled warning
-                    // would be ~48 identical lines an hour.
-                    crate::no_token::note_rejected_credential(&format!(
-                        "the configured update token was rejected ({error}); continuing \
-                         unauthenticated against github.com/{}/{} — updates still work \
-                         while the channel is public, but rotate the token with: {}",
-                        self.source.owner,
-                        self.source.repo,
-                        token::provision_remedy(&self.source.owner, &self.source.repo)
-                    ));
-                }
-                ListDecision::Blocked(explanation) => {
-                    crate::no_token::announce_unreadable(
-                        self.staging,
-                        self.current_build,
-                        &explanation,
-                    );
-                    return Ok(None);
-                }
-                ListDecision::RateLimited(message) => {
-                    // Deliberately no `record_failure`: a rate limit is not a broken
-                    // pipeline, and letting it accrue a streak would fire the "update
-                    // pipeline is likely broken" notification at a healthy machine
-                    // that simply checked too often. The latch lengthens the wait.
-                    RATE_LIMITED.store(true, Ordering::Relaxed);
-                    crate::status::record(
-                        self.staging,
-                        self.current_build,
-                        &format!("update check deferred: {message}"),
-                    );
-                    return Ok(None);
-                }
-                ListDecision::Failed(message) => {
-                    crate::health::Health::record_failure(
-                        &self.staging.health(),
-                        "network",
-                        &message,
-                    );
-                    return Err(message);
-                }
+    /// GET one listing page with the token. `Err` is a real failure, already recorded
+    /// in the health ledger.
+    fn page(&mut self, url: &str) -> Result<Page, String> {
+        // A failed releases LIST is `network`-class: GitHub unreachable / auth broken.
+        // (The transient/persistent distinction the ledger needs lives in the CLASS
+        // split — an asset that provably exists but can't be fetched is `pipeline`,
+        // recorded by the caller — so a broken download build can't hide behind
+        // "transient".) The two states that are NOT failures — "cannot read the
+        // channel at all" and "rate limited" — leave the ledger alone and say so.
+        let error = match (self.fetch)(url, self.tok) {
+            Ok(body) => {
+                note_readable(Lane::Token, self.source);
+                return Ok(Page::Body(body));
+            }
+            Err(error) => error,
+        };
+        match classify_list_error(&error, self.source) {
+            ListDecision::TokenRejected => {
+                // The lane note must say "rotate the token", not "provision
+                // one" — a credential exists; GitHub refused it.
+                TOKEN_REJECTED.store(true, Ordering::Relaxed);
+                // Throttled: this is a STANDING condition (a stale token stays
+                // stale), re-observed on every check, so an unthrottled warning
+                // would be ~48 identical lines an hour.
+                crate::no_token::note_rejected_credential(&format!(
+                    "the configured update token was rejected ({error}); continuing over \
+                     the unmetered web lane against github.com/{}/{} — updates still work \
+                     while the channel is public, but rotate the token with: {}",
+                    self.source.owner,
+                    self.source.repo,
+                    token::provision_remedy(&self.source.owner, &self.source.repo)
+                ));
+                Ok(Page::TokenRejected)
+            }
+            ListDecision::Blocked(explanation) => {
+                crate::no_token::announce_unreadable(
+                    self.staging,
+                    self.current_build,
+                    &explanation,
+                );
+                Ok(Page::Ended)
+            }
+            ListDecision::RateLimited(message) => {
+                // Deliberately no `record_failure`: a rate limit is not a broken
+                // pipeline, and letting it accrue a streak would fire the "update
+                // pipeline is likely broken" notification at a healthy machine
+                // that simply checked too often. The latch lengthens the wait.
+                // The 403/429 answer carries this window's headers too, so the
+                // ledger can name the lane, the budget and — when the server said
+                // when it renews — the exact epoch siblings and the cadence hold to.
+                note_delivery(self.staging, Lane::Token, self.token_source);
+                record_deferral(
+                    self.staging,
+                    self.current_build,
+                    &format!("update check deferred: {message}"),
+                );
+                Ok(Page::Ended)
+            }
+            ListDecision::Failed(message) => {
+                crate::health::Health::record_failure(&self.staging.health(), "network", &message);
+                Err(message)
             }
         }
     }
 }
 
-/// Ask the server whether the memoized listing still describes the channel.
-///
-/// `Ok(Some(true))` — every page answered 304, so the catalog is unchanged and the
-/// memoized selection is reusable. `Ok(Some(false))` — something moved (a page returned a
-/// body, or the credential lane flipped mid-revalidation); the caller must re-walk the
-/// WHOLE listing unconditionally from page 1, never stitch. `Ok(None)`/`Err` are the
-/// ordinary non-failure/failure ends, already reported by [`ListContext::page`].
-fn revalidate_catalog(
-    ctx: &mut ListContext<'_>,
-    memo: &CatalogMemo,
-) -> Result<Option<bool>, String> {
-    let lane = ctx.tok.is_some();
-    for (index, validator) in memo.etags.iter().enumerate() {
-        // `index` is 0-based, pages are 1-based; saturating so the arithmetic carries no
-        // panic obligation (the cast is exact — `etags.len() <= MAX_PAGES` is checked on
-        // read).
-        let page = u32::try_from(index).unwrap_or(MAX_PAGES).saturating_add(1);
-        let url = releases_page_url(ctx.source, page);
-        let Some(response) = ctx.page(&url, Some(validator))? else {
-            return Ok(None);
-        };
-        if !matches!(response, aterm_update_core::ApiResponse::NotModified) {
-            // A body came back: this page is NOT what the memo describes. Discard the
-            // whole memo — the pages already revalidated belong to the old generation and
-            // must not be combined with this one.
-            return Ok(Some(false));
-        }
-        if ctx.tok.is_some() != lane {
-            // The credential ladder flipped lanes mid-revalidation. A memo is keyed by
-            // its lane, so half of this revalidation was against the wrong one.
-            return Ok(Some(false));
-        }
-    }
-    Ok(Some(true))
-}
-
-/// Enumerate the complete bounded release-metadata set, unconditionally — the historical
-/// walk, now also capturing each page's `ETag` so the NEXT check can ask instead of
-/// re-download.
+/// Enumerate the complete bounded release-metadata set on the TOKEN lane — the
+/// historical walk.
 ///
 /// GitHub documents no ordering contract for List Releases, so the caller chooses the
 /// greatest canonical numeric vMAJOR.MINOR.PATCH tag carrying the exact appcast name
 /// (retired two-component tags are skipped, never ordered), and only after that decision
 /// fetches one manifest (+ one signature under Tier SIG) — row order cannot select an
 /// older release and broken historical assets add no download latency.
-fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
+fn list_releases(ctx: &mut ListContext<'_>) -> Result<Listing, String> {
     let mut release_catalog = Vec::new();
-    let mut validators: Vec<String> = Vec::new();
-    // A walk is memoizable only if EVERY page hands us a validator. One missing `ETag`
-    // and the memo could not be fully revalidated later, so none is written.
-    let mut memoizable = true;
     for page in 1..=MAX_PAGES {
         let url = releases_page_url(ctx.source, page);
-        let Some(response) = ctx.page(&url, None)? else {
-            return Ok(None);
+        let body = match ctx.page(&url)? {
+            Page::Body(body) => body,
+            Page::Ended => return Ok(Listing::Ended),
+            Page::TokenRejected => return Ok(Listing::TokenRejected),
         };
-        let (body, etag) = match response {
-            aterm_update_core::ApiResponse::Body { bytes, etag } => (bytes, etag),
-            // Unreachable: this pass sends no validator and the HTTP layer refuses to
-            // honour an unsolicited 304. Fail closed rather than treat "no body" as "no
-            // releases", which would read as an empty channel.
-            aterm_update_core::ApiResponse::NotModified => {
-                let msg =
-                    String::from("GitHub answered 304 to an unconditional release listing request");
-                crate::health::Health::record_failure(&ctx.staging.health(), "network", &msg);
-                return Err(msg);
-            }
-        };
-        match etag {
-            Some(etag) => validators.push(etag),
-            None => memoizable = false,
-        }
         // Unparseable list JSON is the same `network` class (the LIST layer failed —
         // a proxy/portal mangling the response looks exactly like this).
         let releases: Vec<Release> = match aterm_json::from_slice(&body) {
@@ -1872,17 +1683,7 @@ fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
         let page_len = releases.len();
         release_catalog.extend(releases);
         if page_len < PER_PAGE as usize {
-            // THE terminal-short-page condition. A memo may only be written here: the
-            // listing is exhausted, so there is no page N+1 whose later appearance a
-            // revalidation of these pages could miss.
-            //
-            // …and never across a lane flip: `already_retried` means some pages were
-            // listed with a credential and the rest without.
-            let memoizable = memoizable && !ctx.already_retried;
-            return Ok(Some(Catalog::Fresh {
-                releases: release_catalog,
-                validators: memoizable.then_some(validators),
-            }));
+            return Ok(Listing::Releases(release_catalog));
         }
         if page == MAX_PAGES {
             let msg = format!(
@@ -1898,73 +1699,244 @@ fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
         }
     }
     // Unreachable: the loop returns on the short page and errors at MAX_PAGES.
-    Ok(Some(Catalog::Fresh {
-        releases: release_catalog,
-        validators: None,
-    }))
+    Ok(Listing::Releases(release_catalog))
 }
 
-/// Learn what the channel currently offers, at a cost that scales with CHANGE rather
-/// than with history.
+// ---------------------------------------------------------------------------------
+// THE WEB LANE
+// ---------------------------------------------------------------------------------
+
+/// The injected WEB-LANE pointer transport: `url → (status, Location)`. Production
+/// passes [`aterm_update_core::head_no_redirect`]; tests pass a counting fake, which
+/// is what makes "zero `api.github.com` requests" a measurement rather than a claim.
+type HeadFetch<'a> = &'a mut dyn FnMut(&str) -> Result<HeadAnswer, HttpError>;
+
+/// What the evergreen pointer said the channel head is, relative to what this ledger
+/// last authorized.
+enum WebHead {
+    /// The pointer names the tag this ledger last authorized: nothing to fetch.
+    Unchanged { tag: String },
+    /// A tag this ledger has not authorized (or nothing was recorded): the synthesized
+    /// candidate whose every asset URL is the derived tag-specific one.
+    New(AuthoritativeRelease),
+    /// A NON-failure end — the channel has no published release (announced, loud) or
+    /// the host asked us to wait (deferred). The check is over.
+    Ended,
+}
+
+/// The names of every asset the web lane may fetch for release `tag`, in the index
+/// order [`web_release`] fixes: appcast, its signature, the roster, its signature, the
+/// DMG, the zip. Names, not URLs — the URLs are derived from these under the strict
+/// charset, so a name is the only thing a fetch can be addressed by.
+fn web_asset_names(version: &str) -> [String; 6] {
+    [
+        APPCAST_ASSET.to_string(),
+        APPCAST_SIG_ASSET.to_string(),
+        aterm_update_core::roster::ROSTER_ASSET.to_string(),
+        aterm_update_core::roster::ROSTER_SIG_ASSET.to_string(),
+        format!("aterm-{version}.dmg"),
+        format!("aterm-{version}-mac.zip"),
+    ]
+}
+
+/// The candidate the web lane elects for the pointer's `tag`: the same
+/// [`AuthoritativeRelease`] shape the LIST election produces, with every asset's URL
+/// the DERIVED `…/releases/download/<tag>/<name>` (a pure function of the trusted
+/// source and the pointer's tag — never a server string) and the canonical version the
+/// tag names, which the fetched manifest's `version` must then equal.
 ///
-/// Runs the credential ladder: `tok` is cleared in place when a rejected token falls back
-/// to anonymous, so the caller's later asset fetches ride the same lane. Returns
-/// `Ok(None)` for the two non-failure ends of a check — channel unreadable (announced) or
-/// rate limited (status recorded); `Err` is a real failure, already recorded in the health
-/// ledger.
+/// The signature index is recorded exactly when the LIST election would record it
+/// (a pinned keyset), so branch (A) of [`fetch_authoritative_release`] behaves
+/// identically on both lanes; the roster tier locates its assets by name either way.
+fn web_release(
+    source: &Source,
+    tag: &str,
+    pinned_update_pubkeys: &[&str],
+) -> Result<AuthoritativeRelease, String> {
+    let TagKind::Candidate(numeric) = parse_numeric_tag(tag)? else {
+        return Err(format!(
+            "the channel head {tag:?} is a retired two-component release tag"
+        ));
+    };
+    let version = canonical_authority_version(tag, &numeric)?;
+    let mut assets = Vec::with_capacity(6);
+    for name in web_asset_names(&version) {
+        let url =
+            aterm_update_core::cdn::release_download_url(&source.owner, &source.repo, tag, &name)
+                .ok_or_else(|| format!("no download URL can be derived for {name:?} of {tag}"))?;
+        assets.push(Asset { name, url, size: 0 });
+    }
+    Ok(AuthoritativeRelease {
+        tag: numeric,
+        version,
+        release: Release {
+            tag_name: tag.to_string(),
+            draft: false,
+            assets,
+        },
+        manifest_index: 0,
+        signature_index: (!pinned_update_pubkeys.is_empty()).then_some(1),
+    })
+}
+
+/// ONE unmetered HEAD, and the decision it yields. Runs the web lane's whole
+/// classification: a redirect to a canonical tag is the head; the ledger's `latest_tag`
+/// decides whether anything else is fetched; a 404 is the loud standing state; a 429 or
+/// 5xx is a deferral; a transport failure is the historical `network`-class failure.
 ///
-/// # Freshness is the server's word
-///
-/// The fast path is taken ONLY when every stored validator earns a 304 on THIS check.
-/// There is no TTL, no offline reuse, and no local staleness heuristic; a server that
-/// ignores `If-None-Match`, a stripped header, an unsafe validator or an absent memo all
-/// land on the historical full walk. The failure direction is "no saving", never "stale
-/// answer" — and a memo that IS reused still has its appcast, signature, roster and
-/// roster signature fetched and verified afterwards, exactly as before, because the memo
-/// holds a TAG and asset URLs, never trust.
-fn fetch_release_catalog(
+/// `known_tag` is what `status.toml` recorded as last authorized. The comparison is
+/// string equality on tags this function already proved canonical, so `v0.74.0`
+/// recorded and `v0.74.0` pointed at is "unchanged", and nothing else is.
+fn resolve_web_head(
     staging: &Staging,
     current_build: u64,
     source: &Source,
-    tok: &mut Option<String>,
-    diagnosis: Option<token::Diagnosis>,
-    fetch: CatalogFetch<'_>,
-) -> Result<Option<Catalog>, String> {
-    let had_token = tok.is_some();
-    let memo_path = staging.catalog_memo();
-    let memo = CatalogMemo::read(
-        &memo_path,
-        source,
-        had_token,
-        current_build,
-        crate::PINNED_UPDATE_PUBKEYS,
+    known_tag: Option<&str>,
+    diagnosis: Option<&token::Diagnosis>,
+    pinned_update_pubkeys: &[&str],
+    head: HeadFetch<'_>,
+) -> Result<WebHead, String> {
+    use aterm_update_core::pointer::{self, PointerError};
+    let pointer = pointer::resolve_with(
+        &source.owner,
+        &source.repo,
+        APPCAST_ASSET,
+        &pointer::canonical_app_tag,
+        head,
     );
-    let mut ctx = ListContext {
-        staging,
-        current_build,
-        source,
-        tok,
-        diagnosis: diagnosis.as_ref(),
-        had_token,
-        already_retried: false,
-        fetch,
-    };
-    if let Some(memo) = &memo {
-        match revalidate_catalog(&mut ctx, memo)? {
-            Some(true) => {
-                return Ok(Some(Catalog::Unchanged(
-                    memo.selection
-                        .clone()
-                        .map(MemoSelection::into_authoritative),
-                )));
-            }
-            // Something moved. Fall through to the unconditional walk from page 1 — and
-            // drop the memo, so a permanently-unusable one is not re-read every check.
-            Some(false) => CatalogMemo::discard(&memo_path),
-            None => return Ok(None),
+    let pointer = match pointer {
+        Ok(pointer) => pointer,
+        Err(PointerError::NoRelease { .. }) => {
+            crate::no_token::announce_unreadable(
+                staging,
+                current_build,
+                &unreadable_explanation(404, source, diagnosis),
+            );
+            return Ok(WebHead::Ended);
         }
+        Err(error @ PointerError::Transient { .. }) => {
+            record_web_deferral(
+                staging,
+                current_build,
+                &format!("update check deferred: {error}"),
+            );
+            return Ok(WebHead::Ended);
+        }
+        // A refused redirect, an unexpected status, an unsafe source, a transport
+        // failure: the historical `network`-class failure. A refusal in particular is
+        // NOT interpreted — the pointer named something this client will not follow,
+        // and the check ends without a request to it.
+        Err(error) => {
+            let message = error.to_string();
+            crate::health::Health::record_failure(&staging.health(), "network", &message);
+            return Err(message);
+        }
+    };
+    note_readable(Lane::Web, source);
+    if known_tag == Some(pointer.tag.as_str()) {
+        return Ok(WebHead::Unchanged { tag: pointer.tag });
     }
-    walk_catalog(&mut ctx)
+    let candidate = web_release(source, &pointer.tag, pinned_update_pubkeys)?;
+    // The pointer's own `Location` and the candidate's derived appcast URL are the same
+    // string by construction (`parse_location` proved it); assert the construction
+    // rather than trust it, because every later GET is addressed by the derived one.
+    debug_assert_eq!(candidate.release.assets[0].url, pointer.location);
+    Ok(WebHead::New(candidate))
+}
+
+/// THE URL CROSS-CHECK, web lane only: the signed manifest names its container's
+/// download URL, and that URL must name THE TAG the pointer chose and THE CONTAINER
+/// the manifest itself names. The manifest field is never followed — the derived URL
+/// is what is downloaded — so this binds the signed bytes to the tag (invariant (d):
+/// tag == `v<version>` == the tag in the manifest's URL), and a re-published appcast
+/// copied onto another tag cannot be elected under it.
+///
+/// What is bound is the TAG and the DMG name, not the repository: the publisher signs
+/// `url` under the compiled-in public channel's slug (`manifest_out.rs` `repo_slug` =
+/// `[workspace.metadata.aterm] update_channel`, the key `build.rs` stamps into
+/// `DEFAULT_OWNER`/`DEFAULT_REPO`), so a credential-less updater REPOINTED at a mirror
+/// that carries the upstream-signed appcast would otherwise refuse every release as a
+/// `manifest`-class failure blamed on a publisher who did nothing wrong (2026-09-04
+/// review). The repository half adds nothing to (d): `pointer::parse_location` already
+/// scopes every GET after the HEAD to the source repository. The URL's slug must be the
+/// source's or the compiled-in channel's (GitHub-style case-insensitively); anything
+/// else is a manifest signed for a channel this updater does not read.
+fn web_container_url_agrees(source: &Source, tag: &str, manifest: &Manifest) -> Result<(), String> {
+    let Some(url) = manifest.url.as_deref() else {
+        return Err(format!(
+            "authoritative {tag} carries no container `url`; the web lane requires the \
+             signed manifest to name its own download URL"
+        ));
+    };
+    let refuse = |why: &str| {
+        format!(
+            "authoritative {tag} names container URL {url:?}, {why}; refusing a manifest \
+             whose URL does not bind it to the tag the channel head points at"
+        )
+    };
+    // `https://github.com/<owner>/<repo>/releases/download/<tag>/<dmg>`, every segment
+    // under the strict predicate the derived URLs are built with.
+    let Some(rest) = url.strip_prefix("https://github.com/") else {
+        return Err(refuse("which is not a github.com release download URL"));
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let [owner, repo, "releases", "download", url_tag, dmg] = parts.as_slice() else {
+        return Err(refuse("which is not a release download URL"));
+    };
+    if !parts
+        .iter()
+        .all(|p| aterm_update_core::cdn::path_segment_safe(p))
+    {
+        return Err(refuse("which is not URL-safe"));
+    }
+    if *url_tag != tag {
+        return Err(refuse(&format!("which names tag {url_tag:?}, not {tag}")));
+    }
+    if *dmg != manifest.dmg {
+        return Err(refuse(&format!(
+            "which names container {dmg:?}, not the manifest's {:?}",
+            manifest.dmg
+        )));
+    }
+    let names_default_channel = owner.eq_ignore_ascii_case(crate::DEFAULT_OWNER)
+        && repo.eq_ignore_ascii_case(crate::DEFAULT_REPO);
+    if !(is_slug(source, owner, repo) || names_default_channel) {
+        return Err(refuse(&format!(
+            "which names repository {owner}/{repo} — neither this updater's source \
+             github.com/{}/{} nor the compiled-in channel github.com/{}/{}",
+            source.owner,
+            source.repo,
+            crate::DEFAULT_OWNER,
+            crate::DEFAULT_REPO
+        )));
+    }
+    Ok(())
+}
+
+/// The acquisition half of a check, on whichever lane the source put it: the elected
+/// candidate (or none), and the lane it was elected on.
+#[derive(Debug)]
+struct Acquired {
+    lane: Lane,
+    /// The credential every asset fetch on this check rides with — `Some` on the token
+    /// lane only. The transport refuses to pair it with a non-API host, so the web
+    /// lane's `None` is structural, not policy.
+    tok: Option<String>,
+    candidate: Option<AuthoritativeRelease>,
+    /// The pointer's tag, on the web lane: recorded as `latest_tag` on the terminal
+    /// healthy outcomes so the next check can stop at the HEAD.
+    web_tag: Option<String>,
+}
+
+/// How a check's acquisition ended.
+#[derive(Debug)]
+enum Acquisition {
+    /// Proceed to authorization and staging.
+    Proceed(Acquired),
+    /// The web lane's steady state: the pointer names the last authorized tag.
+    UpToDate { tag: String },
+    /// A non-failure end, already recorded.
+    Ended,
 }
 
 /// Background check + stage. Returns `Some(version)` when a strictly-newer
@@ -2017,13 +1989,194 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     result
 }
 
+/// The acquisition half of [`check_and_stage_inner`]: pick the lane from the source and
+/// the token chain, learn the channel head on it, and elect the candidate.
+///
+/// Injected transports, so the whole lane choice is measurable without a network: the
+/// token lane's page fetcher and the web lane's HEAD. The asset fetches that follow use
+/// the credential this returns, through the transport's own host gate.
+fn acquire(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    support: &Path,
+    list: ListFetch<'_>,
+    head: HeadFetch<'_>,
+) -> Result<Acquisition, String> {
+    // THE LANE CHOICE. On the compiled-in public channel the token chain is not even
+    // consulted: a credential buys nothing on a host that reads none, and walking the
+    // chain would re-spawn `security`/`gh` every check to gather a secret nothing uses.
+    // A repointed source runs ONE walk of the chain — the token, or the diagnosis
+    // explaining why there isn't one — and the outcome decides the lane.
+    //
+    // RESOLVE, DO NOT GATE: the absence of a token never ends a check here — a source
+    // with no token is on the web lane, and only a network response may declare this
+    // machine unable to update (`resolve_web_head`, `classify_list_error`).
+    let (tok, token_source, diagnosis) = if is_default_channel(source) {
+        (None, None, None)
+    } else {
+        let resolved = token::resolve_or_diagnose(support, &source.owner, &source.repo);
+        let token_source = resolved.as_ref().ok().map(|(_, source)| *source);
+        let (tok, diagnosis) = plan_credential(resolved);
+        (tok, token_source, diagnosis)
+    };
+
+    if let Some(tok) = tok.as_deref() {
+        // THE TOKEN LANE: today's LIST, byte for byte, with the token.
+        let mut ctx = ListContext {
+            staging,
+            current_build,
+            source,
+            tok,
+            token_source,
+            fetch: list,
+        };
+        match list_releases(&mut ctx)? {
+            Listing::Releases(releases) => {
+                // The LIST answered on the token lane, and its headers are this check's
+                // budget measurement.
+                note_delivery(staging, Lane::Token, token_source);
+                let candidate =
+                    match select_authoritative_release(releases, crate::PINNED_UPDATE_PUBKEYS) {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            record_untrustworthy_election(staging, current_build, &error);
+                            return Ok(Acquisition::Ended);
+                        }
+                    };
+                return Ok(Acquisition::Proceed(Acquired {
+                    lane: Lane::Token,
+                    tok: Some(tok.to_string()),
+                    web_tag: candidate.as_ref().map(|c| c.release.tag_name.clone()),
+                    candidate,
+                }));
+            }
+            Listing::Ended => return Ok(Acquisition::Ended),
+            // GitHub refused the credential: the source has no usable token, which is
+            // the web lane's definition. Fall through with the diagnosis the rejection
+            // implies (the chain did resolve something; it just does not work).
+            Listing::TokenRejected => {}
+        }
+    } else if let Some(diagnosis) = diagnosis.as_ref() {
+        // A token that our own chain refused (a chmod 644 file, a mangled paste)
+        // still costs this repointed machine the token lane even though the web lane
+        // may work. Say so, throttled, once in a while.
+        crate::no_token::note_unusable_token(source, diagnosis);
+    }
+
+    // THE WEB LANE. The recorded tag is trusted only when the ledger still describes
+    // THIS build's verdict on THIS source (`status::latest_tag`).
+    let known_tag = crate::status::latest_tag(staging, current_build, source);
+    match resolve_web_head(
+        staging,
+        current_build,
+        source,
+        known_tag.as_deref(),
+        diagnosis.as_ref(),
+        crate::PINNED_UPDATE_PUBKEYS,
+        head,
+    )? {
+        WebHead::Ended => Ok(Acquisition::Ended),
+        WebHead::Unchanged { tag } => {
+            note_delivery(staging, Lane::Web, None);
+            Ok(Acquisition::UpToDate { tag })
+        }
+        WebHead::New(candidate) => {
+            note_delivery(staging, Lane::Web, None);
+            Ok(Acquisition::Proceed(Acquired {
+                lane: Lane::Web,
+                tok: None,
+                web_tag: Some(candidate.release.tag_name.clone()),
+                candidate: Some(candidate),
+            }))
+        }
+    }
+}
+
+/// The token-lane election failed closed (a duplicate candidate, a malformed tag, an
+/// unsigned maximum): `manifest`-class, with the two-tier wording.
+fn record_untrustworthy_election(staging: &Staging, current_build: u64, error: &str) {
+    crate::warn(error);
+    let h = crate::health::Health::record_failure(&staging.health(), "manifest", error);
+    // Two-tier wording, exactly like the pipeline branch below. "deferred"
+    // means postponed-and-will-retry, which is a lie for this class: an
+    // untrustworthy authoritative release stays untrustworthy until the
+    // PUBLISHER republishes, so retrying changes nothing. A machine sat at
+    // failure 597 still being told its check was "deferred".
+    let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
+        format!(
+            "FAILING ({} consecutive checks since {}): {error} — this machine \
+             cannot install any release until that is fixed at the publisher",
+            h.manifest_failures,
+            h.class_since("manifest")
+        )
+    } else {
+        format!(
+            "update check deferred: {error} (attempt {})",
+            h.manifest_failures
+        )
+    };
+    crate::status::record(staging, current_build, &msg);
+}
+
+/// Write a deferral for a rate-limit-shaped ASSET failure on `lane`: held to the
+/// LIST's `x-ratelimit-reset` on the token lane (the API window is what ran out), the
+/// plain deferred record on the web lane (a `github.com` 429 holds to nothing).
+fn record_asset_deferral(staging: &Staging, lane: Lane, current_build: u64, outcome: &str) {
+    match lane {
+        Lane::Token => record_deferral(staging, current_build, outcome),
+        Lane::Web | Lane::Unknown => record_web_deferral(staging, current_build, outcome),
+    }
+}
+
+/// Where `lane`'s release assets come from, for the wording of a fetch failure, and
+/// the `delivery=` note such a failure books — BY LANE, because the two lanes fetch
+/// from different hosts and a message naming the wrong one sends an operator to
+/// debug a host the check never spoke to (2026-09-04 audit). The web lane fetches
+/// every asset from the unmetered download host (`github.com/…/releases/download/…`)
+/// and books `blocked` — the host did not serve an asset the release names (a
+/// filtering proxy, or a publish missing an asset); the token lane fetches through
+/// the releases API and books `api-failed`. Neither note contains whitespace: it is
+/// one token of the space-separated status line.
+fn asset_source(lane: Lane) -> (&'static str, &'static str) {
+    match lane {
+        Lane::Token => ("the releases API", "api-failed"),
+        Lane::Web | Lane::Unknown => ("the download host", "blocked"),
+    }
+}
+
+/// A publishable stage strictly newer than the running build, as the check loop's
+/// `Some` answer: "a build is staged and can be applied" — reported so the apply lane
+/// arms even on a check that fetched nothing.
+fn applicable_stage(staging: &Staging, current_build: u64) -> Option<String> {
+    Ready::read_publishable(staging)
+        .filter(|ready| ready.build_number > current_build)
+        .map(|ready| ready.version)
+}
+
+/// Remove the state files a PREVIOUS design of this crate wrote into the `0700`
+/// Updates root and nothing reads any more: `catalog.json` / `catalog.headers`, the
+/// conditional-request memo (ETag + cached LIST body) of the API-lane builds up to
+/// d15e9ff47 (v0.74.0). Without this every upgraded machine keeps a stale ETag memo
+/// forever — `sweep_download_scratch` sweeps only `download/`.
+fn reclaim_retired_state(staging: &Staging) {
+    for name in ["catalog.json", "catalog.headers"] {
+        let _ = std::fs::remove_file(staging.root.join(name));
+    }
+}
+
 fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<String>, String> {
     // Only stage for a real installed bundle (a dev build has nothing to swap).
     if bundle::resolve().is_none() {
         return Ok(None);
     }
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    reclaim_retired_state(&staging);
     crate::status::clear_check_note();
+    // The hold epoch is THIS check's to set or not: a previous check's reset must never
+    // be read back by the loop as this one's (a rate-limited LIST whose headers carry
+    // no reset would otherwise "hold" to an epoch already in the past).
+    RATE_LIMIT_RESET.store(0, Ordering::Relaxed);
     // A surviving apply streak recorded by a DIFFERENT build is proven stale
     // — the machine moved by SOME means (channel, manual install, boot swap)
     // — so every check heals it here rather than letting `update status`
@@ -2040,103 +2193,59 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     }
     // The Application Support dir is the Updates dir's parent.
     let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
-    // ONE walk of the token chain: the token, or the diagnosis explaining why there
-    // isn't one. Resolving and then separately diagnosing would re-spawn `security`
-    // and `gh` on every check of an unprovisioned machine.
-    //
-    // RESOLVE, DO NOT GATE: the absence of a token may never end a check here — only
-    // a network response may declare this machine unable to update (`plan_credential`,
-    // `classify_list_error`).
-    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(
-        &support,
-        &source.owner,
-        &source.repo,
-    ));
 
     // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
     let floor = crate::manifest::Floor::read(&staging.floor());
 
-    // List first, decide after: [`fetch_release_catalog`] documents the ordering
-    // contract, the credential ladder (it may clear `tok` in place) and the conditional
-    // fast path that makes a steady-state check cost a 304 instead of the whole history.
-    //
-    // The page fetcher is INJECTED rather than called directly, so the check's request
-    // and byte cost is measurable in a test (`aterm-update`'s catalog-cost harness) —
-    // there was no other seam. The header sink is a file in the same `0700` Updates
-    // directory as the rest of the staging state; curl dumps response headers there so
-    // the `ETag` can be read back without corrupting the body it also writes to stdout.
-    let header_sink = staging.catalog_headers();
-    let mut fetch = |url: &str, validator: Option<&str>, token: Option<&str>| {
-        aterm_update_core::api_get_conditional(url, token, validator, Some(header_sink.as_path()))
+    // The two transports, INJECTED rather than called directly, so the lane choice and
+    // its request cost are measurable in a test. The token lane's header sink is a file
+    // in the same `0700` Updates directory as the rest of the staging state; curl dumps
+    // the LIST's response headers there so the `x-ratelimit-*` block can be read back
+    // without corrupting the body it also writes to stdout. The web lane's HEAD needs
+    // no sink: the headers ARE its answer.
+    let header_sink = staging.list_headers();
+    let mut list = |url: &str, token: &str| {
+        aterm_update_core::api_get_with_headers(url, Some(token), Some(header_sink.as_path()))
     };
-    let Some(catalog) = fetch_release_catalog(
+    let mut head = aterm_update_core::head_no_redirect;
+    let acquired = match acquire(
         &staging,
         current_build,
         source,
-        &mut tok,
-        diagnosis,
-        &mut fetch,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    // A revalidated catalog reuses the selection computed from those exact bytes; a fresh
-    // one selects now and — only if the selection SUCCEEDED and the walk was memoizable —
-    // records both for the next check. An ERROR is never memoized: an untrustworthy
-    // authoritative release must be re-derived every check, so republishing fixes it on
-    // the next tick rather than after a cache expires (there being no expiry).
-    let (selection, validators) = match catalog {
-        Catalog::Unchanged(selected) => (Ok(selected), None),
-        Catalog::Fresh {
-            releases,
-            validators,
-        } => (
-            select_authoritative_release(releases, crate::PINNED_UPDATE_PUBKEYS),
-            validators,
-        ),
-    };
-    let authoritative = match selection {
-        Ok(candidate) => {
-            if let Some(validators) = validators {
-                CatalogMemo::write(
-                    &staging.catalog_memo(),
-                    source,
-                    tok.is_some(),
-                    current_build,
-                    validators,
-                    candidate.as_ref(),
-                );
-            }
-            candidate
-        }
-        Err(error) => {
-            crate::warn(&error);
-            let h = crate::health::Health::record_failure(&staging.health(), "manifest", &error);
-            // Two-tier wording, exactly like the pipeline branch below. "deferred"
-            // means postponed-and-will-retry, which is a lie for this class: an
-            // untrustworthy authoritative release stays untrustworthy until the
-            // PUBLISHER republishes, so retrying changes nothing. A machine sat at
-            // failure 597 still being told its check was "deferred".
-            let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
-                format!(
-                    "FAILING ({} consecutive checks since {}): {error} — this machine \
-                     cannot install any release until that is fixed at the publisher",
-                    h.manifest_failures,
-                    h.class_since("manifest")
-                )
-            } else {
-                format!(
-                    "update check deferred: {error} (attempt {})",
-                    h.manifest_failures
-                )
-            };
-            crate::status::record(&staging, current_build, &msg);
-            return Ok(None);
+        &support,
+        &mut list,
+        &mut head,
+    )? {
+        Acquisition::Proceed(acquired) => acquired,
+        Acquisition::Ended => return Ok(None),
+        Acquisition::UpToDate { tag } => {
+            // THE STEADY STATE, on one request. The pointer names the tag this ledger
+            // last authorized, so nothing is fetched and nothing is re-judged: the
+            // release was accepted or declined on a previous check under the same
+            // gates, and only a MOVED pointer can change that answer. A terminal
+            // healthy outcome — the channel was read.
+            crate::health::Health::record_success(&staging.health());
+            crate::status::set_latest_tag(&tag, source);
+            crate::status::record(
+                &staging,
+                current_build,
+                &format!("up to date (channel head {tag}){}", lane_note(source)),
+            );
+            // …still answering `Some` for a stage a sibling won the race to publish,
+            // so this process's apply lane arms too (see the covered arms below).
+            return Ok(applicable_stage(&staging, current_build));
         }
     };
-    // The asset fetches ride the SAME lane the list request settled on: if the token
-    // was rejected above, `tok` is already `None` and these go anonymous too.
+    let Acquired {
+        lane,
+        tok,
+        candidate: authoritative,
+        web_tag,
+    } = acquired;
+    // The asset fetches ride the credential the lane settled on: `Some(token)` to the
+    // asset API on the token lane, `None` to the derived web URLs on the web lane. The
+    // transport's own host gate (`refuse_credential_off_api`) makes the pairing
+    // structural — a credential can never reach `github.com` from here.
     let mut download = |url: &str, max_bytes: u64| {
         aterm_update_core::download_bytes(url, tok.as_deref(), max_bytes)
     };
@@ -2149,7 +2258,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // build still taking the unarmed keyset path is a fork that has not committed a
     // master of its own (branch (A) of `fetch_authoritative_release`).
     //
-    // `floor_seq` is a snapshot read before the (network) list fetch above, so it can be
+    // `floor_seq` is a snapshot read before the (network) head fetch above, so it can be
     // stale by the time a roster is admitted; `floor_refresh` re-reads the durable floor
     // at the admission point itself, closing the check-vs-ratchet TOCTOU between two
     // concurrent app instances.
@@ -2161,12 +2270,26 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         now_unix: unix_now(),
         floor_refresh: Some(&floor_refresh),
     };
-    let fetched = fetch_authoritative_release(
+    let mut fetched = fetch_authoritative_release(
         authoritative,
         crate::PINNED_UPDATE_PUBKEYS,
         &mut download,
         &roster_policy,
     );
+    // THE URL CROSS-CHECK, after every signature has been verified and the version
+    // bound, and before anything is staged: on the web lane the signed manifest must
+    // name the very container URL this client derived under the pointer's tag.
+    if lane == Lane::Web
+        && let Some((manifest, release, _)) = fetched.selected.as_ref()
+        && let Err(error) = web_container_url_agrees(source, &release.tag_name, manifest)
+    {
+        crate::warn(&format!(
+            "{error}; refusing authoritative {}",
+            release.tag_name
+        ));
+        fetched.selected = None;
+        fetched.manifest_rejected = true;
+    }
     // ATTRIBUTION, recorded where a human will find it later: the updater's own status
     // file, beside the release it describes. The owner's requirement is "I can track
     // which computer does what", and for the client half this is the record. It is
@@ -2181,12 +2304,6 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     }
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let asset_fetch_rate_limited = fetched.asset_fetch_rate_limited;
-    if !asset_fetch_rate_limited {
-        // The small assets fetched without a rate limit (or were not needed): the
-        // small-asset streak is over — on EVERY check, including the common "up to
-        // date" one, not only the path that goes on to download a container.
-        ASSET_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
-    }
     let manifest_rejected = fetched.manifest_rejected;
     let observed_roster_seq = fetched.observed_roster_seq;
     let best = fetched.selected;
@@ -2278,60 +2395,55 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
-        if appcast_fetch_error
-            && asset_fetch_rate_limited
-            && rate_limit_still_deferrable(&ASSET_RATE_LIMIT_STREAK)
-        {
-            // The manifest/roster/signature GET met GitHub's rate limit — the same
-            // verdict `ListDecision::RateLimited` gets one request earlier, and for
-            // the same reason no `record_failure`: three saturated checks in a row
-            // on a shared anonymous IP used to book a persistent `pipeline` streak
-            // and fire the "download pipeline is likely broken" notice at a
-            // perfectly healthy machine (2026-08-19 audit). Latch the back-off and
-            // say "deferred", exactly as the list-level path does.
-            RATE_LIMITED.store(true, Ordering::Relaxed);
-            let message = "GitHub rate limit hit while fetching a release asset — \
-                           backing off, will retry on the next check";
-            crate::status::record(
+        if appcast_fetch_error && asset_fetch_rate_limited {
+            // The manifest/roster/signature GET met GitHub's throttle — the same
+            // verdict a rate-limited LIST gets one request earlier, and for the same
+            // reason no `record_failure`: a saturated check must not book a
+            // persistent `pipeline` streak and fire the "download pipeline is likely
+            // broken" notice at a perfectly healthy machine (2026-08-19 audit).
+            // "deferred" is the substring every sibling's ledger gate reads.
+            record_asset_deferral(
                 &staging,
+                lane,
                 current_build,
-                &format!("update check deferred: {message}"),
+                "update check deferred: GitHub rate limit hit while fetching a release \
+                 asset — backing off, will retry on the next check",
             );
             return Ok(None);
         }
         let msg = if appcast_fetch_error {
-            // Manifests exist but could not be downloaded while the releases list
-            // succeeded — a `pipeline`-class failure. The ledger decides the honest
-            // wording: a streak ≥ PERSISTENT_AFTER is not called "deferred".
+            // Manifests exist but could not be downloaded while the channel head was
+            // readable — a `pipeline`-class failure. The ledger decides the honest
+            // wording: a streak ≥ PERSISTENT_AFTER is not called "deferred". Worded
+            // and noted BY LANE: the host that did not answer is the one this lane
+            // actually asked (`asset_source`).
+            let (host, note) = asset_source(lane);
+            crate::status::set_delivery_note(note);
             let h = crate::health::Health::record_failure(
                 &staging.health(),
                 "pipeline",
-                if asset_fetch_rate_limited {
-                    "release assets answer HTTP 403/429 check after check while the release \
-                     list succeeds — a blocked download host, not GitHub's rate limit"
-                } else {
-                    "release manifests exist but could not be fetched"
-                },
+                &format!("release manifests exist but could not be fetched from {host}"),
             );
             if h.pipeline_failures >= crate::PERSISTENT_AFTER {
                 format!(
                     "FAILING ({} consecutive checks since {}): release manifests exist \
-                     but cannot be downloaded — this build's download pipeline is \
-                     likely broken",
+                     but cannot be downloaded from {host} — this build's download \
+                     pipeline is likely broken",
                     h.pipeline_failures,
                     h.class_since("pipeline")
                 )
             } else {
                 format!(
                     "update check deferred: a release manifest could not be fetched \
-                     (attempt {} — will retry)",
+                     from {host} (attempt {} — will retry)",
                     h.pipeline_failures
                 )
             }
         } else if manifest_rejected {
             // Manifests were FETCHED but rejected (unsigned / bad signature /
-            // unparseable): the pipeline works; the release side (or an attacker)
-            // is the problem. Its own class — it must not clear a streak.
+            // unparseable / a version or URL that does not bind to the tag): the
+            // pipeline works; the release side (or an attacker) is the problem. Its
+            // own class — it must not clear a streak.
             let h = crate::health::Health::record_failure(
                 &staging.health(),
                 "manifest",
@@ -2350,8 +2462,8 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                     .to_string()
             }
         } else {
-            // The check itself ran fine (list fetched, nothing carries a manifest):
-            // clear any stale failure streak so health reflects THIS check.
+            // The check itself ran fine (the head was read, nothing carries a
+            // manifest): clear any stale failure streak so health reflects THIS check.
             crate::health::Health::record_success(&staging.health());
             format!("no release carries an update manifest{}", lane_note(source))
         };
@@ -2364,7 +2476,8 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // a streak instead of being reset every cycle by its own check's manifest fetch.
 
     // Downgrade gate: never stage an older-or-equal build. A terminal healthy
-    // outcome — the whole pipeline this check exercised worked.
+    // outcome — the whole pipeline this check exercised worked — and the one that
+    // records `latest_tag`, so the next web-lane check stops at the HEAD.
     //
     // DELIBERATELY NOT GATED ON THE BUNDLE AT THIS PATH. Suppressing the download
     // when the installed bundle already carries this build would save one redundant
@@ -2375,6 +2488,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // not an input to an acquisition decision (2026-08-19 round-4 skeptics).
     if manifest.build_number <= current_build {
         crate::health::Health::record_success(&staging.health());
+        if let Some(tag) = web_tag.as_deref() {
+            crate::status::set_latest_tag(tag, source);
+        }
         crate::status::record(
             &staging,
             current_build,
@@ -2393,13 +2509,15 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     //
     // BOTH holds are TERMINAL HEALTHY outcomes and must clear the acquisition streaks,
     // for exactly the reason the downgrade gate immediately above does: everything this
-    // check exercised — the releases list, the appcast fetch, the signature/roster
+    // check exercised — the channel head, the appcast fetch, the signature/roster
     // admission — WORKED, and the only reason it stops here is a deliberate policy
     // decision about the build it found. Returning without `record_success` left the
     // network/pipeline/manifest streaks standing, and a machine parked under a yank
     // floor stays parked for days, so ordinary non-consecutive blips accumulated check
     // after check until one crossed PERSISTENT_AFTER and fired "your update pipeline is
     // likely broken" at a machine whose pipeline had just run end to end in front of it.
+    // (`latest_tag` is deliberately NOT recorded: a floor can move under the same tag,
+    // and re-judging costs unmetered requests only.)
     if manifest.build_number < effective_min_build {
         crate::health::Health::record_success(&staging.health());
         crate::status::record(
@@ -2426,7 +2544,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     }
 
     // If a newer build is already staged, don't re-download it. This is still a
-    // TERMINAL HEALTHY outcome — the list and the manifest were fetched and accepted;
+    // TERMINAL HEALTHY outcome — the head and the manifest were fetched and accepted;
     // the only step skipped is a download whose bytes we already have — so clear the
     // acquisition streaks. Omitting that let non-consecutive pipeline/manifest blips
     // accumulate for the whole life of a pending stage and cross PERSISTENT_AFTER,
@@ -2434,6 +2552,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // a stage waiting to apply.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
+        if let Some(tag) = web_tag.as_deref() {
+            crate::status::set_latest_tag(tag, source);
+        }
         record_covered_stage_status(&staging, current_build, &manifest);
         // ANSWER `Some`, exactly as the check loop's contract says: "the check
         // also answers `Some` for a build that was already published and is
@@ -2464,7 +2585,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         crate::install::unix_now_secs(),
     ) {
         // A backed-off re-stage is still a terminal healthy end to the ACQUISITION half
-        // of this check: the list, the appcast and its authorization all worked, and we
+        // of this check: the head, the appcast and its authorization all worked, and we
         // stop only because a memo says these exact bytes already refused to stage.
         // Recording nothing left the network/pipeline/manifest streaks standing for the
         // whole life of the memo — up to 24 h, and a quarantine's window never opens at
@@ -2505,6 +2626,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // apply lane too.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
+        if let Some(tag) = web_tag.as_deref() {
+            crate::status::set_latest_tag(tag, source);
+        }
         record_covered_stage_status(&staging, current_build, &manifest);
         return Ok(Ready::read_publishable(&staging).map(|ready| ready.version));
     }
@@ -2535,7 +2659,8 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // Download the exact unique same-release container identity already proven
     // while accepting the authoritative manifest — the zip when the release
     // carries one, else the DMG. No order-dependent asset lookup is permitted
-    // after this point.
+    // after this point. On the web lane the URL is the DERIVED one for the pointer's
+    // tag (the manifest's own `url` was cross-checked above and is never followed).
     let asset = &release.assets[artifact.asset_index];
     let container = artifact.container.label();
 
@@ -2544,8 +2669,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     sweep_download_scratch(&staging);
     // LIVE PROGRESS for a host that shows it (the aterm window's status bar): a
     // sibling poller stats the growing `.part` against the asset's declared size
-    // — the API's `size`, `0` when it was not reported, which the host renders as
-    // "unknown". Joined on drop, so it cannot outlive the download it watches.
+    // — the API's `size` on the token lane, `0` on the web lane (and when the API
+    // did not report one), which the host renders as "unknown". Joined on drop, so
+    // it cannot outlive the download it watches.
     let download_watch = crate::progress::watch_download(&part, &manifest.version, asset.size);
     // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
@@ -2558,18 +2684,14 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     drop(download_watch);
     if let Err(e) = downloaded {
         let _ = std::fs::remove_file(&part);
-        // The container's own 429/403 is the same weather as the manifest's, one
-        // request later in the check: deferred (bounded by the streak), not a
-        // pipeline failure.
-        if aterm_update_core::download_error_is_rate_limit(&e)
-            && rate_limit_still_deferrable(&CONTAINER_RATE_LIMIT_STREAK)
-        {
-            RATE_LIMITED.store(true, Ordering::Relaxed);
+        // The container's own 429 is the same weather as the manifest's, one
+        // request later in the check: deferred, not a pipeline failure.
+        if aterm_update_core::download_error_is_rate_limit(&e) {
             let note = format!(
                 "update check deferred: GitHub rate limit hit while downloading the \
                  {container} — backing off, will retry on the next check"
             );
-            crate::status::record(&staging, current_build, &note);
+            record_asset_deferral(&staging, lane, current_build, &note);
             // Answer the live channel too: the bar opened on the first byte and
             // a deferral is its honest end (the wrapper reports only `Err`s).
             if crate::progress::take_download_began() {
@@ -2577,6 +2699,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             }
             return Ok(None);
         }
+        // The same by-lane note as the manifest leg: the container came from the
+        // host this lane fetches from, and no other was asked.
+        crate::status::set_delivery_note(asset_source(lane).1);
         crate::health::Health::record_failure(
             &staging.health(),
             "pipeline",
@@ -2585,10 +2710,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Err(format!("{container} download failed: {e}"));
     }
 
-    // The container arrived: its streak is over.
-    CONTAINER_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
-    // …and everything from here to the publish is one "verifying" phase on the
-    // live channel: size, digest, extract, codesign/Gatekeeper, the atomic stage.
+    // The container arrived; everything from here to the publish is one "verifying"
+    // phase on the live channel: size, digest, extract, codesign/Gatekeeper, the
+    // atomic stage.
     crate::progress::report(crate::progress::Progress::Verifying {
         version: manifest.version.clone(),
     });
@@ -2697,11 +2821,15 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let _ = std::fs::remove_file(&container_path);
     crate::manifest::FailedMark::clear(&staging.failed());
     // Terminal healthy outcome: this check exercised the WHOLE pipeline (manifest,
-    // DMG, verify, stage) successfully — clear every failure streak.
+    // container, verify, stage) successfully — clear every failure streak.
     crate::health::Health::record_success(&staging.health());
     // Raise the high-water to the build we just staged (never lowered): a later attempt
     // to roll us back below it is refused above (F6).
     crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number, 0);
+    // …and remember the tag, so the next web-lane check is one HEAD.
+    if let Some(tag) = web_tag.as_deref() {
+        crate::status::set_latest_tag(tag, source);
+    }
 
     // NOT "applies on next launch". The stager has no idea whether it does: the
     // in-session apply lane owns that decision, is on by default, and when it
@@ -2735,26 +2863,6 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
 
 #[cfg(test)]
 mod tests {
-    /// Each asset leg's rate-limit deferral is bounded by ITS OWN consecutive
-    /// streak and reset by ITS OWN success — three deferrals, then the failure is
-    /// booked; a success starts the count over.
-    #[test]
-    fn a_rate_limit_deferral_is_bounded_per_leg_and_reset_by_that_legs_success() {
-        let streak = std::sync::atomic::AtomicU32::new(0);
-        for _ in 0..super::ASSET_RATE_LIMIT_DEFERRALS {
-            assert!(super::rate_limit_still_deferrable(&streak));
-        }
-        assert!(
-            !super::rate_limit_still_deferrable(&streak),
-            "the fourth is booked"
-        );
-        streak.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            super::rate_limit_still_deferrable(&streak),
-            "a success starts over"
-        );
-    }
-
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -2791,77 +2899,50 @@ mod tests {
         }
     }
 
-    /// A machine with no token, against a channel it cannot read, must produce a
-    /// Blocked decision whose text names the consequence, all three indistinguishable
-    /// causes, and the exact remedy for each — never a bare "idle", which an operator
+    /// The web lane's standing "cannot read the channel" wording must survive being read
+    /// months later out of `status.toml`: the consequence, every cause GitHub renders
+    /// identically, and the remedy for each — never a bare "idle", which an operator
     /// cannot tell apart from "no updates available".
     #[test]
-    fn an_unreadable_channel_without_a_token_is_loud_and_actionable_not_idle() {
+    fn an_unreadable_channel_is_loud_and_actionable_not_idle() {
         let source = test_source();
-        for error in [
-            not_found(),
-            HttpError::Unauthorized { code: 401 },
-            HttpError::Unauthorized { code: 403 },
-        ] {
-            let ListDecision::Blocked(text) =
-                classify_list_error(&error, false, false, &source, Some(&unprovisioned()))
-            else {
-                panic!("{error:?} with no token must block, not idle or fail");
-            };
-            // The consequence, in the words the status/notification surfaces assert.
-            assert!(text.contains("NEVER receive an update"), "{text}");
-            // The channel, so an operator can see WHICH repo was unreadable.
-            assert!(text.contains("github.com/alabsystems/aterm"), "{text}");
-            // All three causes: GitHub answers identically for every one of them, so
-            // guessing (and naming only "private repo") sends operators down the
-            // wrong path when the real fault is a typo'd owner/repo.
-            assert!(text.contains("PRIVATE"), "cause 1 missing: {text}");
-            assert!(text.contains("does not exist"), "cause 2 missing: {text}");
-            assert!(
-                text.contains("ATERM_UPDATE_OWNER"),
-                "cause 3 missing: {text}"
-            );
-            // The copy-pasteable fix for cause 1 — and it must be the rung THIS
-            // source actually consults. On the compiled-in public channel the token
-            // chain reads only `$ATERM_UPDATE_TOKEN` (it will not go looking for an
-            // ambient credential to read a public repo), so telling the operator to
-            // write the 0600 file would send them to watch nothing change
-            // (2026-08-19).
-            assert!(
-                text.contains(token::provision_remedy(&source.owner, &source.repo)),
-                "{text}"
-            );
-            assert!(
-                text.contains("ATERM_UPDATE_TOKEN"),
-                "the default channel's only rung must be named: {text}"
-            );
-            assert!(
-                !text.contains(token::PROVISION_COMMAND),
-                "the 0600-file remedy is a no-op on the default channel: {text}"
-            );
-        }
+        let text = unreadable_explanation(404, &source, Some(&unprovisioned()));
+        assert!(text.contains("NEVER receive an update"), "{text}");
+        assert!(text.contains("github.com/alabsystems/aterm"), "{text}");
+        assert!(text.contains("HTTP 404"), "{text}");
+        // Every cause the web host cannot distinguish.
+        assert!(
+            text.contains("no published release"),
+            "cause 1 missing: {text}"
+        );
+        assert!(text.contains("private"), "cause 2 missing: {text}");
+        assert!(
+            text.contains("ATERM_UPDATE_OWNER"),
+            "cause 3 missing: {text}"
+        );
+        // On the compiled-in public channel a token is IGNORED, so no token remedy is
+        // offered there: a user who followed it would watch nothing change.
+        assert!(text.contains("ignored"), "{text}");
+        assert!(
+            !text.contains(token::PROVISION_COMMAND) && !text.contains("ATERM_UPDATE_TOKEN"),
+            "a token remedy on the public channel is a no-op and must not be printed: {text}"
+        );
 
-        // …and an OVERRIDDEN source does consult the ambient chain, so there the
-        // 0600-file remedy is the right one to print.
-        {
-            let overridden = Source {
-                owner: "someone-else".to_string(),
-                repo: "private-aterm".to_string(),
-            };
-            let ListDecision::Blocked(text) = classify_list_error(
-                &not_found(),
-                false,
-                false,
-                &overridden,
-                Some(&unprovisioned()),
-            ) else {
-                panic!("an unreadable overridden channel with no token must block");
-            };
-            assert!(text.contains(token::PROVISION_COMMAND), "{text}");
-        }
-
-        // A token the CHAIN refused (chmod 644) is the actionable sub-case and must
-        // be named rather than folded into "not configured".
+        // A REPOINTED source walks the token chain, so there the private case has a
+        // remedy and the refused-token sub-case is named rather than folded into "not
+        // configured".
+        let overridden = Source {
+            owner: "someone-else".to_string(),
+            repo: "private-aterm".to_string(),
+        };
+        let text = unreadable_explanation(404, &overridden, Some(&unprovisioned()));
+        assert!(text.contains("PRIVATE"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("no update token is provisioned"), "{text}");
+        assert!(
+            text.contains(token::provision_remedy(&overridden.owner, &overridden.repo)),
+            "{text}"
+        );
         use aterm_update_core::token::{ProbeOutcome, SourceProbe};
         let refused = token::Diagnosis {
             resolved: None,
@@ -2870,11 +2951,7 @@ mod tests {
                 outcome: ProbeOutcome::Rejected("chmod 600 it"),
             }],
         };
-        let ListDecision::Blocked(text) =
-            classify_list_error(&not_found(), false, false, &source, Some(&refused))
-        else {
-            panic!("must block");
-        };
+        let text = unreadable_explanation(404, &overridden, Some(&refused));
         assert!(
             text.contains("0600 update-token file (chmod 600 it)"),
             "the refused source must be named: {text}"
@@ -2883,270 +2960,152 @@ mod tests {
 
     /// A missing token must not stop a check before the network. `plan_credential` is
     /// deliberately total — it has no value that means "stop" — so the only way to
-    /// reintroduce a gate is to change its type, which this test pins.
-    ///
-    /// The residual gap this test does NOT close: a hand-written `return` added
-    /// directly inside `check_and_stage` still slips past every automated test here,
-    /// because `check_and_stage` resolves its own staging dir and network and cannot
-    /// be driven from a unit test. Closing that needs the fetch/staging seams to be
-    /// injectable.
+    /// reintroduce a gate is to change its type, which this test pins. A source with no
+    /// token is simply on the web lane, and only a network answer (the pointer's) may
+    /// declare a machine unable to update.
     #[test]
     fn a_missing_token_never_stops_a_check_before_the_network() {
-        // The unprovisioned machine: the chain found nothing.
-        let diagnosis = unprovisioned();
-        let (tok, carried) = plan_credential(Err(diagnosis));
+        let (tok, carried) = plan_credential(Err(unprovisioned()));
         assert!(tok.is_none(), "no token was resolvable");
         assert!(
             carried.is_some(),
             "the diagnosis must survive so the channel-unreadable explanation can name \
              WHY there is no token, instead of the misleading 'not configured'"
         );
-        // …and the check proceeds: the ONLY thing that may now declare this machine
-        // unable to update is a network response.
-        assert_eq!(
-            classify_list_error(
-                &HttpError::RateLimited {
-                    code: 429,
-                    url: "u".into(),
-                    authenticated: false
-                },
-                false,
-                false,
-                &test_source(),
-                carried.as_ref(),
-            ),
-            ListDecision::RateLimited(
-                "GitHub rate limit hit (HTTP 429) for u; the unauthenticated API allows ~60 \
-                 requests/hour per IP address — backing off, will retry on the next check"
-                    .to_string()
-            ),
-            "an anonymous check must reach — and be judged by — the network"
-        );
-
-        // A resolved token still flows through unchanged, with no diagnosis.
         let (tok, carried) = plan_credential(Ok(("ghp_x".to_string(), "$ATERM_UPDATE_TOKEN")));
         assert_eq!(tok.as_deref(), Some("ghp_x"));
         assert!(carried.is_none());
     }
 
-    /// A rate limit is not a broken pipeline and not an auth failure. It must reach
-    /// the caller as its own decision so the check backs off WITHOUT recording a
-    /// health failure — a streak there fires the "your update pipeline is likely
-    /// broken" notification at a machine that is merely checking too often.
+    /// The TOKEN lane's LIST ladder: a rate limit backs off without a health streak or
+    /// an auth verdict; a rejected credential drops the check onto the web lane (never
+    /// "unprovisioned", never a strand); a renamed repository is the standing Blocked
+    /// state; everything else — including 404 WITH a token — is today's failure path.
     #[test]
-    fn a_rate_limit_backs_off_and_is_never_an_auth_or_pipeline_failure() {
+    fn the_token_lane_list_ladder_classifies_every_answer() {
         let source = test_source();
         let url = "https://api.github.com/repos/alabsystems/aterm/releases".to_string();
-        for (had_token, authenticated) in [(true, true), (false, false)] {
-            let error = HttpError::RateLimited {
+        let ListDecision::RateLimited(text) = classify_list_error(
+            &HttpError::RateLimited {
                 code: 429,
                 url: url.clone(),
-                authenticated,
-            };
-            let decision =
-                classify_list_error(&error, had_token, false, &source, Some(&unprovisioned()));
-            let ListDecision::RateLimited(text) = decision else {
-                panic!("a rate limit must classify as RateLimited, got {decision:?}");
-            };
-            assert!(
-                !text.contains("rotate") && !text.contains("NEVER receive an update"),
-                "a rate limit must not read as a revoked token or a stranded machine: {text}"
-            );
-            assert!(text.contains("backing off"), "{text}");
-        }
-        // The anonymous lane's advice has to name the budget that was actually hit —
-        // ~60/hour per IP, shared by every machine behind one NAT.
-        let anon = HttpError::RateLimited {
-            code: 403,
-            url,
-            authenticated: false,
+                authenticated: true,
+            },
+            &source,
+        ) else {
+            panic!("a rate limit must classify as RateLimited");
         };
-        let ListDecision::RateLimited(text) =
-            classify_list_error(&anon, false, false, &source, None)
-        else {
-            panic!("must be RateLimited");
-        };
-        assert!(text.contains("~60 requests/hour per IP"), "{text}");
-    }
-
-    /// A resolved token that GitHub rejects gets exactly ONE anonymous retry: a
-    /// stale ambient `gh auth token` must not brick a machine whose channel is
-    /// public. The retry is bounded — after it, the failure is reported as the auth
-    /// problem it is, and is NEVER mistaken for an unprovisioned machine (which would
-    /// tell the operator to provision a token they already have).
-    #[test]
-    fn a_rejected_token_is_retried_anonymously_exactly_once() {
-        let source = test_source();
+        assert!(
+            !text.contains("rotate") && !text.contains("NEVER receive an update"),
+            "a rate limit must not read as a revoked token or a stranded machine: {text}"
+        );
+        assert!(text.contains("backing off"), "{text}");
         for code in [401u16, 403] {
             assert_eq!(
-                classify_list_error(
-                    &HttpError::Unauthorized { code },
-                    true,
-                    false,
-                    &source,
-                    None
-                ),
-                ListDecision::RetryAnonymous,
-                "HTTP {code} with a token must be retried without it"
+                classify_list_error(&HttpError::Unauthorized { code }, &source),
+                ListDecision::TokenRejected,
+                "HTTP {code} with a token continues on the web lane"
             );
-            // …and after the retry, it is a plain failure with today's wording.
-            let ListDecision::Failed(text) =
-                classify_list_error(&HttpError::Unauthorized { code }, true, true, &source, None)
-            else {
-                panic!("the retry must not loop");
-            };
-            assert!(text.contains("rotate it"), "{text}");
         }
-        // A 404 WITH a token is a real, actionable auth problem (the token cannot see
-        // the repo) — never a retry, and never the no-token "blocked" wording.
-        let ListDecision::Failed(text) =
-            classify_list_error(&not_found(), true, false, &source, None)
-        else {
-            panic!("404 with a token is a failure, not a retry or a strand");
+        for code in [301u16, 308] {
+            let ListDecision::Blocked(text) = classify_list_error(
+                &HttpError::Status {
+                    code,
+                    url: url.clone(),
+                },
+                &source,
+            ) else {
+                panic!("a moved repository is a standing state, not weather");
+            };
+            assert!(text.contains("renamed or transferred"), "{text}");
+            assert!(text.contains("ATERM_UPDATE_OWNER"), "{text}");
+        }
+        let ListDecision::Failed(text) = classify_list_error(&not_found(), &source) else {
+            panic!("404 with a token is a failure, not a strand");
         };
         assert!(text.contains("404"), "{text}");
-    }
-
-    /// Nothing about the ladder may turn a machine that HAS a working token into a
-    /// blocked one: `Blocked` is reachable only when the chain produced no token at
-    /// all, and transport/other statuses stay on today's `network`-class failure path
-    /// regardless of lane.
-    #[test]
-    fn a_machine_with_a_token_is_never_classified_as_unprovisioned() {
-        let source = test_source();
-        let every_error = [
-            not_found(),
-            HttpError::Unauthorized { code: 401 },
-            HttpError::Unauthorized { code: 403 },
+        for error in [
             HttpError::Status {
                 code: 500,
-                url: "https://api.github.com/x".into(),
+                url: url.clone(),
             },
             HttpError::Transport("curl GET x failed (exit 6): dns".into()),
             HttpError::Malformed("GitHub API returned HTTP <html> for x".into()),
-        ];
-        for error in &every_error {
-            for already_retried in [false, true] {
-                let decision = classify_list_error(error, true, already_retried, &source, None);
-                assert!(
-                    !matches!(decision, ListDecision::Blocked(_)),
-                    "{error:?} (retried={already_retried}) must not read as an \
-                     unprovisioned machine: {decision:?}"
-                );
-            }
-        }
-        // Transport and unexpected statuses are unchanged on BOTH lanes: they are
-        // genuine transient faults, so they keep the `network`-class Err path.
-        for had_token in [true, false] {
-            for error in [
-                HttpError::Transport("curl GET x failed (exit 6): dns".into()),
-                HttpError::Status {
-                    code: 500,
-                    url: "https://api.github.com/x".into(),
-                },
-            ] {
-                assert!(
-                    matches!(
-                        classify_list_error(&error, had_token, false, &source, None),
-                        ListDecision::Failed(_)
-                    ),
-                    "{error:?} must stay a failure (had_token={had_token})"
-                );
-            }
+        ] {
+            assert!(
+                matches!(
+                    classify_list_error(&error, &source),
+                    ListDecision::Failed(_)
+                ),
+                "{error:?} must stay a failure"
+            );
         }
     }
 
-    /// The lane latch is what the background loop reads to choose a cadence its
-    /// rate-limit budget can afford, and what clears the stranded state. A successful
-    /// anonymous read must clear the latch just like an authenticated one: on a
-    /// public channel, "we can read it" is the whole property.
+    /// The lane latch is what the background loop reads to choose a cadence, and what
+    /// clears the stranded state. Reading the channel on the web lane — with no
+    /// credential at all — clears it exactly as a token-lane read does, and the healthy
+    /// status names the lane, the interval and (per channel) WHY a token is absent.
     #[test]
-    fn a_successful_anonymous_read_establishes_the_lane_and_clears_the_strand() {
+    fn a_readable_channel_establishes_the_lane_and_clears_the_strand() {
         let _serialized = crate::STRANDED_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let source = test_source();
         RATE_LIMITED.store(true, Ordering::Relaxed);
+        RATE_LIMIT_RESET.store(7, Ordering::Relaxed);
         TOKEN_REJECTED.store(false, Ordering::Relaxed);
-        note_readable(false, &source);
-        assert_eq!(lane(), Lane::Anonymous);
+        note_readable(Lane::Web, &source);
+        assert_eq!(lane(), Lane::Web);
         assert!(
             !rate_limited(),
             "a completed read clears the rate-limit backoff latch"
         );
+        assert_eq!(rate_limit_reset(), None, "…and any hold");
         assert!(!crate::no_token::is_stranded());
-        // …and the healthy status says WHICH lane, so `aterm-ctl update status` can
-        // answer "why is this Mac slow to update?" without anyone reading the log.
         let note = lane_note(&source);
         assert!(
-            note.contains("anonymously") && note.contains("30-minute"),
+            note.contains("unmetered web lane")
+                && note.contains("30-minute")
+                && note.contains("no GitHub API request is made"),
             "{note}"
         );
         // On the PUBLIC channel the status must NOT claim "no update token
-        // provisioned" — the installer may have written the update-token file,
-        // and this channel never reads it (token::walk consults only
-        // $ATERM_UPDATE_TOKEN for the compiled-in source). Name the channel
-        // and the file's irrelevance instead.
+        // provisioned" — the installer may have written the update-token file, and
+        // this channel ignores every rung. Name the channel and the file's irrelevance.
         assert!(
-            note.contains("public channel reads no") && note.contains("token file"),
-            "the public-channel status names the channel and the file's irrelevance: {note}"
+            note.contains("ignores every update-token rung") && note.contains("repointed"),
+            "{note}"
         );
-        assert!(
-            note.contains("repointed"),
-            "…and says who a provisioned file WOULD serve: {note}"
-        );
-        assert!(
-            !note.contains("no update token provisioned"),
-            "the contradiction next to an installer-written token file: {note}"
-        );
-        // A REPOINTED channel walks the whole token chain, so for it the
-        // missing token stays the named, remediable cause.
+        assert!(!note.contains("no update token provisioned"), "{note}");
+        // A REPOINTED channel walks the whole chain, so for it the missing token stays
+        // the named, remediable cause.
         let repointed = Source {
             owner: "example".into(),
             repo: "mirror".into(),
         };
-        let rnote = lane_note(&repointed);
         assert!(
-            rnote.contains("no update token provisioned"),
-            "a repointed channel's remediable cause is still named: {rnote}"
+            lane_note(&repointed).contains("no update token provisioned"),
+            "{}",
+            lane_note(&repointed)
         );
-        // A rejected PROVISIONED token is the third way onto this lane, and it asks
-        // for the opposite remedy from both wordings above: rotation, never
-        // provisioning (round-11 audit).
+        // A rejected PROVISIONED token asks for the opposite remedy: rotation.
         TOKEN_REJECTED.store(true, Ordering::Relaxed);
         let rejected_note = lane_note(&source);
         assert!(
             rejected_note.contains("rejected by GitHub") && rejected_note.contains("rotate"),
-            "a rejected token must not be reported as an unprovisioned one: {rejected_note}"
+            "{rejected_note}"
         );
-        TOKEN_REJECTED.store(false, Ordering::Relaxed);
-
-        note_readable(true, &source);
-        assert_eq!(lane(), Lane::Authenticated);
+        // A token-lane read ends the rejected story and keeps the historical wording.
+        note_readable(Lane::Token, &source);
+        assert_eq!(lane(), Lane::Token);
+        assert!(!TOKEN_REJECTED.load(Ordering::Relaxed));
         assert_eq!(
             lane_note(&source),
             "",
             "a provisioned machine's existing status wording must not change"
         );
-    }
-
-    fn test_staging(label: &str) -> Staging {
-        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "aterm-github-stage-{label}-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(root.join("download")).unwrap();
-        Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged/aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root,
-        }
+        note_readable(Lane::Web, &source);
     }
 
     fn candidate_manifest() -> Manifest {
@@ -3157,6 +3116,7 @@ mod tests {
             commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
             sha256: "ab".repeat(32),
             dmg: "aterm-0.54.0.dmg".into(),
+            url: None,
             zip: None,
             zip_sha256: None,
             min_build: None,
@@ -3895,8 +3855,7 @@ mod tests {
                 ],
                 &[],
             )
-            .err()
-            .expect("a noncanonical numeric maximum must fail closed");
+            .expect_err("a noncanonical numeric maximum must fail closed");
             assert!(
                 err.contains(same_or_newer_noncanonical) && err.contains("numeric dotted"),
                 "{err}"
@@ -3910,8 +3869,7 @@ mod tests {
             ],
             &[],
         )
-        .err()
-        .expect("an unorderable historical exact-name tag must fail closed");
+        .expect_err("an unorderable historical exact-name tag must fail closed");
         assert!(err.contains("numeric dotted"), "{err}");
     }
 
@@ -3928,8 +3886,7 @@ mod tests {
             ],
             &[public_key.as_str()],
         )
-        .err()
-        .expect("unsigned highest must defer");
+        .expect_err("unsigned highest must defer");
         assert!(err.contains("v0.10.0") && err.contains("unsigned"), "{err}");
 
         let mut duplicate_sig =
@@ -3940,8 +3897,7 @@ mod tests {
             size: 0,
         });
         let err = select_authoritative_release(vec![duplicate_sig, lower], &[public_key.as_str()])
-            .err()
-            .expect("duplicate highest signature must defer");
+            .expect_err("duplicate highest signature must defer");
         assert!(
             err.contains("duplicate assets") && err.contains(".sig"),
             "{err}"
@@ -4174,8 +4130,7 @@ mod tests {
                 vec![release_with_appcast(malformed, "must-not-fetch")],
                 &[],
             )
-            .err()
-            .expect("nonnumeric exact-name candidate must fail closed");
+            .expect_err("nonnumeric exact-name candidate must fail closed");
             assert!(err.contains("numeric dotted"), "{malformed}: {err}");
         }
         // Numeric but noncanonical: a leading zero gives one release two
@@ -4186,8 +4141,7 @@ mod tests {
                 vec![release_with_appcast(noncanonical_maximum, "must-not-fetch")],
                 &[],
             )
-            .err()
-            .expect("noncanonical numeric maximum must fail closed");
+            .expect_err("noncanonical numeric maximum must fail closed");
             assert!(
                 err.contains(noncanonical_maximum) && err.contains("numeric dotted"),
                 "{noncanonical_maximum}: {err}"
@@ -4201,8 +4155,7 @@ mod tests {
             size: 0,
         });
         let err = select_authoritative_release(vec![duplicate_asset], &[])
-            .err()
-            .expect("duplicate exact assets must fail closed");
+            .expect_err("duplicate exact assets must fail closed");
         assert!(err.contains("duplicate assets"), "{err}");
 
         let err = select_authoritative_release(
@@ -4212,8 +4165,7 @@ mod tests {
             ],
             &[],
         )
-        .err()
-        .expect("duplicate canonical candidates must fail closed");
+        .expect_err("duplicate canonical candidates must fail closed");
         assert!(
             err.contains("duplicate published update candidates"),
             "{err}"
@@ -4229,8 +4181,7 @@ mod tests {
             ],
             &[],
         )
-        .err()
-        .expect("an aliasing spelling must fail closed");
+        .expect_err("an aliasing spelling must fail closed");
         assert!(err.contains("numeric dotted"), "{err}");
     }
 
@@ -4288,8 +4239,7 @@ mod tests {
             ],
             &[],
         )
-        .err()
-        .expect("a poisoned maximum must fail closed, not elect the runner-up");
+        .expect_err("a poisoned maximum must fail closed, not elect the runner-up");
         assert!(
             err.contains("duplicate assets") && err.contains("v0.10.0"),
             "{err}"
@@ -4480,7 +4430,7 @@ mod tests {
 
     #[test]
     fn corrupt_high_ready_and_deleted_stage_cannot_suppress_restage() {
-        let staging = test_staging("publishable");
+        let staging = Staging::scratch("publishable");
         let manifest = candidate_manifest();
         std::fs::create_dir_all(&staging.staged_app).unwrap();
 
@@ -4548,7 +4498,7 @@ mod tests {
     /// actually looking for appeared nowhere.
     #[test]
     fn a_stage_that_already_covers_the_candidate_records_the_staged_decision() {
-        let staging = test_staging("covered-status");
+        let staging = Staging::scratch("covered-status");
         let manifest = candidate_manifest();
         let commit = manifest.commit.as_deref().unwrap();
         write_ready(&staging, manifest.build_number, commit, &manifest.sha256);
@@ -4610,7 +4560,7 @@ mod tests {
     /// bundle" could never reach PERSISTENT_AFTER.
     #[test]
     fn a_backed_off_check_clears_the_acquisition_streaks_but_never_the_stage_streak() {
-        let staging = test_staging("backoff-health");
+        let staging = Staging::scratch("backoff-health");
         let ledger = staging.health();
         crate::health::Health::record_failure(&ledger, "network", "dns");
         crate::health::Health::record_failure(&ledger, "pipeline", "asset fetch failed");
@@ -4633,7 +4583,7 @@ mod tests {
     fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         use crate::manifest::{FailedMark, RETRY_BACKOFF_SECS};
 
-        let staging = test_staging("stage-backoff-vs-apply");
+        let staging = Staging::scratch("stage-backoff-vs-apply");
         let manifest = candidate_manifest();
         let canonical_commit = manifest.commit.as_deref().unwrap().to_string();
         let running = manifest.build_number - 1;
@@ -4717,7 +4667,7 @@ mod tests {
     fn a_quarantined_build_is_skipped_forever_and_the_status_line_says_so() {
         use crate::manifest::FailedMark;
 
-        let staging = test_staging("stage-backoff-quarantine");
+        let staging = Staging::scratch("stage-backoff-quarantine");
         let manifest = candidate_manifest();
         let running = manifest.build_number - 1;
         const NOW: u64 = 1_000_000;
@@ -4784,7 +4734,7 @@ mod tests {
     /// the only reclaim, and it runs under the stage lock before the next download.
     #[test]
     fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
-        let staging = test_staging("download-sweep");
+        let staging = Staging::scratch("download-sweep");
 
         // Two abandoned versions plus the current one: a killed transfer's `.part` and
         // a fully-downloaded container that was never staged.
@@ -6118,425 +6068,1163 @@ mod tests {
         assert_eq!(urls, ["m-url"]);
     }
     // ---------------------------------------------------------------------------
-    // THE CATALOG COST HARNESS (aup-1)
+    // THE WEB LANE, MEASURED.
     //
-    // The win here is REQUESTS and BYTES, both structurally determined, so the honest
-    // instrument is a counter over a fake server rather than a timer: the page fetcher
-    // is injected, the fake records every URL, every validator and every body byte it
-    // hands back, and the tests assert the per-check cost in each regime.
-    //
-    //   cargo test -p aterm-update catalog -- --nocapture
-    //   -> {"regime":"cold","requests":1,"body_bytes":685123,...}
-    //      {"regime":"warm_304","requests":1,"body_bytes":0,...}
+    // Both transports are injected — the token lane's LIST fetcher and the web lane's
+    // HEAD — and the asset downloader is a closure, so every request a check makes is
+    // COUNTED here rather than claimed. On the web lane the LIST fake panics: "zero
+    // `api.github.com` requests" is then a fact the compiler and the test runner
+    // jointly enforce, on the happy path and on every failure path.
     // ---------------------------------------------------------------------------
 
-    /// A `Staging` rooted at a fresh temp dir. Built field-by-field rather than through
-    /// `Staging::resolve()` + `$ATERM_UPDATE_ROOT`, because `std::env::set_var` is
-    /// `unsafe` in edition 2024 and a data race under a multi-threaded test runner — and
-    /// because these tests must never be able to touch the real per-user ledgers.
-    fn scratch_staging(label: &str) -> Staging {
-        let root = std::env::temp_dir().join(format!(
-            "aterm-catalog-{label}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("download")).unwrap();
-        Staging {
-            apply_lock: root.join("apply.lock"),
-            stage_lock: root.join("stage.lock"),
-            download: root.join("download"),
-            staged_app: root.join("staged").join("aterm.app"),
-            ready: root.join("ready.toml"),
-            status: root.join("status.toml"),
-            root,
-        }
+    /// The release the fixture channel's pointer names.
+    const WEB_TAG: &str = "v0.10.0";
+
+    /// The DERIVED tag-specific URL of `name` on the fixture channel.
+    fn tag_url(tag: &str, name: &str) -> String {
+        aterm_update_core::cdn::release_download_url("alabsystems", "aterm", tag, name).unwrap()
     }
 
-    /// A GitHub-SHAPED listing page: real structure (`tag_name`, `draft`, `assets[]` with
-    /// `name`/`url`/`size`) plus the bulk our subset `Release`/`Asset` deliberately
-    /// ignores — the per-release `author` and per-asset `uploader` user blocks that make
-    /// the real page ~14.2 KB per release (measured 2026-08-20 against the shipped
-    /// channel: 594,708 bytes for 42 releases / 200 assets).
-    ///
-    /// The padding is explicit and lands the fixture inside that measured band, so the
-    /// byte figures these tests print describe the real cost rather than a toy one — and
-    /// the parse the warm path skips is a parse of REPRESENTATIVE bytes.
-    fn github_shaped_page(tags: &[&str]) -> Vec<u8> {
-        /// Measured bytes per release on the shipped channel (594,708 / 42, 2026-08-20).
-        const BYTES_PER_RELEASE: usize = 14_160;
-        let mut out = String::from("[");
-        for (i, tag) in tags.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            let mut release = format!(
-                "{{\"id\":{i},\"tag_name\":\"{tag}\",\"draft\":false,\"prerelease\":false,\
-                 \"assets\":[\
-                 {{\"name\":\"aterm-appcast.toml\",\"url\":\"https://api.github.com/a/{i}/1\",\"size\":512}},\
-                 {{\"name\":\"aterm-appcast.toml.sig\",\"url\":\"https://api.github.com/a/{i}/2\",\"size\":64}},\
-                 {{\"name\":\"aterm-{tag}-mac.zip\",\"url\":\"https://api.github.com/a/{i}/3\",\"size\":26417423}}\
-                 ]"
-            );
-            // Stand-in for the author/uploader user blocks and the release body: bulk the
-            // parser must walk and discard, which is most of what the wire carries.
-            let pad = BYTES_PER_RELEASE.saturating_sub(release.len() + 12);
-            release.push_str(",\"body\":\"");
-            release.push_str(&"x".repeat(pad));
-            release.push_str("\"}");
-            out.push_str(&release);
-        }
-        out.push(']');
-        out.into_bytes()
+    /// The DERIVED tag-specific URL prefix (`…/releases/download/<tag>/`) every GET of
+    /// `tag` must carry. (The builder refuses an empty name, so it is taken off a
+    /// placeholder.)
+    fn tag_prefix(tag: &str) -> String {
+        let url = tag_url(tag, "x");
+        url[..url.len() - 1].to_string()
     }
 
-    /// A fake page server that records what each check actually costs.
-    struct FakeChannel {
-        /// Page bodies, page 1 first.
-        pages: Vec<Vec<u8>>,
-        /// The `ETag` each page offers (`None` = the server offers none).
-        etags: Vec<Option<String>>,
-        /// Validators the server will HONOUR with a 304. Anything else gets a body.
-        honours: std::collections::BTreeSet<String>,
-        requests: std::cell::Cell<u32>,
-        body_bytes: std::cell::Cell<u64>,
-        conditional: std::cell::Cell<u32>,
+    /// The one evergreen URL a web-lane check is allowed to HEAD.
+    fn evergreen_url() -> String {
+        aterm_update_core::pointer::latest_download_url("alabsystems", "aterm", APPCAST_ASSET)
+            .unwrap()
     }
 
-    impl FakeChannel {
-        fn new(pages: Vec<Vec<u8>>, etags: Vec<Option<String>>) -> Self {
-            let honours = etags.iter().flatten().cloned().collect();
-            Self {
-                pages,
-                etags,
-                honours,
-                requests: std::cell::Cell::new(0),
-                body_bytes: std::cell::Cell::new(0),
-                conditional: std::cell::Cell::new(0),
-            }
-        }
-
-        /// Stop honouring every validator — what a published release does.
-        fn moved(&mut self) {
-            self.honours.clear();
-        }
-
-        fn serve(
-            &self,
-            url: &str,
-            validator: Option<&str>,
-        ) -> Result<aterm_update_core::ApiResponse, HttpError> {
-            self.requests.set(self.requests.get() + 1);
-            if validator.is_some() {
-                self.conditional.set(self.conditional.get() + 1);
-            }
-            let page = url
-                .rsplit("&page=")
-                .next()
-                .and_then(|p| p.parse::<usize>().ok())
-                .expect("the walk must ask for a numbered page");
-            if let Some(v) = validator
-                && self.honours.contains(v)
-            {
-                return Ok(aterm_update_core::ApiResponse::NotModified);
-            }
-            let body = self
-                .pages
-                .get(page - 1)
-                .cloned()
-                .unwrap_or_else(|| b"[]".to_vec());
-            self.body_bytes
-                .set(self.body_bytes.get() + body.len() as u64);
-            Ok(aterm_update_core::ApiResponse::Body {
-                bytes: body,
-                etag: self.etags.get(page - 1).cloned().flatten(),
-            })
-        }
-
-        fn report(&self, regime: &str) {
-            println!(
-                "{{\"regime\":\"{regime}\",\"requests\":{},\"conditional_requests\":{},\
-                 \"body_bytes\":{}}}",
-                self.requests.get(),
-                self.conditional.get(),
-                self.body_bytes.get()
-            );
-        }
+    /// GitHub's measured answer to the evergreen HEAD: a 302 whose `Location` is the
+    /// tag-specific appcast URL of `tag`.
+    fn redirect_to(tag: &str) -> Result<HeadAnswer, HttpError> {
+        Ok(HeadAnswer {
+            code: 302,
+            location: Some(tag_url(tag, APPCAST_ASSET)),
+        })
     }
 
-    /// Run one whole check's listing leg against `channel`.
-    fn run_check(staging: &Staging, channel: &FakeChannel) -> Option<Catalog> {
-        let source = test_source();
-        let mut tok = None;
-        let mut fetch = |url: &str,
-                         validator: Option<&str>,
-                         _token: Option<&str>|
-         -> Result<aterm_update_core::ApiResponse, HttpError> {
-            channel.serve(url, validator)
+    /// The LIST transport on the web lane: any call is the bug these tests exist to
+    /// catch.
+    fn no_api_ever(url: &str, _token: &str) -> Result<Vec<u8>, HttpError> {
+        panic!("the web lane made an api.github.com request: {url}")
+    }
+
+    /// The owner side of one web-lane release: a master-signed roster naming m3, and an
+    /// appcast for [`WEB_TAG`] signed by m3 whose `url` field is `container_url` — the
+    /// derived DMG URL by default, or whatever a test wants to bind against.
+    struct WebChannel {
+        master_pub: String,
+        machine_pub: String,
+        appcast: Vec<u8>,
+        appcast_sig: Vec<u8>,
+        roster: Vec<u8>,
+        roster_sig: Vec<u8>,
+    }
+
+    fn web_channel(container_url: Option<&str>) -> WebChannel {
+        let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
+        let m3 = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
+        let machine_pub = b64(m3.public_key().as_ref());
+        let roster = aterm_update_core::roster::Roster {
+            schema: 1,
+            roster_seq: 4,
+            valid_until: "2027-02-01T00:00:00Z".into(),
+            machines: vec![aterm_update_core::roster::Machine {
+                id: "m3".into(),
+                pubkey: machine_pub.clone(),
+                added_at: "2026-08-04T00:00:00Z".into(),
+                not_after: None,
+            }],
+            revoked: vec![],
         };
-        match fetch_release_catalog(staging, 100, &source, &mut tok, None, &mut fetch) {
-            Ok(catalog) => catalog,
-            Err(error) => panic!("the fake channel never fails: {error}"),
+        let roster = roster.to_toml().unwrap().into_bytes();
+        let mut appcast = String::from_utf8(manifest_bytes("0.10.0", 10, 0)).unwrap();
+        if let Some(url) = container_url {
+            appcast.push_str(&format!("url = {url:?}\n"));
+        }
+        appcast.push_str("machine_id = \"m3\"\nroster_seq = 4\n");
+        let appcast = appcast.into_bytes();
+        WebChannel {
+            master_pub: b64(master.public_key().as_ref()),
+            machine_pub,
+            appcast_sig: m3.sign(&appcast).as_ref().to_vec(),
+            appcast,
+            roster_sig: master.sign(&roster).as_ref().to_vec(),
+            roster,
         }
     }
 
-    /// Take the check all the way through selection + memo write, exactly as
-    /// `check_and_stage_inner` does, and return the chosen version.
-    fn run_check_and_memoize(staging: &Staging, channel: &FakeChannel) -> Option<String> {
-        let catalog = run_check(staging, channel).expect("the listing succeeded");
-        let (selection, validators) = match catalog {
-            Catalog::Unchanged(selected) => (Ok(selected), None),
-            Catalog::Fresh {
-                releases,
-                validators,
-            } => (
-                select_authoritative_release(releases, crate::PINNED_UPDATE_PUBKEYS),
-                validators,
+    impl WebChannel {
+        /// The pinned-master policy every armed client runs, over `masters` (the
+        /// caller's `[channel.master_pub.as_str()]` — a borrow the policy outlives).
+        fn policy<'a>(&self, masters: &'a [&'a str]) -> RosterPolicy<'a> {
+            RosterPolicy {
+                master_pubkeys: masters,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            }
+        }
+
+        /// Serve the four assets of [`WEB_TAG`] by their DERIVED URL — nothing else
+        /// exists, exactly like the real download host.
+        fn serve(&self, url: &str) -> Result<Vec<u8>, String> {
+            let base = tag_prefix(WEB_TAG);
+            let Some(name) = url.strip_prefix(base.as_str()) else {
+                return Err(format!("HTTP 404: no such asset {url}"));
+            };
+            match name {
+                APPCAST_ASSET => Ok(self.appcast.clone()),
+                APPCAST_SIG_ASSET => Ok(self.appcast_sig.clone()),
+                aterm_update_core::roster::ROSTER_ASSET => Ok(self.roster.clone()),
+                aterm_update_core::roster::ROSTER_SIG_ASSET => Ok(self.roster_sig.clone()),
+                _ => Err(format!("HTTP 404: no such asset {url}")),
+            }
+        }
+    }
+
+    fn support_dir(staging: &Staging) -> std::path::PathBuf {
+        staging.root.parent().unwrap().to_path_buf()
+    }
+
+    /// The build every web-lane fixture check runs as.
+    const WEB_BUILD: u64 = 5;
+
+    /// Run the web lane's acquisition against a pointer that answers `answer`, with the
+    /// LIST fake armed. `known` writes a ledger that authorized that tag AS THIS BUILD,
+    /// AGAINST THE FIXTURE SOURCE (the only ledger the shortcut may trust). Returns the
+    /// outcome and every URL the HEAD transport was asked.
+    fn acquire_web(
+        staging: &Staging,
+        known: Option<&str>,
+        answer: impl FnMut() -> Result<HeadAnswer, HttpError>,
+    ) -> (Result<Acquisition, String>, Vec<String>) {
+        if let Some(tag) = known {
+            write_ledger(staging, tag, WEB_BUILD, "alabsystems/aterm");
+        } else {
+            let _ = std::fs::remove_file(&staging.status);
+        }
+        acquire_web_from(staging, &test_source(), answer)
+    }
+
+    /// A ledger that authorized `tag` while running `build`, against `source`.
+    fn write_ledger(staging: &Staging, tag: &str, build: u64, source: &str) {
+        std::fs::write(
+            &staging.status,
+            format!(
+                "schema = 1\noutcome = \"x\"\ncurrent_build = {build}\nlatest_tag = {tag:?}\n\
+                 latest_source = {source:?}\n"
             ),
+        )
+        .unwrap();
+    }
+
+    /// [`acquire_web`] over whatever ledger is on disk, as `source`.
+    fn acquire_web_from(
+        staging: &Staging,
+        source: &Source,
+        mut answer: impl FnMut() -> Result<HeadAnswer, HttpError>,
+    ) -> (Result<Acquisition, String>, Vec<String>) {
+        let mut heads = Vec::new();
+        let mut head = |url: &str| {
+            heads.push(url.to_string());
+            answer()
         };
-        let candidate = selection.expect("the fixture catalog selects cleanly");
-        if let Some(validators) = validators {
-            CatalogMemo::write(
-                &staging.catalog_memo(),
-                &test_source(),
-                false,
-                100,
-                validators,
-                candidate.as_ref(),
+        let mut list = no_api_ever;
+        let outcome = acquire(
+            staging,
+            WEB_BUILD,
+            source,
+            &support_dir(staging),
+            &mut list,
+            &mut head,
+        );
+        (outcome, heads)
+    }
+
+    /// **THE measurement.** A web-lane check whose pointer has MOVED costs ONE HEAD of
+    /// the evergreen URL plus FOUR GETs — appcast, its signature, the roster, its
+    /// signature — every one addressed by the DERIVED tag-specific URL, none through
+    /// `latest` again, none to `api.github.com`, none with a credential; the armed
+    /// roster chain runs on those bytes unchanged and the manifest's `url` binds to
+    /// the pointer's tag.
+    #[test]
+    fn a_web_lane_check_makes_zero_api_requests_and_only_tag_specific_gets() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("zero-api");
+        let source = test_source();
+        let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+        let masters = [channel.master_pub.as_str()];
+        let (outcome, heads) = acquire_web(&staging, None, || redirect_to(WEB_TAG));
+        assert_eq!(
+            heads,
+            vec![evergreen_url()],
+            "one HEAD, of the evergreen URL"
+        );
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("a moved pointer proceeds to acquisition: {outcome:?}");
+        };
+        assert_eq!(acquired.lane, Lane::Web);
+        assert_eq!(acquired.tok, None, "no credential exists on this lane");
+        assert_eq!(acquired.web_tag.as_deref(), Some(WEB_TAG));
+        let candidate = acquired
+            .candidate
+            .expect("the pointer's tag is the candidate");
+        assert_eq!(candidate.version, "0.10.0");
+        assert_eq!(candidate.release.tag_name, WEB_TAG);
+        for asset in &candidate.release.assets {
+            assert_eq!(
+                asset.url,
+                tag_url(WEB_TAG, &asset.name),
+                "every asset URL is the derived tag-specific one"
+            );
+            assert!(!aterm_update_core::cdn::is_api_host(&asset.url));
+        }
+
+        let mut gets: Vec<String> = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            gets.push(url.to_string());
+            channel.serve(url)
+        };
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        let (manifest, release, _) = fetched
+            .selected
+            .as_ref()
+            .expect("the armed chain accepts the rostered release over the web lane");
+        assert_eq!(
+            fetched
+                .attribution
+                .as_ref()
+                .map(|who| who.machine_id.as_str()),
+            Some("m3")
+        );
+        assert_eq!(fetched.observed_roster_seq, Some(4));
+        web_container_url_agrees(&source, &release.tag_name, manifest)
+            .expect("the manifest's url names the derived container URL under the tag");
+
+        // The request ledger.
+        let prefix = tag_prefix(WEB_TAG);
+        assert_eq!(
+            gets.len(),
+            4,
+            "appcast, its sig, the roster, its sig: {gets:?}"
+        );
+        assert_eq!(gets[0], tag_url(WEB_TAG, APPCAST_ASSET));
+        for url in &gets {
+            assert!(url.starts_with(&prefix), "not tag-specific: {url}");
+            assert!(
+                !url.contains("/releases/latest/"),
+                "through `latest`: {url}"
+            );
+            assert!(!aterm_update_core::cdn::is_api_host(url), "metered: {url}");
+        }
+        let mut names: Vec<&str> = gets.iter().map(|u| &u[prefix.len()..]).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                APPCAST_ASSET,
+                APPCAST_SIG_ASSET,
+                aterm_update_core::roster::ROSTER_ASSET,
+                aterm_update_core::roster::ROSTER_SIG_ASSET,
+            ]
+        );
+        assert_eq!(lane(), Lane::Web);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE STEADY STATE: a pointer naming the tag this ledger last authorized ends the
+    /// check after its one HEAD — no GET, no API. Any OTHER recorded tag, or none, is
+    /// re-judged.
+    #[test]
+    fn the_steady_state_is_one_head_when_the_pointer_names_the_authorized_tag() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("steady");
+        let (outcome, heads) = acquire_web(&staging, Some(WEB_TAG), || redirect_to(WEB_TAG));
+        assert_eq!(heads, vec![evergreen_url()]);
+        let Ok(Acquisition::UpToDate { tag }) = outcome else {
+            panic!("an unchanged pointer is the steady state: {outcome:?}");
+        };
+        assert_eq!(tag, WEB_TAG);
+        assert_eq!(
+            crate::status::latest_tag(&staging, WEB_BUILD, &test_source()).as_deref(),
+            Some(WEB_TAG)
+        );
+        // A pointer that moved past the recorded tag — or a ledger with none — proceeds.
+        for known in [Some("v0.9.0"), None] {
+            let (outcome, heads) = acquire_web(&staging, known, || redirect_to(WEB_TAG));
+            assert_eq!(heads.len(), 1);
+            assert!(
+                matches!(outcome, Ok(Acquisition::Proceed(_))),
+                "{known:?}: {outcome:?}"
             );
         }
-        candidate.map(|c| c.version)
-    }
-
-    /// THE measurement. A steady-state check must cost ONE conditional request and ZERO
-    /// body bytes, and must reach the SAME answer the full walk reached.
-    ///
-    /// Two-sided reach guards, so neither half can pass vacuously:
-    ///   * the cold regime must really transfer a representative page (the fixture's
-    ///     bytes-per-release is asserted to sit in the measured ~14.2 KB band, and the
-    ///     transferred total must be non-trivial);
-    ///   * the warm regime must really have SENT a validator (a check that skipped the
-    ///     request entirely would also show zero bytes, and would be wrong);
-    ///   * both regimes must select the same version — a "saving" that changes the
-    ///     answer is not a saving.
-    #[test]
-    fn a_steady_state_catalog_check_costs_a_304_and_no_body_bytes() {
-        let staging = scratch_staging("steady");
-        let page = github_shaped_page(&["v0.19.0", "v0.21.0", "v0.20.0"]);
-        // Fixture reach guard: representative of the real wire, not a toy.
-        let per_release = page.len() / 3;
-        assert!(
-            (12_000..17_000).contains(&per_release),
-            "the fixture page must be ~14.2 KB per release like the real one, got \
-             {per_release} B"
-        );
-        let channel = FakeChannel::new(vec![page.clone()], vec![Some("\"gen-1\"".into())]);
-
-        // COLD: no memo. The historical walk — one request, the whole page.
-        let cold = run_check_and_memoize(&staging, &channel);
-        channel.report("cold");
-        assert_eq!(
-            cold.as_deref(),
-            Some("0.21.0"),
-            "max arbitration, not row order"
-        );
-        assert_eq!(channel.requests.get(), 1);
-        assert_eq!(channel.conditional.get(), 0, "nothing to revalidate yet");
-        assert_eq!(channel.body_bytes.get(), page.len() as u64);
-        assert!(
-            staging.catalog_memo().exists(),
-            "a memoizable walk must memoize"
-        );
-
-        // WARM: the memo revalidates. One CONDITIONAL request, zero body bytes.
-        let before = channel.body_bytes.get();
-        let warm = run_check_and_memoize(&staging, &channel);
-        channel.report("warm_304");
-        assert_eq!(warm, cold, "the fast path must reach the SAME answer");
-        assert_eq!(channel.requests.get(), 2, "one more request, not zero");
-        assert_eq!(
-            channel.conditional.get(),
-            1,
-            "the saving must come from ASKING with a validator, not from skipping the ask"
-        );
-        assert_eq!(
-            channel.body_bytes.get(),
-            before,
-            "a revalidated catalog must transfer NO body bytes"
-        );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// When the channel MOVES, the memo is abandoned and the whole listing is re-walked
-    /// unconditionally from page 1 — never stitched across generations — and the new
-    /// answer is the one that wins.
+    /// Every way the pointer can fail ends the check WITHOUT an API request: a 404 is
+    /// the loud standing state (announced, stranded), a 429/5xx is a deferral (no
+    /// health entry), a refused redirect or a transport failure is the historical
+    /// `network`-class failure — and a refusal is never interpreted, so nothing is
+    /// fetched from wherever it pointed.
     #[test]
-    fn a_published_release_invalidates_the_memo_and_is_seen_immediately() {
-        let staging = scratch_staging("moved");
-        let first = github_shaped_page(&["v0.20.0"]);
-        let channel = FakeChannel::new(vec![first], vec![Some("\"gen-1\"".into())]);
-        assert_eq!(
-            run_check_and_memoize(&staging, &channel).as_deref(),
-            Some("0.20.0")
-        );
+    fn every_web_lane_failure_path_ends_without_an_api_request() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("failures");
+        crate::status::clear_check_note();
 
-        // A cut lands: new bytes, new validator, and the old one is no longer honoured.
-        let mut channel = FakeChannel::new(
-            vec![github_shaped_page(&["v0.20.0", "v0.21.0"])],
-            vec![Some("\"gen-2\"".into())],
+        // 404: stranded, and the ledger says why.
+        crate::no_token::clear();
+        let (outcome, heads) = acquire_web(&staging, None, || {
+            Ok(HeadAnswer {
+                code: 404,
+                location: None,
+            })
+        });
+        assert_eq!(heads.len(), 1);
+        assert!(matches!(outcome, Ok(Acquisition::Ended)), "{outcome:?}");
+        assert!(crate::no_token::is_stranded());
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(text.contains("cannot read its release channel"), "{text}");
+        assert!(text.contains("HTTP 404"), "{text}");
+        assert!(
+            !staging.health().exists(),
+            "a standing state is not a fault"
         );
-        channel.moved();
-        let seen = run_check_and_memoize(&staging, &channel);
-        channel.report("moved");
-        assert_eq!(
-            seen.as_deref(),
-            Some("0.21.0"),
-            "a real update must NEVER be hidden by the memo"
-        );
-        // The revalidation attempt plus the full unconditional re-walk of page 1.
-        assert_eq!(channel.requests.get(), 2);
-        assert_eq!(channel.conditional.get(), 1);
-        // …and the refreshed memo now carries the new generation.
-        let memo = CatalogMemo::read(
-            &staging.catalog_memo(),
-            &test_source(),
-            false,
-            100,
+        crate::no_token::clear();
+
+        // 429 / 5xx: deferred, no health entry, the latch set for the loop.
+        for code in [429u16, 503] {
+            let (outcome, heads) = acquire_web(&staging, None, || {
+                Ok(HeadAnswer {
+                    code,
+                    location: None,
+                })
+            });
+            assert_eq!(heads.len(), 1);
+            assert!(
+                matches!(outcome, Ok(Acquisition::Ended)),
+                "{code}: {outcome:?}"
+            );
+            assert!(rate_limited(), "{code}: the loop lengthens its wait");
+            assert_eq!(rate_limit_reset(), None, "the web host names no reset");
+            let text = std::fs::read_to_string(&staging.status).unwrap();
+            assert!(text.contains("deferred"), "{code}: {text}");
+            assert!(!text.contains("held_until"), "{code}: {text}");
+            assert!(!staging.health().exists(), "{code}: weather is not a fault");
+        }
+
+        // A refused redirect (another repository, the same asset name) and a transport
+        // failure: `network`-class, and NOTHING is fetched from the refused location.
+        let elsewhere =
+            "https://github.com/someone/aterm/releases/download/v0.10.0/aterm-appcast.toml";
+        for (label, answer) in [
+            (
+                "refused",
+                Ok(HeadAnswer {
+                    code: 302,
+                    location: Some(elsewhere.to_string()),
+                }),
+            ),
+            (
+                "transport",
+                Err(HttpError::Transport("curl HEAD x failed".into())),
+            ),
+            (
+                "unexpected",
+                Ok(HeadAnswer {
+                    code: 200,
+                    location: None,
+                }),
+            ),
+        ] {
+            let before = crate::health::Health::read(&staging.health()).network_failures;
+            let (outcome, heads) = acquire_web(&staging, None, || answer.clone());
+            assert_eq!(heads.len(), 1, "{label}");
+            let Err(error) = outcome else {
+                panic!("{label}: expected a failure, got {outcome:?}");
+            };
+            if label == "refused" {
+                assert!(error.contains("refuses to follow"), "{error}");
+                assert!(
+                    !error.contains("someone/aterm"),
+                    "a refusal never echoes the server's string: {error}"
+                );
+            }
+            assert_eq!(
+                crate::health::Health::read(&staging.health()).network_failures,
+                before + 1,
+                "{label}: booked as network"
+            );
+        }
+        note_readable(Lane::Web, &test_source());
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// Invariant (d): the pointer alone can never choose what is installed. The tag it
+    /// names must equal `v` + the signed manifest's `version` AND the tag inside the
+    /// signed manifest's `url`; a manifest that fails either bind is REJECTED, and the
+    /// manifest's URL is never the one downloaded.
+    #[test]
+    fn the_pointers_tag_the_manifest_version_and_the_manifest_url_must_agree() {
+        let source = test_source();
+        let derived = tag_url(WEB_TAG, "aterm-0.10.0.dmg");
+        let manifest = |url: Option<&str>| {
+            let mut text = String::from_utf8(manifest_bytes("0.10.0", 10, 0)).unwrap();
+            if let Some(url) = url {
+                text.push_str(&format!("url = {url:?}\n"));
+            }
+            Manifest::parse(&text).unwrap()
+        };
+        web_container_url_agrees(&source, WEB_TAG, &manifest(Some(&derived))).unwrap();
+        for wrong in [
+            // The same appcast copied onto another tag.
+            Some(tag_url("v0.9.0", "aterm-0.10.0.dmg")),
+            // Another repository's copy of the container.
+            Some(
+                "https://github.com/someone/aterm/releases/download/v0.10.0/aterm-0.10.0.dmg"
+                    .into(),
+            ),
+            // The evergreen alias, which would let a moving pointer choose.
+            Some("https://github.com/alabsystems/aterm/releases/latest/download/aterm.dmg".into()),
+            // No URL at all: the web lane requires the bind.
+            None,
+        ] {
+            let error = web_container_url_agrees(&source, WEB_TAG, &manifest(wrong.as_deref()))
+                .expect_err("must refuse");
+            assert!(
+                error.contains("refusing") || error.contains("requires"),
+                "{wrong:?}: {error}"
+            );
+        }
+
+        // The version half, on the real fetch path: a pointer at v0.11.0 whose appcast
+        // says 0.10.0 is refused as a manifest defect, never staged.
+        let channel = web_channel(Some(&derived));
+        let masters = [channel.master_pub.as_str()];
+        let candidate = web_release(&source, "v0.11.0", crate::PINNED_UPDATE_PUBKEYS).unwrap();
+        let mut gets = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            gets.push(url.to_string());
+            // Serve WEB_TAG's bytes under v0.11.0's derived names.
+            let name = url.rsplit('/').next().unwrap().to_string();
+            channel.serve(&tag_url(WEB_TAG, &name))
+        };
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
             crate::PINNED_UPDATE_PUBKEYS,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_none());
+        assert!(
+            fetched.manifest_rejected,
+            "version 0.10.0 does not bind to v0.11.0"
+        );
+        assert!(
+            gets.iter().all(|u| u.starts_with(&tag_prefix("v0.11.0"))),
+            "every GET was addressed by the pointer's tag: {gets:?}"
+        );
+    }
+
+    /// A pointer that moves DURING a check cannot mix two releases: the HEAD is asked
+    /// exactly once, and every GET is addressed by the tag that one answer named.
+    #[test]
+    fn a_pointer_that_moves_mid_check_cannot_mix_two_releases() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("moving");
+        let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+        let masters = [channel.master_pub.as_str()];
+        let mut calls = 0;
+        let (outcome, heads) = acquire_web(&staging, None, || {
+            calls += 1;
+            redirect_to(if calls == 1 { WEB_TAG } else { "v0.11.0" })
+        });
+        assert_eq!(heads.len(), 1, "the pointer is consulted once");
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let mut gets = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            gets.push(url.to_string());
+            channel.serve(url)
+        };
+        let fetched = fetch_authoritative_release(
+            Some(acquired.candidate.unwrap()),
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_some());
+        assert!(
+            gets.iter().all(|u| u.starts_with(&tag_prefix(WEB_TAG))),
+            "{gets:?}"
+        );
+        assert!(gets.iter().all(|u| !u.contains("v0.11.0")), "{gets:?}");
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// Invariant (c) on the web lane: a roster that cannot be FETCHED refuses the
+    /// release as a transport failure and never falls back to the compiled-in keyset —
+    /// even when that keyset carries the very machine key that signed the appcast.
+    #[test]
+    fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_and_never_falls_to_the_keyset() {
+        let source = test_source();
+        let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+        let masters = [channel.master_pub.as_str()];
+        let keyset = [channel.machine_pub.as_str()];
+        let candidate = web_release(&source, WEB_TAG, &keyset).unwrap();
+        let mut gets = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            gets.push(url.to_string());
+            if url.ends_with(aterm_update_core::roster::ROSTER_ASSET) {
+                return Err("HTTP 404: the release does not carry this asset".to_string());
+            }
+            channel.serve(url)
+        };
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
+            &keyset,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_none(), "refused");
+        assert!(
+            fetched.appcast_fetch_error,
+            "transport, not a manifest verdict"
+        );
+        assert!(!fetched.manifest_rejected);
+        assert!(!fetched.asset_fetch_rate_limited);
+        assert!(fetched.attribution.is_none());
+        assert!(
+            gets.iter().all(|u| !aterm_update_core::cdn::is_api_host(u)),
+            "{gets:?}"
+        );
+        // …and a web-host 429 on the same leg is the deferrable weather, still refused.
+        let mut download = |url: &str, _max: u64| {
+            if url.ends_with(aterm_update_core::roster::ROSTER_ASSET) {
+                return Err("rate limited (HTTP 429) fetching an asset".to_string());
+            }
+            channel.serve(url)
+        };
+        let candidate = web_release(&source, WEB_TAG, &keyset).unwrap();
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
+            &keyset,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_none() && fetched.appcast_fetch_error);
+        assert!(fetched.asset_fetch_rate_limited);
+    }
+
+    /// The TOKEN lane is today's LIST, byte for byte: every page is an `api.github.com`
+    /// request carrying the resolved token, a rejected token hands the check to the web
+    /// lane (and the status names rotation), and a rate limit ends the check as a
+    /// deferral with no health entry — and none of it ever touches `github.com`.
+    #[test]
+    fn the_token_lane_keeps_the_api_list_and_never_requests_from_github_com() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("token-lane");
+        let source = test_source();
+        crate::status::clear_check_note();
+        let page = br#"[{"tag_name":"v0.9.0","draft":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/1","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/2","size":64},
+            {"name":"aterm-0.9.0.dmg","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/3","size":1}]}]"#
+            .to_vec();
+        let mut requests: Vec<(String, String)> = Vec::new();
+        let mut fetch = |url: &str, token: &str| {
+            requests.push((url.to_string(), token.to_string()));
+            Ok(page.clone())
+        };
+        let mut ctx = ListContext {
+            staging: &staging,
+            current_build: 5,
+            source: &source,
+            tok: "ghp_test",
+            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            fetch: &mut fetch,
+        };
+        let Ok(Listing::Releases(releases)) = list_releases(&mut ctx) else {
+            panic!("one short page is the whole listing");
+        };
+        assert_eq!(releases.len(), 1);
+        assert_eq!(requests.len(), 1, "one page, one request");
+        for (url, token) in &requests {
+            assert!(aterm_update_core::cdn::is_api_host(url), "{url}");
+            assert_eq!(token, "ghp_test", "the token rides every LIST request");
+            assert!(!url.starts_with("https://github.com/"), "{url}");
+        }
+        assert_eq!(lane(), Lane::Token);
+        assert_eq!(lane_note(&source), "");
+        // Every asset URL the token lane elects from is the API URL — the credential
+        // pairs only with that host, by the transport's own gate.
+        let elected = select_authoritative_release(releases, &[])
+            .unwrap()
+            .unwrap();
+        for asset in &elected.release.assets {
+            assert!(aterm_update_core::cdn::is_api_host(&asset.url));
+        }
+
+        // A rejected token: the check continues on the web lane, and says "rotate".
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
+        let mut rejecting = |_url: &str, _token: &str| Err(HttpError::Unauthorized { code: 401 });
+        let mut ctx = ListContext {
+            staging: &staging,
+            current_build: 5,
+            source: &source,
+            tok: "ghp_stale",
+            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            fetch: &mut rejecting,
+        };
+        assert!(matches!(
+            list_releases(&mut ctx),
+            Ok(Listing::TokenRejected)
+        ));
+        assert!(TOKEN_REJECTED.load(Ordering::Relaxed));
+        assert!(!staging.health().exists(), "a stale token is not a fault");
+
+        // A rate-limited LIST: deferred, held to the server's reset, no health entry.
+        let reset = unix_now_secs() + 20 * 60;
+        std::fs::write(
+            staging.list_headers(),
+            format!(
+                "HTTP/2 403 \r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 0\r\n\
+                 x-ratelimit-reset: {reset}\r\n\r\n"
+            ),
         )
-        .expect("the re-walk memoized the new generation");
-        assert_eq!(memo.etags, vec!["\"gen-2\"".to_string()]);
+        .unwrap();
+        let mut limited = |url: &str, _token: &str| {
+            Err(HttpError::RateLimited {
+                code: 403,
+                url: url.to_string(),
+                authenticated: true,
+            })
+        };
+        let mut ctx = ListContext {
+            staging: &staging,
+            current_build: 5,
+            source: &source,
+            tok: "ghp_test",
+            token_source: Some("$ATERM_UPDATE_TOKEN"),
+            fetch: &mut limited,
+        };
+        assert!(matches!(list_releases(&mut ctx), Ok(Listing::Ended)));
+        assert!(rate_limited());
+        assert!(
+            rate_limit_reset().is_some(),
+            "the token lane holds to the reset"
+        );
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(
+            text.contains("deferred") && text.contains("held_until"),
+            "{text}"
+        );
+        assert!(
+            text.contains("lane = \"token:env\""),
+            "the rung's ID, not its label: {text}"
+        );
+        assert!(!staging.health().exists(), "weather is not a fault");
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
+        note_readable(Lane::Web, &source);
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// A page that offers no `ETag` makes the whole walk unmemoizable: a memo that could
-    /// not be fully revalidated later must never be written, because a partially
-    /// revalidated listing is exactly the torn snapshot this design refuses.
+    /// The compiled-in public channel never consults the token chain: `acquire` goes
+    /// straight to the web lane even when a token would resolve, because a credential
+    /// buys nothing on a host that reads none — and honouring one would make draft
+    /// releases visible to the selector.
     #[test]
-    fn a_page_without_a_validator_is_never_memoized() {
-        let staging = scratch_staging("novalidator");
-        let channel = FakeChannel::new(vec![github_shaped_page(&["v0.21.0"])], vec![None]);
+    fn the_public_channel_ignores_every_token_rung() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(is_default_channel(&test_source()));
+        assert!(!is_default_channel(&Source {
+            owner: "example".into(),
+            repo: "mirror".into(),
+        }));
+        let staging = Staging::scratch("public-ignores-token");
+        // The LIST fake panics, so a check that consulted the chain and found a token
+        // (this developer's shell may well carry `gh auth token`) would fail here.
+        let (outcome, heads) = acquire_web(&staging, None, || redirect_to(WEB_TAG));
+        assert_eq!(heads.len(), 1);
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(acquired.lane, Lane::Web);
+        assert!(acquired.tok.is_none());
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// GitHub slugs are case-insensitive, so a case variant of the public channel IS
+    /// the public channel: no chain walk (the LIST fake would panic on a resolved
+    /// token), the web lane, and the "ignores every rung" wording — never the
+    /// repointed-source treatment.
+    #[test]
+    fn a_case_variant_of_the_public_channel_is_still_the_web_lane_with_no_chain_walk() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let variant = Source {
+            owner: "Alabsystems".into(),
+            repo: "ATERM".into(),
+        };
+        assert!(is_default_channel(&variant));
+        let staging = Staging::scratch("public-case-variant");
+        let _ = std::fs::remove_file(&staging.status);
+        let (outcome, heads) = acquire_web_from(&staging, &variant, || {
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(
+                    aterm_update_core::cdn::release_download_url(
+                        "Alabsystems",
+                        "ATERM",
+                        WEB_TAG,
+                        APPCAST_ASSET,
+                    )
+                    .unwrap(),
+                ),
+            })
+        });
+        assert_eq!(heads.len(), 1);
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(acquired.lane, Lane::Web);
+        assert!(acquired.tok.is_none());
+        assert!(
+            lane_note(&variant).contains("ignores every update-token rung"),
+            "{}",
+            lane_note(&variant)
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE STEADY-STATE SHORTCUT IS BOUND TO THIS MACHINE'S DECISION. A ledger naming
+    /// the pointer's tag is "up to date" only when it was written by THIS build against
+    /// THIS source; recorded by another build (a manual downgrade, an applied stage) or
+    /// against another repository (a repointed updater), the release is re-judged —
+    /// one HEAD and the tag-specific GETs, still zero API. And a RETIRED stage clears
+    /// the tag, so the next check re-fetches and re-stages rather than answering "up to
+    /// date" on a build that is gone.
+    #[test]
+    fn the_shortcut_is_bound_to_the_recording_build_and_source_and_cleared_by_retirement() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("shortcut-binding");
+        let source = test_source();
+        // The same tag, recorded by another build: re-judged.
+        for other in [WEB_BUILD - 1, WEB_BUILD + 1] {
+            write_ledger(&staging, WEB_TAG, other, "alabsystems/aterm");
+            let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+            assert_eq!(heads, vec![evergreen_url()]);
+            assert!(
+                matches!(outcome, Ok(Acquisition::Proceed(_))),
+                "build {other}: {outcome:?}"
+            );
+        }
+        // The same tag, recorded against another repository: re-judged.
+        write_ledger(&staging, WEB_TAG, WEB_BUILD, "example/mirror");
+        let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert_eq!(heads.len(), 1);
+        assert!(
+            matches!(outcome, Ok(Acquisition::Proceed(_))),
+            "{outcome:?}"
+        );
+        // A ledger that recorded no source (an earlier build of this design): re-judged.
+        std::fs::write(
+            &staging.status,
+            format!("schema = 1\ncurrent_build = {WEB_BUILD}\nlatest_tag = {WEB_TAG:?}\n"),
+        )
+        .unwrap();
+        let (outcome, _) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert!(
+            matches!(outcome, Ok(Acquisition::Proceed(_))),
+            "{outcome:?}"
+        );
+        // This build, this source: the steady state — written the way the check writes
+        // it, through `set_latest_tag` + `record`.
+        crate::status::clear_check_note();
+        crate::status::set_latest_tag(WEB_TAG, &source);
+        crate::status::record(&staging, WEB_BUILD, "staged 0.10.0 (build 10)");
+        let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert_eq!(heads.len(), 1);
+        assert!(
+            matches!(outcome, Ok(Acquisition::UpToDate { .. })),
+            "{outcome:?}"
+        );
+        // RETIREMENT ("so the next check re-stages"): the unchanged pointer now
+        // proceeds to a full re-fetch — and every request is still off the API.
+        staging.retire_published();
+        let (outcome, heads) = acquire_web_from(&staging, &source, || redirect_to(WEB_TAG));
+        assert_eq!(heads, vec![evergreen_url()]);
+        let Ok(Acquisition::Proceed(acquired)) = outcome else {
+            panic!("a retired stage forces a re-fetch: {outcome:?}");
+        };
+        assert_eq!(acquired.web_tag.as_deref(), Some(WEB_TAG));
+        for asset in &acquired.candidate.unwrap().release.assets {
+            assert!(!aterm_update_core::cdn::is_api_host(&asset.url));
+        }
+        crate::status::clear_check_note();
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE URL BIND ON A REPOINTED SOURCE. The publisher signs `url` under the
+    /// compiled-in channel's slug, so a credential-less updater repointed at a mirror
+    /// carrying the upstream-signed appcast must accept it — the bind is on the TAG and
+    /// the DMG, which invariant (d) needs, not on the repository, which
+    /// `parse_location` already scopes. Any other slug, tag or container is refused, and
+    /// so is a manifest with no `url` at all.
+    #[test]
+    fn the_url_bind_accepts_the_source_or_the_compiled_in_channel_and_nothing_else() {
+        let mirror = Source {
+            owner: "example".into(),
+            repo: "mirror".into(),
+        };
+        let with_url = |url: Option<&str>| Manifest {
+            url: url.map(str::to_string),
+            ..candidate_manifest()
+        };
+        let dmg = candidate_manifest().dmg;
+        let tag = "v0.6.0";
+        let upstream = tag_url(tag, &dmg);
+        web_container_url_agrees(&mirror, tag, &with_url(Some(&upstream)))
+            .expect("the upstream-signed appcast is accepted on a mirror");
+        web_container_url_agrees(&test_source(), tag, &with_url(Some(&upstream)))
+            .expect("…and on the compiled-in channel");
+        let own =
+            aterm_update_core::cdn::release_download_url("example", "mirror", tag, &dmg).unwrap();
+        web_container_url_agrees(&mirror, tag, &with_url(Some(&own)))
+            .expect("a mirror's own re-signed appcast is accepted too");
+        let cased =
+            aterm_update_core::cdn::release_download_url("Example", "MIRROR", tag, &dmg).unwrap();
+        web_container_url_agrees(&mirror, tag, &with_url(Some(&cased)))
+            .expect("slugs compare case-insensitively, as GitHub does");
+        for (why, bad) in [
+            (
+                "another repository",
+                aterm_update_core::cdn::release_download_url("someone", "else", tag, &dmg).unwrap(),
+            ),
+            ("another tag", tag_url("v0.7.0", &dmg)),
+            ("another container", tag_url(tag, "aterm-0.7.0.dmg")),
+            (
+                "another host",
+                format!("https://evil.example/alabsystems/aterm/releases/download/{tag}/{dmg}"),
+            ),
+            (
+                "the evergreen URL",
+                aterm_update_core::pointer::latest_download_url("alabsystems", "aterm", &dmg)
+                    .unwrap(),
+            ),
+            ("a query", format!("{upstream}?x=1")),
+            ("an extra segment", format!("{upstream}/x")),
+        ] {
+            let error =
+                web_container_url_agrees(&mirror, tag, &with_url(Some(&bad))).expect_err(why);
+            assert!(error.contains("refusing"), "{why}: {error}");
+        }
+        assert!(
+            web_container_url_agrees(&mirror, tag, &with_url(None))
+                .unwrap_err()
+                .contains("no container `url`")
+        );
+    }
+
+    /// The standing "cannot read the channel" wording on a REPOINTED source names the
+    /// remedy for the token the machine actually has: a token GitHub REJECTED (the
+    /// check fell onto the web lane through `Listing::TokenRejected`, and the chain
+    /// kept no diagnosis because it succeeded) says rotate, never "no update token is
+    /// provisioned" — the two status surfaces agree.
+    #[test]
+    fn a_rejected_token_is_named_as_such_when_the_pointer_then_answers_404() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mirror = Source {
+            owner: "example".into(),
+            repo: "private-mirror".into(),
+        };
+        TOKEN_REJECTED.store(true, Ordering::Relaxed);
+        let text = unreadable_explanation(404, &mirror, None);
+        assert!(
+            text.contains("rejected by GitHub") && text.contains("rotate"),
+            "{text}"
+        );
+        assert!(!text.contains("no update token is provisioned"), "{text}");
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
+        let text = unreadable_explanation(404, &mirror, None);
+        assert!(text.contains("no update token is provisioned"), "{text}");
+        assert!(!text.contains("rotate"), "{text}");
+        let text = unreadable_explanation(404, &mirror, Some(&unprovisioned()));
+        assert!(text.contains("no update token is provisioned"), "{text}");
+    }
+
+    /// The memo files of the retired conditional-request design are reclaimed from the
+    /// Updates root on every check; nothing else there is touched.
+    #[test]
+    fn the_retired_catalog_memo_is_reclaimed() {
+        let staging = Staging::scratch("reclaim");
+        for name in ["catalog.json", "catalog.headers", "floor.toml"] {
+            std::fs::write(staging.root.join(name), "x").unwrap();
+        }
+        reclaim_retired_state(&staging);
+        assert!(!staging.root.join("catalog.json").exists());
+        assert!(!staging.root.join("catalog.headers").exists());
+        assert!(
+            staging.floor().exists(),
+            "only the retired memo is reclaimed"
+        );
+        reclaim_retired_state(&staging);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// The ledger's `lane` is one token of a space-separated status line, so the
+    /// token lane records the rung's fixed ID and never its label: for EVERY rung the
+    /// chain can report — three labels carry spaces — the recorded value has no
+    /// whitespace, and `status_line_suffix` renders exactly the expected tokens.
+    #[test]
+    fn every_token_rung_records_a_whitespace_free_lane() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("lane-ids");
+        let _ = std::fs::remove_file(staging.list_headers());
+        for rung in token::RUNGS {
+            crate::status::clear_check_note();
+            note_delivery(&staging, Lane::Token, Some(rung.label));
+            crate::status::record(&staging, 5, "up to date");
+            let text = std::fs::read_to_string(&staging.status).unwrap();
+            let delivery = crate::Delivery::from_ledger_text(&text);
+            let lane = delivery.lane.clone().expect("the lane was recorded");
+            assert!(
+                !lane.chars().any(char::is_whitespace),
+                "{:?} recorded lane {lane:?}",
+                rung.label
+            );
+            assert_eq!(lane, format!("token:{}", rung.id));
+            assert_eq!(
+                delivery.status_line_suffix(),
+                format!(" lane=token:{} delivery=ok", rung.id),
+                "{:?}",
+                rung.label
+            );
+            let suffix = delivery.status_line_suffix();
+            let tokens: Vec<&str> = suffix.split(' ').filter(|t| !t.is_empty()).collect();
+            assert_eq!(tokens.len(), 2, "{tokens:?}");
+        }
+        // The web lane is the bare word, and a lane-less ledger reports nothing.
+        crate::status::clear_check_note();
+        note_delivery(&staging, Lane::Web, None);
+        crate::status::record(&staging, 5, "up to date");
+        let text = std::fs::read_to_string(&staging.status).unwrap();
         assert_eq!(
-            run_check_and_memoize(&staging, &channel).as_deref(),
-            Some("0.21.0")
+            crate::Delivery::from_ledger_text(&text).lane.as_deref(),
+            Some("web")
         );
-        assert!(
-            !staging.catalog_memo().exists(),
-            "no validator ⇒ no memo ⇒ the next check pays the full listing, as before"
-        );
+        crate::status::clear_check_note();
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// An UNSOLICITED 304 (nothing was asked) is refused rather than read as "no
-    /// releases". The HTTP layer already refuses to produce one; this pins the walk's own
-    /// fail-closed arm, because "the channel is empty" and "the channel is unchanged" must
-    /// never be confusable.
+    /// A fetch failure is worded — and its `delivery=` note booked — for the host the
+    /// lane actually asked: the download host on the web lane (`blocked`), the
+    /// releases API on the token lane (`api-failed`). Neither note carries whitespace.
     #[test]
-    fn an_unsolicited_not_modified_fails_the_listing_closed() {
-        let staging = scratch_staging("unsolicited");
-        let source = test_source();
-        let mut tok = None;
-        let mut fetch = |_url: &str,
-                         _validator: Option<&str>,
-                         _token: Option<&str>|
-         -> Result<aterm_update_core::ApiResponse, HttpError> {
-            Ok(aterm_update_core::ApiResponse::NotModified)
-        };
-        // `Catalog` is deliberately not `Debug` (it carries a whole release), so this
-        // destructures rather than `expect_err`s.
-        let Err(error) = fetch_release_catalog(&staging, 100, &source, &mut tok, None, &mut fetch)
-        else {
-            panic!("an unconditional 304 is not an empty catalog");
-        };
-        assert!(error.contains("304"), "{error}");
+    fn a_fetch_failure_names_the_host_its_lane_asked() {
+        assert_eq!(asset_source(Lane::Web), ("the download host", "blocked"));
+        assert_eq!(
+            asset_source(Lane::Token),
+            ("the releases API", "api-failed")
+        );
+        for lane in [Lane::Unknown, Lane::Token, Lane::Web] {
+            let (host, note) = asset_source(lane);
+            assert!(!note.chars().any(char::is_whitespace), "{note:?}");
+            assert!(!host.is_empty());
+        }
+        // The web lane never says "API" and the token lane never says "download host".
+        assert!(!asset_source(Lane::Web).0.contains("API"));
+        assert!(!asset_source(Lane::Token).0.contains("download host"));
+    }
+
+    // ------------------------------------------------------------------------------
+    // HOLD-UNTIL-RESET: the epoch a rate-limited check hands its siblings and the loop.
+    // ------------------------------------------------------------------------------
+
+    /// `min(reset, now + 1 h) + jitter(0..60 s)`: an honest reset is waited out exactly
+    /// (plus scatter), a reset past the horizon is a lie and is clamped to it.
+    #[test]
+    fn a_list_rate_limit_records_held_until_from_the_servers_reset_clamped_to_an_hour() {
+        let now = 1_788_390_000;
+        let reset = now + 13 * 60;
+        assert_eq!(
+            hold_epoch(reset, now, 0),
+            Some(reset),
+            "no entropy, no scatter"
+        );
+        assert_eq!(
+            hold_epoch(reset, now, 255),
+            Some(reset + 59),
+            "the scatter is under a minute"
+        );
+        for entropy in 0..=255u8 {
+            let until = hold_epoch(reset, now, entropy).expect("a future reset holds");
+            assert!(
+                (reset..reset + HOLD_JITTER_SECS).contains(&until),
+                "{entropy}: {until}"
+            );
+        }
+        assert_eq!(
+            hold_epoch(now + 48 * 3600, now, 0),
+            Some(now + HOLD_HORIZON_SECS),
+            "a reset two days out is clamped to the hour GitHub's window actually is"
+        );
+        for stale in [0, now - 1, now] {
+            assert_eq!(
+                hold_epoch(stale, now, 255),
+                None,
+                "a reset not ahead of now is no hold at all — never jittered forward"
+            );
+        }
+
+        // End to end from the header file: the LIST's own `x-ratelimit-reset` becomes
+        // the ledger's `held_until` and the loop's `rate_limit_reset()`, and a readable
+        // LIST clears it again.
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("held");
+        let live_now = unix_now_secs();
+        let reset = live_now + 20 * 60;
+        std::fs::write(
+            staging.list_headers(),
+            format!(
+                "HTTP/2 403 \r\nx-ratelimit-limit: 60\r\nx-ratelimit-remaining: 0\r\n\
+                 x-ratelimit-used: 60\r\nx-ratelimit-reset: {reset}\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        crate::status::clear_check_note();
+        // (`RATE_LIMIT_RESET` is process-wide and every check-path test that reads its
+        // channel zeroes it, so the epoch is asserted on the function's own return and
+        // the ledger it wrote, not on a global another thread may have cleared.)
+        let until =
+            hold_until_reset(&staging).expect("the reset was read from this check's headers");
+        assert!(
+            (reset..reset + HOLD_JITTER_SECS).contains(&until),
+            "{until} vs {reset}"
+        );
+        record_deferral(&staging, 42, "update check deferred: GitHub rate limit hit");
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        let v: aterm_toml::Value = text.parse().unwrap();
+        let held = v
+            .get("held_until")
+            .and_then(aterm_toml::Value::as_str)
+            .and_then(crate::rfc3339_to_unix)
+            .expect("held_until is written as the ledger's RFC3339 shape");
+        assert!(
+            (reset..reset + HOLD_JITTER_SECS).contains(&held),
+            "{held} vs {reset}: {text}"
+        );
+        assert!(
+            v.get("outcome")
+                .and_then(aterm_toml::Value::as_str)
+                .is_some_and(|o| o.contains("deferred")),
+            "the 'deferred' substring stays on the sentence: {text}"
+        );
+        RATE_LIMIT_RESET.store(until, Ordering::Relaxed);
+        note_readable(Lane::Token, &test_source());
+        assert_eq!(rate_limit_reset(), None, "a readable LIST clears the hold");
+
+        // Headers without a reset: the plain deferred record, no hold, ladder as before.
+        std::fs::write(
+            staging.list_headers(),
+            "HTTP/2 403 \r\ncontent-type: x\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(hold_until_reset(&staging), None);
+        record_deferral(&staging, 42, "update check deferred: GitHub rate limit hit");
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(!text.contains("held_until"), "{text}");
+        assert!(text.contains("deferred"), "{text}");
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// Everything that could make the memoized bytes mean something else is a KEY, and a
-    /// mismatch on ANY of them discards the memo (→ the historical full listing). This is
-    /// the whole staleness surface, enumerated.
+    /// A hold is a fact about GitHub's clock, not about this machine: it writes no
+    /// `health.toml`, books no streak, and the asset-lane variant holds only when the
+    /// API window was actually involved — a `github.com` 429 keeps the plain record.
     #[test]
-    fn a_memo_is_refused_whenever_anything_it_is_keyed_on_differs() {
-        let staging = scratch_staging("keys");
-        let channel = FakeChannel::new(
-            vec![github_shaped_page(&["v0.21.0"])],
-            vec![Some("\"gen-1\"".into())],
-        );
-        assert!(run_check_and_memoize(&staging, &channel).is_some());
-        let path = staging.catalog_memo();
-        let source = test_source();
-        let good = CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS);
+    fn a_hold_never_writes_health_or_changes_a_verdict() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("held-health");
+        let reset = unix_now_secs() + 600;
+        std::fs::write(
+            staging.list_headers(),
+            format!(
+                "HTTP/2 403 \r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: {reset}\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        crate::status::clear_check_note();
+        record_deferral(&staging, 42, "update check deferred: GitHub rate limit hit");
         assert!(
-            good.is_some(),
-            "PRECONDITION: the memo we just wrote is usable"
+            !staging.health().exists(),
+            "a hold never writes health.toml"
         );
+        let h = crate::health::Health::read(&staging.health());
+        assert_eq!(h.acquisition_failures(), 0);
+        assert!(!h.is_persistent());
 
-        // The credential lane: a token and an anonymous client can see different sets.
+        // The asset legs: a deferral on the TOKEN lane holds to the LIST's reset (the
+        // API window is what ran out); one on the WEB lane holds to nothing — the
+        // download host carries no budget — and books the plain deferred record.
+        record_web_deferral(&staging, 42, "update check deferred: web 429");
+        let text = std::fs::read_to_string(&staging.status).unwrap();
         assert!(
-            CatalogMemo::read(&path, &source, true, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+            !text.contains("held_until"),
+            "a github.com 429 holds to nothing: {text}"
         );
-        // The running build: the pinned keyset and the selection rules are compiled in.
+        assert!(text.contains("deferred"), "{text}");
+        assert!(rate_limited(), "the loop still lengthens its wait");
+        record_asset_deferral(&staging, Lane::Web, 42, "update check deferred: web asset");
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(!text.contains("held_until"), "{text}");
+        record_asset_deferral(
+            &staging,
+            Lane::Token,
+            42,
+            "update check deferred: api asset",
+        );
+        let text = std::fs::read_to_string(&staging.status).unwrap();
         assert!(
-            CatalogMemo::read(&path, &source, false, 101, crate::PINNED_UPDATE_PUBKEYS).is_none()
+            text.contains("held_until"),
+            "a token-lane asset deferral holds to the reset: {text}"
         );
-        // The channel.
-        let elsewhere = Source {
-            owner: "someone-else".into(),
-            repo: "aterm".into(),
-        };
-        assert!(
-            CatalogMemo::read(&path, &elsewhere, false, 100, crate::PINNED_UPDATE_PUBKEYS)
-                .is_none()
-        );
-
-        // A mangled file, a wrong schema, an unsafe validator, an out-of-range index and
-        // a renamed appcast asset are each fatal to the memo.
-        let mut memo = good.unwrap();
-        let write = |memo: &CatalogMemo| {
-            std::fs::write(&path, aterm_json::to_vec(memo).unwrap()).unwrap();
-        };
-        memo.schema = CATALOG_MEMO_SCHEMA + 1;
-        write(&memo);
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
-        );
-        memo.schema = CATALOG_MEMO_SCHEMA;
-
-        memo.etags = vec!["\"a\"\r\nX-Evil: 1".to_string()];
-        write(&memo);
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
-            "a validator that could inject a header must never be echoed back"
-        );
-        memo.etags = vec!["\"gen-1\"".to_string()];
-
-        let mut broken = memo.clone();
-        broken.selection.as_mut().unwrap().manifest_index = 99;
-        write(&broken);
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
-        );
-
-        let mut renamed = memo.clone();
-        renamed.selection.as_mut().unwrap().release.assets[0].name = "not-the-appcast".into();
-        write(&renamed);
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
-            "the recorded index must still land on the exact appcast name"
-        );
-
-        let mut retagged = memo.clone();
-        retagged.selection.as_mut().unwrap().release.tag_name = "v01.21.0".into();
-        write(&retagged);
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
-            "a non-canonical tag spelling must not be admitted beside the canonical one"
-        );
-
-        std::fs::write(&path, b"{not json").unwrap();
-        assert!(
-            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
-        );
+        assert!(!staging.health().exists(), "still no health.toml");
+        note_readable(Lane::Web, &test_source());
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

@@ -191,7 +191,7 @@ mod macos {
         // SAFETY: `+[NSThread isMainThread]` is a side-effect-free class-method
         // `BOOL` query, and the cast is exactly `-(BOOL)(id, SEL)`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> aterm_objc::Bool = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::Bool = msg();
             f(class(c"NSThread").as_id(), sel!(isMainThread)).as_bool()
         }
     }
@@ -201,8 +201,8 @@ mod macos {
         // SAFETY: `+alloc` then `-init` on `NSObject` is the canonical +1
         // construction, and both prototypes are `-(id)(id, SEL)`.
         unsafe {
-            let alloc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             let raw = alloc(class(c"NSObject").as_id(), sel!(alloc));
             Obj::from_owned(init(raw, sel!(init))).expect("a fresh NSObject")
         }

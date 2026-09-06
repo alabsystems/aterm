@@ -961,10 +961,13 @@ mod macos {
                         probe.as_id(),
                         "NSMenu refused the declared class as its delegate"
                     );
-                    let target_of: unsafe extern "C" fn(aterm_objc::Id, Sel) -> aterm_objc::Id =
-                        aterm_objc::msg();
+                    let target_of: unsafe extern "C-unwind" fn(
+                        aterm_objc::Id,
+                        Sel,
+                    )
+                        -> aterm_objc::Id = aterm_objc::msg();
                     assert_eq!(target_of(item.id(), sel!(target)), probe.as_id());
-                    let action_of: unsafe extern "C" fn(aterm_objc::Id, Sel) -> Sel =
+                    let action_of: unsafe extern "C-unwind" fn(aterm_objc::Id, Sel) -> Sel =
                         aterm_objc::msg();
                     assert_eq!(action_of(item.id(), sel!(action)), sel!(statusAction:));
                     assert_eq!(appkit::send_isize(item.id(), sel!(tag)), 7);
@@ -976,7 +979,7 @@ mod macos {
                     );
                     assert!(!centre.is_null());
                     let name = appkit::nsstring(NOTE).expect("NSString");
-                    let add: unsafe extern "C" fn(
+                    let add: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
                         Sel,
                         aterm_objc::Id,
@@ -1009,12 +1012,13 @@ mod macos {
 
                     // (3) the runtime's dispatch of `statusAction:`, with the
                     // REAL tagged NSMenuItem as the sender.
-                    let perform_sel: unsafe extern "C" fn(
+                    let perform_sel: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
                         Sel,
                         Sel,
                         aterm_objc::Id,
-                    ) -> aterm_objc::Id = aterm_objc::msg();
+                    )
+                        -> aterm_objc::Id = aterm_objc::msg();
                     perform_sel(
                         probe.as_id(),
                         sel!(performSelector:withObject:),
@@ -1042,7 +1046,7 @@ mod macos {
                 // SAFETY: `-action` is `-(SEL)` on a live NSMenuItem, and
                 // `-title` is `-(NSString *)`.
                 unsafe {
-                    let action: unsafe extern "C" fn(aterm_objc::Id, Sel) -> Sel =
+                    let action: unsafe extern "C-unwind" fn(aterm_objc::Id, Sel) -> Sel =
                         aterm_objc::msg();
                     assert!(action(item.id(), sel!(action)).is_null());
                     assert_eq!(action(wired.id(), sel!(action)), sel!(statusAction:));

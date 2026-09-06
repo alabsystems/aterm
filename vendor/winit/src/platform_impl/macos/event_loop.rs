@@ -1,7 +1,7 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
-// (The application delegate is declared with `aterm_objc::declare_class!`,
-//  so the handle stored here is that crate's `Retained` and the protocol
-//  object handed to `setDelegate:` is a named crossing.)
+// (The application delegate is declared with `aterm_objc::declare_class!`, and
+//  every `objc2` binding call in this file is now a typed send through
+//  `aterm_objc`. Search for the aterm local-patch marker.)
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -18,14 +18,22 @@ use core_foundation::runloop::{
     kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetMain, CFRunLoopSourceContext,
     CFRunLoopSourceCreate, CFRunLoopSourceRef, CFRunLoopSourceSignal, CFRunLoopWakeUp,
 };
-use objc2::rc::{autoreleasepool, Retained};
-use objc2::sel;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEvent, NSWindow};
-use objc2_foundation::{MainThreadMarker, NSObjectProtocol};
+// LOCAL PATCH (aterm): objc2's `autoreleasepool`/`Retained`/`sel!`, its four
+// `NSApplication`, `NSApplicationActivationPolicy`, `NSEvent` and `NSWindow`
+// bindings, `MainThreadMarker` and `NSObjectProtocol` are all gone. The
+// activation-policy values are the seam's, at the SDK's own (SIGNED) values.
+use aterm_objc::send::{
+    send_bool, send_bool_sel, send_id, send_id_usize, send_usize, send_v, send_v_bool, send_v_id,
+    send_v_id_bool,
+};
+use aterm_objc::{Id, MainThread, Obj, autoreleasepool, class, sel};
 
-use super::aterm_objc_seam;
+use super::aterm_objc_seam::consts::{
+    NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY, NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED,
+    NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
+};
 
-use super::app::override_send_event;
+use super::app::{override_send_event, set_send_event_panic_info};
 use super::app_state::{ApplicationDelegate, HandlePendingUserEvents};
 use super::event::dummy_event;
 use super::monitor::{self, MonitorHandle};
@@ -73,7 +81,11 @@ impl PanicInfo {
 #[derive(Debug)]
 pub struct ActiveEventLoop {
     delegate: aterm_objc::Retained<ApplicationDelegate>,
-    pub(super) mtm: MainThreadMarker,
+    /// LOCAL PATCH (aterm), W12: `aterm_objc::MainThread`, not
+    /// `MainThreadMarker`. `window.rs` reads this field, and reading it is what
+    /// used to make that file need `objc2_foundation` — a CROSS-FILE
+    /// CONSUMPTION through a struct field rather than through a call.
+    pub(super) mtm: MainThread,
 }
 
 impl ActiveEventLoop {
@@ -84,8 +96,8 @@ impl ActiveEventLoop {
         // COMPILE-TIME derivation off objc2's `mutability::MainThreadOnly`, and
         // `ApplicationDelegate` no longer carries it. This asks the same
         // question the marker's own constructor asks.
-        let mtm = MainThreadMarker::new()
-            .expect("an ActiveEventLoop was rooted off the main thread");
+        let mtm =
+            MainThread::new().expect("an ActiveEventLoop was rooted off the main thread");
         let p = Self { delegate, mtm };
         RootWindowTarget { p, _marker: PhantomData }
     }
@@ -105,8 +117,7 @@ impl ActiveEventLoop {
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        let monitor = monitor::primary_monitor();
-        Some(monitor)
+        monitor::primary_monitor()
     }
 
     #[inline]
@@ -120,22 +131,24 @@ impl ActiveEventLoop {
 
     #[inline]
     pub fn system_theme(&self) -> Option<Theme> {
-        let app = NSApplication::sharedApplication(self.mtm);
-
-        if app.respondsToSelector(sel!(effectiveAppearance)) {
-            // LOCAL PATCH (aterm): `appearance_to_theme` takes the raw `id` its
-            // own sends take, now that `window_delegate.rs`'s bindings are
-            // ported. This file is not, so it crosses here.
-            //
-            // SAFETY: `-effectiveAppearance` answers a live `NSAppearance`,
-            // borrowed for the duration of this statement.
-            Some(unsafe {
-                super::window_delegate::appearance_to_theme(aterm_objc::Id::from_ptr(
-                    std::ptr::from_ref(&*app.effectiveAppearance()).cast_mut().cast(),
-                ))
-            })
-        } else {
-            Some(Theme::Light)
+        let _ = self.mtm;
+        // LOCAL PATCH (aterm), W12: `appearance_to_theme` takes the raw `id`
+        // its own sends take, and this file now HAS one — the crossing that
+        // used to be on these lines is gone.
+        //
+        // SAFETY: `-respondsToSelector:` is `B24@0:8:16` and
+        // `-effectiveAppearance` is `@16@0:8` on `NSApplication`, answering a
+        // live `NSAppearance` borrowed for the duration of this statement.
+        unsafe {
+            let app = app();
+            if send_bool_sel(app, sel!(respondsToSelector:), sel!(effectiveAppearance)) {
+                Some(super::window_delegate::appearance_to_theme(send_id(
+                    app,
+                    sel!(effectiveAppearance),
+                )))
+            } else {
+                Some(Theme::Light)
+            }
         }
     }
 
@@ -172,19 +185,40 @@ impl ActiveEventLoop {
     }
 
     pub(crate) fn hide_application(&self) {
-        NSApplication::sharedApplication(self.mtm).hide(None)
+        let _ = self.mtm;
+        // SAFETY: `-hide:` is `v24@0:8@16` on `NSApplication`; its argument is
+        // the `nil` sender upstream passed as `None`.
+        unsafe { send_v_id(app(), sel!(hide:), Id::NIL) }
     }
 
     pub(crate) fn hide_other_applications(&self) {
-        NSApplication::sharedApplication(self.mtm).hideOtherApplications(None)
+        let _ = self.mtm;
+        // SAFETY: `-hideOtherApplications:` is `v24@0:8@16` on `NSApplication`.
+        unsafe { send_v_id(app(), sel!(hideOtherApplications:), Id::NIL) }
     }
 
     pub(crate) fn set_allows_automatic_window_tabbing(&self, enabled: bool) {
-        NSWindow::setAllowsAutomaticWindowTabbing(enabled, self.mtm)
+        let _ = self.mtm;
+        // SAFETY: `+setAllowsAutomaticWindowTabbing:` is `v20@0:8B16` — a CLASS
+        // method on `NSWindow`, which is why the receiver is the class object.
+        unsafe {
+            send_v_bool(
+                class(c"NSWindow").as_id(),
+                sel!(setAllowsAutomaticWindowTabbing:),
+                enabled,
+            )
+        }
     }
 
     pub(crate) fn allows_automatic_window_tabbing(&self) -> bool {
-        NSWindow::allowsAutomaticWindowTabbing(self.mtm)
+        let _ = self.mtm;
+        // SAFETY: `+allowsAutomaticWindowTabbing` is `B16@0:8`, a class method.
+        unsafe {
+            send_bool(
+                class(c"NSWindow").as_id(),
+                sel!(allowsAutomaticWindowTabbing),
+            )
+        }
     }
 }
 
@@ -207,7 +241,10 @@ pub struct EventLoop<T: 'static> {
     ///
     /// We intentionally don't store `WinitApplication` since we want to have
     /// the possibility of swapping that out at some point.
-    app: Retained<NSApplication>,
+    ///
+    /// LOCAL PATCH (aterm): an `aterm_objc::Obj` — the same +1 handle
+    /// `Retained<NSApplication>` was.
+    app: Obj,
     /// The application delegate that we've registered.
     ///
     /// The delegate is only weakly referenced by NSApplication, so we must
@@ -239,17 +276,19 @@ impl<T> EventLoop<T> {
     pub(crate) fn new(
         attributes: &PlatformSpecificEventLoopAttributes,
     ) -> Result<Self, EventLoopError> {
-        let mtm = MainThreadMarker::new()
+        let mtm = MainThread::new()
             .expect("on macOS, `EventLoop` must be created on the main thread!");
 
         // Initialize the application (if it has not already been).
-        let app = NSApplication::sharedApplication(mtm);
+        // SAFETY: `+sharedApplication` answers the process-lifetime singleton,
+        // +0 autoreleased, so it is retained into a handle this struct owns.
+        let app = unsafe { Obj::retain(app()) }.expect("+sharedApplication to answer");
 
         let activation_policy = match attributes.activation_policy {
             None => None,
-            Some(ActivationPolicy::Regular) => Some(NSApplicationActivationPolicy::Regular),
-            Some(ActivationPolicy::Accessory) => Some(NSApplicationActivationPolicy::Accessory),
-            Some(ActivationPolicy::Prohibited) => Some(NSApplicationActivationPolicy::Prohibited),
+            Some(ActivationPolicy::Regular) => Some(NS_APPLICATION_ACTIVATION_POLICY_REGULAR),
+            Some(ActivationPolicy::Accessory) => Some(NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY),
+            Some(ActivationPolicy::Prohibited) => Some(NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED),
         };
         let delegate = ApplicationDelegate::new(
             mtm,
@@ -259,19 +298,26 @@ impl<T> EventLoop<T> {
         );
 
         autoreleasepool(|_| {
-            app.setDelegate(Some(delegate.as_protocol_object()));
+            // SAFETY: `-setDelegate:` is `v24@0:8@16` on `NSApplication` and
+            // takes a WEAK reference — which is why `EventLoop` keeps its own
+            // handle to the delegate below. `as_delegate_id` asserts the class
+            // really conforms to `NSApplicationDelegate`, which is the
+            // compile-time fact `ProtocolObject` used to carry.
+            unsafe { send_v_id(app.id(), sel!(setDelegate:), delegate.as_delegate_id()) };
         });
 
         // Override `sendEvent:` on the application to forward to our application state.
-        override_send_event(&app);
+        // SAFETY: `app` owns a +1 to the live shared `NSApplication`.
+        unsafe { override_send_event(app.id(), mtm) };
 
         let panic_info: Rc<PanicInfo> = Default::default();
-        // LOCAL PATCH (aterm): `observer.rs` speaks `aterm_objc::MainThread` now,
-        // so the marker crosses here. This file keeps `MainThreadMarker` as its own
-        // currency because six of its uses feed `NSApplication::sharedApplication`
-        // and `NSWindow::{setAllowsAutomaticWindowTabbing,allowsAutomaticWindowTabbing}`,
-        // which are `objc2-app-kit` bindings and pin it until those rows are ported.
-        setup_control_flow_observers(aterm_objc_seam::witness(mtm), Rc::downgrade(&panic_info));
+        // LOCAL PATCH (aterm): the override's Rust-panic guard is
+        // `stop_app_on_panic`, so it needs the slot the observers get below.
+        set_send_event_panic_info(mtm, Rc::downgrade(&panic_info));
+        // LOCAL PATCH (aterm): `observer.rs` speaks `aterm_objc::MainThread`,
+        // and since W12 so does this file — the crossing that used to sit on
+        // this line is gone.
+        setup_control_flow_observers(mtm, Rc::downgrade(&panic_info));
 
         let (sender, receiver) = mpsc::channel();
         Ok(EventLoop {
@@ -322,8 +368,9 @@ impl<T> EventLoop<T> {
                     self.delegate.dispatch_init_events();
                 }
 
-                // SAFETY: We do not run the application re-entrantly
-                unsafe { self.app.run() };
+                // SAFETY: We do not run the application re-entrantly.
+                // `-run` is `v16@0:8` on `NSApplication`.
+                unsafe { send_v(self.app.id(), sel!(run)) };
 
                 // While the app is running it's possible that we catch a panic
                 // to avoid unwinding across an objective-c ffi boundary, which
@@ -355,8 +402,8 @@ impl<T> EventLoop<T> {
                     debug_assert!(!self.delegate.is_running());
 
                     self.delegate.set_stop_on_launch();
-                    // SAFETY: We do not run the application re-entrantly
-                    unsafe { self.app.run() };
+                    // SAFETY: We do not run the application re-entrantly.
+                    unsafe { send_v(self.app.id(), sel!(run)) };
 
                     // Note: we dispatch `NewEvents(Init)` + `Resumed` events after the application
                     // has launched
@@ -388,8 +435,8 @@ impl<T> EventLoop<T> {
                         },
                     }
                     self.delegate.set_stop_on_redraw(true);
-                    // SAFETY: We do not run the application re-entrantly
-                    unsafe { self.app.run() };
+                    // SAFETY: We do not run the application re-entrantly.
+                    unsafe { send_v(self.app.id(), sel!(run)) };
                 }
 
                 // While the app is running it's possible that we catch a panic
@@ -435,21 +482,27 @@ impl OwnedDisplayHandle {
     }
 }
 
-pub(super) fn stop_app_immediately(app: &NSApplication) {
+///
+/// # Safety
+/// `app` must be the live shared `NSApplication`.
+pub(super) unsafe fn stop_app_immediately(app: Id) {
     autoreleasepool(|_| {
-        app.stop(None);
-        // To stop event loop immediately, we need to post some event here.
-        // See: https://stackoverflow.com/questions/48041279/stopping-the-nsapplication-main-event-loop/48064752#48064752
-        // LOCAL PATCH (aterm): `dummy_event` now answers an `aterm_objc::Obj`
-                // (a +1 handle) rather than `Retained<NSEvent>`; this file still
-                // sends through the `objc2` binding, so the handle is crossed back
-                // for the one call. The `Obj` is bound to a local so its +1
-                // outlives the borrow.
-                let dummy = dummy_event().expect("NSEvent refused the dummy event");
-                // SAFETY: `dummy` owns a +1 to a live `NSEvent`, which is what
-                // `NSEvent` is a correct binding for.
-                let dummy: &NSEvent = unsafe { super::aterm_objc_seam::objc2_ref(dummy.id()) };
-                app.postEvent_atStart(dummy, true);
+        // SAFETY: `-stop:` is `v24@0:8@16` on `NSApplication` and its argument
+        // is the `nil` sender upstream passed as `None`;
+        // `-postEvent:atStart:` is `v32@0:8@16B24`.
+        unsafe {
+            send_v_id(app, sel!(stop:), Id::NIL);
+            // To stop event loop immediately, we need to post some event here.
+            // See: https://stackoverflow.com/questions/48041279/stopping-the-nsapplication-main-event-loop/48064752#48064752
+            //
+            // LOCAL PATCH (aterm), W12: `dummy_event` answers an
+            // `aterm_objc::Obj` (a +1 handle) rather than `Retained<NSEvent>`,
+            // and this file now sends the raw `id` — the crossing that used to
+            // sit here is gone. The `Obj` is bound to a local so its +1
+            // outlives the send.
+            let dummy = dummy_event().expect("NSEvent refused the dummy event");
+            send_v_id_bool(app, sel!(postEvent:atStart:), dummy.id(), true);
+        }
     });
 }
 
@@ -463,10 +516,30 @@ pub(super) fn stop_app_immediately(app: &NSApplication) {
 ///
 /// This ensures that no windows linger on after the event loop has exited,
 /// see <https://github.com/rust-windowing/winit/issues/4135>.
-pub(super) fn notify_windows_of_exit(app: &NSApplication) {
-    for window in app.windows() {
-        window.close();
-    }
+///
+/// # Safety
+/// `app` must be the live shared `NSApplication`.
+pub(super) unsafe fn notify_windows_of_exit(app: Id) {
+    // LOCAL PATCH (aterm): the array is walked by index rather than by
+    // `NSFastEnumeration`, for `monitor.rs`'s reason. The pool is EXPLICIT
+    // because `-windows` answers +0 autoreleased and `-close` runs a whole
+    // teardown — including `windowWillClose:` and the fork's own `Destroyed`
+    // dispatch — inside it.
+    autoreleasepool(|_| {
+        // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is
+        // `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`;
+        // `-close` is `v16@0:8` on `NSWindow`. THE LENGTH IS READ ONCE, which
+        // is upstream's behaviour: `for window in app.windows()` walked a
+        // SNAPSHOT array, so a `-close` cannot shift the indices.
+        unsafe {
+            let windows = send_id(app, sel!(windows));
+            let n = send_usize(windows, sel!(count));
+            for i in 0..n {
+                let window = send_id_usize(windows, sel!(objectAtIndex:), i);
+                send_v(window, sel!(close));
+            }
+        }
+    });
 }
 
 /// Catches panics that happen inside `f` and when a panic
@@ -474,9 +547,10 @@ pub(super) fn notify_windows_of_exit(app: &NSApplication) {
 #[inline]
 // LOCAL PATCH (aterm): takes `aterm_objc::MainThread`, because its only caller
 // (`observer.rs::control_flow_handler`) is ported and no longer mints an objc2
-// marker. The marker is re-derived at the one line that needs one.
+// marker. Since W12 nothing here consumes one, so the witness is simply the
+// proof and the re-derivation is gone.
 pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
-    mtm: aterm_objc::MainThread,
+    mtm: MainThread,
     panic_info: Weak<PanicInfo>,
     f: F,
 ) -> Option<R> {
@@ -487,12 +561,18 @@ pub fn stop_app_on_panic<F: FnOnce() -> R + UnwindSafe, R>(
             // because some callback are still called during the `stop` message
             // and we need to know in those callbacks if the application is currently
             // panicking
-            {
-                let panic_info = panic_info.upgrade().unwrap();
-                panic_info.set_panic(e);
+            // LOCAL PATCH (aterm): no `unwrap`. This guard is also the OUTER
+            // half of the `"C-unwind"` `sendEvent:` override, so a second
+            // panic here would escape straight into AppKit's caller with no
+            // Rust catch above it. If the event loop's `PanicInfo` is gone
+            // (teardown ordering) the honest answer is the named abort.
+            match panic_info.upgrade() {
+                Some(panic_info) => panic_info.set_panic(e),
+                None => aterm_objc::abort_on_unwind("stop_app_on_panic (event loop gone)"),
             }
-            let app = NSApplication::sharedApplication(aterm_objc_seam::marker(mtm));
-            stop_app_immediately(&app);
+            let _ = mtm;
+            // SAFETY: `app()` is the live shared `NSApplication`.
+            unsafe { stop_app_immediately(app()) };
             None
         },
     }
@@ -559,4 +639,14 @@ impl<T> EventLoopProxy<T> {
         }
         Ok(())
     }
+}
+
+/// `+[NSApplication sharedApplication]`, the process-lifetime singleton — the
+/// same helper `app_state.rs` and `window_delegate.rs` carry, for the same
+/// reason: the marker objc2's binding demanded is objc2's requirement, not
+/// AppKit's, and every call site here still holds a witness.
+fn app() -> Id {
+    // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication` and creates
+    // the instance on first call.
+    unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }

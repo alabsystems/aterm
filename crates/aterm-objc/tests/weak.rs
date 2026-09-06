@@ -59,8 +59,8 @@ fn new_object() -> Obj {
     // SAFETY: `+alloc` is `@16#0:8` and `-init` is `@16@0:8` on `NSObject`;
     // the pair yields a +1 reference this `Obj` adopts.
     unsafe {
-        let alloc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-        let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         let raw = alloc(class(c"NSObject").as_id(), sel!(alloc));
         Obj::from_owned(init(raw, sel!(init))).expect("a fresh NSObject")
     }
@@ -71,8 +71,8 @@ fn new_object() -> Obj {
 fn new_mutable_string() -> Obj {
     // SAFETY: `+alloc`/`-init` on `NSMutableString`, same prototypes.
     unsafe {
-        let alloc: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-        let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let alloc: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
         let raw = alloc(class(c"NSMutableString").as_id(), sel!(alloc));
         Obj::from_owned(init(raw, sel!(init))).expect("a fresh NSMutableString")
     }
@@ -845,7 +845,7 @@ fn a_weak_reference_does_not_retain() {
     // decision input — the assertion below is about a DIFFERENCE, which is the
     // only thing this number can honestly support.
     let count = |id: Id| unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> isize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> isize = msg();
         f(id, sel!(retainCount))
     };
 

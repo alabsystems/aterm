@@ -100,7 +100,7 @@ fn a_fourteen_argument_method_is_sendable_from_rust_not_just_declarable() {
     // included — on a live instance of the class that declares it.
     unsafe {
         #[rustfmt::skip]
-        let f: unsafe extern "C" fn(
+        let f: unsafe extern "C-unwind" fn(
             Id, Sel,
             i64, i64, i64, i64, i64, i64, i64,
             i64, i64, i64, i64, i64, i64, i64,
@@ -173,13 +173,13 @@ fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
         // which is the outcome the parent asserts against.
         // SAFETY: `-length` on a live NSString, whose prototype this is.
         let len = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(borrowed, sel!(length))
         };
         assert_eq!(len, "no pool anywhere".len());
         // SAFETY: `-hash` on a live NSObject.
         let _ = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(borrowed2, sel!(hash))
         };
 
@@ -440,6 +440,11 @@ struct NoDefault(u64);
 unsafe impl Encode for NoDefault {
     const ENCODING: &'static str = "Q";
 }
+// SAFETY: `#[repr(transparent)]` over a `u64`, whose zero is a valid value.
+// `InertZero` is the bound the containment of an NSException at `invoke` needs
+// (the block then answers `NoDefault(0)`); it is NOT `Default` — F8's point
+// stands: no `Default` impl is written and none is demanded.
+unsafe impl aterm_objc::InertZero for NoDefault {}
 
 #[test]
 fn a_block_may_return_a_type_that_has_no_default_impl() {
@@ -488,20 +493,20 @@ fn the_return_types_this_crate_can_send_all_declare_their_abi() {
     // SAFETY: no pointer here is called; the test only builds the prototypes,
     // which is what exercises the bound.
     unsafe {
-        let _: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-        let _: unsafe extern "C" fn(Id, Sel) = msg();
-        let _: unsafe extern "C" fn(Id, Sel) -> aterm_objc::Bool = msg();
-        let _: unsafe extern "C" fn(Id, Sel) -> aterm_objc::CGRect = msg();
-        let _: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
-        let _: unsafe extern "C" fn(Id, Sel) -> Sel = msg();
-        let _: unsafe extern "C" fn(Id, Sel) -> *const c_void = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::Bool = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::CGRect = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> Sel = msg();
+        let _: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_void = msg();
     }
     // A real send through the newly-encodable `*const c_char`: `-UTF8String`.
     let s = ns_string("utf8 through a char*").expect("NSString");
     // SAFETY: `-UTF8String` on a live NSString returns a NUL-terminated buffer
     // owned by the receiver and valid while it is.
     let round = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
         CStr::from_ptr(f(s.id(), sel!(UTF8String)))
             .to_string_lossy()
             .into_owned()

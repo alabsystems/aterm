@@ -1699,7 +1699,7 @@ mod macos {
                 // class rather than `object_getClass(this)`.
                 unsafe {
                     let sup = self.super_receiver();
-                    let f: unsafe extern "C" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
+                    let f: unsafe extern "C-unwind" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
                         aterm_objc::msg_super();
                     f(&raw const sup, sel!(updateTrackingAreas));
                 }
@@ -1708,7 +1708,9 @@ mod macos {
 
             /// Accept the FIRST click even when the window is not key, so clicking the "+"
             /// in a background window works in a single click (native feel).
-            @sel(acceptsFirstMouse:)
+            /// NOT CONTAINED: a contained NO would swallow that click, a real answer;
+            /// the body is send-free, so the marker only states the policy.
+            @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
             }
@@ -2437,7 +2439,7 @@ mod macos {
                 // that DECLARES this method, so lookup starts at `NSView`.
                 unsafe {
                     let sup = self.super_receiver();
-                    let f: unsafe extern "C" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
+                    let f: unsafe extern "C-unwind" fn(*const aterm_objc::ObjcSuper, aterm_objc::Sel) =
                         aterm_objc::msg_super();
                     f(&raw const sup, sel!(updateTrackingAreas));
                 }
@@ -2447,7 +2449,9 @@ mod macos {
             /// Accept the FIRST click even when the window is not key, so clicking a tab
             /// in a background window both raises it AND selects the tab in one click
             /// (matches native tab behavior).
-            @sel(acceptsFirstMouse:)
+            /// NOT CONTAINED: a contained NO would swallow that click, a real answer;
+            /// the body is send-free, so the marker only states the policy.
+            @sel(acceptsFirstMouse:) @abort_on_exception
             fn acceptsFirstMouse(&self, _event: Id) -> aterm_objc::Bool {
                 aterm_objc::Bool::YES
             }
@@ -5239,7 +5243,7 @@ mod macos {
                 // `methodReturnLength` bytes, asserted to be pointer-sized.
                 unsafe {
                     let selector = sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:);
-                    let sig_for: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                    let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                     let sig = sig_for(
                         delegate.as_id(),
                         sel!(methodSignatureForSelector:),
@@ -5261,10 +5265,14 @@ mod macos {
                             sig,
                         );
                         assert!(!inv.is_null());
-                        let set_sel: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+                        let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
                         set_sel(inv, sel!(setSelector:), selector);
-                        let set_arg: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void, isize) =
-                            msg();
+                        let set_arg: unsafe extern "C-unwind" fn(
+                            Id,
+                            Sel,
+                            *mut std::ffi::c_void,
+                            isize,
+                        ) = msg();
                         // index 2 = the (nil) NSToolbar, 3 = the identifier,
                         // 4 = the BOOL.
                         let mut toolbar = Id::NIL;
@@ -5291,7 +5299,8 @@ mod macos {
                         );
                         appkit::send_v_id(inv, sel!(invokeWithTarget:), delegate.as_id());
                         let mut out = Id::NIL;
-                        let get_ret: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) = msg();
+                        let get_ret: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) =
+                            msg();
                         get_ret(
                             inv,
                             sel!(getReturnValue:),
@@ -5351,7 +5360,7 @@ mod macos {
                         sel!(toolbarDefaultItemIdentifiers:),
                         sel!(toolbarAllowedItemIdentifiers:),
                     ] {
-                        let perform: unsafe extern "C" fn(Id, Sel, Sel, Id) -> Id = msg();
+                        let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id) -> Id = msg();
                         let arr = perform(
                             delegate.as_id(),
                             sel!(performSelector:withObject:),
@@ -5360,7 +5369,7 @@ mod macos {
                         );
                         assert!(!arr.is_null(), "{s:?} returned nil");
                         assert_eq!(appkit::send_usize(arr, sel!(count)), 1);
-                        let first: unsafe extern "C" fn(Id, Sel, usize) -> Id = msg();
+                        let first: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = msg();
                         assert_eq!(
                             appkit::nsstring_to_rust(first(arr, sel!(objectAtIndex:), 0)),
                             STRIP_ITEM_ID
@@ -5408,7 +5417,7 @@ mod macos {
                 type Ivars = ();
                 protocols: [NSObject];
 
-                @sel(acceptsFirstMouse:)
+                @sel(acceptsFirstMouse:) @abort_on_exception
                 fn accepts_first_mouse(&self, _event: Id) -> Bool {
                     FIRST_MOUSE.store(1, Ordering::SeqCst);
                     Bool::YES
@@ -5432,7 +5441,7 @@ mod macos {
                 // SAFETY: as `foundation_invokes_the_three_argument_toolbar_selector`.
                 unsafe {
                     let selector = sel!(control:textView:doCommandBySelector:);
-                    let sig_for: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+                    let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
                     let sig = sig_for(probe.as_id(), sel!(methodSignatureForSelector:), selector);
                     assert!(!sig.is_null());
                     assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 5);
@@ -5447,10 +5456,14 @@ mod macos {
                             sel!(invocationWithMethodSignature:),
                             sig,
                         );
-                        let set_sel: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+                        let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
                         set_sel(inv, sel!(setSelector:), selector);
-                        let set_arg: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void, isize) =
-                            msg();
+                        let set_arg: unsafe extern "C-unwind" fn(
+                            Id,
+                            Sel,
+                            *mut std::ffi::c_void,
+                            isize,
+                        ) = msg();
                         let mut nil = Id::NIL;
                         for idx in [2, 3] {
                             set_arg(
@@ -5469,7 +5482,8 @@ mod macos {
                         );
                         appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
                         let mut out = Bool::NO;
-                        let get_ret: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) = msg();
+                        let get_ret: unsafe extern "C-unwind" fn(Id, Sel, *mut std::ffi::c_void) =
+                            msg();
                         get_ret(
                             inv,
                             sel!(getReturnValue:),
@@ -5529,7 +5543,7 @@ mod macos {
                     class_name(aterm_objc::superclass_of(FirstMouseProbe::class())),
                     c"NSView"
                 );
-                let perform: unsafe extern "C" fn(Id, Sel, Sel, Id) -> Id = msg();
+                let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id) -> Id = msg();
                 perform(
                     probe.as_id(),
                     sel!(performSelector:withObject:),

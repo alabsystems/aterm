@@ -118,7 +118,7 @@ fn foundation_invokes_an_arity_two_block() {
     // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block
     // argument; `text` is a live +1 NSString.
     unsafe {
-        let enumerate: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
+        let enumerate: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
         enumerate(text.id(), sel!(enumerateLinesUsingBlock:), block.as_ptr());
     }
     assert_eq!(
@@ -215,7 +215,7 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
     // SAFETY: `block` is a live heap block, which is a valid message receiver;
     // `-class` is a plain accessor.
     unsafe {
-        let cls: unsafe extern "C" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
+        let cls: unsafe extern "C-unwind" fn(Id, Sel) -> aterm_objc::ClassPtr = msg();
         let c = cls(Id::from_ptr(block.as_ptr()), sel!(class));
         assert!(!c.is_null());
         let name = aterm_objc::class_name(c).to_string_lossy().into_owned();
@@ -229,8 +229,11 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
         // x86_64 compat slice `BOOL` is `signed char`, so a receiver that
         // answered a non-0/1 byte would have been materialised as an invalid
         // `bool`. D3's rule, now enforced rather than remembered.
-        let is_kind: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
-            msg();
+        let is_kind: unsafe extern "C-unwind" fn(
+            Id,
+            Sel,
+            aterm_objc::ClassPtr,
+        ) -> aterm_objc::Bool = msg();
         assert!(
             is_kind(
                 Id::from_ptr(block.as_ptr()),
@@ -240,4 +243,76 @@ fn the_runtime_agrees_a_block_is_an_objc_object() {
             .as_bool()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// W12 — the ownership rule `observer.rs::queue_closure` now depends on.
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn CFRunLoopGetCurrent() -> *mut c_void;
+    fn CFRunLoopPerformBlock(rl: *mut c_void, mode: *const c_void, block: *mut c_void);
+    fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source: bool) -> i32;
+    static kCFRunLoopDefaultMode: *const c_void;
+}
+
+/// `CFRunLoopPerformBlock` TAKES ITS OWN REFERENCE, so the caller may release
+/// immediately.
+///
+/// This is the one new ownership claim the `observer.rs` port makes. Upstream
+/// passed a `&block2::Block` borrowed from an `RcBlock` that dropped at the end
+/// of the same function, so the shape is not new — but it was implicit in a
+/// binding type, and here it is a raw pointer and a `Drop` two lines apart. If
+/// the run loop did NOT copy, this test invokes a freed heap block.
+///
+/// Both halves are asserted, and the second is what makes it a measurement
+/// rather than a smoke test: the closure RAN (so the block survived our
+/// release), and its captured payload was dropped EXACTLY ONCE afterwards (so
+/// the run loop's reference was given back rather than leaked).
+#[test]
+fn cfrunloopperformblock_takes_its_own_reference() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let spy = DropSpy(Arc::clone(&drops));
+    let h = Arc::clone(&hits);
+
+    // SAFETY: a no-argument, `()`-returning block, which is exactly what
+    // `CFRunLoopPerformBlock` invokes (`void (^)(void)`).
+    let block = unsafe {
+        RcBlock::new0(move || {
+            let _ = &spy;
+            h.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+    .expect("a heap block");
+
+    // SAFETY: the current run loop is live for this thread, the mode is
+    // Foundation's own constant, and the block is a live heap block.
+    unsafe { CFRunLoopPerformBlock(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode, block.as_ptr()) };
+
+    // THE RELEASE, before the run loop has run anything. `queue_closure`'s
+    // `RcBlock` goes out of scope at exactly this point.
+    drop(block);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "our release destroyed the closure — the run loop did not take a \
+         reference, and `queue_closure` is invoking freed memory"
+    );
+
+    // SAFETY: draining the default mode for a bounded time on this thread.
+    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, false) };
+
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the queued block did not run"
+    );
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        1,
+        "the closure was dropped {} times after the run loop invoked it; the \
+         run loop's reference must be given back exactly once",
+        drops.load(Ordering::SeqCst)
+    );
 }

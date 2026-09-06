@@ -1460,7 +1460,7 @@ mod tests {
         use crate::metal::swapchain::{Swapchain, SwapchainConfig};
 
         let Some(dev) = Device::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         // The house convention for first-party Metal tests (see the ffi
@@ -1596,7 +1596,7 @@ mod tests {
     #[test]
     fn metal_texture_carries_its_mints_latch_and_alias_inherits_it() {
         let Some(mint) = mint() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1629,7 +1629,7 @@ mod tests {
     #[test]
     fn crossing_a_metal_resource_into_a_wgpu_seam_panics_by_name() {
         let Some(mint) = mint() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1692,7 +1692,7 @@ mod tests {
     #[test]
     fn the_metal_arm_refuses_short_uploads_and_oversized_writes() {
         let Some(mint) = mint() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
@@ -1745,11 +1745,11 @@ mod tests {
     fn the_metal_readback_reproduces_the_wgpu_padding_contract() {
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Ok(ctx) = crate::GpuContext::new() else {
-            eprintln!("SKIP: no wgpu context");
+            crate::stderr_line!("SKIP: no wgpu context");
             return;
         };
         let Some(dev) = Device::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let latch = Arc::new(LossLatch::new());
@@ -1850,11 +1850,11 @@ mod tests {
     fn the_padding_tail_is_neither_written_nor_consulted() {
         let _test_pool = crate::metal::ffi::AutoreleasePool::new();
         let Ok(ctx) = crate::GpuContext::new() else {
-            eprintln!("SKIP: no wgpu context");
+            crate::stderr_line!("SKIP: no wgpu context");
             return;
         };
         let Some(dev) = Device::system_default() else {
-            eprintln!("SKIP: no Metal device");
+            crate::stderr_line!("SKIP: no Metal device");
             return;
         };
         let latch = Arc::new(LossLatch::new());

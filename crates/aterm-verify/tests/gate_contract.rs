@@ -67,6 +67,13 @@ impl FakeRepo {
         me.objc_toolbar_driver(0);
         // And the window driver (W8), likewise.
         me.objc_window_driver(0);
+        // And the event driver, likewise.
+        me.objc_event_driver(0);
+        // And the three the objc2 exit added: the modal driver (W13) and the
+        // two capability drivers (W12), likewise.
+        me.objc_alert_driver(0);
+        me.objc_swizzle_driver(0);
+        me.objc_bound_driver(0);
         me
     }
 
@@ -126,6 +133,62 @@ impl FakeRepo {
         self.script(
             "target/debug/examples/objc_window_drive",
             &format!("echo 'objc-window-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_event_drive` example that exits `code` — `0`/`1`/`2`
+    /// as its siblings.
+    fn objc_event_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_event_drive",
+            &format!("echo 'objc-event-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_event_drive` that dies by `SIGABRT` — the shape of
+    /// the v0.72.0 crash the real driver reproduces, and the one reading
+    /// where this stage differs from its siblings.
+    fn objc_event_driver_aborting(&self) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_event_drive",
+            "echo 'objc-event-drive: stub about to abort'; kill -ABRT $$",
+        );
+        self
+    }
+
+    /// A stand-in `objc_alert_drive` example that exits `code` — `0`/`1`/`2`
+    /// as the window drive's.
+    fn objc_alert_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_alert_drive",
+            &format!("echo 'objc-alert-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_swizzle_drive` example that exits `code`. An
+    /// `aterm-objc` example lands in the same `target/debug/examples/` as the
+    /// `aterm-gui` ones, which is what the stage's path resolution assumes.
+    fn objc_swizzle_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_swizzle_drive",
+            &format!("echo 'objc-swizzle-drive: stub'; exit {code}"),
+        );
+        self
+    }
+
+    /// A stand-in `objc_bound_drive` example that exits `code`, likewise.
+    fn objc_bound_driver(&self, code: i32) -> &Self {
+        fs::create_dir_all(self.root.join("target/debug/examples")).expect("mkdir");
+        self.script(
+            "target/debug/examples/objc_bound_drive",
+            &format!("echo 'objc-bound-drive: stub'; exit {code}"),
         );
         self
     }
@@ -281,8 +344,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        26,
-        "23 gate stages plus the three --full tiers"
+        30,
+        "27 gate stages plus the three --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -903,6 +966,142 @@ fn the_objc_window_drive_reads_its_exit_code_and_two_is_not_green() {
     );
 }
 
+/// The event driver's reading, with the one difference that matters: a
+/// SIGNAL DEATH IS A FINDING. v0.72.0 died by `SIGABRT` on the first mouse
+/// move; the driver reproduces that shape, so the stage must read "no exit
+/// status" as the gate FAILING, never as could-not-run — the siblings read a
+/// signal as harness noise, and that reading here would file the crash under
+/// "decided nothing".
+#[cfg(target_os = "macos")]
+#[test]
+fn the_objc_event_drive_reads_its_exit_code_and_a_signal_death_is_a_failure() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::ObjcEventDrive)
+        .expect("the objc event drive is planned");
+    repo.objc_event_driver(0);
+    assert_eq!(
+        tally(&[stages::run_stage(&ctx, &spec)]),
+        Tally::default(),
+        "a clean drive leaves the run clean"
+    );
+    repo.objc_event_driver(1);
+    let t = tally(&[stages::run_stage(&ctx, &spec)]);
+    assert_eq!(t.gate_failures, 1, "exit 1 is a finding about the tree");
+    assert_eq!(t.could_not_run, 0);
+    repo.objc_event_driver(2);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(t.could_not_run, 1, "exit 2 decided nothing");
+    assert_eq!(t.gate_failures, 0, "…and is not a finding about the tree");
+    assert_eq!(t.skipped(), 0, "…and above all is not a quiet skip");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render().contains("  FAIL  objc event drive: NOT RUN"),
+        "{}",
+        r.render()
+    );
+    repo.objc_event_driver(3);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(
+        t.gate_failures, 1,
+        "exit 3 is the trapped abort: THE finding"
+    );
+    assert_eq!(t.could_not_run, 0, "…and is never read as could-not-run");
+    assert!(
+        r.render().contains("  FAIL  objc event drive: ABORTED"),
+        "{}",
+        r.render()
+    );
+    repo.objc_event_driver_aborting();
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    assert_eq!(
+        t.gate_failures, 1,
+        "an untrapped signal death is still THE finding, not harness noise"
+    );
+    assert_eq!(t.could_not_run, 0, "…and is never read as could-not-run");
+    assert!(t.failed(), "so the run cannot end green");
+    assert!(
+        r.render().contains("  FAIL  objc event drive: ABORTED"),
+        "{}",
+        r.render()
+    );
+}
+
+/// The three drivers the objc2 exit added read their exit codes the way the
+/// window drive does — and `2` is NOT green for any of them. One test for the
+/// three, because the reading is one reading: each driver answers `0`/`1`/`2`,
+/// each stage must file `1` as a finding about the tree and `2` as could-not-
+/// run that still fails the run, and a stage that read any of the three
+/// differently would be the stage a reader had to learn separately.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_three_objc2_exit_drives_read_their_exit_codes_and_two_is_not_green() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    type Stub = fn(&FakeRepo, i32) -> &FakeRepo;
+    let rows: [(StageId, &str, Stub); 3] = [
+        (
+            StageId::ObjcAlertDrive,
+            "objc alert drive",
+            FakeRepo::objc_alert_driver,
+        ),
+        (
+            StageId::ObjcSwizzleDrive,
+            "objc swizzle drive",
+            FakeRepo::objc_swizzle_driver,
+        ),
+        (
+            StageId::ObjcBoundDrive,
+            "objc bound drive",
+            FakeRepo::objc_bound_driver,
+        ),
+    ];
+    for (id, name, stub) in rows {
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("the {name} is planned"));
+
+        stub(&repo, 0);
+        assert_eq!(
+            tally(&[stages::run_stage(&ctx, &spec)]),
+            Tally::default(),
+            "{name}: a clean drive leaves the run clean"
+        );
+
+        stub(&repo, 1);
+        let t = tally(&[stages::run_stage(&ctx, &spec)]);
+        assert_eq!(
+            t.gate_failures, 1,
+            "{name}: exit 1 is a finding about the tree"
+        );
+        assert_eq!(t.could_not_run, 0);
+
+        stub(&repo, 2);
+        let r = stages::run_stage(&ctx, &spec);
+        let t = tally(std::slice::from_ref(&r));
+        assert_eq!(t.could_not_run, 1, "{name}: exit 2 decided nothing");
+        assert_eq!(
+            t.gate_failures, 0,
+            "{name}: …and is not a finding about the tree"
+        );
+        assert_eq!(t.skipped(), 0, "{name}: …and above all is not a quiet skip");
+        assert!(t.failed(), "{name}: so the run cannot end green");
+        assert!(
+            r.render().contains(&format!("  FAIL  {name}: NOT RUN")),
+            "{}",
+            r.render()
+        );
+    }
+}
+
 #[test]
 fn selftest_matches_the_scripts_selftest_ladder_exactly() {
     // The reference is `tools/verify.sh --selftest` on this tree: every stage
@@ -966,6 +1165,10 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "objc IME drive (selftest: not executed)"),
             ("skip", "objc toolbar drive (selftest: not executed)"),
             ("skip", "objc window drive (selftest: not executed)"),
+            ("skip", "objc event drive (selftest: not executed)"),
+            ("skip", "objc alert drive (selftest: not executed)"),
+            ("skip", "objc swizzle drive (selftest: not executed)"),
+            ("skip", "objc bound drive (selftest: not executed)"),
             // The six verdict cases the bash gate printed here too. They are the
             // selftest's actual evidence: every other row above says "not
             // executed", so without these the ladder shows a run that checked

@@ -294,6 +294,9 @@ pub(crate) fn spawn_native_update_reconcile_worker(
     std::thread::Builder::new()
         .name("aterm-update-facts".to_string())
         .spawn(move || {
+            // QoS (port of 61a6c8b62): reconcile facts feed a settings screen,
+            // not a frame; results return through the proxy, no lock is held.
+            crate::qos::set_self(crate::qos::Role::Background);
             let health_proxy = drain_proxy.clone();
             run_native_update_worker(
                 receiver,
@@ -4872,6 +4875,9 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name("aterm-packages-status".into())
             .spawn(move || {
+                // QoS (port of 61a6c8b62): a package inventory probe is
+                // cosmetic to the terminal; it lands via the proxy when done.
+                crate::qos::set_self(crate::qos::Role::Background);
                 let report = crate::packages_screen::collect_packages_status(available);
                 let completion = PackagesWorkerCompletion::refresh(report);
                 let _ = proxy.send_event(Wake::NativePackagesFinished {
@@ -5086,6 +5092,9 @@ impl App {
                 let spawn = std::thread::Builder::new()
                     .name("aterm-native-update-check".into())
                     .spawn(move || {
+                        // QoS (port of 61a6c8b62): a network update probe;
+                        // nobody at the keyboard is blocked on its answer.
+                        crate::qos::set_self(crate::qos::Role::Background);
                         let source =
                             aterm_update::Source::resolve(owner.as_deref(), repo.as_deref());
                         let status = aterm_update::check_now(build, &source);

@@ -40,7 +40,7 @@ fn ns_string_length_is_utf16_code_units() {
         let obj = ns_string("héllo").expect("NSString");
         // SAFETY: `-length` is `-(NSUInteger)` on a live NSString.
         let len: usize = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(obj.id(), sel!(length))
         };
         assert_eq!(len, 5, "NSString length counts UTF-16 units, not bytes");
@@ -57,16 +57,16 @@ fn owned_and_retained_balance_exactly() {
         // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance this `Obj`
         // adopts and releases exactly once.
         let obj = unsafe {
-            let alloc: unsafe extern "C" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
             let raw = alloc(class(c"NSObject"), sel!(alloc));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             Obj::from_owned(init(raw, sel!(init))).expect("NSObject instance")
         };
         // SAFETY: `-retainCount` is `-(NSUInteger)`; it is diagnostic-only, which
         // is precisely what this test wants it for.
         let count = |o: &Obj| -> usize {
             unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
                 f(o.id(), sel!(retainCount))
             }
         };
@@ -124,7 +124,8 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
         // SAFETY: `+errorWithDomain:code:userInfo:` is a documented Foundation
         // constructor returning an autoreleased NSError; the pool above owns it.
         let err: Id = unsafe {
-            let f: unsafe extern "C" fn(aterm_objc::ClassPtr, Sel, Id, isize, Id) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel, Id, isize, Id) -> Id =
+                msg();
             f(
                 class(c"NSError"),
                 sel!(errorWithDomain:code:userInfo:),
@@ -214,7 +215,7 @@ fn cached_selectors_are_not_slower_than_uncached() {
         for _ in 0..ITERS {
             // SAFETY: `-length` on a live NSString is `-(NSUInteger)`.
             acc += unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
                 f(obj, sel_uncached(c"length"))
             };
         }
@@ -226,7 +227,7 @@ fn cached_selectors_are_not_slower_than_uncached() {
         for _ in 0..ITERS {
             // SAFETY: as above.
             acc += unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+                let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
                 f(obj, sel!(length))
             };
         }
@@ -291,16 +292,16 @@ fn an_autoreleased_object_lives_exactly_as_long_as_its_pool() {
         // SAFETY: `-retainCount` is `-(NSUInteger)` and diagnostic-only, which
         // is exactly what this test wants it for.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
             f(id, sel!(retainCount))
         }
     };
     autoreleasepool(|_| {
         // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance.
         let owned = unsafe {
-            let alloc: unsafe extern "C" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
+            let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
             let raw = alloc(class(c"NSObject"), sel!(alloc));
-            let init: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let init: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             Obj::from_owned(init(raw, sel!(init))).expect("NSObject instance")
         };
         let before = count(owned.id());
@@ -314,7 +315,7 @@ fn an_autoreleased_object_lives_exactly_as_long_as_its_pool() {
         // Still fully alive and messageable inside the pool.
         // SAFETY: `-description` is `-(id)` on the live object above.
         let desc = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = msg();
             f(borrowed, sel!(description))
         };
         assert!(!desc.is_null());
@@ -327,7 +328,7 @@ fn utf8_string_of_a_nil_receiver_is_empty() {
     // `Id` is a raw pointer rather than a `NonNull` for.
     // SAFETY: sending to nil is defined by the runtime and returns 0/null.
     let p: *const c_char = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
         f(Id::NIL, sel!(UTF8String))
     };
     assert!(p.is_null());

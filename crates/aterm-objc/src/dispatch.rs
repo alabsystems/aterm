@@ -193,7 +193,41 @@ struct Job<F, R> {
     out: Option<std::thread::Result<R>>,
 }
 
-/// What the main queue runs. `extern "C"`, so it must not unwind.
+/// The payload [`run_on_main`] re-raises on the CALLING thread when an
+/// `NSException` was contained inside the closure on the main thread.
+///
+/// The closure has no value to return, and `run_on_main` has no `Result` to
+/// return it in, so the containment crosses back the way a panic does: as the
+/// payload of a `resume_unwind` on the caller's thread. The main thread itself
+/// CONTINUES — the exception was caught inside libdispatch's frame, reported
+/// through [`crate::exception`] against `"run_on_main"`, and released — and
+/// the caller's panic hook is not invoked (`resume_unwind` never runs it). A
+/// caller that wants to survive it wraps the call in `catch_unwind` and
+/// downcasts to this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainedInRunOnMain {
+    /// The report's ordinal for THIS containment — the value
+    /// [`crate::contained_count`] took as the report incremented it, carried
+    /// out of the catch by [`crate::exception::Contained::ordinal`] rather
+    /// than re-read from the global counter afterwards (another thread's
+    /// containment in between would otherwise make it name the wrong report).
+    pub ordinal: u64,
+}
+
+impl std::fmt::Display for ContainedInRunOnMain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "aterm-objc: an NSException raised inside a run_on_main closure was \
+             contained on the main thread (containment #{}); see the containment log",
+            self.ordinal
+        )
+    }
+}
+
+/// What the main queue runs. `extern "C"`, so it must not unwind — and nothing
+/// does: a Rust panic is caught and carried back as data, and an
+/// `NSException` is contained inside and carried back the same way.
 ///
 /// # Safety
 /// `ctx` must be the address of a live `Job<F, R>` whose `f` is `Some`, and the
@@ -220,7 +254,7 @@ where
     // `UnwindSafe` and cannot be; the assertion is discharged by the fact that
     // nothing observes the captures after a panic — the payload goes back to
     // the caller, which resumes the unwind and drops the job.
-    job.out = Some(std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
         // The witness is minted HERE, on the thread it describes, through the
         // CHECKED constructor.
         //
@@ -259,8 +293,19 @@ where
         // The pool the module docs promise, on the DISPATCHED path. The closure
         // never sees it — a pool reference in scope of a generic `R` is exactly
         // `load_borrowed`'s defect.
-        autoreleasepool(|_pool| f(mt))
-    })));
+        //
+        // The containment sits INSIDE the pool and INSIDE the `catch_unwind`,
+        // the measured order: an `NSException` out of `f` is caught here on
+        // the main thread, reported, and released before the pool pops.
+        autoreleasepool(|_pool| crate::exception::contain("run_on_main", || f(mt)))
+    }));
+    job.out = Some(match ran {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(contained)) => Err(Box::new(ContainedInRunOnMain {
+            ordinal: contained.ordinal(),
+        })),
+        Err(payload) => Err(payload),
+    });
 }
 
 /// Run `f` on the main thread and return what it produced.
@@ -310,9 +355,13 @@ where
 ///
 /// If `f` panics, the panic is caught on the main thread and re-raised here,
 /// with its original payload, on the calling thread — never unwound through
-/// libdispatch's C frame. Also panics if libdispatch fails to run the submitted
-/// function at all, which would be a contract violation rather than a
-/// misuse.
+/// libdispatch's C frame. If `f` raises an `NSException` (through a send, or
+/// through AppKit code it called), the exception is CONTAINED on the main
+/// thread — reported against `"run_on_main"` through [`crate::exception`],
+/// its Rust frames dropped, the main thread continuing — and re-raised here
+/// as a panic whose payload is [`ContainedInRunOnMain`]. Also panics if
+/// libdispatch fails to run the submitted function at all, which would be a
+/// contract violation rather than a misuse.
 ///
 /// # Examples
 ///

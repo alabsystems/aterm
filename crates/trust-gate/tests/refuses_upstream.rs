@@ -103,7 +103,25 @@ fn upstream_shaped_wrapper(root: &Path) -> PathBuf {
 /// Run the nested build. `path` is the child's ENTIRE PATH (what decides the
 /// remedy); the compiler is named absolutely so PATH only has to reach `cc`.
 fn build(root: &Path, rustc: &Path, path: &str) -> (bool, String) {
-    let out = Command::new(cargo())
+    let cargo = cargo();
+    let mut cmd = Command::new(&cargo);
+    // Under `targo --unverified test`, `$CARGO` is targo, and targo has exactly
+    // two lanes, neither of them implicit: a bare `targo build` is refused
+    // before any build script runs, so the gate under test would never be
+    // reached and every case here would fail on targo's lane message instead
+    // (measured 2026-09-03 on the full ladder — "nested explicit-unverified
+    // Targo propagation is unavailable on this platform" is the outer run's
+    // own warning about this). The nested build selects the unverified lane
+    // explicitly; the gate in build.rs runs either way, which is what these
+    // tests are about. Stock cargo takes no such flag and gets none.
+    let is_targo = cargo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("targo"));
+    if is_targo {
+        cmd.arg("--unverified");
+    }
+    let out = cmd
         .args(["build", "-q"])
         .current_dir(root.join("pkg"))
         .env("RUSTC", rustc)

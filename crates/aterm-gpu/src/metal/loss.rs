@@ -343,7 +343,7 @@ mod tests {
     fn device() -> Option<Device> {
         let d = Device::system_default();
         if d.is_none() {
-            eprintln!("SKIP: no Metal device on this machine");
+            crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
     }

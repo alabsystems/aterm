@@ -126,9 +126,12 @@ pub trait Fetcher {
     /// pass and in every fresh process, bytes it could prove it already had.
     ///
     /// The saving is ROUND-TRIPS, not rate-limit budget, and the difference matters: the
-    /// sixteen asset reads already go to the unmetered release CDN, and the listing — the
-    /// one `api.github.com` request — still happens. Claiming the anonymous 60/hr budget
-    /// back would be describing the code as it was before the zero-API asset fetch landed.
+    /// sixteen asset reads already go to the unmetered release CDN, and the listing — one
+    /// `api.github.com` request PER PAGE on the listing lane — still happens there. (On the
+    /// pointer lane, `crate::net::GithubFetcher::index_pointer`, discovery is one
+    /// unmetered HEAD and there is no API request to save at all.) Claiming the anonymous
+    /// 60/hr budget back would be describing the code as it was before the zero-API asset
+    /// fetch landed.
     ///
     /// This method is the proof. The production impl derives it from the release LISTING
     /// (which `index_candidates` must fetch anyway, and memoizes), so answering costs
@@ -7073,6 +7076,87 @@ mod tests {
         assert!(
             rendered.contains("network problem") && !rendered.contains("signature-valid"),
             "the message must point at the network: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`Fake`] whose index listing answers GitHub's anonymous rate limit — the exact
+    /// error string `aterm_update_core`'s API layer renders for a 403/429 on the LIST,
+    /// which is what a drained office IP hands `atpkg` at GUI launch.
+    struct RateLimitedFake {
+        inner: Fake,
+        limited: std::cell::Cell<bool>,
+        source: String,
+    }
+    impl Fetcher for RateLimitedFake {
+        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            if self.limited.get() {
+                Err(aterm_update_core::HttpError::RateLimited {
+                    code: 403,
+                    url: "https://api.github.com/repos/alabsystems/atpkg-index/releases?per_page=100&page=1".into(),
+                    authenticated: false,
+                }
+                .to_string())
+            } else {
+                self.inner.index_candidates()
+            }
+        }
+        fn pkg_manifest(
+            &self,
+            repo: &str,
+            program: &str,
+            build: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+            self.inner.pkg_manifest(repo, program, build)
+        }
+        fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+            self.inner.download(repo, asset, dest)
+        }
+        fn source_id(&self) -> String {
+            self.source.clone()
+        }
+    }
+
+    /// A RATE-LIMITED listing is a transport failure like any other: the same-source
+    /// identity cache stands in for it, and without a cache the verdict is
+    /// `Unreachable` naming the rate limit — never `NoIndex`, never a signature failure.
+    /// This is the outcome a drained IP at GUI launch reaches, and the cache is what
+    /// keeps the toolchain usable through it.
+    #[test]
+    fn a_rate_limited_listing_is_unreachable_so_the_cache_stands_in() {
+        let dir = scratch("cache-rate-limited");
+        let layout = layout(&dir);
+        let f = RateLimitedFake {
+            inner: fixture(&dir),
+            limited: std::cell::Cell::new(false),
+            source: "src:A".into(),
+        };
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        f.limited.set(true);
+        install(&f, &layout, &anchor(), &req, fl(0), 0)
+            .expect("a rate-limited listing is served from the same-source cache");
+        let f2 = RateLimitedFake {
+            inner: fixture(&dir),
+            limited: std::cell::Cell::new(true),
+            source: "src:B".into(),
+        };
+        let err = install(&f2, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(
+            matches!(err, FlowError::Unreachable(_)),
+            "a rate limit with no cache is a transport verdict, not a trust one: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("rate limit")
+                && rendered.contains("network problem")
+                && !rendered.contains("signature-valid"),
+            "the message names the rate limit and points at the network: {rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

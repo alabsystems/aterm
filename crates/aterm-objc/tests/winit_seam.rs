@@ -1,20 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! W3 P2, P3 and the port itself — the seventy-two rows the winit port has to
+//! W3 P2, P3 and the port itself — the seventy-one rows the winit port has to
 //! register, checked against the runtime's own authority instead of against a
 //! claim.
 //!
 //! # What changed when the fork was ported, and the number that went stale
 //!
-//! 71 OF THE 72 ROWS are declared by [`aterm_objc::declare_class!`] today — 23
-//! in `window_delegate.rs`, 43 in `view.rs`, 3 in `app_state.rs` and 2 in
-//! `window.rs` — and the 72nd is the test-only `TestApplication` row named
-//! below. One of them, `draggingEntered:`, was CORRECTED in the move. This
-//! header used to say "23 of the 72", which was true for exactly one wave and
-//! then quietly became the reason a reader would over-read the test at the
+//! ALL SEVENTY-ONE ROWS are declared by [`aterm_objc::declare_class!`] today —
+//! 23 in `window_delegate.rs`, 43 in `view.rs`, 3 in `app_state.rs` and 2 in
+//! `window.rs`. One of them, `draggingEntered:`, was CORRECTED in the move.
+//! This header used to say "23 of the 72", which was true for exactly one wave
+//! and then quietly became the reason a reader would over-read the test at the
 //! bottom of this file; the count is asserted by
 //! [`the_table_still_covers_every_declared_method`] and stated here to match it.
+//!
+//! IT WAS SEVENTY-TWO UNTIL W12, and the 72nd was not product code: `app.rs`'s
+//! `TestApplication` declared a `sendEvent:` inside a `#[cfg(test)] mod tests`
+//! that this repository could never compile — `winit` is a path dependency and
+//! not a workspace member, so `cargo test -p winit` refuses outright. W12
+//! deletes that module rather than porting code no compiler ever sees, and
+//! [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`] takes over the
+//! one thing its row was really buying: a reading of
+//! `-[NSApplication sendEvent:]`'s LIVE encoding against the type `app.rs`
+//! swizzles it with.
 //! So this file is no longer only a survey of a fork it does not touch: it is
 //! the census of a fork that is CONVERTED, and three things below keep it
 //! honest about that.
@@ -237,84 +246,83 @@ fn expand(spec: &str) -> String {
 #[rustfmt::skip]
 const ROWS: &[Row] = &[
     // ---- ApplicationDelegate : NSObject <NSApplicationDelegate>
-    Row { site: "app_state.rs:116",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:121",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:126",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
+    Row { site: "app_state.rs:132",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:137",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:142",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
     // ---- WinitWindow : NSWindow
-    Row { site: "window.rs:184",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
-    Row { site: "window.rs:190",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:211",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:217",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
     // ---- WinitApplication : NSApplication
-    Row { site: "app.rs:199",       sel: "sendEvent:",                     authority: Authority::Class("NSApplication"), winit: "v@:@" },
     // ---- WindowDelegate : NSObject <NSWindowDelegate, NSDraggingDestination>
-    Row { site: "window_delegate.rs:230", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:237", sel: "windowWillClose:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:250", sel: "windowDidResize:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:257", sel: "windowWillStartLiveResize:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:265", sel: "windowDidEndLiveResize:",            authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:272", sel: "windowDidMove:",                     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:278", sel: "windowDidChangeBackingProperties:",  authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:294", sel: "windowDidBecomeKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:302", sel: "windowDidResignKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:318", sel: "windowWillEnterFullScreen:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:344", sel: "windowWillExitFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:358", sel: "window:willUseFullScreenPresentationOptions:", authority: Authority::Proto("NSWindowDelegate"), winit: "Q@:@Q" },
-    Row { site: "window_delegate.rs:385", sel: "windowDidEnterFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:405", sel: "windowDidExitFullScreen:",           authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:435", sel: "windowDidFailToEnterFullScreen:",    authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:459", sel: "windowDidChangeOcclusionState:",     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:468", sel: "windowDidChangeScreen:",             authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:231", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:238", sel: "windowWillClose:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:251", sel: "windowDidResize:",                   authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:258", sel: "windowWillStartLiveResize:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:266", sel: "windowDidEndLiveResize:",            authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:273", sel: "windowDidMove:",                     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:279", sel: "windowDidChangeBackingProperties:",  authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:295", sel: "windowDidBecomeKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:303", sel: "windowDidResignKey:",                authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:328", sel: "windowWillEnterFullScreen:",         authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:355", sel: "windowWillExitFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:375", sel: "window:willUseFullScreenPresentationOptions:", authority: Authority::Proto("NSWindowDelegate"), winit: "Q@:@Q" },
+    Row { site: "window_delegate.rs:402", sel: "windowDidEnterFullScreen:",          authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:429", sel: "windowDidExitFullScreen:",           authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:460", sel: "windowDidFailToEnterFullScreen:",    authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:484", sel: "windowDidChangeOcclusionState:",     authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:493", sel: "windowDidChangeScreen:",             authority: Authority::Proto("NSWindowDelegate"), winit: "v@:@" },
     // THE ONE ROW THAT USED TO DISAGREE. `-> bool` where NSDraggingDestination
     // declares NSDragOperation — CLOSED by the port: it is `-> usize` now.
-    Row { site: "window_delegate.rs:508", sel: "draggingEntered:",                   authority: Authority::Proto("NSDraggingDestination"), winit: "Q@:@" },
-    Row { site: "window_delegate.rs:527", sel: "prepareForDragOperation:",           authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:534", sel: "performDragOperation:",              authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
-    Row { site: "window_delegate.rs:550", sel: "concludeDragOperation:",             authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:556", sel: "draggingExited:",                    authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
-    Row { site: "window_delegate.rs:568", sel: "observeValueForKeyPath:ofObject:change:context:", authority: Authority::Class("NSObject"), winit: "v@:@@@^v" },
+    Row { site: "window_delegate.rs:533", sel: "draggingEntered:",                   authority: Authority::Proto("NSDraggingDestination"), winit: "Q@:@" },
+    Row { site: "window_delegate.rs:552", sel: "prepareForDragOperation:",           authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:559", sel: "performDragOperation:",              authority: Authority::Proto("NSDraggingDestination"), winit: "B@:@" },
+    Row { site: "window_delegate.rs:575", sel: "concludeDragOperation:",             authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:581", sel: "draggingExited:",                    authority: Authority::Proto("NSDraggingDestination"), winit: "v@:@" },
+    Row { site: "window_delegate.rs:593", sel: "observeValueForKeyPath:ofObject:change:context:", authority: Authority::Class("NSObject"), winit: "v@:@@@^v" },
     // ---- View : NSView <NSTextInputClient>
-    Row { site: "view.rs:232", sel: "isFlipped",                    authority: Authority::Class("NSView"), winit: "B@:" },
-    Row { site: "view.rs:238", sel: "viewDidMoveToWindow",          authority: Authority::Class("NSView"), winit: "v@:" },
-    Row { site: "view.rs:244", sel: "frameDidChange:",              authority: Authority::None("an NSNotificationCenter callback registered by `WinitView::new`; no protocol declares it and no loaded class implements it — measured, not assumed. Upstream's Rust signature typed the argument `&NSEvent` when the notification centre passes an NSNotification (same `@`, wrong name); the port took it to `Id`, so the misnaming is closed and only the missing authority is left"), winit: "v@:@" },
-    Row { site: "view.rs:257", sel: "drawRect:",                    authority: Authority::Class("NSView"), winit: "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
-    Row { site: "view.rs:269", sel: "acceptsFirstResponder",        authority: Authority::Class("NSResponder"), winit: "B@:" },
-    Row { site: "view.rs:282", sel: "touchBar",                     authority: Authority::Class("NSResponder"), winit: "@@:" },
-    Row { site: "view.rs:288", sel: "resetCursorRects",             authority: Authority::Class("NSView"), winit: "v@:" },
-    Row { site: "view.rs:328", sel: "hasMarkedText",                authority: Authority::Proto("NSTextInputClient"), winit: "B@:" },
-    Row { site: "view.rs:334", sel: "markedRange",                  authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
-    Row { site: "view.rs:346", sel: "selectedRange",                authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
-    Row { site: "view.rs:353", sel: "setMarkedText:selectedRange:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}{_NSRange=QQ}" },
-    Row { site: "view.rs:466", sel: "unmarkText",                   authority: Authority::Proto("NSTextInputClient"), winit: "v@:" },
-    Row { site: "view.rs:496", sel: "validAttributesForMarkedText", authority: Authority::Proto("NSTextInputClient"), winit: "@@:" },
-    Row { site: "view.rs:507", sel: "attributedSubstringForProposedRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "@@:{_NSRange=QQ}^{_NSRange=QQ}" },
-    Row { site: "view.rs:517", sel: "characterIndexForPoint:",      authority: Authority::Proto("NSTextInputClient"), winit: "Q@:{CGPoint=dd}" },
-    Row { site: "view.rs:526", sel: "firstRectForCharacterRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}" },
-    Row { site: "view.rs:562", sel: "insertText:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}" },
-    Row { site: "view.rs:590", sel: "doCommandBySelector:",         authority: Authority::Proto("NSTextInputClient"), winit: "v@::" },
-    Row { site: "view.rs:616", sel: "keyDown:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:695", sel: "keyUp:",                       authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:714", sel: "flagsChanged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:721", sel: "insertTab:",                   authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
-    Row { site: "view.rs:727", sel: "insertBackTab:",               authority: Authority::None("declared by no protocol and implemented by no loaded class — measured: NSStandardKeyBindingResponding declares its two siblings `insertTab:` and `cancelOperation:` and not this one, and NSResponder implements none of the three. The auditor DERIVES a shape for it from those siblings; this census only records that the runtime holds no description of its own"), winit: "v@:@" },
-    Row { site: "view.rs:735", sel: "cancelOperation:",             authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
-    Row { site: "view.rs:809", sel: "mouseDown:",                   authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:816", sel: "mouseUp:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:823", sel: "rightMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:830", sel: "rightMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:837", sel: "otherMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:844", sel: "otherMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:853", sel: "mouseMoved:",                  authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:858", sel: "mouseDragged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:863", sel: "rightMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:868", sel: "otherMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:873", sel: "mouseEntered:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:881", sel: "mouseExited:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:890", sel: "scrollWheel:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:950", sel: "magnifyWithEvent:",            authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:967", sel: "smartMagnifyWithEvent:",       authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:978", sel: "rotateWithEvent:",             authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:997", sel: "pressureChangeWithEvent:",     authority: Authority::Class("NSResponder"), winit: "v@:@" },
-    Row { site: "view.rs:1012", sel: "_wantsKeyDownForEvent:",       authority: Authority::Class("NSResponder"), winit: "B@:@" },
-    Row { site: "view.rs:1018", sel: "acceptsFirstMouse:",           authority: Authority::Class("NSView"), winit: "B@:@" },
+    Row { site: "view.rs:235", sel: "isFlipped",                    authority: Authority::Class("NSView"), winit: "B@:" },
+    Row { site: "view.rs:241", sel: "viewDidMoveToWindow",          authority: Authority::Class("NSView"), winit: "v@:" },
+    Row { site: "view.rs:247", sel: "frameDidChange:",              authority: Authority::None("an NSNotificationCenter callback registered by `WinitView::new`; no protocol declares it and no loaded class implements it — measured, not assumed. Upstream's Rust signature typed the argument `&NSEvent` when the notification centre passes an NSNotification (same `@`, wrong name); the port took it to `Id`, so the misnaming is closed and only the missing authority is left"), winit: "v@:@" },
+    Row { site: "view.rs:260", sel: "drawRect:",                    authority: Authority::Class("NSView"), winit: "v@:{CGRect={CGPoint=dd}{CGSize=dd}}" },
+    Row { site: "view.rs:273", sel: "acceptsFirstResponder",        authority: Authority::Class("NSResponder"), winit: "B@:" },
+    Row { site: "view.rs:286", sel: "touchBar",                     authority: Authority::Class("NSResponder"), winit: "@@:" },
+    Row { site: "view.rs:292", sel: "resetCursorRects",             authority: Authority::Class("NSView"), winit: "v@:" },
+    Row { site: "view.rs:332", sel: "hasMarkedText",                authority: Authority::Proto("NSTextInputClient"), winit: "B@:" },
+    Row { site: "view.rs:343", sel: "markedRange",                  authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
+    Row { site: "view.rs:355", sel: "selectedRange",                authority: Authority::Proto("NSTextInputClient"), winit: "{_NSRange=QQ}@:" },
+    Row { site: "view.rs:362", sel: "setMarkedText:selectedRange:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}{_NSRange=QQ}" },
+    Row { site: "view.rs:475", sel: "unmarkText",                   authority: Authority::Proto("NSTextInputClient"), winit: "v@:" },
+    Row { site: "view.rs:511", sel: "validAttributesForMarkedText", authority: Authority::Proto("NSTextInputClient"), winit: "@@:" },
+    Row { site: "view.rs:522", sel: "attributedSubstringForProposedRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "@@:{_NSRange=QQ}^{_NSRange=QQ}" },
+    Row { site: "view.rs:534", sel: "characterIndexForPoint:",      authority: Authority::Proto("NSTextInputClient"), winit: "Q@:{CGPoint=dd}" },
+    Row { site: "view.rs:543", sel: "firstRectForCharacterRange:actualRange:", authority: Authority::Proto("NSTextInputClient"), winit: "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}" },
+    Row { site: "view.rs:579", sel: "insertText:replacementRange:", authority: Authority::Proto("NSTextInputClient"), winit: "v@:@{_NSRange=QQ}" },
+    Row { site: "view.rs:607", sel: "doCommandBySelector:",         authority: Authority::Proto("NSTextInputClient"), winit: "v@::" },
+    Row { site: "view.rs:633", sel: "keyDown:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:712", sel: "keyUp:",                       authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:731", sel: "flagsChanged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:738", sel: "insertTab:",                   authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
+    Row { site: "view.rs:744", sel: "insertBackTab:",               authority: Authority::None("declared by no protocol and implemented by no loaded class — measured: NSStandardKeyBindingResponding declares its two siblings `insertTab:` and `cancelOperation:` and not this one, and NSResponder implements none of the three. The auditor DERIVES a shape for it from those siblings; this census only records that the runtime holds no description of its own"), winit: "v@:@" },
+    Row { site: "view.rs:752", sel: "cancelOperation:",             authority: Authority::Proto("NSStandardKeyBindingResponding"), winit: "v@:@" },
+    Row { site: "view.rs:826", sel: "mouseDown:",                   authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:833", sel: "mouseUp:",                     authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:840", sel: "rightMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:847", sel: "rightMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:854", sel: "otherMouseDown:",              authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:861", sel: "otherMouseUp:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:870", sel: "mouseMoved:",                  authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:875", sel: "mouseDragged:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:880", sel: "rightMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:885", sel: "otherMouseDragged:",           authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:890", sel: "mouseEntered:",                authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:898", sel: "mouseExited:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:907", sel: "scrollWheel:",                 authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:967", sel: "magnifyWithEvent:",            authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:984", sel: "smartMagnifyWithEvent:",       authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:995", sel: "rotateWithEvent:",             authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:1014", sel: "pressureChangeWithEvent:",     authority: Authority::Class("NSResponder"), winit: "v@:@" },
+    Row { site: "view.rs:1030", sel: "_wantsKeyDownForEvent:",       authority: Authority::Class("NSResponder"), winit: "B@:@" },
+    Row { site: "view.rs:1037", sel: "acceptsFirstMouse:",           authority: Authority::Class("NSView"), winit: "B@:@" },
 ];
 
 /// A `&'static CStr` from a table entry.
@@ -464,7 +472,7 @@ fn every_site_points_at_the_line_that_declares_it() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 72, "every row's site was followed, none skipped");
+    assert_eq!(checked, 71, "every row's site was followed, none skipped");
 }
 
 /// The key-binding family, MEASURED — because the reason two rows carry is
@@ -633,10 +641,10 @@ fn the_table_still_covers_every_declared_method() {
          and this table has {}; the census is stale",
         ROWS.len()
     );
-    assert_eq!(ROWS.len(), 72);
+    assert_eq!(ROWS.len(), 71);
 
-    // And the port's own progress, stated as a number rather than implied: 71
-    // of the 72 are declared by `aterm_objc::declare_class!` today — 23 in
+    // And the port's own progress, stated as a number rather than implied: ALL
+    // 71 are declared by `aterm_objc::declare_class!` today — 23 in
     // `window_delegate.rs`, 43 in `view.rs`, 3 in `app_state.rs` and 2 in
     // `window.rs`. This is the pair that moves as each further file is ported,
     // and that would catch a file half-converted.
@@ -660,47 +668,33 @@ fn the_table_still_covers_every_declared_method() {
         );
         ported_total += ported;
     }
-    assert_eq!(
-        ported_total, 71,
-        "71 of the 72 rows are declared by aterm_objc"
-    );
+    assert_eq!(ported_total, 71, "all 71 rows are declared by aterm_objc");
 
-    // THE ONE STILL ON objc2, AND IT IS NOT PRODUCT CODE. `app.rs:185`'s
-    // `sendEvent:` belongs to `TestApplication`, which is declared inside
-    // `#[cfg(test)] mod tests`, in `fn test_custom_class()`, with a `todo!()`
-    // body — instantiated by that one test and by nothing else. Porting it
-    // would move NOTHING off objc2: the class does not exist in a shipping
-    // process, so no live-class audit can ever read it, which is the one
-    // documented exception to
-    // `crates/aterm-gui/examples/objc_live_class_audit.rs`'s rule that the gate
-    // must read the REGISTERED class. See the `APP` target there, where the
-    // exception is stated beside the rule and beside what app.rs really does
-    // ship: a `method_setImplementation` swizzle of `-[NSApplication
-    // sendEvent:]` that no encoding check in this tree can see.
+    // THE EXCEPTION THAT USED TO BE HERE IS GONE, and its shape is worth
+    // keeping because the reason it was an exception is the reason it was
+    // deleted rather than ported. `app.rs` declared a 72nd row — `sendEvent:`
+    // on a `TestApplication` inside `#[cfg(test)] mod tests`, with a `todo!()`
+    // body — and porting it would have moved NOTHING off objc2: the class does
+    // not exist in a shipping process, so no live-class audit can ever read it.
+    // It could not even be COMPILED here: `winit` is a path dependency and not
+    // a workspace member, so `cargo test -p winit` answers *"package `winit`
+    // cannot be tested because it requires dev-dependencies and is not a member
+    // of the workspace"*. W12 deleted the module, and what `app.rs` really
+    // ships — a `method_setImplementation` swizzle of `-[NSApplication
+    // sendEvent:]` — is now covered by
+    // `the_swizzled_row_still_encodes_the_way_app_rs_types_it` below and by
+    // `objc_window_drive`'s IMP/`dladdr` stage.
     //
-    // So the number a roadmap should price is FIVE, and this wave paid it. What
-    // is asserted here is the SHAPE of the exception, not just its size: the
-    // remaining site must be inside a `#[cfg(test)]` module, or it is product
-    // code again and owes a port and an audit target like every other row.
+    // The assertion left behind is that app.rs declares NOTHING: if a row ever
+    // reappears there it is product code, and it owes a port, a table row and
+    // an audit target like every other one.
     let app_src = std::fs::read_to_string(base.join("app.rs")).expect("the fork is readable");
     assert_eq!(
         declaration_sites(&app_src),
-        1,
-        "app.rs holds exactly one declared row, and it is the test-only one"
+        0,
+        "app.rs declares a method again; add it to the table and to the live-class audit"
     );
-    let test_mod = app_src
-        .find("#[cfg(test)]")
-        .expect("app.rs's remaining declaration lives in a #[cfg(test)] module");
-    let declaration = app_src
-        .find("#[method(sendEvent:)]")
-        .expect("app.rs's remaining declaration is `sendEvent:`");
-    assert!(
-        declaration > test_mod,
-        "app.rs's objc2 declaration has moved OUT of `#[cfg(test)] mod tests` and is product \
-         code now — it owes a port and a live-class audit target, and the exception recorded \
-         here no longer covers it"
-    );
-    for file in ["app_state.rs", "window.rs"] {
+    for file in ["app.rs", "app_state.rs", "window.rs"] {
         let src = std::fs::read_to_string(base.join(file)).expect("the fork is readable");
         assert_eq!(
             src.lines()
@@ -776,8 +770,8 @@ fn no_declared_winit_method_takes_a_block() {
     assert_eq!(
         bare,
         vec![
-            ("view.rs:244", "frameDidChange:", "v@:@".to_string()),
-            ("view.rs:727", "insertBackTab:", "v@:@".to_string()),
+            ("view.rs:247", "frameDidChange:", "v@:@".to_string()),
+            ("view.rs:744", "insertBackTab:", "v@:@".to_string()),
         ],
         "the set of rows no protocol or class declares changed"
     );
@@ -834,11 +828,13 @@ fn the_block_encoding_is_what_foundation_itself_emits() {
 /// this test's transcription IS the only reading in this crate, and the second
 /// one lives in `crates/aterm-gui/examples/objc_live_class_audit.rs`.
 ///
-/// This test is also the ONLY reading in the tree that can see a framework
-/// moving under `app.rs`'s swizzle: `app.rs:185`'s `v@:@` is written down here
-/// and compared against `-[NSApplication sendEvent:]`'s live encoding, which is
-/// two sources that do not move together. The auditor's part A cannot — for a
-/// `Rows::Patched` target it reads both sides off the same `Method` object.
+/// The reading that can see a FRAMEWORK moving under `app.rs`'s swizzle used to
+/// be one of these rows and is now
+/// [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`], which is
+/// strictly stronger: it derives the expected string from the same Rust type
+/// `app.rs` installs rather than from a transcription. The auditor's part A
+/// cannot make that comparison — for a `Rows::Patched` target it reads both
+/// sides off the same `Method` object.
 #[test]
 fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
     assert!(
@@ -857,7 +853,10 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
             disagreements.push((row.site, row.sel, ours, authority));
         }
     }
-    assert_eq!(checked, 70, "seventy of the seventy-two have an authority");
+    assert_eq!(
+        checked, 69,
+        "sixty-nine of the seventy-one have an authority"
+    );
 
     let named: Vec<String> = disagreements
         .iter()
@@ -1112,11 +1111,10 @@ fn the_ported_signatures_encode_to_the_authority() {
     // drift into silence. 71 rows are ported; 48 of them are read on this axis
     // only by the live-class auditor, which is the better instrument and the
     // reason the mirror was never grown.
-    let ported = ROWS
-        .iter()
-        .filter(|r| !r.site.starts_with("app.rs:"))
-        .count();
-    assert_eq!(ported, 71, "71 of the 72 rows are ported; see the header");
+    // (The `app.rs:` filter that used to sit here is gone with the row it
+    // excluded — every row in the table is a ported one now.)
+    let ported = ROWS.len();
+    assert_eq!(ported, 71, "all 71 rows are ported; see the header");
     assert_eq!(
         ported - expected,
         48,
@@ -1290,4 +1288,181 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
     // window between `+alloc` and the ivar store ON ONE INSTANCE; a class whose
     // `Ivars` carry state must establish that its designated initializer does
     // not substitute, which is what window.rs's 1,024-window measurement does.
+}
+
+// ------------------------------------------------- the swizzled framework row
+
+/// `-[NSApplication sendEvent:]` STILL ENCODES THE WAY `app.rs` TYPES IT.
+///
+/// # What this replaces, and why it is stronger
+///
+/// The table above carried a 72nd row whose `winit` column read `v@:@` and
+/// whose authority was `-[NSApplication sendEvent:]`'s live encoding. It was
+/// attached to `app.rs`'s test-only `TestApplication` declaration, which W12
+/// deleted — but the comparison it performed is the one thing in the tree that
+/// can notice AppKit changing the signature of the row this backend PATCHES.
+///
+/// It is re-made here from a better source. The expected string is not
+/// transcribed: it is DERIVED by [`aterm_objc::MethodFn`] from the same Rust
+/// function-pointer type `app.rs` declares and installs, which is exactly the
+/// derivation `SwizzleSite::install` performs at launch. So this test and the
+/// product code cannot disagree about what the fork expects — there is one
+/// source and it is a type.
+///
+/// The fork's own spelling of that type is read out of `app.rs` and compared,
+/// so the copy below cannot drift from the fork it claims to mirror. That is
+/// the failure mode a transcribed row has and a derived one does not, moved to
+/// the one place a derivation still needs a transcription.
+#[test]
+fn the_swizzled_row_still_encodes_the_way_app_rs_types_it() {
+    use aterm_objc::{Id, MethodFn, Sel};
+
+    assert!(load_appkit(), "AppKit must load for this to mean anything");
+
+    /// `app.rs`'s `SendEvent`, spelled again.
+    type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);
+
+    // THE FORK REALLY DECLARES THIS TYPE. A derivation from a type that has
+    // drifted from the fork's is a derivation from nothing.
+    let app_src =
+        std::fs::read_to_string(fork_backend().join("app.rs")).expect("the fork is readable");
+    assert!(
+        app_src.contains(r#"type SendEvent = unsafe extern "C-unwind" fn(Id, Sel, Id);"#),
+        "app.rs no longer types its swizzled implementation as \
+         `unsafe extern \"C-unwind\" fn(Id, Sel, Id)`; this test's copy is stale and its \
+         derivation proves nothing"
+    );
+
+    let derived = <SendEvent as MethodFn>::method_encoding();
+    assert_eq!(derived, "v@:@", "the derivation itself moved");
+
+    // SAFETY: `NSApplication` is a live registered class and `sendEvent:` an
+    // interned selector; `method_types` tolerates a selector the class does not
+    // implement by answering `None`.
+    let live = unsafe {
+        aterm_objc::method_types(
+            aterm_objc::class(c"NSApplication"),
+            aterm_objc::sel_uncached(c"sendEvent:"),
+        )
+    }
+    .map(|t| aterm_objc::strip_method_offsets(&t))
+    .expect("-[NSApplication sendEvent:] is a real row");
+    assert_eq!(
+        live, derived,
+        "AppKit's -sendEvent: encodes {live} and app.rs installs a {derived}; the \
+         swizzle would be refused at launch, which is the right outcome and a \
+         terrible way to find out"
+    );
+}
+
+/// …AND THE FORK PATCHES EXACTLY THE ROWS THIS FILE CHECKS.
+///
+/// # The spelling the test above is armed at, and the one it is not
+///
+/// [`the_swizzled_row_still_encodes_the_way_app_rs_types_it`] derives its
+/// expectation from a type instead of transcribing a string, which is the right
+/// improvement and is not the whole question. Its SUBJECT is still one hand-written
+/// literal in one file: it reads `app.rs` for
+/// `type SendEvent = …` and checks `-[NSApplication sendEvent:]`. **A SECOND
+/// swizzle landing anywhere in the fork would leave it passing, unchanged**,
+/// because nothing in it asks how many rows the fork patches. That is pass 14's
+/// finding — a guard whose subject is its own table rather than the code — one
+/// spelling out, at the capability W12 added.
+///
+/// So the subject here is the fork. Every `SwizzleSite::install` call in the
+/// macOS backend is found in the source, and the set must be exactly the one
+/// above covers. A new one fails this test on the day it lands, with its own
+/// file and line, instead of on the day AppKit changes underneath it.
+#[test]
+fn the_fork_patches_exactly_the_framework_rows_this_file_checks() {
+    /// Every `(file, line, selector)` at which the fork installs a swizzle.
+    ///
+    /// A site is `NAME.install(cls, sel!(x), f)`; the selector is the second
+    /// argument, which is where a selector goes. Read from the source, not
+    /// from a list.
+    fn install_sites() -> Vec<(String, usize, String)> {
+        let dir = fork_backend();
+        let mut stack = vec![dir.clone()];
+        let mut paths = Vec::new();
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).expect("the fork's macOS backend is readable") {
+                let path = entry.expect("a readable entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        let mut out = Vec::new();
+        for path in paths {
+            let file = path
+                .strip_prefix(&dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let src = std::fs::read_to_string(&path).expect("readable");
+            // `//` comments removed: this fork's own prose spells `.install(`
+            // in the doc comment that explains it.
+            let stripped: String = src
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut from = 0_usize;
+            while let Some(at) = stripped[from..].find(".install(") {
+                let start = from + at;
+                from = start + ".install(".len();
+                let line = stripped[..start].matches('\n').count() + 1;
+                let rest = &stripped[from..];
+                let sel = rest
+                    .find("sel!(")
+                    .and_then(|i| {
+                        let tail = &rest[i + "sel!(".len()..];
+                        tail.find(')').map(|e| tail[..e].trim().to_owned())
+                    })
+                    .unwrap_or_else(|| "<no sel! in the call>".to_owned());
+                out.push((file.clone(), line, sel));
+            }
+        }
+        out
+    }
+
+    /// The rows checked above, by the selector each patches.
+    const CHECKED: &[&str] = &["sendEvent:"];
+
+    let sites = install_sites();
+    assert!(
+        !sites.is_empty(),
+        "no `SwizzleSite::install` call was found in the fork; this test is \
+         not reading the source, and one that reads nothing passes"
+    );
+    let uncovered: Vec<String> = sites
+        .iter()
+        .filter(|(_, _, sel)| !CHECKED.contains(&sel.as_str()))
+        .map(|(f, l, sel)| format!("{f}:{l}: {sel}"))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "{} swizzle site(s) in the fork patch a framework row that nothing in \
+         this file checks the encoding of. A swizzle is the one thing in this \
+         tree that replaces code Apple shipped, and the encoding comparison at \
+         install is the only check that can notice Apple changing the \
+         signature underneath it:\n  {}",
+        uncovered.len(),
+        uncovered.join("\n  ")
+    );
+    // …and BOTH WAYS, so a row whose site is deleted does not leave a check
+    // standing over nothing.
+    let stale: Vec<&str> = CHECKED
+        .iter()
+        .filter(|c| !sites.iter().any(|(_, _, sel)| sel == *c))
+        .copied()
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "this file checks the encoding of {stale:?}, which the fork no longer \
+         swizzles"
+    );
 }

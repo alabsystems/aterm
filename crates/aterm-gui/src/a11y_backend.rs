@@ -102,7 +102,7 @@ pub(crate) fn notice_lines(reason: &str) -> [String; 2] {
 /// the surface a windowed launch has; it takes none away.
 pub(crate) fn report_failure(reason: &str, location: &str) {
     for line in notice_lines(reason) {
-        eprintln!("aterm-gui: {line}");
+        crate::logging::stderr_line!("aterm-gui: {line}");
         crate::config_notice::queue_deferred(line);
     }
     aterm_log::error!("accessibility publisher failed at {location}: {reason}");

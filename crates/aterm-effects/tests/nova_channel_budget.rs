@@ -207,7 +207,7 @@ fn the_over_budget_channel_is_drawn_in_full_not_truncated() {
 
     let mut pane = Vec::new();
     for p in 0..4u64 {
-        drive(0xA11C_E5 ^ p, g, 600, &mut pane);
+        drive(0xA11CE5 ^ p, g, 600, &mut pane);
         channel.extend_from_slice(&pane);
     }
     assert!(

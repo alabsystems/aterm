@@ -80,6 +80,19 @@ const EXEMPTION: &str = "ty-driver-unarmed:";
 /// short of reaching an unrelated function.
 const WINDOW: usize = 40;
 
+/// Whether a region names the CHECKER — `ty` as a word or an identifier prefix
+/// (`ty`, `"ty"`, `ty_bin`, `ty_path`) — rather than merely containing the two
+/// letters. The first version of this scan asked `region.contains("ty")`, and
+/// a `cargo check --keep-going` driver in xtask's gate whose comments say
+/// "type error", "exactly" and "TRIPLE-SCOPED" was reported as an unarmed
+/// model check for it (2026-09-03); the substring test made the gate say
+/// something false about a site that never runs `ty` at all.
+fn mentions_ty(region: &str) -> bool {
+    region
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|w| w == "ty" || w.starts_with("ty_"))
+}
+
 fn scan(path: &Path, rel: &str) -> Vec<Driver> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -95,7 +108,17 @@ fn scan(path: &Path, rel: &str) -> Vec<Driver> {
         let lo = i.saturating_sub(WINDOW);
         let hi = (i + WINDOW).min(lines.len());
         let region = lines[lo..hi].join("\n");
-        if region.contains("cargo") && !region.contains("ty") {
+        // A `cargo` driver is one that RUNS cargo — `Command::new("cargo")`,
+        // `$CARGO`, or the workspace's cargo_bin helper — not one whose
+        // comments mention the word (the 2026-09-03 sharpening skipped on any
+        // lowercase "cargo" in the region, which a future ty driver's prose
+        // could carry).
+        let runs_cargo = region.contains("Command::new(\"cargo\")")
+            || region.contains("env!(\"CARGO\")")
+            || region.contains("var_os(\"CARGO\")")
+            || region.contains("var(\"CARGO\")")
+            || region.contains("cargo_bin(");
+        if runs_cargo && !mentions_ty(&region) {
             continue;
         }
         found.push(Driver {

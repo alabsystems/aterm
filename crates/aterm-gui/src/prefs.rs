@@ -4958,7 +4958,7 @@ pub(crate) struct ConfigSnapshotSaveResult {
 pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome {
     let Some(path) = crate::app_config::config_path() else {
         let msg = "no config path (HOME/XDG unset)".to_string();
-        eprintln!("aterm-gui: prefs save: {msg}; skipping");
+        crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; skipping");
         return SaveOutcome::Error(msg);
     };
     // A missing file is fine — start from empty and create it on write. The
@@ -4971,7 +4971,7 @@ pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome 
         Ok(contents) => contents,
         Err(error) => {
             let msg = format!("{} unreadable ({error})", path.display());
-            eprintln!("aterm-gui: prefs save: {msg}; leaving config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; leaving config unchanged");
             return SaveOutcome::Error(msg);
         }
     };
@@ -4979,14 +4979,14 @@ pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome 
         Ok(text) => text.to_string(),
         Err(error) => {
             let msg = format!("{} is not UTF-8 ({error})", path.display());
-            eprintln!("aterm-gui: prefs save: {msg}; leaving config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; leaving config unchanged");
             return SaveOutcome::Error(msg);
         }
     };
     let updated = match apply_prefs_edits(&existing, edits) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("aterm-gui: prefs save: {e}; leaving config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {e}; leaving config unchanged");
             return SaveOutcome::Error(e.to_string());
         }
     };
@@ -5075,7 +5075,7 @@ pub(crate) fn save_prefs_snapshot_observed(
                 "{} changed while saving ({message}); review the latest file and retry",
                 path.display()
             );
-            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
             ConfigSnapshotSaveResult {
                 outcome: SaveOutcome::Conflict {
                     expected: baseline.observed.content,
@@ -5087,7 +5087,7 @@ pub(crate) fn save_prefs_snapshot_observed(
         }
         crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
             let message = format!("{} save failed at {stage:?} ({message})", path.display());
-            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
             ConfigSnapshotSaveResult {
                 outcome: SaveOutcome::Error(message),
                 observed: None,
@@ -5103,7 +5103,7 @@ pub(crate) fn save_prefs_snapshot_observed(
                  ({stage:?}: {message})",
                 path.display()
             );
-            eprintln!("aterm-gui: prefs save: {message}");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}");
             ConfigSnapshotSaveResult {
                 outcome: SaveOutcome::PublishedUnverified {
                     stage,
@@ -5128,7 +5128,7 @@ fn commit_prefs_bytes(
                 "{} changed while saving ({message}); review the latest file and retry",
                 path.display()
             );
-            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
             SaveOutcome::Conflict {
                 expected: baseline.observed.content,
                 observed,
@@ -5137,7 +5137,7 @@ fn commit_prefs_bytes(
         }
         crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
             let message = format!("{} save failed at {stage:?} ({message})", path.display());
-            eprintln!("aterm-gui: prefs save: {message}; config unchanged");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
             SaveOutcome::Error(message)
         }
         crate::native_document_host::AtomicCommitResult::PublishedUnverified {
@@ -5150,7 +5150,7 @@ fn commit_prefs_bytes(
                  ({stage:?}: {message})",
                 path.display()
             );
-            eprintln!("aterm-gui: prefs save: {message}");
+            crate::logging::stderr_line!("aterm-gui: prefs save: {message}");
             SaveOutcome::PublishedUnverified {
                 stage,
                 observed,

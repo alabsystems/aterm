@@ -143,7 +143,8 @@ impl MainThread {
         // `BOOL` query on a Foundation class that is always linked into an
         // AppKit process, and the prototype cast is exactly `-(BOOL)(id, SEL)`.
         let is_main = unsafe {
-            let f: unsafe extern "C" fn(Id, Sel) -> crate::encode::Bool = crate::runtime::msg();
+            let f: unsafe extern "C-unwind" fn(Id, Sel) -> crate::encode::Bool =
+                crate::runtime::msg();
             f(
                 crate::runtime::class(c"NSThread").as_id(),
                 crate::sel!(isMainThread),
@@ -622,7 +623,7 @@ pub unsafe fn send_super_dealloc(this: Id, cls: ClassPtr) {
     // crate creates descends from `NSObject`, which implements `dealloc`, so
     // the send always resolves.
     unsafe {
-        let f: unsafe extern "C" fn(*const crate::runtime::ObjcSuper, Sel) =
+        let f: unsafe extern "C-unwind" fn(*const crate::runtime::ObjcSuper, Sel) =
             crate::runtime::msg_super();
         f(&raw const sup, crate::sel!(dealloc));
     }

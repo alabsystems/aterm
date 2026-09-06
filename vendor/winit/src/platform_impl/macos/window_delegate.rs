@@ -66,6 +66,7 @@ use super::view::WinitView;
 use super::window::WinitWindow;
 use super::{ffi, Fullscreen, MonitorHandle, OsError, WindowId};
 use crate::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
+use crate::keyboard::ModifiersState;
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{InnerSizeWriter, WindowEvent};
 use crate::platform::macos::{OptionAsAlt, WindowExtMacOS};
@@ -315,29 +316,39 @@ aterm_objc::declare_class! {
         }
 
         /// Invoked when before enter fullscreen
+        ///
+        /// LOCAL PATCH (aterm): the state-machine flags are written BEFORE any
+        /// send. A contained `NSException` in `-isZoomed` or in
+        /// `current_monitor_inner`'s `-screen` used to leave
+        /// `in_fullscreen_transition == false` and `fullscreen == None` while
+        /// AppKit finished entering fullscreen, after which `set_fullscreen(None)`
+        /// short-circuited on `None == None` and only the green button could
+        /// leave. Now the transition flag is up first and the `None` arm
+        /// records "borderless, current monitor" before it asks which monitor.
         @sel(windowWillEnterFullScreen:)
         fn window_will_enter_fullscreen(&self, _sender: Id) {
             trace_scope!("windowWillEnterFullScreen:");
 
-            self.ivars().maximized.set(self.is_zoomed());
-            let mut fullscreen = self.ivars().fullscreen.borrow_mut();
-            match &*fullscreen {
-                // Exclusive mode sets the state in `set_fullscreen` as the user
-                // can't enter exclusive mode by other means (like the
-                // fullscreen button on the window decorations)
-                Some(Fullscreen::Exclusive(_)) => (),
-                // `window_will_enter_fullscreen` was triggered and we're already
-                // in fullscreen, so we must've reached here by `set_fullscreen`
-                // as it updates the state
-                Some(Fullscreen::Borderless(_)) => (),
-                // Otherwise, we must've reached fullscreen by the user clicking
-                // on the green fullscreen button. Update state!
-                None => {
-                    let current_monitor = self.current_monitor_inner();
-                    *fullscreen = Some(Fullscreen::Borderless(current_monitor));
-                },
-            }
             self.ivars().in_fullscreen_transition.set(true);
+            // `None` here means the user clicked the green button (an
+            // exclusive or borderless request is `set_fullscreen`'s own doing
+            // and is already recorded): record the fact BEFORE the monitor is
+            // known, so a raise while asking leaves a state that
+            // `set_fullscreen(None)` can still leave.
+            let entered_by_user = {
+                let mut fullscreen = self.ivars().fullscreen.borrow_mut();
+                let by_user = fullscreen.is_none();
+                if by_user {
+                    *fullscreen = Some(Fullscreen::Borderless(None));
+                }
+                by_user
+            };
+            self.ivars().maximized.set(self.is_zoomed());
+            if entered_by_user {
+                let current_monitor = self.current_monitor_inner();
+                *self.ivars().fullscreen.borrow_mut() =
+                    Some(Fullscreen::Borderless(current_monitor));
+            }
         }
 
         /// Invoked when before exit fullscreen
@@ -355,7 +366,13 @@ aterm_objc::declare_class! {
         /// here — objc2's `NSApplicationPresentationOptions` is
         /// `#[repr(transparent)]` over exactly that word, so this is a
         /// re-spelling and not a conversion.
-        @sel(window:willUseFullScreenPresentationOptions:)
+        ///
+        /// NOT CONTAINED: its zero is `NSApplicationPresentationDefault`, which
+        /// drops the `FullScreen` bit AppKit requires in this reply and would
+        /// give a fullscreen window a normal window's menu-bar/dock policy —
+        /// a real answer, not an inert one. The body makes no send, so a
+        /// raise cannot reach it today; the marker states the policy.
+        @sel(window:willUseFullScreenPresentationOptions:) @abort_on_exception
         fn window_will_use_fullscreen_presentation_options(
             &self,
             _sender: Id,
@@ -402,13 +419,21 @@ aterm_objc::declare_class! {
         }
 
         /// Invoked when exited fullscreen
+        ///
+        /// LOCAL PATCH (aterm): the transition flag is cleared and the parked
+        /// request taken BEFORE `restore_state_from_fullscreen`'s sends
+        /// (`-setStyleMask:`, `-isZoomed`, `-zoom:`/`-setFrame:`). A contained
+        /// raise in those used to leave `in_fullscreen_transition == true` for
+        /// the life of the window: every later `set_fullscreen` parked its
+        /// request and nothing ever consumed it.
         @sel(windowDidExitFullScreen:)
         fn window_did_exit_fullscreen(&self, _sender: Id) {
             trace_scope!("windowDidExitFullScreen:");
 
-            self.restore_state_from_fullscreen();
             self.ivars().in_fullscreen_transition.set(false);
-            if let Some(target_fullscreen) = self.ivars().target_fullscreen.take() {
+            let target_fullscreen = self.ivars().target_fullscreen.take();
+            self.restore_state_from_fullscreen();
+            if let Some(target_fullscreen) = target_fullscreen {
                 self.set_fullscreen(target_fullscreen);
             }
             // LOCAL PATCH (aterm): see windowDidEnterFullScreen: — the same
@@ -665,15 +690,35 @@ unsafe fn dragged_paths(sender: Id) -> Option<Vec<std::path::PathBuf>> {
         if list.is_null() {
             return None;
         }
+        // LOCAL PATCH (aterm): the property list is DOCUMENTED to be an
+        // `NSArray` of `NSString`, but the pasteboard is written by the
+        // dragging source, not by AppKit — a source that puts any other
+        // object under `NSFilenamesPboardType` would make `-count` /
+        // `-objectAtIndex:` / `-UTF8String` an unrecognized-selector
+        // NSException inside `draggingEntered:`, which aterm's trampoline
+        // turns into a process abort. Check the classes first (`-isKindOfClass:`
+        // is on NSObject, so it is safe on anything): a non-array root, or
+        // ANY non-string entry, refuses the whole list — the `None` arm both
+        // callers already have — so a malformed drop is never half-delivered
+        // with the copy badge shown. MEASURED 2026-09-04 (macOS 26.6.2): every
+        // public write route for such a list throws in the SOURCE process
+        // inside CFPasteboardSetData, so this is defence against a private
+        // pasteboard writer, not a reproduced input; an empty `@[]` still
+        // reads as `Some(vec![])`, upstream winit's own behaviour.
+        let is_a = |obj: Id, cls: &'static std::ffi::CStr| -> bool {
+            send_bool_id(obj, sel!(isKindOfClass:), class(cls).as_id())
+        };
+        if !is_a(list, c"NSArray") {
+            return None;
+        }
         let count = send_usize(list, sel!(count));
-        Some(
-            (0..count)
-                .map(|i| {
-                    let file = send_id_usize(list, sel!(objectAtIndex:), i);
-                    std::path::PathBuf::from(seam::nsstring_to_rust(file))
-                })
-                .collect(),
-        )
+        (0..count)
+            .map(|i| {
+                let file = send_id_usize(list, sel!(objectAtIndex:), i);
+                (!file.is_null() && is_a(file, c"NSString"))
+                    .then(|| std::path::PathBuf::from(seam::nsstring_to_rust(file)))
+            })
+            .collect::<Option<Vec<_>>>()
     }
 }
 
@@ -719,23 +764,24 @@ fn new_window(
     mtm: MainThread,
 ) -> Option<aterm_objc::Retained<WinitWindow>> {
     aterm_objc::autoreleasepool(|_| {
-        // LOCAL PATCH (aterm): `monitor.ns_screen()` is `monitor.rs`'s and
-        // still answers an objc2 `Retained<NSScreen>`, so its result is
-        // re-badged at the boundary (`seam::obj_of`) and everything below sends
-        // through the first-party layer. `+[NSScreen mainScreen]` needed no
-        // main-thread marker at the runtime — objc2's binding asked for one
-        // because its `MainThreadOnly` mutability demanded it of every `NSScreen`
-        // method, not because AppKit does.
+        // LOCAL PATCH (aterm): `monitor.ns_screen()` answers an
+        // `aterm_objc::Obj` since W12, so the re-badge that used to sit on the
+        // line below is GONE. `+[NSScreen mainScreen]` needed no main-thread
+        // marker at the runtime — objc2's binding asked for one because its
+        // `MainThreadOnly` mutability demanded it of every `NSScreen` method,
+        // not because AppKit does.
         let screen: Option<aterm_objc::Obj> = match attrs.fullscreen.clone().map(Into::into) {
             Some(Fullscreen::Borderless(Some(monitor)))
             | Some(Fullscreen::Exclusive(VideoModeHandle { monitor, .. })) => {
-                // SITE 1 OF 2 (the other is in `set_fullscreen`): this file
-                // is off the objc2 list and this expression still consumes an
-                // objc2 TYPE. `ns_screen` answers `Option<Retained<NSScreen>>`
-                // and `seam::obj_of<T>` takes it through a generic parameter,
-                // so the name never appears here and the name-counting metric
-                // cannot see it. It changes again when `monitor.rs` ports.
-                monitor.ns_screen(mtm).map(|s| seam::obj_of(&*s)).or_else(main_screen)
+                // SITE 1 OF 2 (the other is in `set_fullscreen`), and both are
+                // now ordinary calls. What they WERE is the finding worth
+                // keeping: this file was off the objc2 list and this expression
+                // still consumed an objc2 TYPE, because `ns_screen` answered
+                // `Option<Retained<NSScreen>>` and `seam::obj_of<T>` took it
+                // through a GENERIC parameter — no name on the line for a
+                // name-counting metric to see. It changed when `monitor.rs`
+                // ported, exactly as the note here predicted.
+                monitor.ns_screen(mtm).or_else(main_screen)
             },
             Some(Fullscreen::Borderless(None)) => main_screen(),
             None => None,
@@ -827,7 +873,7 @@ fn new_window(
         // the `usize` the runtime wants.
         let window: Option<aterm_objc::Retained<WinitWindow>> = unsafe {
             let raw = WinitWindow::alloc_ivars(mtm, ());
-            let init: unsafe extern "C" fn(
+            let init: unsafe extern "C-unwind" fn(
                 Id,
                 aterm_objc::Sel,
                 aterm_objc::CGRect,
@@ -1857,7 +1903,7 @@ impl WindowDelegate {
         // to that monitor before we toggle fullscreen (as `toggleFullScreen`
         // does not take a screen parameter, but uses the current screen)
         if let Some(ref fullscreen) = fullscreen {
-            let new_screen = match fullscreen {
+            let monitor = match fullscreen {
                 Fullscreen::Borderless(Some(monitor)) => monitor.clone(),
                 Fullscreen::Borderless(None) => {
                     if let Some(monitor) = self.current_monitor_inner() {
@@ -1867,13 +1913,23 @@ impl WindowDelegate {
                     }
                 },
                 Fullscreen::Exclusive(video_mode) => video_mode.monitor(),
-            }
-            .ns_screen(mtm)
-            .unwrap();
-            // SITE 2 OF 2 — see `WindowDelegate::new`. `new_screen` is an
-            // objc2 `Retained<NSScreen>` at this line, re-badged generically;
-            // the metric counts names and there is no name to count.
-            let new_screen = seam::obj_of(&*new_screen);
+            };
+            // LOCAL PATCH (aterm): upstream `unwrap`s the NSScreen here and
+            // `assert!`s below that the window is on one. Between a display
+            // leaving (unplug, sleep/wake) and AppKit's own reshuffle both are
+            // false for an instant, and under aterm's trampoline policy either
+            // panic is a process abort inside `windowDidEnterFullScreen:` /
+            // `windowDidExitFullScreen:`. When the target screen or the
+            // window's own screen is nil the fullscreen REQUEST IS DROPPED —
+            // no state change, no `toggleFullScreen:` — exactly as the
+            // `Borderless(None)` arm above already does when there is no
+            // current monitor; the caller may ask again once a screen exists.
+            let Some(new_screen) = monitor.ns_screen(mtm) else {
+                return;
+            };
+            // SITE 2 OF 2 — see `WindowDelegate::new`. `new_screen` was an
+            // objc2 `Retained<NSScreen>` here, re-badged generically; since W12
+            // `ns_screen` answers the `Obj` directly and the re-badge is gone.
 
             // SAFETY: `-screen` is `@@:` on `NSWindow` and is non-nil for a
             // window that is on screen; `-frame` is `{CGRect}@:` on `NSScreen`;
@@ -1883,7 +1939,9 @@ impl WindowDelegate {
             // `-isEqual:`.
             unsafe {
                 let old_screen = send_id(self.win(), sel!(screen));
-                assert!(!old_screen.is_null(), "window to be on a screen");
+                if old_screen.is_null() {
+                    return;
+                }
                 if old_screen != new_screen.id() {
                     let origin = send_rect(new_screen.id(), sel!(frame)).origin;
                     send_v_point(self.win(), sel!(setFrameOrigin:), origin);
@@ -2169,15 +2227,15 @@ impl WindowDelegate {
     // Allow directly accessing the current monitor internally without unwrapping.
     pub(crate) fn current_monitor_inner(&self) -> Option<MonitorHandle> {
         // SAFETY: `-screen` is `@@:` on `NSWindow` and answers nil for an
-        // offscreen window. `get_display_id` is `monitor.rs`'s and still takes
-        // an objc2 `&NSScreen`, so this crosses back for exactly that call —
-        // the parameter type is what pins the binding type, so this file names
-        // none.
+        // offscreen window. `get_display_id` took an objc2 `&NSScreen` until
+        // W12 and this line crossed back for exactly that call — a PARAMETER
+        // TYPE pinning a binding in a file that named none. It takes the raw
+        // `id` now.
         let screen = unsafe { send_id(self.win(), sel!(screen)) };
         if screen.is_null() {
             return None;
         }
-        let display_id = get_display_id(unsafe { seam::objc2_ref(screen) });
+        let display_id = get_display_id(screen);
         if let Some(monitor) = MonitorHandle::new(display_id) {
             Some(monitor)
         } else {
@@ -2200,8 +2258,7 @@ impl WindowDelegate {
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        let monitor = monitor::primary_monitor();
-        Some(monitor)
+        monitor::primary_monitor()
     }
 
     #[cfg(feature = "rwh_04")]
@@ -2487,6 +2544,11 @@ impl WindowExtMacOS for WindowDelegate {
         self.view().option_as_alt()
     }
 
+    // LOCAL PATCH (aterm): see `WinitView::cached_modifiers`.
+    fn cached_modifiers(&self) -> ModifiersState {
+        self.view().cached_modifiers()
+    }
+
     fn set_borderless_game(&self, borderless_game: bool) {
         self.ivars().is_borderless_game.set(borderless_game);
     }
@@ -2514,7 +2576,8 @@ fn dark_appearance_name() -> aterm_objc::Obj {
 /// `appearance` must be a live `NSAppearance`.
 pub unsafe fn appearance_to_theme(appearance: Id) -> Theme {
     let dark = dark_appearance_name();
-    // SAFETY: `+arrayWithObjects:count:` is `@@:^@Q` on `NSArray`;
+    // SAFETY: `+arrayWithObjects:count:` is `@@:r^@Q` on `NSArray` (the
+    // objects pointer is `const id *`, hence the `r`; forge/objc-w7 ddef27fe7);
     // `-bestMatchFromAppearancesWithNames:` is `@@:@` on `NSAppearance` and
     // answers nil when none of the names matches; `-isEqualToString:` is `B@:@`
     // on `NSString`. Both names are live for the whole call.

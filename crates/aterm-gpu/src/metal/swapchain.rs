@@ -1121,7 +1121,7 @@ mod tests {
     fn device() -> Option<Device> {
         let d = Device::system_default();
         if d.is_none() {
-            eprintln!("SKIP: no Metal device on this machine");
+            crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
     }
@@ -1891,7 +1891,7 @@ mod tests {
         }
 
         assert_eq!(presented, FRAMES);
-        eprintln!(
+        crate::stderr_line!(
             "frame cycle on {}: {FRAMES} frames x {} texels rendered, verified, \
              presented and recycled through a 3-drawable pool; latch clean",
             dev.name(),
@@ -2280,7 +2280,7 @@ mod tests {
                 assert!(!latch.is_lost(), "cycle {cycle} step {i}: no loss");
             }
         }
-        eprintln!(
+        crate::stderr_line!(
             "reconfigure storm on {}: 12 live reconfigures over 6 axes, every axis \
              read back, every post-step drawable vended with the new config, every \
              present clean",
@@ -2562,7 +2562,7 @@ mod tests {
                 "frame {frame}: healthy frames never latch"
             );
         }
-        eprintln!(
+        crate::stderr_line!(
             "two-submit cycle on {}: {FRAMES} frames of encode-submit + \
              compose-submit + present on ONE session queue, byte-verified, \
              A harvested by polling every frame",

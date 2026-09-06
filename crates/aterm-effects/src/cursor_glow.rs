@@ -66700,8 +66700,7 @@ halo = "add"
         const WHITE_HOT: i32 = 160;
 
         let lit = |px: u32, ground: u32| -> [i32; 3] {
-            let ch =
-                |sh: u32| (((px >> sh) & 0xff) as i32 - ((ground >> sh) & 0xff) as i32).max(0);
+            let ch = |sh: u32| (((px >> sh) & 0xff) as i32 - ((ground >> sh) & 0xff) as i32).max(0);
             [ch(16), ch(8), ch(0)]
         };
         // `census(keep)` walks the corpus and returns (lit population, grey
@@ -66821,9 +66820,7 @@ halo = "add"
         };
 
         let (n, grey, white, worst) = census(1.0);
-        println!(
-            "JUMP-STREAK-GREY-CENSUS lit={n} grey={grey} white={white} worst={worst:?}"
-        );
+        println!("JUMP-STREAK-GREY-CENSUS lit={n} grey={grey} white={white} worst={worst:?}");
         // NON-VACUOUS: the corpus lit a real mark.
         // The floor is set against the SNAPPY mark, not the lingering one it
         // replaced: front-loading the decay legitimately removed more than half
@@ -66845,7 +66842,8 @@ halo = "add"
         );
         // **THE BOUND IS ZERO**, not a share.
         assert_eq!(
-            grey, 0,
+            grey,
+            0,
             "grey is not a rainbow colour: {grey} of {n} lit jump-streak pixels \
              carry chroma under {} — worst {worst:?}. Every law that has ever \
              greyed this mark did so by spending chroma at constant light; if \

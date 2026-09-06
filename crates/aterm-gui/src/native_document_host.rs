@@ -252,6 +252,59 @@ pub(crate) struct GrantedDocument {
     pub(crate) observed: ObservedFileVersion,
 }
 
+/// One local file ADMITTED but not yet GRANTED: the blocking half of an open
+/// (path resolution, the bounded read, UTF-8 validation), done, and carried to
+/// the grant store to be minted into a [`GrantedDocument`].
+///
+/// This is the seam that lets admission run OFF the main thread. Everything a
+/// thread needs to admit a file is in the URI; everything that must stay on the
+/// UI thread — the single process-local grant per canonical file — happens in
+/// [`DocumentGrantStore::grant_admitted`]. The value is plain owned data and
+/// crosses threads by move.
+#[derive(Clone, Debug)]
+pub(crate) struct AdmittedDocument {
+    pub(crate) canonical_uri: String,
+    pub(crate) path: PathBuf,
+    target: AtomicFileTarget,
+    pub(crate) text: String,
+    pub(crate) observed: ObservedFileVersion,
+}
+
+impl AdmittedDocument {
+    pub(crate) fn target(&self) -> &AtomicFileTarget {
+        &self.target
+    }
+}
+
+/// The blocking half of [`DocumentGrantStore::open_local`]: resolve the URI,
+/// bind the atomic target, read at most `limit` bytes, validate UTF-8. This is
+/// where an evicted iCloud Drive item or an unreachable network volume waits
+/// (or, with the thread policy OFF, fails as
+/// [`DocumentHostError::NotDownloaded`]) — which is why it takes no `&mut self`
+/// and may run on a worker thread.
+pub(crate) fn admit_local_file(
+    uri: &str,
+    limit: usize,
+    allow_config_symlinks: bool,
+) -> Result<AdmittedDocument, DocumentHostError> {
+    let requested = file_uri_path(uri)?;
+    let contents =
+        read_atomic_file_with_config_symlinks(&requested, limit, false, allow_config_symlinks)?;
+    let path = contents.baseline.target.target_path.clone();
+    if !path.is_absolute() {
+        return Err(DocumentHostError::NotAbsolute);
+    }
+    let canonical_uri = path_to_file_uri(&path)?;
+    let text = decode_utf8(contents.bytes)?;
+    Ok(AdmittedDocument {
+        canonical_uri,
+        path,
+        target: contents.baseline.target,
+        text,
+        observed: contents.baseline.observed,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DocumentHostError {
     UnsupportedScheme,
@@ -275,6 +328,15 @@ pub(crate) enum DocumentHostError {
         path: PathBuf,
     },
     TargetRetargeted,
+    /// The target is a DATALESS file — evicted from iCloud Drive (or another
+    /// File Provider) — and the reading thread's policy forbids waiting for the
+    /// download. macOS reports exactly this as `EDEADLK` from `read(2)` when
+    /// `IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES` is OFF for the thread (see
+    /// [`crate::dataless_files`]); open/stat/realpath all succeed first, so the
+    /// read is the only place it can surface.
+    NotDownloaded {
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for DocumentHostError {
@@ -300,6 +362,11 @@ impl std::fmt::Display for DocumentHostError {
             Self::TargetRetargeted => {
                 f.write_str("document path now resolves to a different file; reopen it")
             }
+            Self::NotDownloaded { path } => write!(
+                f,
+                "{} is evicted from iCloud Drive and must be downloaded in Finder first",
+                path.display()
+            ),
         }
     }
 }
@@ -460,18 +527,30 @@ impl DocumentGrantStore {
         limit: usize,
         allow_config_symlinks: bool,
     ) -> Result<GrantedDocument, DocumentHostError> {
-        let requested = file_uri_path(uri)?;
-        let contents =
-            read_atomic_file_with_config_symlinks(&requested, limit, false, allow_config_symlinks)?;
-        let path = contents.baseline.target.target_path.clone();
-        if !path.is_absolute() {
-            return Err(DocumentHostError::NotAbsolute);
-        }
-        let canonical_uri = path_to_file_uri(&path)?;
-        let text = decode_utf8(contents.bytes)?;
-        let observed = contents.baseline.observed;
+        // SYNCHRONOUS admission on the caller's thread. The main-thread callers
+        // that must not wait on a download go through `admit_local_file` on a
+        // worker and hand the result to `grant_admitted` (App's two-phase open);
+        // this form is for test/restore/effect callers that need the result now.
+        let admitted = admit_local_file(uri, limit, allow_config_symlinks)?;
+        self.grant_admitted(admitted, access)
+    }
 
-        let admitted_target = contents.baseline.target;
+    /// Mint or upgrade the single process-local grant for one already-admitted
+    /// file. Non-blocking: no filesystem read, only the cheap revalidation of an
+    /// existing grant's binding. UI-thread only, like every other mutation of the
+    /// store.
+    pub(crate) fn grant_admitted(
+        &mut self,
+        admitted: AdmittedDocument,
+        access: GrantAccess,
+    ) -> Result<GrantedDocument, DocumentHostError> {
+        let AdmittedDocument {
+            canonical_uri,
+            path,
+            target: admitted_target,
+            text,
+            observed,
+        } = admitted;
         let grant = if let Some(id) = self.by_uri.get(&canonical_uri).copied() {
             let grant = self
                 .grants
@@ -782,7 +861,25 @@ fn open_regular_read(path: &Path) -> Result<RegularReadHandle, DocumentHostError
     Ok(RegularReadHandle::Open { file, metadata })
 }
 
+/// Classify one failed `read(2)` on an already-open regular file. `EDEADLK` is
+/// the kernel's one signal that the file is DATALESS and this thread may not
+/// wait for its download ([`crate::dataless_files`]); every other error is an
+/// ordinary preflight I/O failure.
+fn read_error(path: &Path, error: std::io::Error) -> DocumentHostError {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EDEADLK) {
+        return DocumentHostError::NotDownloaded {
+            path: path.to_path_buf(),
+        };
+    }
+    DocumentHostError::Io {
+        stage: AtomicSaveStage::Preflight,
+        message: format!("could not read {}: {error}", path.display()),
+    }
+}
+
 fn bounded_read(
+    path: &Path,
     file: &mut File,
     metadata: &fs::Metadata,
     limit: usize,
@@ -796,10 +893,7 @@ fn bounded_read(
     std::io::Read::by_ref(file)
         .take(u64::try_from(sentinel_limit).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
-        .map_err(|error| DocumentHostError::Io {
-            stage: AtomicSaveStage::Preflight,
-            message: error.to_string(),
-        })?;
+        .map_err(|error| read_error(path, error))?;
     let after = file.metadata().map_err(|error| DocumentHostError::Io {
         stage: AtomicSaveStage::Preflight,
         message: error.to_string(),
@@ -824,7 +918,7 @@ fn read_stable_file(
             message: format!("{} does not exist", path.display()),
         });
     };
-    let (bytes, after) = bounded_read(&mut file, &metadata, limit)?;
+    let (bytes, after) = bounded_read(path, &mut file, &metadata, limit)?;
     if bytes.len() > limit {
         return Err(DocumentHostError::TooLarge { limit });
     }
@@ -1201,8 +1295,8 @@ fn observe_file(path: &Path, content_limit: usize) -> Result<ObservedFileVersion
     let RegularReadHandle::Open { mut file, metadata } = opened else {
         return Ok(ObservedFileVersion::missing());
     };
-    let (bytes, after) =
-        bounded_read(&mut file, &metadata, content_limit).map_err(|error| error.to_string())?;
+    let (bytes, after) = bounded_read(path, &mut file, &metadata, content_limit)
+        .map_err(|error| error.to_string())?;
     if bytes.len() <= content_limit && after.len() != bytes.len() as u64 {
         return Err("target changed while it was being observed".to_string());
     }
@@ -2022,6 +2116,82 @@ mod tests {
         assert_eq!(first.text, "# hello\n");
         assert_eq!(first.grant.id, second.grant.id);
         assert_eq!(second.grant.access, GrantAccess::ReadWrite);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The main thread's dataless-file policy is OFF (`crate::dataless_files`),
+    /// so an evicted iCloud Drive item's first `read(2)` returns `EDEADLK`
+    /// instead of blocking. That one errno — and only that one — is the
+    /// "download it in Finder first" verdict; every other read failure stays an
+    /// ordinary preflight I/O error.
+    #[cfg(unix)]
+    #[test]
+    fn edeadlk_on_read_is_reported_as_not_downloaded() {
+        let path = Path::new("/Users//someone/Library/Mobile Documents/notes.md");
+        let evicted = read_error(path, std::io::Error::from_raw_os_error(libc::EDEADLK));
+        assert_eq!(
+            evicted,
+            DocumentHostError::NotDownloaded {
+                path: path.to_path_buf()
+            }
+        );
+        let rendered = evicted.to_string();
+        assert!(rendered.contains("evicted from iCloud Drive"), "{rendered}");
+        assert!(
+            rendered.contains("downloaded in Finder first"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("notes.md"), "{rendered}");
+
+        let other = read_error(path, std::io::Error::from_raw_os_error(libc::EIO));
+        assert!(
+            matches!(
+                &other,
+                DocumentHostError::Io {
+                    stage: AtomicSaveStage::Preflight,
+                    message
+                } if message.contains("could not read") && message.contains("notes.md")
+            ),
+            "{other:?}"
+        );
+    }
+
+    /// The two halves of an open compose to exactly what `open_local` did in one
+    /// call: admission is a pure function of the URI (so a worker can run it) and
+    /// granting is the store's only mutation. Admitting twice mints one grant.
+    #[test]
+    fn admission_then_grant_matches_the_synchronous_open() {
+        let path = unique_file("two-phase", b"# split\n");
+        let uri = file_uri(&path);
+        let admitted = admit_local_file(&uri, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+        assert_eq!(admitted.text, "# split\n");
+        assert!(admitted.canonical_uri.starts_with("file:///"));
+        assert!(admitted.path.is_absolute());
+
+        let mut grants = DocumentGrantStore::new();
+        let first = grants
+            .grant_admitted(admitted.clone(), GrantAccess::ReadOnly)
+            .unwrap();
+        let second = grants
+            .grant_admitted(admitted, GrantAccess::ReadWrite)
+            .unwrap();
+        assert_eq!(first.grant.id, second.grant.id);
+        assert_eq!(second.grant.access, GrantAccess::ReadWrite);
+        assert_eq!(first.text, "# split\n");
+        assert_eq!(first.observed, second.observed);
+
+        let direct = grants
+            .open_local(&uri, GrantAccess::ReadOnly, DEFAULT_DOCUMENT_LIMIT)
+            .unwrap();
+        assert_eq!(direct.grant.id, first.grant.id);
+        assert_eq!(direct.grant.canonical_uri, first.grant.canonical_uri);
+        assert!(
+            matches!(
+                admit_local_file("file:///definitely/missing/aterm-doc.md", 16, false),
+                Err(DocumentHostError::Io { .. })
+            ),
+            "a missing file fails at admission, before any grant state exists"
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

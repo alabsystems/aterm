@@ -52,6 +52,10 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ObjcImeDrive => objc_ime_drive(ctx, &mut r),
         StageId::ObjcToolbarDrive => objc_toolbar_drive(ctx, &mut r),
         StageId::ObjcWindowDrive => objc_window_drive(ctx, &mut r),
+        StageId::ObjcEventDrive => objc_event_drive(ctx, &mut r),
+        StageId::ObjcAlertDrive => objc_alert_drive(ctx, &mut r),
+        StageId::ObjcSwizzleDrive => objc_swizzle_drive(ctx, &mut r),
+        StageId::ObjcBoundDrive => objc_bound_drive(ctx, &mut r),
         StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
@@ -567,6 +571,237 @@ pub fn objc_ime_outcome(code: Option<i32>) -> (Outcome, String) {
 }
 
 /// `targo --unverified test -p aterm-bench --test differential`
+/// The event driver's target name — the `[[example]]`, the built file and the
+/// argv below all have to agree, so they read it from here.
+pub const OBJC_EVENT_DRIVE_EXAMPLE: &str = "objc_event_drive";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_event_drive`
+#[must_use]
+pub fn objc_event_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_EVENT_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the event driver's exit (`0` clean / `1` finding /
+/// `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_event_drive.rs`).
+///
+/// ONE DELIBERATE DIFFERENCE from its three siblings: an ABORT — exit `3`
+/// from the driver's own signal trap, or no exit status at all when the trap
+/// could not convert it — is a GATE FAILURE here, not could-not-run. For
+/// the other drivers a signal is an accident of the harness; for this one it
+/// is the very finding it exists to make. v0.72.0 died by `SIGABRT` when a
+/// `WinitView` row sent a key-only accessor to a mouse event inside a
+/// `declare_class!` trampoline, and the driver reproduces exactly that shape
+/// (measured: exit 134 at the first `mouseMoved:` against the v0.72.0
+/// `view.rs`). Reading that as "decided nothing" would be reading the crash
+/// as a shrug.
+///
+/// Since exception containment landed in `aterm_objc`, the driver's two
+/// CONTROL children pin both halves of the trampoline's policy: the v0.72.0
+/// send must now be CONTAINED (exit 0, the containment line on stderr naming
+/// `poke:` and `NSInternalInconsistencyException`, a later send answering),
+/// and a Rust panic must still ABORT with `abort_on_unwind`'s message. Either
+/// control answering the other way is exit `1`.
+#[must_use]
+pub fn objc_event_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc event drive: every NSEvent-taking row of the ported WinitView, and the NSApplication sendEvent: override, survived a real NSEvent of every type AppKit can deliver to it — mouse, drag, tracking, scroll, gesture, key, cancelOperation: and the defined kinds — the exception control CONTAINED the v0.72.0 send (named on stderr, later send answered) and the panic control still aborted".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc event drive: a relation failed (an event did not produce the WindowEvent winit promises), a row went undriven, or a control answered the wrong way (the exception control was not contained and named, or the panic control did not abort)".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc event drive: NOT RUN — no event loop, no window, no view, or the control could not be spawned, so nothing was proven about the event rows (exit 2, never a pass)".to_string(),
+        ),
+        Some(3) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc event drive: ABORTED — a WinitView row raised an NSException or panicked on an NSEvent AppKit can deliver (the v0.72.0 mouse-move crash class); the driver's signal trap turned the abort into exit 3 and the transcript names the row".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc event drive: unexpected exit {c} (the driver answers only 0/1/2/3)"),
+        ),
+        None => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc event drive: ABORTED — the driver died by a signal its trap could not convert, which for this driver is still the finding it exists to make: a WinitView row raised an NSException or panicked on an NSEvent AppKit can deliver (the v0.72.0 mouse-move crash class)".to_string(),
+        ),
+    }
+}
+
+/// The modal driver's target name — the `[[example]]`, the built file and the
+/// argv below all have to agree, so they read it from here.
+pub const OBJC_ALERT_DRIVE_EXAMPLE: &str = "objc_alert_drive";
+
+/// `targo --unverified build -q -p aterm-gui --example objc_alert_drive`
+#[must_use]
+pub fn objc_alert_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "--example",
+        OBJC_ALERT_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the modal driver's exit code (`0` clean / `1` finding
+/// / `2` NOT RUN, declared in `crates/aterm-gui/examples/objc_alert_drive.rs`).
+///
+/// THREE codes, like the window drive's: the driver's 90 s budget ends in `2`,
+/// not in a code of its own, because a sheet that never came down proved
+/// nothing about the subsystem rather than something bad about it.
+#[must_use]
+pub fn objc_alert_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc alert drive: the real NSAlert answered every question — +new and the button order, the first button's bare-Return key equivalent read off AppKit, the block ABI called directly, the sheet attaching, a keyDown through the swizzled -sendEvent: reaching the installed monitor and consumed by its nil, removeMonitor:, performClick: ending the sheet with NSAlertFirstButtonReturn delivered to a block AppKit had copied, the menu bar walk, and a chrome capture that is a PNG".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc alert drive: the driven alert did not behave — a button, key equivalent, monitor, completion response, sheet predicate, menu-bar read or capture answered the wrong value".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc alert drive: NOT RUN — no event loop, no window, or the stages did not finish within the driver's budget, so nothing was proven about the modal subsystem (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc alert drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of a block or monitor ownership bug"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc alert drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+/// The swizzle driver's target name — the built file and the argv below have
+/// to agree, so they read it from here. An `aterm-objc` example: the
+/// capability under drive is the crate's own, and the example carries its
+/// AppKit link line itself.
+pub const OBJC_SWIZZLE_DRIVE_EXAMPLE: &str = "objc_swizzle_drive";
+
+/// `targo --unverified build -q -p aterm-objc --example objc_swizzle_drive`
+#[must_use]
+pub fn objc_swizzle_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-objc",
+        "--example",
+        OBJC_SWIZZLE_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the swizzle driver's exit code (`0` clean / `1`
+/// finding / `2` NOT RUN, declared in
+/// `crates/aterm-objc/examples/objc_swizzle_drive.rs`).
+#[must_use]
+pub fn objc_swizzle_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc swizzle drive: SwizzleSite installed on the live -[NSApplication sendEvent:] — the prototype check passed against Apple's own v24@0:8@16, the registered encoding was unchanged by the swap (the measurement that makes encoding checks no evidence of a swizzle), the IMP's image moved from AppKit into this executable, a real NSEvent ran both halves of the chain, and a wrong prototype was refused".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc swizzle drive: the swizzle did not behave — the prototype check disagreed with Apple's encoding, the IMP's image did not move, the chain did not run both halves, or a wrong prototype was accepted".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc swizzle drive: NOT RUN — no NSApplication or no main thread, so nothing was proven about the swizzle (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc swizzle drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of a chain entered with the wrong prototype"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc swizzle drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
+/// The container driver's target name — the built file and the argv below
+/// have to agree, so they read it from here. An `aterm-objc` example, like the
+/// swizzle driver's.
+pub const OBJC_BOUND_DRIVE_EXAMPLE: &str = "objc_bound_drive";
+
+/// `targo --unverified build -q -p aterm-objc --example objc_bound_drive`
+#[must_use]
+pub fn objc_bound_drive_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-objc",
+        "--example",
+        OBJC_BOUND_DRIVE_EXAMPLE,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// How the ladder reads the container driver's exit code (`0` clean / `1`
+/// finding / `2` NOT RUN, declared in
+/// `crates/aterm-objc/examples/objc_bound_drive.rs`).
+///
+/// The driver's hang differential runs in CHILD processes under its own 5 s
+/// watchdog and reports through `1`; the parent has no hang of its own to
+/// name, so there is no fourth code.
+#[must_use]
+pub fn objc_bound_outcome(code: Option<i32>) -> (Outcome, String) {
+    match code {
+        Some(0) => (
+            Outcome::Ok,
+            "objc bound drive: MainThreadBound dropped its payload on the main thread from a worker — a plain T and a declared class's -dealloc with a Rust destructor — where the unsound twin declared beside it dropped both on the worker, and the needs_drop short-circuit was proved load-bearing by a child that hangs without it and returns with it".to_string(),
+        ),
+        Some(1) => (
+            Outcome::Fail(Severity::GateFailed),
+            "objc bound drive: a destructor landed on the wrong thread, the unsound twin stopped being unsound (the comparison lost its subject), or the hang differential answered the wrong way".to_string(),
+        ),
+        Some(2) => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc bound drive: NOT RUN — no main thread or no child could be spawned, so nothing was proven about the container (exit 2, never a pass)".to_string(),
+        ),
+        Some(c) => (
+            Outcome::Fail(Severity::GateFailed),
+            format!("objc bound drive: unexpected exit {c} (the driver answers only 0/1/2) — a signal here is the shape of a -dealloc on the wrong thread"),
+        ),
+        None => (
+            Outcome::Fail(Severity::CouldNotRun),
+            "objc bound drive: no exit status — killed by a signal, or never spawned".to_string(),
+        ),
+    }
+}
+
 #[must_use]
 pub fn differential_args() -> Vec<String> {
     [
@@ -1503,6 +1738,174 @@ fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
     let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
     r.raw(out.output.as_str());
     let (outcome, label) = objc_window_outcome(out.code);
+    r.record(outcome, label);
+}
+
+fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as its three siblings do.
+    if ctx.selftest {
+        r.skip("objc event drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc event drive (macOS only: the driven view.rs is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc event drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_event_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --example {OBJC_EVENT_DRIVE_EXAMPLE}"));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_EVENT_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc event drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, for the same two reasons as its siblings —
+    // and here a third: cargo would turn the driver's signal death into its
+    // own exit 101, and the signal IS the finding (see `objc_event_outcome`).
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_event_outcome(out.code);
+    r.record(outcome, label);
+}
+
+fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as its siblings do.
+    if ctx.selftest {
+        r.skip("objc alert drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc alert drive (macOS only: the driven modal subsystem is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc alert drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_alert_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!("targo build --example {OBJC_ALERT_DRIVE_EXAMPLE}"));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_ALERT_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc alert drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, for the same two reasons as its siblings:
+    // the driver lane's banner would land in the transcript, and cargo's own
+    // exit codes would collide with the driver's 0/1/2.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_alert_outcome(out.code);
+    r.record(outcome, label);
+}
+
+fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as its siblings do.
+    if ctx.selftest {
+        r.skip("objc swizzle drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc swizzle drive (macOS only: the driven NSApplication is a macOS one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc swizzle drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_swizzle_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!(
+            "targo build -p aterm-objc --example {OBJC_SWIZZLE_DRIVE_EXAMPLE}"
+        ));
+        return;
+    }
+    // An `aterm-objc` example lands under the same `<target>/debug/examples/`
+    // as the `aterm-gui` ones: cargo's layout is per target dir, not per crate.
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_SWIZZLE_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc swizzle drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, as its siblings.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_swizzle_outcome(out.code);
+    r.record(outcome, label);
+}
+
+fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
+    // SELFTEST FIRST, as its siblings do.
+    if ctx.selftest {
+        r.skip("objc bound drive (selftest: not executed)");
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        r.skip("objc bound drive (macOS only: libdispatch's main queue is a Darwin one)");
+        return;
+    }
+    if !ctx.tools.have_targo() {
+        r.skip("objc bound drive (no targo)");
+        return;
+    }
+    let build = exec::run(&targo(ctx, objc_bound_drive_build_args()), ctx.exec_env());
+    if !build.ok {
+        r.raw(build.output.as_str());
+        r.fail(format!(
+            "targo build -p aterm-objc --example {OBJC_BOUND_DRIVE_EXAMPLE}"
+        ));
+        return;
+    }
+    let bin = debug_example(
+        &ctx.root,
+        ctx.env.cargo_target_dir.as_deref(),
+        OBJC_BOUND_DRIVE_EXAMPLE,
+    );
+    if !is_executable_file(&bin) {
+        r.cannot_run(format!(
+            "objc bound drive: just-built driver missing ({})",
+            bin.display()
+        ));
+        return;
+    }
+    // A BINARY, never `targo run`, as its siblings — and this driver
+    // re-executes ITSELF as its hang-differential children, by path, so the
+    // path it is run from must be the built file and not cargo's runner.
+    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    r.raw(out.output.as_str());
+    let (outcome, label) = objc_bound_outcome(out.code);
     r.record(outcome, label);
 }
 

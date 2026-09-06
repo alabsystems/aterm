@@ -89,6 +89,10 @@ struct Triple {
 // a named tag would appear in its place and `NSMethodSignature` reads the
 // FIELDS, not the tag. `#[repr(C)]` with three `i64`s matches the C layout
 // exactly and nothing is packed.
+// SAFETY: three `i64`s; all-zero is `{0, 0, 0}`, a valid `Triple` — which is
+// what a contained `tripleForCharacterRange:` answers.
+unsafe impl aterm_objc::InertZero for Triple {}
+
 unsafe impl Encode for Triple {
     const ENCODING: &'static str = "{?=qqq}";
 }
@@ -157,7 +161,7 @@ fn signature_for(cls: ClassPtr, s: Sel) -> Id {
     // NSObject and returns an AUTORELEASED `NSMethodSignature` (+0), borrowed
     // here for the length of the enclosing pool.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
         f(cls.as_id(), sel!(instanceMethodSignatureForSelector:), s)
     }
 }
@@ -167,7 +171,7 @@ fn signature_for(cls: ClassPtr, s: Sel) -> Id {
 fn return_length(sig: Id) -> usize {
     // SAFETY: `-methodReturnLength` is `-(NSUInteger)` on a live signature.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> usize = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = msg();
         f(sig, sel!(methodReturnLength))
     }
 }
@@ -178,7 +182,7 @@ fn return_type(sig: Id) -> String {
     // SAFETY: `-methodReturnType` is `-(const char *)` on a live signature;
     // the string is owned by the signature and outlives this read.
     let p = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> *const c_char = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> *const c_char = msg();
         f(sig, sel!(methodReturnType))
     };
     assert!(!p.is_null(), "a signature always reports a return type");
@@ -194,16 +198,16 @@ fn invocation(target: Id, cls: ClassPtr, s: Sel) -> Id {
     // returns an autoreleased invocation; the two setters are `-(void)(id)` and
     // `-(void)(SEL)`.
     unsafe {
-        let new: unsafe extern "C" fn(Id, Sel, Id) -> Id = msg();
+        let new: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = msg();
         let inv = new(
             class(c"NSInvocation").as_id(),
             sel!(invocationWithMethodSignature:),
             sig,
         );
         assert!(!inv.is_null(), "NSInvocation was built");
-        let set_id: unsafe extern "C" fn(Id, Sel, Id) = msg();
+        let set_id: unsafe extern "C-unwind" fn(Id, Sel, Id) = msg();
         set_id(inv, sel!(setTarget:), target);
-        let set_sel: unsafe extern "C" fn(Id, Sel, Sel) = msg();
+        let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
         set_sel(inv, sel!(setSelector:), s);
         inv
     }
@@ -218,7 +222,7 @@ unsafe fn set_argument(inv: Id, slot: *const c_void, index: isize) {
     // SAFETY: the caller pins `slot`'s type and the prototype is
     // `-(void)(void *, NSInteger)`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, *const c_void, isize) = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, isize) = msg();
         f(inv, sel!(setArgument:atIndex:), slot, index);
     }
 }
@@ -234,9 +238,9 @@ unsafe fn invoke_returning<T: Default>(inv: Id) -> T {
     // and writes exactly `methodReturnLength` bytes, which the caller has
     // pinned to `size_of::<T>()`.
     unsafe {
-        let go: unsafe extern "C" fn(Id, Sel) = msg();
+        let go: unsafe extern "C-unwind" fn(Id, Sel) = msg();
         go(inv, sel!(invoke));
-        let get: unsafe extern "C" fn(Id, Sel, *mut c_void) = msg();
+        let get: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
         get(
             inv,
             sel!(getReturnValue:),
@@ -320,7 +324,7 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
     // --- HFA(4) on arm64, `sret` on x86_64, with the full argument shape.
     let mut actual = NSRange::default();
     let rect = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange, *mut NSRange) -> CGRect = msg();
         f(
             this,
             sel!(firstRectForCharacterRange:actualRange:),
@@ -355,7 +359,7 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
 
     // --- INDIRECT on both ABIs.
     let triple = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, NSRange) -> Triple = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel, NSRange) -> Triple = msg();
         f(
             this,
             sel!(tripleForCharacterRange:),
@@ -369,7 +373,7 @@ fn a_direct_send_reaches_each_return_class_with_its_arguments_intact() {
 
     // --- two registers, no indirection.
     let marked = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel) -> NSRange = msg();
+        let f: unsafe extern "C-unwind" fn(Id, Sel) -> NSRange = msg();
         f(this, sel!(markedRange))
     };
     assert_eq!(

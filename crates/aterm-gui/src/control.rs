@@ -483,6 +483,21 @@ enum AimedAppLane {
     Denied,
 }
 
+/// The App-target verbs whose AIMED form (`@<sid> <verb> …`) is routed to the
+/// session resolver instead of being answered on the App lane.
+///
+/// ONE LITERAL, TWO READERS, and they must not drift. [`aimed_app_lane`] uses it
+/// to send the request PAST `dispatch_before_session`'s
+/// [`crate::fabric::app_halt_refusal`] gate, and the session dispatch uses it to
+/// re-ask that same App-lane question after the session resolves — because what
+/// an aimed App verb drives is NOT the resolved session (see the halt gate in
+/// [`handle`]). A verb added here therefore joins both sides at once; a verb
+/// added to only one of two hand-written lists is how `@<sid> tab close N`
+/// retired a HELD session through an unheld window-mate.
+fn is_aimed_app_verb(verb: &str) -> bool {
+    matches!(verb, "spawn" | "tab")
+}
+
 /// Classify an aimed `spawn`/`tab`. The selector is the verb's ARGUMENT — "the
 /// window hosting `<sid>`" — not instance routing, so for an Owner it must
 /// survive to the session resolver: the ordinary App lane validates every
@@ -507,7 +522,7 @@ fn aimed_app_lane(
     selector: Option<&Selector>,
     principal: NativeControlPrincipal,
 ) -> Option<AimedAppLane> {
-    if !matches!(verb, "spawn" | "tab") || matches!(selector, None | Some(Selector::SelfTok)) {
+    if !is_aimed_app_verb(verb) || matches!(selector, None | Some(Selector::SelfTok)) {
         return None;
     }
     Some(
@@ -1133,6 +1148,53 @@ mod help_tests {
         );
     }
 
+    /// THE TWO GOLDENS ARE ONE CATALOG, AND THEY MUST NOT BE REGENERATED APART.
+    ///
+    /// `help --full` is the introspection HEADER followed by exactly
+    /// `catalog_lines_full()`, and each half is pinned to its own fixture by its
+    /// own `#[ignore]`d writer in a DIFFERENT crate's test suite. So a deliberate
+    /// wording change regenerates whichever golden the author's `-p` happened to
+    /// name, and the other keeps the old text until someone runs the other
+    /// suite — which is the same "two literals for one value" shape the halt set
+    /// and the `hold` help each carried, one directory over.
+    ///
+    /// MEASURED, not hypothetical: at `c6640c33c` the `trail` row's `bloom=` key
+    /// was in `control_verbs.rs` and in `help_catalog_full.txt` and NOT in
+    /// `ctl_help_full.txt`, so `help_full_is_byte_identical_to_the_generated_golden`
+    /// was red on a change that had nothing to do with it. This assertion turns
+    /// "regenerated one of them" into a failure in EITHER suite, which is the
+    /// only place it can be noticed by whoever caused it.
+    #[test]
+    fn the_two_help_goldens_are_one_catalog() {
+        const CATALOG_GOLDEN: &str =
+            include_str!("../../aterm-types/tests/fixtures/help_catalog_full.txt");
+        let ctl: Vec<&str> = CTL_HELP_FULL_GOLDEN.lines().collect();
+        let catalog: Vec<&str> = CATALOG_GOLDEN.lines().collect();
+        assert!(
+            ctl.len() > catalog.len(),
+            "`help --full` is the header plus the whole catalog"
+        );
+        let head = ctl.len() - catalog.len();
+        for (i, (c, g)) in ctl[head..].iter().zip(catalog.iter()).enumerate() {
+            assert_eq!(
+                c,
+                g,
+                "catalog row {} differs between the two goldens: one of them was \
+                 regenerated and the other was not (`targo --unverified test -p \
+                 aterm-gui --lib -- --ignored regen_ctl_help_golden` and `-p \
+                 aterm-types --lib -- --ignored regen_help_catalog_golden` are a \
+                 PAIR)",
+                i + 1,
+            );
+        }
+        assert!(
+            ctl[..head]
+                .iter()
+                .all(|l| l.starts_with('#') || l.starts_with("OK ")),
+            "everything above the catalog is the header block"
+        );
+    }
+
     /// Writes the golden. Ignored so a routine run can never rewrite the pin.
     #[test]
     #[ignore = "rewrites aterm-types/tests/fixtures/ctl_help_full.txt; run by name on purpose"]
@@ -1329,6 +1391,21 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.is_failing_persistently(),
         st.outcome
     );
+    // HOW UPDATES REACH THIS MACHINE, in the same one-glance line: `lane=` (`web` — the
+    // unmetered download host, no credential, no API request — or `token:<rung id>`,
+    // the rung's fixed whitespace-free id: env/keychain/file/github-env/gh-env/gh-cli),
+    // `delivery=` (`ok`, `held:<rfc3339>` while a token's API budget renews, `deferred`,
+    // `blocked` on the web lane, `api-failed` on the token lane) and, on the token lane
+    // only, `budget=<remaining>/<limit>@<reset>` from the last release LIST's own
+    // headers. Emitted ONLY when the ledger recorded them, so a healthy line from an
+    // older ledger is byte-identical to before.
+    if let Some(delivery) = aterm_update::delivery() {
+        let suffix = delivery.status_line_suffix();
+        if !suffix.is_empty() {
+            let line = out.trim_end_matches('\n');
+            out = format!("{line}{suffix}\n");
+        }
+    }
     // STRUCTURALLY UNABLE, in the same one-glance line. A copy run from the mounted
     // DMG, a Gatekeeper-translocated download, or a dev-marked build has no bundle
     // to replace: no check thread ever starts, so every field above stays at the
@@ -2839,7 +2916,7 @@ pub fn spawn(
                 "control socket dir {} not creatable; socket disabled",
                 sock_dir.display()
             );
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: control socket dir {} not creatable; socket disabled",
                 sock_dir.display()
             );
@@ -2882,7 +2959,7 @@ pub fn spawn(
                 "control socket {sock_path} already has a live listener; running without \
                  a control socket rather than hijacking it"
             );
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: control socket {sock_path} already has a live listener; \
                  running without a control socket rather than hijacking it"
             );
@@ -2894,7 +2971,9 @@ pub fn spawn(
             Some(t) => Arc::new(t),
             None => {
                 aterm_log::warn!("could not provision control-socket token; socket disabled");
-                eprintln!("aterm-gui: could not provision control-socket token; socket disabled");
+                crate::logging::stderr_line!(
+                    "aterm-gui: could not provision control-socket token; socket disabled"
+                );
                 return;
             }
         };
@@ -2918,7 +2997,7 @@ pub fn spawn(
                     aterm_log::warn!(
                         "control socket bind failed at {sock_path} (attempt {attempt}/3): {e}"
                     );
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: control socket bind failed at {sock_path} \
                          (attempt {attempt}/3): {e}"
                     );
@@ -2934,7 +3013,7 @@ pub fn spawn(
                                 "control socket {sock_path} became live during retry; \
                                  running socketless rather than hijacking it"
                             );
-                            eprintln!(
+                            crate::logging::stderr_line!(
                                 "aterm-gui: control socket {sock_path} became live during \
                                  retry; running socketless rather than hijacking it"
                             );
@@ -2974,7 +3053,9 @@ pub fn spawn(
         connection_dispatch.set_capacity(workers);
         if workers == 0 {
             aterm_log::warn!("control socket disabled: no connection worker could start");
-            eprintln!("aterm-gui: control socket disabled: no connection worker could start");
+            crate::logging::stderr_line!(
+                "aterm-gui: control socket disabled: no connection worker could start"
+            );
             drop(listener);
             let _ = std::fs::remove_file(&sock_path);
             let _ = std::fs::remove_file(&plan.token_path);
@@ -3005,7 +3086,7 @@ pub fn spawn(
             "control socket listening at {sock_path} ({workers} RPC lanes, {subscription_workers} subscription lanes; excess peers get retry)"
         );
         #[cfg(not(windows))]
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: control socket listening at {sock_path} (token-gated, same-uid only)"
         );
         #[cfg(windows)]
@@ -3013,10 +3094,10 @@ pub fn spawn(
             // Same `listening at <PATH> (token-gated` shape aterm-nest parses,
             // with the HONEST posture parenthetical, plus the one-line
             // peer-uid-unavailable notice (never silently claim same-uid).
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: control socket listening at {sock_path} (token-gated, dir-ACL only)"
             );
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: control socket peer-uid check NOT available on Windows (AF_UNIX \
                  has no SO_PEERCRED); relying on the %LOCALAPPDATA% directory ACL (owner \
                  verified + hardened to an owner-only DACL) + the per-launch token"
@@ -3839,19 +3920,39 @@ fn dispatch_before_session(
             return None;
         }
     }
-    // THE FLEET HALT, APP LANE (design §5.3). Two App-target verbs are in the §5.3
-    // set and neither resolves a session, so the halt gate in the session dispatch
-    // is STRUCTURALLY unreachable for them. `invoke` reaches a PTY — `invoke
-    // Paste` writes the OS clipboard into the front tab's PTY through
-    // `App::paste_clipboard`, and `invoke SelectAll` + `copy` chooses those bytes
-    // off the session's own screen first. `tab` RETIRES a session: `tab close [N]`
-    // reaches `App::close_tab_via_verb` and destroys the tab's session, which is
-    // the third of the three things `fabric::is_pty_reaching` says a halt covers —
-    // a driver refused `@<sid> close` used to substitute `tab close` and get the
-    // same effect. Checked HERE, after authorization, for the same reason the
-    // session gate is placed after it: an unauthorized caller must learn nothing
-    // about the target's state. `app_halt_refusal` explains why the question it
-    // asks is "is ANY session held" rather than "is the front one held".
+    // THE FLEET HALT, APP LANE (design §5.3). FIVE App-target verbs are in the
+    // §5.3 set and none of them resolves a session, so the halt gate in the
+    // session dispatch is STRUCTURALLY unreachable for their bare forms. The
+    // count is not maintained here by hand — the call below is generic over the
+    // verb and asks `fabric::is_pty_reaching` itself, which is the point; the
+    // number is written down only so an auditor enumerating the fenced set from
+    // this comment enumerates the same set the code does, the way
+    // `dispatch_bridge_verb`'s doc records for the BridgeOnly set. They are:
+    //
+    // * `invoke` reaches a PTY — `invoke Paste` writes the OS clipboard into the
+    //   front tab's PTY through `App::paste_clipboard`, and `invoke SelectAll` +
+    //   `copy` chooses those bytes off the session's own screen first.
+    // * `hwkey` posts a real NSEvent onto the OS event queue, so it takes the
+    //   same winit path a physical keypress does — the one route into a session
+    //   that is indistinguishable from fingers on the keyboard.
+    // * `pointer` moves aterm's own pointer through `App::on_cursor_moved`, and
+    //   under DEC 1000/1002/1003 the terminal REPORTS that motion to the program
+    //   on the far side.
+    // * `pane` redirects where the next keystroke lands: it moves the focused
+    //   leaf, and with it which session the window's keyboard — and every
+    //   flagless, front-routed socket verb — drives.
+    // * `tab` RETIRES a session: `tab close [N]` reaches `App::close_tab_via_verb`
+    //   and destroys the tab's session, which is the third of the three things
+    //   `fabric::is_pty_reaching` says a halt covers — a driver refused `@<sid>
+    //   close` used to substitute `tab close` and get the same effect.
+    //
+    // Checked HERE, after authorization, for the same reason the session gate is
+    // placed after it: an unauthorized caller must learn nothing about the
+    // target's state. `app_halt_refusal` explains why the question it asks is "is
+    // ANY session held" rather than "is the front one held". The AIMED forms
+    // (`@<sid> tab …`) do not pass this site at all — `aimed_app_lane` above
+    // routes them to the session resolver — and are gated by the SECOND call to
+    // `app_halt_refusal`, in the session dispatch.
     if let Some(refusal) = crate::fabric::app_halt_refusal(store, verb) {
         return Some(refusal.into());
     }
@@ -4044,25 +4145,45 @@ fn advance_artifact_quarantine_anchor() {}
 fn expire_artifact_quarantine_anchor() {}
 
 fn artifact_reply_quarantine() -> &'static ArtifactReplyQuarantine {
-    static QUARANTINE: std::sync::OnceLock<ArtifactReplyQuarantine> = std::sync::OnceLock::new();
+    // The cell holds a `&'static` to a leaked value rather than the value
+    // itself, so the reaper thread spawned by the initializer can be HANDED
+    // the quarantine instead of asking this accessor for it. The 2026-09-05
+    // lazy-init reentrancy census (freeze-safety obligation 6, OB-19) went red
+    // on the previous shape: the reaper's first line called
+    // `artifact_reply_quarantine()`, a blocking `get_or_init` on the very cell
+    // whose initializer had just spawned it. That only ever completed because
+    // the reaper is a fresh thread and the initializer returns right after the
+    // spawn — a wait on one's own caller all the same, and the census has no
+    // waiver for one. Now nothing inside the initializer touches the cell.
+    static QUARANTINE: std::sync::OnceLock<&'static ArtifactReplyQuarantine> =
+        std::sync::OnceLock::new();
     QUARANTINE.get_or_init(|| {
-        let quarantine = ArtifactReplyQuarantine {
-            entries: std::sync::Mutex::new(Vec::new()),
-            changed: std::sync::Condvar::new(),
-        };
+        let quarantine: &'static ArtifactReplyQuarantine =
+            Box::leak(Box::new(ArtifactReplyQuarantine {
+                entries: std::sync::Mutex::new(Vec::new()),
+                changed: std::sync::Condvar::new(),
+            }));
         // One reaper handles every failed handoff. If the OS refuses the single
         // helper thread, queued guards intentionally remain retained forever:
         // fail-closed availability loss is safer than releasing an advertised
         // path before its bounded compatibility handoff.
         let _ = std::thread::Builder::new()
             .name("aterm-artifact-quarantine".into())
-            .spawn(artifact_reply_quarantine_reaper);
+            .spawn(move || {
+                // QoS (port of 61a6c8b62): the ONE `Housekeeping` worker. It only
+                // releases retention guards whose deadline has passed; nothing
+                // waits on that release (an absent reaper retains them forever,
+                // by design, see above), it holds `entries` for a sweep and not
+                // across any I/O, and running arbitrarily late merely keeps a
+                // failed reply's file on disk a little longer.
+                crate::qos::set_self(crate::qos::Role::Housekeeping);
+                artifact_reply_quarantine_reaper(quarantine);
+            });
         quarantine
     })
 }
 
-fn artifact_reply_quarantine_reaper() {
-    let quarantine = artifact_reply_quarantine();
+fn artifact_reply_quarantine_reaper(quarantine: &'static ArtifactReplyQuarantine) {
     loop {
         let mut entries = quarantine
             .entries
@@ -7828,6 +7949,30 @@ fn handle(
     // nothing else: `post`, `inbox seen`, `meta set`, `lease` and every read verb
     // stay answerable, because a halted agent must still be able to ask why.
     if let Some(refusal) = crate::fabric::halt_refusal(ctx, verb) {
+        return refusal;
+    }
+
+    // …AND THE APP LANE AGAIN, for an AIMED App verb (`@<sid> tab …`, §S3).
+    // [`aimed_app_lane`] deliberately routes those PAST the App-lane halt gate in
+    // `dispatch_before_session`, because the selector is the verb's ARGUMENT and
+    // has to survive to the session resolver. What they then drive is NOT the
+    // resolved session: `cmd_tab_aimed` resolves `hosting_window(session)` and
+    // `App::apply_tab_cmd_in` acts on the WHOLE window, so `tab close N` retires
+    // whichever session tab N hosts. The gate above asks only about the AIMED
+    // session, so under a PARTIAL halt — the ordinary case, since
+    // `fabric::bridge_lost` holds only the sids in `LINK.touched` — `@<unheld>
+    // tab close N` retired a HELD window-mate that `@<held> close` and `tab close`
+    // had both just been refused on: the exact substitution `tab`'s membership
+    // in `is_pty_reaching` exists to stop.
+    //
+    // So re-ask the App-lane question here, keyed on [`is_aimed_app_verb`]
+    // rather than on a second literal of verb names, and on `is_pty_reaching`
+    // inside `app_halt_refusal` rather than on `tab` — an aimed verb outside the
+    // §5.3 set (`spawn`, a NAMED residual in `is_pty_reaching`'s doc) is
+    // untouched, and one added to the lane later is covered without an edit.
+    if is_aimed_app_verb(verb)
+        && let Some(refusal) = crate::fabric::app_halt_refusal(store, verb)
+    {
         return refusal;
     }
 
@@ -19376,11 +19521,19 @@ mod tests {
         // never resolves a session: `invoke Paste` was answered in
         // `dispatch_before_session`, so `halt_refusal` was structurally
         // unreachable for it and a standing fleet halt did not stop it.
+        //
+        // TWO sites, not one. The second is in the SESSION dispatch, for the
+        // AIMED App forms (`@<sid> tab …`): `aimed_app_lane` routes those past
+        // the first site so the selector reaches the resolver, and what they
+        // then drive is the hosting WINDOW rather than the aimed session — so
+        // the session gate above them is the wrong question and a partial halt
+        // let `tab close N` retire a held window-mate.
         assert_eq!(
             control.matches("fabric::app_halt_refusal(").count(),
-            1,
-            "the App-lane halt gate has exactly one production call site: \
-             dispatch_before_session, before dispatch_app_verb"
+            2,
+            "the App-lane halt gate has exactly two production call sites: \
+             dispatch_before_session before dispatch_app_verb, and the session \
+             dispatch for the aimed App forms"
         );
         for (name, src) in [
             ("input.rs", include_str!("input.rs")),
@@ -19401,6 +19554,109 @@ mod tests {
         // beside the set it derives, under the name `is_pty_reaching`'s doc cites,
         // and it walks EVERY row whatever its target. THIS test is about the GATE:
         // where the halt is asked, and where it must never be.
+    }
+
+    /// AN AIMED APP VERB IS GATED ON WHAT IT DRIVES, NOT ON THE SID IT NAMES.
+    ///
+    /// `@<sid> tab …` is routed PAST the App-lane halt gate by `aimed_app_lane`,
+    /// because the selector is the verb's ARGUMENT and has to reach the session
+    /// resolver. What it then drives is `hosting_window(sid)` — the whole window
+    /// — so `tab close N` retires whichever session tab N hosts. Gated on the
+    /// AIMED session's own hold, a PARTIAL halt (the ordinary case: `bridge_lost`
+    /// halts only the sids in `LINK.touched`, so a session the bridge never
+    /// governed is unheld beside its held window-mates) let `@<unheld> tab close
+    /// N` retire a HELD sibling that `@<held> close` and bare `tab close` had
+    /// both just been refused on — the exact substitution `tab`'s membership in
+    /// `is_pty_reaching` was added to stop.
+    #[test]
+    fn an_aimed_app_verb_asks_the_app_lane_halt_question_inbox_hold() {
+        crate::fabric::with_link_reset(an_aimed_app_verb_asks_the_app_lane_halt_question_body);
+    }
+
+    fn an_aimed_app_verb_asks_the_app_lane_halt_question_body() {
+        let store = session_store::new_store();
+        let held = crate::session_store::test_handle(1);
+        let unheld = crate::session_store::test_handle(2);
+        let held_sid = held.sid.as_str().to_string();
+        let unheld_ctx = unheld.ctx.clone();
+        store.write().unwrap().register(held);
+        store.write().unwrap().register(unheld);
+        assert_eq!(
+            dispatch_bridge_verb(
+                "hold",
+                &format!("{held_sid} on reason=fabric-lost origin=fleet"),
+                None,
+                Scope::Bridge,
+                &store,
+            )
+            .as_deref(),
+            Some("OK hold=1\n"),
+        );
+
+        // The SESSION gate — the only one an aimed App verb used to pass — says
+        // the request may proceed, because the sid it NAMES is not the sid it
+        // would retire.
+        assert!(
+            crate::fabric::halt_refusal(&unheld_ctx, "tab").is_none(),
+            "the unheld window-mate is not itself held: this is precisely why the \
+             session gate is the wrong question for a verb that drives a window",
+        );
+        // The APP-lane gate — which the aimed forms now also ask — refuses it.
+        assert_eq!(
+            crate::fabric::app_halt_refusal(&store, "tab").as_deref(),
+            Some("ERR halted reason=fabric-lost origin=fleet\n"),
+        );
+        // `spawn` rides the SAME lane and is a NAMED residual of the halt set
+        // (`is_pty_reaching`'s doc: it MINTS a session rather than reaching one,
+        // and halting it would refuse a human's `aterm new-tab`). Widening the
+        // gate to the lane must not have swept it in.
+        assert!(is_aimed_app_verb("spawn"));
+        assert!(
+            crate::fabric::app_halt_refusal(&store, "spawn").is_none(),
+            "the gate asks `is_pty_reaching`, not `is this an aimed App verb`",
+        );
+
+        // ONE LITERAL, NOT TWO: every verb the lane routes to the resolver is a
+        // verb this gate asks about, over the whole shipped table.
+        for spec in aterm_types::control_verbs::VERBS {
+            let routed = aimed_app_lane(
+                spec.name,
+                Some(&Selector::Local(1)),
+                NativeControlPrincipal::Owner,
+            )
+            .is_some();
+            assert_eq!(
+                routed,
+                is_aimed_app_verb(spec.name),
+                "{}: the aimed lane and the gate that follows it must name the \
+                 same verbs",
+                spec.name,
+            );
+        }
+
+        // …and the gate really sits in the SESSION dispatch, after the session
+        // halt gate and before the arm that drives the hosting window. Reverting
+        // the gate leaves the two assertions above passing (they test `fabric`,
+        // which was always right) and this one failing, which is the one that
+        // says the dispatch consults it.
+        let production = include_str!("control.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("control.rs has a tests module");
+        let gate = production
+            .rfind("is_aimed_app_verb(verb)")
+            .expect("the aimed App-lane halt gate is in the session dispatch");
+        let session_gate = production
+            .find("crate::fabric::halt_refusal(ctx, verb)")
+            .expect("the session halt gate");
+        let aimed_tab_arm = production
+            .find("\"tab\" if is_cross =>")
+            .expect("the aimed tab dispatch arm");
+        assert!(
+            session_gate < gate && gate < aimed_tab_arm,
+            "the aimed App-lane halt gate belongs between the session halt gate \
+             and the arm that hands the request to the hosting window",
+        );
     }
 
     /// THE `fabric:` LEASE NAMESPACE IS THE BRIDGE CONNECTION'S (DESIGN §11.2).

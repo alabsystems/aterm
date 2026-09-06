@@ -628,7 +628,7 @@ impl AppRt for AppRtMacOS {
         // which is `-(void)(NSColor *)` and RETAINS it. The pool is the caller's
         // (the winit event loop's), which is why the borrow is sound.
         unsafe {
-            let make: unsafe extern "C" fn(
+            let make: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
                 aterm_objc::Sel,
                 f64,
@@ -952,7 +952,7 @@ impl AppRt for AppRtMacOS {
         // failed activation. `-activateWithOptions:` is
         // `-(BOOL)(NSApplicationActivationOptions)`, an `NSUInteger` bitmask.
         unsafe {
-            let find: unsafe extern "C" fn(
+            let find: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
                 aterm_objc::Sel,
                 libc::pid_t,
@@ -965,7 +965,7 @@ impl AppRt for AppRtMacOS {
             if app.is_null() {
                 return false;
             }
-            let activate: unsafe extern "C" fn(
+            let activate: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
                 aterm_objc::Sel,
                 usize,
@@ -1098,6 +1098,20 @@ pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<winit::window:
 /// dispatch, or on a suspicious age (negative beyond scheduler jitter, or > 2 s —
 /// clock skew / a synthesized or replayed event) the caller falls back to "now",
 /// which is exactly today's behaviour.
+/// The modifier state winit last DERIVED FROM AN EVENT for `window` — its own
+/// cache, which `update_modifiers` writes before it queues `ModifiersChanged`.
+/// For re-syncing after an `NSException` was contained inside a
+/// `flagsChanged:`-shaped row (see `App::note_objc_containments`): the cache
+/// is current while the app's copy may be one event behind. NOT a hardware
+/// probe: the class-level flags query on `NSEvent` is WindowServer-backed and
+/// banned tree-wide (tools/grep_guard.sh B9a) — the first cut of this hook
+/// reached for it and the guard caught it.
+#[cfg(target_os = "macos")]
+pub(crate) fn cached_modifiers(window: &winit::window::Window) -> winit::keyboard::ModifiersState {
+    use winit::platform::macos::WindowExtMacOS as _;
+    window.cached_modifiers()
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     use aterm_objc::{class, sel};
@@ -1738,8 +1752,10 @@ mod reduce_motion {
         // or immortal objects that are only borrowed here. Both prototypes are
         // `-(id)`, exactly as cast.
         unsafe {
-            let f: unsafe extern "C" fn(aterm_objc::ClassPtr, aterm_objc::Sel) -> aterm_objc::Id =
-                aterm_objc::msg();
+            let f: unsafe extern "C-unwind" fn(
+                aterm_objc::ClassPtr,
+                aterm_objc::Sel,
+            ) -> aterm_objc::Id = aterm_objc::msg();
             let ws = f(
                 aterm_objc::class(c"NSWorkspace"),
                 aterm_objc::sel!(sharedWorkspace),
@@ -1747,7 +1763,7 @@ mod reduce_motion {
             if ws.is_null() {
                 return aterm_objc::Id::NIL;
             }
-            let g: unsafe extern "C" fn(aterm_objc::Id, aterm_objc::Sel) -> aterm_objc::Id =
+            let g: unsafe extern "C-unwind" fn(aterm_objc::Id, aterm_objc::Sel) -> aterm_objc::Id =
                 aterm_objc::msg();
             g(ws, aterm_objc::sel!(notificationCenter))
         }
@@ -1777,7 +1793,7 @@ mod reduce_motion {
             // is one this class declares; `name` is a live +1 NSString the pool
             // outlives; nil `object` means "from any sender".
             unsafe {
-                let add: unsafe extern "C" fn(
+                let add: unsafe extern "C-unwind" fn(
                     aterm_objc::Id,
                     aterm_objc::Sel,
                     aterm_objc::Id,
@@ -1875,8 +1891,11 @@ mod reduce_motion {
             // SAFETY: `-removeObserver:` is `-(void)(id)`; `center` is the live
             // workspace centre and `target` a live observer registered on it.
             unsafe {
-                let f: unsafe extern "C" fn(aterm_objc::Id, aterm_objc::Sel, aterm_objc::Id) =
-                    aterm_objc::msg();
+                let f: unsafe extern "C-unwind" fn(
+                    aterm_objc::Id,
+                    aterm_objc::Sel,
+                    aterm_objc::Id,
+                ) = aterm_objc::msg();
                 f(center, aterm_objc::sel!(removeObserver:), target.as_id());
             }
         }
@@ -1891,7 +1910,7 @@ mod reduce_motion {
                 // `center` is live, `name` a live +1 NSString, nil sender is
                 // legal.
                 unsafe {
-                    let f: unsafe extern "C" fn(
+                    let f: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
                         aterm_objc::Sel,
                         aterm_objc::Id,
@@ -1947,7 +1966,7 @@ mod reduce_motion {
                 // has no `Encode` impl on purpose, because on the x86_64
                 // compat slice `BOOL` is `signed char` and only two of its 256
                 // values are valid `bool` bit patterns.
-                let responds: unsafe extern "C" fn(
+                let responds: unsafe extern "C-unwind" fn(
                     aterm_objc::Id,
                     aterm_objc::Sel,
                     aterm_objc::Sel,
@@ -2079,7 +2098,7 @@ mod layer_colorspace {
         // not `"@"` — which is exactly the distinction `ClassPtr`'s own newtype
         // exists to keep, and the reason this is not `send_bool_id`.
         unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
+            let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
                 aterm_objc::msg();
             f(obj, sel!(isKindOfClass:), metal).as_bool()
         }
@@ -2112,7 +2131,7 @@ mod layer_colorspace {
             if cs.is_null() {
                 return false;
             }
-            let set_cs: unsafe extern "C" fn(Id, Sel, *mut c_void) = aterm_objc::msg();
+            let set_cs: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = aterm_objc::msg();
             set_cs(layer, sel!(setColorspace:), cs);
             CGColorSpaceRelease(cs);
             true
@@ -2249,7 +2268,7 @@ mod layer_colorspace {
                 return None;
             }
             let n = appkit::send_usize(subs, sel!(count));
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
             for i in 0..n {
                 let l = at(subs, sel!(objectAtIndex:), i);
                 if is_metal_layer(l) {
@@ -2352,7 +2371,7 @@ mod vibrancy {
                 let r = f64::from((bg >> 16) & 0xff) / 255.0;
                 let g = f64::from((bg >> 8) & 0xff) / 255.0;
                 let b = f64::from(bg & 0xff) / 255.0;
-                let make: unsafe extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id =
+                let make: unsafe extern "C-unwind" fn(Id, Sel, f64, f64, f64, f64) -> Id =
                     aterm_objc::msg();
                 let color = make(
                     class(c"NSColor").as_id(),
@@ -2387,11 +2406,14 @@ mod vibrancy {
                 return;
             }
             let n = appkit::send_usize(subs, sel!(count));
-            let at: unsafe extern "C" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
+            let at: unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id = aterm_objc::msg();
             // `-isKindOfClass:` takes a CLASS, encoded `"#"` and not `"@"` —
             // hence the explicit prototype rather than `send_bool_id`.
-            let is_kind: unsafe extern "C" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
-                aterm_objc::msg();
+            let is_kind: unsafe extern "C-unwind" fn(
+                Id,
+                Sel,
+                aterm_objc::ClassPtr,
+            ) -> aterm_objc::Bool = aterm_objc::msg();
             let mut ours: Vec<Id> = Vec::new();
             for i in 0..n {
                 let sv = at(subs, sel!(objectAtIndex:), i);
@@ -2440,7 +2462,7 @@ mod vibrancy {
             appkit::send_v_isize(effect, sel!(setBlendingMode:), BLENDING_BEHIND_WINDOW);
             appkit::send_v_isize(effect, sel!(setState:), STATE_ACTIVE);
             appkit::send_v_usize(effect, sel!(setAutoresizingMask:), AUTORESIZE_WH);
-            let add: unsafe extern "C" fn(Id, Sel, Id, isize, Id) = aterm_objc::msg();
+            let add: unsafe extern "C-unwind" fn(Id, Sel, Id, isize, Id) = aterm_objc::msg();
             add(
                 content,
                 sel!(addSubview:positioned:relativeTo:),
@@ -2642,12 +2664,12 @@ pub(crate) fn disable_press_and_hold() {
         let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
             return;
         };
-        let boxed: unsafe extern "C" fn(Id, Sel, Bool) -> Id = aterm_objc::msg();
+        let boxed: unsafe extern "C-unwind" fn(Id, Sel, Bool) -> Id = aterm_objc::msg();
         let value = boxed(class(c"NSNumber").as_id(), sel!(numberWithBool:), Bool::NO);
         if value.is_null() {
             return;
         }
-        let dict: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id = aterm_objc::msg();
+        let dict: unsafe extern "C-unwind" fn(Id, Sel, Id, Id) -> Id = aterm_objc::msg();
         let defaults = dict(
             class(c"NSDictionary").as_id(),
             sel!(dictionaryWithObject:forKey:),

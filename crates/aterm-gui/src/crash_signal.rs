@@ -295,7 +295,17 @@ mod imp {
                 // SA_RESTART so syscalls we trap *out of* are restarted where
                 // possible. SA_NODEFER is intentionally NOT set, so the signal
                 // stays masked while our handler runs.
-                act.sa_flags = libc::SA_RESTART;
+                // SA_ONSTACK: a SIGSEGV from a STACK OVERFLOW arrives with no
+                // stack to run a handler on; without the alternate stack the
+                // handler itself faults and the process dies silently — no
+                // banner, no marker, no "closed unexpectedly" on the next
+                // launch. Rust's runtime installs a sigaltstack on the main
+                // thread and on every std::thread at start (that is how its own
+                // "has overflowed its stack" message works), and replacing its
+                // SIGSEGV/SIGBUS handler here does not remove those stacks, so
+                // the flag is all it takes to reuse them. Found by the
+                // 2026-09-02 abort audit.
+                act.sa_flags = libc::SA_RESTART | libc::SA_ONSTACK;
                 libc::sigemptyset(&mut act.sa_mask);
                 libc::sigaction(sig, &act, std::ptr::null_mut());
             }

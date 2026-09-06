@@ -370,12 +370,21 @@ macro_rules! block_ctor {
             /// `Encode` impl, deliberately) and a packed struct whose
             /// System V x86-64 classification nobody has stated. This is the
             /// crate's rule applied at the LAST place that was exempt from it.
+            ///
+            /// # The `InertZero` bound
+            ///
+            /// An `NSException` raised inside the closure is CONTAINED at the
+            /// block's `invoke` — reported against `"block invoke"` through
+            /// [`crate::exception`] — and the block answers its return
+            /// type's all-zero value, which [`crate::InertZero`] is the promise
+            /// is the inert one (`nil`, `NO`, `0`, `()`). A Rust panic still
+            /// aborts with a name, as before.
             #[must_use]
             pub unsafe fn $ctor<$($A,)* R, F>(closure: F) -> Option<Self>
             where
                 F: Fn($($A),*) -> R + 'static,
                 $($A: $crate::Encode,)*
-                R: $crate::Encode,
+                R: $crate::Encode + $crate::InertZero,
             {
                 /// The stack block: the fixed header, then the closure.
                 #[repr(C)]
@@ -391,7 +400,12 @@ macro_rules! block_ctor {
                 // `R`, so the bound bought nothing and cost every block whose
                 // return type has no `Default` — an `Option<T>` for a `T` that
                 // is not `Default`, a `Retained<T>`, a bare `Id` newtype.
-                unsafe extern "C" fn $invoke<$($A,)* R, F: Fn($($A),*) -> R>(
+                //
+                // The same measured order as `declare_class!`'s trampoline:
+                // `catch_unwind` OUTSIDE (a Rust panic aborts with a name),
+                // the Objective-C `@try` INSIDE (an `NSException` is
+                // contained, reported, and answered with the inert zero).
+                unsafe extern "C" fn $invoke<$($A,)* R: crate::InertZero, F: Fn($($A),*) -> R>(
                     block: *mut c_void,
                     $($arg: $A),*
                 ) -> R {
@@ -400,7 +414,15 @@ macro_rules! block_ctor {
                     // in a `Blk<F>` of exactly this `F`.
                     let closure = unsafe { &(*block.cast::<Blk<F>>()).closure };
                     let guard = ::std::panic::catch_unwind(
-                        ::std::panic::AssertUnwindSafe(move || closure($($arg),*)),
+                        ::std::panic::AssertUnwindSafe(move || {
+                            match crate::exception::contain(
+                                "block invoke",
+                                move || closure($($arg),*),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => crate::exception::inert::<R>(),
+                            }
+                        }),
                     );
                     match guard {
                         Ok(v) => v,

@@ -487,6 +487,15 @@ impl Worker {
         let join = std::thread::Builder::new()
             .name("aterm-title-summary".to_string())
             .spawn(move || {
+                // QoS (port of 61a6c8b62): a smart tab title is cosmetic, and
+                // earning one is expensive: LLM inference plus `lsof`/`codesign`
+                // subprocess attestation of the managed server. At the default
+                // QoS all of that competes with the UI thread for P-cores, so on
+                // a saturated machine the user pays keystroke latency to have a
+                // tab label rewritten. Nothing blocks on this thread — the title
+                // simply lands later. (The `term` observation that FEEDS it runs
+                // on the UI thread under `try_lock`; this worker never takes it.)
+                crate::qos::set_self(crate::qos::Role::Background);
                 worker_loop(request_rx, result_tx, proxy, authority_epoch, worker_ollama);
             })?;
         Ok(Self {
@@ -917,7 +926,9 @@ impl Coordinator {
                         // deterministic description remains visible and is never replaced
                         // with provider diagnostics.
                         if entry.last_error.as_deref() != Some(error.as_str()) {
-                            eprintln!("aterm-gui: smart title provider: {error}");
+                            crate::logging::stderr_line!(
+                                "aterm-gui: smart title provider: {error}"
+                            );
                             entry.last_error = Some(error.clone());
                         }
                         entry.failure_count = entry.failure_count.saturating_add(1);
@@ -4459,7 +4470,7 @@ mod tests {
             // The marker the stager asserts on. Without it, a child spawn
             // whose `--exact` filter matched nothing would run zero tests,
             // exit 0, and turn this whole proof vacuous.
-            eprintln!("ATERM-ENV-TEST: child ran its assertions");
+            crate::logging::stderr_line!("ATERM-ENV-TEST: child ran its assertions");
             // …and the minimal set really did arrive.
             assert_eq!(
                 std::env::var_os("OLLAMA_NOHISTORY").as_deref(),
@@ -4508,7 +4519,7 @@ mod tests {
                 "the child exited 0 without running its assertions — the \
                  `--exact` filter matched nothing and the proof was vacuous:\n{child_err}"
             );
-            eprintln!("ATERM-ENV-TEST: stager spawned and verified the child");
+            crate::logging::stderr_line!("ATERM-ENV-TEST: stager spawned and verified the child");
             return;
         }
 
@@ -4689,7 +4700,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         match observed {
             Some(pid) => assert_eq!(pid, std::process::id()),
             None => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "title_summary: NOT RUN — `/usr/sbin/lsof` did not answer within \
                      the production budget in {ATTEMPTS} attempts, so the connected \
                      socket's owner was NOT attributed and NOTHING about \
@@ -4812,7 +4823,7 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             crate::app_config::EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT
         );
         assert!(!outcome.activity.trim().is_empty());
-        eprintln!("attested Ollama activity: {}", outcome.activity);
+        crate::logging::stderr_line!("attested Ollama activity: {}", outcome.activity);
     }
 
     #[cfg(target_os = "macos")]
@@ -4936,6 +4947,89 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
         // failure. This bound has already crossed under full-suite load elsewhere
         // in this repo (cb8c0cff, c1281c6a).
         assert!(start.elapsed() < Duration::from_secs(30));
+
+        // The runner puts the child in its OWN process group (port of 61a6c8b62:
+        // `process_group(0)` = POSIX_SPAWN_SETPGROUP) so the deadline kill is
+        // `kill(-pid)` and reaches the whole tree. Pin PGID == PID from inside
+        // the child, because the `timed out` assertions above hold even if the
+        // group kill silently stopped applying (the runner deliberately never
+        // joins the reader, so a surviving grandchild is invisible to them).
+        // Both probes report through a file: the output struct's fields are
+        // private to the runner's module, and the timeout path returns none.
+        let probe_file = std::env::temp_dir().join(format!(
+            "aterm-title-group-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&probe_file);
+        let script = format!(
+            "echo $$ > '{0}'; ps -o pgid= -p $$ >> '{0}'",
+            probe_file.display()
+        );
+        run_command_bounded(
+            std::process::Command::new("/bin/sh").args(["-c", &script]),
+            Duration::from_secs(10),
+            0,
+            "test helper group",
+        )
+        .unwrap();
+        let probe = std::fs::read_to_string(&probe_file).unwrap();
+        let _ = std::fs::remove_file(&probe_file);
+        let mut lines = probe.lines().map(str::trim);
+        let child_pid = lines.next().unwrap();
+        let child_pgid = lines.next().unwrap();
+        assert!(!child_pid.is_empty());
+        assert_eq!(
+            child_pid, child_pgid,
+            "the child must lead its own process group"
+        );
+
+        // And prove the kill REACHES a re-parented grandchild: `sleep` is
+        // backgrounded (same group — a non-interactive `sh -c` has no job
+        // control) and outlives its parent, so after the runner gives up it is
+        // only the group kill that can have taken it down. The pid travels via
+        // a file because the runner does not return output on the timeout path.
+        // The sleep is far longer than the poll window below, so a survivor
+        // cannot exit on its own and fake the pass (a regression leaks one idle
+        // `sleep`, which is harmless).
+        let pid_file = std::env::temp_dir().join(format!(
+            "aterm-title-group-kill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let script = format!("sleep 600 & echo $! > '{}'; wait", pid_file.display());
+        let escaped = run_command_bounded(
+            std::process::Command::new("/bin/sh").args(["-c", &script]),
+            Duration::from_secs(2),
+            128,
+            "test helper escaped grandchild",
+        )
+        .unwrap_err();
+        assert!(escaped.contains("timed out"));
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("the shell wrote the grandchild pid before the deadline")
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pid_file);
+        assert!(grandchild > 1);
+        let gone_by = Instant::now() + Duration::from_secs(30);
+        loop {
+            // SAFETY: signal 0 delivers nothing; it only asks whether `grandchild`
+            // still names a process we may signal.
+            let alive = unsafe { libc::kill(grandchild, 0) } == 0;
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if !alive {
+                assert_eq!(errno, Some(libc::ESRCH));
+                break;
+            }
+            assert!(
+                Instant::now() < gone_by,
+                "grandchild {grandchild} survived the group kill: `sleep 600` outlived the runner"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         let oversized = run_command_bounded(
             std::process::Command::new("/bin/sh").args(["-c", "printf '%02048d' 0"]),

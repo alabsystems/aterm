@@ -33830,8 +33830,13 @@ enabled = true
             3,
             "the riff is pushed from exactly the two known render paths"
         );
+        // W13: the macOS site was `objc2_app_kit::NSBeep()` and is now
+        // `appkit::beep()` — the first-party binding of the SAME AppKit
+        // function. The scan is for the CALL, not for the crate that used to
+        // provide it, so it survives the next rename of the provider and would
+        // still fail if the emission itself were removed.
         assert!(
-            host.contains("objc2_app_kit::NSBeep()") && host.contains("win32::beep()"),
+            host.contains("crate::appkit::beep()") && host.contains("win32::beep()"),
             "the audible bel emission sites moved; re-locate their gate"
         );
 

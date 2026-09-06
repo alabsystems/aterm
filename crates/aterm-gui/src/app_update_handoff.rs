@@ -4607,6 +4607,11 @@ impl App {
                     let spawned = std::thread::Builder::new()
                         .name("aterm-handoff-emergency-reaper".to_string())
                         .spawn(move || {
+                            // QoS (port of 61a6c8b62): a REAPER is `Background`,
+                            // never `Housekeeping` — it enforces a kill-and-reap
+                            // deadline, and a starved reaper leaks the process
+                            // whose CPU use is the problem (see `qos::Role`).
+                            crate::qos::set_self(crate::qos::Role::Background);
                             emergency_reap_and_report(
                                 child_pid,
                                 attempt_id,

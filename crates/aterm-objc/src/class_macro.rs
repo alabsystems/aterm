@@ -34,6 +34,65 @@ macro_rules! __aterm_objc_ret {
     };
 }
 
+/// A selector's token stream as the ONE string the runtime knows it by —
+/// `@sel(toolbar:itemForItemIdentifier:)` becomes
+/// `"toolbar:itemForItemIdentifier:"` — spelled exactly as [`crate::sel!`]
+/// spells it, so a containment report names the selector, not the Rust `fn`.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aterm_objc_sel_str {
+    ($($tok:tt)+) => {
+        ::core::concat!($(::core::stringify!($tok)),+)
+    };
+}
+
+/// The body of a declared method's trampoline, by containment policy.
+///
+/// Two arms, chosen by the marker written after `@sel(…)`:
+///
+/// * none — the default: the call runs under [`crate::exception::contain`],
+///   an `NSException` raised inside it is reported against the selector and
+///   the trampoline answers [`crate::exception::inert`] — the all-zero value,
+///   which for every type this crate crosses the C ABI with means "nothing
+///   happened". The return type must be [`crate::InertZero`].
+/// * `@abort_on_exception` — the call runs bare: an `NSException` reaches the
+///   `catch_unwind` outside, which Rust cannot catch, and the process aborts
+///   exactly as it did before containment existed. For a selector whose zero
+///   is a real answer rather than an inert one, or a return type with no
+///   inert zero.
+///
+/// Any other marker is a compile error naming the two that exist.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __aterm_objc_method_call {
+    ([] $name:ident :: $method:ident, [$($sel_tok:tt)+], $slf:ident, [$($ret:ty)?], ($($arg:ident),*)) => {
+        match $crate::exception::contain(
+            $crate::__aterm_objc_sel_str!($($sel_tok)+),
+            move || $name::$method($slf $(, $arg)*),
+        ) {
+            ::core::result::Result::Ok(__v) => __v,
+            ::core::result::Result::Err(_) => {
+                $crate::exception::inert::<$crate::__aterm_objc_ret!($($ret)?)>()
+            }
+        }
+    };
+    ([abort_on_exception] $name:ident :: $method:ident, [$($sel_tok:tt)+], $slf:ident, [$($ret:ty)?], ($($arg:ident),*)) => {
+        $name::$method($slf $(, $arg)*)
+    };
+    ([$other:ident] $name:ident :: $method:ident, [$($sel_tok:tt)+], $slf:ident, [$($ret:ty)?], ($($arg:ident),*)) => {
+        ::core::compile_error!(::core::concat!(
+            "aterm-objc: `@",
+            ::core::stringify!($other),
+            "` after @sel(",
+            $crate::__aterm_objc_sel_str!($($sel_tok)+),
+            ") is not a containment policy — the only marker is \
+             `@abort_on_exception` (keep the abort for a method whose zero \
+             return is not inert); write nothing for the default, which \
+             contains an NSException and returns the inert zero",
+        ))
+    };
+}
+
 /// Count the `:` tokens in a selector's token stream.
 ///
 /// The arity of an Objective-C selector IS its colon count, and the runtime
@@ -95,8 +154,14 @@ macro_rules! __aterm_objc_count {
 ///   unconditionally, because that is the ONLY thing any of the seven real
 ///   sites needs from `dealloc`.
 /// * One `extern "C"` trampoline per `@sel(…)` method, each with the correct
-///   Objective-C type encoding and each wrapped in a panic guard, because
-///   unwinding out of an ObjC frame is undefined behaviour.
+///   Objective-C type encoding, each wrapped in a panic guard (unwinding out
+///   of an ObjC frame is undefined behaviour, so a Rust panic aborts with the
+///   method's name), and each CONTAINING an `NSException` raised inside it —
+///   the exception is reported against the selector through
+///   [`crate::exception`], every Rust `Drop` on the unwound frames runs, and
+///   the method answers the inert zero of its return type. A method whose
+///   zero is not inert writes `@abort_on_exception` after its `@sel(…)` and
+///   keeps the abort; `-dealloc` always keeps it.
 ///
 /// # Divergences from objc2, and why
 ///
@@ -262,6 +327,7 @@ macro_rules! declare_class {
             $(
                 $(#[$mmeta:meta])*
                 @sel($($sel_tok:tt)+)
+                $(@$policy:ident)?
                 fn $method:ident(& $slf:ident $(, $arg:ident : $argty:ty)* $(,)?) $(-> $ret:ty)? $body:block
             )*
         }
@@ -321,6 +387,13 @@ macro_rules! declare_class {
                     $($( __b.add_protocol($crate::cstr!(::core::stringify!($proto))); )*)?
 
                     // -dealloc: drop the Rust ivars, then [super dealloc].
+                    //
+                    // NOT CONTAINED, by design: an `NSException` out of the
+                    // ivar drop or `[super dealloc]` reaches the guard below,
+                    // which Rust cannot catch, and the process aborts. A
+                    // half-deallocated object is not a state to continue
+                    // from. (The super send is `"C-unwind"` like every other,
+                    // so the frames above it still run their drops first.)
                     {
                         unsafe extern "C" fn __dealloc(__this: $crate::Id, _cmd: $crate::Sel) {
                             let __guard = ::std::panic::catch_unwind(
@@ -434,6 +507,17 @@ macro_rules! declare_class {
                                 ),
                             )
                         };
+                        // THE ORDER IS MEASURED: `catch_unwind` OUTSIDE,
+                        // the Objective-C `@try` INSIDE. A Rust panic is not
+                        // swallowed by `@catch (id)` — it runs its drops,
+                        // crosses the wrapper, and lands on the outer guard,
+                        // so the abort-on-panic policy and its exact message
+                        // survive. An `NSException` is caught by the inner
+                        // wrapper, after every Rust `Drop` between the raise
+                        // and this frame has run, and the method answers its
+                        // inert zero (or, under `@abort_on_exception`, the
+                        // exception reaches the outer guard and aborts as it
+                        // always did). See `crate::exception`.
                         unsafe extern "C" fn __tramp(
                             __this: $crate::Id,
                             _cmd: $crate::Sel,
@@ -454,7 +538,13 @@ macro_rules! declare_class {
                                     // the reference borrows no bytes of its own.
                                     let __self: &$name =
                                         unsafe { &*__this.cast::<$name>().cast_const() };
-                                    $name::$method(__self $(, $arg)*)
+                                    $crate::__aterm_objc_method_call!(
+                                        [$($policy)?] $name::$method,
+                                        [$($sel_tok)+],
+                                        __self,
+                                        [$($ret)?],
+                                        ($($arg),*)
+                                    )
                                 }),
                             );
                             match __guard {
@@ -467,7 +557,8 @@ macro_rules! declare_class {
                         // SAFETY: `__tramp` is `extern "C"` with the
                         // `(id, SEL, ..)` prototype the runtime calls, its
                         // encoding is derived from those same Rust types, and
-                        // it cannot unwind (the guard above aborts instead).
+                        // it cannot unwind: a Rust panic aborts at the guard
+                        // above, and an NSException is contained inside it.
                         unsafe {
                             __b.add_method(
                                 $crate::sel!($($sel_tok)+),
@@ -575,7 +666,7 @@ macro_rules! declare_class {
                 // therefore unwritten, which is exactly `IvarSlot::init`'s
                 // precondition.
                 unsafe {
-                    let __alloc: unsafe extern "C" fn(
+                    let __alloc: unsafe extern "C-unwind" fn(
                         $crate::ClassPtr,
                         $crate::Sel,
                     ) -> $crate::Id = $crate::msg();
@@ -613,7 +704,7 @@ macro_rules! declare_class {
                     if __raw.is_null() {
                         return ::core::option::Option::None;
                     }
-                    let __init: unsafe extern "C" fn(
+                    let __init: unsafe extern "C-unwind" fn(
                         $crate::Id,
                         $crate::Sel,
                     ) -> $crate::Id = $crate::msg();

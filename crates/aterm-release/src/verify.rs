@@ -917,11 +917,55 @@ pub fn post_publish(
         }
     };
 
+    // THE EVERGREEN POINTER — what a credential-less updater actually discovers by. The
+    // web-lane client HEADs `releases/latest/download/aterm-appcast.toml`, refuses the
+    // redirect, and fetches nothing unless the tag it names moved; a release the pointer
+    // does not name is invisible to every install with no token, however correct its
+    // assets. Read anonymously with the client's own strict parse. On a PRIVATE repo the
+    // pointer answers 404 by GitHub design (the fleet reads such a channel over the
+    // token lane), so there it degrades to a note like the DMG HEAD above; the rehearsal
+    // scratch repo skips it outright.
+    let pointer_note = if api_dmg_check {
+        "pointer skipped (scratch repo)".to_string()
+    } else {
+        match publish::probe_evergreen_pointer(
+            slug,
+            manifest_out::MANIFEST_ASSET,
+            &aterm_update_core::pointer::canonical_app_tag,
+        )? {
+            publish::PointerProbe::Tag { tag: pointed, .. } if pointed == tag => {
+                format!("evergreen pointer → {tag}")
+            }
+            publish::PointerProbe::Tag { tag: pointed, .. } => {
+                return Err(Error::new(format!(
+                    "https://github.com/{slug}/releases/latest/download/{} names {pointed}, \
+                     not {tag} — every credential-less install discovers the channel head \
+                     from that pointer and would never see {tag}; make it the latest release \
+                     (`gh release edit {tag} -R {slug} --latest`)",
+                    manifest_out::MANIFEST_ASSET
+                )));
+            }
+            publish::PointerProbe::NoRelease if repo_is_private(slug)? => {
+                "evergreen pointer unreadable anonymously (private repo — the fleet reads \
+                 this channel over the token lane)"
+                    .to_string()
+            }
+            other => {
+                return Err(Error::new(format!(
+                    "https://github.com/{slug}/releases/latest/download/{} does not resolve \
+                     to a release this public channel's clients would accept ({other:?}) — \
+                     the web-lane updater would never see {tag}",
+                    manifest_out::MANIFEST_ASSET
+                )));
+            }
+        }
+    };
+
     step(
         "verify",
         &format!(
             "live scan selects {tag} build {} · {byte_note} · {signature_note} · {dmg_note} · \
-             {zip_note}",
+             {zip_note} · {pointer_note}",
             best.build
         ),
     );

@@ -3626,7 +3626,7 @@ impl Config {
             return loaded;
         };
         if paths.len() > MAX_ACTIVE_TOY_PACKS {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: sparkle_words.toy_packs lists {} paths; only the first \
                  {MAX_ACTIVE_TOY_PACKS} are active",
                 paths.len()
@@ -3641,7 +3641,7 @@ impl Config {
             let source = match source {
                 Ok(source) => source,
                 Err(error) => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: sparkle_words.toy_packs[{index}] {expanded:?} \
                          unreadable ({error}); skipping"
                     );
@@ -3651,7 +3651,7 @@ impl Config {
             let pack = match aterm_effects::spec::compile_toy_pack_toml(&source) {
                 Ok(pack) => pack,
                 Err(error) => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: sparkle_words.toy_packs[{index}] {expanded:?} \
                          invalid ({error}); skipping"
                     );
@@ -3990,13 +3990,13 @@ impl Config {
                 override_toml.as_deref(),
             )
             .unwrap_or_else(|error| {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: sparkle words lexicon override rejected ({error}); using builtin"
                 );
                 aterm_lexicon::Lexicon::with_languages(&refs)
             });
             for warning in sparkle_logged_warnings(lexicon.conflicts(), cfg.cjk_single_char) {
-                eprintln!("aterm-gui: sparkle_words lexicon: {warning}");
+                crate::logging::stderr_line!("aterm-gui: sparkle_words lexicon: {warning}");
             }
             crate::word_decorations::Resolved {
                 cfg,
@@ -4292,14 +4292,14 @@ impl Config {
                                 out.push('\n');
                             }
                         }
-                        Err(e) => eprintln!(
+                        Err(e) => crate::logging::stderr_line!(
                             "aterm-gui: sparkle_words.lexicon {expanded:?} rejected ({e}); \
                              skipping that layer"
                         ),
                     }
                 }
                 Err(error) => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: sparkle_words.lexicon {expanded:?} unreadable ({error}); \
                          skipping that layer"
                     );
@@ -4967,7 +4967,7 @@ impl Config {
                 aterm_render::TextBlending::LinearCorrected
             }
             Some(other) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: unknown text_blending {other:?} (expected \"linear\" or \
                      \"linear-corrected\"); using linear-corrected"
                 );
@@ -5160,7 +5160,7 @@ impl Config {
         match self.background_material.as_deref() {
             None => BackgroundMaterial::None,
             Some(s) => BackgroundMaterial::parse(s).unwrap_or_else(|| {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: config background_material: expected none|hud|sidebar|\
                      under-window, got {s:?}; using none"
                 );
@@ -5295,7 +5295,7 @@ impl Config {
             Some(s) => match WindowTheme::parse(s) {
                 Some(t) => t,
                 None => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: config window_theme: expected auto|light|dark, got {s:?}; using auto"
                     );
                     WindowTheme::Auto
@@ -5315,7 +5315,7 @@ impl Config {
             Some(s) => match RightClickGesture::parse(s) {
                 Some(g) => g,
                 None => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: config right_click: expected copy_paste|off, got {s:?}; using the platform default"
                     );
                     RightClickGesture::PLATFORM_DEFAULT
@@ -5341,7 +5341,7 @@ impl Config {
             Some(s) => match TabMenuChord::parse(s) {
                 Some(g) => g,
                 None => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: config tab_menu_chord: expected on|menu_key|off, got {s:?}; using on"
                     );
                     TabMenuChord::On
@@ -5361,7 +5361,7 @@ impl Config {
             Some(s) => match WindowColorspace::parse(s) {
                 Some(c) => c,
                 None => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: config window_colorspace: expected srgb|display-p3, got {s:?}; using srgb"
                     );
                     WindowColorspace::Srgb
@@ -5381,7 +5381,7 @@ impl Config {
             Some(s) => match TabBandHeight::parse(s) {
                 Some(h) => h,
                 None => {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: config tab_band_height: expected compact|standard, got {s:?}; using the platform default"
                     );
                     TabBandHeight::PLATFORM_DEFAULT
@@ -5837,7 +5837,7 @@ fn warn_deprecated_font_env_aliases_once() {
             ("ATERM_EMOJI_FONT", "emoji_font"),
         ] {
             if std::env::var_os(var).is_some() {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: ${var} is deprecated; set `{key}` in aterm.toml instead \
                      (an explicit config entry outranks the env alias)"
                 );
@@ -5871,7 +5871,7 @@ fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
                 .is_some_and(|key| key.trim() == crate::prefs::LEGACY_EDIT_DISPLAY_FONT)
         });
         if legacy_key {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: `{legacy}` is deprecated; rename it to `{current}` \
                  (the old key still works — the faces are now named for the \
                  letterform rather than a game)",
@@ -5889,12 +5889,12 @@ fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
                 .iter()
                 .find(|(legacy, _)| *legacy == id)
             {
-                Some((_, Some(current))) => eprintln!(
+                Some((_, Some(current))) => crate::logging::stderr_line!(
                     "aterm-gui: `{key} = \"{id}\"` is deprecated; write \"{current}\" \
                      instead (same face, named for its letterform)",
                     key = crate::prefs::EDIT_DISPLAY_FONT,
                 ),
-                Some((_, None)) => eprintln!(
+                Some((_, None)) => crate::logging::stderr_line!(
                     "aterm-gui: `{key} = \"{id}\"` names a face aterm no longer ships \
                      — it carried no redistribution licence and has no substitute; \
                      your primary font is used instead",
@@ -5916,7 +5916,7 @@ fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
 fn warn_background_opacity_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: background_opacity < 1.0 requests translucent glass, but the \
              CPU (softbuffer) renderer has no translucent present path; the window \
              renders solid (use the GPU backend for real vibrancy; the raised contrast \
@@ -5944,7 +5944,7 @@ fn warn_background_opacity_unimplemented_once() {
 fn warn_background_material_unimplemented_once() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: background_material selects a window-level vibrancy blur \
              (NSVisualEffectView), but the CPU (softbuffer) renderer cannot composite \
              over it; the setting has no effect on the CPU backend (use the GPU backend)"
@@ -6482,7 +6482,7 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
         // AUTORELEASED rep, alive for this pool; `-pixelsWide`/`-pixelsHigh`
         // are `-(NSInteger)`.
         unsafe {
-            let data_with: unsafe extern "C" fn(Id, Sel, *const c_void, usize) -> Id =
+            let data_with: unsafe extern "C-unwind" fn(Id, Sel, *const c_void, usize) -> Id =
                 aterm_objc::msg();
             let data = data_with(
                 class(c"NSData").as_id(),
@@ -6522,7 +6522,7 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
             if srgb.is_null() {
                 return Err("could not convert the image to sRGB".to_string());
             }
-            let convert: unsafe extern "C" fn(Id, Sel, Id, isize) -> Id = aterm_objc::msg();
+            let convert: unsafe extern "C-unwind" fn(Id, Sel, Id, isize) -> Id = aterm_objc::msg();
             let rep = convert(
                 rep,
                 sel!(bitmapImageRepByConvertingToColorSpace:renderingIntent:),
@@ -6539,7 +6539,8 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
             // properties dictionary is `+dictionary`, which is nil-free and
             // autoreleased.
             let properties = appkit::send_id(class(c"NSDictionary").as_id(), sel!(dictionary));
-            let representation: unsafe extern "C" fn(Id, Sel, usize, Id) -> Id = aterm_objc::msg();
+            let representation: unsafe extern "C-unwind" fn(Id, Sel, usize, Id) -> Id =
+                aterm_objc::msg();
             let png = representation(
                 rep,
                 sel!(representationUsingType:properties:),
@@ -6555,7 +6556,7 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
             let png_len = appkit::send_usize(png, sel!(length));
             let mut png_bytes = vec![0_u8; png_len];
             if png_len != 0 {
-                let get_bytes: unsafe extern "C" fn(Id, Sel, *mut c_void, usize) =
+                let get_bytes: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void, usize) =
                     aterm_objc::msg();
                 get_bytes(
                     png,
@@ -6814,7 +6815,9 @@ impl Config {
                     CursorStyle::SteadyBlock
                 }
             } else if cursor_style.eq_ignore_ascii_case("underline") {
-                eprintln!("aterm-gui: config cursor_style \"underline\" is retired; using \"bar\"");
+                crate::logging::stderr_line!(
+                    "aterm-gui: config cursor_style \"underline\" is retired; using \"bar\""
+                );
                 if blink {
                     CursorStyle::BlinkingBar
                 } else {
@@ -6829,7 +6832,7 @@ impl Config {
                     CursorStyle::SteadyBar
                 }
             } else {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: config cursor_style: expected block|bar, got {cursor_style:?}"
                 );
                 if blink {
@@ -6853,7 +6856,7 @@ impl Config {
                 match themes.resolve(&name) {
                     Ok(_) => {}
                     Err(error) => {
-                        eprintln!(
+                        crate::logging::stderr_line!(
                             "aterm-gui: config theme: {name:?} does not resolve ({error}); using Default"
                         );
                     }
@@ -6888,7 +6891,9 @@ impl Config {
                         }
                         any = true;
                     }
-                    None => eprintln!("aterm-gui: config {key}: expected #RRGGBB, got {s:?}"),
+                    None => crate::logging::stderr_line!(
+                        "aterm-gui: config {key}: expected #RRGGBB, got {s:?}"
+                    ),
                 }
             }
         }
@@ -6902,7 +6907,9 @@ impl Config {
                     any = true;
                 }
                 None => {
-                    eprintln!("aterm-gui: config selection_color: expected #RRGGBB, got {s:?}")
+                    crate::logging::stderr_line!(
+                        "aterm-gui: config selection_color: expected #RRGGBB, got {s:?}"
+                    )
                 }
             }
         }
@@ -6916,7 +6923,9 @@ impl Config {
                     any = true;
                 }
                 None => {
-                    eprintln!("aterm-gui: config selection_foreground: expected #RRGGBB, got {s:?}")
+                    crate::logging::stderr_line!(
+                        "aterm-gui: config selection_foreground: expected #RRGGBB, got {s:?}"
+                    )
                 }
             }
         }
@@ -6933,7 +6942,9 @@ impl Config {
                         ok = true;
                     }
                     None => {
-                        eprintln!("aterm-gui: config palette[{i}]: expected #RRGGBB, got {hex:?}")
+                        crate::logging::stderr_line!(
+                            "aterm-gui: config palette[{i}]: expected #RRGGBB, got {hex:?}"
+                        )
                     }
                 }
             }
@@ -6951,7 +6962,7 @@ impl Config {
                 "disabled" | "off" => tc.bidi.mode = BiDiMode::Disabled,
                 "implicit" | "on" => tc.bidi.mode = BiDiMode::Implicit,
                 "explicit" => tc.bidi.mode = BiDiMode::Explicit,
-                other => eprintln!(
+                other => crate::logging::stderr_line!(
                     "aterm-gui: config bidi: expected implicit|disabled|explicit, got {other:?}"
                 ),
             }
@@ -6962,7 +6973,7 @@ impl Config {
             match w.trim().to_ascii_lowercase().as_str() {
                 "narrow" | "single" => tc.ambiguous_width_double = false,
                 "wide" | "double" => tc.ambiguous_width_double = true,
-                other => eprintln!(
+                other => crate::logging::stderr_line!(
                     "aterm-gui: config ambiguous_width: expected narrow|wide, got {other:?}"
                 ),
             }
@@ -7206,7 +7217,7 @@ pub(crate) fn load_config() -> Config {
         match crate::native_config_service::VersionedConfigService::observe_path(&path, true) {
             Ok(observation) => observation,
             Err(error) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: ignoring unreadable config {}: {error}",
                     path.display()
                 );
@@ -7214,7 +7225,7 @@ pub(crate) fn load_config() -> Config {
             }
         };
     let config: Config = aterm_toml::from_str(&observation.text).unwrap_or_else(|e| {
-        eprintln!("aterm-gui: ignoring invalid config {}: {e}", path.display());
+        crate::logging::stderr_line!("aterm-gui: ignoring invalid config {}: {e}", path.display());
         Config::default()
     });
     warn_deprecated_display_font_spelling(&observation.text, &config);
@@ -8792,7 +8803,9 @@ impl App {
                 .backend
                 .rebuild_font_from_admitted(self.font_px, self.theme)
             {
-                eprintln!("aterm-gui: resident font generation rebuild failed: {error}");
+                crate::logging::stderr_line!(
+                    "aterm-gui: resident font generation rebuild failed: {error}"
+                );
                 return false;
             }
         }
@@ -10011,7 +10024,7 @@ impl App {
         let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns);
         warns.extend(unaccepted);
         for w in &warns {
-            eprintln!("aterm-gui: {w}");
+            crate::logging::stderr_line!("aterm-gui: {w}");
         }
         // Surface dropped rules / restart notices in-window. A fresh (possibly `None`)
         // notice also CLEARS a stale banner once the config is fixed; repaint to reflect.
@@ -10760,7 +10773,7 @@ impl App {
             .filter(|t| aterm_types::text_shaping::FontFeature::parse_token(t).is_none())
             .collect();
         if !rejected.is_empty() {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: config font_features: ignored unparseable token(s) {rejected:?} \
                  (use a 1–4 char tag; optional +/- prefix or tag=value)"
             );
@@ -10773,7 +10786,7 @@ impl App {
                 .iter()
                 .map(|t| String::from_utf8_lossy(t).trim_end().to_string())
                 .collect();
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: config font_features: the active font does not provide {tags:?}; \
                  those have no effect (choose a font that carries these OpenType features)"
             );
@@ -14034,7 +14047,7 @@ mod tab_band_height_tests {
         let Some(renderer) =
             aterm_render::Renderer::from_system(crate::FONT_PX, aterm_render::Theme::default())
         else {
-            eprintln!("SKIP: no system monospace font");
+            crate::logging::stderr_line!("SKIP: no system monospace font");
             return;
         };
         let target = TabBandHeight::Standard.target_logical_px();
@@ -14055,7 +14068,7 @@ mod tab_band_height_tests {
             let pad_top = crate::logical_to_device_px(pad_logical, scale);
             let head = synthetic_band_head_px(target, pad_top, 1, cell_h, scale);
             let band = head + pad_top + cell_h;
-            eprintln!(
+            crate::logging::stderr_line!(
                 "C3 band at scale {scale}: font_px={px} cell_h={cell_h} pad_top={pad_top} \
                  before={} head={head} band={band}",
                 pad_top + cell_h

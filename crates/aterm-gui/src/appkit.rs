@@ -34,65 +34,60 @@
 //! that goes through it, because winit's 358 sites will pay whichever of the
 //! two shapes that port chooses.
 //!
-//! # WHAT IS STILL ON `objc2`, AND WHY — the inventory, not a gesture
+//! # WHAT IS STILL ON `objc2` IN THIS CRATE: NOTHING — and this is what the
+//! inventory that stood here used to say
 //!
-//! W2 moved all six remaining `declare_class!` sites and eight whole files.
-//! What is left is listed here rather than left to be discovered, because a
-//! seam nobody wrote down is indistinguishable from an oversight. The
-//! authoritative check is `grep -rn 'use objc2\|objc2::\|objc2_app_kit::\|objc2_foundation::\|block2::' crates/aterm-gui/src`;
-//! this is that list with its reasons.
+//! This heading was "WHAT IS STILL ON `objc2`, AND WHY", and it listed the
+//! remaining files with a reason each, because a seam nobody wrote down is
+//! indistinguishable from an oversight. W13 emptied the list. The check is
+//! unchanged and is what to run rather than trust this paragraph:
 //!
-//! * ~~**`toolbar.rs`**~~ — PORTED (W7). It was the largest entry here: four
-//!   first-party declared classes whose ~250 AppKit BINDING calls were still
-//!   `objc2`'s, crossed at [`objc2_ref`] / `id_of` / the classes' own `view()`.
-//!   `objc2-send-sites-v1` over that file is now **0 raw / 0 code**, down from
-//!   268 / 267, and `sed 's://.*$::' toolbar.rs | grep objc2` finds nothing:
-//!   the file holds no `objc2` token outside prose. `id_of` had no callers left
-//!   anywhere and is deleted; `objc2_ref` kept exactly one, in
-//!   `app_introspect.rs` below, reached through `toolbar::native_strip_container`
-//!   (which now returns [`aterm_objc::Obj`]). The seam deliberately lives in
-//!   the UNPORTED module rather than as the last `objc2` type in a ported one.
-//! * **`alert_keys.rs` + `menu.rs::confirm` + `lib.rs`'s paste sheet** — ONE
-//!   subsystem, the modal alert and its `RcBlock` key interceptor, shared
-//!   between two callers. Porting either caller alone would leave two
-//!   spellings of the same event monitor.
-//! * **`lib.rs`, TWO one-liners that are NOT that subsystem** and that this
-//!   list omitted until the tenth pass ran its own grep: `lib.rs:1505`
-//!   (`objc2_foundation::MainThreadMarker::new()`, the launch-failure alert's
-//!   main-thread test) and `lib.rs:15697` (`objc2_app_kit::NSBeep()`, the
-//!   bell). Neither is "goes whole or not at all": [`MainThread::new`] is a
-//!   drop-in for the first and `NSBeep` is a plain C function needing no
-//!   binding at all. They are named here rather than left to be found, which
-//!   is this list's whole purpose.
-//! * **`app_introspect.rs`** — the `chrome` verb's AppKit readback and the
-//!   window-CAPTURE path, which shares its `NSBitmapImageRep` machinery with
-//!   `cg_capture.rs`. Mixed, so it goes whole or not at all.
+//! ```text
+//! $ grep -rn 'use objc2\|objc2::\|objc2_app_kit::\|objc2_foundation::\|block2::' crates/aterm-gui/src
+//! ```
 //!
-//! This module's OWN `objc2` reference is test-only and deliberate:
-//! [`consts_tests`] diffs every ported constant against the `objc2-app-kit`
-//! expression it replaced. It is an oracle against the crate being retired, so
-//! it departs with it — see that module's note for what survives it.
+//! It answers nothing outside prose. `crates/aterm-objc/tests/objc2_exit_condition.rs`
+//! is the same rule as a TEST, over a scope derived by subtraction rather than
+//! remembered, and its `GUI_FILES` count is 0.
 //!
-//! Nothing here removes a PACKAGE. `objc2`, `block2` and the `objc2-*`
-//! bindings are still parents of `aterm-gui` through the entries above,
-//! and vendored `winit` reaches them independently. `forge survey` on the
-//! `mac-arm` cell was byte-identical to before W2's wave (47 third-party
-//! packages, 561,477 LOC, 24,778 unsafe tokens). That is the design: dominator
-//! arithmetic, not sequencing preference.
+//! The list as it stood, and where each entry went:
 //!
-//! THE PACKAGE COUNT IS STILL 47 AND THE LOC LINE IS NOT STILL 561,477, and
-//! the difference is worth stating rather than quietly restating. W3 moved
-//! `vendor/winit/src/platform_impl/macos/window_delegate.rs`'s declared class
-//! onto `aterm_objc`, and the survey counts vendored `winit`'s OWN source in
-//! the third-party column — so the line moved. It read 561,755 / 24,786 when
-//! that sentence was written and it does NOT read that today: `cargo forge
-//! survey` on this commit answers **47 third-party / 562,346 LOC / 24,811
-//! unsafe**, byte-identical to the same command at `origin/main`, so this wave
-//! moved none of it. A number with "today" in it goes stale by the next
-//! commit; re-run the command rather than trust this line. Porting a fork's file makes that number go UP until the package it
-//! was porting away from actually leaves, and it leaves only when every winit
-//! file has stopped using it. `winit`'s dominator row is unchanged at 12
-//! packages, which is the number that would move if anything had.
+//! * ~~**`toolbar.rs`**~~ — PORTED (W7). The largest entry: four first-party
+//!   declared classes whose ~250 AppKit BINDING calls were still `objc2`'s,
+//!   crossed at `objc2_ref` / `id_of` / the classes' own `view()`. `id_of` had
+//!   no callers left and was deleted then; `objc2_ref` kept exactly one, in
+//!   `app_introspect.rs` — and with that file ported it has none either and is
+//!   deleted here, for the same reason and by the same rule.
+//! * ~~**`alert_keys.rs` + `menu.rs::confirm` + `lib.rs`'s paste sheet**~~ —
+//!   PORTED (W13), together, because they are ONE subsystem: the modal alert
+//!   and its `RcBlock` key interceptor, shared between two callers. Porting
+//!   either caller alone would have left two spellings of the same event
+//!   monitor, which is exactly why the entry named all three.
+//! * ~~**`lib.rs`'s two one-liners that are NOT that subsystem**~~ — PORTED.
+//!   `MainThreadMarker::new()` became [`MainThread::new`], a drop-in; `NSBeep`
+//!   is a plain C function and became [`beep`], bound in this module beside the
+//!   `NSAppearanceName` globals because it is the same kind of thing they are.
+//! * ~~**`app_introspect.rs`**~~ — PORTED (W13). The `chrome` verb's AppKit
+//!   readback and the window-CAPTURE path, whole, as its entry said it would
+//!   have to go.
+//!
+//! This module's own test-only reference went with them: `consts_tests` diffed
+//! every ported constant against the `objc2-app-kit` expression it replaced,
+//! and said itself that it could only live while that crate was a dependency.
+//! Its replacement is stronger and is described at the foot of this file.
+//!
+//! **What this does NOT do is remove a package**, and the distinction matters
+//! as much now as when this note said it about W2. `aterm-gui`'s four manifest
+//! rows are still here after this wave by design — retiring them is a separate,
+//! single commit, because that is where the package set moves — and vendored
+//! `winit` reaches all four crates independently through EIGHT files of its own
+//! macOS backend that are NOT ported (`app.rs`, `app_state.rs`,
+//! `aterm_objc_seam.rs`, `event_loop.rs`, `menu.rs`, `monitor.rs`,
+//! `observer.rs`, `window.rs`). Measured with `cargo forge survey --cell
+//! mac-arm` at the commit this wave branched from: 47 third-party packages,
+//! 563,759 LOC, 24,865 unsafe tokens. Re-run the command rather than trust the
+//! number — a figure with "today" in it goes stale by the next commit, which is
+//! why the sentence this replaces had to be corrected twice already.
 //!
 //! # Ownership
 //!
@@ -370,6 +365,74 @@ pub(crate) mod consts {
     /// (`NSLineBreakMode`, `NSUInteger`). A title too long for its chip must
     /// end in an ELLIPSIS, not simply stop.
     pub(crate) const NS_LINE_BREAK_BY_TRUNCATING_TAIL: usize = 4;
+
+    // ---- W13: the modal-alert subsystem's constants ----
+
+    /// `NSEvent.h:103` — `NSEventMaskKeyDown = 1ULL << NSEventTypeKeyDown`,
+    /// and `NSEvent.h:34` — `NSEventTypeKeyDown = 10`. So `1 << 10` = 1024, an
+    /// `NSEventMask` (`unsigned long long`, passed as `NSUInteger` here because
+    /// that is what `+addLocalMonitorForEventsMatchingMask:handler:` takes and
+    /// both are 64-bit on every Apple target this compiles for).
+    ///
+    /// THE ONE MASK `alert_keys` INSTALLS. A wider mask would hand the
+    /// interceptor mouse and flags-changed events it has no answer for; a
+    /// narrower one would miss the Return this module exists to route.
+    pub(crate) const NS_EVENT_MASK_KEY_DOWN: usize = 1 << 10;
+
+    /// `NSAlert.h:50` — `static const NSModalResponse NSAlertFirstButtonReturn
+    /// = 1000;` (`NSModalResponse` is `NSInteger`).
+    ///
+    /// The FIRST button added to an `NSAlert` is its default, so this is the
+    /// affirmative answer for both confirmations: `menu::confirm`'s proceed and
+    /// the paste sheet's "Paste". It was a bare `1000` at both sites with the
+    /// name only in a comment.
+    pub(crate) const NS_ALERT_FIRST_BUTTON_RETURN: isize = 1000;
+
+    // ---- W13: the `chrome` introspection reader's constants ----
+    //
+    // `NSWindowToolbarStyle` (`NSWindow.h:243-249`) and `NSToolbarDisplayMode`
+    // (`NSToolbar.h:23-28`) are both IMPLICIT enumerations — no enumerator
+    // carries a value, so each is its ordinal. They are read back and turned
+    // into words by `app_introspect::read_native_chrome`, which is the only
+    // consumer; `UNIFIED_COMPACT` and `ICON_ONLY` already existed above because
+    // `toolbar.rs` SETS them, and the pair of readers and writers agreeing is
+    // itself checked by the `_Static_assert` test.
+
+    /// `NSWindow.h:244` — `NSWindowToolbarStyleAutomatic` (`NSInteger`), the
+    /// first enumerator of an implicit enum, so 0.
+    pub(crate) const NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC: isize = 0;
+    /// `NSWindow.h:245` — `NSWindowToolbarStyleExpanded`.
+    pub(crate) const NS_WINDOW_TOOLBAR_STYLE_EXPANDED: isize = 1;
+    /// `NSWindow.h:246` — `NSWindowToolbarStylePreference`.
+    pub(crate) const NS_WINDOW_TOOLBAR_STYLE_PREFERENCE: isize = 2;
+    /// `NSWindow.h:247` — `NSWindowToolbarStyleUnified`.
+    pub(crate) const NS_WINDOW_TOOLBAR_STYLE_UNIFIED: isize = 3;
+
+    /// `NSToolbar.h:24` — `NSToolbarDisplayModeDefault` (`NSUInteger`).
+    pub(crate) const NS_TOOLBAR_DISPLAY_MODE_DEFAULT: usize = 0;
+    /// `NSToolbar.h:25` — `NSToolbarDisplayModeIconAndLabel`.
+    pub(crate) const NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL: usize = 1;
+    /// `NSToolbar.h:27` — `NSToolbarDisplayModeLabelOnly`.
+    pub(crate) const NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY: usize = 3;
+
+    // ---- W13: the titlebar snapshot's constants ----
+
+    /// `NSBitmapImageRep.h:37` — `NSBitmapImageFileTypePNG` (`NSUInteger`), the
+    /// fifth enumerator of an implicit enum, so 4.
+    pub(crate) const NS_BITMAP_IMAGE_FILE_TYPE_PNG: usize = 4;
+
+    /// `NSGraphics.h:129` — `NSColorRenderingIntentPerceptual` (`NSInteger`),
+    /// the FOURTH enumerator of an implicit enum, so **3**.
+    ///
+    /// THIS ROW WAS WRITTEN `1` FIRST, and the `_Static_assert` probe rejected
+    /// it before a line of it compiled — `expression evaluates to '3 == 1'`. It
+    /// is `NS_TEXT_ALIGNMENT_CENTER`'s shape exactly: an implicit enumerator
+    /// whose ordinal a reader guesses from the name's prominence rather than
+    /// from its POSITION, and one that could never have been caught at run time
+    /// here (a wrong intent produces a subtly different conversion of the
+    /// titlebar's colours, not a failure). The instrument earned its place on
+    /// its first row.
+    pub(crate) const NS_COLOR_RENDERING_INTENT_PERCEPTUAL: isize = 3;
 }
 
 // The two `NSAppearanceName` constants — the EXCEPTION the [`consts`] note
@@ -395,6 +458,37 @@ unsafe extern "C" {
     /// `NSAppearance.h:64` — the dark system appearance's name.
     #[link_name = "NSAppearanceNameDarkAqua"]
     static NS_APPEARANCE_NAME_DARK_AQUA: Id;
+
+    /// `NSGraphics.h:222` — `APPKIT_EXTERN void NSBeep(void);`
+    ///
+    /// A C FUNCTION, not a message and not a header value: the third shape a
+    /// framework "constant" can take, and the one the [`consts`] note's two
+    /// categories had no room for. It is bound here beside the two
+    /// `NSAppearanceName` globals because it is the same kind of thing they are
+    /// — a real symbol `AppKit.tbd` exports (`_NSBeep`) — and for the same
+    /// reason: writing it as anything else does not link.
+    #[link_name = "NSBeep"]
+    fn ns_beep();
+}
+
+/// Play the user's configured macOS alert sound (the BEL bell).
+///
+/// # Why this is a function and not a send
+///
+/// `NSBeep()` is a free function in AppKit, so there is no receiver and no
+/// selector — [`aterm_objc::msg`] has nothing to cast. The call is one `extern
+/// "C"` invocation of a symbol the framework exports, which is why it needs no
+/// `unsafe` at its call site: taking no arguments and returning nothing, it has
+/// no prototype a caller could get wrong.
+///
+/// It honours the user's sound settings (including a muted system), and it is
+/// safe from any thread — but aterm only ever calls it from the event-loop
+/// thread, which is where `on_bell` runs.
+pub(crate) fn beep() {
+    // SAFETY: `_NSBeep` is exported by AppKit (verified in `AppKit.tbd`), takes
+    // no arguments and returns nothing, so the declaration above IS its
+    // complete prototype and there is no ABI question to get wrong.
+    unsafe { ns_beep() }
 }
 
 /// The `NSAppearanceName` for the light or dark system appearance, +0.
@@ -414,244 +508,41 @@ pub(crate) fn appearance_name(dark: bool) -> Id {
     }
 }
 
-/// THE SEAM between the first-party runtime and the `objc2` bindings.
-///
-/// # Where it is, and it is now ONE site
-///
-/// This used to be a PAIR of functions crossed ~250 times, because
-/// `toolbar.rs`'s four declared classes were first-party while every AppKit
-/// BINDING call in the same module was `objc2`'s. W7 ported those bindings, so
-/// the other direction ([`id_of`]) has no callers at all and is deleted, and
-/// this one is crossed exactly ONCE:
-///
-/// ```text
-/// $ grep -rn 'appkit::objc2_ref(' crates/aterm-gui/src
-/// crates/aterm-gui/src/app_introspect.rs:6584
-/// ```
-///
-/// The trailing `(` in that pattern is not cosmetic and the claim was WRONG
-/// without it: three comments in this crate write the name in prose, so the
-/// paren-less grep answers four lines while the sentence above it says one.
-/// A CALL is what `(` matches.
-///
-/// That site is `toolbar::native_strip_container`'s only caller. The seam sits
-/// in `app_introspect.rs` — which is still `objc2` and goes whole or not at
-/// all, sharing its `NSBitmapImageRep` machinery with `cg_capture.rs` — rather
-/// than in `toolbar.rs`, so the ported file holds no `objc2` type at all.
-/// `alert_keys.rs` + `menu.rs::confirm` and the paste sheet are the other
-/// entries on that list; none of them cross here.
-///
-/// # IT TAKES THE OWNER, NOT THE POINTER, AND THAT IS THE WHOLE POINT
-///
-/// The first spelling was `objc2_ref<'a, T>(id: Id) -> &'a T`: an
-/// UNCONSTRAINED output lifetime, which borrowck will unify with anything the
-/// caller wants. The one call site paired it with an owning [`Obj`] and then
-/// SHADOWED that owner, so the retain outlived the reference and the code was
-/// sound — but only by a coincidence of naming. Nothing stopped a later editor
-/// from renaming the owner and dropping it, and the resulting use-after-free
-/// would compile silently, because the link from the reference back to the
-/// retain that keeps it alive ran through a raw pointer the compiler cannot
-/// see.
-///
-/// Taking `&Obj` and eliding the lifetime puts that link back INTO THE TYPE:
-/// the returned `&T` borrows the owner, so dropping or moving the owner while
-/// the reference is live is a borrow-check error rather than a silent one. The
-/// tenth pass raised the shadowing; this is the answer that does not depend on
-/// a name.
-///
-/// # Safety
-///
-/// `owner` must hold a live instance of a class `T` is a correct `objc2`
-/// binding for. `objc2`'s binding types are `#[repr(C)]` chains bottoming out
-/// in a zero-sized `AnyObject`, so the reference borrows no bytes of its own
-/// and the cast is a reinterpretation of the pointer only. Lifetime is no
-/// longer part of the obligation: the signature carries it.
-#[must_use]
-pub(crate) unsafe fn objc2_ref<T>(owner: &aterm_objc::Obj) -> &T {
-    let id = owner.id();
-    debug_assert!(!id.is_null(), "objc2_ref of nil");
-    // SAFETY: the caller guarantees `owner` holds a live instance of `T`'s
-    // class; `T` is a zero-sized opaque binding marker, and `owner`'s retain
-    // outlives the returned borrow by the signature above.
-    unsafe { &*id.as_ptr().cast_const().cast::<T>() }
-}
-
-/// NINETEEN OF THE TWENTY PORTED CONSTANTS, DIFFED AGAINST THE CRATE THEY
-/// REPLACED. It said EVERY and it was 17 of 20 until the tenth pass counted
-/// them; the twentieth has no objc2 expression to diff against at all.
-///
-/// # Why this exists
-///
-/// [`consts`]'s own note says each value was read twice — from the SDK header
-/// cited on its line, and from `objc2-app-kit 0.2.2`'s generated binding. That
-/// discipline still shipped a wrong value, because the second reading was
-/// performed by EYE and recorded as agreement: `NSTextAlignment::Center` is
-/// spelled `Self(if TARGET_ABI_USES_IOS_VALUES { 1 } else { 2 })`, which
-/// "confirms" whichever branch the reader already believed. Only evaluating it
-/// distinguishes them, and on this arch it evaluates to the branch the prose had
-/// ruled out. The cost was a live tab strip whose labels were right-aligned.
-///
-/// So the second reading is done by the COMPILER here instead. Every row is a
-/// constant this module now owns against the `objc2` expression it replaced, on
-/// whatever arch the test is built for — which is also why the `x86_64` slice
-/// gets the same check for free when it is built, without this box being able to
-/// execute it.
-///
-/// The three that were missing are NAMED rather than quietly added, because
-/// WHICH three is the finding. `NS_MODAL_RESPONSE_OK` and
-/// `NS_VARIABLE_STATUS_ITEM_LENGTH` were simply omitted and are covered below.
-///
-/// `NS_LINE_BREAK_BY_TRUNCATING_TAIL` is the interesting one and it is
-/// COVERED HERE BY NOTHING, because it CANNOT be: `NSLineBreakMode` lives
-/// behind `objc2-app-kit`'s `NSParagraphStyle` feature, which `aterm-gui` does
-/// not enable — which is why even the pre-port code sent that selector with
-/// this module's own constant through a raw `objc2::msg_send!` rather than a
-/// typed binding. So the crate this oracle diffs against has no expression for
-/// it, and "EVERY PORTED CONSTANT, DIFFED AGAINST THE CRATE IT REPLACED" was
-/// never achievable for that row. It is also a W7 row (the tab label's
-/// ellipsis) and was the ONE constant in this module whose doc cited a header
-/// with NO line number — least-checked on both instruments at once, which is
-/// the exact profile of `NS_TEXT_ALIGNMENT_CENTER`, the row that shipped
-/// wrong. Its line number is now cited, and its only oracle is the SDK:
-///
-/// ```text
-/// $ printf '#import <Cocoa/Cocoa.h>\n_Static_assert(NSLineBreakByTruncatingTail == 4, "");\nint main(void){return 0;}\n' > /tmp/lb.m
-/// $ cc -arch arm64 -fsyntax-only /tmp/lb.m   # passes; == 3 fails
-/// ```
-///
-/// All three values are in fact correct — a `_Static_assert` over all 20
-/// against the SDK compiles for `arm64` and `x86_64` and fails when any row is
-/// inverted — so the defect was in the guard's claim about itself, not in a
-/// value.
-///
-/// These asserts are only possible while `objc2-app-kit` is still a dependency
-/// of `aterm-gui` (through `app_introspect.rs`, `alert_keys.rs` and `menu.rs`'s
-/// confirm sheet — the named seam list). When the last of those is ported the
-/// crate leaves and this module must go with it; the SDK header citations on
-/// each constant are what survive it, and the `clang` measurement in
-/// `NS_TEXT_ALIGNMENT_CENTER`'s doc is the reproduction recipe.
-#[cfg(test)]
-mod consts_tests {
-    use objc2_app_kit::{
-        NSAutoresizingMaskOptions, NSCellImagePosition, NSEventModifierFlags, NSLineCapStyle,
-        NSTextAlignment, NSToolbarDisplayMode, NSTrackingAreaOptions, NSWindowButton,
-        NSWindowOrderingMode, NSWindowTitleVisibility, NSWindowToolbarStyle,
-    };
-
-    use super::consts::*;
-
-    /// The signed (`NSInteger`) enumerators.
-    #[test]
-    fn every_signed_constant_equals_the_objc2_value_it_replaced() {
-        assert_eq!(NS_MODAL_RESPONSE_OK, objc2_app_kit::NSModalResponseOK);
-        assert_eq!(
-            NS_TEXT_ALIGNMENT_CENTER,
-            NSTextAlignment::Center.0,
-            "the tab labels' alignment — the row that shipped wrong; see its doc"
-        );
-        assert_eq!(NS_TEXT_ALIGNMENT_LEFT, NSTextAlignment::Left.0);
-        assert_eq!(NS_WINDOW_ABOVE, NSWindowOrderingMode::NSWindowAbove.0);
-        assert_eq!(
-            NS_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT,
-            NSWindowToolbarStyle::UnifiedCompact.0
-        );
-        assert_eq!(
-            NS_WINDOW_TITLE_HIDDEN,
-            NSWindowTitleVisibility::NSWindowTitleHidden.0
-        );
-    }
-
-    /// The unsigned (`NSUInteger`) enumerators and bitmasks.
-    #[test]
-    fn every_unsigned_constant_equals_the_objc2_value_it_replaced() {
-        assert_eq!(NS_LINE_CAP_STYLE_ROUND, NSLineCapStyle::Round.0);
-        assert_eq!(NS_NO_IMAGE, NSCellImagePosition::NSNoImage.0);
-        assert_eq!(
-            NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY,
-            NSToolbarDisplayMode::IconOnly.0
-        );
-        assert_eq!(
-            NS_WINDOW_CLOSE_BUTTON,
-            NSWindowButton::NSWindowCloseButton.0
-        );
-        assert_eq!(
-            NS_WINDOW_MINIATURIZE_BUTTON,
-            NSWindowButton::NSWindowMiniaturizeButton.0
-        );
-        assert_eq!(NS_WINDOW_ZOOM_BUTTON, NSWindowButton::NSWindowZoomButton.0);
-        assert_eq!(
-            NS_TRACKING_HOVER_IN_VISIBLE_RECT,
-            (NSTrackingAreaOptions::NSTrackingMouseEnteredAndExited
-                | NSTrackingAreaOptions::NSTrackingActiveAlways
-                | NSTrackingAreaOptions::NSTrackingInVisibleRect)
-                .0,
-            "the hover tracking area the ✕ reveal depends on"
-        );
-        assert_eq!(
-            NS_VIEW_MIN_X_MARGIN_MAX_Y_MARGIN,
-            (NSAutoresizingMaskOptions::NSViewMinXMargin
-                | NSAutoresizingMaskOptions::NSViewMaxYMargin)
-                .0
-        );
-        assert_eq!(
-            NS_VIEW_WIDTH_SIZABLE,
-            NSAutoresizingMaskOptions::NSViewWidthSizable.0
-        );
-        assert_eq!(
-            NS_EVENT_MODIFIER_FLAG_CONTROL,
-            NSEventModifierFlags::NSEventModifierFlagControl.0,
-            "the ctrl-click that pops the tab context menu"
-        );
-        assert_eq!(
-            NS_EVENT_MODIFIER_FLAG_SHIFT,
-            NSEventModifierFlags::NSEventModifierFlagShift.0
-        );
-        assert_eq!(
-            NS_EVENT_MODIFIER_FLAG_COMMAND,
-            NSEventModifierFlags::NSEventModifierFlagCommand.0
-        );
-    }
-
-    /// The one `CGFloat` constant, which is neither enumerator nor bitmask.
-    ///
-    /// `NSVariableStatusItemLength` is the row whose FIRST spelling here was an
-    /// `extern static` and failed to link (`Undefined symbols:
-    /// "_NSVariableStatusItemLength"`) — the failure that produced the
-    /// [`consts`] note. It is a header value, and `objc2-app-kit` compiles its
-    /// own copy exactly as this module does; comparing them is what says so.
-    #[test]
-    fn the_float_constant_equals_the_objc2_value_it_replaced() {
-        assert!(
-            (NS_VARIABLE_STATUS_ITEM_LENGTH - objc2_app_kit::NSVariableStatusItemLength).abs()
-                < f64::EPSILON,
-            "left {NS_VARIABLE_STATUS_ITEM_LENGTH}, right {}",
-            objc2_app_kit::NSVariableStatusItemLength
-        );
-    }
-
-    /// The `NSAppearanceName` globals are the same POINTERS AppKit hands
-    /// `objc2`, not merely equal strings.
-    ///
-    /// [`super::appearance_name`] binds `_NSAppearanceNameAqua` /
-    /// `_NSAppearanceNameDarkAqua` as extern statics — the documented exception
-    /// to `consts`'s "framework constants are header values" rule. Comparing
-    /// the raw addresses proves the linker resolved this module's declaration
-    /// to the same object `objc2-app-kit` reaches, which a string comparison
-    /// would not: a wrong-but-equal `NSString` would pass that and still fail
-    /// `+appearanceNamed:`.
-    #[test]
-    fn the_appearance_names_are_appkits_own_globals() {
-        for (dark, want) in [
-            (true, unsafe { objc2_app_kit::NSAppearanceNameDarkAqua }),
-            (false, unsafe { objc2_app_kit::NSAppearanceNameAqua }),
-        ] {
-            let ours = super::appearance_name(dark);
-            assert!(!ours.is_null(), "dark={dark}: the extern static is nil");
-            assert_eq!(
-                ours.as_ptr().cast_const().cast::<std::ffi::c_void>(),
-                std::ptr::from_ref(want).cast::<std::ffi::c_void>(),
-                "dark={dark}: not the same global objc2 binds"
-            );
-        }
-    }
-}
+// # WHERE THE CONSTANTS ARE CHECKED NOW — the oracle changed, and this note
+// is the record of the swap
+//
+// Until W13 this module ended in `consts_tests`: 19 of the 20 ported constants
+// diffed at run time against the `objc2-app-kit` expression each had replaced.
+// It was a real instrument — it existed because `NS_TEXT_ALIGNMENT_CENTER` had
+// been "read twice" BY EYE and shipped as RIGHT alignment, and the compiler
+// evaluating both sides is what would have caught it. It also said outright
+// that it could only live while `objc2-app-kit` was still a dependency, and
+// that when the last holdout was ported "the crate leaves and this module must
+// go with it".
+//
+// This is that. **The oracle is not gone, it is REPLACED, and by a stronger
+// one**: `crates/aterm-objc/tests/gui_appkit_constants.rs` `_Static_assert`s
+// every constant in [`consts`] against the SDK ITSELF, on BOTH arches, by
+// compiling the assertion with `clang -fsyntax-only`. Four things improve:
+//
+// * The authority is Apple's header rather than a third-party crate's
+//   transcription of it — one fewer link in the chain to be wrong.
+// * `x86_64` is covered, which the run-time diff never could on this box:
+//   compiling an assertion for an arch needs no binary for that arch to run.
+//   `NS_TEXT_ALIGNMENT_CENTER`'s two `#[cfg]` arms are BOTH checked, each
+//   under the matching `#if`.
+// * The three rows the old oracle could not reach are covered. Two were simply
+//   omitted; `NS_LINE_BREAK_BY_TRUNCATING_TAIL` was UNREACHABLE, because
+//   `NSLineBreakMode` lives behind an `objc2-app-kit` feature `aterm-gui` does
+//   not enable — so "EVERY PORTED CONSTANT, DIFFED AGAINST THE CRATE IT
+//   REPLACED" was never achievable for it. Against the SDK there is no such
+//   gap.
+// * Coverage runs BOTH WAYS off the SOURCE: every constant the parser finds in
+//   [`consts`] must have a row, and every row must name a constant that is
+//   really here. The old test was a hand-written list of `assert_eq!`s, so a
+//   constant added without one was invisible to it.
+//
+// The SDK header and line on each constant ABOVE is what the new test's row
+// table is checked against, so those citations went from documentation to
+// input. `NS_COLOR_RENDERING_INTENT_PERCEPTUAL` is the first row it caught:
+// written `1`, rejected before it compiled, correct at `3`.

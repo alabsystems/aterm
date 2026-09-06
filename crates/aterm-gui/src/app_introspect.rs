@@ -376,7 +376,7 @@ fn reject_encode_job(mut job: EncodeJob, reason: &str) {
         EncodeJob::Snapshot { transaction, .. } => {
             // `begin_snapshot_generation` already removed `.done`; dropping the
             // untouched transaction therefore leaves this attempt unpublished.
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: snapshot rejected for {}: {reason}",
                 transaction.target.path.display()
             );
@@ -1276,8 +1276,12 @@ fn run_encode_job(job: EncodeJob) {
         } => {
             let path = transaction.target.path.display();
             match write_snapshot_artifacts(&frame, &text, &transaction) {
-                Ok(()) => eprintln!("aterm-gui: snapshot written to {path} (+ .txt, .done)"),
-                Err(error) => eprintln!("aterm-gui: snapshot failed for {path}: {error}"),
+                Ok(()) => crate::logging::stderr_line!(
+                    "aterm-gui: snapshot written to {path} (+ .txt, .done)"
+                ),
+                Err(error) => {
+                    crate::logging::stderr_line!("aterm-gui: snapshot failed for {path}: {error}")
+                }
             }
         }
         #[cfg(any(target_os = "macos", windows))]
@@ -4294,7 +4298,7 @@ impl App {
         let transaction = match begin_snapshot_generation(std::path::Path::new(&path)) {
             Ok(transaction) => transaction,
             Err(error) => {
-                eprintln!("aterm-gui: snapshot refused for {path}: {error}");
+                crate::logging::stderr_line!("aterm-gui: snapshot refused for {path}: {error}");
                 return;
             }
         };
@@ -4323,7 +4327,7 @@ impl App {
             match self.recording_presented_frame_capture(front, false, false) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
-                    eprintln!("aterm-gui: snapshot deferred: {error}");
+                    crate::logging::stderr_line!("aterm-gui: snapshot deferred: {error}");
                     return;
                 }
             }
@@ -4334,7 +4338,7 @@ impl App {
             match self.recording_presented_destination_capture(front) {
                 Ok(destination) => Some(destination),
                 Err(error) => {
-                    eprintln!("aterm-gui: snapshot deferred: {error}");
+                    crate::logging::stderr_line!("aterm-gui: snapshot deferred: {error}");
                     return;
                 }
             }
@@ -4356,14 +4360,14 @@ impl App {
                 self.backend.is_gpu(),
                 has_gpu_surface,
             ) {
-                eprintln!("aterm-gui: snapshot refused: {error}");
+                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
                 return;
             }
             if let Err(error) = crate::window_capture_material_guard(
                 self.render_knobs.background_material,
                 !cfg!(windows),
             ) {
-                eprintln!("aterm-gui: snapshot refused: {error}");
+                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
                 return;
             }
             match self.present_before_window_capture(
@@ -4372,7 +4376,7 @@ impl App {
             ) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
-                    eprintln!("aterm-gui: snapshot refused: {error}");
+                    crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
                     return;
                 }
             }
@@ -4527,7 +4531,7 @@ impl App {
             let frame = match snapshot_frame_from_presented_client(&exact.client) {
                 Ok(frame) => frame,
                 Err(error) => {
-                    eprintln!("aterm-gui: snapshot refused: {error}");
+                    crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
                     return;
                 }
             };
@@ -4585,7 +4589,7 @@ impl App {
         ) {
             Ok(frame) => frame,
             Err(error) => {
-                eprintln!("aterm-gui: snapshot refused: {error}");
+                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
                 return;
             }
         };
@@ -4681,6 +4685,10 @@ impl App {
             let spawned = std::thread::Builder::new()
                 .name("aterm-video-encode".to_string())
                 .spawn(move || {
+                    // QoS (port of 61a6c8b62): a recording encode is cosmetic
+                    // work no keystroke waits on; it must never take P-core
+                    // time from the UI thread on a saturated machine.
+                    crate::qos::set_self(crate::qos::Role::Background);
                     if let Ok(j) = vrx.recv() {
                         run_encode_job(j);
                     }
@@ -4715,6 +4723,9 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("aterm-png-encode".to_string())
             .spawn(move || {
+                // QoS (port of 61a6c8b62): screenshot encoding is off the
+                // keystroke path; the client waits on its reply, not the human.
+                crate::qos::set_self(crate::qos::Role::Background);
                 // Drain until every sender is gone (process teardown); a dead
                 // client's dropped reply receiver only makes send() fail, which
                 // `run_encode_job` ignores — never a worker panic.
@@ -5941,120 +5952,207 @@ impl App {
     /// Off macOS there is no native chrome, so it returns a single explanatory line.
     #[cfg(target_os = "macos")]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
-        use objc2_app_kit::{NSApplication, NSToolbarDisplayMode, NSView, NSWindowToolbarStyle};
-        use objc2_foundation::MainThreadMarker;
+        use aterm_objc::{Id, autoreleasepool, class, sel};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        use crate::appkit::consts::{
+            NS_TOOLBAR_DISPLAY_MODE_DEFAULT, NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL,
+            NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY, NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY,
+            NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC, NS_WINDOW_TOOLBAR_STYLE_EXPANDED,
+            NS_WINDOW_TOOLBAR_STYLE_PREFERENCE, NS_WINDOW_TOOLBAR_STYLE_UNIFIED,
+            NS_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT,
+        };
+        use crate::appkit::{self, MainThread};
 
         let mut out: Vec<String> = Vec::new();
 
         // We are on the winit main-loop thread (this runs via `user_event`), so the
-        // marker is always present; bail gracefully if somehow not.
-        let Some(mtm) = MainThreadMarker::new() else {
+        // witness is always present; bail gracefully if somehow not.
+        let Some(mtm) = MainThread::new() else {
             out.push("ERR not on main thread".to_string());
             return out;
         };
 
-        // --- The frontmost window's NSToolbar ---------------------------------
-        // Reach the NSWindow the SAME way `match_window_colorspace_to_content` /
-        // `toolbar::install_window_toolbar` do: winit Window -> AppKit
-        // RawWindowHandle -> NSView -> NSWindow.
-        let ns_window = self
-            .front()
-            .and_then(|ws| ws.os_window.as_ref())
-            .and_then(|w| w.window_handle().ok())
-            .and_then(|handle| match handle.as_raw() {
-                // SAFETY: `ns_view` points at the front window's live NSView (owned
-                // by winit for the window's lifetime); we only borrow it on the main
-                // thread, as AppKit requires, to read its `window`.
-                RawWindowHandle::AppKit(h) => {
-                    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-                    view.window()
-                }
-                _ => None,
-            });
-
-        // SAFETY: all the AppKit getters below (`toolbar`/`toolbarStyle`/
-        // `displayMode`/`items`/`itemIdentifier`/`label`) are plain side-effect-free
-        // accessors with no preconditions beyond a live receiver, called here on the
-        // MAIN thread (this method runs only via `Wake::ReadChrome` in `user_event`).
-        unsafe {
-            match ns_window.as_deref().and_then(|w| w.toolbar()) {
-                Some(toolbar) => {
-                    let style = match ns_window.as_deref().map(|w| w.toolbarStyle()) {
-                        Some(NSWindowToolbarStyle::Automatic) => "automatic",
-                        Some(NSWindowToolbarStyle::Expanded) => "expanded",
-                        Some(NSWindowToolbarStyle::Preference) => "preference",
-                        Some(NSWindowToolbarStyle::Unified) => "unified",
-                        Some(NSWindowToolbarStyle::UnifiedCompact) => "unified-compact",
-                        _ => "?",
-                    };
-                    let display_mode = match toolbar.displayMode() {
-                        NSToolbarDisplayMode::IconOnly => "icon-only",
-                        NSToolbarDisplayMode::LabelOnly => "label-only",
-                        NSToolbarDisplayMode::IconAndLabel => "icon-and-label",
-                        _ => "default",
-                    };
-                    let items = toolbar.items();
-                    out.push(format!(
-                        "toolbar style={style} displayMode={display_mode} items={}",
-                        items.len()
-                    ));
-                    for item in &items {
-                        let id = item.itemIdentifier();
-                        let label = item.label();
-                        out.push(format!("toolbar-item id={id} label={label:?}"));
+        // EVERY OBJECT THIS FUNCTION TOUCHES IS BORROWED, so the whole read runs
+        // inside one pool. `objc2` retained each getter's result into a `Retained`
+        // and released it at the end of its expression; the ported form keeps the
+        // raw +0 `Id`s alive by SCOPE instead, which is what an autorelease pool is
+        // for and is one retain/release pair per object cheaper. Nothing here
+        // outlives the pool: the only things that escape are `String`s.
+        autoreleasepool(|_| {
+            // --- The frontmost window's NSToolbar ------------------------------
+            // Reach the NSWindow the SAME way `match_window_colorspace_to_content` /
+            // `toolbar::install_window_toolbar` do: winit Window -> AppKit
+            // RawWindowHandle -> NSView -> NSWindow.
+            let ns_window = self
+                .front()
+                .and_then(|ws| ws.os_window.as_ref())
+                .and_then(|w| w.window_handle().ok())
+                .and_then(|handle| match handle.as_raw() {
+                    // SAFETY: `ns_view` points at the front window's live NSView
+                    // (owned by winit for the window's lifetime); we only borrow it
+                    // on the main thread, as AppKit requires, to read its `window`.
+                    // `-[NSView window]` is `-(NSWindow *)` and +0.
+                    RawWindowHandle::AppKit(h) => {
+                        let view = Id::from_ptr(h.ns_view.as_ptr());
+                        let window = unsafe { appkit::send_id(view, sel!(window)) };
+                        (!window.is_null()).then_some(window)
                     }
-                }
-                None => out.push("toolbar (none)".to_string()),
-            }
-        }
+                    _ => None,
+                });
 
-        // Native title chrome: including a one-tab window, emit canonical titles,
-        // selection, independent states, and tooltips. This is app/session identity,
-        // not merely a multi-tab switcher. Read off the retained handle (we own the
-        // control), not
-        // via a toolbar-item view downcast (objc2 0.5 has no `Retained::downcast`).
-        if let Some(handle) = self.frontmost_window.and_then(|w| self._toolbars.get(&w)) {
-            if let Some(line) = self.apprt.read_toolbar_chrome(handle) {
-                out.push(line);
-            }
-            // The per-tab CONTEXT MENUS (session-metadata stage 2): one
-            // `tab-menu tab=<i> items=[...]` line per tab chip, read off the
-            // SAME stored models a right-click pops — so a driving AI sees
-            // exactly the items (and greyed states) a human would. Empty at ≤1
-            // tab, like the switcher line above.
-            out.extend(self.apprt.read_toolbar_tab_menus(handle));
-        }
-
-        // --- The application menu bar (NSApplication.mainMenu) ----------------
-        let app = NSApplication::sharedApplication(mtm);
-        // SAFETY: `mainMenu`/`itemArray`/`title`/`submenu` are side-effect-free
-        // getters with no preconditions beyond a live receiver, on the main thread.
-        unsafe {
-            match app.mainMenu() {
-                Some(main) => {
-                    for top in &main.itemArray() {
-                        let title = top.title();
-                        match top.submenu() {
-                            Some(sub) => {
-                                let names: Vec<String> = sub
-                                    .itemArray()
-                                    .iter()
-                                    // Skip separators (empty title) so the listing
-                                    // reads as the command set, not the dividers.
-                                    .filter(|i| !i.title().is_empty())
-                                    .map(|i| i.title().to_string())
-                                    .collect();
-                                out.push(format!("menu {title:?}: {}", names.join(", ")));
+            // SAFETY: all the AppKit getters below (`toolbar`/`toolbarStyle`/
+            // `displayMode`/`items`/`count`/`objectAtIndex:`/`itemIdentifier`/
+            // `label`) are plain side-effect-free accessors with no preconditions
+            // beyond a live receiver, called here on the MAIN thread (`mtm` proves
+            // it; this method runs only via `Wake::ReadChrome` in `user_event`).
+            // Every one returns +0, borrowed for the pool above. The two enumerated
+            // properties are read at the widths the runtime states:
+            // `-toolbarStyle` is `-(NSWindowToolbarStyle)`, an NSInteger, and
+            // `-displayMode` is `-(NSToolbarDisplayMode)`, an NSUInteger — a pair
+            // that would silently agree on every value either happens to hold.
+            unsafe {
+                let toolbar = ns_window
+                    .map(|w| appkit::send_id(w, sel!(toolbar)))
+                    .filter(|t| !t.is_null());
+                match toolbar {
+                    Some(toolbar) => {
+                        let style =
+                            match ns_window.map(|w| appkit::send_isize(w, sel!(toolbarStyle))) {
+                                Some(NS_WINDOW_TOOLBAR_STYLE_AUTOMATIC) => "automatic",
+                                Some(NS_WINDOW_TOOLBAR_STYLE_EXPANDED) => "expanded",
+                                Some(NS_WINDOW_TOOLBAR_STYLE_PREFERENCE) => "preference",
+                                Some(NS_WINDOW_TOOLBAR_STYLE_UNIFIED) => "unified",
+                                Some(NS_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT) => "unified-compact",
+                                _ => "?",
+                            };
+                        // All four `NSToolbarDisplayMode` enumerators are named, and
+                        // the `_` arm still stands behind them: an enumerator Apple
+                        // adds later reads as "default" exactly as it did under the
+                        // `objc2` form, which had the same shape. Naming DEFAULT
+                        // rather than letting `_` swallow it is what keeps every row
+                        // of this enum inside the constant table the SDK check
+                        // covers.
+                        let display_mode = match appkit::send_usize(toolbar, sel!(displayMode)) {
+                            NS_TOOLBAR_DISPLAY_MODE_ICON_ONLY => "icon-only",
+                            NS_TOOLBAR_DISPLAY_MODE_LABEL_ONLY => "label-only",
+                            NS_TOOLBAR_DISPLAY_MODE_ICON_AND_LABEL => "icon-and-label",
+                            NS_TOOLBAR_DISPLAY_MODE_DEFAULT => "default",
+                            _ => "default",
+                        };
+                        let items = appkit::send_id(toolbar, sel!(items));
+                        let count = if items.is_null() {
+                            0
+                        } else {
+                            appkit::send_usize(items, sel!(count))
+                        };
+                        out.push(format!(
+                            "toolbar style={style} displayMode={display_mode} items={count}"
+                        ));
+                        for i in 0..count {
+                            let item = appkit::send_id_usize(items, sel!(objectAtIndex:), i);
+                            if item.is_null() {
+                                continue;
                             }
-                            // A top-level item with no submenu (uncommon for a bar).
-                            None => out.push(format!("menu {title:?}: (no submenu)")),
+                            // Byte-identical output to the `objc2` form: `{id}` was
+                            // `Display` on an `NSString` (its Rust text) and
+                            // `{label:?}` was `Debug` on one, which
+                            // `objc2-foundation` implements as `Debug` of that same
+                            // text. A `String` here prints the same two ways.
+                            let id = appkit::nsstring_to_rust(appkit::send_id(
+                                item,
+                                sel!(itemIdentifier),
+                            ));
+                            let label =
+                                appkit::nsstring_to_rust(appkit::send_id(item, sel!(label)));
+                            out.push(format!("toolbar-item id={id} label={label:?}"));
                         }
                     }
+                    None => out.push("toolbar (none)".to_string()),
                 }
-                None => out.push("menu (none)".to_string()),
             }
-        }
+
+            // Native title chrome: including a one-tab window, emit canonical
+            // titles, selection, independent states, and tooltips. This is
+            // app/session identity, not merely a multi-tab switcher. Read off the
+            // retained handle (we own the control), not via a toolbar-item view
+            // downcast — no binding crate is involved either way now, but the
+            // reason the handle is authoritative is unchanged: it is what
+            // `toolbar.rs` built and still owns.
+            if let Some(handle) = self.frontmost_window.and_then(|w| self._toolbars.get(&w)) {
+                if let Some(line) = self.apprt.read_toolbar_chrome(handle) {
+                    out.push(line);
+                }
+                // The per-tab CONTEXT MENUS (session-metadata stage 2): one
+                // `tab-menu tab=<i> items=[...]` line per tab chip, read off the
+                // SAME stored models a right-click pops — so a driving AI sees
+                // exactly the items (and greyed states) a human would. Empty at ≤1
+                // tab, like the switcher line above.
+                out.extend(self.apprt.read_toolbar_tab_menus(handle));
+            }
+
+            // --- The application menu bar (NSApplication.mainMenu) ------------
+            // SAFETY: `+sharedApplication` and `-mainMenu`/`-itemArray`/`-title`/
+            // `-submenu` are side-effect-free getters with no preconditions beyond
+            // a live receiver, on the main thread (`mtm`). All are +0 and borrowed
+            // for this pool. `+[NSApplication sharedApplication]` CREATES the
+            // instance on first call, which is why `objc2` demanded the marker for
+            // it — that obligation is why `mtm` is taken and consumed here rather
+            // than dropped in the port.
+            unsafe {
+                let _: MainThread = mtm;
+                let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+                let main = if app.is_null() {
+                    Id::NIL
+                } else {
+                    appkit::send_id(app, sel!(mainMenu))
+                };
+                if main.is_null() {
+                    out.push("menu (none)".to_string());
+                } else {
+                    let tops = appkit::send_id(main, sel!(itemArray));
+                    let n = if tops.is_null() {
+                        0
+                    } else {
+                        appkit::send_usize(tops, sel!(count))
+                    };
+                    for i in 0..n {
+                        let top = appkit::send_id_usize(tops, sel!(objectAtIndex:), i);
+                        if top.is_null() {
+                            continue;
+                        }
+                        let title = appkit::nsstring_to_rust(appkit::send_id(top, sel!(title)));
+                        let sub = appkit::send_id(top, sel!(submenu));
+                        if sub.is_null() {
+                            // A top-level item with no submenu (uncommon for a bar).
+                            out.push(format!("menu {title:?}: (no submenu)"));
+                            continue;
+                        }
+                        let kids = appkit::send_id(sub, sel!(itemArray));
+                        let kn = if kids.is_null() {
+                            0
+                        } else {
+                            appkit::send_usize(kids, sel!(count))
+                        };
+                        let names: Vec<String> = (0..kn)
+                            .map(|j| {
+                                let kid = appkit::send_id_usize(kids, sel!(objectAtIndex:), j);
+                                if kid.is_null() {
+                                    String::new()
+                                } else {
+                                    appkit::nsstring_to_rust(appkit::send_id(kid, sel!(title)))
+                                }
+                            })
+                            // Skip separators (empty title) so the listing reads as
+                            // the command set, not the dividers. A nil item lands
+                            // here too, which is the same "nothing to name" case.
+                            .filter(|t| !t.is_empty())
+                            .collect();
+                        out.push(format!("menu {title:?}: {}", names.join(", ")));
+                    }
+                }
+            }
+        });
 
         out
     }
@@ -6384,7 +6482,10 @@ impl App {
     /// RGBA8 + dims. The encode/write half lives on the encode worker.
     #[cfg(target_os = "macos")]
     fn window_rgba_of(&self, wid: Option<WindowId>) -> Result<(Vec<u8>, u32, u32), String> {
+        use aterm_objc::{Id, sel};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        use crate::appkit;
 
         // Reach the window's NSView the SAME way `read_native_chrome` /
         // `match_window_colorspace_to_content` / `toolbar::install_window_toolbar`
@@ -6406,17 +6507,20 @@ impl App {
         // SAFETY: `ns_view` points at the front window's live NSView (owned by winit
         // for the window's lifetime); we only borrow it on the main thread, as AppKit
         // requires, to read its `window` and the window's `windowNumber`.
-        let view: &objc2_app_kit::NSView =
-            unsafe { &*(h.ns_view.as_ptr() as *const objc2_app_kit::NSView) };
-        let Some(ns_window) = view.window() else {
+        // `-[NSView window]` is `-(NSWindow *)` and +0 — borrowed, and nothing here
+        // outlives the two accessor calls below, so no retain is owed.
+        let view = Id::from_ptr(h.ns_view.as_ptr());
+        let ns_window = unsafe { appkit::send_id(view, sel!(window)) };
+        if ns_window.is_null() {
             return Err("no window to capture (headless)".to_string());
-        };
-        // `windowNumber()` is the CGWindowID the window server knows this NSWindow
+        }
+        // `-windowNumber` is the CGWindowID the window server knows this NSWindow
         // by — the handle `CGWindowListCreateImage` keys off. A negative / zero number
         // means the window is off-screen / not yet committed; treat as uncapturable.
-        // SAFETY: a side-effect-free accessor on the live front-window `NSWindow`,
-        // called on the main thread (this runs only via `Wake::CaptureWindow`).
-        let window_number = unsafe { ns_window.windowNumber() };
+        // SAFETY: a side-effect-free `-(NSInteger)` accessor on the live front-window
+        // `NSWindow`, called on the main thread (this runs only via
+        // `Wake::CaptureWindow`).
+        let window_number = unsafe { appkit::send_isize(ns_window, sel!(windowNumber)) };
         if window_number <= 0 {
             return Err(
                 "window capture failed (front window has no on-screen window number)".to_string(),
@@ -6499,13 +6603,38 @@ impl App {
         window_width: u32,
         window_height: u32,
     ) -> Result<Option<RgbaOverlay>, String> {
-        use objc2::rc::Retained;
-        use objc2_app_kit::{
-            NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey, NSButton,
-            NSColorRenderingIntent, NSColorSpace, NSView, NSWindowButton,
-        };
-        use objc2_foundation::NSDictionary;
+        use aterm_objc::autoreleasepool;
+
+        // ONE POOL AROUND THE WHOLE SNAPSHOT. Every AppKit object this function
+        // touches after the first two is +0 — `-bitmapImageRepForCachingDisplayInRect:`,
+        // `+sRGBColorSpace`, the converted rep and the PNG `NSData` are all
+        // autoreleased returns — and the two it OWNS (`chrome_root` and the empty
+        // properties dictionary) release inside it, which is where a `dealloc`'s own
+        // autoreleases land. `objc2` retained each of these into a `Retained` and
+        // relied on the caller's pool for the same drops; the scope is stated here
+        // instead of assumed.
+        autoreleasepool(|_| self.native_chrome_overlay_pooled(wid, window_width, window_height))
+    }
+
+    /// The pooled body of [`Self::native_chrome_overlay_of`] — split out only so the
+    /// `?` operator has a `Result`-returning function to return from, which a closure
+    /// passed to [`aterm_objc::autoreleasepool`] would also give but at the cost of an
+    /// explicit return type on a 150-line closure.
+    #[cfg(target_os = "macos")]
+    fn native_chrome_overlay_pooled(
+        &self,
+        wid: WindowId,
+        window_width: u32,
+        window_height: u32,
+    ) -> Result<Option<RgbaOverlay>, String> {
+        use aterm_objc::{Id, Obj, class, sel};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        use crate::appkit;
+        use crate::appkit::consts::{
+            NS_BITMAP_IMAGE_FILE_TYPE_PNG, NS_COLOR_RENDERING_INTENT_PERCEPTUAL,
+            NS_WINDOW_CLOSE_BUTTON,
+        };
 
         let state = self
             .windows
@@ -6529,30 +6658,46 @@ impl App {
         };
         // SAFETY: Winit owns this live NSView for the OS window's lifetime. This
         // method runs only on the application's main event-loop thread.
-        let content: &NSView =
-            unsafe { &*(handle.ns_view.as_ptr() as *const objc2_app_kit::NSView) };
-        let ns_window = content
-            .window()
-            .ok_or_else(|| "window capture lost its AppKit window".to_string())?;
-        let close: Retained<NSButton> = ns_window
-            .standardWindowButton(NSWindowButton::NSWindowCloseButton)
-            .ok_or_else(|| {
-                "window capture could not locate AppKit titlebar controls".to_string()
-            })?;
-        // SAFETY: NSButton inherits NSControl -> NSView; this is an upcast of the
-        // same retained Objective-C object, never a dynamic downcast.
-        let mut chrome_root: Retained<NSView> = unsafe { Retained::cast(close) };
+        // `-[NSView window]` is `-(NSWindow *)` and `-[NSWindow
+        // standardWindowButton:]` is `-(NSButton *)(NSWindowButtonType)`, an
+        // NSUInteger — both +0, borrowed for the pool this runs inside.
+        let content = Id::from_ptr(handle.ns_view.as_ptr());
+        let ns_window = unsafe { appkit::send_id(content, sel!(window)) };
+        if ns_window.is_null() {
+            return Err("window capture lost its AppKit window".to_string());
+        }
+        // SAFETY: as above.
+        let close = unsafe {
+            appkit::send_id_usize(
+                ns_window,
+                sel!(standardWindowButton:),
+                NS_WINDOW_CLOSE_BUTTON,
+            )
+        };
+        if close.is_null() {
+            return Err("window capture could not locate AppKit titlebar controls".to_string());
+        }
+        // NO CAST IS NEEDED, and the reason is the port's own shape. `objc2` had to
+        // write `Retained::cast::<NSView>(close)` because its `NSButton` and `NSView`
+        // are DIFFERENT Rust types; an `Id` is the instance address and nothing else,
+        // so an upcast along the NSButton -> NSControl -> NSView chain is not an
+        // operation here at all. What the cast asserted — that the object really is
+        // an NSView, so `-superview` and `-bounds` are its methods — is now carried
+        // by the SAFETY comments on the sends, which is where the obligation belongs.
+        let mut chrome_root = close;
         for _ in 0..32 {
-            // SAFETY: side-effect-free parent read on a live main-thread NSView.
-            let Some(parent) = (unsafe { chrome_root.superview() }) else {
+            // SAFETY: side-effect-free `-(NSView *)superview` read on a live
+            // main-thread NSView, +0.
+            let parent = unsafe { appkit::send_id(chrome_root, sel!(superview)) };
+            if parent.is_null() {
                 break;
-            };
-            if macos_view_is_ancestor_of(&parent, content)? {
+            }
+            if macos_view_is_ancestor_of(parent, content)? {
                 break;
             }
             chrome_root = parent;
         }
-        if macos_view_is_ancestor_of(&chrome_root, content)? {
+        if macos_view_is_ancestor_of(chrome_root, content)? {
             return Err(
                 "window capture refused an AppKit chrome root containing client pixels".to_string(),
             );
@@ -6561,28 +6706,27 @@ impl App {
         // The retained custom strip must be inside the selected titlebar root.
         // Otherwise the snapshot would silently omit native tabs or the '+' button.
         if let Some(toolbar) = self._toolbars.get(&wid) {
-            // THE SEAM, and it lives HERE on purpose. `toolbar.rs` is ported
-            // whole off `objc2` (W7) and hands back the first-party `Obj`; this
-            // module is on the list of what is still `objc2` and goes whole or
-            // not at all, so the one crossing between them is one line in the
-            // UNPORTED module rather than the last `objc2` type in the ported
-            // one. `grep -n native_strip_container` finds exactly this site.
-            // THE OWNER IS NAMED AND IT IS NOT SHADOWED. `native_strip_container`
-            // hands back a +1 `Obj`; the `&NSView` below is that retain
-            // reinterpreted, and the only thing keeping it valid is the retain.
-            // This used to bind both to `strip`, which was sound — a shadowed
-            // binding lives to the end of its scope — but sound BY NAMING: the
-            // link ran through a raw pointer, so renaming the owner and dropping
-            // it would have compiled. `appkit::objc2_ref` now takes `&Obj` and
-            // elides the lifetime, so the borrow is the compiler's business:
-            // `drop(strip_owner)` before the last use of `strip` is an error.
-            // SAFETY: the handle's container is a live `NSView` — `toolbar.rs`
-            // built it with `+[NSView alloc] -initWithFrame:` and retains it for
-            // the handle's lifetime — and `objc2`'s `NSView` is a zero-sized
-            // marker at the instance address, so this borrows no bytes of its own.
+            // THE SEAM IS GONE, and this is where it used to be. `toolbar.rs`
+            // was ported off `objc2` by W7 and has handed back a first-party
+            // `Obj` ever since; this module was the last holdout, so the one
+            // crossing between them lived here as `appkit::objc2_ref` — a
+            // reinterpretation of the container's `Id` as `objc2`'s zero-sized
+            // `NSView` marker, written to take `&Obj` so the borrow checker
+            // could see the retain that kept it alive. With this module ported
+            // there are no two spellings left to cross between: the `Obj` is
+            // used as the `Id` it is, and `objc2_ref` has no callers and is
+            // deleted, exactly as its twin `id_of` was.
+            //
+            // THE OWNER IS STILL NAMED AND STILL NOT SHADOWED, because that half
+            // of the finding survives the seam. `native_strip_container` hands
+            // back a +1 `Obj`; `strip_owner` holds it, and `strip` is the raw
+            // pointer inside it. Dropping the owner while `strip` is still in
+            // use would compile — a raw `Id` carries no lifetime — so the owner
+            // is bound to a name that lives to the end of this block and is
+            // never rebound.
             let strip_owner = crate::toolbar::native_strip_container(toolbar);
-            let strip: &NSView = unsafe { crate::appkit::objc2_ref(&strip_owner) };
-            if !macos_view_is_ancestor_of(&chrome_root, strip)? {
+            let strip = strip_owner.id();
+            if !macos_view_is_ancestor_of(chrome_root, strip)? {
                 return Err(
                     "window capture could not isolate the complete AppKit toolbar subtree"
                         .to_string(),
@@ -6590,68 +6734,121 @@ impl App {
             }
         }
 
-        let bounds = chrome_root.bounds();
+        // SAFETY: `-[NSView bounds]` is `-(NSRect)` — a 32-byte struct return, which
+        // is why `send_rect` exists and picks the indirect entry point on the arch
+        // that needs one — on a live main-thread NSView.
+        let bounds = unsafe { appkit::send_rect(chrome_root, sel!(bounds)) };
         if !macos_rect_is_finite(bounds) || bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return Err("window capture found invalid AppKit chrome bounds".to_string());
         }
         // nil means window-base coordinates. Convert those exact points through
         // NSWindow's backing transform rather than multiplying by a guessed scale.
-        let window_rect = chrome_root.convertRect_toView(bounds, None);
-        // SAFETY: side-effect-free geometry conversion on the live NSWindow.
-        let backing_rect = unsafe { ns_window.convertRectToBacking(window_rect) };
+        // SAFETY: `-convertRect:toView:` is `-(NSRect)(NSRect, NSView *)` and
+        // `-convertRectToBacking:` is `-(NSRect)(NSRect)`; both are side-effect-free
+        // geometry conversions on live main-thread receivers, and `Id::NIL` is the
+        // documented "window base coordinates" argument.
+        let window_rect = unsafe {
+            appkit::send_rect_rect_id(chrome_root, sel!(convertRect:toView:), bounds, Id::NIL)
+        };
+        // SAFETY: as above, on the live NSWindow.
+        let backing_rect =
+            unsafe { appkit::send_rect_rect(ns_window, sel!(convertRectToBacking:), window_rect) };
         if !macos_rect_is_finite(backing_rect) {
             return Err("window capture found invalid AppKit backing geometry".to_string());
         }
 
         // SAFETY: both calls are the documented view-caching pair, on the main
-        // thread. The first allocates a compatible bitmap; the second draws only
-        // this chrome subtree and leaves every undrawn pixel transparent.
-        let bitmap: Retained<NSBitmapImageRep> = unsafe {
-            chrome_root
-                .bitmapImageRepForCachingDisplayInRect(bounds)
-                .ok_or_else(|| {
-                    "window capture could not allocate an AppKit chrome bitmap".to_string()
-                })?
+        // thread. The first allocates a compatible bitmap
+        // (`-(NSBitmapImageRep *)(NSRect)`, +0); the second draws only this chrome
+        // subtree into it (`-(void)(NSRect, NSBitmapImageRep *)`) and leaves every
+        // undrawn pixel transparent.
+        let bitmap = unsafe {
+            appkit::send_id_rect(
+                chrome_root,
+                sel!(bitmapImageRepForCachingDisplayInRect:),
+                bounds,
+            )
         };
+        if bitmap.is_null() {
+            return Err("window capture could not allocate an AppKit chrome bitmap".to_string());
+        }
+        // SAFETY: as above.
         unsafe {
-            chrome_root.cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+            appkit::send_v_rect_id(
+                chrome_root,
+                sel!(cacheDisplayInRect:toBitmapImageRep:),
+                bounds,
+                bitmap,
+            );
         }
         // The caching rep inherits the live window/display backing profile.
         // Convert its pixels (do not merely retag them) before mixing them with
         // the renderer's canonical sRGB client and declaring sRGB in the PNG.
-        let srgb = unsafe { NSColorSpace::sRGBColorSpace() };
+        //
+        // SAFETY: `+[NSColorSpace sRGBColorSpace]` is `+(NSColorSpace *)`, +0 and
+        // process-lifetime; `-bitmapImageRepByConvertingToColorSpace:renderingIntent:`
+        // is `-(NSBitmapImageRep *)(NSColorSpace *, NSColorRenderingIntent)` — the
+        // intent is an NSInteger, measured, which is why the helper is
+        // `send_id_id_isize` and not its unsigned twin.
+        let srgb = unsafe { appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace)) };
+        if srgb.is_null() {
+            return Err("window capture could not reach the sRGB color space".to_string());
+        }
+        // SAFETY: as above.
         let bitmap = unsafe {
-            bitmap
-                .bitmapImageRepByConvertingToColorSpace_renderingIntent(
-                    &srgb,
-                    NSColorRenderingIntent::Perceptual,
-                )
-                .ok_or_else(|| {
-                    "window capture could not convert AppKit chrome to sRGB".to_string()
-                })?
+            appkit::send_id_id_isize(
+                bitmap,
+                sel!(bitmapImageRepByConvertingToColorSpace:renderingIntent:),
+                srgb,
+                NS_COLOR_RENDERING_INTENT_PERCEPTUAL,
+            )
         };
-        let properties =
-            NSDictionary::<NSBitmapImageRepPropertyKey, objc2::runtime::AnyObject>::new();
+        if bitmap.is_null() {
+            return Err("window capture could not convert AppKit chrome to sRGB".to_string());
+        }
+        // An EMPTY properties dictionary, exactly as the `objc2` form built. `+new`
+        // rather than `+dictionary` so the +1 is owned by this frame outright and its
+        // lifetime does not depend on which pool is innermost.
+        // SAFETY: `+[NSDictionary new]` is `+(instancetype)` and +1.
+        let Some(properties) = (unsafe {
+            Obj::from_owned(appkit::send_id(class(c"NSDictionary").as_id(), sel!(new)))
+        }) else {
+            return Err("window capture could not allocate AppKit chrome properties".to_string());
+        };
         // PNG standardizes the NSBitmapImageRep's implementation-defined channel
         // order and premultiplication into straight RGBA before Rust reads it.
+        //
+        // SAFETY: `-representationUsingType:properties:` is
+        // `-(NSData *)(NSBitmapImageFileType, NSDictionary *)` — the file type is an
+        // NSUInteger — on the live converted rep, with a live dictionary. +0.
         let png = unsafe {
-            bitmap
-                .representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
-                .ok_or_else(|| {
-                    "window capture could not encode the AppKit chrome bitmap".to_string()
-                })?
+            appkit::send_id_usize_id(
+                bitmap,
+                sel!(representationUsingType:properties:),
+                NS_BITMAP_IMAGE_FILE_TYPE_PNG,
+                properties.id(),
+            )
         };
-        let png_len = png.length();
+        if png.is_null() {
+            return Err("window capture could not encode the AppKit chrome bitmap".to_string());
+        }
+        // SAFETY: `-[NSData length]` is `-(NSUInteger)` on the live PNG data.
+        let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
         let mut png_bytes = vec![0_u8; png_len];
         if png_len != 0 {
-            // SAFETY: the Vec owns `png_len` initialized bytes and the non-null
-            // destination remains valid for the duration of NSData's bounded copy.
-            let destination =
-                std::ptr::NonNull::new(png_bytes.as_mut_ptr().cast()).ok_or_else(|| {
-                    "window capture could not allocate AppKit chrome bytes".to_string()
-                })?;
+            // SAFETY: `-getBytes:length:` is `-(void)(void *, NSUInteger)` and WRITES
+            // through the pointer, which is why the helper's argument is `*mut` and
+            // its encoding `^v` rather than the const `r^v`. The Vec owns exactly
+            // `png_len` initialized bytes, so the destination is valid and correctly
+            // sized for NSData's bounded copy — and `png_len` came from the receiver
+            // itself, so it cannot exceed the receiver's own length.
             unsafe {
-                png.getBytes_length(destination, png_len);
+                appkit::send_v_ptr_usize(
+                    png,
+                    sel!(getBytes:length:),
+                    png_bytes.as_mut_ptr().cast(),
+                    png_len,
+                );
             }
         }
         let (rgba, width, height) = decode_native_chrome_png(&png_bytes)?;
@@ -7221,28 +7418,41 @@ mod native_settings_compatibility_controls_tests {
 /// instead of an event-loop hang.
 #[cfg(target_os = "macos")]
 fn macos_view_is_ancestor_of(
-    ancestor: &objc2_app_kit::NSView,
-    descendant: &objc2_app_kit::NSView,
+    ancestor: aterm_objc::Id,
+    descendant: aterm_objc::Id,
 ) -> Result<bool, String> {
-    if std::ptr::eq(ancestor, descendant) {
+    use aterm_objc::sel;
+
+    if ancestor.is_null() || descendant.is_null() {
+        return Err("window capture walked a nil AppKit view".to_string());
+    }
+    if ancestor == descendant {
         return Ok(true);
     }
-    // SAFETY: side-effect-free superview reads on live NSViews, main thread only.
-    let mut current = unsafe { descendant.superview() };
+    // SAFETY: side-effect-free `-(NSView *)superview` reads on live NSViews, main
+    // thread only. Each answer is +0 and is only compared, never kept.
+    let mut current = unsafe { crate::appkit::send_id(descendant, sel!(superview)) };
     for _ in 0..64 {
-        let Some(view) = current else {
+        if current.is_null() {
             return Ok(false);
-        };
-        if std::ptr::eq(ancestor, &*view) {
+        }
+        if ancestor == current {
             return Ok(true);
         }
-        current = unsafe { view.superview() };
+        // SAFETY: as above.
+        current = unsafe { crate::appkit::send_id(current, sel!(superview)) };
     }
     Err("window capture found an invalid cyclic AppKit view hierarchy".to_string())
 }
 
+/// `NSRect` IS `CGRect`, and this signature is where the port says so.
+///
+/// Foundation's `NSRect` is a typedef of `CGRect` on 64-bit macOS — the runtime
+/// encodes both `{CGRect={CGPoint=dd}{CGSize=dd}}`, which is what every
+/// rect-returning helper in [`aterm_objc::send`] is cast to. So the type moved
+/// name without moving a byte.
 #[cfg(target_os = "macos")]
-fn macos_rect_is_finite(rect: objc2_foundation::NSRect) -> bool {
+fn macos_rect_is_finite(rect: aterm_objc::CGRect) -> bool {
     rect.origin.x.is_finite()
         && rect.origin.y.is_finite()
         && rect.size.width.is_finite()
@@ -7361,14 +7571,16 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
     // Normalize the platform image into the SAME explicit sRGB space as the
     // renderer-owned client and AppKit chrome overlay. DeviceRGB is
     // display-dependent and cannot truthfully be tagged sRGB in the output PNG.
-    let srgb_name = objc2_foundation::NSString::from_str("kCGColorSpaceSRGB");
-    // SAFETY: NSString is toll-free bridged to CFStringRef; CreateWithName returns
-    // a new colour-space object that the guard below releases exactly once.
-    let color_space: CGColorSpaceRef = unsafe {
-        CGColorSpaceCreateWithName(
-            (&*srgb_name as *const objc2_foundation::NSString).cast::<std::ffi::c_void>(),
-        )
+    let Some(srgb_name) = crate::appkit::nsstring("kCGColorSpaceSRGB") else {
+        return Err("window capture failed (could not name the sRGB color space)".to_string());
     };
+    // SAFETY: NSString is toll-free bridged to CFStringRef, so the +1 `Obj` above is
+    // a valid `CFStringRef` for this call and stays alive across it (it is dropped at
+    // the end of this function, long after `CreateWithName` has copied what it needs).
+    // `CreateWithName` returns a new colour-space object that the guard below releases
+    // exactly once.
+    let color_space: CGColorSpaceRef =
+        unsafe { CGColorSpaceCreateWithName(srgb_name.id().as_ptr().cast_const()) };
     if color_space.is_null() {
         return Err("window capture failed (could not create sRGB color space)".to_string());
     }
@@ -9008,11 +9220,19 @@ mod chrome_output_tests {
             .nth(1)
             .and_then(|tail| tail.split("fn current_window_rgba_of").next())
             .expect("native chrome capture source");
+        // W13 ported this path off `objc2`, so the spellings moved from that
+        // crate's generated method names to the SELECTORS themselves. Scanning for
+        // the selector is strictly stronger: it is what the runtime is actually
+        // sent, and it survives the next change of who provides the binding.
         assert!(
-            chrome.contains("bitmapImageRepByConvertingToColorSpace_renderingIntent"),
+            chrome.contains("sel!(bitmapImageRepByConvertingToColorSpace:renderingIntent:)"),
             "AppKit backing pixels need a real profile conversion before composition"
         );
-        assert!(chrome.contains("NSColorSpace::sRGBColorSpace"));
+        assert!(chrome.contains("sel!(sRGBColorSpace)"));
+        assert!(
+            chrome.contains("NS_COLOR_RENDERING_INTENT_PERCEPTUAL"),
+            "the conversion must name a rendering intent, not default to one"
+        );
 
         let ffi = include_str!("lib.rs");
         assert!(ffi.contains("pub fn CGColorSpaceCreateWithName"));
@@ -9306,7 +9526,7 @@ mod terminal_split_capture_tests {
         let mut gpu = match aterm_gpu::GpuRenderer::new(font_px, app.theme) {
             Ok(gpu) => gpu,
             Err(error) => {
-                eprintln!("SKIP: no headless GPU/font available: {error}");
+                crate::logging::stderr_line!("SKIP: no headless GPU/font available: {error}");
                 return;
             }
         };
@@ -9636,7 +9856,7 @@ mod terminal_split_capture_tests {
         let Some(mut renderer) =
             aterm_render::Renderer::from_system(16.0, aterm_render::Theme::default())
         else {
-            eprintln!("SKIP: no system monospace font");
+            crate::logging::stderr_line!("SKIP: no system monospace font");
             return;
         };
         let (cw, ch) = renderer.cell_size();

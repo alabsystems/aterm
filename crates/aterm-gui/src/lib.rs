@@ -213,6 +213,7 @@ mod selection_custody_conformance;
 // record (`Terminal::last_custody_transition`). Test-only, like its siblings.
 mod crash_signal;
 mod cwd_native;
+mod dataless_files;
 /// The DefTerm handoff broker: an STA thread with its own Win32 message pump,
 /// running BESIDE winit (winit stays the UI event loop; this is a satellite).
 /// Refuses to start while no COM handoff server can answer.
@@ -375,6 +376,7 @@ mod proxy;
 /// a per-session per-producer high-water mark, and an in-doubt outcome that is
 /// reported rather than replayed (design §6.5, §11.2).
 mod pty_idem;
+mod qos;
 mod quit_safety;
 mod restore;
 mod scroll_motion;
@@ -825,6 +827,120 @@ impl MetricsView {
 /// Half-period of the cursor blink: a `Blinking*` DECSCUSR cursor toggles
 /// on/off every this long (the classic terminal cadence).
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// The outcome of rolling a STALE blink deadline forward: where the next flip
+/// lands on the original phase grid, and whether the flips missed in between
+/// were an odd number — in which case the visible phase must toggle once so the
+/// cursor lands where a free-running one would be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaleBlinkRoll {
+    next: Instant,
+    phase_flips: bool,
+}
+
+/// Roll a blink deadline that has been STALE for at least one whole
+/// `BLINK_INTERVAL` forward, by whole half-periods, onto the first grid point
+/// strictly after `now`. `None` for a deadline still in the future, and ALSO
+/// for one expired by less than a half-period: that one is not stale, it is
+/// merely due, and `new_events` flips it on the very next pass.
+///
+/// PROVENANCE. Hand-port of commit `61a6c8b62` (`fix/event-loop-wake-spin-v2`,
+/// 2026-08-11) — a port, not a merge: main is ~2100 commits past that branch's
+/// base and the hunk no longer applies. On that branch this was a spin fix: the
+/// phase flip lived behind the terminal lock, so `about_to_wait`'s
+/// "engine mid-process" arm (reached exactly during an output flood, when
+/// `term.try_lock()` loses to the parser) re-folded the same expired instant
+/// forever, and a `WaitUntil` in the past never sleeps.
+///
+/// THAT PREMISE IS GONE ON MAIN, so this is narrower than the branch's hunk.
+/// The flip now runs in `new_events` under `ResumeTimeReached` with no
+/// terminal lock, and on the vendored macOS backend that cause is derived from
+/// the CLOCK, not from what woke the loop (`vendor/winit/.../macos/
+/// app_state.rs::wakeup`: a `WaitUntil` already in the past is
+/// `ResumeTimeReached` whatever woke it, and `observer.rs::start_at` turns it
+/// into an immediate wake). So an instant that expired mid-turn normally costs
+/// one past arm and is flipped on the next `new_events` — the same thing the
+/// `Some(true)` arm's `get_or_insert_with` does — and `metrics::record_deadline`
+/// backstops whatever remains. Rolling THAT case would move the flip a
+/// half-period out and drop a due toggle (a lost blink phase), which is why a
+/// merely-due deadline is excluded here.
+///
+/// What this handles is the genuinely STALE deadline, expired by a whole
+/// half-period or more, so at least one flip has already been missed: a single
+/// turn that outran the blink, or a pass on which `new_events` did not run at
+/// all (`wakeup` returns early inside a nested run loop, and the video,
+/// cursor-effect and presentation judges at the top of `new_events` exist
+/// because `WaitCancelled` pressure has been measured starving a due
+/// `WaitUntil`). Either way the roll stays on the ORIGINAL grid (rather than
+/// `now + BLINK_INTERVAL`) so the rhythm survives; because `BLINK_INTERVAL` is
+/// the HALF period, the missed flips' parity is reported so the caller can
+/// toggle the phase when it is odd. This composes with, and does not
+/// duplicate, the `record_deadline` heal: the roll runs first, hands it a
+/// future instant, and the heal's stale-arm counters stay honest about the
+/// owners that still arm the past.
+fn roll_stale_blink_forward(deadline: Instant, now: Instant) -> Option<StaleBlinkRoll> {
+    let overdue = now.checked_duration_since(deadline)?;
+    if overdue < BLINK_INTERVAL {
+        return None;
+    }
+    let missed = overdue.as_nanos() / BLINK_INTERVAL.as_nanos().max(1);
+    // Flips due at `deadline`, `deadline + 1`, ..., the last grid point <= now.
+    let flips = u32::try_from(missed.saturating_add(1)).unwrap_or(u32::MAX);
+    let next = deadline
+        .checked_add(BLINK_INTERVAL.saturating_mul(flips))
+        .unwrap_or(now + BLINK_INTERVAL);
+    Some(StaleBlinkRoll {
+        next,
+        phase_flips: flips % 2 == 1,
+    })
+}
+
+#[cfg(test)]
+mod blink_roll_tests {
+    use super::*;
+
+    #[test]
+    fn a_future_deadline_is_not_rolled() {
+        let now = Instant::now();
+        let armed = now + BLINK_INTERVAL / 3;
+        assert_eq!(roll_stale_blink_forward(armed, now), None);
+    }
+
+    /// Merely DUE is not stale: `new_events` flips this one on the next pass
+    /// (one past arm, backstopped by `record_deadline`). Rolling it would push
+    /// the flip a half-period out and drop the toggle that is owed.
+    #[test]
+    fn a_deadline_expired_by_less_than_a_half_period_is_left_for_new_events() {
+        let origin = Instant::now();
+        let now = origin + BLINK_INTERVAL / 2;
+        assert_eq!(roll_stale_blink_forward(origin, now), None);
+    }
+
+    /// The contract the roll rests on: whatever comes back is STRICTLY in the
+    /// future, sits on the original phase grid, and reports the parity of the
+    /// flips it skipped — 2.5 half-periods late means three flips were due
+    /// (origin, +1, +2), so the phase toggles and the next lands on +3.
+    #[test]
+    fn a_stale_deadline_lands_on_the_next_grid_point_and_reports_odd_flips() {
+        let origin = Instant::now();
+        let now = origin + BLINK_INTERVAL * 2 + BLINK_INTERVAL / 2;
+        let roll = roll_stale_blink_forward(origin, now).unwrap();
+        assert_eq!(roll.next, origin + BLINK_INTERVAL * 3);
+        assert!(roll.next > now);
+        assert!(roll.phase_flips);
+    }
+
+    /// Exactly one half-period late is the stale threshold: two flips were due
+    /// (origin and +1), an even number, so the phase is where it started and
+    /// the next flip lands on +2.
+    #[test]
+    fn exactly_one_half_period_late_rolls_two_flips_with_no_net_toggle() {
+        let origin = Instant::now();
+        let roll = roll_stale_blink_forward(origin, origin + BLINK_INTERVAL).unwrap();
+        assert_eq!(roll.next, origin + BLINK_INTERVAL * 2);
+        assert!(!roll.phase_flips);
+    }
+}
 
 /// SYNC-1 release classification grace: an expired frame-hold deadline is left
 /// armed this long so the release REDRAW (which reads the live sync state)
@@ -1507,7 +1623,7 @@ mod launch_alert_tests {
 /// which raises the same system alert from any thread — that thread is about
 /// to take the whole process down and must report first.
 fn fatal_launch_error(headless: bool, detail: &str) -> ! {
-    eprintln!("aterm-gui: {detail}");
+    crate::logging::stderr_line!("aterm-gui: {detail}");
     if launch_alert_wanted(
         headless,
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
@@ -3074,6 +3190,16 @@ enum Wake {
     /// delivered to the PTY (see `App::search_paste_in`). Never constructed off Linux.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     FindPasteReady { wid: WindowId, text: String },
+    /// An `aterm-document-admit` worker finished the BLOCKING half of a document
+    /// open (path resolution, the bounded read, UTF-8) for a file drop or an Open…
+    /// menu item — phase two of `App::request_document_tab_in_window`. The main
+    /// thread mints the grant and installs the tab in
+    /// `App::complete_document_admission`, matching the outcome to its pending
+    /// ticket; a closed window or a superseded read drops it. The read itself
+    /// (an evicted iCloud Drive download, a network volume's timeout) never ran
+    /// on this thread, which is the whole point. Boxed: the payload carries the
+    /// document text.
+    DocumentAdmitted(Box<app_documents::DocumentAdmissionOutcome>),
     /// The multi-line paste SHEET was answered (macOS). The pastejacking confirmation
     /// is a window sheet rather than an app-modal `NSAlert` so it cannot block the
     /// event loop. It does NOT follow that the sheet reliably receives Return: an
@@ -4874,7 +5000,7 @@ fn apply_font_config_to_backend(
         let bytes = match aterm_render::font_file::read_font_file(std::path::Path::new(path)) {
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: config {key}: {path:?} failed bounded font admission \
                      ({error}); keeping the current working face"
                 );
@@ -4887,7 +5013,7 @@ fn apply_font_config_to_backend(
             backend.set_styled_font(slot, &bytes)
         };
         if let Err(error) = result {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: config {key}: {path:?} rejected ({error}); \
                  keeping the current working face"
             );
@@ -11617,6 +11743,13 @@ struct App {
     /// notification center references its observer weakly. `None` before the
     /// first window attaches / off macOS / headless.
     _reduce_motion: Option<platform::ReduceMotionObserver>,
+    /// The value of `aterm_objc::contained_count()` at the last turn. An
+    /// `NSException` contained inside a declared Objective-C method is an
+    /// EVENT to this loop: the method answered its inert zero instead of what
+    /// AppKit asked for, so on the next turn [`App::note_objc_containments`]
+    /// re-requests a redraw and re-reads the modifier state. Always `0` off
+    /// macOS.
+    objc_contained_seen: u64,
     /// Process-global pool that owns every live `Session`, keyed by stable id and
     /// refcounted by terminal-view count. Canonical [`tab_model::View::Terminal`]
     /// entries reference this pool; a native-only workspace leaves it empty. A
@@ -12609,6 +12742,17 @@ impl Drop for App {
         let _ = self.video_abort_app_shutdown();
     }
 }
+
+/// The paste a multi-line confirmation sheet is still holding, shared between
+/// this frame and the sheet's completion block.
+///
+/// It is an `Rc` and it starts EMPTY, and both halves earn their keep — see
+/// [`App::present_multiline_paste_sheet`], where the text goes in only after
+/// every fallible step has succeeded, so a failure there can hand the paste back
+/// to the caller instead of dropping it inside a block that will never be called.
+#[cfg(target_os = "macos")]
+type PasteConfirmPayload =
+    std::rc::Rc<std::cell::RefCell<Option<(WindowId, String, Source, input::PasteFraming)>>>;
 
 impl App {
     /// Read-only effective serious-mode status for menu/palette/control wiring.
@@ -14592,7 +14736,7 @@ impl App {
             // is exactly that. What actually narrows the window is `Once` plus
             // position: one write, at the first harness construction, before
             // that harness's test can reach `Staging::resolve` — and the tests
-            // that must never race it (`github.rs::scratch_staging`) already
+            // that must never race it (`aterm_update::paths::Staging::scratch`) already
             // build their staging by hand for this very reason. This override
             // is deliberately process-permanent; set-and-restore would let a
             // later test stage under the REAL per-user ledger again.
@@ -14702,6 +14846,7 @@ impl App {
             apprt,
             system_reduce_motion: false,
             _reduce_motion: None,
+            objc_contained_seen: 0,
             pool,
             link_estimates: HashMap::new(),
             find_origins: HashMap::new(),
@@ -15168,7 +15313,7 @@ impl App {
         if let Some(reason) = refusal {
             // The same two-channel answer every impossible gesture gives: the
             // card answers the person, the log answers the investigator.
-            eprintln!("aterm-gui: {reason}");
+            crate::logging::stderr_line!("aterm-gui: {reason}");
             self.surface_gesture_failure(&format!("✕ {reason}"));
             return Err(reason);
         }
@@ -15261,7 +15406,7 @@ impl App {
                 // The `New tab` / `New window` shape: the log carries the whole
                 // error, the card carries its first line to the person who
                 // pressed the key and saw nothing happen.
-                eprintln!("aterm-gui: could not split the pane: {e}");
+                crate::logging::stderr_line!("aterm-gui: could not split the pane: {e}");
                 self.surface_gesture_failure(&format!("✕ Split failed: {e}"));
                 Err(format!("could not split the pane: {e}"))
             }
@@ -15627,6 +15772,47 @@ impl App {
         }
     }
 
+    /// Treat every `NSException` contained since the last turn as an event.
+    ///
+    /// `aterm_objc::exception` catches an exception AppKit raises inside a
+    /// declared method, logs it (see `logging::install_objc_containment_sink`)
+    /// and makes the method answer its inert zero — `nil`, `NO`, `0` — instead
+    /// of what AppKit asked for. That is the right thing for the method to do
+    /// and the wrong thing for the app to leave alone: a `drawRect:` that
+    /// answered nothing left a frame unpainted, a `flagsChanged:` that answered
+    /// nothing left winit's modifier state stale. So on the next turn every
+    /// window is asked to redraw, and each focused window's modifier state is
+    /// re-read from winit's own event-derived cache (never a WindowServer-backed
+    /// probe — tools/grep_guard.sh B9a) rather than waiting for a
+    /// `ModifiersChanged` that may never come.
+    #[cfg(target_os = "macos")]
+    fn note_objc_containments(&mut self) {
+        let now = aterm_objc::contained_count();
+        if now == self.objc_contained_seen {
+            return;
+        }
+        let since = now.saturating_sub(self.objc_contained_seen);
+        self.objc_contained_seen = now;
+        aterm_log::warn!(
+            "objc: {since} NSException(s) contained since the last turn (total {now}); \
+             redrawing every window and re-reading the modifier state"
+        );
+        self.request_redraw_all_windows();
+        let focused: Vec<(WindowId, ModifiersState)> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| ws.focused)
+            .filter_map(|(wid, ws)| {
+                ws.os_window
+                    .as_ref()
+                    .map(|w| (*wid, platform::cached_modifiers(w)))
+            })
+            .collect();
+        for (wid, mods) in focused {
+            self.on_modifiers_changed(wid, mods);
+        }
+    }
+
     /// Accept every platform modifier snapshot as authoritative.
     ///
     /// Focus loss clears the cached snapshot in [`Self::on_focus`], but a backend
@@ -15711,11 +15897,12 @@ impl App {
             && self.bell_beep.try_fire(now)
         {
             // The user's configured macOS alert sound. AppKit is already
-            // in-process (winit); safe to call from the main thread.
+            // in-process (winit); safe to call from the main thread. `NSBeep`
+            // is a C FUNCTION, not a message, so `appkit::beep` is a plain
+            // call with no receiver, no selector and no `unsafe` at this site —
+            // see its binding for why that is sound rather than merely tidy.
             #[cfg(target_os = "macos")]
-            unsafe {
-                objc2_app_kit::NSBeep();
-            }
+            crate::appkit::beep();
             // Windows twin: the default system sound (honours the user's sound
             // scheme, including a muted one), behind the same rate-limit gate.
             #[cfg(windows)]
@@ -16062,11 +16249,12 @@ impl App {
         source: Source,
         framing: input::PasteFraming,
     ) -> Option<String> {
-        use objc2_app_kit::{NSAlert, NSView};
-        use objc2_foundation::{MainThreadMarker, NSString};
+        use aterm_objc::{Id, Obj, RcBlock, Sel, class, sel};
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-        let Some(mtm) = MainThreadMarker::new() else {
+        use crate::appkit::{self, MainThread};
+
+        let Some(mtm) = MainThread::new() else {
             return Some(text);
         };
         let Some(proxy) = self.proxy.clone() else {
@@ -16103,11 +16291,15 @@ impl App {
             .and_then(|handle| match handle.as_raw() {
                 // SAFETY: `ns_view` points at this window's live NSView (owned by winit
                 // for the window's lifetime); borrowed only on the main thread, as
-                // AppKit requires, to read its `window`.
-                RawWindowHandle::AppKit(h) => {
-                    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
-                    view.window()
-                }
+                // AppKit requires, to read its `window`. `-[NSView window]` is
+                // `-(NSWindow *)` and +0, so the result is RETAINED into `Obj` — the
+                // sheet outlives this expression and `PasteConfirm` holds the window
+                // for its `attachedSheet` test, which is the retain `objc2`'s
+                // `Retained<NSWindow>` return carried here.
+                RawWindowHandle::AppKit(h) => unsafe {
+                    let view = Id::from_ptr(h.ns_view.as_ptr());
+                    Obj::retain(appkit::send_id(view, sel!(window)))
+                },
                 _ => None,
             });
         let Some(ns_window) = ns_window else {
@@ -16124,12 +16316,33 @@ impl App {
         // The sheet's DEC 2004 reading rides with the text for the same reason the
         // Linux banner parks it: the answer is delivered later still, and the mode
         // may have moved by then.
-        let payload = std::cell::RefCell::new(Some((wid, text, source, framing)));
-        let handler = block2::RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
-            let Some((wid, text, source, framing)) = payload.borrow_mut().take() else {
+        //
+        // THE CELL IS SHARED AND STARTS EMPTY, and both halves of that are the port's
+        // doing. `objc2`'s form moved the text into a plain `RefCell` HERE, before
+        // the block existed, because every fallible step in this function came
+        // earlier and `block2`'s constructor could not fail. The first-party
+        // `RcBlock::new1` CAN return `None` (a `_Block_copy` that could not
+        // allocate), and so can `nsstring`/`+[NSAlert new]` below — and each of those
+        // paths owes the caller its `text` back so the paste can fall back rather
+        // than vanish. A cell moved into the closure is unreachable once the closure
+        // is built, so the cell is an `Rc` the frame keeps a handle to, and the text
+        // goes into it only after every fallible step has succeeded — which also
+        // means the sheet is never armed over an empty payload.
+        let payload: PasteConfirmPayload = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handler_payload = std::rc::Rc::clone(&payload);
+        // Bound FIRST and wrapped SECOND, so nothing inside the completion inherits
+        // the constructor's `unsafe` context — the shape `app_launch_successor.rs`
+        // records. Nothing in this body is unsafe at all, which is the point: the
+        // whole ABI question lives in the one `RcBlock::new1` below. It is an
+        // `aterm_objc::RcBlock`, so the completion runs under the same guarded
+        // trampoline every declared method does (an `NSException` raised inside it
+        // is contained and reported, not a `nounwind`-frame abort). The response
+        // is `NSModalResponse`, i.e. `NSInteger`.
+        let completion = move |response: isize| {
+            let Some((wid, text, source, framing)) = handler_payload.borrow_mut().take() else {
                 return;
             };
-            let proceed = response == objc2_app_kit::NSAlertFirstButtonReturn;
+            let proceed = response == appkit::consts::NS_ALERT_FIRST_BUTTON_RETURN;
             let _ = proxy.send_event(Wake::PasteConfirmed {
                 id,
                 wid,
@@ -16138,32 +16351,105 @@ impl App {
                 framing,
                 proceed,
             });
-        });
+        };
+        // SAFETY: `-beginSheetModalForWindow:completionHandler:` calls the block as
+        // `void (^)(NSModalResponse)`, the `(isize) -> ()` prototype `new1` builds
+        // (`NSModalResponse` is `NSInteger`, `Encode`-`"q"`); nothing unwinds out of
+        // its `invoke`.
+        let Some(handler) = (unsafe { RcBlock::new1(completion) }) else {
+            return Some(text);
+        };
 
-        // SAFETY: standard NSAlert construction + `beginSheetModalForWindow:` on the
-        // main thread (`mtm` proves it), against a live NSWindow retained by winit.
-        // `window` / `addButtonWithTitle:` are plain accessors on the fresh alert.
-        let (panel, accept, cancel) = unsafe {
-            let alert = NSAlert::new(mtm);
-            alert.setMessageText(&NSString::from_str("Paste multiple lines?"));
-            alert.setInformativeText(&NSString::from_str(&format!(
+        // `mtm` is the main-thread witness this whole path stands on; it is consumed
+        // here so it cannot be read as decoration. `NSAlert` is main-thread-only and
+        // the sheet is attached below, both under the proof `MainThread::new()` gave.
+        let _: crate::appkit::MainThread = mtm;
+        let (Some(message), Some(informative), Some(paste_title), Some(cancel_title)) = (
+            appkit::nsstring("Paste multiple lines?"),
+            appkit::nsstring(&format!(
                 "The clipboard holds {lines} lines and bracketed paste is off, so each line \
                  could run as a command. Paste anyway?"
-            )));
+            )),
+            appkit::nsstring("Paste"),
+            appkit::nsstring("Cancel"),
+        ) else {
+            return Some(text);
+        };
+        // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1, adopted by
+        // `Obj::from_owned`.
+        let Some(alert) =
+            (unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) })
+        else {
+            return Some(text);
+        };
+        // SAFETY: standard NSAlert setters + `-beginSheetModalForWindow:
+        // completionHandler:` on the main thread (`mtm` proved it above), against a
+        // live NSWindow this frame retains. `-setMessageText:`/`-setInformativeText:`
+        // are `-(void)(NSString *)` and COPY, so the +1 strings may drop at the end of
+        // this frame. `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and
+        // `-window` is `-(NSWindow *)`, both +0 and therefore RETAINED into `Obj`
+        // rather than adopted — the retain `objc2`'s `Retained` returns carried. The
+        // sheet call is `-(void)(NSWindow *, void (^)(NSModalResponse))`, so the last
+        // parameter is a `BlockPtr`: a block is `@?` to the runtime, not `@`.
+        // AppKit COPIES the block, so `handler` may drop when this function returns.
+        let (panel, accept, cancel) = unsafe {
+            appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
+            appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
             // First button added is the default (AppKit gives it Return with an EMPTY
             // modifier mask, which is why `alert_keys` has to route ⌘Return itself);
             // Cancel takes Escape. Both are retained for the key interceptor to click.
-            let accept = alert.addButtonWithTitle(&NSString::from_str("Paste"));
-            let cancel = alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            let panel = alert.window();
-            alert.beginSheetModalForWindow_completionHandler(&ns_window, Some(&handler));
+            let accept = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                paste_title.id(),
+            ));
+            let cancel = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                cancel_title.id(),
+            ));
+            let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
+            // ARMED HERE, one statement before the sheet goes up: every fallible
+            // step above has succeeded, so the completion can no longer find an
+            // empty cell for a sheet that is really on screen.
+            *payload.borrow_mut() = Some((wid, text, source, framing));
+            // `-beginSheetModalForWindow:completionHandler:` is `v@:@@?`, so the
+            // last parameter is a `BlockPtr`; AppKit copies the block, so
+            // `handler`'s own reference may drop at the end of this function.
+            let begin_sheet: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
+                aterm_objc::msg();
+            begin_sheet(
+                alert.id(),
+                sel!(beginSheetModalForWindow:completionHandler:),
+                ns_window.id(),
+                handler.as_block_ptr(),
+            );
             (panel, accept, cancel)
         };
         // Watch the keys for exactly as long as this entry lives. Installed AFTER the
         // sheet is up so the monitor's own liveness test (`attachedSheet`) is already
         // true for the very first keystroke.
-        let keys =
-            alert_keys::watch_alert_keys(panel.clone(), Some(ns_window.clone()), accept, cancel);
+        //
+        // FROM HERE ON THE SHEET IS UP, so no path may hand `text` back: the caller's
+        // fallback would paste immediately, underneath a confirmation the user is
+        // still being asked. `None` — "the answer is owed" — is the only correct
+        // return, and it is correct even in the degraded arms below, because the
+        // completion handler is already installed and will deliver through
+        // `Wake::PasteConfirmed` whichever way the person answers.
+        //
+        // A missing button or panel means there is nothing for the interceptor to
+        // click, so it is simply not installed — the same degradation
+        // `watch_alert_keys` documents for the case where AppKit declines the
+        // monitor. The sheet still answers by mouse and by its own stock keys.
+        let keys = match (panel.as_ref(), accept, cancel) {
+            (Some(panel), Some(accept), Some(cancel)) => alert_keys::watch_alert_keys(
+                panel.clone_retained(),
+                Some(ns_window.clone_retained()),
+                accept,
+                cancel,
+            ),
+            _ => None,
+        };
         if keys.is_none() {
             aterm_log::warn!(
                 "multiline-paste sheet: AppKit declined a local key monitor; the sheet \
@@ -16171,6 +16457,18 @@ impl App {
                  will not answer it",
             );
         }
+        // The entry needs the alert's own panel for its `attachedSheet` liveness
+        // test. Without it the one-at-a-time bookkeeping is lost — a second paste
+        // could stack a second sheet — but the sheet on screen still answers, which
+        // is why this degrades rather than refuses.
+        let Some(panel) = panel else {
+            aterm_log::warn!(
+                "multiline-paste sheet: the alert reported no panel, so this \
+                 confirmation is not tracked; it will still answer, but a second \
+                 multi-line paste could stack a second sheet",
+            );
+            return None;
+        };
         self.paste_confirm = Some(alert_keys::PasteConfirm::new(
             id, wid, ns_window, panel, keys,
         ));
@@ -16294,10 +16592,11 @@ impl App {
     /// repaint (the Cmd-V path relies on the same echo).
     fn drop_file(&mut self, wid: WindowId, path: &std::path::Path) {
         // Native document tabs consume the gesture as a document open. The URI
-        // conversion is only syntax: `open_document_tab_in_window` still mints the
-        // real bounded local-file grant, canonicalizes the target, and validates
-        // UTF-8. Settings and future non-document apps consume no ambient file
-        // authority and do not leak a path into a parked terminal session.
+        // conversion is only syntax: `request_document_tab_in_window` still mints
+        // the real bounded local-file grant, canonicalizes the target, and
+        // validates UTF-8 (on the admission worker). Settings and future
+        // non-document apps consume no ambient file authority and do not leak a
+        // path into a parked terminal session.
         if let Some((instance, _)) = self.active_native_view(wid) {
             if let Some(
                 kind @ (crate::native_app::AppKind::Markdown | crate::native_app::AppKind::Editor),
@@ -16306,11 +16605,18 @@ impl App {
                 .app(instance)
                 .map(crate::native_app::NativeApp::kind)
             {
+                // Two-phase: the read runs on an `aterm-document-admit` worker and
+                // `Wake::DocumentAdmitted` installs the tab, so a dropped file that
+                // is evicted from iCloud Drive (or lives on an unreachable volume)
+                // cannot stall this thread. An error HERE is a request-shape
+                // problem; a read failure is reported by the completion arm.
                 let result = crate::native_document_host::path_to_file_uri(path)
                     .map_err(|error| error.to_string())
-                    .and_then(|uri| self.open_document_tab_in_window(wid, kind, &uri));
+                    .and_then(|uri| self.request_document_tab_in_window(wid, kind, &uri));
                 if let Err(error) = result {
-                    eprintln!("aterm-gui: dropped document was not opened: {error}");
+                    crate::logging::stderr_line!(
+                        "aterm-gui: dropped document was not opened: {error}"
+                    );
                 }
             }
             return;
@@ -16518,7 +16824,7 @@ impl App {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                eprintln!(
+                crate::logging::stderr_line!(
                     "aterm-gui: deferred GPU build declined ({error}); \
                      the CPU renderer keeps serving captures"
                 );
@@ -16536,13 +16842,15 @@ impl App {
             Err(error) => {
                 // The same sentence the boot build prints, for the same reason:
                 // the run continues on the CPU renderer.
-                eprintln!("aterm-gui: GPU unavailable ({error}); using CPU renderer");
+                crate::logging::stderr_line!(
+                    "aterm-gui: GPU unavailable ({error}); using CPU renderer"
+                );
                 self.settle_on_cpu_renderer();
                 return;
             }
         };
         let (name, adapter_backend) = gpu.adapter();
-        eprintln!("aterm-gui: GPU rendering on {name} ({adapter_backend})");
+        crate::logging::stderr_line!("aterm-gui: GPU rendering on {name} ({adapter_backend})");
         gpu.install_prepared_font(family, prepared, self.theme);
         // Geometry is renderer state, and a fresh backend starts at zero.
         let pad = self.backend.pad();
@@ -17158,6 +17466,10 @@ impl ApplicationHandler<Wake> for App {
         if !matches!(cause, StartCause::Init) {
             crate::watchdog::beat(crate::watchdog::Breadcrumb::NewEvents);
         }
+        // A contained NSException since the last turn is an event: whatever the
+        // contained method was answering, it answered "nothing", so re-request.
+        #[cfg(target_os = "macos")]
+        self.note_objc_containments();
         // VIDEO wake judgment, on EVERY cause (the v0.51 law: a clock is armed
         // only on evidence its judge will actually see). `fold_video_deadlines`
         // re-arms `deadline`/`next_frame` on every `about_to_wait` turn, but
@@ -17874,7 +18186,41 @@ impl ApplicationHandler<Wake> for App {
                     // Engine mid-process: leave blink state untouched and keep
                     // folding any already-armed deadline so blinking continues
                     // uninterrupted once the burst clears.
-                    if let Some(d) = ws.next_blink {
+                    //
+                    // PORT NOTE (61a6c8b62, `fix/event-loop-wake-spin-v2`). On
+                    // that branch this arm was a spin: the flip needed the very
+                    // lock it just failed to take, so an expired instant was
+                    // re-folded forever and a past `WaitUntil` never sleeps. On
+                    // main the flip runs lock-free in `new_events` under
+                    // `ResumeTimeReached`, which the vendored macOS backend
+                    // derives from the clock (a past `WaitUntil` is
+                    // `ResumeTimeReached` whatever woke the loop, and wakes
+                    // immediately), so an instant that expired MID-TURN is
+                    // normally flipped on the next `new_events` at the cost of
+                    // one past arm — exactly what the `Some(true)` arm above
+                    // also does, and what `record_deadline` backstops. It is
+                    // deliberately left alone: rolling it would drop a due
+                    // toggle. Only a deadline stale by a whole half-period —
+                    // a turn that outran the blink, or a pass that skipped
+                    // `new_events` under the `WaitCancelled` pressure its
+                    // every-wake judges guard against — is rolled, on its own
+                    // grid, replaying the missed flips' parity so the cursor
+                    // lands where a free-running one would. See
+                    // `roll_stale_blink_forward`.
+                    if let Some(armed) = ws.next_blink {
+                        let d = match roll_stale_blink_forward(armed, Instant::now()) {
+                            Some(roll) => {
+                                if roll.phase_flips {
+                                    ws.blink_phase = !ws.blink_phase;
+                                    if let Some(w) = ws.os_window.as_ref() {
+                                        w.request_redraw();
+                                    }
+                                }
+                                ws.next_blink = Some(roll.next);
+                                roll.next
+                            }
+                            None => armed,
+                        };
                         fold_owned_deadline(
                             &mut deadline,
                             &mut deadline_owner,
@@ -18559,7 +18905,9 @@ impl ApplicationHandler<Wake> for App {
             // The FIRST/only window's GPU surface failed: there is no other window to
             // keep the app alive and no CPU fallback in GPU mode — exit rather than
             // run blind with a black screen.
-            eprintln!("aterm-gui: could not create the initial window surface; exiting");
+            crate::logging::stderr_line!(
+                "aterm-gui: could not create the initial window surface; exiting"
+            );
             el.exit();
             return;
         }
@@ -20253,6 +20601,28 @@ impl ApplicationHandler<Wake> for App {
             Wake::FindPasteReady { wid, text } => {
                 self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
             }
+            // A document admission worker reported. A read failure gets the same
+            // reporting the synchronous gesture paths used: the line on stderr for
+            // the log, and the user-facing notice — an evicted iCloud file says so,
+            // in words the user can act on. A completion for a window that has
+            // since closed (or a superseded ticket) is dropped with the log line
+            // only; nobody is waiting for it.
+            Wake::DocumentAdmitted(outcome) => match self.complete_document_admission(*outcome) {
+                Ok(_) => {}
+                Err(rejected @ app_documents::DocumentAdmissionRejected::Dropped(_)) => {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: document admission dropped: {}",
+                        rejected.detail()
+                    );
+                }
+                Err(rejected @ app_documents::DocumentAdmissionRejected::Failed(_)) => {
+                    crate::logging::stderr_line!(
+                        "aterm-gui: document was not opened: {}",
+                        rejected.detail()
+                    );
+                    menu::notify("Couldn’t Open File", rejected.detail());
+                }
+            },
             // The pastejacking sheet was answered. `deliver_paste_confirmed` (not
             // `deliver_paste`) so the guard does not ask a second time.
             Wake::PasteConfirmed {
@@ -22300,7 +22670,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // closed every enumerable named descriptor exactly once and cleared the
         // authority environment. Stop before helpers, sessions, or user code can
         // reuse one of those descriptor numbers.
-        eprintln!("aterm-gui: rejected malformed inherited handoff");
+        crate::logging::stderr_line!("aterm-gui: rejected malformed inherited handoff");
         return;
     }
     // A GUI-subsystem exe (see the binaries' `windows_subsystem` attribute) has
@@ -22337,6 +22707,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Diagnostics first, before any thread spawns: without a logger every
     // aterm_log record — including containment_audit denials — is discarded.
     logging::init();
+    // The event-loop thread never waits for an iCloud Drive download (macOS;
+    // no-op elsewhere): a dataless read on THIS thread fails fast as
+    // `NotDownloaded` instead of stalling into the watchdog. Thread-scoped, so
+    // the document admission workers that opt back in are unaffected.
+    if let Err(errno) = dataless_files::main_thread_never_materializes() {
+        logging::stderr_line!(
+            "aterm-gui: could not disable dataless-file materialization on the main \
+             thread (errno {errno}); an evicted iCloud file may still stall it"
+        );
+    }
+    // And the Objective-C exception-containment sink right behind it, so a
+    // contained NSException lands in aterm.log with its method, name, reason
+    // and call stack from the first turn of the run loop.
+    #[cfg(target_os = "macos")]
+    logging::install_objc_containment_sink();
     // B3 — PROCESS-GROUP CONTAINMENT, successor side (see
     // `tests/handoff_launchd_job.rs` and `app_update_handoff`). A process that
     // arrived through an update handoff is a CANDIDATE: the parent that started
@@ -22388,7 +22773,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             "handoff candidate cannot lead its own process group (kernel reports pgid {group} for \
              pid {own}); refusing to start update logic whose helpers no reaper could sweep"
         );
-        eprintln!("aterm-gui: handoff candidate could not contain its own process group");
+        crate::logging::stderr_line!(
+            "aterm-gui: handoff candidate could not contain its own process group"
+        );
         return;
     }
     // Self-update apply, BEFORE any thread spawn or window: if a previous run
@@ -22448,7 +22835,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // The log is the durable one; stderr stays for a TTY launch.
         ref other => {
             aterm_log::warn!("update apply (boot): {other:?}");
-            eprintln!("aterm-gui: update apply: {other:?}");
+            crate::logging::stderr_line!("aterm-gui: update apply: {other:?}");
         }
     }
     // Post-update "leveled-up" handoff: `ATERM_UPDATED_FROM` is set by
@@ -22534,7 +22921,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                      ({error}); exiting before any window so the outgoing process keeps every \
                      session"
                 );
-                eprintln!("aterm-gui: overlap handoff could not be claimed: {error}");
+                crate::logging::stderr_line!(
+                    "aterm-gui: overlap handoff could not be claimed: {error}"
+                );
                 // This launch COUNTED a boot-trial launch for its build moments ago
                 // (`check_boot_health`, inside the boot apply above), and it is now
                 // exiting BY RULE — the outgoing process gave up before the transfer
@@ -22665,7 +23054,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // most restrictive mode, and log the rejection rather than silently widening.
     let containment_mode = aterm_containment::init_mode_from_env(ContainmentMode::User)
         .unwrap_or_else(|e| {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: invalid ATERM_CONTAINMENT_MODE ({e}); falling back to \
                  Containment (most restrictive)"
             );
@@ -22675,7 +23064,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             ContainmentMode::Containment
         });
     if verbose() {
-        eprintln!("aterm-gui: containment mode = {containment_mode}");
+        crate::logging::stderr_line!("aterm-gui: containment mode = {containment_mode}");
     }
     // $ATERM_HEADLESS: bind the control socket and run the engine + offscreen
     // renderer without ever opening a window (clean automated introspection).
@@ -22707,14 +23096,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             .as_deref(),
     ) {
         cli::HeadlessArming::Armed(source) => {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: headless mode (armed by {}): no window; engine + control socket only",
                 source.as_str()
             );
             true
         }
         cli::HeadlessArming::Refused(value) => {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: $ATERM_HEADLESS=\"{value}\" does NOT arm headless mode \
                  (0/off/empty disable it) — starting WINDOWED. Pass --headless (or set \
                  ATERM_HEADLESS=1) if a window was not what you meant."
@@ -22779,7 +23168,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // config-file edit cannot pair config A with assets for config B.
     let mut native_config_service = native_config_service::VersionedConfigService::load_current()
         .unwrap_or_else(|error| {
-            eprintln!("aterm-gui: native config service: {error}");
+            crate::logging::stderr_line!("aterm-gui: native config service: {error}");
             native_config_service::VersionedConfigService::new_runtime(String::new())
                 .expect("empty config is valid TOML")
         });
@@ -22903,7 +23292,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         && config.background_material_or_default() != app_config::BackgroundMaterial::None
     {
         if config.hdr_glow_or_default() {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: background_material and hdr_glow are mutually exclusive on Windows \
                  (the DirectComposition backdrop swapchain cannot carry the scRGB EDR tag); \
                  keeping hdr_glow — set hdr_glow = false to see the backdrop"
@@ -22987,7 +23376,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // makes the race benign — whoever arrives second gets the finished value.
     std::thread::Builder::new()
         .name("aterm-chrome-font-warm".into())
-        .spawn(crate::tray_raster::warm_chrome_font_assets)
+        .spawn(|| {
+            // QoS (port of 61a6c8b62): `Responsive`, NOT `Background` as the
+            // branch had it. This warm initialises the `prepared_ui_font_assets`
+            // `OnceLock` (and takes `lock_fonts()`), and the UI thread's first
+            // chrome raster blocks on that very init if it arrives mid-parse.
+            // A `OnceLock` in progress is a lock the UI thread contends, and a
+            // demoted initialiser is a priority inversion — the UI thread would
+            // wait at USER_INTERACTIVE on an E-core-parked UTILITY parse. At
+            // USER_INITIATED the warm still never outranks the UI thread; it
+            // only stops sitting descheduled underneath it.
+            crate::qos::set_self(crate::qos::Role::Responsive);
+            crate::tray_raster::warm_chrome_font_assets();
+        })
         .ok();
     let (startup_font_tx, startup_font_rx) =
         std::sync::mpsc::sync_channel::<StartupFontGeneration>(1);
@@ -23031,11 +23432,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             ) {
                 Ok(g) => {
                     let (name, backend) = g.adapter();
-                    eprintln!("aterm-gui: GPU rendering on {name} ({backend})");
+                    crate::logging::stderr_line!("aterm-gui: GPU rendering on {name} ({backend})");
                     (Backend::Gpu(GpuBackend::new(g)), true)
                 }
                 Err(e) => {
-                    eprintln!("aterm-gui: GPU unavailable ({e}); using CPU renderer");
+                    crate::logging::stderr_line!(
+                        "aterm-gui: GPU unavailable ({e}); using CPU renderer"
+                    );
                     // H1 (Windows Mica/Acrylic): withdraw the visual-swapchain
                     // request so windows attached AFTER this failure are created
                     // WITHOUT `WS_EX_NOREDIRECTIONBITMAP` (softbuffer needs the
@@ -23047,7 +23450,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                     #[cfg(windows)]
                     if aterm_gpu::dx12_visual_swapchain_requested() {
                         aterm_gpu::withdraw_dx12_visual_swapchain();
-                        eprintln!(
+                        crate::logging::stderr_line!(
                             "aterm-gui: background_material needs the GPU renderer; the backdrop \
                              is disabled this run (an already-created window may render blank — \
                              remove background_material or fix the GPU to recover)"
@@ -23276,7 +23679,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         } => {
             if os_sandbox {
                 if verbose() {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: containment mode {mode}: OS sandbox ACTUATED \
                          (sandbox-exec '(deny network*)' + conservative secret-dir read/write deny \
                          ~/.ssh ~/.aws ~/.gnupg ~/.config/gh ~/.config/aterm ~/.netrc); \
@@ -23294,13 +23697,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 // is a cap-gated no-op there) and the notice must never overstate
                 // the posture; the Unix bytes are unchanged.
                 if cfg!(windows) {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: containment mode {mode}: OS sandbox NOT actuated \
                          (capability gate only; no resource limits on this platform); \
                          see aterm-containment::actuator"
                     );
                 } else {
-                    eprintln!(
+                    crate::logging::stderr_line!(
                         "aterm-gui: containment mode {mode}: OS sandbox NOT actuated \
                          (rlimits + capability gate only); see aterm-containment::actuator"
                     );
@@ -23708,7 +24111,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     )
     .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
     if adopting {
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: SEAMLESS update — re-adopted the running shell (pid {}); no relaunch of the session",
             session0.pid
         );
@@ -23888,7 +24291,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             Ok((runtime, control)) => (Some(runtime), Some(control)),
             Err(error) => {
                 aterm_log::warn!("{error}; operator observation disabled");
-                eprintln!("aterm-gui: {error}; operator observation disabled");
+                crate::logging::stderr_line!("aterm-gui: {error}; operator observation disabled");
                 (None, None)
             }
         }
@@ -23919,7 +24322,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         }
         control_auth::SocketResolution::Disabled => {
             aterm_log::warn!("control socket disabled by environment");
-            eprintln!("aterm-gui: control socket disabled by environment");
+            crate::logging::stderr_line!("aterm-gui: control socket disabled by environment");
             None
         }
         control_auth::SocketResolution::NoDir => {
@@ -23927,7 +24330,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 "no per-user runtime dir (set XDG_RUNTIME_DIR, HOME, or ATERM_CONTROL_SOCK); \
                  control socket disabled"
             );
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: no per-user runtime dir (set XDG_RUNTIME_DIR, HOME, or \
                  ATERM_CONTROL_SOCK); control socket disabled"
             );
@@ -23942,7 +24345,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                  unix-socket path limit; control socket disabled (use a shorter path)",
                 path.len()
             );
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: ATERM_CONTROL_SOCK path is {} bytes — exceeds this platform's \
                  {limit}-byte unix-socket path limit; control socket disabled (use a shorter path)",
                 path.len()
@@ -24002,11 +24405,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // now share this one already-compiled generation.
     let prepared_path_feeds = match config_runtime_handle {
         Ok(handle) => handle.join().unwrap_or_else(|_| {
-            eprintln!("aterm-gui: config-runtime worker panicked; preparing inline");
+            crate::logging::stderr_line!(
+                "aterm-gui: config-runtime worker panicked; preparing inline"
+            );
             config.prepare_path_feed_generation()
         }),
         Err(error) => {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: could not start config-runtime worker ({error}); preparing inline"
             );
             config.prepare_path_feed_generation()
@@ -24090,7 +24495,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         cfg_warns.push(crash_notice);
     }
     for w in &cfg_warns {
-        eprintln!("aterm-gui: {w}");
+        crate::logging::stderr_line!("aterm-gui: {w}");
     }
     // Seed the process-global search index depth cap (config `search_history_lines`)
     // before any ⌘F / socket `search` builds an index. Re-derived on config reload.
@@ -24101,22 +24506,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         None
     } else {
         app_native::spawn_native_update_reconcile_worker(proxy.clone())
-            .map_err(|error| eprintln!("aterm-gui: {error}"))
+            .map_err(|error| crate::logging::stderr_line!("aterm-gui: {error}"))
             .ok()
     };
     // Headless windows are still interactive through the control socket and
     // render real frames. Keep config parsing/host probes off their event loop
     // exactly as for a visible window; only unit-test Apps omit this worker.
     let native_config_host = native_config_host::HostDiagnosticsLane::spawn(proxy.clone())
-        .map_err(|error| eprintln!("aterm-gui: {error}"))
+        .map_err(|error| crate::logging::stderr_line!("aterm-gui: {error}"))
         .ok();
     let native_font_catalog = native_font_catalog::Lane::spawn(proxy.clone())
-        .map_err(|error| eprintln!("aterm-gui: {error}"))
+        .map_err(|error| crate::logging::stderr_line!("aterm-gui: {error}"))
         .ok();
     let mut app = App {
         apprt,
         system_reduce_motion: false,
         _reduce_motion: None,
+        objc_contained_seen: 0,
         // SEAMLESS WINDOW CARRY: reappear at the outgoing window's position.
         seamless_position: seamless_window.and_then(|w| Some((w.outer_x?, w.outer_y?))),
         pool,
@@ -24439,7 +24845,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .video_export
         .wait_idle(std::time::Duration::from_secs(120))
     {
-        eprintln!("aterm-gui: still waiting for the cancelled video export to clean up");
+        crate::logging::stderr_line!(
+            "aterm-gui: still waiting for the cancelled video export to clean up"
+        );
     }
     // Graceful-exit Kitty Log flush (§F4.4): merge any un-debounced sighting
     // delta into `kitty-log.toml` INLINE — past the event loop, blocking is
@@ -24461,7 +24869,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         if !manifest.is_empty()
             && let Err(e) = restore::write(&manifest)
         {
-            eprintln!("aterm-gui: could not persist the session layout: {e}");
+            crate::logging::stderr_line!("aterm-gui: could not persist the session layout: {e}");
         }
     }
     // Smart-title inference is the one App-owned subsystem with a managed child
@@ -34477,7 +34885,7 @@ mod window_routing_conformance {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "App window-routing Tier-1 conformance: {validated} real transitions \
              (2 CreateWindow + the ConnectedCreateWindow mint + a RaiseSession + the \
              close-down-to-exit chain) strictly validated against the WindowRouting spec; \
@@ -34635,7 +35043,7 @@ mod pane_tree_conformance {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "pane_tree Tier-1 conformance: real split/close transitions conform AND the \
              dangling-focus negative control was rejected by ty."
         );
@@ -34820,7 +35228,7 @@ mod session_pool_conformance {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "session_pool Tier-1 conformance: real open-in-new-window / close-window \
              attach/detach transitions conform AND the retire-while-viewed negative \
              control was rejected by ty."
@@ -35001,7 +35409,7 @@ mod tab_strip_conformance {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "tab_strip Tier-1 conformance: real NewTab/SelectTab/Close (incl. a NON-FRONT \
              close) keep the native strip in lockstep with the tab model AND the stale-strip \
              negative control was rejected by ty."
@@ -35182,7 +35590,7 @@ mod path_confine_conformance {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&tydir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "PathConfine Tier-1 conformance: real honest (committed inside) + escape (planted \
              symlink, rejected, victim intact) Confine transitions strictly validated against \
              committed PathConfine.tla; outside-commit negative control rejected."
@@ -35947,7 +36355,7 @@ mod spec_xref_gate {
         let status = if status.success() {
             status
         } else {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "spec_xref_closure: in-tree `cargo run -p xtask` failed (host-repo cargo \
                  config?) — retrying from a config-neutral cwd via env CARGO"
             );
@@ -36328,7 +36736,7 @@ mod spec_xref_gate {
                     .map(|w| w.machine),
             )
             .collect();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure (relocated to aterm-gui): collected {} refinement anchor(s) + \
              {} waiver(s) across {} machine(s):",
             refs.len(),
@@ -36338,7 +36746,7 @@ mod spec_xref_gate {
         for m in &machines {
             let r = refs.iter().filter(|x| x.machine == *m).count();
             let w = waivers.iter().filter(|x| x.machine == *m).count();
-            eprintln!("    {m:<16} refinements={r:<3} waivers={w}");
+            crate::logging::stderr_line!("    {m:<16} refinements={r:<3} waivers={w}");
         }
 
         // Phase 0 NOT regressed: the terminal_modes anchors (from aterm-core, now
@@ -36367,7 +36775,7 @@ mod spec_xref_gate {
 
         // ---- Build the registered SpecModule set (embedded + external ISOLATION) ----
         let modules = registered_modules();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: {} registered SpecModule(s) ({} embedded + external ISOLATION)",
             modules.len(),
             xref::model_registry().len()
@@ -36376,9 +36784,9 @@ mod spec_xref_gate {
         // ---- Run the obligations (1, 3, 4) ----
         let report = xref::check_closure(&modules);
 
-        eprintln!("spec_xref_closure: per-machine coverage ledger:");
+        crate::logging::stderr_line!("spec_xref_closure: per-machine coverage ledger:");
         for c in &report.coverage {
-            eprintln!(
+            crate::logging::stderr_line!(
                 "  {:<16} ratio={:.3} bound={:<3} waived={:<3} actions={:<3} {}{}",
                 c.machine,
                 c.ratio(),
@@ -36504,7 +36912,7 @@ mod spec_xref_gate {
         }
         // RUN it (the gate now proves window_routing Tier-1, not merely claims it).
         super::window_routing_conformance::run_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: window_routing is actively-bound AND its Tier-1 conformance \
              (real App create/close→exit routing) was RUN by the gate (finding 3)."
         );
@@ -36536,7 +36944,7 @@ mod spec_xref_gate {
             );
         }
         super::pane_tree_conformance::run_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: pane_tree is actively-bound AND its Tier-1 conformance \
              (real split/close re-point) was RUN by the gate."
         );
@@ -36568,7 +36976,7 @@ mod spec_xref_gate {
             );
         }
         super::session_pool_conformance::run_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: session_pool is actively-bound AND its Tier-1 conformance \
              (real attach/detach refcount accounting) was RUN by the gate."
         );
@@ -36600,7 +37008,7 @@ mod spec_xref_gate {
             );
         }
         super::tab_strip_conformance::run_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: tab_strip is actively-bound AND its Tier-1 conformance \
              (native strip parity, incl. a non-front-window close) was RUN by the gate."
         );
@@ -36646,7 +37054,7 @@ mod spec_xref_gate {
             );
         }
         super::early_out_tests::run_asymmetric_pad_layout_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: AsymmetricPadLayout is fully bound across CPU/GPU/GUI and the \
              real RepaintKey origin-change conformance was RUN by the gate."
         );
@@ -36700,7 +37108,7 @@ mod spec_xref_gate {
             );
         }
         super::app_input::input_release_pairing_conformance::run_conformance();
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: input_release_pairing is actively-bound AND its Tier-1 \
              two-window owner-map conformance was RUN by the gate."
         );
@@ -36762,7 +37170,7 @@ mod spec_xref_gate {
         let sel_ev = super::selection_custody_conformance::run_conformance();
         let sel_summary =
             assert_step_evidence("SelectionCustody", SELECTION_CUSTODY_ACTIONS, &sel_ev);
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: SelectionCustody is actively-bound (11/11 actions, zero \
              waivers) AND its Tier-1 conformance (real drag/press gestures + real VT \
              damage/scroll/eviction/ED-3/RIS batches) was RUN by the gate — with each \
@@ -36871,7 +37279,7 @@ mod spec_xref_gate {
         // each transition actually reaches, rather than to functions the run touches.
         let press_ev = super::press_custody_conformance::run_conformance();
         let press_summary = assert_step_evidence("PressCustody", PRESS_CUSTODY_ACTIONS, &press_ev);
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: PressCustody is actively-bound (11/11 actions, zero \
              waivers) AND its Tier-1 conformance (real scroll/wheel/gesture/press seams — \
              all four press classes delivered as real key events — plus real \
@@ -36941,7 +37349,7 @@ mod spec_xref_gate {
                 .map(|e| e.audit().wide_windows().2.len())
                 .max()
                 .unwrap_or(0);
-            eprintln!(
+            crate::logging::stderr_line!(
                 "spec_xref_closure: EXECUTION-EVIDENCE REACH — {audited_machines} of {} \
                  anchor-bearing machines linked into this binary are audited for per-step \
                  function entry ({audited_names:?}; {audited} of {all_anchors} anchors). \
@@ -36978,7 +37386,7 @@ mod spec_xref_gate {
              vacuously ty-only."
         );
         let ledger = aterm_spec::xref::verifier_ledger(&modules);
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: UNIFIED VERIFIER LEDGER (Phase 4) — {} proof anchor(s) over the \
              kani half, {} (machine, action) rows total:",
             proofs.len(),
@@ -36996,7 +37404,7 @@ mod spec_xref_gate {
                     e.proofs.iter().cloned().collect::<Vec<_>>().join(", ")
                 )
             };
-            eprintln!("  {}{}", e.render(), detail);
+            crate::logging::stderr_line!("  {}{}", e.render(), detail);
         }
         // Non-vacuity: every collected proof anchor MUST land on a real ledger row with
         // `kani` set — i.e. the (machine, action) resolved and the ledger registered it.
@@ -37056,7 +37464,7 @@ mod spec_xref_gate {
                 "StreamingSearch::{action} must remain joined across ty and Kani"
             );
         }
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: ledger non-vacuous — {} row(s) ty+kani, {} kani-only, {} ty-only.",
             ledger.iter().filter(|e| e.ty && e.kani).count(),
             ledger.iter().filter(|e| e.kani && !e.ty).count(),
@@ -37187,12 +37595,13 @@ mod spec_xref_gate {
                     match aterm_spec::verify::audit_dead_negative_controls(&m, &reported_refs) {
                         Ok(0) => {}
                         Ok(n) => {
-                            eprintln!(
+                            crate::logging::stderr_line!(
                                 "spec_xref_closure: `{}` — {n} dead action(s) at the committed \
                                 config machine-verified as independent prove-and-catch negative \
                                  controls (safe all-live baseline; each isolated mutant fires and \
                                  is caught): {:?}",
-                                m.name, reported
+                                m.name,
+                                reported
                             );
                             neg_control_models += 1;
                             neg_control_actions += n;
@@ -37206,7 +37615,7 @@ mod spec_xref_gate {
                 }
             }
             let _ = std::fs::remove_dir_all(&dir);
-            eprintln!(
+            crate::logging::stderr_line!(
                 "spec_xref_closure: all {} embedded models pass `ty check --strict-vacuity` (armed \
                  Trust) — {} dead mutant action(s) across {} model(s) machine-verified as \
                  independent prove-and-catch negative controls (interpreter-recomputed dead sets, \
@@ -37244,7 +37653,7 @@ mod spec_xref_gate {
             let module_txt =
                 aterm_spec::ir::lower_to_ir("aterm_spec_xref", &modules, &refs, &waivers, &proofs);
             let lowered = aterm_spec::ir::lowered_machine_names(&modules, &refs);
-            eprintln!(
+            crate::logging::stderr_line!(
                 "spec_xref_closure: assembled .trust_ir — {} bytes, {} SpecModule block(s), {} \
                  actively-lowered machine(s): {:?}; {} proof line(s) lowered; {} colliding source \
                  anchor record(s) omitted from TrustIr's unresolved S0 fallback view",
@@ -37265,7 +37674,7 @@ mod spec_xref_gate {
             // xtask node — the SAME generator the build-graph spec-link uses).
             let manifest = harness_manifest();
             let (exit_code, report) = run_spec_link(&trust_ir, &ir_path, Some(&manifest));
-            eprintln!(
+            crate::logging::stderr_line!(
                 "--- trust-ir spec-link report (REAL assembled module, L1+L2 armed) ---\n{report}"
             );
             let disposition = classify_spec_link(exit_code, &report).unwrap_or_else(|| {
@@ -37314,11 +37723,11 @@ mod spec_xref_gate {
                 );
             }
             match disposition {
-                SpecLinkDisposition::Certifying => eprintln!(
+                SpecLinkDisposition::Certifying => crate::logging::stderr_line!(
                     "trust-ir spec-link: CERTIFYING — typed Trust linkage was present and every \
                      checked obligation passed."
                 ),
-                SpecLinkDisposition::ExplicitDesignOnly => eprintln!(
+                SpecLinkDisposition::ExplicitDesignOnly => crate::logging::stderr_line!(
                     "NOTICE — trust-ir spec-link is VIOLATION-FREE BUT NON-CERTIFYING: every \
                      aterm SpecModule is explicitly design-only (`target none`) because aterm \
                      does not yet own Trust FuncIds/typed projection targets. This external run \
@@ -37331,7 +37740,7 @@ mod spec_xref_gate {
             let _ = std::fs::remove_dir_all(&ir_dir);
         }
 
-        eprintln!(
+        crate::logging::stderr_line!(
             "spec_xref_closure: LOCAL GREEN — obligations 1/3/4 hold for terminal_modes + {} \
              ISOLATION machines; Tier-1 conformances discharged (interpreter default, ty \
              escalation). TrustIr analysis ran when installed; an explicit design-only result \
@@ -37412,7 +37821,9 @@ mod spec_xref_gate {
         );
 
         let (bad_exit_code, bad_report) = run_spec_link(&trust_ir, &bad_path, None);
-        eprintln!("--- trust-ir spec-link report (BOGUS module) ---\n{bad_report}");
+        crate::logging::stderr_line!(
+            "--- trust-ir spec-link report (BOGUS module) ---\n{bad_report}"
+        );
         assert_eq!(
             bad_exit_code,
             Some(1),
@@ -37441,7 +37852,9 @@ mod spec_xref_gate {
         let good_path = dir.join("good.trust_ir");
         std::fs::write(&good_path, &good_txt).expect("write good module");
         let (good_exit_code, good_report) = run_spec_link(&trust_ir, &good_path, None);
-        eprintln!("--- trust-ir spec-link report (CONTROL good module) ---\n{good_report}");
+        crate::logging::stderr_line!(
+            "--- trust-ir spec-link report (CONTROL good module) ---\n{good_report}"
+        );
         let good_disposition =
             classify_spec_link(good_exit_code, &good_report).unwrap_or_else(|| {
                 panic!(
@@ -37456,7 +37869,7 @@ mod spec_xref_gate {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-        eprintln!(
+        crate::logging::stderr_line!(
             "trust_ir_has_teeth: TRUST rejected the bogus anchor with [Ob.1] and accepted the \
              controlled good module as {good_disposition:?}. ExplicitDesignOnly means \
              violation-free analysis, not external certification."
@@ -41037,12 +41450,12 @@ pub fn run_ship(rest: &[String]) -> i32 {
         }
     }
     let Some(tool) = candidates.into_iter().find(|p| p.is_file()) else {
-        eprintln!("aterm ship: this machine is not set up to publish aterm.");
-        eprintln!(
+        crate::logging::stderr_line!("aterm ship: this machine is not set up to publish aterm.");
+        crate::logging::stderr_line!(
             "aterm ship:   the release tool (`aterm-release`) ships with the SOURCE, not the \
              app — it is not something every install carries."
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm ship:   from a checkout, build it once:  cargo build --release -p aterm-release"
         );
         return 1;
@@ -41050,7 +41463,7 @@ pub fn run_ship(rest: &[String]) -> i32 {
     match std::process::Command::new(&tool).args(rest).status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("aterm ship: could not run {}: {e}", tool.display());
+            crate::logging::stderr_line!("aterm ship: could not run {}: {e}", tool.display());
             1
         }
     }

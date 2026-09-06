@@ -272,9 +272,69 @@ pub fn provision_remedy(owner: &str, repo: &str) -> &'static str {
     if needs_ambient_credential(owner, repo) {
         PROVISION_COMMAND
     } else {
+        // Reachable only from a caller that consults the chain for the public
+        // channel — atpkg's index listing. The app updater never does: its web lane
+        // reads that channel with no credential and ignores every rung.
         "export ATERM_UPDATE_TOKEN=$(gh auth token)   # the default channel is public: \
-         aterm reads ONLY this rung for it, and never an ambient credential"
+         only this rung is ever read for it (by atpkg's index listing; the app updater \
+         reads it with no credential at all), never an ambient credential"
     }
+}
+
+/// One rung of the chain: the operator-facing LABEL every diagnostic surface prints
+/// ([`SourceProbe::source`], the source [`resolve_or_diagnose`] returns) and the FIXED
+/// IDENTIFIER the update ledger records it under (`lane = "token:<id>"` in
+/// `status.toml`).
+///
+/// Two spellings on purpose. Three labels contain spaces (`keychain item
+/// aterm-update-token`, `0600 update-token file`, `gh auth token`), and the line
+/// `aterm ctl update status` prints is space-separated `key=value` tokens — a label
+/// spliced into `lane=` split its own line into three (2026-09-04 audit). The id is
+/// `[a-z-]` only (pinned by a test), and is what a reader should match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    pub label: &'static str,
+    pub id: &'static str,
+}
+
+/// Every rung of the chain, in the order [`walk`] consults them. The labels here ARE
+/// the labels the walk reports — it iterates this table — so the two cannot drift.
+pub const RUNGS: [Rung; 6] = [
+    Rung {
+        label: "$ATERM_UPDATE_TOKEN",
+        id: "env",
+    },
+    Rung {
+        label: "keychain item aterm-update-token",
+        id: "keychain",
+    },
+    Rung {
+        label: "0600 update-token file",
+        id: "file",
+    },
+    Rung {
+        label: "$GITHUB_TOKEN",
+        id: "github-env",
+    },
+    Rung {
+        label: "$GH_TOKEN",
+        id: "gh-env",
+    },
+    Rung {
+        label: "gh auth token",
+        id: "gh-cli",
+    },
+];
+
+/// The ledger identifier for a rung LABEL: `env`, `keychain`, `file`, `github-env`,
+/// `gh-env` or `gh-cli`. Total: a label the table does not name — none exists today —
+/// is `other`, still whitespace-free, so no caller can write a broken status line.
+#[must_use]
+pub fn rung_id(label: &str) -> &'static str {
+    RUNGS
+        .iter()
+        .find(|rung| rung.label == label)
+        .map_or("other", |rung| rung.id)
 }
 
 /// Resolve the token, or `None` when none is provisioned (the updater then stays
@@ -316,9 +376,11 @@ fn walk(
     // chain runs ONLY when the source has been pointed somewhere else, which is
     // the only way to reach a repo that can actually require authentication.
     //
-    // A token is still usable on the default channel for anonymous API rate
-    // limits — but that is opt-in, via the explicit `$ATERM_UPDATE_TOKEN` rung,
-    // never something ambient we go looking for.
+    // The app updater does not consult this chain for the compiled-in channel AT
+    // ALL — its web lane reads that channel with no credential and ignores every
+    // rung. atpkg's index listing is the one caller that still can, and for it a
+    // token on the default channel is opt-in via the explicit `$ATERM_UPDATE_TOKEN`
+    // rung only, never something ambient we go looking for.
     //
     // LIMIT, deliberate: "pointed somewhere else" means the ENV override only
     // (`ATERM_UPDATE_OWNER`/`_REPO`). This crate cannot see the GUI's `[update]
@@ -337,17 +399,18 @@ fn walk(
         });
         return probe.supplied().map(|token| (token, "$ATERM_UPDATE_TOKEN"));
     }
-    let chain: [(&'static str, &dyn Fn() -> Probe); 6] = [
-        ("$ATERM_UPDATE_TOKEN", &|| probe_env("ATERM_UPDATE_TOKEN")),
-        ("keychain item aterm-update-token", &probe_keychain),
-        ("0600 update-token file", &|| {
-            probe_file(&token_file(support_dir))
-        }),
-        ("$GITHUB_TOKEN", &|| probe_env("GITHUB_TOKEN")),
-        ("$GH_TOKEN", &|| probe_env("GH_TOKEN")),
-        ("gh auth token", &probe_gh_cli),
+    // One probe per [`RUNGS`] entry, in table order: the label the walk reports is the
+    // table's, so the ledger id (`rung_id`) can never name a rung the walk did not.
+    let probes_in_order: [&dyn Fn() -> Probe; 6] = [
+        &|| probe_env("ATERM_UPDATE_TOKEN"),
+        &probe_keychain,
+        &|| probe_file(&token_file(support_dir)),
+        &|| probe_env("GITHUB_TOKEN"),
+        &|| probe_env("GH_TOKEN"),
+        &probe_gh_cli,
     ];
-    for (source, run) in chain {
+    for (rung, run) in RUNGS.iter().zip(probes_in_order) {
+        let source = rung.label;
         let probe = run();
         probes.push(SourceProbe {
             source,
@@ -601,6 +664,33 @@ fn read_token_file(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every rung the chain can report maps to a distinct, whitespace-free ledger id
+    /// — `lane = "token:<id>"` is one token of a space-separated status line — and the
+    /// default-channel rung the walk names by literal is the table's first entry.
+    #[test]
+    fn every_rung_has_a_distinct_whitespace_free_ledger_id() {
+        let mut ids = std::collections::BTreeSet::new();
+        for rung in RUNGS {
+            assert!(
+                !rung.id.is_empty() && rung.id.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "{:?} → {:?}: ids are [a-z-] only",
+                rung.label,
+                rung.id
+            );
+            assert!(ids.insert(rung.id), "duplicate id {:?}", rung.id);
+            assert_eq!(rung_id(rung.label), rung.id);
+        }
+        assert_eq!(RUNGS[0].label, "$ATERM_UPDATE_TOKEN");
+        assert_eq!(rung_id("$ATERM_UPDATE_TOKEN"), "env");
+        assert_eq!(rung_id("keychain item aterm-update-token"), "keychain");
+        assert_eq!(rung_id("0600 update-token file"), "file");
+        assert_eq!(rung_id("$GITHUB_TOKEN"), "github-env");
+        assert_eq!(rung_id("$GH_TOKEN"), "gh-env");
+        assert_eq!(rung_id("gh auth token"), "gh-cli");
+        // Total, and still safe for a label nobody emits.
+        assert_eq!(rung_id("something with spaces"), "other");
+    }
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 

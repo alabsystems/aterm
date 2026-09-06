@@ -99,7 +99,24 @@ fn token(t: &str) -> &'static str {
     match t {
         "v" => "v",
         "id" => "@",
-        "bool" => "B",
+        // `BOOL` IS NOT THE SAME LETTER ON BOTH ARCHES — `_Bool` (`B`) on
+        // aarch64, `signed char` (`c`) on the x86_64 compat slice. This read
+        // `"B"` until W15, which is the aarch64 spelling written down as if it
+        // were the answer, and it is the ONE token here that is not.
+        //
+        // 35 of this file's rows carry a `bool` somewhere in their helper's
+        // name, so on an x86_64 host every one of them compared `B` against the
+        // runtime's `c` and this census failed — loudly, which is the only
+        // thing that makes it a portability defect rather than a hole, and
+        // still an instrument that only works on the arch it was written on, in
+        // a tree that ships a per-arch pair and keeps a both-arch constants
+        // test for exactly this class of mistake.
+        //
+        // `Bool::ENCODING` is the crate's own arch-dependent answer, measured
+        // with clang on both and re-checked at run time against a
+        // Foundation-emitted signature; every other test in this crate spells
+        // it that way and this one now does too.
+        "bool" => <aterm_objc::Bool as aterm_objc::Encode>::ENCODING,
         "isize" => "q",
         "usize" => "Q",
         "f64" => "d",
@@ -109,12 +126,23 @@ fn token(t: &str) -> &'static str {
         // prototype reads a denormal rather than a wrong number.
         "f32" => "f",
         "u16" => "S",
+        // The C `unsigned int`, and the SECOND narrow return in the tree.
+        // `-[NSNumber unsignedIntValue]` is `I`, not `Q`, because
+        // `CGDirectDisplayID` is a `uint32_t`; a `Q` prototype would read the
+        // upper 32 bits of `x0`, which AAPCS64 leaves unspecified for an `int`
+        // return. Same hazard as `u16` below, one width up.
+        "u32" => "I",
         // The SIGNED short. `NSEventSubtype` is the only narrow signed
         // argument either ported file sends (`+otherEventWithType:…subtype:`),
         // and `S` vs `s` is exactly the distinction the census exists for.
         "i16" => "s",
         "sel" => ":",
         "cls" => "#",
+        // `Protocol *`. `@encode(Protocol *)` is `@` — an OBJECT, not `#` —
+        // which is the one of the four runtime pointer types that does NOT
+        // follow from its own name, and is measured rather than assumed in
+        // `aterm_objc::runtime`'s `ProtocolPtr`.
+        "proto" => "@",
         // TWO POINTER TOKENS, deliberately. `ptr` is a bare `void *` the
         // runtime hands back untouched (KVO's `context:`); `idptr` is a const
         // pointer to object pointers Foundation dereferences and retains
@@ -274,6 +302,13 @@ const ROWS: &[(&str, &str, &str)] = &[
     ("NSApplication", "requestUserAttention:", "send_isize_usize"),
     ("NSApplication", "respondsToSelector:", "send_bool_sel"),
     ("NSApplication", "effectiveAppearance", "send_id"),
+    // The `sendEvent:` override (app.rs) makes its sends through `aterm_objc`
+    // since exception containment: the key window for the Cmd+keyUp fix, and
+    // the event's pointer deltas for the device events.
+    ("NSApplication", "keyWindow", "send_id"),
+    ("NSWindow", "sendEvent:", "send_v_id"),
+    ("NSEvent", "deltaX", "send_f64"),
+    ("NSEvent", "deltaY", "send_f64"),
     // ---- NSScreen ----
     ("NSScreen", "frame", "send_rect"),
     ("NSScreen", "backingScaleFactor", "send_f64"),
@@ -408,6 +443,66 @@ const ROWS: &[(&str, &str, &str)] = &[
         "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:",
         "send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize",
     ),
+    // ---- W12, menu.rs ----
+    ("NSMenu", "addItem:", "send_v_id"),
+    ("NSMenuItem", "setSubmenu:", "send_v_id"),
+    (
+        "NSMenuItem",
+        "initWithTitle:action:keyEquivalent:",
+        "send_id_id_sel_id",
+    ),
+    // `NSEventModifierFlags` is an `NSUInteger`, so the setter is `v@:Q`. The
+    // fork passes the seam's `NS_EVENT_MODIFIER_FLAG_*` bits, which are
+    // `_Static_assert`ed against the SDK on both arches.
+    (
+        "NSMenuItem",
+        "setKeyEquivalentModifierMask:",
+        "send_v_usize",
+    ),
+    ("NSProcessInfo", "processName", "send_id"),
+    ("NSString", "stringByAppendingString:", "send_id_id"),
+    ("NSApplication", "setServicesMenu:", "send_v_id"),
+    ("NSApplication", "setMainMenu:", "send_v_id"),
+    // ---- W12, monitor.rs ----
+    ("NSScreen", "deviceDescription", "send_id"),
+    // `I`, not `Q`. See the `u32` token above.
+    ("NSNumber", "unsignedIntValue", "send_u32"),
+    // ---- W12, app_state.rs and event_loop.rs ----
+    //
+    // `-setActivationPolicy:` ANSWERS a `BOOL` the fork ignores, exactly as it
+    // did through `objc2-app-kit`'s binding, and the argument is a SIGNED
+    // `NSApplicationActivationPolicy`. A `send_v_usize` spelling would have
+    // compiled and passed all three values the fork uses.
+    ("NSApplication", "setActivationPolicy:", "send_bool_isize"),
+    ("NSApplication", "delegate", "send_id"),
+    ("NSApplication", "windows", "send_id"),
+    ("NSApplication", "run", "send_v"),
+    ("NSApplication", "stop:", "send_v_id"),
+    ("NSApplication", "postEvent:atStart:", "send_v_id_bool"),
+    ("NSRunningApplication", "bundleIdentifier", "send_id"),
+    ("NSWindow", "close", "send_v"),
+    // THE SECOND AND THIRD ROWS THAT MOVED OUT OF `NOT_SENT`, found by the
+    // same arm that found `-sendEvent:` and in the same wave. Both were excused
+    // as target-action selectors `menu.rs` hands to AppKit — which they still
+    // are — and both are ALSO sent, by `event_loop.rs`'s `hide_application`
+    // and `hide_other_applications`, which are winit's own public API doing
+    // directly what the menu item asks AppKit to do. An excuse phrased as "the
+    // fork never sends it" was false the moment the second use existed, and
+    // the presence check could not see it because `menu.rs` still spells both.
+    ("NSApplication", "hide:", "send_v_id"),
+    ("NSApplication", "hideOtherApplications:", "send_v_id"),
+    // ---- W12, app.rs's swizzled -sendEvent: ----
+    ("NSApplication", "keyWindow", "send_id"),
+    ("NSEvent", "deltaX", "send_f64"),
+    ("NSEvent", "deltaY", "send_f64"),
+    // THE ROW THAT MOVED OUT OF `NOT_SENT`, and the reason the arm below
+    // exists. `-sendEvent:` was excused as "a method LOOKUP for the override
+    // that swizzles it, not a send" — true of `app.rs` before W12 and FALSE
+    // after: the ported trampoline forwards a Cmd-modified key-up with
+    // `send_v_id(key_window, sel!(sendEvent:), event)`. The excuse's own
+    // both-ways check could not notice, because it asks whether the fork still
+    // SPELLS the selector and the fork spells it in both places.
+    ("NSWindow", "sendEvent:", "send_v_id"),
 ];
 
 /// The CLASS-METHOD rows. `class_getInstanceMethod` cannot see these.
@@ -475,6 +570,34 @@ const CLASS_ROWS: &[(&str, &str, &str)] = &[
         "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:",
         "send_id_usize_point_usize_f64_isize_id_i16_isize_isize",
     ),
+    // ---- W12, menu.rs ----
+    //
+    // `+new` HAS TO BE HERE PER CLASS, and it is the row that showed the
+    // coverage arm's own blind spot: that arm matches selector NAMES, so
+    // `NSMutableAttributedString`'s and `NSArray`'s `new` rows already
+    // "covered" `+[NSMenu new]` and `+[NSMenuItem new]` — two class-method
+    // sends nothing had checked. Named rows are the fix here;
+    // `every_class_method_send_names_its_own_receiver` below is the fix to the
+    // guard.
+    ("NSMenu", "new", "send_id"),
+    ("NSMenuItem", "new", "send_id"),
+    ("NSMenuItem", "separatorItem", "send_id"),
+    ("NSProcessInfo", "processInfo", "send_id"),
+    // ---- W12, monitor.rs ----
+    ("NSScreen", "screens", "send_id"),
+    // ---- W12, app_state.rs and event_loop.rs ----
+    ("NSRunningApplication", "currentApplication", "send_id"),
+    // The two `NSWindow` CLASS methods, which is what made them worth a row of
+    // their own: `objc2-app-kit` spelled them
+    // `NSWindow::setAllowsAutomaticWindowTabbing(enabled, mtm)` — an
+    // associated function taking a marker — and nothing about that call site
+    // said the receiver was the class object rather than a window.
+    (
+        "NSWindow",
+        "setAllowsAutomaticWindowTabbing:",
+        "send_v_bool",
+    ),
+    ("NSWindow", "allowsAutomaticWindowTabbing", "send_bool"),
 ];
 
 /// Rows the fork sends through an `aterm_objc::msg()` FUNCTION POINTER rather
@@ -488,12 +611,20 @@ const CLASS_ROWS: &[(&str, &str, &str)] = &[
 /// `aterm-objc` and finds nothing is not left wondering.
 ///
 /// `window_delegate.rs:837` declares
-/// `unsafe extern "C" fn(Id, Sel, CGRect, usize, usize, Bool) -> Id`.
-const MSG_POINTER_ROWS: &[(&str, &str, &str)] = &[(
-    "NSWindow",
-    "initWithContentRect:styleMask:backing:defer:",
-    "send_id_rect_usize_usize_bool",
-)];
+/// `unsafe extern "C-unwind" fn(Id, Sel, CGRect, usize, usize, Bool) -> Id`.
+const MSG_POINTER_ROWS: &[(&str, &str, &str)] = &[
+    (
+        "NSWindow",
+        "initWithContentRect:styleMask:backing:defer:",
+        "send_id_rect_usize_usize_bool",
+    ),
+    // W12. `app_state.rs`'s `as_delegate_id` asserts the delegate really
+    // conforms to `NSApplicationDelegate` — the compile-time fact objc2's
+    // `ProtocolObject` used to carry — with
+    // `unsafe extern "C-unwind" fn(Id, Sel, ProtocolPtr) -> Bool`. `Protocol *`
+    // encodes `@`, not `#`.
+    ("NSObject", "conformsToProtocol:", "send_bool_proto"),
+];
 
 /// Selectors the fork spells with `sel!` but NEVER SENDS, each with the reason.
 ///
@@ -512,27 +643,17 @@ const MSG_POINTER_ROWS: &[(&str, &str, &str)] = &[(
 const NOT_SENT: &[(&str, &str)] = &[
     (
         "orderFrontStandardAboutPanel:",
-        "menu.rs:24 — a target-action selector handed to `menu_item`; AppKit \
+        "menu.rs:72 — a target-action selector handed to `menu_item`; AppKit \
          dispatches it, the fork never does",
     ),
     (
-        "hide:",
-        "menu.rs:39 — the Hide item's action, handed to `menu_item` for AppKit to \
-         dispatch; the fork never sends it",
-    ),
-    (
-        "hideOtherApplications:",
-        "menu.rs:48 — the Hide Others item's action, handed to `menu_item` for AppKit to \
-         dispatch; the fork never sends it",
-    ),
-    (
         "unhideAllApplications:",
-        "menu.rs:61 — the Show All item's action, handed to `menu_item` for AppKit to \
+        "menu.rs:109 — the Show All item's action, handed to `menu_item` for AppKit to \
          dispatch; the fork never sends it",
     ),
     (
         "terminate:",
-        "menu.rs:71 — the Quit item's action, handed to `menu_item` for AppKit to \
+        "menu.rs:119 — the Quit item's action, handed to `menu_item` for AppKit to \
          dispatch; the fork never sends it",
     ),
     (
@@ -541,11 +662,6 @@ const NOT_SENT: &[(&str, &str)] = &[
          `addObserver:selector:name:object:`. `WinitView` DECLARES it \
          (view.rs:244) and `winit_seam.rs` censuses that declaration; the \
          notification centre sends it, not the fork",
-    ),
-    (
-        "sendEvent:",
-        "app.rs:88 — `class.instance_method(sel!(sendEvent:))`, a method \
-         LOOKUP for the override that swizzles it, not a send",
     ),
 ];
 
@@ -628,13 +744,20 @@ fn every_sent_selector_encodes_the_way_its_helper_spells_it() {
         "every row must have been consulted, not merely not-disagreed-with"
     );
     assert!(
-        checked >= 183,
+        checked >= 216,
         "the census shrank to {checked} rows; it covered 96 when written and \
          179 after W9 phase 2 added `cursor.rs`'s and `view.rs`'s. The floor is \
          the MEASURED count, not a guess: 187 was written here first, from \
          counting the rows by eye, and this assertion is what said 179. Pass 14 \
          raised it to 183 — four sends the fork really makes had no row at all, \
-         which is why a floor on the TABLE is not coverage of the SOURCE."
+         which is why a floor on the TABLE is not coverage of the SOURCE. W12 \
+         raised it to 202 with `menu.rs`'s twelve, `monitor.rs`'s three \
+         `app.rs`'s four, and \
+         `app_state.rs`/`event_loop.rs`/`window.rs`'s twelve, and added a THIRD arm — \
+         `every_class_object_receiver_is_censused_for_its_own_class` — \
+         because the coverage arm matches selector NAMES and so two of those \
+         twelve (`+[NSMenu new]`, `+[NSMenuItem new]`) were already \
+         'covered' by `new` rows belonging to other classes."
     );
 }
 
@@ -769,6 +892,550 @@ fn every_selector_the_fork_sends_has_a_census_row() {
         assert!(
             reason.len() >= 40,
             "the `NOT_SENT` entry for {name} must say why, not just that"
+        );
+    }
+
+    // …AND THE THIRD WAY, which is the one W12 needed. The check above asks
+    // whether the fork still SPELLS an excused selector. `-sendEvent:` was
+    // excused as a swizzle LOOKUP and then became a real send in the same file
+    // — the fork spells it in both places, so the excuse survived a change that
+    // made it false, and a selector with no prototype row went out with it.
+    //
+    // An excuse must therefore be checked against what the selector is USED
+    // FOR, not against whether it is present. `sent_selectors` reads the
+    // POSITION.
+    //
+    // W15 RE-ASKED THE SPELLING QUESTION AND THE ANSWER WAS NO. The walk used
+    // to look for a `sel!` inside a callee whose NAME began `send`, which made
+    // its subject a naming convention rather than a send. The fork makes three
+    // sends through a raw `aterm_objc::msg()` cast instead, and the walk was
+    // measurably blind to two of them:
+    //
+    //   app_state.rs:376        conformsToProtocol:                  not seen
+    //   window_delegate.rs:840  initWithContentRect:styleMask:…      not seen
+    //   app_state.rs:307        isKindOfClass:                       seen ONLY
+    //                           because cursor.rs also sends it via `send_bool_cls`
+    //
+    // Either of those could have been excused in `NOT_SENT` and this arm would
+    // have agreed. (Planted: it was caught, but by the row-count RATCHET —
+    // which is the guard-on-its-own-table that pass 14 was about, and it stops
+    // catching anything the moment a port adds a row while removing one.)
+    //
+    // The subject is now the CODE: a `sel!` in the SECOND ARGUMENT POSITION of
+    // any call, whatever the callee is called, because argument two is where
+    // `objc_msgSend`'s `_cmd` goes and that is what makes an expression a send.
+    // Second-position-only is the same deliberate rule as before, one level
+    // more precisely stated — `addObserver:selector:name:object:` passes
+    // `frameDidChange:` as argument FOUR, which is the one excuse that is most
+    // clearly correct and must keep working.
+    let sent = sent_selectors();
+
+    // THE CODE-SUBJECT ARM COMES FIRST, and the order is the point. Every
+    // `msg()` cast in the fork IS a send; the walk must see each one's
+    // selector, and this arm finds the cast sites in the SOURCE rather than
+    // counting the walk against a number. Planted with the callee-name rule
+    // restored: with the floor first, the FLOOR fired and this arm never ran —
+    // which is a guard reporting on its own table again, one level up from the
+    // defect it was written for. With this arm first it names the three sites.
+    let cast_sends = raw_msg_cast_selectors();
+    assert!(
+        cast_sends.len() >= 3,
+        "the fork's raw `msg()` cast sites were not found ({} of them); this \
+         arm is not reading the fork",
+        cast_sends.len()
+    );
+    let unseen: Vec<String> = cast_sends
+        .iter()
+        .filter(|(name, _)| !sent.iter().any(|s| s == name))
+        .map(|(name, at)| format!("{at}: {name}"))
+        .collect();
+    assert!(
+        unseen.is_empty(),
+        "{} send(s) made through a raw `msg()` cast are invisible to the \
+         send-position walk, so an excuse for any of them could go false \
+         without this test noticing:\n  {}",
+        unseen.len(),
+        unseen.join("\n  ")
+    );
+
+    // …and only then the floor, which is a ratchet on the same reading.
+    assert!(
+        sent.len() >= 185,
+        "the send-position walk found only {} selector(s); it is not reading \
+         the fork",
+        sent.len()
+    );
+
+    let contradicted: Vec<&str> = NOT_SENT
+        .iter()
+        .map(|r| r.0)
+        .filter(|n| sent.iter().any(|s| s == n))
+        .collect();
+    assert!(
+        contradicted.is_empty(),
+        "these `NOT_SENT` entries name selectors the fork DOES send — the \
+         excuse became false without the selector disappearing, which is \
+         exactly what the presence check above cannot see: {contradicted:?}"
+    );
+}
+
+/// Every selector in a SEND POSITION in the fork: a `sel!(…)` that is the
+/// SECOND ARGUMENT of a call.
+///
+/// The callee's name is not consulted. Argument two is where `objc_msgSend`
+/// puts `_cmd`, so it is the position that makes an expression a send, and it
+/// is the same position whether the call is spelled `send_v_id(…)`, a raw
+/// `msg()` cast's `f(…)`, or `SEND_EVENT.install(…)`. W15 replaced a rule that
+/// matched the callee's NAME beginning `send`, which the fork's three raw
+/// `msg()` casts walked straight past.
+///
+/// Argument-two-only is deliberate and is the same rule the name-based walk
+/// had: `addObserver:selector:name:object:` passes `frameDidChange:` as
+/// argument FOUR, and it is genuinely not sent.
+fn sent_selectors() -> Vec<String> {
+    let mut out = Vec::new();
+    for (_file, stripped) in fork_sources() {
+        out.extend(
+            selectors_in_second_argument_position(&stripped)
+                .into_iter()
+                .map(|(n, _)| n),
+        );
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every `.rs` file under the fork's macOS backend, with `//` comments
+/// removed and the newlines kept so a line number is still recoverable.
+///
+/// RECURSIVE, for the reason the other walks are: a `read_dir` that assumed a
+/// flat directory is a scope that goes stale the day someone adds one.
+fn fork_sources() -> Vec<(String, String)> {
+    let dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/winit/src/platform_impl/macos");
+    let mut stack = vec![dir.clone()];
+    let mut paths = Vec::new();
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("the fork's macOS backend is readable") {
+            let path = entry.expect("a readable entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let file = path
+                .strip_prefix(&dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let src = std::fs::read_to_string(&path).expect("readable");
+            let stripped: String = src
+                .lines()
+                .map(|l| l.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (file, stripped)
+        })
+        .collect()
+}
+
+/// One frame of the argument-position walk.
+struct Frame {
+    /// `(` preceded by an identifier character — i.e. a CALL, not a grouping
+    /// paren, a tuple or a `&[…]`.
+    is_call: bool,
+    /// How many top-level commas have been seen inside this frame.
+    arg: usize,
+    /// Whether nothing but whitespace and a PATH QUALIFIER has appeared since
+    /// this argument began. A `sel!` that is not the first thing in argument
+    /// two is part of a larger expression, not the selector — but the fork
+    /// spells the macro both bare and as `aterm_objc::sel!`, and a rule that
+    /// only accepted the bare form would have missed
+    /// `-initWithContentRect:styleMask:backing:defer:` and `-isKindOfClass:`,
+    /// which is this very test's defect one spelling out.
+    at_arg_start: bool,
+}
+
+/// Every `sel!(…)` that begins the second argument of a call, with its line.
+///
+/// Written as one pass over the characters with an explicit frame stack rather
+/// than as a search for a callee pattern, because the thing being looked for is
+/// a POSITION and a position is not a substring. `[` and `{` push frames too,
+/// so a comma inside a slice or a block does not advance the enclosing call's
+/// argument index.
+fn selectors_in_second_argument_position(stripped: &str) -> Vec<(String, usize)> {
+    let b: Vec<char> = stripped.chars().collect();
+    let mut out = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0_usize;
+    let mut line = 1_usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        // A `sel!(…)` — read the selector, decide, and jump past it whole so
+        // its own parentheses never reach the frame stack.
+        if c == 's' && stripped[byte_at(&b, i)..].starts_with("sel!(") {
+            let rest = &stripped[byte_at(&b, i) + "sel!(".len()..];
+            let end = rest.find(')');
+            let name = end.map(|e| rest[..e].trim().to_owned()).unwrap_or_default();
+            let is_selector_argument = stack
+                .last()
+                .is_some_and(|f| f.is_call && f.arg == 1 && f.at_arg_start);
+            if is_selector_argument && !name.is_empty() && !name.starts_with('$') {
+                out.push((name, line));
+            }
+            // Advance past the whole macro call, counting newlines inside it
+            // (a multi-line `sel!(\n  foo:bar:\n)` is the fork's own style).
+            let Some(e) = end else { break };
+            let consumed: usize = "sel!(".chars().count() + rest[..=e].chars().count();
+            line += b[i..(i + consumed).min(b.len())]
+                .iter()
+                .filter(|c| **c == '\n')
+                .count();
+            i += consumed;
+            if let Some(f) = stack.last_mut() {
+                f.at_arg_start = false;
+            }
+            continue;
+        }
+        // A string or char literal: skip it whole, so a comma or paren inside
+        // one cannot move the argument index.
+        if c == '"' {
+            i += 1;
+            while i < b.len() && b[i] != '"' {
+                if b[i] == '\\' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == '\n' {
+                    line += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            if let Some(f) = stack.last_mut() {
+                f.at_arg_start = false;
+            }
+            continue;
+        }
+        match c {
+            '(' => {
+                let prev = b[..i].iter().rev().find(|p| !p.is_whitespace());
+                let is_call = prev.is_some_and(|p| p.is_alphanumeric() || *p == '_' || *p == '>');
+                stack.push(Frame {
+                    is_call,
+                    arg: 0,
+                    at_arg_start: true,
+                });
+            }
+            '[' | '{' => stack.push(Frame {
+                is_call: false,
+                arg: 0,
+                at_arg_start: true,
+            }),
+            ')' | ']' | '}' => {
+                stack.pop();
+                if let Some(f) = stack.last_mut() {
+                    f.at_arg_start = false;
+                }
+            }
+            ',' => {
+                if let Some(f) = stack.last_mut() {
+                    f.arg += 1;
+                    f.at_arg_start = true;
+                }
+            }
+            // A path qualifier — `aterm_objc::` — leaves the argument still
+            // "at its start"; anything else does not.
+            ch if ch.is_alphanumeric() || ch == '_' || ch == ':' => {}
+            ch if !ch.is_whitespace() => {
+                if let Some(f) = stack.last_mut() {
+                    f.at_arg_start = false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `text` up to and including the `)` that closes its first `(`.
+///
+/// Nothing more: a span that runs to the end of the file makes every lookup
+/// succeed against somebody else's call.
+fn call_span(text: &str) -> &str {
+    let mut depth = 0_usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[..=i];
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+/// THE SENDS THE FORK MAKES WITHOUT A `send…` HELPER.
+///
+/// A `let f: unsafe extern "C-unwind" fn(Id, Sel, …) = msg();` followed by `f(recv,
+/// sel!(x), …)` is a send with no `send` in it anywhere. This finds each cast's
+/// binding name in the source and then the selector at that binding's call, so
+/// the check above has a second, independently-derived set to be measured
+/// against rather than a floor of its own.
+fn raw_msg_cast_selectors() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (file, stripped) in fork_sources() {
+        let mut from = 0_usize;
+        while let Some(at) = stripped[from..].find("msg()") {
+            let start = from + at;
+            from = start + "msg()".len();
+            // The binding: `let <name>: unsafe extern "C-unwind" fn(…) = …msg();`
+            let Some(let_at) = stripped[..start].rfind("let ") else {
+                continue;
+            };
+            let head = &stripped[let_at + "let ".len()..];
+            let Some(colon) = head.find(':') else {
+                continue;
+            };
+            let name = head[..colon].trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            // The call: the first `<name>(` after the cast.
+            let tail = &stripped[from..];
+            let mut search = 0_usize;
+            let call_at = loop {
+                let Some(hit) = tail[search..].find(&format!("{name}(")) else {
+                    break None;
+                };
+                let abs = search + hit;
+                let prev = tail[..abs].chars().next_back();
+                if prev.is_none_or(|p| !(p.is_alphanumeric() || p == '_')) {
+                    break Some(abs);
+                }
+                search = abs + 1;
+            };
+            let Some(call_at) = call_at else { continue };
+            let line = stripped[..from + call_at].matches('\n').count() + 1;
+            // BOUND THE SPAN TO THE CALL. Scanning to end-of-file finds the
+            // next send in the file instead of this one's, which is a walk that
+            // always answers and is never right — it reported
+            // `conformsToProtocol:` for `isKindOfClass:`'s cast site before
+            // this line existed.
+            let span = call_span(&tail[call_at..]);
+            // AN INDEPENDENT READING, deliberately. The first `sel!` inside
+            // the span, found by substring rather than by the frame-stack walk
+            // this arm exists to check — a cross-check that shares its parser
+            // with its subject is one reading wearing two hats, and it showed:
+            // planting the old callee-name rule broke BOTH and the failure
+            // arrived as "this arm is not reading the fork" instead of naming
+            // the three sites. The position needs no checking here, because the
+            // cast's own type is `fn(Id, Sel, …)` — argument two IS the
+            // selector, by the signature the fork wrote.
+            if let Some(at) = span.find("sel!(") {
+                let rest = &span[at + "sel!(".len()..];
+                if let Some(end) = rest.find(')') {
+                    let name = rest[..end].trim();
+                    if !name.is_empty() {
+                        out.push((name.to_owned(), format!("{file}:{line}")));
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The byte offset of char index `i` in the string `b` was built from.
+fn byte_at(b: &[char], i: usize) -> usize {
+    b[..i].iter().map(|c| c.len_utf8()).sum()
+}
+
+/// CLASS-OBJECT RECEIVERS whose selector is not a literal at the send.
+///
+/// Each is a site where `class(c"X").as_id()` is handed to something other
+/// than a `sel!` literal, so the pair cannot be read off the line. Listed with
+/// the reason and with what IS censused instead, because a site the walk
+/// cannot decide must be decided by a person once, in writing, rather than
+/// skipped silently.
+const DYNAMIC_CLASS_RECEIVERS: &[(&str, &str)] = &[
+    (
+        "cursor.rs",
+        "`cursor_from_selector(s)` sends a Sel its callers pass in. Every one \
+         of the 27 literals that reach it is censused — the 17 documented \
+         accessors in `CLASS_ROWS`, the 10 undocumented ones in \
+         `TOLERATED_CLASS_ROWS` — and all 27 are `send_id`.",
+    ),
+    (
+        "window_delegate.rs",
+        "`set_transparent` picks `+clearColor` or `+windowBackgroundColor` \
+         into a local before the send. Both are `CLASS_ROWS` entries on \
+         `NSColor` and both are `send_id`.",
+    ),
+];
+
+/// THE RECEIVER ARM: a send to a CLASS OBJECT is censused against ITS OWN
+/// class.
+///
+/// # The blind spot this closes, found by the row that walked into it
+///
+/// [`every_selector_the_fork_sends_has_a_census_row`] matches selector NAMES
+/// and nothing else, because a `sel!(…)` literal does not say who it is being
+/// sent to. That is the right rule for the 200-odd instance sends — the
+/// receiver is a local whose class no walk could recover — and it is the WRONG
+/// rule for the handful of sends whose receiver is written out in the same
+/// expression. `+new` is where it bit: `NSMutableAttributedString` and
+/// `NSArray` already had `new` rows, so when W12's `menu.rs` added
+/// `+[NSMenu new]` and `+[NSMenuItem new]` the coverage arm was already
+/// satisfied and TWO class-method sends went uncensused. Nothing would have
+/// noticed if either had been the wrong shape.
+///
+/// The subject here is the CODE: `class(c"X").as_id()` is the fork's one
+/// spelling for "the receiver is the class object X", so the pair is read off
+/// the source and checked against the table, rather than the table being
+/// counted against itself.
+#[test]
+fn every_class_object_receiver_is_censused_for_its_own_class() {
+    let dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/winit/src/platform_impl/macos");
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
+    let mut dynamic: Vec<String> = Vec::new();
+
+    let mut stack = vec![dir.clone()];
+    let mut paths = Vec::new();
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("the fork's macOS backend is readable") {
+            let path = entry.expect("a readable entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    for path in &paths {
+        let file = path
+            .strip_prefix(&dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        let src = std::fs::read_to_string(path).expect("readable");
+        // Strip `//` comments line by line, keeping the newlines so a line
+        // number can still be recovered. This file's own prose spells the
+        // pattern, and so does the fork's.
+        let stripped: String = src
+            .lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut from = 0_usize;
+        while let Some(at) = stripped[from..].find("class(c\"") {
+            let start = from + at;
+            let rest = &stripped[start..];
+            let name_start = "class(c\"".len();
+            let Some(name_end) = rest[name_start..].find('"') else {
+                break;
+            };
+            let cls = &rest[name_start..name_start + name_end];
+            let after = &rest[name_start + name_end..];
+            from = start + name_start + name_end;
+            // ONLY the class-object RECEIVER spelling. `class(c"X")` without
+            // `.as_id()` is an `alloc` argument or an `isKindOfClass:`
+            // argument — a class POINTER, not a receiver — and censusing it
+            // as a send would be a category error.
+            let Some(tail) = after.strip_prefix("\").as_id()") else {
+                continue;
+            };
+            let line = stripped[..start].matches('\n').count() + 1;
+            let t = tail.trim_start_matches([',', ' ', '\n', '\t']);
+            if let Some(selrest) = t.strip_prefix("sel!(") {
+                let Some(end) = selrest.find(')') else {
+                    continue;
+                };
+                let name = selrest[..end].trim().to_owned();
+                pairs.push((cls.to_owned(), name, format!("{file}:{line}")));
+            } else {
+                dynamic.push(file.clone());
+            }
+        }
+    }
+
+    assert!(
+        pairs.len() >= 20,
+        "the walk found only {} class-object receiver(s); it is not reading \
+         the fork",
+        pairs.len()
+    );
+
+    let covered: Vec<(&str, &str)> = CLASS_ROWS
+        .iter()
+        .map(|r| (r.0, r.1))
+        .chain(TOLERATED_CLASS_ROWS.iter().map(|n| ("NSCursor", *n)))
+        .chain(NO_STATIC_ENCODING.iter().map(|r| (r.0, r.1)))
+        .collect();
+    let missing: Vec<String> = pairs
+        .iter()
+        .filter(|(cls, name, _)| !covered.contains(&(cls.as_str(), name.as_str())))
+        .map(|(cls, name, at)| format!("{at}: +[{cls} {name}]"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} class-method send(s) have no CLASS_ROWS entry FOR THEIR OWN \
+         CLASS — a row for the same selector on a different class does not \
+         check these:\n  {}",
+        missing.len(),
+        missing.join("\n  ")
+    );
+
+    // The dynamic sites are decided once, in writing, and BOTH WAYS: an
+    // excuse whose file no longer has one dies.
+    dynamic.sort();
+    dynamic.dedup();
+    let excused: Vec<&str> = DYNAMIC_CLASS_RECEIVERS.iter().map(|r| r.0).collect();
+    let unexcused: Vec<&String> = dynamic
+        .iter()
+        .filter(|f| !excused.contains(&f.as_str()))
+        .collect();
+    assert!(
+        unexcused.is_empty(),
+        "these files send to a class object with a non-literal selector and \
+         have no entry in `DYNAMIC_CLASS_RECEIVERS`: {unexcused:?}"
+    );
+    let stale: Vec<&str> = excused
+        .iter()
+        .copied()
+        .filter(|f| !dynamic.iter().any(|d| d == f))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these `DYNAMIC_CLASS_RECEIVERS` entries name files with no such site \
+         any more: {stale:?}"
+    );
+    for (file, reason) in DYNAMIC_CLASS_RECEIVERS {
+        assert!(
+            reason.len() >= 60,
+            "the `DYNAMIC_CLASS_RECEIVERS` entry for {file} must say what IS \
+             censused instead"
         );
     }
 }

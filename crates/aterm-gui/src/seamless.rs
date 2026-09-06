@@ -1829,7 +1829,7 @@ fn attest_handoff_parent_from(
             // weaker witness. Off macOS the parent link IS the documented
             // witness, so there is nothing to report.
             #[cfg(target_os = "macos")]
-            eprintln!(
+            crate::logging::stderr_line!(
                 "aterm-gui: seamless handoff: no kernel birth record for parent {pid}; \
                  falling back to the process link for parent-death detection"
             );
@@ -2356,7 +2356,7 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
              identity",
             crate::build_info::GIT_COMMIT
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: seamless handoff refused: this build reports commit \
              `{}`, which is not a usable identity",
             crate::build_info::GIT_COMMIT
@@ -2371,7 +2371,9 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
         .map(|(build, commit)| HandoffTarget { build, commit })
     else {
         aterm_log::error!("seamless handoff refused: malformed target identity `{raw}`");
-        eprintln!("aterm-gui: seamless handoff refused: malformed target identity `{raw}`");
+        crate::logging::stderr_line!(
+            "aterm-gui: seamless handoff refused: malformed target identity `{raw}`"
+        );
         return None;
     };
     if expected != own {
@@ -2392,10 +2394,13 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
             own.build,
             own.commit
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm-gui: seamless handoff refused: the outgoing process authorized \
              build {} commit {}, but this binary is build {} commit {}",
-            expected.build, expected.commit, own.build, own.commit
+            expected.build,
+            expected.commit,
+            own.build,
+            own.commit
         );
         return None;
     }
@@ -5450,7 +5455,7 @@ mod f4_adoption_proof_asymmetry {
             old_parent_digest, child_digest,
             "a schema bump must break the proof"
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "F4/schema: parent={} child={} (child re-emitted `schema = 2`)",
             hex12(&old_parent_digest),
             hex12(&child_digest)
@@ -5475,7 +5480,7 @@ mod f4_adoption_proof_asymmetry {
             old_parent_digest, child_digest,
             "an additive always-emitted field must break the proof"
         );
-        eprintln!(
+        crate::logging::stderr_line!(
             "F4/field: parent={} child={} (child re-emitted `zoomed = false`)",
             hex12(&old_parent_digest),
             hex12(&child_digest)
@@ -5509,7 +5514,9 @@ mod f4_adoption_proof_asymmetry {
                 fixed_point, digests_match,
                 "{label}: digest equality IS wire fixed-pointness"
             );
-            eprintln!("F4/lemma: {label}: fixed_point={fixed_point} digests_match={digests_match}");
+            crate::logging::stderr_line!(
+                "F4/lemma: {label}: fixed_point={fixed_point} digests_match={digests_match}"
+            );
         }
     }
 
@@ -5682,7 +5689,7 @@ mod f4_adoption_proof_asymmetry {
             d
         };
         assert_ne!(parent_digest, child_digest);
-        eprintln!(
+        crate::logging::stderr_line!(
             "F4/meta: parent meta {} bytes, child meta {} bytes — screen_digest inputs differ",
             newer_parent_meta.len(),
             child_meta.len()

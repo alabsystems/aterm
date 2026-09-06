@@ -678,7 +678,7 @@ impl Keybindings {
     pub fn from_config(table: Option<&std::collections::BTreeMap<String, String>>) -> Keybindings {
         let (map, _unbinds, warns) = Self::collect(table);
         for w in &warns {
-            eprintln!("aterm-gui: {w}");
+            crate::logging::stderr_line!("aterm-gui: {w}");
         }
         Keybindings { map }
     }
@@ -978,7 +978,7 @@ impl KeySequences {
     pub fn from_config(table: Option<&std::collections::BTreeMap<String, String>>) -> KeySequences {
         let (map, warns) = Self::collect(table);
         for w in &warns {
-            eprintln!("aterm-gui: {w}");
+            crate::logging::stderr_line!("aterm-gui: {w}");
         }
         KeySequences { map }
     }

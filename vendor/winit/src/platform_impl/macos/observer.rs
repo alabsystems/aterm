@@ -1,7 +1,9 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
 // (`RunLoop::main`, `setup_control_flow_observers` and this file's internal
 //  handlers take `aterm_objc::MainThread` instead of objc2's
-//  `MainThreadMarker`; the file's only remaining third-party name is `block2`.)
+//  `MainThreadMarker`, and the queued-closure block is `aterm_objc::RcBlock`
+//  instead of a `block2::RcBlock`; no third-party Objective-C name remains
+//  in the file.)
 //! Utilities for working with `CFRunLoop`.
 //!
 //! See Apple's documentation on Run Loops for details:
@@ -13,7 +15,6 @@ use std::ptr;
 use std::rc::Weak;
 use std::time::Instant;
 
-use block2::Block;
 use core_foundation::base::{CFIndex, CFOptionFlags, CFRelease, CFTypeRef};
 use core_foundation::date::CFAbsoluteTimeGetCurrent;
 use core_foundation::runloop::{
@@ -32,13 +33,21 @@ use tracing::error;
 // a framework binding and the file needed no `seam::marker` crossing at all.
 // That is what makes this file, and `window_delegate.rs`, the two the
 // substitution actually frees.
-use aterm_objc::MainThread;
+use aterm_objc::{MainThread, RcBlock};
 
 use super::app_state::ApplicationDelegate;
 use super::event_loop::{stop_app_on_panic, PanicInfo};
 use super::ffi;
 
-unsafe fn control_flow_handler<F>(panic_info: *mut c_void, f: F)
+// LOCAL PATCH (aterm): the two observer callbacks are `extern "C-unwind"` and
+// CONTAIN an NSException. Each runs the application's event handlers
+// (`wakeup`/`cleared`), whose AppKit sends are `aterm_objc` sends and can
+// raise; a raise unwinding into `stop_app_on_panic`'s `catch_unwind` used to
+// abort with "Rust cannot catch foreign exceptions". The order is the measured
+// one — `catch_unwind` OUTSIDE (a Rust panic still stops the app through
+// `stop_app_on_panic`), the containment INSIDE — and `site` names the
+// observer in the report.
+unsafe fn control_flow_handler<F>(panic_info: *mut c_void, site: &'static str, f: F)
 where
     F: FnOnce(Weak<PanicInfo>) + UnwindSafe,
 {
@@ -55,18 +64,23 @@ where
     let mtm = MainThread::new().unwrap();
     stop_app_on_panic(mtm, Weak::clone(&panic_info), move || {
         let _ = &panic_info;
-        f(panic_info.0)
+        let _ = aterm_objc::contain(site, move || f(panic_info.0));
     });
 }
 
+/// The observer callback prototype, spelled `"C-unwind"`; converted to
+/// `core_foundation`'s `extern "C"` alias at the one registration site.
+type ObserverCallBack =
+    extern "C-unwind" fn(CFRunLoopObserverRef, CFRunLoopActivity, *mut c_void);
+
 // begin is queued with the highest priority to ensure it is processed before other observers
-extern "C" fn control_flow_begin_handler(
+extern "C-unwind" fn control_flow_begin_handler(
     _: CFRunLoopObserverRef,
     activity: CFRunLoopActivity,
     panic_info: *mut c_void,
 ) {
     unsafe {
-        control_flow_handler(panic_info, |panic_info| {
+        control_flow_handler(panic_info, "CFRunLoop observer (AfterWaiting)", |panic_info| {
             #[allow(non_upper_case_globals)]
             match activity {
                 kCFRunLoopAfterWaiting => {
@@ -82,13 +96,13 @@ extern "C" fn control_flow_begin_handler(
 
 // end is queued with the lowest priority to ensure it is processed after other observers
 // without that, LoopExiting would  get sent after AboutToWait
-extern "C" fn control_flow_end_handler(
+extern "C-unwind" fn control_flow_end_handler(
     _: CFRunLoopObserverRef,
     activity: CFRunLoopActivity,
     panic_info: *mut c_void,
 ) {
     unsafe {
-        control_flow_handler(panic_info, |panic_info| {
+        control_flow_handler(panic_info, "CFRunLoop observer (BeforeWaiting/Exit)", |panic_info| {
             #[allow(non_upper_case_globals)]
             match activity {
                 kCFRunLoopBeforeWaiting => {
@@ -129,9 +143,19 @@ impl RunLoop {
         &self,
         flags: CFOptionFlags,
         priority: CFIndex,
-        handler: CFRunLoopObserverCallBack,
+        handler: ObserverCallBack,
         context: *mut CFRunLoopObserverContext,
     ) {
+        // LOCAL PATCH (aterm): `core_foundation` spells the callback
+        // `extern "C"`; ours is `extern "C-unwind"`. The two share one calling
+        // convention — the ABI string only tells rustc whether the callee may
+        // unwind — and NOTHING unwinds out of these handlers: a Rust panic is
+        // caught by `stop_app_on_panic`, an NSException by `contain`. So the
+        // conversion is a re-spelling of the same address.
+        // SAFETY: same machine ABI, same arity and argument types; the pointer
+        // is a valid function of that shape.
+        let handler: CFRunLoopObserverCallBack =
+            unsafe { std::mem::transmute::<ObserverCallBack, CFRunLoopObserverCallBack>(handler) };
         let observer = unsafe {
             CFRunLoopObserverCreate(
                 ptr::null_mut(),
@@ -179,19 +203,50 @@ impl RunLoop {
     /// put the event at the very front of the queue, to be handled as soon as possible after
     /// handling whatever event it's currently handling.
     pub fn queue_closure(&self, closure: impl FnOnce() + 'static) {
+        // LOCAL PATCH (aterm): the block parameter is a BARE BLOCK POINTER.
+        //
+        // `&Block<dyn Fn()>` and `*mut c_void` are the same argument to this C
+        // function; what the binding bought was the TYPE, and `new0`'s `Encode`
+        // bounds check the closure's arity and return type, which
+        // `Block<dyn Fn()>` did not.
+        //
+        // `as_ptr`, not `as_block_ptr`: this is a C FUNCTION ARGUMENT, so no
+        // Objective-C encoding is emitted for it by anyone and there is nothing
+        // for the `"@?"` letter to be right about. `as_block_ptr` is for a
+        // block argument of a method this tree DECLARES.
         extern "C" {
-            fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFTypeRef, block: &Block<dyn Fn()>);
+            fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFTypeRef, block: *mut c_void);
         }
 
-        // Convert `FnOnce()` to `Block<dyn Fn()>`.
+        // LOCAL PATCH (aterm): the block is `aterm_objc::RcBlock`, whose
+        // `invoke` is the same guarded trampoline every declared method runs
+        // under — `catch_unwind` OUTSIDE (a Rust panic aborts, NAMED, through
+        // `abort_on_unwind("block invoke")`), the Objective-C `@try` INSIDE (an
+        // `NSException` is contained and reported against `block invoke`).
+        // This frame is what `handle_event` runs under for every event queued
+        // while another is in flight, and what `handle_scale_factor_changed`
+        // runs under; the third-party block it replaced had a `nounwind`
+        // `extern "C"` invoke, and a raise below such a frame was MEASURED to
+        // abort the process ("panic in a function that cannot unwind") even
+        // with a containment outside it — or, with nothing outside, to
+        // terminate through libc++abi's uncaught-exception handler. So the
+        // queued road is now contained at the same depth as the observers'.
+        //
+        // Convert `FnOnce()` to a `Fn()` block.
         let closure = Cell::new(Some(closure));
-        let block = block2::RcBlock::new(move || {
-            if let Some(closure) = closure.take() {
-                closure()
-            } else {
-                error!("tried to execute queued closure on main thread twice");
-            }
-        });
+        // SAFETY: the prototype `CFRunLoopPerformBlock` invokes is `void (^)(void)`,
+        // which is exactly what `new0` over a `Fn() -> ()` builds; nothing
+        // unwinds out of its `invoke`.
+        let block = unsafe {
+            RcBlock::new0(move || {
+                if let Some(closure) = closure.take() {
+                    closure()
+                } else {
+                    error!("tried to execute queued closure on main thread twice");
+                }
+            })
+        }
+        .expect("_Block_copy of the queued closure");
 
         // There are a few common modes (`kCFRunLoopCommonModes`) defined by Cocoa:
         // - `NSDefaultRunLoopMode`, alias of `kCFRunLoopDefaultMode`.
@@ -210,8 +265,19 @@ impl RunLoop {
         // [#1779]: https://github.com/rust-windowing/winit/issues/1779
         let mode = unsafe { kCFRunLoopDefaultMode as CFTypeRef };
 
-        // SAFETY: The runloop is valid, the mode is a `CFStringRef`, and the block is `'static`.
-        unsafe { CFRunLoopPerformBlock(self.0, mode, &block) }
+        // SAFETY: The runloop is valid, the mode is a `CFStringRef`, and the block is `'static`
+        // (`CFRunLoopPerformBlock` copies it; `block`'s own reference is released on return).
+        //
+        // THE OWNERSHIP RULE, MEASURED. `block` is `_Block_release`d at the
+        // end of this scope while the run loop invokes the closure later, which
+        // is sound because `CFRunLoopPerformBlock` takes its OWN reference:
+        // measured 1 -> 2 on the block header's refcount across the call, and
+        // the capture's `-retainCount` back to 1 after the invoke.
+        // `aterm-objc/tests/blocks.rs` asserts both halves. The ownership is
+        // UNCHANGED from upstream, which dropped its `block2::RcBlock` here and
+        // passed a borrow; the note exists because the borrow is now a raw
+        // pointer.
+        unsafe { CFRunLoopPerformBlock(self.0, mode, block.as_ptr()) }
     }
 }
 

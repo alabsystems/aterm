@@ -1539,25 +1539,20 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 #[cfg(target_os = "macos")]
 mod macos {
     use aterm_objc::{Id, Obj, Retained, Sel, autoreleasepool, class, sel};
-    // THE SEAM, and it is one function wide. `confirm` below is the ONLY thing
-    // in this module still on `objc2`, because its key interceptor is
+    // THE SEAM IS CLOSED. `confirm` below was the ONLY thing in this module
+    // still on `objc2`, held there because its key interceptor is
     // `crate::alert_keys`, whose `RcBlock` event monitor is shared with the
     // multi-line-paste SHEET in `lib.rs` — a different subsystem with its own
     // `NSAlert`, its own completion block and its own `PasteConfirm` state.
-    // Porting one without the other would leave two spellings of the same
-    // monitor; porting both is the modal-alert subsystem's own wave. Everything
-    // else here — the whole menu bar, the open panel, the alerts that need no
-    // interceptor, and the workspace URL opens — is first-party.
-    use objc2::rc::Retained as Objc2Retained;
-    use objc2::runtime::AnyObject;
-    use objc2::{class as objc2_class, msg_send, msg_send_id};
-    use objc2_app_kit::{NSButton, NSWindow};
-    use objc2_foundation::NSString;
+    // Porting one without the other would have left two spellings of the same
+    // monitor, so W13 ported the whole modal-alert subsystem in one move:
+    // `alert_keys.rs`, this function, and the sheet. There is no seam left to
+    // import, which is why this block names only first-party crates.
     use winit::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
-        NS_EVENT_MODIFIER_FLAG_COMMAND, NS_EVENT_MODIFIER_FLAG_CONTROL,
-        NS_EVENT_MODIFIER_FLAG_SHIFT, NS_MODAL_RESPONSE_OK,
+        NS_ALERT_FIRST_BUTTON_RETURN, NS_EVENT_MODIFIER_FLAG_COMMAND,
+        NS_EVENT_MODIFIER_FLAG_CONTROL, NS_EVENT_MODIFIER_FLAG_SHIFT, NS_MODAL_RESPONSE_OK,
     };
     use crate::appkit::{self, MainThread};
 
@@ -2286,6 +2281,9 @@ mod macos {
     /// document grant before reading the file.
     pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
         let _main_thread = MainThread::new()?;
+        // `-runModal` below spins a nested run loop for as long as the panel is
+        // up; park the main-thread watchdog for exactly that long.
+        let _park = crate::watchdog::park_modal();
         let title = appkit::nsstring(title)?;
         let prompt = appkit::nsstring(prompt)?;
         // SAFETY: NSOpenPanel is created and run on AppKit's main thread
@@ -2370,36 +2368,72 @@ mod macos {
         if MainThread::new().is_none() {
             return true;
         }
-        let title = NSString::from_str(title);
-        let body = NSString::from_str(body);
-        let proceed = NSString::from_str(proceed_label);
-        let cancel = NSString::from_str("Cancel");
-        // THE SEAM — see the module's import block. `confirm` is the one
-        // function here still on `objc2`, because `alert_keys::watch_alert_keys`
-        // (its `RcBlock` key monitor) is shared with `lib.rs`'s paste sheet.
-        // SAFETY: standard `NSAlert` construction + setters + `runModal`, all on the
-        // main thread. Every operand is a valid, retained object for the call;
-        // `runModal` returns the clicked button's `NSModalResponse` (an `isize`). The
+        // `-runModal` below spins a nested run loop until the user answers;
+        // park the main-thread watchdog for exactly that long.
+        let _park = crate::watchdog::park_modal();
+        let (Some(title), Some(body), Some(proceed), Some(cancel)) = (
+            appkit::nsstring(title),
+            appkit::nsstring(body),
+            appkit::nsstring(proceed_label),
+            appkit::nsstring("Cancel"),
+        ) else {
+            // Foundation refused a string, so no alert can be built. FAIL OPEN,
+            // exactly as the off-main-thread arm above does and for the same
+            // reason: a quit that cannot ask must not wedge.
+            return true;
+        };
+        // FAIL OPEN ON A MISSING ALERT TOO. The `objc2` form could not reach this
+        // case — `msg_send_id![…, new]` panicked on nil — so the decision is new
+        // and is stated rather than defaulted: `true` is "proceed", which is what
+        // an unanswerable confirmation has to mean for ⌘Q.
+        let Some(alert) = (
+            // SAFETY: `+[NSAlert new]` is `+(instancetype)` and +1 (alloc+init),
+            // which is what `Obj::from_owned` adopts.
+            unsafe { Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new))) }
+        ) else {
+            return true;
+        };
+        // SAFETY: standard `NSAlert` setters + `runModal`, all on the main thread
+        // (`MainThread::new()` above proves it). `-setMessageText:` and
+        // `-setInformativeText:` are `-(void)(NSString *)` and COPY their argument,
+        // so the +1 strings may drop at the end of this frame.
+        // `-addButtonWithTitle:` is `-(NSButton *)(NSString *)` and `-window` is
+        // `-(NSWindow *)` — both +0, so both are RETAINED into `Obj` rather than
+        // adopted, which is the retain `objc2`'s `Retained` returns carried. The
         // alert keeps the default `NSAlertStyleWarning` (the app-icon caution panel).
-        // `window` / `addButtonWithTitle:` are plain accessors on the fresh alert.
+        // `-runModal` is `-(NSModalResponse)`, an `NSInteger`.
         unsafe {
-            let alert: Objc2Retained<AnyObject> = msg_send_id![objc2_class!(NSAlert), new];
-            let _: () = msg_send![&alert, setMessageText: &*title];
-            let _: () = msg_send![&alert, setInformativeText: &*body];
+            appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
+            appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
             // First button added is the default (Return, with an EMPTY modifier mask —
             // hence the key watch below): the PROCEED action. The second is Cancel
             // (AppKit binds Escape to it).
-            let accept: Objc2Retained<NSButton> =
-                msg_send_id![&alert, addButtonWithTitle: &*proceed];
-            let refuse: Objc2Retained<NSButton> =
-                msg_send_id![&alert, addButtonWithTitle: &*cancel];
-            let panel: Objc2Retained<NSWindow> = msg_send_id![&alert, window];
+            let accept = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                proceed.id(),
+            ));
+            let refuse = Obj::retain(appkit::send_id_id(
+                alert.id(),
+                sel!(addButtonWithTitle:),
+                cancel.id(),
+            ));
+            let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)));
             // Dropped when this function returns — i.e. the moment `runModal` comes
             // back — so the interceptor's lifetime is exactly the alert's.
-            let _keys = crate::alert_keys::watch_alert_keys(panel, None, accept, refuse);
-            let response: isize = msg_send![&alert, runModal];
-            // NSAlertFirstButtonReturn == 1000 → the user clicked PROCEED.
-            response == 1000
+            //
+            // A missing button or panel means there is nothing to click, so the watch
+            // is simply not installed and the alert keeps its stock keys. That is the
+            // same degradation `watch_alert_keys` already documents for the case where
+            // AppKit declines the monitor, and `confirm` still asks its question.
+            let _keys = match (panel, accept, refuse) {
+                (Some(panel), Some(accept), Some(refuse)) => {
+                    crate::alert_keys::watch_alert_keys(panel, None, accept, refuse)
+                }
+                _ => None,
+            };
+            let response = appkit::send_isize(alert.id(), sel!(runModal));
+            response == NS_ALERT_FIRST_BUTTON_RETURN
         }
     }
 
@@ -2412,6 +2446,9 @@ mod macos {
         if MainThread::new().is_none() {
             return;
         }
+        // `-runModal` below spins a nested run loop until the user dismisses
+        // the alert; park the main-thread watchdog for exactly that long.
+        let _park = crate::watchdog::park_modal();
         let (Some(title), Some(body), Some(ok)) = (
             appkit::nsstring(title),
             appkit::nsstring(body),
@@ -2627,7 +2664,7 @@ mod macos {
             if url.is_null() || ws.is_null() {
                 return;
             }
-            let perform: unsafe extern "C" fn(Id, Sel, Sel, Id, f64) = aterm_objc::msg();
+            let perform: unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64) = aterm_objc::msg();
             perform(
                 ws,
                 sel!(performSelector:withObject:afterDelay:),
@@ -2792,8 +2829,11 @@ mod macos {
                     add_separator(&menu);
 
                     // What Foundation reads out of the REGISTERED encoding.
-                    let sig_for: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::Sel) -> Id =
-                        aterm_objc::msg();
+                    let sig_for: unsafe extern "C-unwind" fn(
+                        Id,
+                        aterm_objc::Sel,
+                        aterm_objc::Sel,
+                    ) -> Id = aterm_objc::msg();
                     let sig = sig_for(
                         probe.as_id(),
                         sel!(methodSignatureForSelector:),
@@ -2814,7 +2854,7 @@ mod macos {
                     // now comes from the class that ships, via the class-side
                     // `+instanceMethodSignatureForSelector:` — which needs no
                     // instance at all.
-                    let cls_sig_for: unsafe extern "C" fn(
+                    let cls_sig_for: unsafe extern "C-unwind" fn(
                         aterm_objc::ClassPtr,
                         aterm_objc::Sel,
                         aterm_objc::Sel,
@@ -2828,7 +2868,7 @@ mod macos {
                         !target_sig.is_null(),
                         "Foundation could not build a signature for MenuTarget's declared method"
                     );
-                    let target_ret_type: unsafe extern "C" fn(
+                    let target_ret_type: unsafe extern "C-unwind" fn(
                         Id,
                         aterm_objc::Sel,
                     )
@@ -2852,7 +2892,7 @@ mod macos {
                         3,
                         "MenuTarget's registered argument count moved"
                     );
-                    let ret_type: unsafe extern "C" fn(
+                    let ret_type: unsafe extern "C-unwind" fn(
                         Id,
                         aterm_objc::Sel,
                     )
@@ -2878,10 +2918,13 @@ mod macos {
                             sig,
                         );
                         assert!(!inv.is_null());
-                        let set_sel: unsafe extern "C" fn(Id, aterm_objc::Sel, aterm_objc::Sel) =
-                            aterm_objc::msg();
+                        let set_sel: unsafe extern "C-unwind" fn(
+                            Id,
+                            aterm_objc::Sel,
+                            aterm_objc::Sel,
+                        ) = aterm_objc::msg();
                         set_sel(inv, sel!(setSelector:), sel!(validateMenuItem:));
-                        let set_arg: unsafe extern "C" fn(
+                        let set_arg: unsafe extern "C-unwind" fn(
                             Id,
                             aterm_objc::Sel,
                             *mut std::ffi::c_void,
@@ -2896,7 +2939,7 @@ mod macos {
                         );
                         appkit::send_v_id(inv, sel!(invokeWithTarget:), probe.as_id());
                         let mut out = Bool::NO;
-                        let get_ret: unsafe extern "C" fn(
+                        let get_ret: unsafe extern "C-unwind" fn(
                             Id,
                             aterm_objc::Sel,
                             *mut std::ffi::c_void,
@@ -2920,10 +2963,10 @@ mod macos {
 
                     // …and the action leg, through the runtime's own dispatch
                     // of the target/action pair AppKit stored.
-                    let target_of: unsafe extern "C" fn(Id, aterm_objc::Sel) -> Id =
+                    let target_of: unsafe extern "C-unwind" fn(Id, aterm_objc::Sel) -> Id =
                         aterm_objc::msg();
                     assert_eq!(target_of(items[1].id(), sel!(target)), probe.as_id());
-                    let perform_sel: unsafe extern "C" fn(
+                    let perform_sel: unsafe extern "C-unwind" fn(
                         Id,
                         aterm_objc::Sel,
                         aterm_objc::Sel,
@@ -3009,8 +3052,11 @@ mod macos {
                     // submenu was attached — measured here rather than assumed;
                     // the first version of this assertion expected nil and was
                     // wrong. What matters is that nothing of ours is left on it.
-                    let action_of: unsafe extern "C" fn(Id, aterm_objc::Sel) -> aterm_objc::Sel =
-                        aterm_objc::msg();
+                    let action_of: unsafe extern "C-unwind" fn(
+                        Id,
+                        aterm_objc::Sel,
+                    )
+                        -> aterm_objc::Sel = aterm_objc::msg();
                     let action = action_of(item.id(), sel!(action));
                     assert_ne!(action, sel!(menuAction:));
                     assert_eq!(action, sel!(submenuAction:));

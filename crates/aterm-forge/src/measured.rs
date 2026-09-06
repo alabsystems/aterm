@@ -395,13 +395,79 @@ pub struct Baseline {
 // and never uses it, which is neither an oracle nor an edge in any cell.
 // ---------------------------------------------------------------------------
 
+// RE-MEASURED 2026-09-03 — two things that had moved without a re-measure,
+// and one that moved in this change.
+//
+// (1) WORKSPACE 68 -> 69, resolved 115 -> 116, on mac-arm only: `aterm-objc`,
+//     the first-party Objective-C runtime layer (2026-09-01, b90beb2d2), is a
+//     path dependency and counts as a workspace member of the shipped graph.
+//     No third-party package moved: third_party stays 47 on mac-arm and 188
+//     on linux, and every other count is at ceiling.
+// (2) THIRD-PARTY LOC, all three vendored-winit cells, from the W9-phase-2
+//     port waves: tools/forge-budget.tsv was ratcheted to 563,759 (mac-arm)
+//     with its long reason on 2026-09-02, but these constants were not
+//     re-measured with it, and the tail of the wave (the cancelOperation: fix
+//     and its siblings, +51 lines) landed after the ratchet. `winit`'s
+//     dominator cost moved with it, 80,333 -> 82,708 (12 packages, unchanged).
+//     Re-pinned once more in (4).
+// (3) a966f37cc (the 2026-09-02 abort audit, one commit before this one): +42
+//     lines in vendor/winit —
+//     monitor.rs no longer `expect`s a display that vanished mid-enumeration,
+//     window_delegate.rs no longer `unwrap`s a screen that is gone when
+//     entering full screen, and `dragged_paths` checks the pasteboard's
+//     classes before sending to them. Each carries a `// LOCAL PATCH (aterm):`
+//     marker; see attest.rs for the marker count.
+// (4) the 2026-09-04 self-audit of that commit: +5 lines in
+//     vendor/winit/src/platform_impl/macos/window_delegate.rs — `dragged_paths`
+//     now refuses the WHOLE list when any pasteboard element is not an
+//     NSString (it had delivered the survivors, against its own comment), and
+//     the set_fullscreen comment says the request is dropped. winit's
+//     dominator cost 82,708 -> 82,713; every cell that resolves winit
+//     (mac-arm, linux, win) moved by the same +5.
+// (5) the 2026-09-05 ObjC exception containment: +308 lines in vendor/winit —
+//     every send prototype re-spelled `extern "C-unwind"`, the observer and
+//     queued-closure blocks moved onto aterm_objc::RcBlock, fullscreen rows
+//     writing state before their sends, `@abort_on_exception` reasons on the
+//     rows whose zero is not inert, and the `cached_modifiers` seam the app's
+//     containment hook reads instead of a WindowServer-backed probe. winit's
+//     dominator cost 82,713 -> 83,021, which now LEADS the mac-arm ranking
+//     (objc2-app-kit stays at 82,976); each winit-resolving cell moved +308.
+//     Fifteen new `// LOCAL PATCH (aterm):` markers (90 -> 105; attest.rs).
+//
+//   mac-arm  563,759 (ratchet) -> 563,852; linux 2,738,950 -> 2,739,043;
+//            win 3,586,179 -> 3,586,272 — the same +93 on each cell that
+//            vendors winit, which is the evidence it is one edit.
+// (6) 2026-09-05, THE objc2 EXIT — the W12 + W13 merge, landed on top of the
+//     containment in (5). The winit fork's last eight macOS files
+//     (app.rs, app_state.rs, event_loop.rs, menu.rs, monitor.rs, window.rs,
+//     aterm_objc_seam.rs, platform/macos.rs) and aterm-gui's last five
+//     (alert_keys.rs, menu.rs, lib.rs's paste sheet, app_introspect.rs,
+//     appkit.rs) are on aterm-objc — `SwizzleSite` swizzles `sendEvent:` with
+//     the containment's stop_app_on_panic-outside/contain-inside order kept,
+//     `MainThreadBound` replaces objc2-foundation's — and every objc2-family
+//     row in both manifests is retired (`block2`'s had already left in (5)).
+//     SEVEN PACKAGES LEAVE mac-arm: objc2-app-kit, objc2-foundation, objc2,
+//     block2, objc2-encode, objc-sys and dispatch — 47 -> 40 third-party,
+//     116 -> 109 resolved, 564,165 -> 391,435 LOC (-172,730), 10 -> 9 build
+//     scripts. The fork itself is +288 lines over (5) — the swizzle and
+//     MainThreadBound ports and their `// LOCAL PATCH (aterm):` markers
+//     (105 -> 121; attest.rs) — so winit's dominator cost is 83,021 ->
+//     83,309 and the two cells that vendor winit without the family move by
+//     exactly that: linux 2,739,356 -> 2,739,644; win 3,586,585 ->
+//     3,586,873. `objc2-app-kit` (1 / 82,976) and `objc2-foundation`
+//     (2 / 60,733) leave the mac-arm ranking; `rustybuzz` (7 / 47,712) and
+//     `serde` (3 / 38,412) enter at four and five. Measured on macOS with the
+//     merged tree compiled, its test suites green and its eight drivers run.
+// (7) the same day's objc-w7 residual: the `+arrayWithObjects:count:` SAFETY
+//     comment in vendor/winit window_delegate.rs grew from one line to two
+//     (`@@:r^@Q`, and why). +1 winit line; every winit-resolving cell +1.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 115,
-    workspace: 68,
-    third_party: 47,
-    third_party_loc: 561_477,
-    build_scripts: 10,
+    resolved: 109,
+    workspace: 69,
+    third_party: 40,
+    third_party_loc: 391_436,
+    build_scripts: 9,
     proc_macros: 2,
     duplicate_names: 1,
 };
@@ -411,7 +477,7 @@ pub const LINUX: Baseline = Baseline {
     resolved: 259,
     workspace: 71,
     third_party: 188,
-    third_party_loc: 2_736_668,
+    third_party_loc: 2_739_645,
     build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
@@ -422,7 +488,7 @@ pub const WIN: Baseline = Baseline {
     resolved: 160,
     workspace: 69,
     third_party: 91,
-    third_party_loc: 3_583_897,
+    third_party_loc: 3_586_874,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -632,22 +698,23 @@ pub struct Dom {
 /// full, asserted as ABSENCE in `dominator::tests` (the libc/AccessKit
 /// shape: a zero cost would also be reported for a package forge failed to
 /// see). What leads now is the AppKit/window stack and the updater's TLS:
-/// `objc2-app-kit` unchanged at the top, `winit` up by exactly the fork's
-/// own +664 lines of edits (the headless arm + the §4(b) notices),
-/// `rustls`, `syn`, and the 0.2-generation `objc2-foundation` (whose 0.3
-/// twin left with wgpu-hal).
+/// `winit` at the top since the 2026-09-05 containment (+308, note (5)) put it
+/// 45 lines past `objc2-app-kit`, which was unchanged; before that, `winit` was
+/// up by exactly the fork's own +664 lines of edits (the headless arm + the
+/// §4(b) notices), then `rustls`, `syn`, and the 0.2-generation
+/// `objc2-foundation` (whose 0.3 twin left with wgpu-hal).
+///
+/// RE-PINNED AT THE objc2 EXIT (2026-09-05, note (6)): `objc2-app-kit` and
+/// `objc2-foundation` are GONE from the graph — the campaign's second prize,
+/// asserted as absence in `dominator::tests` like wgpu's — and `winit` is
+/// +288 for the port that took them out. `rustybuzz` and `serde` move up into
+/// the anchor list; neither moved by a line.
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
-    Dom {
-        name: "objc2-app-kit",
-        version: None,
-        pkgs: 1,
-        loc: 82_976,
-    },
     Dom {
         name: "winit",
         version: None,
         pkgs: 12,
-        loc: 80_333,
+        loc: 83_310,
     },
     // RE-PINNED 2026-09-01 by the `once_cell` row, and it is the first time a
     // first-party patch target has moved an anchor in this file. `rustls` is
@@ -667,10 +734,16 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         loc: 64_931,
     },
     Dom {
-        name: "objc2-foundation",
+        name: "rustybuzz",
         version: None,
-        pkgs: 2,
-        loc: 60_733,
+        pkgs: 7,
+        loc: 47_712,
+    },
+    Dom {
+        name: "serde",
+        version: None,
+        pkgs: 3,
+        loc: 38_412,
     },
 ];
 

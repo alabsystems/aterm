@@ -1,8 +1,13 @@
 // Added by the aterm project in 2026; see the repository NOTICE.
 // (This whole file is an aterm addition. It is not upstream winit.)
 //
-// aterm's seam between this backend's `objc2` BINDINGS and the classes it now
-// DECLARES with `aterm_objc`.
+// aterm's binding layer: the AppKit and Foundation CONSTANTS and GLOBALS this
+// backend reads, plus two string helpers.
+//
+// It was the seam between this backend's `objc2` BINDINGS and the classes it
+// DECLARES with `aterm_objc`. There are no bindings left to seam to: W12 ported
+// the last four files and every crossing in this module is deleted. See the
+// section below for what they were and what killed each.
 //
 // # Why a fourth module, and WHAT IT DOES NOT HOLD
 //
@@ -34,170 +39,47 @@
 // sentence is kept rather than deleted because a reader who remembers the old
 // shape should be told it changed, not left to infer it.
 //
-// # Safety
+// # Safety — the argument the crossings rested on, kept as a record
 //
 // `objc2`'s binding types and `aterm_objc`'s declared-class markers are both
 // zero-sized types AT an instance address — `objc2` bottoms out in
 // `runtime::AnyObject`, which wraps a `[u8; 0]`, and
 // `aterm_objc::declare_class!` generates `_opaque: [u8; 0]`. Neither owns any
 // of the instance's bytes, so a reference of one kind at a live instance is a
-// reference of the other kind at the same instance, and crossing is a
-// reinterpretation of the pointer only. What is NOT free, and is the caller's
+// reference of the other kind at the same instance, and crossing was a
+// reinterpretation of the pointer only. What was NOT free, and was the caller's
 // obligation at every call, is that the class really is one the target type is
 // a correct binding for.
+//
+// NOTHING IN THIS FILE RELIES ON THAT ANY MORE — W12 deleted every crossing —
+// and the paragraph is kept rather than dropped because it is the argument a
+// reader would have to reconstruct to understand what the four deleted
+// functions were allowed to do.
 
 use aterm_objc::Id;
-use objc2_foundation::MainThreadMarker;
-
-/// Borrow an `objc2` binding reference at a raw `id`.
-///
-/// The one direction that has to be `unsafe`: nothing about an `Id` says which
-/// class it addresses, and picking the wrong `T` is the same defect as an
-/// unchecked cast in Objective-C.
-///
-/// # Safety
-///
-/// `id` must be non-null and address a live instance of a class that `T` is a
-/// correct `objc2` binding for — including `T = ProtocolObject<dyn P>`, where
-/// the obligation is that the class actually conforms to `P` (for the classes
-/// this backend declares, `class_addProtocol` is what makes that true, and
-/// `aterm_objc::declare_class!`'s `protocols:` list is where it happens).
-#[must_use]
-pub(super) unsafe fn objc2_ref<'a, T>(id: Id) -> &'a T {
-    debug_assert!(!id.is_null(), "objc2_ref of nil");
-    // SAFETY: the caller guarantees `id` addresses a live instance of `T`'s
-    // class; `T` is a zero-sized opaque binding marker, so the reference
-    // borrows none of the instance's own bytes.
-    unsafe { &*id.as_ptr().cast_const().cast::<T>() }
-}
-
-/// Re-badge `objc2`'s main-thread marker as `aterm_objc`'s.
-///
-/// # Why this is not a `From` impl, and why it re-asks
-///
-/// The two types mean the same thing — "the caller has established that this is
-/// the process main thread" — but they are minted by different crates and only
-/// one of them can gate `alloc_init`. `MainThreadMarker` is `!Send` and is
-/// itself only obtainable from `MainThreadMarker::new()`'s
-/// `is_main_thread()` check or from an `unsafe` constructor, so holding one IS
-/// the proof [`aterm_objc::MainThread`] wants.
-///
-/// It re-asks anyway, through the checked constructor, and `expect`s. The cost
-/// is one `+[NSThread isMainThread]` per WINDOW CREATION — not per message, not
-/// per frame — and in exchange the conversion contains no `unsafe` token and no
-/// "trust me" comment for a future reader to have to re-derive. If the answer
-/// were ever `None` while an `objc2` marker was in hand, one of the two crates
-/// would be wrong about the thread and a panic here is strictly better than
-/// building an AppKit object on the strength of it.
-#[must_use]
-pub(super) fn witness(_mtm: MainThreadMarker) -> aterm_objc::MainThread {
-    aterm_objc::MainThread::new().expect(
-        "holding an objc2 MainThreadMarker while +[NSThread isMainThread] says otherwise",
-    )
-}
-
-/// Re-badge `aterm_objc`'s main-thread witness as `objc2`'s marker — the
-/// INVERSE of [`witness`], and the direction W9 found it needed.
-///
-/// # Why the pair has to be bidirectional, which is the whole finding
-///
-/// `MainThreadMarker` is the single most widely shared `objc2` name left in
-/// this backend: twelve of the eighteen files that still import the crate
-/// mention it. The campaign priced substituting it as the cheapest large move
-/// BECAUSE it is a zero-sized marker rather than a binding — nothing about it
-/// addresses an object, so swapping it for [`aterm_objc::MainThread`] moves no
-/// message send at all.
-///
-/// With only [`witness`] the substitution could not START, and the reason is
-/// worth stating because it is a general shape and not a quirk of this type. A
-/// one-way conversion forces the port to proceed ROOT-FIRST: a file may only
-/// flip once every marker it hands onward has already flipped, so nothing can
-/// move until `NSApplication::sharedApplication`, `NSScreen::screens`,
-/// `NSMenu::new` and `MainThreadBound` — the framework bindings that CONSUME a
-/// marker — are ported first. Those are the expensive rows.
-///
-/// This function inverts the order. With both directions available the port
-/// proceeds LEAF-FIRST: a file whose marker is consumed only by first-party
-/// code flips today and takes its own signature with it, and each file that is
-/// still pinned by a framework binding re-derives a marker at that one call
-/// site. `window_delegate.rs` — the largest file in the endgame, and the one
-/// W8 emptied of all 177 send sites without moving the file count — is freed by
-/// exactly this and by nothing else.
-///
-/// # Why it is sound in this direction too
-///
-/// The two types answer the same question with the same primitive. objc2's
-/// `is_main_thread()` calls `pthread_main_np()` and says in its own comment
-/// that this is what `+[NSThread isMainThread]` does under the hood;
-/// [`aterm_objc::MainThread::new`] sends `+[NSThread isMainThread]`. Both
-/// markers are `!Send` and `!Sync`, so holding either one means THIS thread
-/// answered yes.
-///
-/// It re-asks anyway, through the checked constructor, exactly as [`witness`]
-/// does and for the same reason: the conversion then contains no `unsafe` token
-/// and no "trust me" comment. If the answer were ever `None` while an
-/// `aterm_objc` witness was in hand, one of the two crates would be wrong about
-/// the thread, and a panic here is strictly better than reaching AppKit on the
-/// strength of it.
-#[must_use]
-pub(super) fn marker(_w: aterm_objc::MainThread) -> MainThreadMarker {
-    MainThreadMarker::new().expect(
-        "holding an aterm_objc MainThread while objc2's pthread_main_np() says otherwise",
-    )
-}
 
 // ---------------------------------------------------------------------------
-// GEOMETRY: NONE. The section that was here is DELETED, and the arithmetic of
-// its life is the note.
+// THE CROSSINGS: NONE. W12 DELETED ALL FOUR, and the compiler is what found
+// them — `cargo build -p winit` reported `objc2_ref`, `witness`, `marker` and
+// `obj_of` dead within one build of porting the last four backend files.
 //
-// W8 projected a conversion per geometric shape in each direction and wrote
-// six. FIVE WERE DEAD ON ARRIVAL and the compiler said so the same day; the
-// sixth, `cg_rect`, survived with exactly one caller — `view.rs`'s
-// `firstRectForCharacterRange:actualRange:` — and its own doc comment said as
-// much. W9 phase 2 ports that file, so the last caller is gone and the section
-// with it. Six projected, zero surviving, over two waves.
+//   objc2_ref(Id) -> &T   borrowed an objc2 binding at a raw `id`, for a ported
+//                         file handing a result to an UNPORTED neighbour.
+//   witness / marker      the bidirectional marker pair W9 added so the
+//                         substitution could proceed LEAF-FIRST. It did, and
+//                         reached the roots.
+//   obj_of(&T) -> Obj     an owning `Obj` at an objc2 reference, +1, for
+//                         `monitor.rs::ns_screen`'s two readers.
 //
-// `id_of` below went the same way in the same commit and is worth the second
-// example, because its shape was different: it was not over-projected, it had
-// SEVEN live callers, and every one of them was in `view.rs` handing an objc2
-// `&NSEvent` to `event.rs`, which phase 1 had already ported to take a raw
-// `id`. A crossing is dead when EITHER side stops needing it, and a count of
-// call sites says nothing about which.
+// THE LESSON, for the third time in this campaign: a crossing dies when EITHER
+// side stops needing it, so a count of call sites predicts nothing about its
+// lifetime. `seam::id_of` had SEVEN live callers and lost them in one commit;
+// `obj_of` had two; `objc2_ref` had four, in four files, one file at a time.
+//
+// What is left here was never a crossing: two string helpers, the CONSTANTS and
+// the framework GLOBALS. The module keeps its name because it is the fork's
+// binding layer now, which is what the header calls the second kind of content.
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// THE REVERSE CROSSING. Added for `window_delegate.rs` (W8).
-// ---------------------------------------------------------------------------
-
-/// An owning [`aterm_objc::Obj`] at an `objc2` binding reference, +1.
-///
-/// # Why this direction exists again
-///
-/// `aterm-gui` had a function like this (`id_of`) and W7 DELETED it, because
-/// once `toolbar.rs`'s bindings were ported nothing crossed that way any more.
-/// The fork is not in that position and will not be for several waves: this
-/// backend is ported FILE BY FILE, and a ported file's unported neighbours hand
-/// it `objc2` handles across module boundaries — `monitor.rs`'s
-/// `ns_screen() -> Option<Retained<NSScreen>>` and `cursor.rs`'s
-/// `default_cursor() -> Retained<NSCursor>` are the live examples. Re-badging
-/// one of those at the boundary is what lets the RECEIVING file send through
-/// the first-party layer without its unported neighbour changing at all.
-///
-/// It retains, and that is the whole design. `Retained<T>`'s +1 belongs to the
-/// caller's binding handle and will be released when that handle drops; the
-/// `Obj` returned here is a SECOND +1 with its own lifetime, so the two can be
-/// dropped in either order. Borrowing the raw pointer instead would tie an
-/// `aterm_objc` value's validity to an `objc2` value's scope through a link the
-/// compiler cannot see — the exact defect the tenth pass found in
-/// `app_introspect.rs` and that `appkit::objc2_ref` was re-signatured to fix.
-#[must_use]
-pub(super) fn obj_of<T>(r: &T) -> aterm_objc::Obj {
-    let id = Id::from_ptr((r as *const T).cast_mut().cast());
-    // SAFETY: `r` borrows a live Objective-C instance (it is an `objc2` binding
-    // reference, which cannot exist otherwise), so `objc_retain` on its address
-    // is valid and yields a +1 this `Obj` owns.
-    unsafe { aterm_objc::Obj::retain(id) }.expect("retaining a live objc2 binding reference")
-}
 
 // ---------------------------------------------------------------------------
 // STRINGS.
@@ -304,6 +186,18 @@ pub(super) mod consts {
     // ---- NSWindow.h, NSWindowOcclusionState (NSUInteger) ----
     pub(crate) const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
 
+    // ---- NSApplication.h, NSApplicationActivationPolicy (NSInteger) ----
+    //
+    // W12, for `app_state.rs`. SIGNED, which is the whole reason they are
+    // written out: `objc2-app-kit` generated `NSApplicationActivationPolicy` as
+    // an `NSInteger` newtype and `-setActivationPolicy:` takes one, so a `usize`
+    // spelling would have compiled, passed every value the fork uses (0, 1, 2)
+    // and been a different prototype — which is the `-requestUserAttention:`
+    // defect two blocks below, in the other direction.
+    pub(crate) const NS_APPLICATION_ACTIVATION_POLICY_REGULAR: isize = 0;
+    pub(crate) const NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY: isize = 1;
+    pub(crate) const NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED: isize = 2;
+
     // ---- NSApplication.h, NSRequestUserAttentionType (NSUInteger) ----
     //
     // UNSIGNED, and the type is the whole note on `send_isize_usize`: these were
@@ -343,7 +237,29 @@ pub(super) mod consts {
     pub(crate) const NS_EVENT_MODIFIER_FLAG_COMMAND: usize = 1 << 20;
 
     // ---- NSEvent.h, NSEventType (NSUInteger) ----
+    //
+    // W12, for `app.rs`'s swizzled `-sendEvent:`. `objc2-app-kit` generated
+    // these as a Rust `enum` and the fork `match`ed on its variants; here they
+    // are the header's enumerators, `_Static_assert`ed on both arches by
+    // `aterm-objc/tests/winit_seam_constants.rs` like every other row.
+    //
+    // THEY ARE NOT DENSELY NUMBERED where a reader would expect them to be:
+    // the mouse types run 1..7 and then JUMP to 25..27 for the "other" button,
+    // because `NSEventTypeScrollWheel` (22), the tablet types (23, 24) and six
+    // more sit in between. A reader who assumed `OtherMouseDown` followed
+    // `RightMouseDragged` would write 8 and match `NSEventTypeMouseEntered`.
+    pub(crate) const NS_EVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
+    pub(crate) const NS_EVENT_TYPE_LEFT_MOUSE_UP: usize = 2;
+    pub(crate) const NS_EVENT_TYPE_RIGHT_MOUSE_DOWN: usize = 3;
+    pub(crate) const NS_EVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
+    pub(crate) const NS_EVENT_TYPE_MOUSE_MOVED: usize = 5;
+    pub(crate) const NS_EVENT_TYPE_LEFT_MOUSE_DRAGGED: usize = 6;
+    pub(crate) const NS_EVENT_TYPE_RIGHT_MOUSE_DRAGGED: usize = 7;
+    pub(crate) const NS_EVENT_TYPE_KEY_UP: usize = 11;
     pub(crate) const NS_EVENT_TYPE_APPLICATION_DEFINED: usize = 15;
+    pub(crate) const NS_EVENT_TYPE_OTHER_MOUSE_DOWN: usize = 25;
+    pub(crate) const NS_EVENT_TYPE_OTHER_MOUSE_UP: usize = 26;
+    pub(crate) const NS_EVENT_TYPE_OTHER_MOUSE_DRAGGED: usize = 27;
 
     // ---- NSEvent.h, NSEventSubtype (short) ----
     //

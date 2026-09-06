@@ -87,6 +87,34 @@ path = "examples/objc_toolbar_drive.rs"
 name = "objc_window_drive"
 path = "examples/objc_window_drive.rs"
 
+# THE EVENT DRIVER, the fourth row of the same obligation. The auditor proves
+# the ported `WinitView` is SHAPED right, the IME drive composes through it,
+# the window drive resizes and focuses it — and v0.72.0 still aborted on the
+# first `mouseMoved:` AppKit delivered, because no gate had ever sent a MOUSE
+# event through a mouse IMP. This one builds a real `NSEvent` of every type
+# each event-taking row can receive (AppKit's factories and CoreGraphics),
+# enters the IMP as AppKit does, and re-executes itself as a control child
+# that makes the v0.72.0 send inside a trampoline and must die by SIGABRT.
+# Also run by `aterm verify`; by hand it is
+# `cargo run -p aterm-gui --example objc_event_drive`.
+[[example]]
+name = "objc_event_drive"
+path = "examples/objc_event_drive.rs"
+# THE MODAL DRIVER (W13's sixteenth pass), DECLARED FOR THE SAME REASON as the
+# four above: `aterm-verify`'s `stages.rs` reads the target name from HERE, so
+# the name, the built file and the argv can only agree if this file names the
+# target. It closes the D1 gap on the one subsystem none of the other four
+# touches — `NSAlert`, its sheet, the completion block, the local event monitor
+# and the `NSBitmapImageRep` capture — which the sixteenth pass named "the
+# least-driven surface in the whole port". Its cheaper half is
+# `crates/aterm-objc/tests/gui_sent_prototypes.rs`, the census of all 40
+# selectors these files send; a census cannot see a correct send of the wrong
+# selector, a block whose ABI is right and whose ownership is wrong, or a
+# capture chain that answers bytes which are not a PNG.
+[[example]]
+name = "objc_alert_drive"
+path = "examples/objc_alert_drive.rs"
+
 [features]
 # `sixel` is ON by default so the SHIPPED GUI binary decodes + renders sixel
 # graphics and DA1 advertises code 4. It forwards to aterm-core's `sixel`
@@ -133,20 +161,23 @@ sixel = ["aterm-core/sixel"]
 # Opt-in macOS NSAccessibility publishing (accessibility.rs): publishes the
 # visible grid text / role / label to the content NSView so VoiceOver can read
 # the terminal. OFF by default — the pure accessibility snapshot builder always
-# compiles (and is unit-tested), but the AppKit imperative wiring + its extra
-# objc2 bindings are only built when this is enabled, so the default GUI build is
-# byte-identical and carries no per-frame a11y publish cost. (objc2 +
-# objc2-foundation themselves are now always-on macOS deps for the menu bar, so
-# this feature only adds the extra NSAccessibility binding set.)
-a11y-appkit = [
-    "objc2-app-kit/NSAccessibility",
-    "objc2-app-kit/NSAccessibilityProtocols",
-    "objc2-app-kit/NSAccessibilityConstants",
-    # NSRange for the caret's AXSelectedTextRange; NSRange is feature-gated in
-    # objc2-foundation and NOT in the always-on feature list above, so it enters
-    # the build only with the publisher — the default build stays byte-identical.
-    "objc2-foundation/NSRange",
-]
+# compiles (and is unit-tested), but the AppKit imperative wiring is only built
+# when this is enabled, so the default GUI build is byte-identical and carries
+# no per-frame a11y publish cost.
+#
+# W13: THE LIST IS EMPTY, AND THAT IS THE POINT. It used to name four binding
+# features — `objc2-app-kit/NSAccessibility`, `/NSAccessibilityProtocols`,
+# `/NSAccessibilityConstants` and `objc2-foundation/NSRange` (the last for the
+# caret's AXSelectedTextRange) — which is what made this a feature that pulled
+# EXTRA third-party bindings into the build. The publisher is first-party now:
+# it sends `NSAccessibility*` through `aterm-objc`, and the caret range is an
+# `aterm_objc::NSRange`, so enabling this adds aterm code and no dependency at
+# all. The FEATURE STAYS: `accesskit_tree.rs` gates a `compile_error!` on it to
+# keep it mutually exclusive with `a11y-accesskit`, `diagnostics.rs` reports it,
+# and `--no-default-features --features sixel,a11y-appkit` is the documented way
+# to build the VoiceOver path. An empty list is a real feature; deleting the row
+# would break all three.
+a11y-appkit = []
 # CROSS-PLATFORM accessibility via AccessKit: native tab apps and the command palette
 # map their renderer-owned semantic models to native a11y trees (UIA on Windows, AT-SPI
 # on Linux, NSAccessibility on macOS) from the SAME data the pixels consume.
@@ -489,52 +520,47 @@ softbuffer = { version = "0.4", default-features = false, features = [
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# NSBeep for the audible bell + NSWindow.setColorSpace to drop the per-frame
-# CoreAnimation colour-space conversion (see main.rs), plus the always-on native
-# menu bar (menu.rs): NSApplication/NSMenu/NSMenuItem build + install the Apple
-# main menu, NSEvent supplies the key-equivalent modifier flags. NSToolbar/
-# NSToolbarItem back the per-window native COMPACT chrome (toolbar.rs): a single
-# UnifiedCompact-style toolbar row (NSWindowToolbarStyle::UnifiedCompact +
-# setTitleVisibility hidden) whose ONE custom-view item is the Ghostty-style
-# full-width tab strip. That strip is an NSView container holding one custom
-# NSView (ATermTabView) PER tab — each with an NSTextField title label
-# (NSText/NSTextField), an NSFont, an NSColor accent/dim treatment, a close ×
-# NSButton, and an NSTrackingArea for hover-reveal — plus a trailing "+" New Tab
-# NSButton (NSImage = the add template). NSGraphics also gives the NSRectFill the
-# per-tab drawRect: uses to paint the active accent. (NSSegmentedControl /
-# NSSegmentedCell / NSAnimation are now vestigial — the strip was an
-# NSSegmentedControl before the view-based rewrite — but are kept to avoid
-# churning the build surface.) NSPasteboard backs the in-process clipboard
-# read/write (clipboard.rs `pbcopy`/`pbpaste`), so a copy/paste never
-# forks a `/usr/bin/pbcopy`/`pbpaste` subprocess on the winit event-loop thread.
-# NSOpenPanel/NSSavePanel/NSPanel expose the system local-file picker used by the
-# Markdown and editor tab actions; these are binding features in the same crate.
-# AppKit (objc2-app-kit 0.2) is already linked
-# in-process via softbuffer/winit; these add bindings, not a dep.
-# NSImageRep/NSBitmapImageRep: the full-window capture composites the titlebar
-# container's own bitmap over the content pixels, so it needs the rep bindings.
-# NSStatusBar/NSStatusItem/NSStatusBarButton back the menu-bar OPERATOR status
-# item (status_item.rs): the persistent top-menu icon that reflects operator/
-# fleet state and starts/shows/stops the operator session.
-# `NSGraphicsContext` is here only to unlock `+[NSEvent keyEventWithType:…]`, whose
-# binding takes an (always-nil) graphics-context argument — the `hwkey` hardware-path
-# injector builds real NSEvents with it. No graphics context is ever created.
-objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphicsContext", "NSGraphics", "NSColorSpace", "NSColor", "NSWindow", "NSView", "NSResponder", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSRunningApplication", "NSPasteboard", "NSToolbar", "NSToolbarItem", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSControl", "NSCell", "NSButton", "NSBezierPath", "NSText", "NSTextField", "NSFont", "NSTrackingArea", "NSSegmentedControl", "NSSegmentedCell", "NSAnimation", "NSAppearance", "NSAlert", "NSPanel", "NSSavePanel", "NSOpenPanel", "NSWorkspace", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "libc"] }
-# objc2 + objc2-foundation are now ALWAYS built on macOS (not just the optional
-# `a11y-appkit` feature): menu.rs declares an NSObject action target (objc2's
-# declare_class!) and uses NSString/MainThreadMarker for the menu. Both are
-# already in the tree transitively via objc2-app-kit, so this adds bindings only.
-# (The `a11y-appkit` feature below just enables the extra NSAccessibility
-# bindings; the base crates are no longer gated behind it.)
-objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop", "NSData"] }
-objc2 = { version = "0.5" }
-block2 = "0.5"
-# THE FIRST-PARTY REPLACEMENT for the two lines above (and for the objc2-* binding
-# crates): typed message sends, ownership, runtime class creation and the block
-# ABI, with zero dependencies of its own. W1 ports ONE of the seven
-# `declare_class!` sites onto it — `platform.rs`'s `ReduceMotionTarget` — and the
-# rest follow in W2. Not optional and not feature-gated: the ported site is the
-# shipping path.
+# THE FOUR objc2-FAMILY ROWS THAT STOOD HERE ARE RETIRED — `objc2-app-kit`,
+# `objc2-foundation`, `objc2` and `block2`. `block2` went first, with the
+# NSException containment (2026-09-05): its two sites here — the alert key
+# monitor in alert_keys.rs and the paste sheet's completion handler in lib.rs —
+# are `aterm_objc::RcBlock` now, whose `invoke` contains an NSException instead
+# of aborting from a `nounwind` frame. The other three went with W13: this
+# crate's last five family files (`alert_keys.rs`, `menu.rs`, `lib.rs`'s paste
+# sheet, `app_introspect.rs` and `appkit.rs`) ported to `aterm-objc`, so the
+# rows were declaring dependencies no line of this crate could reach. What they backed is unchanged
+# and is now first-party: the audible bell and `setColorSpace`, the always-on
+# native menu bar, the per-window COMPACT toolbar and its tab strip, the
+# in-process pasteboard, the local-file panels, the full-window bitmap capture,
+# the menu-bar operator status item, the modal paste-confirm sheet, and the
+# `+[NSEvent keyEventWithType:…]` hardware-key injector.
+#
+# WHAT RETIRING THEM BUYS, MEASURED RATHER THAN CLAIMED: **nothing yet — zero
+# packages, zero lines, zero unsafe tokens.** `cargo forge survey --cell
+# mac-arm` is byte-identical across this commit. All six family packages are
+# held by a SECOND parent that is still live: the winit fork's own four macOS
+# rows (`vendor/winit/Cargo.toml`), whose backend has eight files still using
+# them. `cargo tree -i -p objc2-app-kit` answers `winit` and nothing else once
+# these rows are gone.
+#
+# So this row's removal is an HONESTY fix, not a size win: it stops this crate
+# claiming a dependency it does not have, and it makes the fork the single
+# remaining parent, which is what the next wave has to port. The packages leave
+# `mac-arm` on the commit that empties `vendor/winit/src/platform_impl/macos`,
+# at no earlier one. Pinned by `objc2_exit_condition`'s
+# `the_manifest_rows_are_live_or_dead_exactly_as_the_file_counts_say`.
+#
+# THAT COMMIT IS THE W12 + W13 MERGE onto the containment (2026-09-05): the
+# fork's rows are gone too (see the retirement note in vendor/winit/Cargo.toml),
+# and the mac-arm cell moved by the packages and lines tools/forge-budget.tsv
+# records with its dated note (6).
+
+# THE FIRST-PARTY REPLACEMENT for the four rows retired above (and for the
+# objc2-* binding crates): typed message sends, ownership, runtime class creation
+# and the block ABI, with zero dependencies of its own. W1 ported ONE of the
+# seven `declare_class!` sites onto it — `platform.rs`'s `ReduceMotionTarget`;
+# as of W13 it carries every macOS site this crate has. Not optional and not
+# feature-gated: it is the shipping path.
 aterm-objc = { workspace = true }
 
 # ORACLE ONLY (never in a shipped build). `security-framework` used to be a hard

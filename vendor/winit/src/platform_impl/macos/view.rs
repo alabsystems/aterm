@@ -229,7 +229,10 @@ aterm_objc::declare_class! {
         type Ivars = ViewState;
         protocols: [NSTextInputClient];
 
-        @sel(isFlipped)
+        // NOT CONTAINED: a contained NO would flip the coordinate system for one
+        // draw. Send-free, so unreachable by a raise; the marker states the
+        // policy (the same for every `@abort_on_exception` YES-row below).
+        @sel(isFlipped) @abort_on_exception
         fn is_flipped(&self) -> Bool {
             // `winit` uses the upper-left corner as the origin.
             Bool::YES
@@ -266,7 +269,8 @@ aterm_objc::declare_class! {
             // This is a direct subclass of NSView, no need to call superclass' drawRect:
         }
 
-        @sel(acceptsFirstResponder)
+        // NOT CONTAINED: a contained NO would refuse first-responder status.
+        @sel(acceptsFirstResponder) @abort_on_exception
         fn accepts_first_responder(&self) -> Bool {
             trace_scope!("acceptsFirstResponder");
             Bool::YES
@@ -331,7 +335,12 @@ aterm_objc::declare_class! {
             Bool::new(self.marked_text_length() > 0)
         }
 
-        @sel(markedRange)
+        // NOT CONTAINED, this row and `selectedRange`: their "nothing" answer
+        // is `{NSNotFound, 0}`, so the containment's all-zero `{0, 0}` is a
+        // REAL range the input context would read as "marked text at 0". The
+        // bodies make no raising send (`-length` on an owned string), so
+        // nothing is lost by keeping the abort.
+        @sel(markedRange) @abort_on_exception
         fn marked_range(&self) -> NSRange {
             trace_scope!("markedRange");
             let length = self.marked_text_length();
@@ -343,7 +352,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        @sel(selectedRange)
+        @sel(selectedRange) @abort_on_exception
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
             // Documented to return `{NSNotFound, 0}` if there is no selection.
@@ -468,20 +477,26 @@ aterm_objc::declare_class! {
             trace_scope!("unmarkText");
             *self.ivars().marked_text.borrow_mut() = new_marked_text();
 
-            // SAFETY: `-inputContext` `@16@0:8` (+0 borrowed);
-            // `-discardMarkedText` `v16@0:8` on `NSTextInputContext`.
-            unsafe {
-                let input_context = send_id(self.as_id(), sel!(inputContext));
-                assert!(!input_context.is_null(), "input context");
-                send_v(input_context, sel!(discardMarkedText));
-            }
-
+            // LOCAL PATCH (aterm): the application is told the composition is
+            // gone and the state machine is grounded BEFORE the send. A
+            // contained raise in `-discardMarkedText` used to leave winit in
+            // `Preedit` with an empty marked string while the application still
+            // showed the old composition — a phantom that persisted until the
+            // next IME event.
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
                 // Leave the Preedit self.ivars()
                 self.ivars().ime_state.set(ImeState::Ground);
             } else {
                 tracing::warn!("Expected to have IME enabled when receiving unmarkText");
+            }
+
+            // SAFETY: `-inputContext` `@16@0:8` (+0 borrowed);
+            // `-discardMarkedText` `v16@0:8` on `NSTextInputContext`.
+            unsafe {
+                let input_context = send_id(self.as_id(), sel!(inputContext));
+                assert!(!input_context.is_null(), "input context");
+                send_v(input_context, sel!(discardMarkedText));
             }
         }
 
@@ -514,7 +529,9 @@ aterm_objc::declare_class! {
             Id::NIL
         }
 
-        @sel(characterIndexForPoint:)
+        // NOT CONTAINED: "no character" is `NSNotFound`, so the contained `0`
+        // would name the first character. Send-free.
+        @sel(characterIndexForPoint:) @abort_on_exception
         // LOCAL PATCH (aterm): `NSUInteger` was an `objc2-foundation` type
         // ALIAS for `usize` and carried nothing else; the declared row's
         // encoding is `Q` either way.
@@ -1009,13 +1026,15 @@ aterm_objc::declare_class! {
         // Allows us to receive Ctrl-Tab and Ctrl-Esc.
         // Note that this *doesn't* help with any missing Cmd inputs.
         // https://github.com/chromium/chromium/blob/a86a8a6bcfa438fa3ac2eba6f02b3ad1f8e0756f/ui/views/cocoa/bridged_content_view.mm#L816
-        @sel(_wantsKeyDownForEvent:)
+        // NOT CONTAINED: a contained NO would hand Ctrl-Tab/Ctrl-Esc back to AppKit.
+        @sel(_wantsKeyDownForEvent:) @abort_on_exception
         fn wants_key_down_for_event(&self, _event: Id) -> Bool {
             trace_scope!("_wantsKeyDownForEvent:");
             Bool::YES
         }
 
-        @sel(acceptsFirstMouse:)
+        // NOT CONTAINED: a contained NO would swallow the first click.
+        @sel(acceptsFirstMouse:) @abort_on_exception
         fn accepts_first_mouse(&self, _event: Id) -> Bool {
             trace_scope!("acceptsFirstMouse:");
             Bool::new(self.ivars().accepts_first_mouse)
@@ -1310,6 +1329,16 @@ impl WinitView {
 
     pub(super) fn option_as_alt(&self) -> OptionAsAlt {
         self.ivars().option_as_alt.get()
+    }
+
+    /// LOCAL PATCH (aterm): the modifier state this view last DERIVED FROM AN
+    /// EVENT — `update_modifiers` writes it before it queues `ModifiersChanged`,
+    /// so after a contained `NSException` inside that row the cache is current
+    /// while the app's copy may be one event behind. Read from the cache, never
+    /// from a WindowServer-backed probe (the class-level flags query is banned
+    /// tree-wide; see tools/grep_guard.sh B9a).
+    pub(super) fn cached_modifiers(&self) -> ModifiersState {
+        self.ivars().modifiers.get().state()
     }
 
     /// Update modifiers if `event` has something different

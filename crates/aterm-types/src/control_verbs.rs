@@ -1326,11 +1326,15 @@ pub const VERBS: &[VerbSpec] = &[
          (ON by default for `ask` and `task`) blocks until the bridge reports the record landed \
          and answers `OK <id> off=<n>` — the broker-assigned offset is the correlation id an \
          answer carries back as `re=`. When the link cannot report a landing the wait ends at \
-         once with `ERR fabric <absent|disconnected> id=<n> queued=1`: `queued=1` says the \
-         message is STILL IN THE OUTBOX and a replacement bridge will publish it (a bridge exit \
-         is the ordinary relaunch path, and `outbox` is a peek that removes nothing), so it must \
-         not be read as `not sent` and re-posted — `post` carries no idempotency key that would \
-         collapse the duplicate. The body is inline text up to 4 KiB, or `len=<n>` followed \
+         once with `ERR fabric <absent|disconnected> id=<n> <queued=1|no-bridge=1>`, and WHICH \
+         of those two tokens it carries is the instruction. `queued=1` says the message is STILL \
+         IN THE OUTBOX and a bridge will publish it (a bridge exit is the ordinary relaunch \
+         path, and `outbox` is a peek that removes nothing), so it must not be read as `not \
+         sent` and re-posted — `post` carries no idempotency key that would collapse the \
+         duplicate. `no-bridge=1` says the opposite about the same queued message: this instance \
+         has no `[fabric] command`, so no bridge exists to drain the outbox and none is coming. \
+         Nothing will publish it, no answer can arrive, and further posts only fill the queue \
+         until `ERR outbox full`. The body is inline text up to 4 KiB, or `len=<n>` followed \
          by that many raw bytes up to 256 KiB. There is no `to=fleet`: a node holds no fleet \
          write grant, and an agent may only ASK a human to halt. REFUSED to an edge-token \
          connection — a write-input edge over one session would otherwise speak AS that session, \
@@ -1369,13 +1373,22 @@ pub const VERBS: &[VerbSpec] = &[
          in-session client already holds, so a halt an injected agent could lift locally would be \
          no halt at all. While on, every PTY-reaching verb resolving to that session answers `ERR \
          halted <reason>` from ANY scope — `send key ctrl feed feed-bin paste paste-bin mouse \
-         resize focus signal turn close invoke hwkey pane tab operator-propose-bin` — a TRANSIENT class \
-         beside `ERR busy`, so existing back-off code already does the right thing. `focus` is in \
-         that set because it writes the DEC 1004 focus reports to the PTY; `invoke` is, because \
-         `invoke Paste` writes the clipboard into the front tab's PTY; `tab` is, because `tab \
-         close [N]` RETIRES a session exactly as `close` does, and a driver refused `close` used \
-         to type that instead. `invoke` and `tab` resolve no session, so they are refused while \
-         ANY session on the instance is held. `post`, `inbox seen`, \
+         pointer resize focus signal turn close invoke hwkey pane tab operator-propose-bin` — a \
+         TRANSIENT class beside `ERR busy`, so existing back-off code already does the right \
+         thing. That enumeration is NOT maintained by hand: it is pinned verb-for-verb against \
+         the set this build enforces (`fabric::is_pty_reaching`), so a verb a halt refuses cannot \
+         be missing from it and a verb named here cannot be answerable. `focus` is in that set \
+         because it writes the DEC 1004 focus reports to the PTY; `pointer` is, because the \
+         terminal REPORTS pointer motion to the program under DEC 1000/1002/1003; `hwkey` is, \
+         because it posts a real NSEvent and so takes the same path a physical keypress does; \
+         `invoke` is, because `invoke Paste` writes the clipboard into the front tab's PTY; \
+         `pane` is, because it moves which pane — and so which session — the keyboard drives; \
+         `tab` is, because `tab close [N]` RETIRES a session exactly as `close` does, and a \
+         driver refused `close` used to type that instead. `invoke`, `hwkey`, `pane`, `pointer` \
+         and `tab` resolve no session, so they are refused while ANY session on the instance is \
+         held — including the aimed `@<sid> tab …` form, which drives the window HOSTING that \
+         session and therefore answers `ERR halted` whenever any session of that instance is \
+         held, not only the one it names. `post`, `inbox seen`, \
          `meta set`, `lease` and every read verb stay answerable, and the physical keyboard is untouched: a \
          halt stops drivers, not humans. When the bridge connection closes, the instance holds \
          every session that bridge ever delivered to or held with `reason=fabric-lost \
@@ -2511,7 +2524,11 @@ mod tests {
     ///   word.
     /// * `post` answered a still-queued message with a bare `ERR fabric
     ///   disconnected`, which reads as "not sent" — and the remedy for "not sent"
-    ///   is to send again, into an inbox with no idempotency key.
+    ///   is to send again, into an inbox with no idempotency key. The `queued=1`
+    ///   that fixed it was then stated UNCONDITIONALLY, over a `fabric absent`
+    ///   that on an instance with no `[fabric] command` is permanent: the row told
+    ///   an agent not to re-post and to wait for a bridge that would never exist,
+    ///   which is why the two states now carry different tokens.
     /// * `inbox seen` moves the LISTED state as well as the handled watermark,
     ///   which is what releases a sender's quota; the two rows read as if the
     ///   watermarks were independently controlled.
@@ -2565,6 +2582,13 @@ mod tests {
         assert!(
             help("post").contains("queued=1"),
             "a `--wait` refused for want of a link must not read as `not sent`"
+        );
+        assert!(
+            help("post").contains("no-bridge=1") && help("post").contains("none is coming"),
+            "…and the state where nothing WILL publish it must not read as \
+             `queued=1` either: on an instance with no `[fabric] command` the \
+             row's own advice (do not re-post, a replacement bridge will publish \
+             it) is advice to wait forever"
         );
 
         assert!(help("outbox").contains("BOUNDED IN BYTES"));

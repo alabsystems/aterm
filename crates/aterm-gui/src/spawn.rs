@@ -658,7 +658,7 @@ fn register_injected_parent_edges(ctx: &SessionCtx) {
     // injected token set. Surface ANY shortfall (n < 3), not only the all-missing
     // case, so a silent partial loss (e.g. two colliding hexes) is visible.
     if n < 3 {
-        eprintln!(
+        crate::logging::stderr_line!(
             "aterm: ATERM_PARENT_SESSION_ID set but recorded only {n}/3 parent edges — \
              some ops have no authority (malformed/duplicate/partial edge tokens)"
         );
@@ -2495,6 +2495,20 @@ fn spawn_compress_worker(term: Arc<Mutex<Terminal>>) -> Option<std::sync::mpsc::
     std::thread::Builder::new()
         .name("aterm-scrollback-compress".into())
         .spawn(move || {
+            // macOS (port of 61a6c8b62): this worker is BACKGROUND work that takes
+            // a FOREGROUND lock. Its batches are cheap, but each one holds the
+            // shared `term` mutex — the same mutex the UI thread takes on the
+            // keystroke path. At the default QoS this thread is a candidate for
+            // E-core placement and for preemption by the P-core work around it,
+            // and being descheduled WHILE HOLDING that lock stalls every waiter
+            // for as long as it takes to be rescheduled — which on a saturated
+            // machine (the case that matters) is far longer than the batch.
+            //
+            // Matching the reader/gather threads at USER_INITIATED does not make
+            // compression urgent; it shortens the window in which a lock holder
+            // can sit descheduled. Deliberately NOT USER_INTERACTIVE: this must
+            // never outrank the UI thread it is trying to stay out of the way of.
+            crate::qos::set_self(crate::qos::Role::Responsive);
             while rx.recv().is_ok() {
                 // FLOOD GATE (cat-flood regression): back-to-back signals mean the
                 // reader is mid-flood, and every promotion batch here contends the
@@ -2601,12 +2615,11 @@ fn spawn_pty_gather(
         .name(format!("aterm-pty-gather-{id}"))
         .spawn(move || {
             // macOS: default QoS parks this thread on E-cores whose wakeup
-            // latency dwarfs the ~10µs PTY producer/consumer cadence.
-            #[cfg(target_os = "macos")]
-            // SAFETY: setting this thread's own QoS class; no pointers involved.
-            unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
-            }
+            // latency dwarfs the ~10µs PTY producer/consumer cadence. (The
+            // same USER_INITIATED class as before, spelled as a `qos::Role` —
+            // port of 61a6c8b62 — so every worker's rank is reviewable in one
+            // place.)
+            crate::qos::set_self(crate::qos::Role::Responsive);
             // Deferred start (overlap park): no master read before release. On a
             // stop-abort the parse stage still gets its terminal message.
             if let Some(gate) = &start_gate
@@ -2828,11 +2841,9 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             // macOS: default QoS parks this thread on E-cores, whose wakeup latency
             // dwarfs the ~10µs PTY producer/consumer cadence and taxes drain
             // throughput double-digit percent. The drain IS user-initiated work.
-            #[cfg(target_os = "macos")]
-            // SAFETY: setting this thread's own QoS class; no pointers involved.
-            unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
-            }
+            // (Same USER_INITIATED class as before, spelled as a `qos::Role` —
+            // port of 61a6c8b62.)
+            crate::qos::set_self(crate::qos::Role::Responsive);
             // Windows keeps the single-thread read+parse loop (ConPTY has no
             // ~1 KiB read cap, so the gather split buys nothing there); the gate
             // and buffer live with whichever thread reads the master.

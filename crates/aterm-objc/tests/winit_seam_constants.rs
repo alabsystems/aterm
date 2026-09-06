@@ -119,6 +119,27 @@ const ROWS: &[(&str, &str)] = &[
     ("NS_EVENT_PHASE_MAY_BEGIN", "NSEventPhaseMayBegin"),
     ("NS_NOT_FOUND", "NSNotFound"),
     ("NS_UTF8_STRING_ENCODING", "NSUTF8StringEncoding"),
+    // ---- W12, app_state.rs's activation policy ----
+    ("NS_APPLICATION_ACTIVATION_POLICY_REGULAR", "NSApplicationActivationPolicyRegular"),
+    ("NS_APPLICATION_ACTIVATION_POLICY_ACCESSORY", "NSApplicationActivationPolicyAccessory"),
+    ("NS_APPLICATION_ACTIVATION_POLICY_PROHIBITED", "NSApplicationActivationPolicyProhibited"),
+    // ---- W12, app.rs's swizzled -sendEvent: ----
+    //
+    // The eleven `NSEventType` enumerators the fork matches on. `objc2-app-kit`
+    // generated them as a Rust `enum`; the numbering is NOT dense across the
+    // mouse types (1..7 then 25..27), which is exactly the kind of gap a
+    // transcription gets wrong and a `_Static_assert` does not.
+    ("NS_EVENT_TYPE_LEFT_MOUSE_DOWN", "NSEventTypeLeftMouseDown"),
+    ("NS_EVENT_TYPE_LEFT_MOUSE_UP", "NSEventTypeLeftMouseUp"),
+    ("NS_EVENT_TYPE_RIGHT_MOUSE_DOWN", "NSEventTypeRightMouseDown"),
+    ("NS_EVENT_TYPE_RIGHT_MOUSE_UP", "NSEventTypeRightMouseUp"),
+    ("NS_EVENT_TYPE_MOUSE_MOVED", "NSEventTypeMouseMoved"),
+    ("NS_EVENT_TYPE_LEFT_MOUSE_DRAGGED", "NSEventTypeLeftMouseDragged"),
+    ("NS_EVENT_TYPE_RIGHT_MOUSE_DRAGGED", "NSEventTypeRightMouseDragged"),
+    ("NS_EVENT_TYPE_KEY_UP", "NSEventTypeKeyUp"),
+    ("NS_EVENT_TYPE_OTHER_MOUSE_DOWN", "NSEventTypeOtherMouseDown"),
+    ("NS_EVENT_TYPE_OTHER_MOUSE_UP", "NSEventTypeOtherMouseUp"),
+    ("NS_EVENT_TYPE_OTHER_MOUSE_DRAGGED", "NSEventTypeOtherMouseDragged"),
 ];
 
 fn repo() -> PathBuf {
@@ -200,6 +221,13 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
     std::fs::write(&path, body).expect("the probe is writable");
     let out = Command::new("cc")
         .args(["-arch", arch, "-fsyntax-only"])
+        // A wrong-but-vacuous assertion WARNS before it passes, so THAT
+        // warning is made fatal — and only that one. A blanket `-Werror` was
+        // tried first and broke the green arm on an unrelated diagnostic:
+        // `NSWindowFullScreenButton` is deprecated, so the whole probe failed
+        // for a reason that has nothing to do with any constant's value. See
+        // [`probe`] for the precedence shape this is about.
+        .arg("-Werror=parentheses")
         .arg(&path)
         .output()
         .expect(
@@ -215,6 +243,24 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
 
 /// The probe source: one `_Static_assert` per row, using the seam's own
 /// literal. `invert` flips ONE row, for the non-vacuity arm.
+///
+/// # The literal is PARENTHESISED, and the day that starts mattering is the day
+/// it would otherwise go silently vacuous
+///
+/// `|` binds LOOSER than `==` in C, so `_Static_assert(SDK == a | b, "")` parses
+/// as `_Static_assert((SDK == a) | b, "")` — non-zero whatever `SDK` is, i.e. an
+/// assertion that passes for every value including the wrong one. Clang warns
+/// (`-Wparentheses`) and exits 0.
+///
+/// **No row in this seam is compound today**, so this probe is not vacuous and
+/// never has been. It would become so the moment someone writes a mask as
+/// `A | B` — which is exactly how `aterm-gui`'s twin of this file spells two of
+/// its rows, where the shape was found and MEASURED
+/// (`gui_appkit_constants::an_unparenthesised_compound_literal_would_be_vacuous`
+/// builds a wrong value both ways and proves the bare form is accepted). The
+/// parentheses and the `-Werror -Wparentheses` in [`compile`] are the fix
+/// applied here BEFORE the row that needs it exists, because a guard that only
+/// starts working after the defect lands is not a guard.
 fn probe(invert: Option<&str>) -> String {
     let values: std::collections::HashMap<String, String> = seam_constants().into_iter().collect();
     let mut s = String::from("#import <Cocoa/Cocoa.h>\n");
@@ -225,7 +271,7 @@ fn probe(invert: Option<&str>) -> String {
             // works for the `double` row as well as every integer one.
             format!("(({lit}) + 1)")
         } else {
-            lit
+            format!("({lit})")
         };
         s.push_str(&format!("_Static_assert({sdk} == {lit}, \"{rust}\");\n"));
     }

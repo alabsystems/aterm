@@ -832,7 +832,7 @@ pub(crate) fn run_conformance() -> StepEvidence {
         );
     }
 
-    eprintln!(
+    crate::logging::stderr_line!(
         "SelectionCustody Tier-1 conformance: {validated} real transitions strictly validated \
          against the derived spec (6 through the real App gesture/press seams, 4 damage cases \
          through real VT batches, 1 wholesale, 1 uniform scroll, 2 evictions), the \

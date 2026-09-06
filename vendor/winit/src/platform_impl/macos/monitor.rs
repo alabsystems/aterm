@@ -1,8 +1,10 @@
 // Modified by the aterm project in 2026; see the repository NOTICE.
 // (`flip_window_screen_coordinates` takes and answers `aterm_objc`'s
 // `CGRect`/`CGPoint` rather than objc2's `NSRect`/`NSPoint`, because its one
-// live caller — `window_delegate.rs` — computes in those. Search for the aterm
-// local-patch marker.)
+// live caller — `window_delegate.rs` — computes in those. Every `objc2`
+// binding call is now a typed send through `aterm_objc`, and `ns_screen`
+// answers an `aterm_objc::Obj` rather than a `Retained<NSScreen>`. Search for
+// the aterm local-patch marker.)
 //
 // NOTE ON THIS NOTICE: see the same note at the head of `view.rs`; it was
 // missing here too until W8.
@@ -19,11 +21,14 @@ use core_foundation::uuid::{CFUUIDGetUUIDBytes, CFUUID};
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGDisplayCopyDisplayMode,
 };
-use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2_app_kit::NSScreen;
-use objc2_foundation::{ns_string, run_on_main, NSNumber};
 use tracing::warn;
+
+// LOCAL PATCH (aterm): objc2's `Retained`/`AnyObject`, its `NSScreen` and
+// `NSNumber` bindings, `ns_string!` and `objc2_foundation::run_on_main` are all
+// gone. `aterm_objc::run_on_main` is the same primitive — W10 built it for
+// exactly this call — and `Obj` is the +1 handle `Retained<NSScreen>` was.
+use aterm_objc::send::{send_f64, send_id, send_id_id, send_id_usize, send_u32, send_usize};
+use aterm_objc::{Id, Obj, autoreleasepool, class, run_on_main, sel};
 
 use super::ffi;
 use crate::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
@@ -200,8 +205,17 @@ pub fn available_monitors() -> VecDeque<MonitorHandle> {
     if let Ok(displays) = CGDisplay::active_displays() {
         let mut monitors = VecDeque::with_capacity(displays.len());
         for display in displays {
-            // Display ID just fetched from `CGGetActiveDisplayList`, should be fine to unwrap.
-            monitors.push_back(MonitorHandle::new(display).expect("invalid display ID"));
+            // LOCAL PATCH (aterm): upstream unwraps here ("just fetched from
+            // `CGGetActiveDisplayList`, should be fine"). A display can leave
+            // between that list and `CGDisplayCreateUUIDFromDisplayID` —
+            // unplug, sleep/wake, an arrangement change — and under aterm's
+            // trampoline policy the panic is a process abort from inside
+            // whatever AppKit callback asked for the monitor list. Skip the
+            // vanished display and say so.
+            match MonitorHandle::new(display) {
+                Some(monitor) => monitors.push_back(monitor),
+                None => warn!("display {display} vanished during enumeration; skipping it"),
+            }
         }
         monitors
     } else {
@@ -209,9 +223,16 @@ pub fn available_monitors() -> VecDeque<MonitorHandle> {
     }
 }
 
-pub fn primary_monitor() -> MonitorHandle {
-    // Display ID just fetched from `CGMainDisplayID`, should be fine to unwrap.
-    MonitorHandle::new(CGDisplay::main().id).expect("invalid display ID")
+/// LOCAL PATCH (aterm): upstream unwraps the main display's UUID. It is `None`
+/// for an instant mid-reconfiguration, and under aterm's trampoline policy
+/// that panic is a process abort. Fall back to the first active display, and
+/// to `None` — which the callers in event_loop.rs / window_delegate.rs already
+/// return — when there is none.
+pub fn primary_monitor() -> Option<MonitorHandle> {
+    MonitorHandle::new(CGDisplay::main().id).or_else(|| {
+        warn!("main display has no UUID right now; falling back to the first active display");
+        available_monitors().pop_front()
+    })
 }
 
 impl fmt::Debug for MonitorHandle {
@@ -258,11 +279,15 @@ impl MonitorHandle {
     }
 
     pub fn scale_factor(&self) -> f64 {
-        run_on_main(|mtm| {
-            match self.ns_screen(super::aterm_objc_seam::witness(mtm)) {
-                Some(screen) => screen.backingScaleFactor() as f64,
-                None => 1.0, // default to 1.0 when we can't find the screen
-            }
+        // LOCAL PATCH (aterm): `aterm_objc::run_on_main` — W10 built it as the
+        // first-party twin of `objc2_foundation::run_on_main`, and it hands the
+        // closure a `MainThread` witness directly, so the seam crossing that
+        // used to sit on this line is gone.
+        run_on_main(|mtm| match self.ns_screen(mtm) {
+            // SAFETY: `screen` owns a +1 to a live `NSScreen`;
+            // `-backingScaleFactor` is `d16@0:8`.
+            Some(screen) => unsafe { send_f64(screen.id(), sel!(backingScaleFactor)) },
+            None => 1.0, // default to 1.0 when we can't find the screen
         })
     }
 
@@ -358,23 +383,53 @@ impl MonitorHandle {
         }
     }
 
+    /// The `NSScreen` this monitor names, +1, or `None` if it is not attached.
+    ///
     /// LOCAL PATCH (aterm), W9: takes `aterm_objc::MainThread`, because its two
     /// cross-file callers are in `window_delegate.rs`, which is ported and holds
-    /// a witness. `NSScreen::screens` still consumes an objc2 marker, so one is
-    /// re-derived here — this file stays on the objc2 list, pinned by that
-    /// binding and by `run_on_main`, and says so rather than pretending the
-    /// signature change moved it.
-    pub(crate) fn ns_screen(&self, w: aterm_objc::MainThread) -> Option<Retained<NSScreen>> {
+    /// a witness.
+    ///
+    /// LOCAL PATCH (aterm), W12: answers an `Obj`, not a `Retained<NSScreen>`.
+    /// THIS SIGNATURE WAS A CROSS-FILE CONSUMPTION THE ENDGAME METRIC COULD NOT
+    /// SEE: `window_delegate.rs` is off the list and held no `objc2` token on
+    /// either of its two call lines, because `seam::obj_of<T>` took the binding
+    /// type through a GENERIC parameter. Porting this deletes both.
+    ///
+    /// The witness is kept though nothing consumes one — `+[NSScreen screens]`
+    /// never needed a marker at the runtime; objc2's `MainThreadOnly` demanded
+    /// it of every `NSScreen` method — for `menu.rs`'s reason: dropping a
+    /// requirement upstream enforced is a behaviour change, not a port.
+    ///
+    /// The array is walked by INDEX: `Retained<NSArray>::into_iter()` compiled
+    /// to `-countByEnumeratingWithState:objects:count:`, whose mutation guard
+    /// and stack buffer are a capability this crate does not have and does not
+    /// need for a handful of displays. Both sends are already censused.
+    pub(crate) fn ns_screen(&self, w: aterm_objc::MainThread) -> Option<Obj> {
+        let _ = w;
         let uuid = self.uuid();
-        NSScreen::screens(super::aterm_objc_seam::marker(w)).into_iter().find(|screen| {
-            let other_native_id = get_display_id(screen);
-            if let Some(other) = MonitorHandle::new(other_native_id) {
-                uuid == other.uuid()
-            } else {
-                // Display ID was just fetched from live NSScreen, but can still result in `None`
-                // with certain Thunderbolt docked monitors.
-                warn!(other_native_id, "comparing against screen with invalid display ID");
-                false
+        // The array and its elements are +0 autoreleased, so the pool is
+        // explicit and the ONE screen that is answered is retained out of it.
+        autoreleasepool(|_| {
+            // SAFETY: `+screens` is `@16#0:8` and answers a live `NSArray`;
+            // `-count` is `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16`,
+            // which cannot be out of range for an index below the count.
+            unsafe {
+                let screens = send_id(class(c"NSScreen").as_id(), sel!(screens));
+                let n = send_usize(screens, sel!(count));
+                for i in 0..n {
+                    let screen = send_id_usize(screens, sel!(objectAtIndex:), i);
+                    let other_native_id = get_display_id(screen);
+                    if let Some(other) = MonitorHandle::new(other_native_id) {
+                        if uuid == other.uuid() {
+                            return Obj::retain(screen);
+                        }
+                    } else {
+                        // Display ID was just fetched from live NSScreen, but can still result in
+                        // `None` with certain Thunderbolt docked monitors.
+                        warn!(other_native_id, "comparing against screen with invalid display ID");
+                    }
+                }
+                None
             }
         })
     }
@@ -392,34 +447,38 @@ impl MonitorHandle {
     /// the `objc2` name in the file that already owns five of them and is
     /// scheduled to lose all of them together.
     ///
-    /// THE +0 IS UPSTREAM'S, unchanged: the `Retained` is dropped as this
-    /// returns, so the pointer is only valid because AppKit owns the screen.
+    /// THE +0 IS UPSTREAM'S, unchanged: the handle is dropped as this returns,
+    /// so the pointer is only valid because AppKit owns the screen.
     /// A public trait method answering `*mut c_void` has no other option, and
     /// re-signaturing winit's public API is not this campaign's business.
     pub(crate) fn ns_screen_ptr(&self, w: aterm_objc::MainThread) -> Option<*mut c_void> {
-        self.ns_screen(w).map(|s| Retained::as_ptr(&s) as _)
+        self.ns_screen(w).map(|s| s.id().as_ptr())
     }
 }
 
-pub(crate) fn get_display_id(screen: &NSScreen) -> u32 {
-    let key = ns_string!("NSScreenNumber");
-
-    objc2::rc::autoreleasepool(|_| {
-        let device_description = screen.deviceDescription();
-
-        // Retrieve the CGDirectDisplayID associated with this screen
-        //
-        // SAFETY: The value from @"NSScreenNumber" in deviceDescription is guaranteed
-        // to be an NSNumber. See documentation for `deviceDescription` for details:
-        // <https://developer.apple.com/documentation/appkit/nsscreen/1388360-devicedescription?language=objc>
-        let obj = device_description
-            .get(key)
-            .expect("failed getting screen display id from device description");
-        let obj: *const AnyObject = obj;
-        let obj: *const NSNumber = obj.cast();
-        let obj: &NSNumber = unsafe { &*obj };
-
-        obj.as_u32()
+/// The `CGDirectDisplayID` behind a live `NSScreen`.
+///
+/// LOCAL PATCH (aterm): takes a raw `id`, not an `&NSScreen`. That PARAMETER
+/// TYPE was the second cross-file consumption in this file —
+/// `window_delegate.rs::current_monitor_inner` had no `objc2` token on its call
+/// line and reached it through `seam::objc2_ref`.
+pub(crate) fn get_display_id(screen: Id) -> u32 {
+    // SAFETY: `-deviceDescription` is `@16@0:8` on `NSScreen` and answers a +0
+    // autoreleased `NSDictionary` whose entries are borrowed for as long as it
+    // is; `-objectForKey:` is `@24@0:8@16`. The value at `@"NSScreenNumber"` is
+    // documented to be an `NSNumber`, and `-unsignedIntValue` is `I16@0:8` — an
+    // `unsigned int`, matching `CGDirectDisplayID`'s `uint32_t`, which is why
+    // this is `send_u32` and not `send_usize`.
+    // <https://developer.apple.com/documentation/appkit/nsscreen/1388360-devicedescription?language=objc>
+    autoreleasepool(|_| unsafe {
+        let key = aterm_objc::ns_string("NSScreenNumber").expect("a Foundation string");
+        let device_description = send_id(screen, sel!(deviceDescription));
+        let number = send_id_id(device_description, sel!(objectForKey:), key.id());
+        assert!(
+            !number.is_null(),
+            "failed getting screen display id from device description"
+        );
+        send_u32(number, sel!(unsignedIntValue))
     })
 }
 

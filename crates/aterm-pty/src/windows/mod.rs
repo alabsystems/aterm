@@ -1490,9 +1490,15 @@ pub fn set_focus_boost(master: i32, on: bool) {
         };
         if std::env::var_os("ATERM_TRACE_BOOST").is_some() {
             let which = if h == s.process { "shell" } else { "conhost" };
-            eprintln!(
-                "BOOST master={master} on={on} target={which} prio_ok={prio_ok} qos_ok={qos_ok}"
-            );
+            // Best-effort: `eprintln!` PANICS when stderr is closed or its reader is
+            // gone, and this trace runs on the spawn path inside the GUI process.
+            {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "BOOST master={master} on={on} target={which} prio_ok={prio_ok} qos_ok={qos_ok}"
+                );
+            }
         }
     }
 }

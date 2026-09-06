@@ -31,6 +31,25 @@
     )
 )]
 
+/// `eprintln!` that CANNOT panic — for every stderr line this crate writes at
+/// runtime (the Metal arm's degrade notes, the swapchain diagnostics).
+///
+/// `eprintln!` panics when the write fails ("failed printing to stderr"), and
+/// the windowed app's stderr fails in ordinary ways: a pipe whose reader has
+/// gone (EPIPE — Rust ignores SIGPIPE, so the write errors), a terminal that
+/// was closed (EIO on the pty). These notes fire on the live present path,
+/// under `drawRect:` / `RedrawRequested`, where a panic is a process abort
+/// under aterm-objc's trampoline policy. Same shape as
+/// `aterm_gui::logging::stderr_line!`; found by the 2026-09-02 abort audit's
+/// second round.
+macro_rules! stderr_line {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let _ = ::std::writeln!(::std::io::stderr().lock(), $($arg)*);
+    }};
+}
+pub(crate) use stderr_line;
+
 use aterm_render::Frame;
 
 mod device_layer;
@@ -410,7 +429,7 @@ fn backends_from_env() -> wgpu::Backends {
     let default = wgpu::Backends::PRIMARY;
     match std::env::var("ATERM_GPU_BACKEND") {
         Ok(v) if !v.is_empty() => parse_gpu_backend(&v).unwrap_or_else(|| {
-            eprintln!(
+            crate::stderr_line!(
                 "aterm-gpu: unknown ATERM_GPU_BACKEND {v:?} (want dx12|vulkan|gl|metal); using default"
             );
             default
@@ -453,7 +472,7 @@ pub fn metal_backend_selected() -> bool {
         if let Ok(v) = std::env::var("ATERM_METAL")
             && v != "1"
         {
-            eprintln!(
+            crate::stderr_line!(
                 "aterm-gpu: ATERM_METAL={v:?} ignored — the dark-launch switch is \
                  retired and Metal is the macOS renderer (the wgpu arm left the \
                  macOS build; on init failure the CPU present path is the floor)"
@@ -468,7 +487,9 @@ pub fn metal_backend_selected() -> bool {
 fn power_preference_from_env() -> wgpu::PowerPreference {
     match std::env::var("ATERM_GPU_POWER") {
         Ok(v) if !v.is_empty() => parse_gpu_power(&v).unwrap_or_else(|| {
-            eprintln!("aterm-gpu: unknown ATERM_GPU_POWER {v:?} (want low|high); using low");
+            crate::stderr_line!(
+                "aterm-gpu: unknown ATERM_GPU_POWER {v:?} (want low|high); using low"
+            );
             wgpu::PowerPreference::LowPower
         }),
         _ => wgpu::PowerPreference::LowPower,
@@ -579,7 +600,7 @@ fn terminal_memory_hints_default() -> wgpu::MemoryHints {
 pub fn terminal_memory_hints() -> wgpu::MemoryHints {
     match std::env::var("ATERM_GPU_MEMBLOCK") {
         Ok(v) if !v.is_empty() => parse_memblock(&v).unwrap_or_else(|| {
-            eprintln!(
+            crate::stderr_line!(
                 "aterm-gpu: unknown ATERM_GPU_MEMBLOCK {v:?} \
                  (want performance|small|default|<4..=256 MiB>); using default"
             );
@@ -604,7 +625,7 @@ async fn adapter_from_env(instance: &wgpu::Instance) -> Option<wgpu::Adapter> {
         .into_iter()
         .find(|a| a.get_info().name.to_ascii_lowercase().contains(&want_lc));
     if found.is_none() {
-        eprintln!(
+        crate::stderr_line!(
             "aterm-gpu: ATERM_GPU_ADAPTER={want:?} matched no adapter; using default selection"
         );
     }
@@ -801,7 +822,7 @@ impl GpuContext {
                 // genuine loss (`Unknown` / driver removal) needs recovery, but flag
                 // both — the frontend re-checks liveness before it rebuilds, and a
                 // stale flag on a context that is being dropped is harmless.
-                eprintln!("aterm-gpu: GPU device lost ({reason:?}): {msg}");
+                crate::stderr_line!("aterm-gpu: GPU device lost ({reason:?}): {msg}");
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
@@ -1013,7 +1034,7 @@ impl GpuContext {
     pub fn read_back(&self, texture: &wgpu::Texture, width: u32, height: u32) -> Frame {
         self.try_read_back(texture, width, height)
             .unwrap_or_else(|e| {
-                eprintln!("aterm-gpu: readback failed ({e}); returning blank frame");
+                crate::stderr_line!("aterm-gpu: readback failed ({e}); returning blank frame");
                 let (w, h) = (width as usize, height as usize);
                 Frame {
                     width: w,

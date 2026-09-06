@@ -534,7 +534,7 @@ mod tests {
             X11Clipboard::connect_with_selections(clip_name.as_bytes(), Some(prim_name.as_bytes()))
         };
         let (Some(a), Some(b)) = (connect(), connect()) else {
-            eprintln!("SKIP: no X display for the clipboard round-trip test");
+            crate::logging::stderr_line!("SKIP: no X display for the clipboard round-trip test");
             return;
         };
         let payload = "aterm clipboard ✓ 你好 😀";

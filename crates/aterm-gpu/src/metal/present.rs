@@ -548,7 +548,7 @@ mod tests {
     fn device() -> Option<ffi::Device> {
         let d = ffi::Device::system_default();
         if d.is_none() {
-            eprintln!("SKIP: no Metal device on this machine");
+            crate::stderr_line!("SKIP: no Metal device on this machine");
         }
         d
     }
@@ -786,7 +786,7 @@ mod tests {
             surface_present_failure(&refusal, false),
             SurfacePresentFailure::Validation
         );
-        eprintln!(
+        crate::stderr_line!(
             "failure mapping on {}: drift->Reconfigured (live), deviceless \
              nil->Timeout/Occluded (live, hint-split), latch->Validation (live)",
             dev.name()
@@ -1124,7 +1124,7 @@ mod tests {
              inside the quad's extent and outside the clip, and it is the \
              assert a full-destination scissor plant must turn RED"
         );
-        eprintln!(
+        crate::stderr_line!(
             "present arm on {}: 6 frames, reconcile fired on the opaque + EDR \
              flips, crown drew IN the blit pass on both formats, letterbox + \
              content verified per frame",

@@ -70,14 +70,20 @@ pub struct ManifestInputs<'a> {
     /// reader can actually fetch from. Naming the private repo produced a public
     /// appcast whose `url` 404s for everyone without a credential.
     ///
-    /// Nothing in the shipping trust path consumes it: the Rust client's
-    /// `Manifest` (crates/aterm-update/src/manifest.rs) has no `url` field at
-    /// all and downloads via the release's own asset API URL, and `install.sh`
-    /// reads `version`/`dmg`/`sha256`/`team_id`/`min_os` and likewise fetches by
-    /// asset id. (An older comment here claimed install.sh grepped this URL; it
-    /// does not, and has not for some time.) It is retained because it is part
-    /// of the frozen v0.25 manifest surface `emit` round-trips against, and
-    /// because it is what a human reading the appcast will click.
+    /// LOAD-BEARING on the credential-less update lane (since 2026-09-03): the
+    /// web-lane client (`aterm_update::github::web_container_url_agrees`)
+    /// REFUSES a manifest whose `url` is absent or does not name exactly
+    /// `https://github.com/<slug>/releases/download/v<version>/<dmg_name>` for
+    /// the tag its evergreen pointer chose — the URL is never followed (the
+    /// client downloads from the URL it derives itself), it is the signed
+    /// binding of the manifest to its tag and container. `<slug>` must be this
+    /// public channel or the client's own repointed source. The cut asserts the
+    /// exact equality against `aterm_update_core::cdn::release_download_url`
+    /// (publish.rs, the pointer gate) and `tools/check-release-shape.sh` checks
+    /// it against what GitHub serves, so a mis-set `update_channel` fails the
+    /// cut rather than the fleet. `install.sh` reads
+    /// `version`/`dmg`/`sha256`/`team_id`/`min_os` and fetches by asset id; it
+    /// does not read this field.
     pub repo_slug: &'a str,
     /// LSMinimumSystemVersion from the STAMPED bundle plist (spec §4).
     pub min_os: &'a str,

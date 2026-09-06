@@ -965,15 +965,36 @@ mod tests {
         );
     }
 
+    /// The unsafe-token instrument, proven on a package that is still here.
+    ///
+    /// This used to read the `objc2` family (>1,000 tokens) as its non-zero
+    /// witness. The objc2 exit (2026-09-05, measured.rs note (6)) took every
+    /// member of that family out of the shipped mac-arm graph, so the same
+    /// test now pins BOTH facts: the instrument still counts (the vendored
+    /// `winit` fork, whose macOS backend is raw sends end to end, is far above
+    /// zero), and the family reads exactly zero because it is ABSENT — not
+    /// because the count went blind, which a zero on a present package would
+    /// also look like.
     #[test]
-    fn unsafe_tokens_are_measured_and_objc2_is_not_zero() {
+    fn unsafe_tokens_are_measured_and_the_objc2_family_is_gone() {
         let s = survey(0);
-        let objc2: u64 = s
+        let winit: u64 = s
             .third_party()
-            .filter(|id| id.name.starts_with("objc2"))
+            .filter(|id| id.name == "winit")
             .map(|id| s.facts[id].unsafe_tokens)
             .sum();
         // A BLOCK count reads ~0 here; the token count is the honest one.
-        assert!(objc2 > 1000, "objc2 family unsafe tokens = {objc2}");
+        assert!(winit > 1000, "winit unsafe tokens = {winit}");
+        let family: Vec<String> = s
+            .third_party()
+            .filter(|id| {
+                id.name.starts_with("objc2") || id.name == "objc-sys" || id.name == "block2"
+            })
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            family.is_empty(),
+            "the objc2 family is back in the shipped mac-arm graph: {family:?}"
+        );
     }
 }
