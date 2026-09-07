@@ -997,7 +997,12 @@ impl SettingsState {
     pub(crate) fn display_value(f: &EditField) -> &str {
         let raw = f.seed.as_deref().unwrap_or(f.placeholder.as_str());
         if f.seed.is_some() && matches!(f.kind, EditKind::Enum { .. }) {
-            enum_recognized(f).unwrap_or(raw)
+            // An off-roster but live value normalizes to its canonical name too
+            // — `rainbow kitty v2` reads back as `music box`, the same way an
+            // offered alias reads back as its picker row.
+            enum_recognized(f)
+                .or_else(|| enum_offered_or_runtime(f))
+                .unwrap_or(raw)
         } else {
             raw
         }
@@ -1303,6 +1308,29 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
     })
 }
 
+/// The voice/style a row's configured value RESOLVES to at RUNTIME even when the
+/// picker does not offer it — the third state the Enum layer was missing.
+///
+/// `enum_recognized` answers one question: is this value one of the options?
+/// For every row but one that is the same as "does the engine accept it", and
+/// the two were treated as interchangeable. The typing-sound row pulled them
+/// apart: `SoundVoice::RainbowKittyV2` ("music box") is live and selectable by
+/// config while `SoundVoice::ALL` — the picker AND v1's voice-agnostic sweep
+/// list — deliberately withholds it until v2's migration completes. Read
+/// through the options alone, that config reported as `auto`: Settings
+/// contradicting the synth actually playing.
+///
+/// So resolve it the way the runtime does (`Config::trail_sound_voice` =
+/// `SoundVoice::parse(..).unwrap_or_default()`) and let a recognized voice
+/// answer with its own canonical name, whichever spelling was authored. `None`
+/// for a genuinely unknown value, whose truthful answer is the row's default —
+/// which for this row IS `auto`, `SoundVoice::default()`.
+fn enum_offered_or_runtime(f: &EditField) -> Option<&'static str> {
+    (f.key == prefs::EDIT_TRAIL_SOUND_STYLE)
+        .then(|| prefs::trail_sound_style_canonical(enum_candidate(f)))
+        .flatten()
+}
+
 /// The canonical current option spelling for compatibility projection and shared stepping.
 /// It resolves annotated defaults and documented aliases before falling back for a
 /// genuinely unrecognized spelling.
@@ -1327,6 +1355,8 @@ pub(crate) fn enum_current(f: &EditField) -> &'static str {
     enum_recognized(f).unwrap_or_else(|| {
         if f.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
             prefs::DEFAULT_CURSOR_TRAIL_STYLE
+        } else if let Some(live) = enum_offered_or_runtime(f) {
+            live
         } else {
             options.first().copied().unwrap_or("")
         }
@@ -1464,7 +1494,10 @@ pub(crate) fn popup_options_with(f: &EditField, pack_ids: &[String]) -> Vec<Stri
             // `pack:<id>` or an unrecognized spelling), leads verbatim + highlighted
             // so opening + Enter is a no-op and it is stepped FROM, never clobbered.
             if enum_recognized(f).is_none() {
-                let token = enum_candidate(f);
+                // A live-but-unoffered voice leads under its CANONICAL name, so
+                // the highlighted row matches what the row displays however the
+                // config spelled it.
+                let token = enum_offered_or_runtime(f).unwrap_or_else(|| enum_candidate(f));
                 if !token.is_empty() {
                     out.push(token.to_string());
                 }
@@ -6510,19 +6543,51 @@ mod tests {
         }
 
         // The typing-sound picker: every synth alias (water → droplet, mech →
-        // mechanical, bell → glass bell, …) projects onto its picker row, the
-        // row is a POPUP chip (14 options), and ←/→ steps the roster.
+        // mechanical, bell / glass bell → music box, …) projects onto its
+        // picker row, the row is a POPUP chip (14 options), and ←/→ steps the
+        // roster.
+        //
+        // AN ALIAS OF AN OFF-ROSTER VOICE IS A DIFFERENT CONTRACT, and the loop
+        // has to say which one it is asking about. A voice can be live and
+        // selectable while `SoundVoice::ALL` deliberately withholds it (the
+        // seam-era `RainbowKittyV2` was one: it parsed for the owner A/B and
+        // stayed out of the roster; since §17.3 phase 7 it IS the roster's
+        // rainbow row, in the deleted glass bell's slot, and `Of(RainbowKitty)`
+        // is the withheld spelling — it names the same music box). For those,
+        // "projects onto its picker row" is not the promise — there is no row.
+        // The promise is that the row still reads back the voice actually
+        // playing, and that opening the popup cannot silently clobber a config
+        // the picker does not offer.
         for &(alias, voice) in aterm_effects::trail_sound::SoundVoice::ALIASES {
             let canonical = voice.name();
+            let on_roster = aterm_effects::trail_sound::SoundVoice::ALL.contains(&voice);
             let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);
             assert!(uses_popup(&f), "typing sound is a popup chip");
+            // BOTH kinds read back truthfully — never the roster's first entry
+            // (`auto`) standing in for a voice the synth is really playing.
             assert_eq!(SettingsState::display_value(&f), canonical, "{alias}");
             assert_eq!(enum_current(&f), canonical, "{alias}");
-            assert_eq!(
-                popup_options(&f).len(),
-                crate::prefs::TRAIL_SOUND_STYLES.len(),
-                "typing-sound alias {alias:?} must not become a custom option"
-            );
+            if on_roster {
+                assert_eq!(
+                    popup_options(&f).len(),
+                    crate::prefs::TRAIL_SOUND_STYLES.len(),
+                    "typing-sound alias {alias:?} must not become a custom option"
+                );
+            } else {
+                // Led verbatim + highlighted, so opening the popup and pressing
+                // Enter is a no-op on a value the picker cannot offer yet.
+                let options = popup_options(&f);
+                assert_eq!(
+                    options.len(),
+                    crate::prefs::TRAIL_SOUND_STYLES.len() + 1,
+                    "off-roster voice {alias:?} leads the popup verbatim"
+                );
+                assert_eq!(
+                    options.first().map(String::as_str),
+                    Some(canonical),
+                    "{alias}"
+                );
+            }
         }
         let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, "water");
         assert_eq!(enum_current(&f), "droplet");

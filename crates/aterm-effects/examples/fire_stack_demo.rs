@@ -111,6 +111,7 @@ fn main() {
     let (w, h) = (COLS * CW, ROWS * CH);
     // Mirror the host's resolved fire config (defaults + the live-review 2s trail).
     let cfg = GlowConfig {
+        classic_mono: false,
         ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Fire,

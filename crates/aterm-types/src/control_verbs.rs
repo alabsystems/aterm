@@ -1083,9 +1083,8 @@ pub const VERBS: &[VerbSpec] = &[
          `trail status`: one standing-state row instead — `trail style= resolved= \
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
-         ribbon_segments= ribbon_hue_bands= field= field_span= sparks= momentum= \
-         momentum_display= speed= resume_grant= woken= bloom= \
-         glow_active= pet_active= cat_active= \
+         ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
+         momentum_display= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \

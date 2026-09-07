@@ -95,7 +95,7 @@ pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
 /// Typing-sound picker (`Config::trail_sound_style`, default `auto`): `auto`
 /// follows the visual trail style's signature palette; every other value
 /// ([`TRAIL_SOUND_STYLES`]) names an instrument — one of the nine palettes by
-/// what it sounds like (`glass bell`, `droplet`, …), the `mechanical`
+/// what it sounds like (`music box`, `droplet`, …), the `mechanical`
 /// keyboard, or a sound-only voice (`typewriter`, `marimba`, `felt`) —
 /// spoken by every keystroke whatever the trail looks like.
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
@@ -1285,6 +1285,15 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "laser",
     "water",
     "beam",
+    // THE SALVAGE — the v0.28 trail, restored as an option: a thin four-layer
+    // comet under a soft square bloom, with the long diagonal jump comet the
+    // modern engine's shape gates no longer mint. Offered last among the
+    // effects because it is a restoration, not a new look.
+    "classic",
+    // …and its second face: the same salvaged engine, colouring the tracer
+    // from the theme's cursor colour (and live OSC 12) instead of the rolling
+    // spectrum. Both were v0.28 looks; neither is a default.
+    "classic mono",
     "off",
 ];
 
@@ -1300,15 +1309,16 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
 ///
 /// `auto` = follow the visual trail's own palette (the default, today's
 /// sound bit for bit); the next nine are the shipped palettes selectable by
-/// what they SOUND like whatever the trail looks like (`glass bell` = the
-/// rainbow kitty's bell, `droplet` = water's plip, …); `mechanical` is the
+/// what they SOUND like whatever the trail looks like (`music box` = the
+/// rainbow kitty's instrument, in the deleted glass bell's slot — §17.3
+/// phase 7; `droplet` = water's plip, …); `mechanical` is the
 /// keyboard; `typewriter` / `marimba` / `felt` are the sound-only
 /// instruments. Alias spellings (the trail-style names, `mech`, `thock`, …)
 /// resolve through [`trail_sound_style_canonical`] /
 /// `Config::trail_sound_voice` — accepted on load, never offered.
 pub(crate) const TRAIL_SOUND_STYLES: &[&str] = &[
     SoundVoice::Style.name(),
-    SoundVoice::Of(GlowStyle::RainbowKitty).name(),
+    SoundVoice::RainbowKittyV2.name(),
     SoundVoice::Of(GlowStyle::Lumen).name(),
     SoundVoice::Of(GlowStyle::Sparkle).name(),
     SoundVoice::Of(GlowStyle::Comet).name(),
@@ -1363,6 +1373,15 @@ pub(crate) fn cursor_trail_style_options<'a>(
 /// `nyan`/`rainbow` spellings retain the flying companion; geometry aliases map
 /// to their explicit picker entries so validation and rendering cannot disagree.
 pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
+    // The way an owner asks for the salvaged trail is by the release they
+    // remember it from, so the version spellings resolve to it.
+    ("classic wake", "classic"),
+    ("classic lumen", "classic mono"),
+    ("mono classic", "classic mono"),
+    ("v0.28", "classic"),
+    ("v028", "classic"),
+    ("0.28", "classic"),
+    ("retro", "classic"),
     ("nyan rainbow", "rainbow kitty flying"),
     ("nyan", "rainbow kitty flying"),
     ("rainbow", "rainbow kitty flying"),
@@ -1389,6 +1408,29 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("wave", "water"),
     ("lightbeam", "beam"),
     ("light-beam", "beam"),
+    // RAINBOW KITTY v2 IS THE RAINBOW KITTY (`docs/design/RAINBOW-KITTY-V2.md`
+    // §17.3: phase 6, 2026-09-05, "`rainbow kitty` selects v2"; phase 7,
+    // 2026-09-06, v1 deleted). Every RainbowKitty spelling — the default
+    // `rainbow kitty pet`, bare `kitty`, the historical `nyan`/`rainbow`, the
+    // flying/tall/underline variants — is the rebuilt engine, which engages
+    // itself from the resolved style alone (`CursorGlow::tick`); the host
+    // carries no engine flag any more. The seam-era `v2` word is kept as a
+    // NO-OP alias so a config written during the A/B (`cursor_trail_style =
+    // "rainbow kitty v2"`) keeps loading without a warning: each entry
+    // resolves to the canonical presentation it names and means exactly what
+    // the bare spelling means. There is NO `… v1` twin: the escape spellings
+    // (`rainbow kitty v1`, `… v1 pet`/`flying`/`underline`/`tall`, `kitty
+    // v1`, `nyan v1`, `rainbow v1`) died with the engine they named, so they
+    // are unknown words now — refused by the validator, and at load they fall
+    // back to the default with the same reported `Unknown` issue as any typo.
+    ("rainbow kitty v2", "rainbow kitty"),
+    ("rainbow kitty v2 pet", "rainbow kitty pet"),
+    ("rainbow kitty v2 flying", "rainbow kitty flying"),
+    ("rainbow kitty v2 underline", "rainbow kitty underline"),
+    ("rainbow kitty v2 tall", "rainbow kitty tall"),
+    ("kitty v2", "rainbow kitty"),
+    ("nyan v2", "rainbow kitty flying"),
+    ("rainbow v2", "rainbow kitty flying"),
 ];
 
 /// Resolve a `cursor_trail_style` spelling (canonical or documented alias,
@@ -4007,7 +4049,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             // WHICH instrument the keystrokes speak with: `auto` follows the
             // visual trail style's signature palette (today's sound); every
             // other option is a voice of its own — the nine palettes by
-            // sound (`glass bell`, `droplet`, …), the `mechanical` keyboard,
+            // sound (`music box`, `droplet`, …), the `mechanical` keyboard,
             // `typewriter` / `marimba` / `felt` — spoken whatever the trail
             // looks like. Volume/on-off/bed gates apply unchanged; picking a
             // voice auditions one keystroke of it (`App::audition_typing_
@@ -5215,6 +5257,14 @@ mod trail_style_tests {
             "water" => GlowStyle::Water,
             "beam" => GlowStyle::Beam,
             "comet" => GlowStyle::Comet,
+            // THE SALVAGE — the v0.28 trail restored, and the one style whose
+            // whole engine lives outside `cursor_glow`
+            // (`aterm_effects::classic_wake`).
+            "classic" => GlowStyle::Classic,
+            // The MONO face is a PRESENTATION of the same style — the colour
+            // closure forks on the spelling, the style does not — so it
+            // classifies here exactly as the ribbon geometries do above.
+            "classic mono" => GlowStyle::Classic,
             "off" => GlowStyle::Lumen, // routed separately; parse → default
             other => {
                 panic!("CURSOR_TRAIL_STYLES entry {other:?} is unclassified by GlowStyle::parse")
@@ -5402,6 +5452,117 @@ mod trail_style_tests {
         }
     }
 
+    /// Does this alias carry the seam-era engine word `v2` (a no-op since
+    /// phase 6, the only engine word left since phase 7)? The alias-table
+    /// tests use it to find the spellings whose canonical is "the alias minus
+    /// the word".
+    fn carries_engine_word(alias: &str) -> bool {
+        alias
+            .split_ascii_whitespace()
+            .any(|w| w.eq_ignore_ascii_case("v2"))
+    }
+
+    /// RAINBOW KITTY's engine-word spellings after the deletion (§17.3, phase
+    /// 7): every alias that carries the `v2` word resolves to a canonical
+    /// picker option that is the SAME spelling with the word removed (so
+    /// companion, species and ribbon agree by construction) and parses to
+    /// `RainbowKitty`; the eight `… v1` escape spellings are gone from the
+    /// table and are refused by the resolver like any unknown word — a `v1`
+    /// config falls back to the default, reported, and the default is the
+    /// rainbow kitty. Neither word is a picker entry.
+    #[test]
+    fn the_engine_word_spellings_are_the_canonical_plus_one_word() {
+        let mut seen_v2 = 0;
+        for &(alias, canonical) in super::CURSOR_TRAIL_STYLE_ALIASES {
+            assert!(
+                !alias
+                    .split_ascii_whitespace()
+                    .any(|w| w.eq_ignore_ascii_case("v1")),
+                "{alias:?}: the v1 escape died with v1 (phase 7)"
+            );
+            if !carries_engine_word(alias) {
+                continue;
+            }
+            seen_v2 += 1;
+            assert_eq!(
+                GlowStyle::parse(canonical),
+                GlowStyle::RainbowKitty,
+                "{alias:?}"
+            );
+            // The long forms are the canonical plus the word; the engine's
+            // short forms (`kitty v2`, `nyan v2`, `rainbow v2`) are the
+            // corresponding short alias plus the word, and that alias must
+            // resolve to the same canonical.
+            let stripped: Vec<&str> = alias
+                .split_ascii_whitespace()
+                .filter(|w| !w.eq_ignore_ascii_case("v2"))
+                .collect();
+            let stripped = stripped.join(" ");
+            assert_eq!(
+                super::cursor_trail_style_canonical(&stripped),
+                Some(canonical),
+                "{alias:?} minus the v2 word must name its own canonical"
+            );
+        }
+        assert_eq!(
+            seen_v2, 8,
+            "the eight seam-era v2 spellings must stay accepted, got {seen_v2}"
+        );
+        for raw in [
+            "rainbow kitty v2",
+            "RAINBOW KITTY V2",
+            "rainbow kitty v2 pet",
+            "rainbow kitty v2 flying",
+            "rainbow kitty v2 underline",
+            "rainbow kitty v2 tall",
+            "kitty v2",
+            "nyan v2",
+            "rainbow v2",
+        ] {
+            let canonical = super::cursor_trail_style_canonical(raw)
+                .unwrap_or_else(|| panic!("{raw:?} must be accepted by the host resolver"));
+            assert_eq!(
+                GlowStyle::parse(canonical),
+                GlowStyle::RainbowKitty,
+                "{raw:?}"
+            );
+        }
+        for raw in [
+            "rainbow kitty v1",
+            "RAINBOW KITTY V1",
+            "rainbow kitty v1 pet",
+            "rainbow kitty v1 flying",
+            "rainbow kitty v1 underline",
+            "rainbow kitty v1 tall",
+            "kitty v1",
+            "nyan v1",
+            "rainbow v1",
+            "v1",
+            "v2",
+            "rainbow kitty v3",
+            "rainbow kittyv1",
+            "phaser v1",
+            "phaser v2",
+            "",
+        ] {
+            assert_eq!(
+                super::cursor_trail_style_canonical(raw),
+                None,
+                "{raw:?} names no style any more"
+            );
+            assert_ne!(
+                GlowStyle::parse(raw),
+                GlowStyle::RainbowKitty,
+                "{raw:?}: the engine agrees there is no second rainbow kitty"
+            );
+        }
+        // Invisible in the picker: no engine-word spelling is a selectable
+        // option, so the picker shows ONE rainbow kitty.
+        for &s in CURSOR_TRAIL_STYLES {
+            assert!(!carries_engine_word(s), "{s:?} leaked into the picker");
+        }
+    }
+
     /// The alias table's twin pin: every documented alias maps to a canonical
     /// option that is (a) actually in the picker's domain and (b) parses to the
     /// SAME engine style as the alias itself — so the Settings panel, the
@@ -5414,6 +5575,15 @@ mod trail_style_tests {
                 CURSOR_TRAIL_STYLES.contains(&canonical),
                 "alias {alias:?} maps outside the picker domain: {canonical:?}"
             );
+            // THE ENGINE-WORD SPELLINGS (`… v2`, the seam-era no-op) are
+            // aliases by construction — the canonical is the alias with the
+            // word removed — so every predicate below agrees on the canonical
+            // trivially, and the engine predicates (which know only the short
+            // forms) are not asked about the raw alias. Their own law is
+            // `the_engine_word_spellings_are_the_canonical_plus_one_word`.
+            if carries_engine_word(alias) {
+                continue;
+            }
             assert_eq!(
                 GlowStyle::parse(alias),
                 GlowStyle::parse(canonical),
@@ -5579,7 +5749,11 @@ mod trail_style_tests {
                 "{o:?}"
             );
         }
-        assert!(super::TRAIL_SOUND_STYLES.contains(&"glass bell"));
+        assert!(super::TRAIL_SOUND_STYLES.contains(&"music box"));
+        assert!(
+            !super::TRAIL_SOUND_STYLES.contains(&"glass bell"),
+            "the glass bell died with v1 (§17.3 phase 7); its spelling is an alias of the music box"
+        );
         assert!(super::TRAIL_SOUND_STYLES.contains(&"typewriter"));
         assert!(super::TRAIL_SOUND_STYLES.contains(&"marimba"));
         assert!(super::TRAIL_SOUND_STYLES.contains(&"felt"));
@@ -5634,7 +5808,8 @@ mod trail_style_tests {
             ("mech", SoundVoice::Mech),
             ("mechanical", SoundVoice::Mech),
             ("water", SoundVoice::Of(GlowStyle::Water)),
-            ("Glass Bell", SoundVoice::Of(GlowStyle::RainbowKitty)),
+            ("music box", SoundVoice::RainbowKittyV2),
+            ("Glass Bell", SoundVoice::RainbowKittyV2),
             ("  felt ", SoundVoice::Felt),
             ("auto", SoundVoice::Style),
             ("garbage", SoundVoice::Style),

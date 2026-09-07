@@ -77,6 +77,7 @@ fn geom() -> Geom {
 
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         // Mirrors the shipping resolver for the rainbow family. The field is
         // irrelevant to every other style in this cross-style regression.
         ribbon_tall: true,

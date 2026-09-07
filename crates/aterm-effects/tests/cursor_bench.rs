@@ -15,6 +15,7 @@ const ITERATIONS: usize = 300;
 
 fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         // Shipping default: the tall body; explicit underline is exercised by
         // the workload matrix benchmark.
         ribbon_tall: true,

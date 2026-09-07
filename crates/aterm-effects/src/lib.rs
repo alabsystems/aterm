@@ -75,6 +75,8 @@ pub mod dog_cameo;
 pub mod dog_glyphs_gen {
     include!("dog_glyphs_gen.rs");
 }
+/// The v0.28 cursor aurora, salvaged and offered as the `classic` trail style.
+pub mod classic_wake;
 pub mod cursor_beam;
 pub mod cursor_comet;
 pub mod cursor_droplet;
@@ -128,6 +130,12 @@ pub mod pet_glyphs_gen {
     include!("pet_glyphs_gen.rs");
 }
 pub mod pipeline;
+/// **RAINBOW KITTY v2** — the rebuilt `rainbow kitty` cursor theme, pixels and
+/// sound as one design (`RAINBOW-KITTY-V2.md`). Built BESIDE v1 (§17.3 phase 3)
+/// and engaged behind one gate, so the other nine styles stay byte-identical
+/// while it lands: [`rainbow_kitty::Engine`] is what `CursorGlow` delegates to
+/// at the twelve enumerated seam points (§17.2, D14).
+pub mod rainbow_kitty;
 /// The chrome-walking helper ROBOT (Robi, from the user's Nitro Keyboard game):
 /// the clockless show engine — walks the prompt line, climbs a ladder, swings
 /// the tab bar like monkey bars, does jumping jacks, and hands out tips.

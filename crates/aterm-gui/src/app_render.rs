@@ -1086,6 +1086,7 @@ mod cursor_fx_generation_fence_tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut halo,
         );
@@ -1258,6 +1259,7 @@ mod cursor_fx_generation_fence_tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut halo,
         );
@@ -1326,6 +1328,7 @@ mod cursor_fx_generation_fence_tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut halo,
         );
@@ -2613,6 +2616,7 @@ mod canonical_layout_scheduler_tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut halo,
         );
@@ -3655,6 +3659,18 @@ pub(crate) fn trail_sound_event(
         // echo-born cue carries `false`.
         shifted: cue.shifted,
     }
+}
+
+/// THE HOST INPUT CLOCK in milliseconds (`RAINBOW-KITTY-V2.md` §16 row 7):
+/// the shared process-monotonic metrics clock ([`crate::metrics::now_us`] —
+/// the SAME epoch the key-arrival stamps use), truncated to `u32` so it wraps
+/// every ~49.7 days, which the synth's time source tolerates by design.
+/// Never `0`: the synth reads `0` as "the host did not stamp one" and falls
+/// back to its own block clock, so a stamp that wraps onto 0 is nudged to 1
+/// rather than read as unknown.
+#[inline]
+pub(crate) fn input_clock_ms() -> u32 {
+    ((crate::metrics::now_us() / 1000) as u32).max(1)
 }
 
 /// Drain every visual spawn cue and optionally emit its allocation-free sound
@@ -6738,6 +6754,431 @@ pub(crate) fn sync_pet_companion_look(
     outcome.worn
 }
 
+/// A cursor-glow [`crate::cursor_glow::Geom`] for a PANE (or the whole grid)
+/// where only the cell metrics and the grid extent are read — the v2
+/// companion router's seat law and its pet-sense projection
+/// ([`aterm_effects::rainbow_kitty::companion::placement`] /
+/// [`aterm_effects::rainbow_kitty::companion::sense`]) read `cw`, `ch`,
+/// `rows` and `cols` and nothing else. The window-absolute fields are zero
+/// on purpose: nothing here emits window-space pixels.
+fn companion_router_geom(
+    geom: aterm_effects::word_decorations::EffectGeom,
+) -> crate::cursor_glow::Geom {
+    crate::cursor_glow::Geom {
+        cw: usize::from(geom.cell_w),
+        ch: usize::from(geom.cell_h),
+        rows: usize::from(geom.rows),
+        cols: usize::from(geom.cols),
+        origin_x: 0,
+        origin_y: 0,
+        win_w: 0,
+        win_h: 0,
+        head: 0,
+    }
+}
+
+/// WHAT THE PET SENSES — the `PetSense` the resident's `PetBrain::tick` takes,
+/// built by Rainbow Kitty v2's router
+/// ([`aterm_effects::rainbow_kitty::companion::sense`]) out of the four host
+/// facts v2 cannot see ([`aterm_effects::rainbow_kitty::companion::HostSense`])
+/// plus the frame's geometry and motion posture. ONE projection for both
+/// render arms — the single-pane present and the composed one — so a split
+/// window can never feed the pet a differently-shaped sense than a single
+/// pane does (the router's KNOWN GAP, host stage).
+///
+/// A pure projection whatever the style: `sense` reads `now`, the geometry
+/// and `reduced_motion` and nothing else, so under the nine other styles it
+/// yields the exact `PetSense` the two inline literals it replaces used to
+/// build. The spine is deliberately NOT injected (D13): the pet runs its own
+/// `vhat` estimator against its owner-tuned thresholds, and a second momentum
+/// signal would retime the chase and the pounce — so the `Ctx` carries zeros
+/// there, which `sense` never reads.
+pub(crate) fn companion_pet_sense(
+    now: Instant,
+    geom: aterm_effects::word_decorations::EffectGeom,
+    glow_cfg: &crate::cursor_glow::GlowConfig,
+    reduced_motion: bool,
+    host: aterm_effects::rainbow_kitty::companion::HostSense,
+) -> aterm_effects::kitty_pet::PetSense {
+    let cfg = aterm_effects::rainbow_kitty::Config::from_glow(glow_cfg, reduced_motion);
+    let ctx = aterm_effects::rainbow_kitty::Ctx {
+        now,
+        geom: companion_router_geom(geom),
+        cfg: &cfg,
+        disp: 0.0,
+        birth_disp: 0.0,
+        phase: 0.0,
+        caret: host.caret.unwrap_or((0, 0)),
+        caret_t: 0.0,
+    };
+    aterm_effects::rainbow_kitty::companion::sense(&ctx, host)
+}
+
+/// WHICH rendered-cell snapshot the v2 companion router probes for ink: the
+/// single-pane present (and both capture splices) read the window's
+/// `input_scratch`; the composed path reads the focused pane's own
+/// `composed_focus_scratch`, at pane geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompanionInk {
+    /// `WindowState::input_scratch` — the whole grid.
+    Single,
+    /// `WindowState::composed_focus_scratch` — the focused pane.
+    Composed,
+}
+
+/// The flying head's ¾-cell lead in px — `cw · KITTY_LEAD_NUM / KITTY_LEAD_DEN`
+/// as `WordDecorations::kitty_cursor_footprint` lays it (its constants are
+/// private to the emitter; `the_router_lead_is_the_footprints_own_lead` pins
+/// this against the footprint itself so the two cannot drift apart).
+fn flying_head_lead_px(cell_w: u16) -> i32 {
+    i32::from(cell_w).saturating_mul(3) / 4
+}
+
+/// THE COMPANION SEAM (`docs/design/RAINBOW-KITTY-V2.md` §7.2, D13) — the ONE
+/// host call into [`aterm_effects::rainbow_kitty::companion`], made by BOTH
+/// render arms ([`emit_single_cursor_companion`], which the live present and
+/// both capture splices share, and `App::compose_cursor_companion`, the split
+/// path) so an impulse minted for a frame always reaches the body that frame
+/// actually draws — the router's KNOWN GAP, closed at the host.
+///
+/// Inert unless v2 owns the frame (one `Option` read — `v2_status` is `Some`
+/// only while the engine is engaged, which since phase 7 is exactly while the
+/// resolved style is the rainbow kitty), so the ten other styles pay one
+/// branch and draw byte-identically. When engaged:
+///
+/// 1. **The body** — [`body_for`](aterm_effects::rainbow_kitty::companion::body_for)
+///    restates the host's own [`CompanionDuty`] (L-B): the pet for
+///    `rainbow kitty` / `kitty` / `… pet`, the flying head only for `… flying`
+///    and the pet-mode sing-along face. `body_claimed` is `false` here: the
+///    animators' own `claim_companion_body` still gates the draw one call
+///    later, and the host holds no earlier claim.
+/// 2. **The impulse** — [`take_companion_impulse`](crate::cursor_glow::CursorGlow::take_companion_impulse)
+///    is the transferring read, made EVERY frame whatever the body (an
+///    `Idle` frame drops it, so a meteor minted while nobody was on glass can
+///    never be replayed onto the next body), and
+///    [`impulse_for`](aterm_effects::rainbow_kitty::companion::impulse_for)
+///    reads it for that body:
+///    * the flying head's `Fly` — the TELEPORT (§7.2(a)): on a horizontal
+///      flight the placement follower is rebased so the very next placement
+///      SNAPS to the landing instead of gliding from the launch (a cat flying
+///      the path arrives late; a cat at the landing on frame 0 is the meteor's
+///      proof of speed); a vertical flight (Enter) keeps the shipped
+///      `Δy ≤ 2·ch` glide exactly as today. The spine floor, the whip, the
+///      squint and the landing squash are exposed as DATA on the `Flight`
+///      ([`Flight::disp_floor`](aterm_effects::rainbow_kitty::companion::Flight::disp_floor),
+///      [`Flight::lead_at`](aterm_effects::rainbow_kitty::companion::Flight::lead_at),
+///      [`Flight::landed`](aterm_effects::rainbow_kitty::companion::Flight::landed))
+///      but `CursorCat` has no receiver for them yet (its `disp`, `lead` and
+///      `land_at` are private — animator-stage work named in the router's
+///      WIRING STATUS), and the host holds no per-window slot to carry a
+///      flight across frames, so they are NOT applied here: a one-frame lead
+///      that the animator's own lead overwrote on the next frame would read
+///      as a jerk, which is worse than the shipped glide.
+///    * the pet's `Perk { at }` — the whole of the pet's coupling (D13): an
+///      OFFER of the arrival edge and nothing else. `PetBrain` has no
+///      perk-edge entry (open owner question 14, default: keeps its own
+///      pounce), so the offer is taken and dropped; the pet's choreography is
+///      untouched, as §7.2(b) requires.
+///    * `React(Delight)` — the flying head's existing pose entry
+///      (`CursorCat::on_delight`), which no host seam fires today; the pet has
+///      no delight entry. `React(Wince)` is NOT re-fired: the host already
+///      fires the head's oops at the key (`on_kill`), and a second firing per
+///      erase would drain its momentum. `React(Land)` has no receiver.
+/// 3. **The seat** (L-D, the measured occlusion fix) — for the flying head,
+///    [`placement`](aterm_effects::rainbow_kitty::companion::placement) over
+///    the shipped footprint, the emitter's own ¾-cell lead and an ink probe
+///    on this frame's rendered cells. The seat is applied through the two
+///    POSE parameters the emitter already reads — `pose.lead` (a horizontal
+///    offset in cells, sign-corrected for the facing flip) and `bob` (whole
+///    rows of lift, which the footprint and the follower both carry) — so the
+///    `kitty_cursor_at_placement` invariant "placement matches the frame it is
+///    emitted with" holds by construction. `over_ink` draws over (the head
+///    never disappears to solve an occlusion).
+///
+/// `ink` names which of the window's rendered-cell snapshots the seat law
+/// probes: `None` for every cell it cannot see, which the law counts as
+/// inked; a host with no cells at all is ink-blind and gets only the
+/// caret-cover half of the yield.
+pub(crate) fn route_v2_companion(
+    ws: &mut WindowState,
+    ink: CompanionInk,
+    duty: CompanionDuty,
+    now: Instant,
+    geom: aterm_effects::word_decorations::EffectGeom,
+    cat_frame: &mut crate::kitty_cursor::CatFrame,
+) {
+    use aterm_effects::rainbow_kitty::companion::{
+        Body, BodyImpulse, CompanionAdmission, Reaction, SeatQuery, body_for, impulse_for,
+        placement,
+    };
+    if ws.cursor_glow.v2_status().is_none() {
+        return;
+    }
+    let glow = &mut ws.cursor_glow;
+    let cat = &mut ws.cursor_cat;
+    let decos = &mut ws.word_decos;
+    let cells: &[Vec<RenderCell>] = match ink {
+        CompanionInk::Single => &ws.input_scratch.cells,
+        CompanionInk::Composed => &ws.composed_focus_scratch.cells,
+    };
+    // The host's custody enum restated in the router's vocabulary — the
+    // engine's `companion::CompanionDuty` is the same three verdicts.
+    let duty = match duty {
+        CompanionDuty::Idle => aterm_effects::companion::CompanionDuty::Idle,
+        CompanionDuty::Pet => aterm_effects::companion::CompanionDuty::Pet,
+        CompanionDuty::FlyingHead { cell } => {
+            aterm_effects::companion::CompanionDuty::FlyingHead { cell }
+        }
+    };
+    let body = body_for(CompanionAdmission {
+        duty,
+        body_claimed: false,
+    });
+    let impulse = glow
+        .take_companion_impulse()
+        .map_or(BodyImpulse::Ignore, |impulse| impulse_for(body, impulse));
+    match impulse {
+        BodyImpulse::Fly(flight) => {
+            if !flight.dir.is_vertical() {
+                decos.rebase_kitty_cursor_placement();
+            }
+        }
+        BodyImpulse::React(Reaction::Delight) if matches!(body, Body::Flying { .. }) => {
+            cat.on_delight(now, 1);
+        }
+        BodyImpulse::Perk { .. }
+        | BodyImpulse::React(Reaction::Delight | Reaction::Wince | Reaction::Land)
+        | BodyImpulse::Ignore => {}
+    }
+    let Body::Flying { cell } = body else {
+        return;
+    };
+    let Some(rest) =
+        decos.kitty_cursor_footprint(aterm_effects::word_decorations::KittyCursorLayout {
+            geom,
+            cursor: cell,
+            look: cat_frame.render_look(),
+            bob: cat_frame.bob,
+        })
+    else {
+        return;
+    };
+    let ink = |row: u16, col: u16| -> Option<bool> {
+        cells
+            .get(usize::from(row))
+            .and_then(|line| line.get(usize::from(col)))
+            .map(|cell| !matches!(cell.ch, ' ' | '\0'))
+    };
+    let seat = placement(
+        cell,
+        &SeatQuery {
+            geom: companion_router_geom(geom),
+            rest,
+            lead_px: flying_head_lead_px(geom.cell_w),
+        },
+        ink,
+    );
+    let dx = seat.x.saturating_sub(rest.x);
+    if dx != 0 && geom.cell_w > 0 {
+        // The emitter draws `round(pose.lead · cw)` px ahead, mirrored when the
+        // body faces left; a seat behind the caret is therefore a negative
+        // lead for a right-facing head and a positive one for a left-facing
+        // head. The facing the emitter will use is the placement frame's,
+        // sampled at this same `now`.
+        let facing_left = cat.placement_frame(now).facing_left;
+        let lead_cells = dx as f32 / f32::from(geom.cell_w);
+        cat_frame.pose.lead += if facing_left { -lead_cells } else { lead_cells };
+    }
+    if seat.lift_rows > 0 {
+        // A row of lift is a whole `ch` on the footprint's `y`, which the
+        // footprint carries as `round(bob · ch)` — exact for whole rows.
+        cat_frame.bob -= f32::from(seat.lift_rows);
+    }
+}
+
+#[cfg(test)]
+mod v2_companion_router_tests {
+    use super::{
+        CompanionDuty, CompanionInk, companion_pet_sense, flying_head_lead_px, input_clock_ms,
+        route_v2_companion,
+    };
+    use crate::{App, WindowId};
+    use aterm_core::terminal::RenderCell;
+    use aterm_effects::rainbow_kitty::companion::HostSense;
+    use aterm_effects::word_decorations::{EffectGeom, KittyCursorLayout};
+    use std::time::{Duration, Instant};
+
+    const GEOM: EffectGeom = EffectGeom {
+        cell_w: 8,
+        cell_h: 16,
+        rows: 24,
+        cols: 80,
+    };
+
+    fn glow_geom() -> crate::cursor_glow::Geom {
+        crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        }
+    }
+
+    /// A grid whose row 4 is inked from `from` to `to` (exclusive), blank
+    /// elsewhere — the ink probe's whole input.
+    fn inked_row(from: usize, to: usize) -> Vec<Vec<RenderCell>> {
+        let mut cells = vec![vec![RenderCell::default(); 80]; 24];
+        for cell in &mut cells[4][from..to] {
+            *cell = RenderCell {
+                ch: 'x',
+                ..RenderCell::default()
+            };
+        }
+        cells
+    }
+
+    /// The host input clock is the synth's one time source: never the `0`
+    /// the synth reads as "unstamped", and never running back.
+    #[test]
+    fn the_input_clock_never_reads_zero_and_never_runs_back() {
+        let a = input_clock_ms();
+        std::thread::sleep(Duration::from_millis(2));
+        let b = input_clock_ms();
+        assert!(a >= 1);
+        assert!(b >= a, "{b} < {a}");
+    }
+
+    /// The router's lead is the emitter's own ¾-cell lead, measured off the
+    /// footprint itself so the two constants cannot drift apart.
+    #[test]
+    fn the_router_lead_is_the_footprints_own_lead() {
+        let mut app = App::headless_for_test();
+        let now = Instant::now();
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        let look = ws.cursor_cat.static_frame(now).render_look();
+        let rest = ws
+            .word_decos
+            .kitty_cursor_footprint(KittyCursorLayout {
+                geom: GEOM,
+                cursor: (4, 10),
+                look,
+                bob: 0.0,
+            })
+            .expect("a mid-line footprint");
+        let cursor_right = 11 * i32::from(GEOM.cell_w);
+        assert_eq!(rest.x - cursor_right, flying_head_lead_px(GEOM.cell_w));
+        assert_eq!(flying_head_lead_px(8), 6);
+        assert_eq!(flying_head_lead_px(0), 0);
+    }
+
+    /// `companion_pet_sense` is a projection of the literal it replaced: the
+    /// same fields, from the same facts, under every style.
+    #[test]
+    fn the_routers_pet_sense_is_the_literal_it_replaced() {
+        let app = App::headless_for_test();
+        let cfg = app.glow_config();
+        let now = Instant::now();
+        let host = HostSense {
+            caret: Some((3, 7)),
+            wrapped: true,
+            output_burst: false,
+            pointer: Some((1.5, 2.5)),
+        };
+        let sense = companion_pet_sense(now, GEOM, &cfg, true, host);
+        assert_eq!(sense.now, now);
+        assert_eq!(sense.caret, Some((3, 7)));
+        assert!(sense.wrapped);
+        assert!(!sense.output_burst);
+        assert_eq!(sense.pointer, Some((1.5, 2.5)));
+        assert_eq!((sense.rows, sense.cols), (24, 80));
+        assert_eq!((sense.cell_w, sense.cell_h), (8, 16));
+        assert!(sense.reduced_motion);
+        let full = companion_pet_sense(now, GEOM, &cfg, false, HostSense::default());
+        assert!(!full.reduced_motion);
+        assert_eq!(full.caret, None);
+    }
+
+    /// THE OCCLUSION FIX (L-D), host side: with v2 engaged and the words
+    /// ahead of the caret inked, the flying head is seated BEHIND the caret
+    /// — expressed as a negative lead on the frame copy — while blank glass
+    /// ahead keeps the shipped seat byte-for-byte; and the pet, which seats
+    /// itself, is never moved.
+    #[test]
+    fn a_v2_flying_head_yields_behind_inked_text_and_the_pet_is_never_moved() {
+        let mut app = App::headless_for_test();
+        let mut cfg = app.glow_config();
+        cfg.enabled = true;
+        cfg.style = crate::cursor_glow::GlowStyle::RainbowKitty;
+        cfg.intensity = 1.0;
+        let now = Instant::now();
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        let mut out = Vec::new();
+        ws.cursor_glow
+            .tick(Some((4, 10)), now, &cfg, glow_geom(), &mut out);
+        assert!(
+            ws.cursor_glow.v2_status().is_some(),
+            "the rainbow kitty engages v2 on its first tick, untold"
+        );
+        let before = ws.cursor_cat.static_frame(now);
+
+        // Blank glass ahead: the shipped seat, untouched.
+        let mut frame = before;
+        ws.input_scratch.cells = inked_row(0, 0);
+        route_v2_companion(
+            ws,
+            CompanionInk::Single,
+            CompanionDuty::FlyingHead { cell: (4, 10) },
+            now,
+            GEOM,
+            &mut frame,
+        );
+        assert_eq!(frame.pose.lead, before.pose.lead);
+        assert_eq!(frame.bob, before.bob);
+
+        // Words ahead, blank behind: the mirror seat, `lead_px` clear of the
+        // caret cell's left edge — a negative lead for a right-facing head.
+        let mut frame = before;
+        ws.input_scratch.cells = inked_row(11, 30);
+        route_v2_companion(
+            ws,
+            CompanionInk::Single,
+            CompanionDuty::FlyingHead { cell: (4, 10) },
+            now,
+            GEOM,
+            &mut frame,
+        );
+        assert!(
+            frame.pose.lead < before.pose.lead,
+            "the head must yield backwards off the words ahead, got {} vs {}",
+            frame.pose.lead,
+            before.pose.lead
+        );
+        assert_eq!(
+            frame.bob, before.bob,
+            "no sky seat while the row behind is blank"
+        );
+
+        // The pet seats itself: the router never touches its frame.
+        let mut frame = before;
+        ws.input_scratch.cells = inked_row(0, 80);
+        route_v2_companion(
+            ws,
+            CompanionInk::Single,
+            CompanionDuty::Pet,
+            now,
+            GEOM,
+            &mut frame,
+        );
+        assert_eq!(frame.pose.lead, before.pose.lead);
+        assert_eq!(frame.bob, before.bob);
+    }
+}
+
 /// Emit the cursor-owned companion sprites for a single-grid frame.
 ///
 /// `WordDecorations` supplies the shared atlas and bakers, but Sparkle Words
@@ -6759,7 +7200,7 @@ pub(crate) fn emit_single_cursor_companion(
     pet_on_glass: bool,
     present: bool,
     pet_frame: aterm_effects::kitty_pet::PetFrame,
-    cat_frame: crate::kitty_cursor::CatFrame,
+    mut cat_frame: crate::kitty_cursor::CatFrame,
     kitty_alpha: u8,
     now: Instant,
     notes_reduced: bool,
@@ -6772,6 +7213,11 @@ pub(crate) fn emit_single_cursor_companion(
     // stand here — a shape in which a future seam that set both alphas would
     // silently draw two companions. The match makes that unrepresentable.
     let duty = cursor_companion_duty(pet_on_glass, kitty_alpha, cursor);
+    // THE COMPANION SEAM ([`route_v2_companion`]): Rainbow Kitty v2's one
+    // call, before either body is drawn, so the impulse and the seat land on
+    // the frame copy the arms below emit. The composed path's twin is in
+    // `compose_cursor_companion`.
+    route_v2_companion(ws, CompanionInk::Single, duty, now, geom, &mut cat_frame);
     if let CompanionDuty::Pet = duty {
         let look = cat_frame.look.normalized();
         let (coat, iris) = sync_pet_companion_look(ws, look, present, now);
@@ -22121,6 +22567,11 @@ impl App {
         window.cursor_pet.invalidate_colors();
         window.installed_kitty_asset_fp = kitty_asset_fp;
         window.installed_config_assets = Some(assets);
+        // RAINBOW KITTY v2 needs no seam here (§17.3 phase 7): the engine
+        // engages itself from the resolved style at the top of `tick`, and
+        // the synth learns the music box from the voice named on each event
+        // (`trail_gesture_voice`). The two per-generation latches this
+        // function used to publish died with v1.
         true
     }
 
@@ -22188,6 +22639,18 @@ impl App {
             .style
             .style
             .unwrap_or(crate::cursor_glow::GlowStyle::Lumen)
+    }
+
+    /// The TRAIL-GESTURE voice for the current config generation
+    /// ([`crate::app_config::Config::trail_sound_voice_for`] over the cached
+    /// presentation): `auto` follows the visual trail, and under the rainbow
+    /// kitty the trail's own instrument is the music box — the voice on the
+    /// event is the ONLY way the synth learns it since phase 7. The key-time
+    /// click and the frame drain both read this, so the two delivery paths
+    /// can never name different instruments; the bonk, the riff and the
+    /// output pips keep the plain `trail_sound_voice` read.
+    pub(crate) fn trail_gesture_voice(&self) -> aterm_effects::trail_sound::SoundVoice {
+        self.config.trail_sound_voice_for(self.trail_presentation())
     }
 
     /// Whether the ACTIVE trail style is the native cadence-comet — the one style
@@ -22362,14 +22825,9 @@ impl App {
             ribbon_segments: ws.cursor_glow.ribbon_segments(),
             ribbon_hue_bands: ws.cursor_glow.ribbon_hue_bands(),
             field: ws.cursor_glow.rainbow_field(),
-            field_span: ws.cursor_glow.ribbon_field_span(),
             sparks: ws.cursor_glow.live_sparks(),
             momentum: ws.cursor_glow.typing_momentum(now),
             momentum_display: ws.cursor_glow.momentum_display(),
-            speed: ws.cursor_glow.glide_speed(),
-            resume_grant: ws.cursor_glow.resume_grant(),
-            woken: ws.cursor_glow.woken_cells(),
-            bloom: ws.cursor_glow.bloom_cells(),
             glow_active: ws.cursor_glow.is_active(),
             pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
             cat_active: ws.cursor_cat.is_active(),
@@ -22383,7 +22841,10 @@ impl App {
             // own cursor colour (OSC 12 / `cursor_color`) is what is on it.
             block_fill: ws.block_fill,
         }
-        .line())
+        // Rainbow Kitty v2's rows (`v2_quads=` … `v2_meteors=`) trail the
+        // line ONLY while v2 owns the frame; every existing reader parses the
+        // unchanged prefix.
+        .line_v2(ws.cursor_glow.v2_status()))
     }
 
     /// Glass-present gate for the stateful cursor-effect clock. A DEC-2026
@@ -22478,6 +22939,9 @@ impl App {
         // cells → grid-interior pixels; read it before borrowing windows. `mut`
         // so the cursor WAKE colour can follow a live OSC-12 cursor colour below.
         let trail_presentation = self.trail_presentation();
+        // The trail-gesture voice, resolved beside the presentation it follows
+        // (`trail_gesture_voice`, hoisted above the window borrow below).
+        let trail_voice = self.config.trail_sound_voice_for(trail_presentation);
         let mut glow_cfg = self.glow_config_for(trail_presentation);
         // Reduced motion ⇒ amplitude EXACTLY 0: the animator then clears its
         // state and emits nothing (proven zero, not merely dimmed). Load shed
@@ -22673,17 +23137,28 @@ impl App {
             let tone = ws
                 .tone_tracker
                 .effective(self.config.tone_melody_or_default());
+            // THE STAMP (`RAINBOW-KITTY-V2.md` §16 row 7): the host input
+            // clock in ms, on BOTH delivery paths — the keyed seam stamps its
+            // click at the key, this drain stamps every echo-born cue at the
+            // frame — so the music box's verse gate measures one clock. An
+            // echo-born cue has no key behind it, so its glyph class is
+            // `0` exactly as its `shifted` is `false` (row 8).
+            let meta = aterm_effects::trail_sound::EventMeta {
+                at_ms: input_clock_ms(),
+                glyph_class: 0,
+                pan_from: 0.0,
+            };
             drain_trail_sound_cues(
                 &mut ws.cursor_glow,
                 glow_cfg.style,
                 cols.min(u16::MAX as usize) as u16,
                 TrailSoundPolicy {
-                    voice: self.config.trail_sound_voice(),
+                    voice: trail_voice,
                     gain,
                     tone,
                     bed: self.config.trail_sound_bed_or_default(),
                 },
-                |event| self.trail_audio.push(event),
+                |event| self.trail_audio.push_meta(event, meta),
             );
         }
         // The FORGE cursor fill (fire style): the block cursor heats along
@@ -22808,12 +23283,25 @@ impl App {
             // (`#65EB7F` caret against a `#722629` ribbon, spine still 0.96).
             // The engine folds this with the energy, so the cadence keeps the
             // attack and the ribbon owns the release.
-            paint: Some(ws.cursor_glow.momentum_display()),
+            //
+            // RAINBOW KITTY v2 (§7.1): under v2 the caret's paint is the
+            // display spine FLOORED by the landing re-light — the caret is
+            // never dimmed at the destination — and `caret_paint` is exactly
+            // `momentum_display` when v2 is not engaged, so the nine other
+            // styles read the same bits they always did.
+            paint: Some(ws.cursor_glow.caret_paint(frame_started)),
             // THE PAGE THE CARET'S LIGHT LANDS ON — the same `default_bg` this
             // pass already handed the ribbon as `glow_cfg.theme_bg`, so the two
             // halves of one effect solve §2.3's pixel law against ONE ground
             // rather than two that happen to agree.
             ground: Some(default_bg & 0x00FF_FFFF),
+            // THE CARET SEAM (§7.1): the instant a v2 meteor's frame-0 flare
+            // fired, while its spring-snap relax is live. v2 does not own the
+            // block fill; it hands the host this one instant and the caret
+            // engine does the white flash + ring pop itself. `None` — every
+            // frame under the other nine styles, and every v2 frame with no
+            // live flare — is the bit-exact identity.
+            flare_at: ws.cursor_glow.caret_flare_at(),
         };
         // CF-6 (gui half): ONE cadence decay per presented frame — and NONE
         // when nobody is listening. Every `TypingCadence` read re-runs
@@ -23003,6 +23491,14 @@ impl App {
                     | aterm_core::terminal::CursorStyle::SteadyBar
             );
         // Styles whose BLOCK has no bespoke body ride the emitter treatment.
+        //
+        // `Classic` is DELIBERATELY ABSENT. The beam-rod block body postdates
+        // v0.28 — that release drew a plain caret beside its trail — and the
+        // whole contract of the salvaged style is that it looks like the build
+        // it was taken from. Adding it here would be a visible improvement on
+        // v0.28, which is precisely the thing this style may not be. One line
+        // reverses it if the bare caret ever reads as unfinished rather than as
+        // faithful.
         let emitter_block = matches!(
             glow_cfg.style,
             crate::cursor_glow::GlowStyle::Beam
@@ -27009,17 +27505,19 @@ impl App {
             if ws.cursor_pet.grieving() {
                 ws.cursor_glow.hush_fanfare(frame_started);
             }
-            let mut pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
-                now: frame_started,
-                caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat) {
-                    cur
-                } else {
-                    None
+            // WHAT THE PET SENSES is projected by Rainbow Kitty v2's router
+            // ([`companion_pet_sense`]) for BOTH render arms, from the four
+            // host facts only the host holds; the geometry and posture ride
+            // the same `glow_geom` / motion policy this frame already resolved.
+            let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
+                frame_started,
+                aterm_effects::word_decorations::EffectGeom {
+                    cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
+                    cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
+                    rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
+                    cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
                 },
-                rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
-                cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
-                cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
-                cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
+                &glow_cfg,
                 // THE MOTION POLICY ONLY — never the performance shed.
                 //
                 // This took `!animate_cat`, which is
@@ -27039,11 +27537,18 @@ impl App {
                 // through `shed_companion_alpha` below and still freezes the
                 // flying cat's frame via `animate_cat`; what it may no longer
                 // do is rewrite the resident's position model mid-walk.
-                reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                output_burst: pet_burst,
-                pointer: pet_pointer,
-                wrapped: pet_wrapped,
-            });
+                !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                aterm_effects::rainbow_kitty::companion::HostSense {
+                    caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat) {
+                        cur
+                    } else {
+                        None
+                    },
+                    wrapped: pet_wrapped,
+                    output_burst: pet_burst,
+                    pointer: pet_pointer,
+                },
+            ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
             // The brain can begin returning below the face-swap threshold,
             // but only one companion is put on glass.
@@ -31331,7 +31836,38 @@ impl App {
         // `pet_visible` already carries the shared one-companion custody gate;
         // [`CompanionDuty`] is that gate as ONE value, matched here and in the
         // single-pane twin so neither path can put two bodies in a frame.
-        let cell = match cursor_companion_duty(ctx.pet_visible, ctx.kitty_alpha, ctx.focus_cursor) {
+        let duty = cursor_companion_duty(ctx.pet_visible, ctx.kitty_alpha, ctx.focus_cursor);
+        // THE COMPANION SEAM ([`route_v2_companion`]) — the single-pane twin's
+        // call, made for EVERY duty (the impulse is consumed even on an idle
+        // or pet frame) at the focused pane's geometry and against the focused
+        // pane's own snapshot, before the pet or the head is emitted. This is
+        // what keeps a split from silently losing the v2 companion.
+        let mut cat_frame = ctx.cat_frame;
+        let router_geom = focus_place.map_or(
+            crate::word_decorations::EffectGeom {
+                cell_w: 0,
+                cell_h: 0,
+                rows: 0,
+                cols: 0,
+            },
+            |place| crate::word_decorations::EffectGeom {
+                cell_w: ctx.cell_w as u16,
+                cell_h: ctx.cell_h as u16,
+                rows: place.rows,
+                cols: place.cols,
+            },
+        );
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            route_v2_companion(
+                ws,
+                CompanionInk::Composed,
+                duty,
+                ctx.now,
+                router_geom,
+                &mut cat_frame,
+            );
+        }
+        let cell = match duty {
             CompanionDuty::Pet => return self.compose_pet_companion(wid, ctx, focus_place),
             CompanionDuty::Idle => return 0,
             CompanionDuty::FlyingHead { cell } => cell,
@@ -31365,8 +31901,8 @@ impl App {
         let layout = aterm_effects::word_decorations::KittyCursorLayout {
             geom,
             cursor: cell,
-            look: ctx.cat_frame.render_look(),
-            bob: ctx.cat_frame.bob,
+            look: cat_frame.render_look(),
+            bob: cat_frame.bob,
         };
         let placement_frame = ws.cursor_cat.placement_frame(ctx.now);
         let Some(placement) = ws
@@ -31399,10 +31935,10 @@ impl App {
                 cursor: cell,
                 look: layout.look,
                 colors,
-                bob: ctx.cat_frame.bob,
+                bob: cat_frame.bob,
                 alpha: ctx.kitty_alpha,
-                pose: ctx.cat_frame.pose,
-                sing: ctx.cat_frame.sing,
+                pose: cat_frame.pose,
+                sing: cat_frame.sing,
                 notes: {
                     ws.music_notes.update(
                         ctx.now,
@@ -32573,28 +33109,35 @@ impl App {
             if ws.cursor_pet.grieving() {
                 ws.cursor_glow.hush_fanfare(now);
             }
-            let mut pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+            // The single-pane twin's projection ([`companion_pet_sense`]) at
+            // the focused PANE's geometry — one router, both arms.
+            let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
                 now,
-                caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat)
-                    && focus_pane_dims.is_some()
-                {
-                    (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
-                } else {
-                    None
+                aterm_effects::word_decorations::EffectGeom {
+                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
+                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
+                    rows: pane_rows,
+                    cols: pane_cols,
                 },
-                rows: pane_rows,
-                cols: pane_cols,
-                cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
-                cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
+                &glow_cfg,
                 // The motion policy ONLY — never the performance shed; the
                 // split path owes the resident the same law as the single-grid
                 // path, or the teleport survives in exactly the layout that is
                 // hardest to notice it in. See the sibling site's note.
-                reduced_motion: !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                output_burst: pet_burst,
-                pointer: pet_pointer,
-                wrapped: pet_wrapped,
-            });
+                !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                aterm_effects::rainbow_kitty::companion::HostSense {
+                    caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat)
+                        && focus_pane_dims.is_some()
+                    {
+                        (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
+                    } else {
+                        None
+                    },
+                    wrapped: pet_wrapped,
+                    output_burst: pet_burst,
+                    pointer: pet_pointer,
+                },
+            ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
             // PETTING (wave 1): stash/clear the hit-box post-tick — the
             // single-pane law verbatim, at the focused pane's origin.

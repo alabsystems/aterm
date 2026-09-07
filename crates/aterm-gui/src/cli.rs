@@ -293,7 +293,7 @@ const HELP_TAIL: &str = concat!(
     // owner's Sound menu); listing it under Cursor is what made the volume dial
     // hard to find in the first place.
     "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
-    "              voice), trail_sound_style (the typing sound: auto | glass bell |\n",
+    "              voice), trail_sound_style (the typing sound: auto | music box |\n",
     "              warm pluck | glitter | ice chime | droplet | pew | zap | tick |\n",
     "              crackle | mechanical | typewriter | marimba | felt), tone_melody,\n",
     "              trail_sound_bed (the ambient texture; default off),\n",
@@ -435,7 +435,7 @@ const STARTER_CONFIG: &str = "\
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown, plus the walking cat the default style rides it with. Default ON — except on Windows, where it is opt-IN: uncomment this line for the whole show
-# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the tall full-height rainbow body — letters inside the light — with the walking cat; \"rainbow kitty\"/\"kitty\" name the same resident) | rainbow kitty flying (same tall ribbon under the earned flying head; aliases \"flying kitty\"/\"kitty flying\" and historical \"nyan rainbow\"/\"nyan\"/\"rainbow\") | rainbow kitty underline (the explicit highlighter-plus-under-baseline alternate) | rainbow kitty tall (an explicit spelling of the default tall body; aliases \"rainbow tall\"/\"tall rainbow\"/\"nyan tall\") | rainbow dog pet | phaser | comet | lumen | sparkle | fire | laser | water | beam | classic (the v0.28 trail restored: thin comet, soft square bloom, and the jump comet the modern gates no longer draw; aliases \"v0.28\"/\"retro\") | classic mono (the same salvaged trail in ONE hue from the theme cursor colour, following cursor_trail_color/OSC 12, instead of the rolling spectrum) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -449,7 +449,7 @@ const STARTER_CONFIG: &str = "\
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
 # trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
 # trail_sound_style = \"auto\"     # typing sound: auto = follow the trail style; or an instrument for every keystroke whatever the trail looks like:
-#                                  #   glass bell | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
+#                                  #   music box | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
 #                                  #   mechanical (keyboard click + thock) | typewriter (clack + platen, bell + carriage on Enter) | marimba | felt (muted piano)
 #                                  #   aliases: the trail-style names (water, comet, rainbow kitty, ...), bell, raindrop, mech, thock, piano, clack
 # tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
@@ -458,7 +458,7 @@ const STARTER_CONFIG: &str = "\
 # bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep); false keeps the visual flash and window attention (default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
 # cursor_trail_bloom_strength = 0.85   # 0.0..=3.0 (halo intensity)
-# cursor_trail_bloom_radius = 2.2      # 0.5..=8.0 (half-res blur texels)
+# cursor_trail_bloom_radius = 2.2      # 0.5..=8.0 half-res blur texels; default 2.2, 1.8 for rainbow kitty; set to override
 # cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
 # hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR or Windows scRGB; provably inert on SDR; default ON)
 # cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)

@@ -180,9 +180,13 @@
 //! blink twice, whether the seat yawns before it loafs, when eye contact
 //! breaks and comes back, whether the loaf peeks before it sleeps, and which
 //! way round each wash goes. Nothing on that list is a metronome and nothing
-//! on it is random. Deep sleep is exempt by law — past [`SLEEP_AFTER`] plus
-//! [`BREATH_WINDOW`] every hand is byte-stable and the frame lane goes to
-//! zero.
+//! on it is random. And because every one of them is a pure function of the
+//! brain's own clocks, each has an INSTANT: a settled cat does not ask for
+//! the frame train to play them ([`PetBrain::needs_frames`] is false the
+//! moment the body is still) — it names the instant of its next visible step
+//! ([`PetBrain::next_change_deadline`]) and the host wakes for that step
+//! alone. Deep sleep is exempt by law — past [`SLEEP_AFTER`] plus
+//! [`BREATH_WINDOW`] every hand is byte-stable and the offer is `None`.
 //!
 //! ## The seat has one precedence
 //!
@@ -227,11 +231,13 @@
 //! unchanging bitmap. An ordinary pounce keeps its three beats.
 
 use core::f32::consts::TAU;
+use core::time::Duration;
 
 use aterm_time::Instant;
 
 use crate::cat_baker::CatColorKey;
 use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
+use crate::rainbow_kitty::ARM_MIN;
 
 // ── the chase ───────────────────────────────────────────────────────────────
 
@@ -479,12 +485,52 @@ const TOUCH_LAND_DUR: f32 = 0.13;
 const ZEE_EVERY: f32 = 1.2;
 const ZEE_LIFE: f32 = 2.2;
 const ZEE_ALIVE_MAX: usize = 3;
+/// THE Z'S LOOKS (A/B #19, the residual): a light-sleep z's fade, growth
+/// and tilt are sampled at the CENTRE of each of this many equal slices of
+/// its life and held across the slice — sixteen looks over [`ZEE_LIFE`],
+/// one every 137 ms — while its drift stays continuous and lands on whole
+/// device pixels in the emitter exactly as before. A "z" a few pixels tall
+/// cannot show 255 levels of alpha or a tenth of a degree of tilt, and it
+/// is precisely this quantization that makes the z a pure function of a
+/// few COUNTABLE edges — a slice boundary, a whole pixel of drift on either
+/// axis, its birth beat, its death — so [`PetBrain::next_change_deadline`]
+/// can name every one of them and the sleeper's z's ride the coarse offer
+/// instead of holding the 60 fps train for the whole light-sleep window
+/// (the `zee_train` of the lone-key census, measured before and after in
+/// `a_lone_key_on_a_quiet_screen_costs_the_pet_a_counted_census`).
+const ZEE_STEPS: f32 = 16.0;
 /// Waking pops ONE startled z — bigger, faster, briefer — before the stretch.
+/// Motion on the train, and BOUNDED by the stretch: it dies inside
+/// [`WAKE_DUR`], which holds the train anyway, so it never costs a frame of
+/// its own (the law below, and measured in
+/// `the_wake_s_startled_z_never_holds_the_frame_train_on_its_own`).
 const ZEE_POP_LIFE: f32 = 0.55;
+const _: () = assert!(
+    ZEE_POP_LIFE < WAKE_DUR,
+    "the wake's pop must die inside the stretch that owns the train"
+);
 /// The purr tell: a floating ♪ or heart every ~2 s while purring, same lane,
 /// same laws.
 const PURR_MOTE_EVERY: f32 = 2.0;
 const PURR_MOTE_LIFE: f32 = 1.9;
+/// THE ♪/♥'S LOOKS — the tell on the offer, closing A/B #19's last mote
+/// (2026-09-06). A purring seat's ♪ and ♥ (and the cheer's, and the hearts a
+/// petting hand buys — one lane, one look) wear one of this many looks per
+/// life, sampled at each slice's centre and held — growth, tilt and fade —
+/// exactly as the sleeper's z does under [`ZEE_STEPS`]: sixteen over
+/// [`PURR_MOTE_LIFE`], one every 119 ms, while the drift stays continuous
+/// and lands on whole device pixels in the emitter. This quantization is
+/// what makes the mote LOSSLESS on the offer: a look that only changes at a
+/// slice boundary and a centre that only changes at a whole pixel are a
+/// finite set of edges [`PetBrain::next_change_deadline`] can name
+/// (`mote_edges`). Before it, a ♪ was continuous in scale, tilt and alpha,
+/// so it was motion and [`PetBrain::needs_frames`] held the 60 fps train
+/// for its whole 1.9 s life — and the tell births one every 2.0 s, so a
+/// contented seat (every long typing run ends on one, and every hand that
+/// pets it) paid the train for ~95 % of its purr. Measured on the
+/// contented-cat census (`a_lone_key_on_a_contented_cat_costs_a_counted_census`)
+/// before and after.
+const PURR_MOTE_STEPS: f32 = 16.0;
 
 // ── the settled gaze and the loaf ───────────────────────────────────────────
 //
@@ -1597,6 +1643,55 @@ const _: () = assert!(BLINK_AT >= GLANCE_AT);
 /// The loaf opens its eyes for this long on its own dealt thump beat.
 const LOAF_PEEK_DUR: f32 = 0.25;
 
+/// THE SEAT'S WINDOW EDGES, for the coarse offer ([`PetBrain::next_change_deadline`]):
+/// every instant inside a dealt hand at which its FRAME can change, as offsets
+/// from the beat window's open — the same arithmetic [`PetBrain::sit_tail`] and
+/// [`PetBrain::sit_blink_beat_at`] deal frames by, read the other way round.
+/// The swing's six are its segment boundaries where the glyph actually swaps
+/// (flick → behind at 1, behind → low at 3, low → behind at 5, behind → flick
+/// at 6, and out at 7); the two silent segments inside a run of one glyph are
+/// not edges. Hand 3 of the tail is the silence and has none.
+const TAIL_EDGES_FLICK: [f32; 2] = [0.0, TAIL_FLICK];
+const TAIL_EDGES_DOUBLE: [f32; 4] = [
+    0.0,
+    TAIL_TAP,
+    TAIL_TAP + TAIL_GAP,
+    2.0 * TAIL_TAP + TAIL_GAP,
+];
+const TAIL_EDGES_SWING: [f32; 6] = [
+    0.0,
+    TAIL_SWING,
+    3.0 * TAIL_SWING,
+    5.0 * TAIL_SWING,
+    6.0 * TAIL_SWING,
+    7.0 * TAIL_SWING,
+];
+const BLINK_EDGES_ONE: [f32; 2] = [0.0, BLINK_DUR];
+const BLINK_EDGES_TWO: [f32; 4] = [
+    0.0,
+    BLINK_DUR,
+    BLINK_DUR + BLINK_GAP,
+    2.0 * BLINK_DUR + BLINK_GAP,
+];
+const GLANCE_EDGES_SHORT: [f32; 2] = [0.0, LOOK_DUR];
+const GLANCE_EDGES_LONG: [f32; 2] = [0.0, LOOK_DUR_LONG];
+
+/// THE PIXEL MARCH's floor step and budget (see [`first_px_step`]): the march
+/// never advances by less than the floor, so a threshold the body is grazing
+/// is resolved in a bounded number of samples, and the budget caps a horizon
+/// nothing crosses (a breath too shallow for the cell size to show).
+const PX_MARCH_MIN: f32 = 0.0005;
+const PX_MARCH_MAX: u32 = 1024;
+/// Bisection depth once a step is bracketed: the bracket is at most one
+/// march step wide, so twelve halvings land inside a tenth of a millisecond.
+const PX_BISECT: u32 = 12;
+/// THE OFFER LANDS PAST ITS EDGE by this much (seconds): the brain's clocks
+/// are `f32` sums of `Duration`s, and a wake aimed exactly at `quiet ==
+/// edge` rounds under it one time in three — a frame drawn a ulp too early
+/// shows the old pose and costs a second [`ARM_MIN`] wake. Ten microseconds
+/// is five ulps of a minute's quiet and no eye's business.
+const OFFER_PAST: f32 = 1e-5;
+
 // ── fade ────────────────────────────────────────────────────────────────────
 
 /// Appear/disappear ramps (seconds). The pet fades in when the caret becomes
@@ -1610,13 +1705,19 @@ const FADE_OUT: f32 = 0.45;
 /// structural (`lib.rs`: "`is_active()` reports when nothing is animating; the
 /// host returns to 0% idle").
 ///
-/// A cat that breathes forever is a 60 fps wake train forever, on a window where
-/// nothing is happening and nobody is looking. So the settled animations — the
-/// tail flick, the wash, curling up, and the breath itself — all play out over
-/// the window that starts when you stop typing and ends here, and then the pet
-/// is a still sleeping sticker until you touch the keyboard. Everything a user
+/// A cat that breathes forever is a wake forever, on a window where nothing is
+/// happening and nobody is looking. So the settled animations — the tail
+/// flick, the wash, curling up, and the breath itself — all play out over the
+/// window that starts when you stop typing and ends here, and then the pet is
+/// a still sleeping sticker until you touch the keyboard. Everything a user
 /// could actually watch happens inside it; what is given up is the frame nobody
 /// sees.
+///
+/// What the window no longer buys is the FRAME TRAIN: the breath inside it is
+/// paced by [`PetBrain::next_change_deadline`] — one wake per whole pixel of
+/// swell and per pose swap, a handful a second — and [`PetBrain::needs_frames`]
+/// is false the moment the body is still (A/B #19). The window is the breath's
+/// LENGTH, and the law that past it the frame is byte-stable.
 const BREATH_WINDOW: f32 = 10.0;
 
 /// The pet's authored art box, in cells: the roster's 232×136 viewbox at the
@@ -1648,9 +1749,9 @@ pub fn art_cols(cell_w: u16, cell_h: u16) -> f32 {
     ART_ROWS * ART_ASPECT * f32::from(cell_h) / f32::from(cell_w)
 }
 
-/// Cap on live pet motes — the pet's ONE small particle lane (landing dust
-/// now; sleep z's and purr notes/hearts ride the same slots). Tiny by design:
-/// these are accents on an animal, not a particle system.
+/// Cap on live pet motes — the pet's ONE small particle lane (landing dust,
+/// the wake's pop, sleep z's and purr notes/hearts share the slots). Tiny
+/// by design: these are accents on an animal, not a particle system.
 pub const PET_MOTES_MAX: usize = 4;
 
 /// What a pet mote is drawn as. One lane, few costumes.
@@ -1667,6 +1768,23 @@ pub enum PetMoteKind {
     Note,
     /// A floating heart from a purring chest.
     Heart,
+}
+
+impl PetMoteKind {
+    /// Whether a mote of this kind is drawn on the COARSE OFFER rather than
+    /// the frame train: its look is one of a few held slices and its centre
+    /// a whole device pixel, so every instant it can change is countable
+    /// and [`PetBrain::next_change_deadline`] names it (`mote_edges`) — the
+    /// sleeper's z ([`ZEE_STEPS`]) and the tell's ♪/♥ ([`PURR_MOTE_STEPS`]).
+    /// The two that stay motion are each bounded by the beat that throws
+    /// them and never idle, measured: the wake's pop ([`ZEE_POP_LIFE`]) dies
+    /// inside the stretch's own train ([`WAKE_DUR`]), and the landing dust
+    /// outlives its landing by a third of a second at most — fewer frames
+    /// than the pixel edges three puffs would offer (see
+    /// [`PetBrain::needs_frames`]).
+    const fn rides_offer(self) -> bool {
+        matches!(self, Self::Zee | Self::Note | Self::Heart)
+    }
 }
 
 /// One resolved mote for this frame, in fractional grid CELLS (centre
@@ -1701,6 +1819,86 @@ struct Mote {
     dir: f32,
     /// Deterministic scatter index (a serial, not a die roll).
     seed: u8,
+}
+
+impl Mote {
+    /// Age as a fraction of life at brain clock `clock` — `resolve_motes`'s
+    /// `u`, alive on `0..1`.
+    fn age(&self, clock: f64) -> f32 {
+        ((clock - self.born) as f32) / self.life.max(0.01)
+    }
+
+    /// The light-sleep z's drift at age `u`, in fractional cells: up and
+    /// away from the head, with a lazy sway — a sleep thought, not a
+    /// projectile. ONE definition, shared by `resolve_motes` (which draws
+    /// it) and the coarse offer's pixel march (which predicts its next whole
+    /// device pixel), so the two can never disagree about where a z is.
+    fn zee_drift(&self, u: f32) -> (f32, f32) {
+        let wobble = (TAU * (u * 0.8 + 0.31 * f32::from(self.seed % 4))).sin();
+        (
+            self.col + self.dir * (0.30 + 0.55 * u) + 0.10 * wobble,
+            self.row - 1.05 * u,
+        )
+    }
+
+    /// The ♪/♥'s drift at age `u`, in fractional cells: a contented drift
+    /// off the working chest, up and a little away, with the same lazy
+    /// sway. ONE definition, shared by `resolve_motes` and the offer's
+    /// pixel march, on the z's terms exactly.
+    fn note_drift(&self, u: f32) -> (f32, f32) {
+        let wobble = (TAU * (u * 0.8 + 0.31 * f32::from(self.seed % 4))).sin();
+        (
+            self.col + self.dir * (0.18 + 0.30 * u) + 0.12 * wobble,
+            self.row - 0.85 * u,
+        )
+    }
+
+    /// The drift the emitter draws for an offer-riding mote
+    /// ([`PetMoteKind::rides_offer`]) at age `u`; the landing dust and the
+    /// wake's pop are motion on the train and never asked.
+    fn drift(&self, u: f32) -> (f32, f32) {
+        match self.kind {
+            PetMoteKind::Zee => self.zee_drift(u),
+            _ => self.note_drift(u),
+        }
+    }
+
+    /// The per-axis speed bound of [`Self::drift`], cells per unit of age.
+    fn drift_slope(&self) -> (f32, f32) {
+        match self.kind {
+            PetMoteKind::Zee => ZEE_DRIFT_SLOPE,
+            _ => NOTE_DRIFT_SLOPE,
+        }
+    }
+
+    /// How many held looks this mote wears in a life ([`look_slice`]).
+    fn look_steps(&self) -> f32 {
+        match self.kind {
+            PetMoteKind::Zee => ZEE_STEPS,
+            _ => PURR_MOTE_STEPS,
+        }
+    }
+}
+
+/// [`Mote::zee_drift`]'s speed bound per axis, in cells per unit of age:
+/// the climb is linear, the sway's derivative peaks at `0.10 · TAU · 0.8`.
+/// What the pixel march strides by (see [`first_px_step`]), so an offer can
+/// skip an interval only where the z provably stays on its pixel.
+const ZEE_DRIFT_SLOPE: (f32, f32) = (0.55 + 0.10 * TAU * 0.8, 1.05);
+/// [`Mote::note_drift`]'s speed bound per axis, the same way: the climb is
+/// `0.85` rows a life, the drift `0.30` cells plus a sway whose derivative
+/// peaks at `0.12 · TAU · 0.8`.
+const NOTE_DRIFT_SLOPE: (f32, f32) = (0.30 + 0.12 * TAU * 0.8, 0.85);
+
+/// An offer-riding mote's look slice at age `u` — `0..steps`, the last one
+/// held to the death — and the age a slice's look is sampled at (its
+/// centre). [`ZEE_STEPS`] for the z, [`PURR_MOTE_STEPS`] for the ♪/♥.
+fn look_slice(u: f32, steps: f32) -> f32 {
+    (u * steps).floor().min(steps - 1.0)
+}
+
+fn look_slice_age(slice: f32, steps: f32) -> f32 {
+    (slice + 0.5) / steps
 }
 
 /// One resolved DEPARTING BODY for this frame (the breed handoff's outgoing
@@ -2689,6 +2887,27 @@ pub struct PetBrain {
     /// so the retired zero-alpha fast path may skip the write harmlessly:
     /// nothing can read it while the pet is hidden.
     last_pose: PetGlyphId,
+    /// THE COARSE OFFER's inputs (A/B #19), remembered from the last tick's
+    /// sense because [`Self::next_change_deadline`] is asked between ticks
+    /// with no sense in hand: the cell height that sizes the sprite's box
+    /// (a "visible step" is a whole DEVICE pixel of that box), and whether
+    /// the last frame was reduced-motion (a still cat offers only its sleep
+    /// edge).
+    last_cell_h: u16,
+    last_cell_w: u16,
+    last_reduced: bool,
+    /// THE GLIDE SENSOR (see [`Self::needs_frames`]): the column the body
+    /// had when the last tick BEGAN, the follower's aim on that tick, and
+    /// whether an eviction (the face-on scoot clear of the caret cell, the
+    /// step off arriving ink) is still short of its mark after it. A
+    /// settled body is never perfectly still: the follower eases the last
+    /// fraction of a cell home at a rate the frame train made invisible
+    /// (under a hundredth of the gap a tick), so "moving" at rest is a
+    /// body that moved this tick AND has a whole device pixel still to go
+    /// — or an eviction under way, which walks at [`INK_EVICT_SPEED`].
+    col_at_tick: f32,
+    home: f32,
+    evicting: bool,
 }
 
 impl Default for PetBrain {
@@ -2832,6 +3051,12 @@ impl Default for PetBrain {
             // is the sleep frame — consistent with what the first emit
             // would write.
             last_pose: PetGlyphId::PetSleep0,
+            last_cell_h: 0,
+            last_cell_w: 0,
+            last_reduced: false,
+            col_at_tick: 0.0,
+            home: 0.0,
+            evicting: false,
         }
     }
 }
@@ -3393,6 +3618,18 @@ impl PetBrain {
         1.0
     }
 
+    /// A mote's DRAWN centre: its fractional-cell centre snapped to the
+    /// device pixel the emitter rounds it to on each axis (`pet_cursor`:
+    /// `(col · cell_w).round()`, `(row · cell_h).round()`), handed back in
+    /// cells at the cells of the last tick. What the light-sleep z reads its
+    /// ink fade at, so the fade is a function of the pixel and not of the
+    /// sub-pixel remainder between two pixels.
+    fn mote_px_cell(&self, col: f32, row: f32) -> (f32, f32) {
+        let cw = f32::from(self.last_cell_w.max(1));
+        let ch = f32::from(self.last_cell_h.max(1));
+        ((col * cw).round() / cw, (row * ch).round() / ch)
+    }
+
     // ── the wave-1 stimuli: note, never act ─────────────────────────────
     //
     // The `kitty_sing::note_char` idiom: stimuli LATCH here and `tick`
@@ -3510,6 +3747,68 @@ impl PetBrain {
         };
         let dt = elapsed.min(0.10);
         self.last_now = Some(sense.now);
+        // ── reversal bookkeeping (the frolic detector) ─────────────────────
+        //
+        // THE GESTURE WINDOWS RIDE THE WALL CLOCK (`elapsed`), not `dt`. Each
+        // of these measures how long ago something HAPPENED — the last
+        // reversal, the last retreat, the last same-direction key — and a
+        // window that only advanced by the motion-clamped `dt` measured the
+        // host's tick cadence instead: with the settled pet off the frame
+        // train (A/B #19 — the coarse offer below), the gap between two ticks
+        // is routinely a third of a second, and a 0.6 s rhythm window that
+        // advanced 0.1 s per tick would have kept a run alive across a pause
+        // the 60 fps train ended. The wave-1 TTLs below already ride the
+        // injected clock for exactly this reason; these are the same law. At
+        // frame cadence `elapsed == dt` and nothing here changes.
+        //
+        // THE PAUSE'S EXCESS IS AGED BEFORE THE MOVE (review, 2026-09-06):
+        // the windows describe the state a pause left behind, so the tick
+        // that ENDS a pause charges the pause (`elapsed − dt`, everything
+        // beyond one motion-clamped frame) BEFORE it consumes its move, and
+        // the frame's own `dt` after it, exactly where it always was. At
+        // frame cadence the excess is zero and every number here is byte
+        // for byte what it was; after a 4 s pause a backspace no longer
+        // completes a stale held-delete run, and the key's own velocity
+        // impulse is no longer decayed by the whole pause.
+        let excess = (elapsed - dt).max(0.0);
+        self.reversal_t += excess;
+        if self.reversal_t > FROLIC_WINDOW {
+            self.reversals = 0;
+            self.reversal_t = 0.0;
+        }
+        // The held-delete window (capped so an idle hour cannot overflow it).
+        self.retreat_gap = (self.retreat_gap + excess).min(60.0);
+        // v̂ decays every tick; observed moves add their impulse in `on_move`.
+        // A pause therefore eases the lead back over VEL_TAU, and the station
+        // drifts home to caret+1 instead of staying parked out ahead. A pause
+        // is wall time (the law above): the lead eases home over the seconds
+        // the user actually paused, whatever the lane was doing.
+        self.vhat *= (-excess / VEL_TAU).exp();
+        // The rhythm run's clock (capped like `retreat_gap`).
+        self.run_t = (self.run_t + excess).min(60.0);
+        if self.run_t > RHYTHM_WINDOW {
+            self.run_count = 0;
+        }
+        // The coarse offer's inputs, and the glide sensor's baseline — see
+        // the fields. Written before any arm can return. THE MARK IS ONLY
+        // MOVED BY A TICK THAT CAN MOVE THE BODY (2026-09-06): the ease home
+        // closes a fraction of the gap per tick, so a zero-`elapsed` tick —
+        // a re-tick at the instant of the last one, which a host asking for
+        // a still or a walk re-reading a wake both produce — leaves `col`
+        // exactly where it was, and re-marking it there told
+        // [`Self::needs_frames`] the body had not moved: a seat with seven
+        // device pixels still to glide parked on the spot (measured, one key
+        // on a contented cat: parked at +16 ms with `|home − col|` = 0.69
+        // cells, the next offer at `SETTLE_TURN`). A tick that carries no
+        // time carries no motion information, so the sensor keeps the last
+        // real tick's reading.
+        if elapsed > 0.0 {
+            self.col_at_tick = self.col;
+        }
+        self.evicting = false;
+        self.last_cell_h = sense.cell_h;
+        self.last_cell_w = sense.cell_w;
+        self.last_reduced = sense.reduced_motion;
         self.clock += f64::from(elapsed);
         // The departure lane is MOTION, so its clock rides the dt clamp:
         // ghosts advance `speed × dt` worth of run per tick like every
@@ -4007,19 +4306,14 @@ impl PetBrain {
             return self.emit(sense, width);
         }
 
-        // ── reversal bookkeeping (the frolic detector) ─────────────────────
+        // ── the frame's own aging (see the pause's excess, above) ──────────
         self.reversal_t += dt;
         if self.reversal_t > FROLIC_WINDOW {
             self.reversals = 0;
             self.reversal_t = 0.0;
         }
-        // The held-delete window (capped so an idle hour cannot overflow it).
         self.retreat_gap = (self.retreat_gap + dt).min(60.0);
-        // v̂ decays every tick; observed moves add their impulse in `on_move`.
-        // A pause therefore eases the lead back over VEL_TAU, and the station
-        // drifts home to caret+1 instead of staying parked out ahead.
         self.vhat *= (-dt / VEL_TAU).exp();
-        // The rhythm run's clock (capped like `retreat_gap`).
         self.run_t = (self.run_t + dt).min(60.0);
         if self.run_t > RHYTHM_WINDOW {
             self.run_count = 0;
@@ -4118,7 +4412,10 @@ impl PetBrain {
         self.last_burst = sense.output_burst;
         self.twitch_t = (self.twitch_t - dt).max(0.0);
         self.stumble_t = (self.stumble_t - dt).max(0.0);
-        self.bored_cool = (self.bored_cool - dt).max(0.0);
+        // A cooldown is a wall-clock window too (the gesture-window law at
+        // the prologue): "one vignette per [`BORED_COOL`]" counts seconds
+        // the user sat there, not ticks the lane happened to run.
+        self.bored_cool = (self.bored_cool - elapsed).max(0.0);
         self.arrive_t = (self.arrive_t - dt).max(0.0);
         if burst_edge
             && self.twitch_t <= 0.0
@@ -4187,7 +4484,8 @@ impl PetBrain {
                 // and the catch all live HERE in the sensor; the steering is
                 // a target override below (the follower controller does the
                 // running — no new motion vocabulary).
-                self.pursuit_cool = (self.pursuit_cool - dt).max(0.0);
+                // A cooldown rides the wall clock (the prologue's law).
+                self.pursuit_cool = (self.pursuit_cool - elapsed).max(0.0);
                 let dist = (px - (self.col + width * 0.5))
                     .abs()
                     .max((py - self.row).abs() * 2.0);
@@ -4398,6 +4696,7 @@ impl PetBrain {
                 // would leave the law with a half-cell of unanimated slack
                 // for no behaviour at all.
                 self.col = Self::evict_toward(self.col, safe, dt);
+                self.evicting = self.col != safe;
             }
         }
 
@@ -5411,7 +5710,6 @@ impl PetBrain {
             STRIDE_CELLS
         };
         self.stride = (self.stride + travelled / stride_cells).rem_euclid(1024.0);
-        self.content = (self.content + travelled * CONTENT_PER_CELL).min(1.0);
 
         // THE DRIFT-BRAKE (wave 4): a long gallop that crosses its station
         // blows past it by [`BRAKE_OVERSHOOT`] on purpose, flips to face its
@@ -5514,6 +5812,9 @@ impl PetBrain {
             self.facing_left = self.speed < 0.0;
         }
 
+        // The glide sensor's mark (see `needs_frames`): where the follower
+        // is easing the settled body to.
+        self.home = target;
         let arrived = (target - self.col).abs() <= ARRIVED && self.speed.abs() < FLIP_SPEED;
         if arrived {
             // The chase leg is over: the drift-brake's odometer rewinds and
@@ -5521,6 +5822,26 @@ impl PetBrain {
             self.leg_dist = 0.0;
             self.braking = false;
             self.brake_over = None;
+            // THE LEDGER IS SPENT IN WALL TIME (the prologue's law): a cat
+            // that sat for a second has spent a second of contentment
+            // whether the lane ticked sixty times or three — and
+            // `enter_settled`'s Purr-or-Loaf deal adds back exactly
+            // `CONTENT_DECAY × (quiet − SIT_AFTER)`, which is only the sum
+            // of what was spent here if this rides the same clock `quiet`
+            // does. On `dt` the deal changed with the host's cadence.
+            //
+            // …AND IT IS SPENT BEFORE ANY ARM CAN RETURN (2026-09-06). It
+            // used to sit below the stimuli, the games and the bored
+            // vignettes, so the tick that STARTS one of them skipped its
+            // whole interval — 16 ms on the train, but a parked pet reaches
+            // the vignette by an OFFER (`next_change_secs` names its
+            // instant), and skipped the whole offer interval: measured on
+            // the contented-cat census, a pet whose ledger ran 0.14 s
+            // behind the 60 fps twin's, purring 0.14 s longer, its swell
+            // still on glass 45 ms after the twin's had stopped. The tell's
+            // end is offered from this ledger, so the ledger must not
+            // depend on the cadence that reads it.
+            self.content = (self.content - CONTENT_DECAY * elapsed).max(0.0);
             // The wave-1 stimuli are consumed HERE — on the ground, below
             // every caret-travel intent (flight, hop, wall transit, pounce,
             // big jump) and after every one-shot hold, exactly like the
@@ -5766,7 +6087,6 @@ impl PetBrain {
                     return self.emit(sense, width);
                 }
             }
-            self.content = (self.content - CONTENT_DECAY * dt).max(0.0);
             self.enter_settled(dt);
             // The settle-turn (review #6) and the settled emissions (sleep
             // z's, the purr tell) — only on the visible, full-motion path:
@@ -5778,7 +6098,10 @@ impl PetBrain {
                 Some((px, _)) if self.pointer_heat > 0.0 => px,
                 _ => f32::from(cc),
             };
-            self.settle_gaze(gaze_col, f32::from(cr), width, dt);
+            // The dwell measures STAYING, which is wall time (the
+            // prologue's law) — and it is what makes the turn's instant a
+            // deadline the coarse offer can name.
+            self.settle_gaze(gaze_col, f32::from(cr), width, elapsed);
             // Gauntlet F9: the face-on sit (the hunt-and-peck stare) parks
             // its muzzle CLEAR of the caret cell — one small deterministic
             // scoot at settle-turn time, only when the caret sits to the
@@ -5804,10 +6127,26 @@ impl PetBrain {
                     // the station it is over a cell, and no cell of this cat
                     // moves without being walked (owner ruling, 2026-08-10).
                     self.col = Self::evict_toward(self.col, clear, dt);
+                    self.evicting = self.col != clear;
                 }
             }
             self.tend_motes(width);
         } else {
+            // THE LEDGER IS EARNED BY TRAVEL — "per cell actually run", the
+            // constant's own words — so it is credited HERE, on the chase,
+            // and not on every tick of the follower (2026-09-06). It used to
+            // be credited beside the stride odometer above, for whatever
+            // `travelled` the follower produced, and a SETTLED body produces
+            // some every tick: pinned between the face-on scoot clear of the
+            // caret cell and the ease home, it re-travels the same
+            // thousandth of a cell forever, and was paid for it at a rate
+            // that depended on how often the lane ticked — measured on the
+            // contented-cat census, a 60 fps seat earning 0.003/s and the
+            // parked pet 0.010/s for sitting still, against a 0.070/s spend,
+            // their tells ending 0.14 s apart. The tell's end is offered from
+            // this ledger, so nothing about the ledger may depend on the
+            // cadence that reads it.
+            self.content = (self.content + travelled * CONTENT_PER_CELL).min(1.0);
             self.content = (self.content - CONTENT_MOVING_DECAY * dt).max(0.0);
             self.leg_dist += travelled;
             let fast = match self.action {
@@ -7220,7 +7559,7 @@ impl PetBrain {
     /// over-the-shoulder `peek` stays instantaneous on purpose: a glance
     /// costs the animal nothing, which is exactly why it is the answer to a
     /// target the body should not chase.
-    fn settle_gaze(&mut self, target_col: f32, caret_row: f32, width: f32, dt: f32) {
+    fn settle_gaze(&mut self, target_col: f32, caret_row: f32, width: f32, elapsed: f32) {
         if !self.action.settled() || self.quiet < SETTLE_TURN {
             self.sit_front = false;
             self.peek = false;
@@ -7273,7 +7612,7 @@ impl PetBrain {
             // hand its whole balance to whatever wandered into range next,
             // which is the instant flip wearing a longer name.
             if behind {
-                self.gaze_dwell += dt;
+                self.gaze_dwell += elapsed;
             } else {
                 self.gaze_dwell = 0.0;
             }
@@ -7722,7 +8061,6 @@ impl PetBrain {
             let fade_in = (u / 0.15).min(1.0);
             let fade_out = ((1.0 - u) / 0.35).clamp(0.0, 1.0);
             let spin = if m.seed % 2 == 0 { 1.0 } else { -1.0 };
-            let wobble = (TAU * (u * 0.8 + 0.31 * f32::from(m.seed % 4))).sin();
             *slot = Some(match m.kind {
                 PetMoteKind::Dust => PetMoteSprite {
                     kind: m.kind,
@@ -7736,24 +8074,45 @@ impl PetBrain {
                     alpha: (fade_in * fade_out * 235.0) as u8,
                 },
                 PetMoteKind::Zee | PetMoteKind::ZeePop => {
-                    let (col, row, scale, rot, peak) = if m.kind == PetMoteKind::Zee {
+                    let (col, row, scale, rot, peak, env, ink) = if m.kind == PetMoteKind::Zee {
+                        // Up and away from the head with a lazy sway (the
+                        // drift, continuous), wearing the slow tilt, the
+                        // growth and the fade of its LOOK SLICE — the
+                        // envelope sampled at the slice's centre and held
+                        // across it (A/B #19's residual, [`ZEE_STEPS`]).
+                        // Sixteen looks over a life is more than a glyph a
+                        // few pixels tall can show anyway, and it is what
+                        // lets the sleeper name the z's every visible edge
+                        // and park between them instead of holding the
+                        // frame train for the whole light-sleep window.
+                        let su = look_slice_age(look_slice(u, ZEE_STEPS), ZEE_STEPS);
+                        let (col, row) = m.zee_drift(u);
+                        // Gauntlet F8's ink fade, read at the DRAWN pixel —
+                        // the device pixel the emitter rounds the centre to
+                        // (`pet_cursor`'s `(col · cell_w).round()`) — so the
+                        // fade, too, can only change where the pixel does.
+                        let (px_col, px_row) = self.mote_px_cell(col, row);
                         (
-                            // Up and away from the head, with a lazy sway and
-                            // a slow tilt — a sleep thought, not a projectile.
-                            m.col + m.dir * (0.30 + 0.55 * u) + 0.10 * wobble,
-                            m.row - 1.05 * u,
-                            0.55 + 0.60 * u,
-                            spin * (0.10 + 0.04 * f32::from(m.seed % 3) + 0.55 * u),
+                            col,
+                            row,
+                            0.55 + 0.60 * su,
+                            spin * (0.10 + 0.04 * f32::from(m.seed % 3) + 0.55 * su),
                             220.0,
+                            (su / 0.15).min(1.0) * ((1.0 - su) / 0.35).clamp(0.0, 1.0),
+                            self.zee_ink_fade(px_col, px_row),
                         )
                     } else {
+                        // The startled pop: bigger, quicker, one sharp rise
+                        // — on the wake's own frame train, continuous.
+                        let (col, row) = (m.col + m.dir * 0.25 * u, m.row - 0.55 * u);
                         (
-                            // The startled pop: bigger, quicker, one sharp rise.
-                            m.col + m.dir * 0.25 * u,
-                            m.row - 0.55 * u,
+                            col,
+                            row,
                             0.85 + 0.55 * u,
                             spin * (0.14 + 0.8 * u),
                             245.0,
+                            fade_in * fade_out,
+                            self.zee_ink_fade(col, row),
                         )
                     };
                     // Gauntlet F8: a z drifting toward an inked row band
@@ -7761,7 +8120,6 @@ impl PetBrain {
                     // mark inside real text is the fake-glyph hazard in its
                     // purest form. Dead-on-arrival z's free their slot, so
                     // the lane (and the frame cadence riding it) releases.
-                    let ink = self.zee_ink_fade(col, row);
                     if ink <= 0.0 {
                         self.motes[i] = None;
                         continue;
@@ -7772,21 +8130,32 @@ impl PetBrain {
                         row,
                         scale,
                         rot,
-                        alpha: (fade_in * fade_out * ink * peak) as u8,
+                        alpha: (env * ink * peak) as u8,
                     }
                 }
-                PetMoteKind::Note | PetMoteKind::Heart => PetMoteSprite {
-                    kind: m.kind,
-                    // A contented drift off the working chest. A size up and
-                    // a shade brighter since the gauntlet (F4b/F7): the purr
-                    // tell was a near-invisible speck at 1x, and the cheer
-                    // has to read as a party from across the room.
-                    col: m.col + m.dir * (0.18 + 0.30 * u) + 0.12 * wobble,
-                    row: m.row - 0.85 * u,
-                    scale: 0.78 + 0.50 * u,
-                    rot: spin * (0.11 + 0.05 * f32::from(m.seed % 3) + 0.4 * u),
-                    alpha: (fade_in * fade_out * 240.0) as u8,
-                },
+                PetMoteKind::Note | PetMoteKind::Heart => {
+                    // A contented drift off the working chest (continuous,
+                    // [`Mote::note_drift`]), wearing the growth, the tilt
+                    // and the fade of its LOOK SLICE — sampled at the
+                    // slice's centre and held across it, the z's law
+                    // ([`PURR_MOTE_STEPS`]): the quantization is what lets
+                    // the offer name every edge of a ♪ and park between
+                    // them. A size up and a shade brighter since the
+                    // gauntlet (F4b/F7): the purr tell was a near-invisible
+                    // speck at 1x, and the cheer has to read as a party
+                    // from across the room.
+                    let su = look_slice_age(look_slice(u, PURR_MOTE_STEPS), PURR_MOTE_STEPS);
+                    let (col, row) = m.note_drift(u);
+                    PetMoteSprite {
+                        kind: m.kind,
+                        col,
+                        row,
+                        scale: 0.78 + 0.50 * su,
+                        rot: spin * (0.11 + 0.05 * f32::from(m.seed % 3) + 0.4 * su),
+                        alpha: ((su / 0.15).min(1.0) * ((1.0 - su) / 0.35).clamp(0.0, 1.0) * 240.0)
+                            as u8,
+                    }
+                }
             });
         }
         out
@@ -8769,10 +9138,16 @@ impl PetBrain {
     /// Deliberately NOT `is_active()`. The pet is a resident, so it is visible
     /// essentially always; arming the cadence on visibility would pin a full
     /// frame rate on a window where nothing is happening, forever. It asks for
-    /// frames only while something is genuinely moving — a fade, a chase, a
-    /// flight, a landing, any one-shot hold — plus the bounded settle-in window
-    /// ([`BREATH_WINDOW`]) that carries the tail flick, the wash, the curl and
-    /// the last breath. After that the cat is still, and so is the window.
+    /// frames only while something is genuinely MOVING — a fade, a chase, a
+    /// flight, a landing, any one-shot hold, a body still gliding into its
+    /// seat. The settled cat's own life — the breath, the seat's dealt tail
+    /// and blink and glance, the wash, the loaf's thump, the fold into each
+    /// pose — is NOT a frame train: those change on the order of a hundred
+    /// milliseconds or slower, and [`Self::next_change_deadline`] names the
+    /// exact instant of each next visible step instead (A/B #19). This used
+    /// to end in `quiet < SLEEP_AFTER + BREATH_WINDOW`, which held the lane
+    /// for 32 s after ANY key on a quiet screen — 3 786 arms measured for one
+    /// keystroke — to draw a 2.4 s breath whose sprite steps every ~100 ms.
     #[must_use]
     pub fn needs_frames(&self) -> bool {
         if self.alpha < 1.0 {
@@ -8782,6 +9157,13 @@ impl PetBrain {
             // the pet invisible until some unrelated repaint happened to tick it
             // again, spreading a 0.30 s appear over seconds of blink intervals.
             return self.last_caret.is_some() || self.alpha > 0.0;
+        }
+        if self.last_caret.is_none() {
+            // Opaque with the caret gone: the fade-OUT's first tick landed on
+            // a zero `dt` (the same instant as the tick before it) and has not
+            // moved the ramp yet. The next tick will; it is owed. (The settle
+            // window used to cover this by accident.)
+            return true;
         }
         if self.flight.is_some()
             || self.deferred_hidden_landing.is_some()
@@ -8891,13 +9273,575 @@ impl PetBrain {
         if self.twitch_t > 0.0 {
             return true;
         }
-        if self.motes.iter().any(Option::is_some) {
-            return true; // a mote is drifting: the lane releases AFTER it fades
+        // A drifting mote is motion only while its emitter is not
+        // countable. The light sleeper's z (A/B #19's residual) and the
+        // tell's ♪/♥ (its last mote, 2026-09-06) ride the offer instead:
+        // their drift lands on whole device pixels, their look is held
+        // across [`ZEE_STEPS`] / [`PURR_MOTE_STEPS`] slices of a life, and
+        // the z's ink fade is read at the drawn pixel, so every instant
+        // either can change is named by [`Self::next_change_deadline`]
+        // (`mote_edges`) and the pet parks between them
+        // ([`PetMoteKind::rides_offer`]). Measured on the lone-key census:
+        // 512 of the 655 train frames one key still cost were z's; on the
+        // contented-cat census (one key on a cat that just finished a long
+        // run, its seat purring) 390 of the 606 were the ♪/♥'s own — 982
+        // wakes in 32 s, now 806 (594 offers, 129 of them the ♪/♥'s edges,
+        // + 212 train frames of the follower's glide and the loaf's roll).
+        //
+        // The two that stay motion are BOUNDED BY THE BEAT THAT THROWS THEM
+        // and never idle, measured
+        // (`the_wake_s_startled_z_never_holds_the_frame_train_on_its_own`,
+        // `landing_dust_holds_the_train_for_a_bounded_beat_past_the_landing`):
+        //
+        //   * the wake's startled pop lives [`ZEE_POP_LIFE`] and the stretch
+        //     it is thrown ahead of holds the train for [`WAKE_DUR`], longer
+        //     — so the pop is never the deciding term, on any of the five
+        //     wake paths (a key, a bell, a petting hand, a failed command, a
+        //     slow success): 0 frames of its own, 34 inside the stretch's;
+        //   * the landing dust lives up to 0.59 s from a [`LAND_DUR`]
+        //     (0.26 s) landing — ≤ 21 frames past it by construction, 10 of
+        //     its own measured (36 with dust in frame; the rest the landing
+        //     and the follower's settle pay for) — and the offer would cost
+        //     MORE than that: the same three puffs stepped 29 whole device
+        //     pixels, and 16 looks each would add 45 more, ~74 wakes against
+        //     the 10 frames. A landing is a caret jump, a stumble or a
+        //     brake; a swipe's puff is a pointer beat; none is ever idle.
+        if self.motes.iter().flatten().any(|m| !m.kind.rides_offer()) {
+            return true;
         }
         if !self.action.settled() {
             return true; // walking, running, startled, frolicking, waking
         }
-        self.quiet < SLEEP_AFTER + BREATH_WINDOW
+        // THE SETTLED HOLDS AND GLIDES — what the settle window used to
+        // cover by accident, each finite by construction:
+        //
+        //   * the double-take: `Perk` is `settled()` for the interrupt rule,
+        //     but it is a [`PERK_HOLD`] one-shot on `action_t`;
+        //   * the small-retreat flinch, a [`FLINCH_DUR`] duck over the perk;
+        //   * a body still GLIDING at rest. Two glides: an EVICTION (the
+        //     face-on scoot clear of the caret cell, the step off arriving
+        //     ink) walks at `INK_EVICT_SPEED` until it lands, and says so;
+        //     and the follower's own ease home, which never truly ends (it
+        //     closes under a hundredth of the gap a tick) and so counts only
+        //     while it is VISIBLE — the body moved this tick and has a whole
+        //     device pixel still to go. Under a pixel the ease is served by
+        //     the offer's own wakes, invisibly. The move-this-tick clause is
+        //     what keeps a body pinned against a wall, or jittering a
+        //     thousandth of a cell between the scoot and the ease, from
+        //     reading as motion.
+        if self.action == PetAction::Perk || self.flinch_t > 0.0 || self.evicting {
+            return true;
+        }
+        if self.col != self.col_at_tick
+            && (self.home - self.col).abs() * f32::from(self.last_cell_w) >= 1.0
+        {
+            return true;
+        }
+        // …and a body whose HOME is still moving: the station leads the caret
+        // by [`Self::lead`] — the typing rhythm's velocity estimate, easing
+        // back over [`VEL_TAU`] from the last key — and while that lead is a
+        // visible pixel the follower is still tracking a mark that moves
+        // between ticks. Parked there, the next offer would find the mark a
+        // cell away and take it in one clamped-`dt` stride instead of the
+        // train's slide (measured: 0.32 cells of daylight between the two at
+        // +0.68 s after one key). Bounded: the lead decays to under a pixel
+        // within two seconds of the last key.
+        if self.lead() * f32::from(self.last_cell_w) >= 1.0 {
+            return true;
+        }
+        // Settled, opaque, every hold spent: still. Whatever changes next is
+        // a dealt beat, a fold, a breath sample or the ladder, and each of
+        // those has an instant — see [`Self::next_change_deadline`].
+        false
+    }
+
+    /// THE COARSE OFFER (A/B #19): the instant of the settled pet's next
+    /// VISIBLE step, so the host can wake for that step alone instead of
+    /// pacing the frame train through 32 s of breathing. The contract is the
+    /// glow engine's (`CursorGlow::next_change_deadline`) and the v2 engine's
+    /// (`rainbow_kitty::Engine::next_change_deadline`): the exact next instant
+    /// at which the frame can differ from the one on glass; `None` when
+    /// nothing will change until an input does; never sooner than
+    /// [`ARM_MIN`] after `now` (a deadline at `now` is a busy re-arm).
+    ///
+    /// A VISIBLE step is one of:
+    ///
+    /// * a frame swap — the seat's dealt tail, blink, glance and yawn windows
+    ///   opening and closing ([`TAIL_EDGES_FLICK`] and its siblings), the
+    ///   wash's paw change and end, the loaf's peek, the sleeper's
+    ///   `PetSleep0`/`PetSleep1` swap at the breath's zero crossings, the
+    ///   gaze opening at [`SETTLE_TURN`], the rationed body turn at the end
+    ///   of its dwell, the ladder itself (stand → sit → wash → loaf → sleep →
+    ///   deep sleep) and the bored vignette's window opening;
+    /// * a mote birth — the light sleeper's next z, the purring seat's next
+    ///   ♪/♥;
+    /// * a live z's and a live ♪/♥'s every edge (A/B #19's residual and its
+    ///   last mote, [`Self::mote_edges`]): the next whole device pixel of
+    ///   drift on either axis, the next look slice ([`ZEE_STEPS`],
+    ///   [`PURR_MOTE_STEPS`]) and the death — neither is motion, because
+    ///   everything the emitter draws of it changes only at those instants;
+    /// * the tell ending — the swell stops when the ledger crosses
+    ///   [`PURR_GATE`];
+    /// * a WHOLE DEVICE PIXEL of the body's box on either axis, for every
+    ///   continuous envelope a settled pose carries — the breath, the purr's
+    ///   swell, the stand's gather, the sit's fold, the loaf's melt and its
+    ///   tail thump — found by [`first_px_step`] over exactly the arithmetic
+    ///   `emit` draws with, so the frame at the offered instant is the frame
+    ///   the 60 fps train would have drawn there, and no frame between two
+    ///   offers could have differed by a pixel.
+    ///
+    /// Conservative where a rule would refuse a hand (the face-on seat's fit
+    /// tests, a z refused by the cap): an offer that lands on a frame the
+    /// present gate dedups costs one wake, an offer that lands late costs a
+    /// stutter, and only the second is a bug. Deep sleep (past
+    /// [`BREATH_WINDOW`]) and a hidden pet offer nothing. Under reduced
+    /// motion the only edge is the ladder's sleep. While the pet is MOVING
+    /// ([`Self::needs_frames`]) the next change is the next frame, so the
+    /// answer is the floor — the train paces those.
+    ///
+    /// Everything offered is a pure function of the brain's own clocks
+    /// (`quiet`, `clock`, the dealt hand), which is why it can be answered
+    /// between ticks at all, and why the gesture windows ride the wall clock
+    /// (the prologue of [`Self::tick`]): a settled brain ticked only at these
+    /// instants deals the same idle as one ticked sixty times a second.
+    #[must_use]
+    pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
+        let secs = self.next_change_secs()?;
+        // From the LAST TICK, not `now`: every edge is measured on the clocks
+        // that tick advanced, and the host's `now` is later by whatever it
+        // spent since. Clamped to a sane span (the longest honest offer is
+        // the ladder's sleep, 22 s) so a float surprise can never arm a wake
+        // in the far future.
+        let base = self.last_now.unwrap_or(now);
+        let at = base + Duration::from_secs_f32((secs + OFFER_PAST).clamp(0.0, 60.0));
+        Some(at.max(now + ARM_MIN))
+    }
+
+    /// THE MOTES' EDGES (A/B #19's residual, and its last mote): for every
+    /// live offer-riding mote ([`PetMoteKind::rides_offer`] — the light
+    /// sleeper's z, the tell's ♪/♥), the earliest of its next whole device
+    /// pixel of drift on either axis — [`first_px_step`] over exactly the
+    /// drift `resolve_motes` draws ([`Mote::drift`]), striding under its
+    /// [`Mote::drift_slope`] — its next look slice ([`Mote::look_steps`])
+    /// and its death. The z's ink fade is read at the drawn pixel, so an
+    /// ink death can land only on a pixel step, which is offered; a birth
+    /// is the beat the sleep arm or the tell of [`Self::next_change_secs`]
+    /// offers (the cheer's and the petting hand's are thrown inside holds
+    /// the train owns). Every edge is a pure function of the brain's clock
+    /// and the mote's birth record, which is what lets it be drawn at these
+    /// instants alone: a mote ticked only here is the mote the 60 fps train
+    /// draws, pixel for pixel (`walk_offers` proves it). One that has
+    /// already outlived its life offers nothing — the next tick of any kind
+    /// culls it, and it draws nothing meanwhile.
+    fn mote_edges(&self, soon: &mut Soonest) {
+        let cw = f32::from(self.last_cell_w.max(1));
+        let ch = f32::from(self.last_cell_h.max(1));
+        for m in self.motes.iter().flatten().filter(|m| m.kind.rides_offer()) {
+            let life = m.life.max(0.01);
+            let u0 = m.age(self.clock);
+            if !(0.0..1.0).contains(&u0) {
+                continue;
+            }
+            let remain = (1.0 - u0) * life;
+            soon.at(remain);
+            let steps = m.look_steps();
+            soon.at(((look_slice(u0, steps) + 1.0) / steps - u0) * life);
+            let horizon = soon.0.map_or(remain, |s| s.min(remain));
+            let (sx, sy) = m.drift_slope();
+            let slope = (sx / life * cw, sy / life * ch);
+            let step = first_px_step((cw, ch), horizon, slope, |t| m.drift(u0 + t / life));
+            if let Some(t) = step {
+                soon.at(t);
+            }
+        }
+    }
+
+    /// Seconds from the last tick to the next visible step — see
+    /// [`Self::next_change_deadline`], whose contract this is.
+    fn next_change_secs(&self) -> Option<f32> {
+        if self.alpha < 1.0 || self.last_caret.is_none() {
+            // Hidden, or a fade the frame train already owns (the first
+            // clause of `needs_frames`): nothing of the settled cat's to offer.
+            return None;
+        }
+        if self.needs_frames() {
+            return Some(0.0); // moving: the next frame, and the train paces it
+        }
+        // From here the pet is settled, opaque, and every hold is spent.
+        let q = self.quiet;
+        let mut soon = Soonest(None);
+        // A live z's or ♪/♥'s edges first, whatever the pose: a z outlives
+        // the sleep it was dreamed in when a key wakes the cat, a heart
+        // outlives the petting hold it was bought in, and each is drawn at
+        // the same instants under reduced motion and in the deep sleep the
+        // spawn cut-off ([`tend_motes`]) keeps the z from ever reaching.
+        self.mote_edges(&mut soon);
+        if self.last_reduced {
+            // Reduced motion draws one still per pose; the only edge left is
+            // the ladder's sleep (the reduced arm of `tick` verdicts it).
+            if self.action != PetAction::Sleep {
+                soon.at(SLEEP_AFTER - q);
+            }
+            return soon.0;
+        }
+        if self.action == PetAction::Sleep && q >= SLEEP_AFTER + BREATH_WINDOW {
+            // Deep sleep: byte-stable until an input, by law — the last z
+            // died before the window closed, so this is `None`.
+            return soon.0;
+        }
+        // The body's box in device pixels — a "visible step" is a whole one.
+        // THE RENDERER'S OWN BOX (review, 2026-09-06): `body_px` rounds the
+        // natural height, then the natural width, and only then scales and
+        // rounds again — the march must key on the same integers or it
+        // predicts a different pixel box than the one drawn (at `cell_h`
+        // 14: 39.24 × 23.8 against 40 × 24, and a light sleeper's first
+        // height step was offered at 524 ms when the sprite changed at 293).
+        let h = (ART_ROWS * f32::from(self.last_cell_h.max(1))).round();
+        let w = (h * ART_ASPECT).round();
+        let c0 = self.clock;
+        // The gaze opens at SETTLE_TURN, and the rationed turn lands when the
+        // dwell is served (`settle_gaze`; deep sleep never turns, and is gone).
+        if q < SETTLE_TURN {
+            soon.at(SETTLE_TURN - q);
+        }
+        if self.gaze_dwell > 0.0 {
+            let dwell = if self.action == PetAction::Sleep {
+                SLEEP_FLIP_DWELL
+            } else {
+                SETTLE_FLIP_DWELL
+            };
+            soon.at(dwell - self.gaze_dwell);
+        }
+        if self.action == PetAction::Sleep {
+            // LIGHT SLEEP: the breath, its pose swap at every zero crossing
+            // of the sine (`s >= 0` wears `PetSleep1`), the next z, and the
+            // window's end — after which the frame is the constant deep
+            // sleeper and this returns `None`.
+            soon.at(SLEEP_AFTER + BREATH_WINDOW - q);
+            let half = f64::from(BREATH_PERIOD) / 2.0;
+            soon.at((half - c0 % half) as f32);
+            let zee = ((q - SLEEP_AFTER) / ZEE_EVERY).floor().max(0.0) + 1.0;
+            let zee_q = SLEEP_AFTER + zee * ZEE_EVERY;
+            if zee_q <= SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE {
+                soon.at(zee_q - q);
+            }
+            let horizon = soon.0.unwrap_or(BREATH_WINDOW);
+            let breath = TAU / BREATH_PERIOD * BREATH_DEPTH;
+            let step = first_px_step((w, h), horizon, (0.5 * breath * w, breath * h), |t| {
+                let s = Self::breath_sample(c0 + f64::from(t));
+                (1.0 - s * BREATH_DEPTH * 0.5, 1.0 + s * BREATH_DEPTH)
+            });
+            if let Some(t) = step {
+                soon.at(t);
+            }
+            return soon.0;
+        }
+        // AWAKE AND SETTLED: the ladder's sleep is always coming.
+        soon.at(SLEEP_AFTER - q);
+        // The tell: the swell stops (and the ♪/♥ with it) when the ledger,
+        // spent at [`CONTENT_DECAY`] a second, crosses the gate — unless the
+        // pose IS the purr, which purrs whatever the ledger says.
+        let tell = self.purring();
+        if tell && self.action != PetAction::Purr {
+            soon.at((self.content - PURR_GATE) / CONTENT_DECAY);
+        }
+        if tell {
+            let beat = ((q - SIT_AFTER).max(0.0) / PURR_MOTE_EVERY).floor() + 1.0;
+            soon.at(SIT_AFTER + beat * PURR_MOTE_EVERY - q);
+        }
+        // The bored vignette's window: the cooldown served AND the quiet
+        // reached, while still shy of `BORED_UNTIL`. Its other gates (a
+        // game, a toy, a roll) are all lane-holders and are false here; the
+        // ledger may have decayed under `PLAY_CONTENT` by then, which costs
+        // one dedup'd wake.
+        if self.content >= PLAY_CONTENT {
+            let t = self.bored_cool.max(BORED_AFTER - q);
+            if q + t < BORED_UNTIL {
+                soon.at(t);
+            }
+        }
+        // The next wash: it outranks the loaf and the purr on the ladder
+        // (`enter_settled` asks `in_wash` first), so a seat, a loaf or a
+        // purr all get up to wash — the one hand in four skips the second.
+        if matches!(
+            self.action,
+            PetAction::Sit | PetAction::Loaf | PetAction::Purr
+        ) {
+            let since = q - SIT_AFTER;
+            let groom_after = self.groom_after();
+            let cycle = groom_after + GROOM_DUR;
+            let wash = if since >= groom_after {
+                ((since - groom_after) / cycle).floor() + 1.0
+            } else {
+                0.0
+            };
+            if !(wash == 1.0 && self.groom_skip()) {
+                soon.at(groom_after + wash * cycle - since);
+            }
+        }
+        let swell = TAU * PURR_HZ * PURR_DEPTH;
+        let swell_slope = if tell {
+            (0.6 * swell * w, swell * h)
+        } else {
+            (0.0, 0.0)
+        };
+        match self.action {
+            PetAction::Stand => {
+                // The gather down toward the fold, then the sit.
+                soon.at(SIT_AFTER - q);
+                let gather_from = SIT_AFTER - SIT_FOLD;
+                if q < gather_from {
+                    soon.at(gather_from - q);
+                } else {
+                    let slope = (0.03 * w / SIT_FOLD, 0.05 * h / SIT_FOLD);
+                    let step =
+                        first_px_step((w, h), SIT_AFTER - q, slope, |t| Self::stand_scale(q + t));
+                    if let Some(t) = step {
+                        soon.at(t);
+                    }
+                }
+            }
+            PetAction::Sit => {
+                let since = q - SIT_AFTER;
+                soon.at(self.loaf_after() - q);
+                if self.settle_seed.is_multiple_of(2) {
+                    soon.at(self.loaf_after() - YAWN_DUR - q);
+                }
+                self.sit_beat_edges(&mut soon);
+                let fold_live = since < SIT_FOLD;
+                if fold_live || tell {
+                    let (fx, fy) = if fold_live {
+                        (0.03 * w / SIT_FOLD, 0.05 * h / SIT_FOLD)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let horizon = if tell {
+                        soon.0.unwrap_or(SLEEP_AFTER)
+                    } else {
+                        SIT_FOLD - since + PX_MARCH_MIN
+                    };
+                    let slope = (fx + swell_slope.0, fy + swell_slope.1);
+                    let step = first_px_step((w, h), horizon, slope, |t| {
+                        Self::seat_scale(q + t, c0 + f64::from(t), tell)
+                    });
+                    if let Some(t) = step {
+                        soon.at(t);
+                    }
+                }
+            }
+            PetAction::Groom => {
+                // The wash's paw change at six tenths, and its end (the
+                // owed groom is a hold, and holds are the train's).
+                let since = (q - SIT_AFTER).max(0.0);
+                let groom_after = self.groom_after();
+                let cycle = groom_after + GROOM_DUR;
+                let into = (since - groom_after).max(0.0);
+                let start = groom_after + (into / cycle).floor() * cycle;
+                soon.at(start + 0.6 * GROOM_DUR - since);
+                soon.at(start + GROOM_DUR - since);
+            }
+            PetAction::Loaf => {
+                let loaf_after = self.loaf_after();
+                let since = (q - loaf_after).max(0.0);
+                let beat = (since / FLICK_EVERY).floor();
+                let phase = since - beat * FLICK_EVERY;
+                // The next thump (beats from one), and the peek on the hand
+                // dealt it — this beat's, if it is still to close, and the
+                // next's.
+                soon.at(loaf_after + (beat + 1.0).max(1.0) * FLICK_EVERY - q);
+                for k in [beat, beat + 1.0] {
+                    if k >= 1.0 && self.beat_deal(k as i64, 3) == 1 {
+                        let open = loaf_after + k * FLICK_EVERY;
+                        soon.at(open - q);
+                        soon.at(open + LOAF_PEEK_DUR - q);
+                    }
+                }
+                let melt_live = since < SIT_FOLD;
+                let thump_live = beat >= 1.0 && phase < FLICK_DUR;
+                if melt_live || thump_live || tell {
+                    let (mx, my) = if melt_live {
+                        (0.02 * w / SIT_FOLD, 0.05 * h / SIT_FOLD)
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    let ty = if thump_live {
+                        TWITCH_BOB * h * core::f32::consts::PI / FLICK_DUR
+                    } else {
+                        0.0
+                    };
+                    let horizon = if tell {
+                        soon.0.unwrap_or(SLEEP_AFTER)
+                    } else {
+                        let melt_end = if melt_live { SIT_FOLD - since } else { 0.0 };
+                        let thump_end = if thump_live { FLICK_DUR - phase } else { 0.0 };
+                        melt_end.max(thump_end) + PX_MARCH_MIN
+                    };
+                    let slope = (mx + swell_slope.0, my + ty + swell_slope.1);
+                    let step = first_px_step((w, h), horizon, slope, |t| {
+                        self.loaf_scale(q + t, c0 + f64::from(t), tell)
+                    });
+                    if let Some(t) = step {
+                        soon.at(t);
+                    }
+                }
+            }
+            PetAction::Purr => {
+                // The deal's own end (2026-09-06): `enter_settled` re-deals
+                // the seat every settled tick, and the purr melts into the
+                // LOAF the tick the ledger plus what the dwell owed it
+                // (`content + owed`, [`Self::enter_settled`]) crosses
+                // [`PURR_GATE`] — a pose swap, so an edge; `owed` is a
+                // constant once the dwell is served, so the crossing is the
+                // ledger's linear spend and exact. Unoffered, the parked
+                // purr swapped at its next swell step instead — 26 ms late,
+                // measured on the contented-cat walk.
+                let owed =
+                    CONTENT_DECAY * (q - SIT_AFTER).clamp(0.0, self.loaf_after() - SIT_AFTER);
+                soon.at((self.content + owed - PURR_GATE) / CONTENT_DECAY);
+                // One static frame with the swell on it (its fold term is
+                // spent long before the pose is reached).
+                let horizon = soon.0.unwrap_or(SLEEP_AFTER);
+                let step = first_px_step((w, h), horizon, swell_slope, |t| {
+                    Self::seat_scale(q + t, c0 + f64::from(t), tell)
+                });
+                if let Some(t) = step {
+                    soon.at(t);
+                }
+            }
+            // `Perk` is a hold (the train's); nothing else is `settled()`.
+            _ => {}
+        }
+        soon.0
+    }
+
+    /// THE SEAT'S DEALT EDGES for the coarse offer: every window boundary
+    /// of the tail, the blink and (face-on) the glance, on each beat's own
+    /// clock, for the beat now and the next. Conservative on purpose where
+    /// `emit`'s precedence or a fit rule would refuse the frame — see
+    /// [`Self::next_change_deadline`] — except for the two refusals that are
+    /// a function of the hand alone: face-on, the tail rides the glance's
+    /// clock ([`Self::tail_clock`]) and can only play inside a look, so a
+    /// beat dealt no glance offers no tail, and the swing is offered only
+    /// when the look is long enough to hold it ([`LOOK_DUR_LONG`]).
+    fn sit_beat_edges(&self, soon: &mut Soonest) {
+        let since = self.quiet - SIT_AFTER;
+        let (period, at) = self.tail_clock();
+        let swing_fits = !self.sit_front || self.look_dur() >= 7.0 * TAIL_SWING;
+        Self::offer_beats(soon, since, period, at, |beat| {
+            if self.sit_front && self.beat_deal(beat, 3) == 0 {
+                return &[];
+            }
+            match self.beat_deal(beat, 4) {
+                0 => &TAIL_EDGES_FLICK,
+                1 => &TAIL_EDGES_DOUBLE,
+                2 if swing_fits => &TAIL_EDGES_SWING,
+                _ => &[],
+            }
+        });
+        let blink_period = BLINK_PERIOD + BLINK_PERIOD_STEP * f32::from((self.settle_seed / 2) % 3);
+        Self::offer_beats(soon, since, blink_period, BLINK_AT, |beat| {
+            if self.beat_deal(beat, 3) == 2 {
+                &BLINK_EDGES_TWO
+            } else {
+                &BLINK_EDGES_ONE
+            }
+        });
+        if self.sit_front {
+            let look: &[f32] = if self.look_dur() >= LOOK_DUR_LONG {
+                &GLANCE_EDGES_LONG
+            } else {
+                &GLANCE_EDGES_SHORT
+            };
+            Self::offer_beats(soon, since, self.glance_period(), GLANCE_AT, |beat| {
+                if self.beat_deal(beat, 3) == 0 {
+                    &[]
+                } else {
+                    look
+                }
+            });
+        }
+    }
+
+    /// Offer every edge of a dealt beat's window for the beat that is on
+    /// now (or the first, before the sit's clock has started) and the one
+    /// after it — `edges(beat)` are the offsets from the window's open at
+    /// `at` into each `period`. Two beats always cover the next edge: the
+    /// next window's open is offset zero of the next beat.
+    fn offer_beats<'a>(
+        soon: &mut Soonest,
+        since: f32,
+        period: f32,
+        at: f32,
+        edges: impl Fn(i64) -> &'a [f32],
+    ) {
+        let beat = if since < 0.0 {
+            0
+        } else {
+            (since / period).floor() as i64
+        };
+        for b in [beat, beat + 1] {
+            let open = b as f32 * period + at;
+            for &edge in edges(b) {
+                soon.at(open + edge - since);
+            }
+        }
+    }
+
+    /// The breath's sample at brain clock `clock` — `emit`'s arithmetic.
+    fn breath_sample(clock: f64) -> f32 {
+        let t = (clock % f64::from(BREATH_PERIOD)) as f32;
+        (TAU * t / BREATH_PERIOD).sin()
+    }
+
+    /// The purr's swell at brain clock `clock` — `emit`'s arithmetic.
+    fn swell_sample(clock: f64) -> f32 {
+        let t = (clock % f64::from(1.0 / PURR_HZ)) as f32;
+        (TAU * PURR_HZ * t).sin()
+    }
+
+    /// The stand's `(scale_x, scale_y)` at `quiet` — `emit`'s arithmetic:
+    /// the gather down over the last [`SIT_FOLD`] before the sit.
+    fn stand_scale(quiet: f32) -> (f32, f32) {
+        let pre = ((quiet - (SIT_AFTER - SIT_FOLD)) / SIT_FOLD).clamp(0.0, 1.0);
+        (1.0 + 0.03 * pre, 1.0 - 0.05 * pre)
+    }
+
+    /// The seat's `(scale_x, scale_y)` at `quiet` and brain `clock` (the sit
+    /// and the purr share it) — `emit`'s arithmetic, in `emit`'s order: the
+    /// fold's rise back to rest, then the swell when the tell is on.
+    fn seat_scale(quiet: f32, clock: f64, tell: bool) -> (f32, f32) {
+        let fold = (1.0 - (quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
+        let mut scale_x = 1.0 + 0.03 * fold;
+        let mut scale_y = 1.0 - 0.05 * fold;
+        if tell {
+            let s = Self::swell_sample(clock);
+            scale_y += s * PURR_DEPTH;
+            scale_x -= s * PURR_DEPTH * 0.6;
+        }
+        (scale_x, scale_y)
+    }
+
+    /// The loaf's `(scale_x, scale_y)` at `quiet` and brain `clock` —
+    /// `emit`'s arithmetic, in `emit`'s order: the melt, the dealt tail
+    /// thump, then the swell when the tell is on.
+    fn loaf_scale(&self, quiet: f32, clock: f64, tell: bool) -> (f32, f32) {
+        let fold = (1.0 - (quiet - self.loaf_after()) / SIT_FOLD).clamp(0.0, 1.0);
+        let mut scale_y = 1.0 + 0.05 * fold;
+        let mut scale_x = 1.0 - 0.02 * fold;
+        let since = (quiet - self.loaf_after()).max(0.0);
+        let beat = (since / FLICK_EVERY).floor();
+        let phase = since - beat * FLICK_EVERY;
+        if beat >= 1.0 && phase < FLICK_DUR {
+            let amp = TWITCH_BOB * (core::f32::consts::PI * phase / FLICK_DUR).sin();
+            let dir = if (beat as i64) % 2 == 0 { 1.0 } else { -1.0 };
+            scale_y += amp * dir;
+        }
+        if tell {
+            let s = Self::swell_sample(clock);
+            scale_y += s * PURR_DEPTH;
+            scale_x -= s * PURR_DEPTH * 0.6;
+        }
+        (scale_x, scale_y)
     }
 
     /// Earned contentment 0..=1.
@@ -8907,10 +9851,85 @@ impl PetBrain {
     }
 }
 
+/// The earliest of the instants offered so far, in seconds from the last
+/// tick — the coarse offer's accumulator. An instant at or before now is not
+/// an offer (that edge was applied by the tick that just ran, or is float
+/// slop on one that was); [`ARM_MIN`] catches what is left.
+struct Soonest(Option<f32>);
+
+impl Soonest {
+    fn at(&mut self, t: f32) {
+        if t > 0.0 && self.0.is_none_or(|best| t < best) {
+            self.0 = Some(t);
+        }
+    }
+}
+
+/// THE PIXEL MARCH: the first `t` in `(0, horizon]` at which the body's box
+/// (`box_px`, width and height in device pixels) scaled by `scale_at(t)` =
+/// `(scale_x, scale_y)` lands on a different whole pixel on either axis than
+/// it does at `t = 0`; `None` if it never does inside the horizon.
+///
+/// Exact, and late by at most [`PX_MARCH_MIN`] (the stride floor can step
+/// over a threshold the box only grazes), without a closed form for the sum
+/// of a ramp and a sine: `slope` bounds `|d/dt|` of each scaled axis in px/s, so from any
+/// sample the box cannot reach the next half-pixel threshold sooner than
+/// `room / slope` — the march steps by exactly that (never under
+/// [`PX_MARCH_MIN`]), which means the key is provably unchanged on every
+/// interval it skips, and the first sample with a new key brackets the step
+/// inside one stride. [`PX_BISECT`] halvings then pin it. The budget
+/// ([`PX_MARCH_MAX`]) only bites on a horizon nothing crosses; spent, the
+/// march offers where it got to, and an early wake is never a late one.
+fn first_px_step(
+    box_px: (f32, f32),
+    horizon: f32,
+    slope: (f32, f32),
+    scale_at: impl Fn(f32) -> (f32, f32),
+) -> Option<f32> {
+    let (w, h) = box_px;
+    let key = |t: f32| {
+        let (sx, sy) = scale_at(t);
+        ((sx * w).round(), (sy * h).round())
+    };
+    let rest = key(0.0);
+    let mut prev = 0.0f32;
+    let mut t = 0.0f32;
+    for _ in 0..PX_MARCH_MAX {
+        let (sx, sy) = scale_at(t);
+        let (vx, vy) = (sx * w, sy * h);
+        if (vx.round(), vy.round()) != rest {
+            let (mut lo, mut hi) = (prev, t);
+            for _ in 0..PX_BISECT {
+                let mid = 0.5 * (lo + hi);
+                if key(mid) == rest {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            return Some(hi);
+        }
+        if t >= horizon {
+            return None;
+        }
+        let room = |v: f32, k: f32| (0.5 - (v - k).abs()).max(0.0);
+        let stride = |room: f32, slope: f32| {
+            if slope > 0.0 {
+                room / slope
+            } else {
+                f32::INFINITY
+            }
+        };
+        let step = stride(room(vx, rest.0), slope.0).min(stride(room(vy, rest.1), slope.1));
+        prev = t;
+        t = (t + step.max(PX_MARCH_MIN)).min(horizon);
+    }
+    Some(t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     /// THE SPECIES CONTRACT: every cat pose the brain can choose has a dog
     /// counterpart, and the mapping is a permutation — distinct poses stay
@@ -9302,6 +10321,1217 @@ mod tests {
         assert!(
             (SLEEP_AFTER as i32 - 2..=SLEEP_AFTER as i32 + 2).contains(&i),
             "slept after {i} one-second frames, expected ~{SLEEP_AFTER}"
+        );
+    }
+
+    // ── A/B #19: the coarse offer ───────────────────────────────────────
+    /// One offer-riding mote (a light-sleep z, a ♪, a ♥ —
+    /// [`PetMoteKind::rides_offer`]) as the emitter draws it at the
+    /// fixture's 10×20 cells: the device pixel its centre rounds to on each
+    /// axis (`pet_cursor`'s `(col · cell_w).round()`), its look — the scale
+    /// and the tilt, keyed FINER than the emitter's tile size and rotation
+    /// bucket, so any change in either must land on an offer — and its
+    /// alpha byte.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct MoteLook {
+        kind: PetMoteKind,
+        cx: i32,
+        cy: i32,
+        scale: i32,
+        rot: i32,
+        alpha: u8,
+    }
+
+    impl MoteLook {
+        /// Whether this mote is one the train drew inside the window `trio`
+        /// spans — FIELD BY FIELD, because two of a mote's edges (a pixel
+        /// of climb and a pixel of sway, a slice and a pixel) can fall
+        /// inside the same two milliseconds, and the frame between them
+        /// lasts less than a hair. Each field steps at most once in the
+        /// window, so a field-wise match is a frame the train drew at some
+        /// instant in it.
+        fn within(self, trio: [Option<MoteLook>; 3]) -> bool {
+            macro_rules! bracketed {
+                ($($field:ident),*) => {
+                    $( trio.iter().flatten().any(|b| b.$field == self.$field) )&&*
+                };
+            }
+            bracketed!(cx, cy, scale, rot, alpha)
+        }
+    }
+
+    /// What a whole device pixel of the fixture's sprite box can tell apart
+    /// — the frame as the eye receives it at `sense`'s 10×20 cells: pose,
+    /// the box's rounded height and width, the row, presence, facing, the
+    /// mote count, and every offer-riding mote's [`MoteLook`] in its slot
+    /// (the z's, the ♪ and the ♥). The scale's sub-pixel remainder is
+    /// deliberately NOT here: it is what the offer is allowed to skip. Nor
+    /// is the column, which the follower's ease home moves by under a
+    /// pixel in total once the pet is parked — [`walk_offers`] holds it to
+    /// a device pixel separately. The two motion motes (the landing dust,
+    /// the wake's pop) are counted, not keyed: they hold the frame train by
+    /// law, so no offer is ever asked to name their next pixel.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Look {
+        action: PetAction,
+        pose: PetGlyphId,
+        box_h: i32,
+        box_w: i32,
+        row: i32,
+        alpha: u8,
+        facing_left: bool,
+        motes: usize,
+        keyed: [Option<MoteLook>; PET_MOTES_MAX],
+    }
+
+    impl Look {
+        /// [`MoteLook::within`] for the whole frame: every field one of the
+        /// window's, every keyed mote in its slot one of the window's.
+        fn within(&self, trio: [&Look; 3]) -> bool {
+            macro_rules! bracketed {
+                ($($field:ident),*) => {
+                    $( trio.iter().any(|b| b.$field == self.$field) )&&*
+                };
+            }
+            bracketed!(action, pose, box_h, box_w, row, alpha, facing_left, motes)
+                && self.keyed.iter().enumerate().all(|(i, z)| match z {
+                    None => trio.iter().any(|b| b.keyed[i].is_none()),
+                    Some(z) => z.within([trio[0].keyed[i], trio[1].keyed[i], trio[2].keyed[i]]),
+                })
+        }
+    }
+
+    /// The feet at each slot's keyed mote's birth, on one brain: set the
+    /// tick a z or a ♪/♥ appears in the slot, cleared when it leaves.
+    fn note_births(f: &PetFrame, births: &mut [Option<f32>; PET_MOTES_MAX]) {
+        for (birth, m) in births.iter_mut().zip(f.motes.iter()) {
+            match m {
+                Some(m) if m.kind.rides_offer() => {
+                    if birth.is_none() {
+                        *birth = Some(f.col);
+                    }
+                }
+                _ => *birth = None,
+            }
+        }
+    }
+
+    /// Per slot, how far over to read the twin's keyed mote: the pet's
+    /// feet at that mote's birth minus the twin's (zero while either has
+    /// none there).
+    fn zee_shifts(
+        pet: &[Option<f32>; PET_MOTES_MAX],
+        twin: &[Option<f32>; PET_MOTES_MAX],
+    ) -> [f32; PET_MOTES_MAX] {
+        let mut out = [0.0; PET_MOTES_MAX];
+        for ((out, p), t) in out.iter_mut().zip(pet).zip(twin) {
+            if let (Some(p), Some(t)) = (p, t) {
+                *out = p - t;
+            }
+        }
+        out
+    }
+
+    /// The pet's own frames are read where they are.
+    const NO_SHIFT: [f32; PET_MOTES_MAX] = [0.0; PET_MOTES_MAX];
+
+    /// The frame's [`Look`], each slot's keyed mote read `shift` columns
+    /// over — zero for the pet's own frames; for the twin's, the pet's feet
+    /// minus the twin's at that mote's BIRTH ([`zee_shifts`]). A z is
+    /// dreamed at the sleeping head and a ♪ off the chest, each a fixed
+    /// offset from the body, so the twin's sits exactly as far from where
+    /// the twin's feet were as the pet's does from where the pet's were;
+    /// the feet themselves differ by the ease home's sub-pixel remainder,
+    /// which the walk concedes (`same_feet`) and which would otherwise put
+    /// the two motes on different device pixels for a tenth of a second at
+    /// a time. Reading the twin's mote at the pet's column compares the
+    /// mote's own drift, pixel for pixel.
+    fn visible(f: &PetFrame, shift: [f32; PET_MOTES_MAX]) -> Look {
+        let h = (ART_ROWS * 20.0).round();
+        let w = (h * ART_ASPECT).round();
+        let mut keyed = [None; PET_MOTES_MAX];
+        for ((slot, m), shift) in keyed.iter_mut().zip(f.motes.iter()).zip(shift) {
+            *slot = m
+                .as_ref()
+                .filter(|m| m.kind.rides_offer())
+                .map(|m| MoteLook {
+                    kind: m.kind,
+                    cx: ((m.col + shift) * 10.0).round() as i32,
+                    cy: (m.row * 20.0).round() as i32,
+                    scale: (m.scale * 1024.0) as i32,
+                    rot: (m.rot * 1024.0) as i32,
+                    alpha: m.alpha,
+                });
+        }
+        Look {
+            action: f.action,
+            pose: f.pose,
+            box_h: (f.scale_y * h).round() as i32,
+            box_w: (f.scale_x * w).round() as i32,
+            row: (f.row * 64.0) as i32,
+            alpha: f.alpha,
+            facing_left: f.facing_left,
+            motes: f.motes.iter().flatten().count(),
+            keyed,
+        }
+    }
+
+    /// The feet within a device pixel (the fixture's 10 px cells).
+    fn same_feet(a: f32, b: f32) -> bool {
+        (a - b).abs() * 10.0 < 1.0
+    }
+
+    /// The census of one [`walk_offers`] drive.
+    #[derive(Debug, Default)]
+    struct Walk {
+        /// Wakes taken from `next_change_deadline` while the pet was parked.
+        offers: u32,
+        /// Wakes taken on the 16 ms train while `needs_frames` held it.
+        train: u32,
+        /// Offered wakes at which nothing visible had changed and the next
+        /// offer was NOT a re-arm — the conservative offers (a hand the fit
+        /// rule refused, a thump's window opening a few ms before its first
+        /// pixel). Allowed, bounded, and counted.
+        idle_wakes: u32,
+        /// Offered wakes at which nothing had changed yet and the next
+        /// offer followed within two milliseconds: the clocks' float slop,
+        /// re-armed at [`ARM_MIN`]. Rare by [`OFFER_PAST`]'s design.
+        slop: u32,
+        /// Of `train`, the wakes that drew a visible light-sleep z while
+        /// NOTHING BUT THE MOTE LANE held the train (`needs_frames` with
+        /// the lane emptied is false — the z's own claim): the residual
+        /// A/B #19 left behind when a drifting z was still motion.
+        zee_train: u32,
+        /// Of `offers`, the wakes that drew a visible light-sleep z — the
+        /// z's riding the offer.
+        zee_offers: u32,
+        /// Of `train`, the wakes that drew a visible ♪ or ♥ on the lane's
+        /// own claim (as `zee_train`) — the residual the z's left behind
+        /// when the tell's motes were still motion. A ♪ drawn on a train
+        /// some hold or glide is paying for is not counted: it costs
+        /// nothing there.
+        note_train: u32,
+        /// Of `offers`, the wakes that drew a visible ♪ or ♥ — the tell
+        /// riding the offer. Most of these are the SWELL's wakes (the
+        /// purring body's own pixel march, ~20 a second) that happen to
+        /// have a ♪ in frame; the ♪'s own cost is `note_edges`.
+        note_offers: u32,
+        /// Of `offers`, the wakes at which a ♪/♥'s drawn look, pixel or
+        /// presence differed from the previous wake's — the edges the tell's
+        /// motes themselves put on the offer.
+        note_edges: u32,
+        /// ♪/♥ births seen on the pet's frames (a slot going from no ♪/♥ to
+        /// one), on the train or the offer.
+        note_births: u32,
+        /// Of `train`, the wakes that drew a visible landing-dust puff or
+        /// the wake's startled pop on the lane's own claim — the two motes
+        /// that stay motion, each bounded by the beat that throws it and
+        /// never idle.
+        dust_train: u32,
+        pop_train: u32,
+    }
+
+    /// Drive `pet` the way the host does after A/B #19 — a wake at every
+    /// offered instant while it is parked, the 16 ms train while
+    /// `needs_frames` holds the lane — for `secs` or until it offers
+    /// nothing, beside a `twin` in the same state ticked on the 16 ms grid
+    /// (plus a millisecond either side of every instant `pet` wakes at) as
+    /// the old per-frame sequence. Two laws are asserted on the way:
+    ///
+    /// * NOTHING VISIBLE HAPPENS BETWEEN TWO OFFERS: while `pet` is parked,
+    ///   every twin frame between its wakes — up to a millisecond short of
+    ///   the next one — is visibly the frame it parked on: an offer is
+    ///   never late;
+    /// * THE GOLDEN: at every wake, `pet`'s frame is the twin's frame at
+    ///   that instant — the same pose, the same pixels, the scale within
+    ///   float noise, the feet within a pixel — so the art and the
+    ///   choreography are untouched. "That instant" is a millisecond wide,
+    ///   because the two brains' clocks are different `f32` sums of the
+    ///   same wall time and an edge aimed at exactly can round either way.
+    fn walk_offers(
+        pet: &mut PetBrain,
+        twin: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        secs: f32,
+    ) -> (Walk, Instant) {
+        let grid = Duration::from_millis(16);
+        let hair = Duration::from_millis(1);
+        let end = start + Duration::from_secs_f32(secs);
+        let mut walk = Walk::default();
+        let mut t = start;
+        let mut tb = start;
+        let mut pet_birth = [None; PET_MOTES_MAX];
+        let mut twin_birth = [None; PET_MOTES_MAX];
+        let first = pet.tick(sense(t, Some(caret)));
+        note_births(&first, &mut pet_birth);
+        let mut last_full = visible(&first, NO_SHIFT);
+        let mut last = last_full;
+        let mut last_col = first.col;
+        let mut b_last = twin.tick(sense(t, Some(caret)));
+        note_births(&b_last, &mut twin_birth);
+        let mut was_idle = false;
+        while t < end {
+            let parked = !pet.needs_frames();
+            // A train wake is the mote lane's OWN only if nothing else held
+            // the lane when the wake was taken — read here, before the tick,
+            // so the frame that ends a hold is the hold's and not the mote's.
+            let own = !parked && !needs_frames_without_motes(pet);
+            let next = if parked {
+                let Some(d) = pet.next_change_deadline(t) else {
+                    break;
+                };
+                assert!(d > t, "a deadline at `now` is a busy re-arm");
+                walk.offers += 1;
+                d
+            } else {
+                walk.train += 1;
+                t + grid
+            };
+            if was_idle {
+                if next - t <= 2 * hair {
+                    walk.slop += 1;
+                } else {
+                    walk.idle_wakes += 1;
+                }
+            }
+            // The twin up to a hair short of the wake: the grid, then that
+            // hair. Every one of these frames is "between two offers". ON
+            // THE TRAIN the twin ticks at the pet's own instants and nowhere
+            // else: a hair tick 1 ms short of a train frame put the twin on
+            // a 15/16/17 ms lattice, and a beat falling inside that hair
+            // (the tell's, while the follower's glide still held the train)
+            // birthed the twin's ♪ a millisecond before the pet's — a skew
+            // that reads as "a late offer" at every pixel step of a mote
+            // born on the train.
+            let before = |twin: &mut PetBrain,
+                          twin_birth: &mut [Option<f32>; PET_MOTES_MAX],
+                          at: Instant| {
+                let f = twin.tick(sense(at, Some(caret)));
+                note_births(&f, twin_birth);
+                if parked {
+                    assert_eq!(
+                        visible(&f, zee_shifts(&pet_birth, twin_birth)),
+                        last,
+                        "the frame changed at +{:?}, before the offer at +{:?} — a late offer",
+                        at - start,
+                        next - start
+                    );
+                    assert!(
+                        same_feet(f.col, last_col),
+                        "the feet moved a pixel at +{:?}, before the offer at +{:?}",
+                        at - start,
+                        next - start
+                    );
+                }
+                f
+            };
+            if parked {
+                while tb + grid < next {
+                    tb += grid;
+                    b_last = before(twin, &mut twin_birth, tb);
+                }
+                if next - hair > tb {
+                    tb = next - hair;
+                    b_last = before(twin, &mut twin_birth, tb);
+                }
+            }
+            t = next;
+            let a = pet.tick(sense(t, Some(caret)));
+            let drew = |kinds: &[PetMoteKind]| {
+                a.motes
+                    .iter()
+                    .flatten()
+                    .any(|m| kinds.contains(&m.kind) && m.alpha > 0)
+            };
+            if drew(&[PetMoteKind::Zee]) {
+                if parked {
+                    walk.zee_offers += 1;
+                } else if own {
+                    walk.zee_train += 1;
+                }
+            }
+            if drew(&[PetMoteKind::Note, PetMoteKind::Heart]) {
+                if parked {
+                    walk.note_offers += 1;
+                } else if own {
+                    walk.note_train += 1;
+                }
+            }
+            if own && drew(&[PetMoteKind::Dust]) {
+                walk.dust_train += 1;
+            }
+            if own && drew(&[PetMoteKind::ZeePop]) {
+                walk.pop_train += 1;
+            }
+            note_births(&a, &mut pet_birth);
+            let b_at = twin.tick(sense(t, Some(caret)));
+            note_births(&b_at, &mut twin_birth);
+            let b_after = if parked {
+                tb = t + hair;
+                let f = twin.tick(sense(tb, Some(caret)));
+                note_births(&f, &mut twin_birth);
+                f
+            } else {
+                tb = t;
+                b_at
+            };
+            // Keyed motes are keyed on OFFERED frames: on the train the
+            // pet is drawn every 16 ms and the offer is not what is being
+            // tested, while the two brains' beat clocks are `f32` sums that
+            // can differ by tens of µs — enough to birth the twin's ♪ on
+            // the hair tick after the pet's — and a train frame has no
+            // hair-wide window to bracket a slice edge that falls inside
+            // that skew (measured: one slice apart at +4.128 s, inside a
+            // loaf's roll). The count still has to agree.
+            let unkey = |mut look: Look, offered: bool| {
+                if !offered {
+                    look.keyed = [None; PET_MOTES_MAX];
+                }
+                look
+            };
+            let full = visible(&a, NO_SHIFT);
+            let is_note = |l: &Option<MoteLook>| {
+                l.is_some_and(|l| matches!(l.kind, PetMoteKind::Note | PetMoteKind::Heart))
+            };
+            let mut note_edge = false;
+            for (now, prev) in full.keyed.iter().zip(last_full.keyed.iter()) {
+                if is_note(now) && !is_note(prev) {
+                    walk.note_births += 1;
+                }
+                if (is_note(now) || is_note(prev)) && now != prev {
+                    note_edge = true;
+                }
+            }
+            if parked && note_edge {
+                walk.note_edges += 1;
+            }
+            let key = unkey(full, parked);
+            let shift = zee_shifts(&pet_birth, &twin_birth);
+            let trio = [
+                unkey(visible(&b_last, shift), parked),
+                unkey(visible(&b_at, shift), parked),
+                unkey(visible(&b_after, shift), parked),
+            ];
+            assert!(
+                key.within([&trio[0], &trio[1], &trio[2]]),
+                "golden: at +{:?} the offered frame {key:?} is not the train's frame \
+                 ({:?} / {:?} / {:?} a millisecond either side); feet {} vs {}",
+                t - start,
+                trio[0],
+                trio[1],
+                trio[2],
+                a.col,
+                b_at.col
+            );
+            // The scale within float noise of the train's at some instant
+            // in the same millisecond-wide window — the tell's end is a
+            // STEP (the swell stops when the ledger crosses `PURR_GATE`),
+            // and two brains whose ledgers are different `f32` sums of the
+            // same wall time cross it a few float-µs apart.
+            assert!(
+                [&b_last, &b_at, &b_after].iter().any(|b| {
+                    (a.scale_y - b.scale_y).abs() < 1e-3 && (a.scale_x - b.scale_x).abs() < 1e-3
+                }),
+                "golden: the scale at +{:?} drifted ({}, {}) vs ({}, {}) / ({}, {}) / ({}, {})",
+                t - start,
+                a.scale_x,
+                a.scale_y,
+                b_last.scale_x,
+                b_last.scale_y,
+                b_at.scale_x,
+                b_at.scale_y,
+                b_after.scale_x,
+                b_after.scale_y
+            );
+            // The feet, once the wake has NOT started a glide: a wake that
+            // does (the seat's scoot clear of the caret cell, at
+            // `INK_EVICT_SPEED`) takes a `dt`-sized first stride by design,
+            // and from that frame the train owns the feet on both brains.
+            assert!(
+                pet.needs_frames() || same_feet(a.col, b_at.col),
+                "golden: the feet at +{:?} drifted a pixel ({} vs {})",
+                t - start,
+                a.col,
+                b_at.col
+            );
+            was_idle = parked && full == last_full;
+            last_full = full;
+            // What the interval AFTER this wake is held to: keyed iff the
+            // pet parked here, so the next stretch is an offer's.
+            last = unkey(full, !pet.needs_frames());
+            last_col = a.col;
+            b_last = b_after;
+        }
+        (walk, t)
+    }
+
+    /// A sense at an arbitrary cell size — `sense` is the 10 × 20 fixture.
+    fn sense_cells(now: Instant, caret: Option<(u16, u16)>, cell_w: u16, cell_h: u16) -> PetSense {
+        PetSense {
+            cell_w,
+            cell_h,
+            ..sense(now, caret)
+        }
+    }
+
+    /// THE MOVE THAT ENDS A PAUSE LANDS ON WINDOWS THE PAUSE HAS AGED
+    /// (review, 2026-09-06). The velocity estimate is the witness: a typed
+    /// advance adds `1 / VEL_TAU` to `vhat`, and a 4 s pause decays whatever
+    /// was there by `e^(−4/0.35) ≈ 0`. Aged AFTER the move, the fresh
+    /// impulse itself was decayed away on the tick that carried it; aged
+    /// before, the pause empties the old estimate and the key's impulse
+    /// stands — the station leans ahead again the moment typing resumes.
+    #[test]
+    fn a_move_that_ends_a_pause_lands_on_windows_the_pause_has_aged() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        // A short typing run, then the pause, then ONE key on the next tick.
+        let mut col = 12u16;
+        for _ in 0..6 {
+            t += Duration::from_millis(100);
+            col += 1;
+            pet.tick(sense(t, Some((4, col))));
+        }
+        t += Duration::from_secs(4);
+        col += 1;
+        pet.tick(sense(t, Some((4, col))));
+        // The key's impulse minus its own frame's decay (`dt` ≤ 0.1 s):
+        // `e^(−0.1/0.35) = 0.75` of it; before the fix the whole 4 s pause
+        // decayed it to `e^(−4/0.35) ≈ 0`.
+        let fresh = (1.0 / VEL_TAU) * (-0.1f32 / VEL_TAU).exp();
+        assert!(
+            pet.vhat >= 0.95 * fresh,
+            "the key that ended the pause must keep its impulse: vhat {} (fresh impulse {fresh})",
+            pet.vhat
+        );
+    }
+
+    /// THE OFFER IS THE RENDERER'S OWN PIXEL STEP, at a cell height the
+    /// natural box does not divide (review, 2026-09-06): `body_px` rounds
+    /// the natural height and width before it scales, and a march keyed on
+    /// the unrounded box predicted a light sleeper's first height step at
+    /// 524 ms when the sprite changed at 293. Ten consecutive offers, each
+    /// no later than the first frame on which the drawn box changes.
+    #[test]
+    fn the_offer_is_the_renderer_s_own_pixel_step_at_an_odd_cell_height() {
+        let start = Instant::now();
+        let (cw, ch) = (7u16, 14u16);
+        let mut pet = PetBrain::default();
+        let mut twin = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 10);
+        let tt = awake(&mut twin, start, 4, 10);
+        assert_eq!(t, tt, "the twins share one clock");
+        pet.force_seed(0);
+        twin.force_seed(0);
+        // Re-lay the world at 7 × 14 and let both settle into light sleep
+        // there: from here every tick is at the odd cell height.
+        let mut settled = 0.0f32;
+        while settled < SLEEP_AFTER + 0.5 {
+            t += Duration::from_millis(16);
+            pet.tick(sense_cells(t, Some((4, 12)), cw, ch));
+            twin.tick(sense_cells(t, Some((4, 12)), cw, ch));
+            settled += 0.016;
+        }
+        assert_eq!(pet.action, PetAction::Sleep, "fixture: a light sleeper");
+        let hair = Duration::from_millis(1);
+        let mut twin_t = t;
+        let mut twin_box = twin
+            .tick(sense_cells(twin_t, Some((4, 12)), cw, ch))
+            .body_px(cw, ch, 100, 30);
+        let mut checked = 0;
+        while checked < 10 {
+            if pet.needs_frames() {
+                t += Duration::from_millis(16);
+                pet.tick(sense_cells(t, Some((4, 12)), cw, ch));
+                continue;
+            }
+            let Some(offer) = pet.next_change_deadline(t) else {
+                break;
+            };
+            // The twin, ticked every millisecond up to a hair past the
+            // offer: the first frame whose drawn box differs is the visible
+            // step, and the offer may not come after it.
+            let mut first_change = None;
+            while twin_t < offer + hair {
+                twin_t += hair;
+                let f = twin.tick(sense_cells(twin_t, Some((4, 12)), cw, ch));
+                let b = f.body_px(cw, ch, 100, 30);
+                if b != twin_box {
+                    twin_box = b;
+                    first_change.get_or_insert(twin_t);
+                }
+            }
+            if let Some(first) = first_change {
+                assert!(
+                    offer <= first + hair,
+                    "offer #{checked} is late: offered +{:?} after the check began, the drawn box changed at +{:?}",
+                    offer - t,
+                    first - t
+                );
+            }
+            checked += 1;
+            t = offer;
+            pet.tick(sense_cells(t, Some((4, 12)), cw, ch));
+        }
+        assert!(checked >= 5, "fixture: the sleeper offered {checked} steps");
+    }
+
+    /// Two brains driven to the same settled seat, the same hand dealt.
+    fn settled_pair(start: Instant, quiet: f32) -> (PetBrain, PetBrain, Instant) {
+        let mut pet = PetBrain::default();
+        let mut twin = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let tt = awake(&mut twin, start, 4, 10);
+        assert_eq!(t, tt, "the twins share one clock");
+        pet.force_seed(0);
+        twin.force_seed(0);
+        // `awake` leaves the seat at `SIT_AFTER + 0.2` of quiet.
+        let more = quiet - (SIT_AFTER + 0.2);
+        let (t, _) = idle(&mut pet, t, (4, 12), more);
+        let _ = idle(&mut twin, tt, (4, 12), more);
+        (pet, twin, t)
+    }
+
+    /// A/B #19, the law itself. An awake, settled cat used to hold the frame
+    /// train for the whole `SLEEP_AFTER + BREATH_WINDOW` after any key (32 s,
+    /// 3 786 arms measured for one keystroke on a quiet screen) to play a
+    /// breath whose sprite steps every ~100 ms. Now it is parked, and it
+    /// names its next step — and the walk proves the naming is exact:
+    /// nothing visible between two offers, the same frame at each.
+    #[test]
+    fn a_settled_pet_asks_for_its_next_breath_step_not_every_frame() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t) = settled_pair(start, 5.0);
+        assert_eq!(pet.action, PetAction::Loaf, "fixture: the long dwell");
+        assert!(
+            !pet.needs_frames(),
+            "a settled, still pet must not ask for the frame train"
+        );
+        let d = pet
+            .next_change_deadline(t)
+            .expect("an awake pet always has a next step (the ladder's sleep at the latest)");
+        assert!(
+            d >= t + Duration::from_millis(40),
+            "the next step is not this frame: +{:?}",
+            d - t
+        );
+        assert!(
+            d <= t + Duration::from_secs_f32(BREATH_PERIOD / 2.0),
+            "and not the far future: +{:?}",
+            d - t
+        );
+        // Walk it all the way down: the loaf, its thumps, the ladder's
+        // sleep, the light sleeper's breath and z's, and deep sleep — where
+        // the offer is `None` and the walk stops on its own.
+        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), 60.0);
+        assert_eq!(pet.action, PetAction::Sleep);
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "the walk must end in deep sleep, not on a timeout: quiet {}",
+            pet.quiet
+        );
+        assert!(pet.next_change_deadline(end).is_none() && !pet.needs_frames());
+        let span = (end - t).as_secs_f32();
+        // The body's own offers — the light sleeper's z's ride the offer
+        // too (A/B #19's residual, `zee_offers`) and are bounded by their
+        // own law, `a_light_sleeper_s_zs_ride_the_offer_not_the_frame_train`.
+        let per_sec = (walk.offers - walk.zee_offers) as f32 / span;
+        eprintln!(
+            "pet lane census (awake loaf → deep sleep): {walk:?} over {span:.1} s = {per_sec:.2} \
+             body offers/s; the settle window's train was {} frames",
+            (span * 60.0) as u32
+        );
+        assert!(
+            per_sec <= 10.0,
+            "{} body offers over {span:.1} s = {per_sec:.1}/s; the offer must be COARSE",
+            walk.offers - walk.zee_offers
+        );
+        // No train at all past the loaf: the z's used to hold it for the
+        // whole light-sleep window (512 of this walk's 513 train frames,
+        // measured before they rode the offer), against the 60 fps × 27 s
+        // the settle window cost.
+        assert!(
+            walk.zee_train == 0 && walk.train <= 1 && walk.offers + walk.train < 900,
+            "{walk:?} over {span:.1} s — the old train was {} frames",
+            (span * 60.0) as u32
+        );
+        assert!(
+            walk.idle_wakes <= 12,
+            "{} wakes changed nothing — the offer is too conservative ({walk:?})",
+            walk.idle_wakes
+        );
+    }
+
+    /// The other half of the law: MOTION keeps the train. The double-take,
+    /// the gather, the flight, the landing and a petting hold each ask for
+    /// every frame — the settle window never paid for these, and releasing
+    /// it must not release them.
+    #[test]
+    fn a_moving_pet_still_asks_for_every_frame() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 4);
+        let (mut perk, mut leap, mut land) = (false, false, false);
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 60))));
+            perk |= f.action == PetAction::Perk;
+            leap |= f.action == PetAction::Leap;
+            land |= f.action == PetAction::Land;
+            let moving = !pet.action.settled()
+                || pet.action == PetAction::Perk
+                || pet.flight.is_some()
+                || pet.land_t > 0.0;
+            if !moving {
+                break;
+            }
+            assert!(
+                pet.needs_frames(),
+                "moving ({:?}, flight {}, land_t {}) must hold the frame train",
+                f.action,
+                pet.flight.is_some(),
+                pet.land_t
+            );
+        }
+        assert!(
+            perk && leap && land,
+            "fixture: the crossing must notice, fly and land (perk {perk}, leap {leap}, land {land})"
+        );
+        // Settled now (past the landing's ease home) — and a pet is a hold
+        // with its own frames.
+        let (t, _) = idle(&mut pet, t, (4, 61), 3.0);
+        assert!(!pet.needs_frames(), "settled: parked");
+        pet.note_petted(t);
+        assert!(
+            pet.needs_frames(),
+            "a latched pet needs the tick that consumes it"
+        );
+        let f = pet.tick(sense(t + Duration::from_millis(16), Some((4, 61))));
+        assert!(
+            pet.pet_hold_t > 0.0 && pet.needs_frames(),
+            "the petting hold ({:?}) animates every frame",
+            f.action
+        );
+    }
+
+    /// Past [`SLEEP_AFTER`] the cat is asleep and its lane is released; what
+    /// it asks for is exactly the breath's visible edges — each pose swap,
+    /// each whole pixel of swell, the next z — and nothing in between (the
+    /// twin's grid proves it), over a full breath period. Past the breath
+    /// window it asks for nothing at all.
+    #[test]
+    fn a_sleeping_pet_asks_for_nothing_between_blinks() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t) = settled_pair(start, SLEEP_AFTER + 0.05);
+        assert_eq!(pet.action, PetAction::Sleep, "fixture: just asleep");
+        assert!(
+            pet.motes.iter().all(Option::is_none),
+            "fixture: before the first z"
+        );
+        assert!(
+            !pet.needs_frames(),
+            "a sleeper with nothing drifting must not ask for the frame train"
+        );
+        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), BREATH_PERIOD);
+        eprintln!("pet lane census (one breath period of light sleep): {walk:?}");
+        assert!(walk.offers >= 3, "the breath has edges: {walk:?}");
+        assert!(
+            walk.idle_wakes <= 2,
+            "a sleeper's offers are its visible edges and nothing else: {walk:?}"
+        );
+        // The first z is born 1.2 s into the period and rides the offer
+        // from there (`zee_offers`, a pixel, a look or a death at a time);
+        // the breath's own edges are the rest.
+        assert!(
+            walk.offers - walk.zee_offers <= 16,
+            "a breath is a handful of steps a period, not a train: {walk:?}"
+        );
+        // Deep sleep: byte-stable, and the offer says so.
+        let (t, f) = idle(&mut pet, end, (4, 12), BREATH_WINDOW + 1.0);
+        assert_eq!(f.action, PetAction::Sleep);
+        assert!(
+            pet.next_change_deadline(t).is_none(),
+            "deep sleep offers nothing until an input"
+        );
+        assert!(!pet.needs_frames());
+    }
+
+    /// A/B #19's residual, closed: the light sleeper's z's RIDE THE OFFER.
+    /// A drifting z used to be motion — `needs_frames` held the frame train
+    /// for as long as one was on glass, which in light sleep is the whole z
+    /// window (the first birth 1.2 s into sleep, the last death at the
+    /// breath window's close): every train frame the census below counted
+    /// after the settle window went was a z's. Now a z is a pure function
+    /// of a few countable edges — its birth beat, each whole device pixel of
+    /// its drift, each of its [`ZEE_STEPS`] looks, its death — and the
+    /// sleeper names them and parks between. The twin walk proves the
+    /// naming exact: at every offer the z is the pixel, the look and the
+    /// alpha the 16 ms train draws there, and nothing about it changes
+    /// between two offers.
+    #[test]
+    fn a_light_sleeper_s_zs_ride_the_offer_not_the_frame_train() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = settled_pair(start, SLEEP_AFTER + 0.05);
+        assert_eq!(pet.action, PetAction::Sleep, "fixture: just asleep");
+        // Both brains on the 16 ms grid to the first visible z.
+        let mut zee = None;
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            let _ = twin.tick(sense(t, Some((4, 12))));
+            if let Some(m) = f
+                .motes
+                .iter()
+                .flatten()
+                .find(|m| m.kind == PetMoteKind::Zee && m.alpha > 0)
+            {
+                zee = Some(*m);
+                break;
+            }
+        }
+        let zee = zee.expect("fixture: the sleeper dreams a z inside ZEE_EVERY of falling asleep");
+        assert_eq!(pet.action, PetAction::Sleep, "fixture: still asleep");
+        assert!(
+            !pet.needs_frames(),
+            "a light sleeper's z's ride the offer, not the frame train (a z at ({}, {}), alpha {})",
+            zee.col,
+            zee.row,
+            zee.alpha
+        );
+        let d = pet
+            .next_change_deadline(t)
+            .expect("a live z has a next edge");
+        assert!(
+            d <= t + Duration::from_secs_f32(ZEE_LIFE / ZEE_STEPS + 0.001),
+            "the z's next look is at most one slice away: +{:?}",
+            d - t
+        );
+        // The rest of the window — every z there is, to deep sleep, where
+        // the offer is `None` and the walk stops on its own.
+        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 12), BREATH_WINDOW + 2.0);
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW && pet.motes.iter().all(Option::is_none),
+            "the walk must end in deep sleep with an empty lane: quiet {}",
+            pet.quiet
+        );
+        let span = (end - t).as_secs_f32();
+        eprintln!("pet lane census (light sleep, the z's on the offer): {walk:?} over {span:.1} s");
+        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
+        assert_eq!(walk.train, 0, "nothing in light sleep is motion ({walk:?})");
+        // The z's cost, per z, at these 10×20 cells — a wake per whole pixel
+        // of climb (1.05 rows × 20 px, monotone: one crossing more than the
+        // travel), per whole pixel of sway (the 0.55-cell drift plus the
+        // sway's 0.33 cells of travel — 0.1 · the total variation of a sine
+        // over 0.8 of a cycle — × 10 px, one more than the travel and two
+        // reversals), per look slice (fifteen boundaries) and the birth —
+        // 50 at most, 49 measured; six z's in the window. Against the 512
+        // train frames the same z's cost before they rode the offer
+        // (`zee_train`, measured), and exactly what the pixel density makes
+        // it: a z climbing N pixels needs N wakes.
+        let climb_px = (1.05 * 20.0_f32).ceil() + 1.0;
+        let sway_px = ((0.55 + 0.33) * 10.0_f32).ceil() + 1.0 + 2.0;
+        let per_zee = (climb_px + sway_px + ZEE_STEPS) as u32;
+        let births = ((BREATH_WINDOW - ZEE_LIFE) / ZEE_EVERY).floor() as u32;
+        assert!(
+            walk.zee_offers >= 100 && walk.zee_offers <= births * per_zee,
+            "the z's are drawn on the offer — a whole pixel, a look, a birth, a death at a time: \
+             {} wakes for {births} z's, the bound {per_zee} a z ({walk:?})",
+            walk.zee_offers
+        );
+        assert!(
+            walk.zee_offers < 512,
+            "{} wakes for the z's — the train they replaced was 512 frames ({walk:?})",
+            walk.zee_offers
+        );
+        assert!(
+            walk.idle_wakes <= 12,
+            "{} wakes changed nothing — the z's offer is too conservative ({walk:?})",
+            walk.idle_wakes
+        );
+    }
+
+    /// THE LONE-KEY CENSUS (A/B #19's row): one key on a quiet screen, and
+    /// every wake the pet takes from it until it offers nothing — the
+    /// follower's slide and the settle on the train, then the ladder, the
+    /// breath, the z's and deep sleep on the offer. The twin walk holds
+    /// throughout; the numbers are the row's.
+    #[test]
+    fn a_lone_key_on_a_quiet_screen_costs_the_pet_a_counted_census() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t) = settled_pair(start, 5.0);
+        // The key: the caret one cell on, both brains at the same instant.
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((4, 13))));
+        let _ = twin.tick(sense(t, Some((4, 13))));
+        assert!(pet.quiet < 0.1, "fixture: the key reset the quiet clock");
+        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 13), 40.0);
+        assert_eq!(pet.action, PetAction::Sleep);
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "the walk must end in deep sleep, not on a timeout: quiet {}",
+            pet.quiet
+        );
+        let span = (end - t).as_secs_f32();
+        eprintln!(
+            "pet lane census (one key on a quiet screen → deep sleep): {walk:?} over {span:.1} s; \
+             the old train was {} frames",
+            (span * 60.0) as u32
+        );
+        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
+        // Measured: 142 train frames (the follower's slide and the settle),
+        // 41 body offers (the ladder, the breath, the beats) and 295 z
+        // offers — 478 wakes for one key, against 696 while the z's held
+        // the train (41 + 655, 512 of them z's) and the 1 920 of the settle
+        // window before A/B #19.
+        assert!(
+            walk.train <= 150 && walk.offers - walk.zee_offers <= 45 && walk.zee_offers <= 300,
+            "{walk:?} over {span:.1} s — the old train was {} frames",
+            (span * 60.0) as u32
+        );
+    }
+
+    /// Two brains driven through the same long typing run — sixty keys at
+    /// 20 cps, the ledger at its 1.0 cap ([`CONTENT_PER_CELL`]) — and the
+    /// same pause after the last key, the same hand dealt: a contented cat,
+    /// and a seat that purrs from the moment it sits.
+    fn contented_pair(start: Instant, quiet: f32) -> (PetBrain, PetBrain, Instant) {
+        let mut pet = PetBrain::default();
+        let mut twin = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let tt = awake(&mut twin, start, 4, 10);
+        assert_eq!(t, tt, "the twins share one clock");
+        pet.force_seed(0);
+        twin.force_seed(0);
+        let (t, _) = type_run(&mut pet, t, 4, 12, 60, 0.05);
+        let (tt, _) = type_run(&mut twin, tt, 4, 12, 60, 0.05);
+        assert_eq!(t, tt, "the twins share one clock");
+        let (t, _) = idle(&mut pet, t, (4, 72), quiet);
+        let _ = idle(&mut twin, tt, (4, 72), quiet);
+        assert!(
+            pet.content >= PURR_GATE,
+            "fixture: the run earned a purr (content {})",
+            pet.content
+        );
+        (pet, twin, t)
+    }
+
+    /// `needs_frames` with the mote lane emptied — what the pet would ask
+    /// for if no mote were alive, so a mote's OWN claim on the train (the
+    /// frames it is the deciding term for) can be counted.
+    fn needs_frames_without_motes(pet: &mut PetBrain) -> bool {
+        let lane = pet.motes;
+        pet.motes = [None; PET_MOTES_MAX];
+        let needs = pet.needs_frames();
+        pet.motes = lane;
+        needs
+    }
+
+    /// THE TELL ON THE OFFER — A/B #19's last mote (2026-09-06). A
+    /// contented seat floats a ♪ or ♥ every [`PURR_MOTE_EVERY`], each alive
+    /// [`PURR_MOTE_LIFE`]: while a ♪ was continuous in scale, tilt and
+    /// alpha it was motion, so the tell held the 60 fps train for ~95 % of
+    /// every purr — after every long typing run, and every hand that pets
+    /// the cat. Now a ♪ wears one of [`PURR_MOTE_STEPS`] held looks, its
+    /// drift lands on whole device pixels, and every edge of it — a pixel,
+    /// a look, the birth, the death — is named by `next_change_deadline`
+    /// (`mote_edges`); the seat parks between. The twin walk proves the
+    /// naming exact: at every offer the ♪ is the pixel, the look and the
+    /// alpha the 16 ms train draws there, and nothing about it changes
+    /// between two offers.
+    #[test]
+    fn a_purring_seat_s_notes_and_hearts_ride_the_offer_not_the_frame_train() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = contented_pair(start, SIT_AFTER + 0.3);
+        assert!(pet.purring(), "fixture: a purring seat ({:?})", pet.action);
+        // Both brains on the 16 ms grid to the first visible ♪/♥ on a seat
+        // that is OTHERWISE PARKED (the tell beats every 2 s from
+        // `SIT_AFTER + 2`; after a 20 cps run the follower's own ease home
+        // still glides the body a few pixels for the first beat or two, and
+        // that glide is the train's by its own law, not the mote's).
+        let mut note = None;
+        for _ in 0..800 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 72))));
+            let _ = twin.tick(sense(t, Some((4, 72))));
+            let floated =
+                f.motes.iter().flatten().find(|m| {
+                    matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart) && m.alpha > 0
+                });
+            if let Some(m) = floated
+                && !needs_frames_without_motes(&mut pet)
+            {
+                note = Some(*m);
+                break;
+            }
+        }
+        let note = note.expect("fixture: the seat floats a ♪ or ♥ while otherwise parked");
+        assert!(pet.purring(), "fixture: still purring ({:?})", pet.action);
+        assert!(
+            !pet.needs_frames(),
+            "a purring seat's ♪/♥ ride the offer, not the frame train \
+             (a {:?} at ({}, {}), alpha {})",
+            note.kind,
+            note.col,
+            note.row,
+            note.alpha
+        );
+        let d = pet
+            .next_change_deadline(t)
+            .expect("a live ♪ has a next edge");
+        assert!(
+            d <= t + Duration::from_secs_f32(PURR_MOTE_LIFE / PURR_MOTE_STEPS + 0.001),
+            "the ♪'s next look is at most one slice away: +{:?}",
+            d - t
+        );
+        // The rest of the purr — every ♪/♥ the ledger buys, the wash, the
+        // loaf, the sleep, the z's — to deep sleep, where the offer is
+        // `None` and the walk stops on its own.
+        let (walk, end) = walk_offers(
+            &mut pet,
+            &mut twin,
+            t,
+            (4, 72),
+            SLEEP_AFTER + BREATH_WINDOW + 2.0,
+        );
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW && pet.motes.iter().all(Option::is_none),
+            "the walk must end in deep sleep with an empty lane: quiet {}",
+            pet.quiet
+        );
+        let span = (end - t).as_secs_f32();
+        eprintln!(
+            "pet lane census (a purring seat, the ♪/♥ on the offer): {walk:?} over {span:.1} s"
+        );
+        assert_eq!(walk.note_train, 0, "a ♪/♥ held the frame train ({walk:?})");
+        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
+        // A ♪'s cost at these 10×20 cells — a wake per whole pixel of climb
+        // (0.85 rows × 20 px, monotone: one crossing more than the travel),
+        // per whole pixel of sway (the 0.30-cell drift plus the sway's 0.40
+        // cells of travel — 0.12 · the total variation of a sine over 0.8
+        // of a cycle — × 10 px, one more than the travel and two
+        // reversals), per look slice (fifteen boundaries) and the birth —
+        // 45 at most, per ♪ the ledger buys (a beat every 2 s from
+        // `SIT_AFTER + 2` for as long as the tell lasts — past the gate on
+        // a dealt `Purr`, which purrs whatever the ledger says until the
+        // re-deal). The wakes that merely DRAW a ♪ (`note_offers`) are
+        // mostly the swell's own pixel march and are reported, not bounded.
+        let climb_px = (0.85 * 20.0_f32).ceil() + 1.0;
+        let sway_px = ((0.30 + 0.40) * 10.0_f32).ceil() + 1.0 + 2.0;
+        let per_note = (climb_px + sway_px + PURR_MOTE_STEPS) as u32;
+        assert!(
+            walk.note_births >= 3,
+            "fixture: the ledger buys a run of ♪/♥ ({walk:?})"
+        );
+        assert!(
+            walk.note_edges >= 30 && walk.note_edges <= walk.note_births * per_note,
+            "the ♪/♥ are drawn on the offer — a whole pixel, a look, a birth, a death at a \
+             time: {} edges for {} of them, the bound {per_note} a ♪ ({walk:?})",
+            walk.note_edges,
+            walk.note_births
+        );
+        assert!(
+            walk.idle_wakes <= 40,
+            "{} wakes changed nothing — the tell's offer is too conservative ({walk:?})",
+            walk.idle_wakes
+        );
+    }
+
+    /// THE CONTENTED-CAT CENSUS (A/B #19's last mote): one key on a cat
+    /// that just finished a long run — the follower's slide and the settle
+    /// on the train, then a seat that purrs its ♪/♥ for as long as the
+    /// ledger lasts, the wash, the loaf, the sleep, the z's and deep sleep
+    /// on the offer. The twin walk holds throughout; the numbers are the
+    /// row's, beside the lone-key census of a cold cat.
+    #[test]
+    fn a_lone_key_on_a_contented_cat_costs_a_counted_census() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t) = contented_pair(start, 2.0);
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((4, 73))));
+        let _ = twin.tick(sense(t, Some((4, 73))));
+        assert!(pet.quiet < 0.1, "fixture: the key reset the quiet clock");
+        let (walk, end) = walk_offers(&mut pet, &mut twin, t, (4, 73), 40.0);
+        assert_eq!(pet.action, PetAction::Sleep);
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "the walk must end in deep sleep, not on a timeout: quiet {}",
+            pet.quiet
+        );
+        let span = (end - t).as_secs_f32();
+        eprintln!(
+            "pet lane census (one key on a contented cat → deep sleep): {walk:?} over {span:.1} s; \
+             the old train was {} frames",
+            (span * 60.0) as u32
+        );
+        assert_eq!(walk.note_train, 0, "a ♪/♥ held the frame train ({walk:?})");
+        assert_eq!(walk.zee_train, 0, "a z held the frame train ({walk:?})");
+        assert_eq!(
+            (walk.dust_train, walk.pop_train),
+            (0, 0),
+            "a landing puff or a wake's pop on a key that neither lands nor wakes ({walk:?})"
+        );
+    }
+
+    /// A TICK THAT CARRIES NO TIME CARRIES NO MOTION INFORMATION
+    /// (2026-09-06, found by the contented-cat census). The glide sensor
+    /// marks the body's column at the start of every tick, and a zero-dt
+    /// tick — the same instant as the last — cannot move the body, so the
+    /// mark landed on the column itself and `needs_frames` read a body
+    /// with seven device pixels still to glide as still: parked at +16 ms
+    /// after the key, the next wake at `SETTLE_TURN`, and the 60 fps twin
+    /// a pixel away by +288 ms. The mark now moves only with a tick that
+    /// could have moved the body.
+    #[test]
+    fn a_zero_dt_tick_does_not_park_a_gliding_body() {
+        let start = Instant::now();
+        let (mut pet, _, t) = contented_pair(start, 2.0);
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((4, 73))));
+        let t = t + Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((4, 73))));
+        let gap_px = (pet.home - pet.col).abs() * 10.0;
+        assert!(
+            gap_px >= 1.0 && pet.speed.abs() < 0.01,
+            "fixture: the body is easing home with a pixel to go ({gap_px} px, speed {})",
+            pet.speed
+        );
+        assert!(pet.needs_frames(), "fixture: the glide holds the lane");
+        // The same instant again: no time, no motion — and no verdict change.
+        let _ = pet.tick(sense(t, Some((4, 73))));
+        assert!(
+            pet.needs_frames(),
+            "a zero-dt tick parked a body with {gap_px} px still to glide"
+        );
+    }
+
+    /// THE WAKE'S POP IS BOUNDED BY THE STRETCH (A/B #19's last mote, the
+    /// measured closure): the one startled z a wake throws lives
+    /// [`ZEE_POP_LIFE`], and the stretch it is thrown ahead of holds the
+    /// train for [`WAKE_DUR`], longer — so on every path that wakes a
+    /// sleeper (a key, a bell, a petting hand, a failed command, a slow
+    /// success) the pop is never the DECIDING term of `needs_frames`: zero
+    /// frames of its own, and never idle, because a wake is an event.
+    #[test]
+    fn the_wake_s_startled_z_never_holds_the_frame_train_on_its_own() {
+        type Wake = fn(&mut PetBrain, Instant) -> (u16, u16);
+        let paths: [(&str, Wake); 5] = [
+            ("a key", |_, _| (4, 13)),
+            ("a bell", |pet, t| {
+                pet.note_bell(t);
+                (4, 12)
+            }),
+            ("a petting hand", |pet, t| {
+                pet.note_petted(t);
+                (4, 12)
+            }),
+            ("a failed command", |pet, t| {
+                pet.note_command_done(t, true, None);
+                (4, 12)
+            }),
+            ("a slow success", |pet, t| {
+                pet.note_command_done(t, false, Some(5_000));
+                (4, 12)
+            }),
+        ];
+        let frames_max = (ZEE_POP_LIFE / 0.016).ceil() as u32 + 1;
+        for (name, wake) in paths {
+            let start = Instant::now();
+            let (mut pet, _, mut t) = settled_pair(start, SLEEP_AFTER + 0.05);
+            assert_eq!(pet.action, PetAction::Sleep, "fixture ({name}): asleep");
+            t += Duration::from_millis(16);
+            let caret = wake(&mut pet, t);
+            let (mut alive, mut own, mut woke) = (0u32, 0u32, false);
+            for _ in 0..90 {
+                let f = pet.tick(sense(t, Some(caret)));
+                woke |= f.action == PetAction::Waking;
+                let popped = f
+                    .motes
+                    .iter()
+                    .flatten()
+                    .any(|m| m.kind == PetMoteKind::ZeePop && m.alpha > 0);
+                if popped {
+                    alive += 1;
+                    assert!(pet.needs_frames(), "{name}: a live pop is motion");
+                    if !needs_frames_without_motes(&mut pet) {
+                        own += 1;
+                    }
+                }
+                t += Duration::from_millis(16);
+            }
+            eprintln!(
+                "wake pop census ({name}): {alive} frames of pop inside the stretch's train, \
+                 {own} of its own (bound {frames_max})"
+            );
+            assert!(woke, "fixture ({name}): the sleeper woke");
+            assert!(alive >= 1, "fixture ({name}): the wake popped a z");
+            assert!(
+                alive <= frames_max,
+                "{name}: the pop outlived its life — {alive} frames, bound {frames_max}"
+            );
+            assert_eq!(
+                own, 0,
+                "{name}: the wake's pop held the frame train on its own for {own} frames"
+            );
+        }
+    }
+
+    /// THE LANDING DUST IS BOUNDED BY THE LANDING (A/B #19's last mote, the
+    /// measured closure): the three puffs a chosen landing throws live up
+    /// to 0.59 s from a [`LAND_DUR`] landing, so the dust can hold the
+    /// train at most `(0.59 − LAND_DUR) / 16 ms` frames past the beat that
+    /// threw it, and only when nothing else does — never idle, because a
+    /// landing is a caret jump. The count of pixel edges the same puffs
+    /// would offer is measured beside it: a mote whose offer costs more
+    /// wakes than the train it replaces stays on the train.
+    #[test]
+    fn landing_dust_holds_the_train_for_a_bounded_beat_past_the_landing() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 4);
+        // A screen-crossing jump: the chosen landing throws its dust.
+        let caret = (4u16, 90u16);
+        let bound = ((0.45 + 0.07 * 2.0 - LAND_DUR) / 0.016).ceil() as u32;
+        let (mut alive, mut own, mut px_edges, mut landed) = (0u32, 0u32, 0u32, false);
+        let mut last_px = [None; PET_MOTES_MAX];
+        for _ in 0..300 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some(caret)));
+            landed |= f.action == PetAction::Land;
+            let mut any = false;
+            for (last, m) in last_px.iter_mut().zip(f.motes.iter()) {
+                let px = m
+                    .filter(|m| m.kind == PetMoteKind::Dust && m.alpha > 0)
+                    .map(|m| ((m.col * 10.0).round() as i32, (m.row * 20.0).round() as i32));
+                any |= px.is_some();
+                if px.is_some() && px != *last {
+                    px_edges += 1;
+                }
+                *last = px;
+            }
+            if any {
+                alive += 1;
+                assert!(pet.needs_frames(), "live dust is motion");
+                if !needs_frames_without_motes(&mut pet) {
+                    own += 1;
+                }
+            }
+        }
+        eprintln!(
+            "landing dust census: {alive} frames of dust on the train, {own} of its own \
+             (bound {bound}); {px_edges} pixel edges the three puffs would have offered \
+             (plus their looks)"
+        );
+        assert!(landed, "fixture: the jump landed");
+        assert!(alive >= 1, "fixture: the landing threw its dust");
+        assert!(
+            own <= bound,
+            "the dust held the frame train {own} frames past the landing, bound {bound}"
+        );
+        assert!(
+            alive <= (0.59 / 0.016) as u32 + 2,
+            "the dust outlived its life: {alive} frames"
         );
     }
 
@@ -11606,14 +13836,25 @@ mod tests {
                     z.row
                 );
                 assert!(z.rot != 0.0, "and always rotated");
-                // (alpha is 0 on the birth tick — the fade-in ramp's foot.)
                 scales.insert((z.scale * 1024.0) as i64);
                 alphas.insert(z.alpha);
             }
         }
         assert!(seen > 0, "light sleep must actually dream");
-        assert!(scales.len() > 8, "the z's scale as they drift");
-        assert!(alphas.len() > 8, "and fade as they go");
+        // The look is held across each of the ZEE_STEPS slices of a life
+        // (A/B #19's residual), so a z wears exactly sixteen scales — and
+        // eight alpha bytes, the three-step rise and the six-step fall
+        // sharing one (137 at 0.625 of the peak) with the plateau's 220.
+        assert_eq!(
+            scales.len(),
+            ZEE_STEPS as usize,
+            "the z's grow as they drift, one size a slice: {scales:?}"
+        );
+        assert_eq!(
+            alphas,
+            [45, 137, 220, 216, 176, 98, 58, 19].into_iter().collect(),
+            "and fade as they go, one alpha a slice"
+        );
     }
 
     /// [`ZEE_EVERY`] is pinned from BOTH sides, on the real tick loop.
@@ -11731,10 +13972,20 @@ mod tests {
         // THE SWITCH, on an identical brain.
         let (mut pet, mut t) = sleeper_with_a_live_zee(start);
         assert!(pet.is_active(), "fixture: a visible pet");
-        assert!(pet.needs_frames(), "fixture: a drifting z owns the lane");
+        // A light sleeper's z rides the offer, not the frame train (A/B
+        // #19's residual): the claim it keeps alive is the NEXT WAKE it
+        // names for the z's next pixel, look or death.
+        assert!(
+            !pet.needs_frames() && pet.next_change_deadline(t).is_some(),
+            "fixture: a drifting z names its next wake"
+        );
         pet.retire_unowned();
         assert!(!pet.is_active(), "a retired pet paints nothing");
         assert!(!pet.needs_frames(), "…and owes the scheduler no frames");
+        assert!(
+            pet.next_change_deadline(t).is_none(),
+            "…and names no wake for a z it no longer carries"
+        );
 
         // The next frame a host would emit from carries nothing at all — no fade
         // to sit through, no mote left in the lane.

@@ -59,6 +59,7 @@ use crate::cursor_glow::{
     RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_FIELD_LEVEL, RAINBOW_SPARKLE_LIGHT_SHARE,
     rainbow_phase_from_unit_turn, rainbow_sweep_at, rainbow_sweep_reflect, rainbow_thing_of,
 };
+use crate::rainbow_kitty::timing::spring_snap;
 use crate::spectrum::{clear_light_of_cyan, clear_thing_of_cyan};
 
 /// The block-cursor base the rainbow blooms FROM when the host names none:
@@ -188,6 +189,15 @@ const SETTLED_ENERGY: f32 = 0.02;
 /// the host's ~530 ms blink half-period, so every flare completes — and the
 /// 60 fps tick disarms — before the next flip can fire one.
 const TWINKLE_DUR: f32 = 0.16;
+/// §7.1's white HOLD — the one frame a v2 meteor is born on. The engine
+/// stamps `flare_at` with the tick's own `now`, so frame 0 sees age exactly 0;
+/// the hold is under half a 120 Hz frame so frame 1 is already on the spring
+/// at any refresh rate, and clock jitter on frame 0 still reads white.
+const FLARE_WHITE_HOLD_S: f32 = 0.004;
+/// §7.1: the four halo rings pop radius ×1.4 on the flare's edge …
+const FLARE_RING_POP: f32 = 0.4;
+/// … and relax on τ 120 ms.
+const FLARE_RING_TAU_S: f32 = 0.120;
 /// How far the block fill glints toward the star colour at the flare peak.
 /// Lowered 0.6 -> 0.35 on 2026-07-24 with the rest of the legibility retune.
 const TWINKLE_MIX: f32 = 0.35;
@@ -302,12 +312,28 @@ pub struct RainbowConfig {
     /// star arms and the glitter dots are LIGHT, and light has no colour until it
     /// is composited. So this tick's emitted quads go through
     /// [`clear_light_of_cyan`] against this ground — the same law, over the same
-    /// triple, that `spend_rainbow_budget` runs on the ribbon's own quads.
+    /// triple, the ribbon's own marks are held to.
     ///
     /// `None` falls back to the shipped page for the polarity the caller names
     /// ([`GROUND_DARK_THEME`] / [`GROUND_LIGHT_THEME`]), so an embedder that has
     /// no background to hand still gets a law rather than none.
     pub ground: Option<u32>,
+    /// **THE FLARE** (`RAINBOW-KITTY-V2.md` §7.1) — the instant a Rainbow
+    /// Kitty v2 meteor's frame-0 flare fired, copied by the host from
+    /// [`crate::cursor_glow::CursorGlow::caret_flare_at`]. While `Some`: on
+    /// the frame it fired the block fills `#FFFFFF` (a light theme flashes
+    /// the vivid live hue instead — white sinks into paper, the same fork the
+    /// twinkle glint takes), then the fill mixes from that flash back toward
+    /// its field stop on `spring-snap` (critically damped, response 0.18 s:
+    /// no undershoot, because a caret that dips past its own colour reads
+    /// "not arrived"), and the four halo rings pop radius ×1.4 on the same
+    /// edge relaxing τ 120 ms. The engine clears it once the relax has
+    /// settled, so a `Some` is always a live relax.
+    ///
+    /// `None` is the IDENTITY: every expression in the tick runs unchanged
+    /// and the emitted bytes are the pre-flare bytes, which is what keeps the
+    /// caret's own pins green with the field added.
+    pub flare_at: Option<Instant>,
 }
 
 /// What a tick produced: the block FILL colour to hand the renderer (it floors it for
@@ -353,6 +379,18 @@ pub struct CursorRainbow {
     /// Latched "a flare is mid-flight" at the last tick (the [`is_active`]
     /// clockless answer, like `energy`).
     twinkling: bool,
+    /// The fingerprint the LAST tick emitted, and the one before it — so
+    /// [`is_active`] can answer from the u8-level delta the host would present
+    /// rather than from `paint > SETTLED_ENERGY`. The colour envelope cools on
+    /// a τ 0.85 s follower under v2 (`spine.rs`), so `paint` stays above 0.02
+    /// for 0.85·ln 50 ≈ 3.3 s while the u8 fill is IDENTICAL frame after frame
+    /// — the live capture of 2026-09-05 measured the caret as the sole owner of
+    /// the effect deadline at ~5.5 presents/s for ~6 s after every burst, and
+    /// the lane's park moving from +0.4 s to +1.47 s. `RAINBOW-KITTY-V2.md`
+    /// §7.1 names this exact host follow-up. A frame whose fingerprint equals
+    /// the previous frame's cannot differ on glass; the caret asks for no tick.
+    fp_last: u64,
+    fp_prev: u64,
     /// The rim's pixel buffer for [`Self::clear_caret_light_of_cyan`], and the
     /// colours the rim was EMITTED with. Both are `clear`-and-refill scratch,
     /// retained across frames exactly like `RainbowLedger`'s: the law lays the
@@ -369,7 +407,13 @@ impl CursorRainbow {
     /// blink cadence — no rainbow-kitty-specific wakeups on a focused idle window.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.energy > SETTLED_ENERGY || self.paint > SETTLED_ENERGY || self.twinkling
+        // THE FINGERPRINT LAW (§7.1): charged (`energy`) or mid-flare keeps the
+        // tick; a merely COOLING block keeps it only while its last two frames
+        // differed — the moment the u8 fill settles, identical fingerprints
+        // release the lane, and the idle rainbow rides the blink cadence.
+        self.energy > SETTLED_ENERGY
+            || self.twinkling
+            || (self.paint > SETTLED_ENERGY && self.fp_last != self.fp_prev)
     }
 
     /// Advance one frame at `now` with the current typing `energy` (`0..1`), the
@@ -466,6 +510,8 @@ impl CursorRainbow {
             self.last_blink = None;
             self.twinkle_at = None;
             self.twinkling = false;
+            self.fp_prev = self.fp_last;
+            self.fp_last = 0;
             return RainbowFrame { fill: None, fp: 0 };
         }
         // **WHERE THIS TICK'S OWN LIGHT STARTS IN THE SHARED STREAM.** `out` is
@@ -662,7 +708,31 @@ impl CursorRainbow {
         // moment the ignition heat did, with the sparkles still lit.
         let caret_floor =
             RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint / CARET_LIGHT_KNEE);
-        let mut fill = lift_to_light_floor(fill, caret_floor);
+        let fill = lift_to_light_floor(fill, caret_floor);
+        // **THE FLARE** (`RAINBOW-KITTY-V2.md` §7.1): on the frame a v2
+        // meteor is born the block fills white (the vivid live hue on a light
+        // theme), then mixes back toward the fill every line above resolved on
+        // `spring-snap` — critically damped, so it never undershoots its own
+        // colour on the way home. `None` is the identity: `fill` passes
+        // through untouched and no expression above or below changes.
+        let flare_age = cfg
+            .flare_at
+            .map(|t| now.saturating_duration_since(t).as_secs_f32());
+        let mut fill = match flare_age {
+            None => fill,
+            Some(age) => {
+                let flash = if dark_theme {
+                    0x00FF_FFFF
+                } else {
+                    shade(head_rgb, 1.0, 0.85)
+                };
+                if age < FLARE_WHITE_HOLD_S {
+                    flash
+                } else {
+                    mix_rgb(flash, fill, spring_snap(age))
+                }
+            }
+        };
 
         // The additive HALO: concentric rings around the block. Brightness = a small
         // breathing idle floor + the typing energy; radius grows with energy. Purely
@@ -688,8 +758,16 @@ impl CursorRainbow {
             // cell sideways (the comment's promise) and the differing x/y growth also
             // means no two layers land the SAME rect, so the thin rings blend into a
             // soft rim instead of double-adding a stacked pair.
-            let radius_x = (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, e) * cw as f32).max(1.0);
-            let radius_y = (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, e) * ch as f32).max(1.0);
+            // §7.1: the rings pop ×1.4 on the flare's edge and relax τ 120 ms.
+            // `1.0` with no flare — a multiply by one is the bit-exact
+            // identity, so every pre-flare ring lands on its pre-flare pixel.
+            let flare_pop = flare_age.map_or(1.0, |age| {
+                1.0 + FLARE_RING_POP * (-age / FLARE_RING_TAU_S).exp()
+            });
+            let radius_x =
+                (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, e) * cw as f32 * flare_pop).max(1.0);
+            let radius_y =
+                (lerp(HALO_RADIUS_IDLE, HALO_RADIUS_MAX, e) * ch as f32 * flare_pop).max(1.0);
             for layer in 0..HALO_LAYERS {
                 // t: 0 = innermost ring hugging the block, 1 = outermost at `radius`.
                 // Coverage falls off as (1-t)² so the overlapping thin rings blend into
@@ -851,6 +929,8 @@ impl CursorRainbow {
             .wrapping_add((halo_energy * 255.0) as u64)
             .wrapping_add(((fill as u64) << 12) ^ ((self.pulse * 64.0) as u64))
             .wrapping_add(twinkle_fp);
+        self.fp_prev = self.fp_last;
+        self.fp_last = fp;
 
         RainbowFrame {
             fill: Some(fill),
@@ -1332,7 +1412,265 @@ mod tests {
             // …and no host page either, so the light-law solves against the
             // shipped ground for the polarity each fixture names.
             ground: None,
+            flare_at: None,
         }
+    }
+
+    /// §7.1, THE FLARE: `Some(now)` fills the block white on that frame; the
+    /// relaxed flare (spring-snap settled) is the `None` frame to the byte,
+    /// halo included — so the field's identity claim is measured, not stated.
+    #[test]
+    fn the_flare_is_white_on_frame_zero_and_the_identity_once_settled() {
+        let g = geom();
+        let t0 = Instant::now();
+        let plain = cfg();
+        let flared = RainbowConfig {
+            flare_at: Some(t0),
+            ..plain
+        };
+        let mut out = Vec::new();
+        let f0 = CursorRainbow::default()
+            .tick(Some((1, 1)), t0, 1.0, true, true, g, &flared, &mut out)
+            .fill
+            .unwrap();
+        assert_eq!(f0, 0x00FF_FFFF, "frame 0 of the flare is white");
+        // Settled: 2 s past the edge the spring is at 1.0 and the ring pop is
+        // below f32 resolution — byte-identical to the plain config.
+        let late = t0 + Duration::from_secs(2);
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let fa = CursorRainbow::default()
+            .tick(Some((1, 1)), late, 1.0, true, true, g, &flared, &mut a)
+            .fill;
+        let fb = CursorRainbow::default()
+            .tick(Some((1, 1)), late, 1.0, true, true, g, &plain, &mut b)
+            .fill;
+        assert_eq!(fa, fb, "a settled flare is the plain fill");
+        assert_eq!(a, b, "a settled flare's halo is the plain halo");
+        // Mid-relax the fill is strictly between: no longer white, not yet home.
+        let mid = t0 + Duration::from_millis(40);
+        let mut m = Vec::new();
+        let fm = CursorRainbow::default()
+            .tick(Some((1, 1)), mid, 1.0, true, true, g, &flared, &mut m)
+            .fill
+            .unwrap();
+        assert_ne!(fm, 0x00FF_FFFF, "40 ms in, the flare has left white");
+        assert_ne!(Some(fm), fb, "40 ms in, the flare is not yet home");
+    }
+
+    /// §7.1 + D4, THE LANDING'S CARET LAW, measured on the REAL seam: after a
+    /// v2 meteor's one white frame the block mixes toward ITS OWN field stop
+    /// — `spectrum(tri(field_t))`, the number the meteor phase-locked at the
+    /// spawn — and stays on it for the whole dwell. A colour step with no
+    /// keystroke behind it is the defect: on the live capture (2026-09-05,
+    /// ctrl-e#1) the caret sat green (95,251,89) for 218 ms and snapped to
+    /// salmon (248,117,117) in ONE frame, because the seam re-read the field
+    /// every frame and the field's fallback — the newest cell of the band the
+    /// jump had ABANDONED — dropped to `0.0` (red) the tick that band was
+    /// retired, 0.64 s after the jump that abandoned it.
+    ///
+    /// The drive is the host's: `CursorGlow` with v2 engaged is ticked, then
+    /// the caret block is ticked at the same `now` with the `RainbowConfig`
+    /// `app_render.rs` builds from the seam (`rainbow_head_rgb`,
+    /// `caret_paint`, `caret_flare_at`), at 120 Hz — nine typed cells, an
+    /// idle long enough that the band's exit swoosh ends INSIDE the dwell,
+    /// a 20-cell nav jump, and a 400 ms dwell.
+    #[test]
+    fn the_caret_settles_on_its_own_stop_without_a_pop() {
+        use crate::cursor_glow::{CursorGlow, GlowConfig, GlowStyle};
+        use crate::rainbow_kitty::meteor::tri;
+        use crate::spectrum::spectrum;
+
+        let g = geom();
+        let glow_cfg = GlowConfig {
+            enabled: true,
+            classic_mono: false,
+            style: GlowStyle::RainbowKitty,
+            color: 0x0050_FA7B,
+            accent: 0x007A_A2F7,
+            duration: Duration::from_millis(240),
+            length: 18,
+            intensity: 1.0,
+            radius: 0.6,
+            ring: true,
+            dark_theme: true,
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
+            beam: false,
+            head_dx: 0.5,
+            pack: None,
+            wake_persist_s: 2.4,
+            ribbon_tall: true,
+        };
+        // The caret's config exactly as the host builds it (app_render.rs,
+        // the live `rainbow_cfg`): an unpinned Default-theme cursor, the seam's
+        // head colour, paint and flare, the page as the ground.
+        fn host_cfg(glow: &CursorGlow, glow_cfg: &GlowConfig, now: Instant) -> RainbowConfig {
+            RainbowConfig {
+                enabled: true,
+                intensity: 1.0,
+                blinking: false,
+                base: None,
+                head_rgb: glow.rainbow_head_rgb(glow_cfg),
+                paint: Some(glow.caret_paint(now)),
+                ground: Some(glow_cfg.theme_bg),
+                flare_at: glow.caret_flare_at(),
+            }
+        }
+        // One host frame: the seam ticks, then the caret block reads it.
+        fn frame(
+            glow: &mut CursorGlow,
+            body: &mut CursorRainbow,
+            glow_cfg: &GlowConfig,
+            g: Geom,
+            now: Instant,
+            cell: (u16, u16),
+        ) -> u32 {
+            let mut glow_out = Vec::new();
+            let mut body_out = Vec::new();
+            glow.tick(Some(cell), now, glow_cfg, g, &mut glow_out);
+            let cfg = host_cfg(glow, glow_cfg, now);
+            body.tick_with_family_phase(
+                Some(cell),
+                now,
+                0.0,
+                glow.rainbow_phase(),
+                glow.rainbow_field(),
+                false,
+                true,
+                g,
+                &cfg,
+                &mut body_out,
+            )
+            .fill
+            .expect("enabled caret fill")
+        }
+        let max_delta = |a: u32, b: u32| -> u32 {
+            (0..3)
+                .map(|s| ((a >> (8 * s)) & 0xff).abs_diff((b >> (8 * s)) & 0xff))
+                .max()
+                .unwrap_or(0)
+        };
+
+        const HZ: u64 = 8_333; // 120 Hz, in microseconds
+        let t0 = Instant::now();
+        let row = 2u16;
+        let mut glow = CursorGlow::default();
+        let mut body = CursorRainbow::default();
+        frame(&mut glow, &mut body, &glow_cfg, g, t0, (row, 4));
+        assert!(glow.v2_status().is_some(), "v2 must own the frame");
+        // Nine typed cells at 70 ms: cols 4..=12, the caret parked at 13.
+        let mut last_key = t0;
+        for k in 1..=9u64 {
+            last_key = t0 + Duration::from_millis(70 * k);
+            glow.note_typed(last_key);
+            frame(
+                &mut glow,
+                &mut body,
+                &glow_cfg,
+                g,
+                last_key,
+                (row, 4 + k as u16),
+            );
+        }
+        // Idle 1.20 s at 120 Hz: the band is in its exit swoosh (retracting)
+        // when the jump comes, and is retired at last-key + 1.54 s — 340 ms
+        // INTO the dwell below.
+        let mut now = last_key;
+        let jump_at = last_key + Duration::from_millis(1_200);
+        while now + Duration::from_micros(HZ) < jump_at {
+            now += Duration::from_micros(HZ);
+            frame(&mut glow, &mut body, &glow_cfg, g, now, (row, 13));
+        }
+        // The nav jump: 20 cells on the row (≥ JUMP_MIN_CELLS), credited.
+        glow.note_motion(jump_at);
+        let landing = (row, 33);
+        let f0 = frame(&mut glow, &mut body, &glow_cfg, g, jump_at, landing);
+        assert_eq!(
+            glow.caret_flare_at(),
+            Some(jump_at),
+            "a credited jump flares on the frame it is observed"
+        );
+        assert_eq!(f0, 0x00FF_FFFF, "frame 0 of the landing is white");
+        // The caret's own stop: the field the seam handed out ON THE LANDING
+        // FRAME, which is also the meteor's `t_land` (D4, §6.4).
+        let field_t = glow.rainbow_field();
+        assert!(
+            field_t > 0.25,
+            "non-vacuous: the walk laid several stops before the jump (t = {field_t})"
+        );
+        let own_stop = spectrum(tri(field_t));
+        assert_eq!(
+            glow.rainbow_head_rgb(&glow_cfg),
+            Some(own_stop),
+            "on the landing frame the seam's head colour IS the caret's own stop"
+        );
+
+        // The 400 ms dwell at 120 Hz, nothing pressed.
+        let mut fills = vec![f0];
+        let mut now = jump_at;
+        let dwell_end = jump_at + Duration::from_millis(400);
+        while now + Duration::from_micros(HZ) <= dwell_end {
+            now += Duration::from_micros(HZ);
+            fills.push(frame(&mut glow, &mut body, &glow_cfg, g, now, landing));
+        }
+        assert!(
+            fills.len() >= 47,
+            "120 Hz over 400 ms: {} frames",
+            fills.len()
+        );
+
+        // LAW 1 — no pop: after the one white frame every per-frame step of
+        // the fill is under 40/255 on every channel (the spring-snap from
+        // white peaks at ~27/255 per 120 Hz frame; the measured defect is a
+        // 151/255 step).
+        let mut worst = (0u32, 0usize);
+        for (i, pair) in fills.windows(2).enumerate().skip(1) {
+            let d = max_delta(pair[0], pair[1]);
+            if d > worst.0 {
+                worst = (d, i + 1);
+            }
+        }
+        assert!(
+            worst.0 <= 40,
+            "the caret popped {}/255 on dwell frame {} (+{:.1} ms): {:06X} -> {:06X}",
+            worst.0,
+            worst.1,
+            worst.1 as f32 * HZ as f32 / 1000.0,
+            fills[worst.1 - 1],
+            fills[worst.1]
+        );
+
+        // LAW 2 — the settled fill IS the paint law applied to the caret's
+        // own stop: a fresh block, handed the host's config with the head
+        // colour replaced by `spectrum(tri(field_t))`, emits the same byte.
+        let settled = *fills.last().unwrap();
+        let mut law = CursorRainbow::default();
+        let mut out = Vec::new();
+        let law_cfg = RainbowConfig {
+            head_rgb: Some(own_stop),
+            ..host_cfg(&glow, &glow_cfg, now)
+        };
+        let expected = law
+            .tick_with_family_phase(
+                Some(landing),
+                now,
+                0.0,
+                glow.rainbow_phase(),
+                field_t,
+                false,
+                true,
+                g,
+                &law_cfg,
+                &mut out,
+            )
+            .fill
+            .unwrap();
+        assert_eq!(
+            settled, expected,
+            "settled on {settled:06X}, but the paint law on the caret's own stop \
+             {own_stop:06X} (t = {field_t}) gives {expected:06X}"
+        );
     }
 
     /// THE CONTINUITY CEILING for a walk whose consecutive samples are `dt`
@@ -1441,6 +1779,7 @@ mod tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut out,
         );
@@ -1471,6 +1810,7 @@ mod tests {
                 head_rgb: None,
                 paint: None,
                 ground: None,
+                flare_at: None,
             },
             &mut out,
         );
@@ -3146,6 +3486,7 @@ mod tests {
         let g = geom();
         let glow_cfg = GlowConfig {
             enabled: true,
+            classic_mono: false,
             style: GlowStyle::RainbowKitty,
             color: 0x0050_FA7B,
             accent: 0x007A_A2F7,

@@ -285,3 +285,41 @@ fn epoch_to_rfc3339_goldens() {
         "2100-02-28T23:59:59Z"
     ); // 2100 ∉ leap
 }
+
+// --- launch policy ----------------------------------------------------------
+
+/// The shipped bundle must FORBID Rosetta translation.
+///
+/// aterm is one universal binary, so on Apple silicon the native slice always
+/// exists. v0.75.0 shipped without this key and Macs in the field launched the
+/// Intel slice under translation — LaunchServices inherits the parent's
+/// architecture and remembers a "Open using Rosetta" tick forever — which
+/// reads to the user as "Using Intel-based apps on a Mac with Apple silicon",
+/// or as an app that will not open at all where Rosetta is absent. The binary
+/// was correct in that release; the launch policy was missing. This test is
+/// the gate: delete the key from apps/aterm-mac/Info.plist and it goes red.
+///
+/// Asserted on the STAMPED output, not just the template, because stamping is
+/// textual splice-and-insert (`set_plist_string`) — a future stamp that
+/// rewrote the wrong element could drop a neighbouring key silently.
+#[test]
+fn the_shipped_bundle_requires_native_execution() {
+    let template = real_template();
+    assert!(
+        template.contains("<key>LSRequiresNativeExecution</key>\n\t<true/>"),
+        "apps/aterm-mac/Info.plist must carry LSRequiresNativeExecution=true — \
+         without it macOS may run aterm's Intel slice under Rosetta on Apple \
+         silicon (v0.75.0 field report): {template}"
+    );
+    let out = stamp_real(Some("aterm"));
+    assert!(
+        out.contains("<key>LSRequiresNativeExecution</key>\n\t<true/>"),
+        "stamping dropped LSRequiresNativeExecution: {out}"
+    );
+    // It is a BOOLEAN. A `<string>true</string>` is not the same key to
+    // LaunchServices, and would be silently ignored.
+    assert!(
+        !out.contains("<key>LSRequiresNativeExecution</key>\n\t<string>"),
+        "LSRequiresNativeExecution must be <true/>, not a string: {out}"
+    );
+}

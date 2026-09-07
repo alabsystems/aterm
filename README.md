@@ -349,9 +349,15 @@ three are the same animal; the original flying head has its own name now,
 `rainbow kitty flying` (the historical `nyan` aliases still select it). The rest
 of the shelf: `rainbow dog pet`, the ribbon geometries `rainbow kitty underline`
 and `rainbow kitty tall`, then `phaser`, `comet`, `lumen`, `sparkle`, `fire`,
-`laser`, `water`, `beam`, and `off` — or load a Trail Pack, a TOML cursor trail
+`laser`, `water`, `beam`, `classic`, `classic mono`, and `off` — or load a Trail Pack, a TOML cursor trail
 composed from the built-in beam, crown, particle, and ramp primitives, no restart
-needed. Every trail has a signature typing sound on macOS, and
+needed. `classic` is the v0.28 trail restored: a thin four-layer comet under a
+soft square bloom, and the long diagonal comet on a screen-crossing jump that
+the modern engine's shape gates no longer draw. It is a faithful restoration —
+its frames are byte-identical to the ones the v0.28 build emits — and it is
+offered as an option, never a default. `classic mono` is that same engine
+wearing v0.28's other face: one hue instead of the rolling spectrum, taken from
+the theme's cursor colour, so it follows `cursor_trail_color` and live OSC 12. Every trail has a signature typing sound on macOS, and
 Settings ▸ Cursor & Motion ▸ Sound picks any instrument — glass bell, droplet,
 typewriter, marimba, felt — regardless of the trail on screen, or leaves it on
 `auto` to follow it.

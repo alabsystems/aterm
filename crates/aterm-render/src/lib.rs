@@ -21524,8 +21524,32 @@ pub fn ribbon_lift_profile(d: f32, lift_span: f32, dn: f32) -> f32 {
 /// cap behaviour).
 ///
 /// Fewer than two vertices is a no-op. Segments of zero major extent are
-/// skipped; a reversed segment (`b.x < a.x`) is tiled from its own start, which
-/// is how a right-to-left run stays head-first in the vertex order.
+/// skipped. **A REVERSED SEGMENT (`b.x < a.x`, a right-to-left run) IS TILED
+/// OVER THE SAME SLABS AS ITS MIRROR**: tiling always starts at the LOWER
+/// coordinate, `[ceil(min(a.x, b.x)), ceil(max(a.x, b.x)))`, so the same path
+/// in the opposite vertex order lands on the same slabs, sampled at the same
+/// centres and dithered by the same ordinals — bit-identical when the lerps
+/// are rounding-free (the tests' dyadic witness), and otherwise the same
+/// reals computed in the other order (`a + (b − a)·t` against
+/// `b + (a − b)·(1 − t)`), whose `f32` rounding can move a truncated coverage
+/// or colour byte by one level and no more, the path from lerp to byte being
+/// continuous everywhere but at three gates an ulp can fall either side of:
+/// the `cov >= 1.0` admission (harmless without `lift` — an admitted coverage
+/// of 1.0 is itself at most one level — but a lifted slab straddling it is
+/// emitted one way and dropped the other), and the steps a degenerate profile
+/// has by construction (a coreless shouldered one, `core == 0` with
+/// `shoulder < 1`, at its spine; a lifted one whose `lift_span` lerps through
+/// zero). Inside a reversed segment the walk therefore runs tail → head.
+/// Head-first shedding is exact at SEGMENT granularity (every segment nearer
+/// the head than the one the budget ran out in is whole, nothing beyond that
+/// one is emitted), and the one irregularity a cut can leave is inside that
+/// segment, where what survives is its FAR end — a gap never longer than the
+/// segment. A segment of major length `step + e` tiles as a `step` slab and
+/// then at most `ceil(e)` px of trailing slabs, so a producer keeping its
+/// segments within `e` of `step` gets a cut at worst one slab and `ceil(e)`
+/// px short of pixel-exact: the meteor's `e` is its stride's rounding, half a
+/// pixel, plus the ~1 % of the stride its station cap adds on flights past 95
+/// stations — a pixel, two on the longest flights.
 ///
 /// **EVERY PIXEL COLUMN HAS ONE OWNER.** Consecutive segments share their
 /// boundary vertex bit for bit, and the tiling takes it half-open at its
@@ -21677,6 +21701,236 @@ pub fn ribbon_beam(
                                     GlowBlend::Over => c,
                                 },
                             });
+                        }
+                    }
+                }
+            }
+            p += len;
+        }
+    }
+    true
+}
+
+/// Rasterize the RIBBON polyline into per-cell-row [`GlowQuad`]s along a
+/// **Y-MAJOR** path: the exact transpose of [`ribbon_beam`], one anti-aliased
+/// transverse profile per major-axis slab, colour and geometry interpolated
+/// between vertices.
+///
+/// **WHY THE TWIN EXISTS.** [`ribbon_beam`] tiles its major axis in X —
+/// `[ceil(a.x), ceil(b.x))` — and `continue`s any segment whose `|Δx| < 1e-3`.
+/// A vertical or steep flight (a cold `Enter`, a history recall, a vertical
+/// meteor) is made ENTIRELY of such segments, so it emits **zero quads**: the
+/// mark is not thin, not dim, it is absent. That is the defect spec D15 names,
+/// and this is its fix. The rejected alternative — chaining [`comet_beam`] in
+/// three thickness segments — is explicitly not taken: it seams.
+///
+/// **CALLERS PICK BY SLOPE** (§6.1, the axis rule, 2026-09-03):
+/// `|dx| >= |dy|` → [`ribbon_beam`]; `|dy| > |dx|` → this. Neither is a
+/// fallback for the other; each is degenerate on the axis its twin owns, and a
+/// producer that guesses wrong draws nothing rather than drawing badly.
+///
+/// **THE VERTEX FIELDS ARE MAJOR/MINOR, NOT X/Y**, which is why the transpose
+/// needs no second struct. Here [`RibbonVertex::x`] is the sample's
+/// window-absolute **Y**, [`RibbonVertex::spine`] is the centreline's
+/// window-absolute **X**, and `up`/`core_up` — the SHOULDERED side, the side
+/// letterforms are on for the x-major twin — reach toward smaller x (left)
+/// while `dn`/`core_dn` reach right. A producer transposes its own polyline
+/// and changes nothing else.
+///
+/// **ONE QUAD PER DEVICE COLUMN PER SLAB** (`w: 1`), where the x-major twin
+/// emits one per device row (`h: 1`). A column's `h` is the slab's own length,
+/// so unlike the x-major twin's single-pixel row it CAN straddle a cell-row
+/// boundary — and the single-row-band invariant the dirty gate and the GPU
+/// scissor rely on forbids that. Each column is therefore split at the
+/// grid-anchored band edges (the same split `push_glow_rect` performs), and
+/// every piece carries its own band's `row` tag; an above-grid piece tags row
+/// 0, exactly as everywhere else in this file.
+///
+/// Everything else is [`ribbon_beam`] verbatim: the same [`ribbon_profile`],
+/// the same [`ribbon_lift_profile`] bump, the same [`BAYER4`] ordered dither at
+/// the same single `f32 -> u8` truncation, the same [`GlowBlend`] pair, the
+/// same half-open `[ceil, ceil)` slab tiling (so every device ROW of the path
+/// has exactly one owning segment, the transpose of the x-major column-owner
+/// law), and the same sub-pixel transverse edges — a band edge landing 0.3 px
+/// into a column emits 0.3 of that column's coverage.
+///
+/// **THE DITHER IS INDEXED THE SAME WAY, WHICH TRANSPOSES THE PATTERN.** The
+/// x-major twin reads `BAYER4[transverse device coordinate][slab ordinal]`; so
+/// does this one, and its transverse coordinate is X rather than Y, so on
+/// screen the emitted pattern is the transpose of the x-major twin's. That is
+/// deliberate, not an oversight: a transposed Bayer matrix is still an
+/// unbiased 4x4 ordered dither (the same sixteen values, mean exactly 0.5, no
+/// axis it fails to walk), it is still SCREEN-anchored rather than
+/// mark-anchored so it cannot crawl as the mark moves — and it is what makes
+/// the twins' parity pin exact (`the_two_ribbon_axes_are_exact_transposes_of_each_other`)
+/// rather than "equal to within one level".
+///
+/// `shoulder` is the level the profile holds on the `up` side once it leaves
+/// the core; the `dn` side is always drawn at 1.0. `step` is the major-axis
+/// sampling stride in pixels (>= 1) and is the whole resolution/cost dial.
+///
+/// Returns `false` when `max_quads` ran out, having emitted everything it could
+/// up to that point: producers order their vertices HEAD FIRST, so a saturated
+/// budget sheds the ribbon's tail — and it sheds WHOLE COLUMNS, never a column
+/// cut half-way across a band edge: the admission check charges every band a
+/// column will split into (`bands + 1`, the twin's one non-transposed line)
+/// before the column's first piece is pushed. Fewer than two vertices is a
+/// no-op, as is a non-positive `clip.cell_h`. Segments of zero major extent
+/// are skipped. A reversed segment (`b.x < a.x` — a head-first DOWNWARD
+/// flight, since `x` is device Y and the head is the first vertex) is tiled
+/// over the same `[ceil(min), ceil(max))` slabs as its mirror, exactly as in
+/// [`ribbon_beam`]: the same slabs, sampled at the same centres and dithered
+/// by the same ordinals — bit-identical when the lerps are rounding-free,
+/// otherwise within one level of each truncation (the lerps being the same
+/// reals computed in the other order), with the three gate exceptions the
+/// x-major twin documents. Tiling always starts at the lower coordinate, so
+/// inside a reversed segment the walk runs tail → head and head-first
+/// shedding is exact at SEGMENT granularity — the segments nearer the head
+/// than the one the budget ran out in are whole, nothing beyond it is
+/// emitted, and the one irregularity a cut can leave is inside that segment
+/// (its far end survives; a gap never longer than the segment). A segment of
+/// length `step + e` tiles as a `step` slab and at most `ceil(e)` px of
+/// trailing slabs, so the meteor's — `step` up to its stride's rounding and
+/// station cap, a pixel or two over — leave a cut at worst one slab and that
+/// much short of pixel-exact.
+#[allow(clippy::too_many_arguments)]
+pub fn ribbon_beam_v(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+) -> bool {
+    if verts.len() < 2 || clip.cell_h <= 0 {
+        return true;
+    }
+    let step = step.max(1) as i32;
+    for w in verts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let span = b.x - a.x;
+        if !span.is_finite() || span.abs() < 1e-3 {
+            continue;
+        }
+        // Tile the major axis — here Y — in CONTIGUOUS integer slabs, with
+        // every pixel ROW owned by EXACTLY ONE segment. The shared boundary
+        // between two segments is the same `f32` on both sides
+        // (`windows(2)`), so taking it half-open at its ceiling hands a
+        // fractional boundary's row to exactly one of them: the segment the
+        // boundary lands INSIDE, whose trailing sliver already samples t ≈ 1
+        // there. This is the transpose of the x-major twin's column-owner law,
+        // and it exists for the same reason — the bed composites source-over,
+        // and a doubly-owned line composites ~1.8x bright.
+        let (start, end) = (a.x.min(b.x).ceil() as i32, a.x.max(b.x).ceil() as i32);
+        let mut p = start;
+        while p < end {
+            let len = step.min(end - p).max(1);
+            // The slab's CENTRE on the segment: sampling at the leading edge
+            // would bias every ramp half a slab toward the tail.
+            let t = ((p as f32 + len as f32 * 0.5 - a.x) / span).clamp(0.0, 1.0);
+            let lerp = |u: f32, v: f32| u + (v - u) * t;
+            let spine = lerp(a.spine, b.spine);
+            let up = lerp(a.up, b.up);
+            let dn = lerp(a.dn, b.dn);
+            let core_up = lerp(a.core_up, b.core_up);
+            let core_dn = lerp(a.core_dn, b.core_dn);
+            let cov = lerp(a.cov, b.cov);
+            let lift = lerp(a.lift, b.lift).max(0.0);
+            let lift_span = lerp(a.lift_span, b.lift_span);
+            // The transverse extent is X here: `up` reaches LEFT of the spine
+            // (the shouldered side), `dn` reaches right.
+            let left = spine - up;
+            let right = spine + dn;
+            if !left.is_nan() && !right.is_nan() && right > left && cov >= 1.0 {
+                let color = lerp_rgb_f(a.color, b.color, t);
+                let x0 = left.floor() as i32;
+                let x1 = right.ceil() as i32;
+                let dither_p = p.div_euclid(step).rem_euclid(4) as usize;
+                // The slab's Y clip and its grid-band split are identical for
+                // every column of the slab, so resolve both ONCE here rather
+                // than sending each hot column through the generic rectangle
+                // splitter. `bands` is the number of quads one visible column
+                // costs; a fully y-clipped slab is charged 1, which keeps the
+                // admission check below byte-for-byte as conservative as the
+                // x-major twin's flat `+ 2` for its single row.
+                let rect_y0 = p.max(clip.y0);
+                let rect_y1 = (p + len).min(clip.y1);
+                let bands = if rect_y1 > rect_y0 {
+                    ((rect_y1 - 1 - clip.origin_y).div_euclid(clip.cell_h)
+                        - (rect_y0 - clip.origin_y).div_euclid(clip.cell_h)
+                        + 1) as usize
+                } else {
+                    1
+                };
+                for x in x0..x1 {
+                    // Admit the WHOLE column or none of it: a column split
+                    // half-way across a band boundary would leave a visible
+                    // notch, which is exactly what head-first shedding exists
+                    // to avoid.
+                    if out.len() + bands + 1 > max_quads {
+                        return false;
+                    }
+                    let lo = (x as f32).max(left);
+                    let hi = ((x + 1) as f32).min(right);
+                    let cover = hi - lo;
+                    if cover <= 0.0 {
+                        continue;
+                    }
+                    let d = (lo + hi) * 0.5 - spine;
+                    let across = if d < 0.0 {
+                        ribbon_profile(d, core_up, up, shoulder)
+                    } else {
+                        ribbon_profile(d, core_dn, dn, 1.0)
+                    };
+                    // THE SPINE'S OWN LIFT, a second C¹ term over the base
+                    // profile: it is zero wherever the base profile is behind
+                    // letterforms, so the certified pair `(colour, cov)` is
+                    // what lands there and only the leading is brighter.
+                    let level = if lift == 0.0 {
+                        cov * across
+                    } else {
+                        cov * across + lift * ribbon_lift_profile(d, lift_span, dn)
+                    };
+                    // THE ORDERED DITHER, at the last truncation in the whole
+                    // design (see [`BAYER4`]). The offset is under one level,
+                    // so a request already clamped at its cap still truncates
+                    // to that cap — the producer's coverage certificates are
+                    // untouched. Indexed by the transverse device coordinate
+                    // and the slab's ORDINAL (a slab is one flat quad along
+                    // the major axis, so there is no sub-slab coordinate for
+                    // the pattern to vary over, and the stride is normally a
+                    // multiple of four).
+                    let c = (level * cover + BAYER4[x.rem_euclid(4) as usize][dither_p]) as u8;
+                    if c > 0 {
+                        let premul = premul_rgb(color, c);
+                        if premul != 0 && rect_y1 > rect_y0 && x >= clip.x0 && x < clip.x1 {
+                            let alpha = match blend {
+                                GlowBlend::Add => 0,
+                                GlowBlend::Over => c,
+                            };
+                            // Split the column at the grid-anchored band edges
+                            // (floor division: an above-grid `yy` lands in a
+                            // NEGATIVE band whose end is still the next
+                            // grid-anchored cell boundary) so every emitted
+                            // quad sits inside exactly one cell row.
+                            let mut yy = rect_y0;
+                            while yy < rect_y1 {
+                                let row_rel = (yy - clip.origin_y).div_euclid(clip.cell_h);
+                                let band_end =
+                                    (clip.origin_y + (row_rel + 1) * clip.cell_h).min(rect_y1);
+                                out.push(GlowQuad {
+                                    // Damage hint: above-grid bands tag row 0.
+                                    row: row_rel.max(0) as u16,
+                                    x: x as u16,
+                                    y: yy as u16,
+                                    w: 1,
+                                    h: (band_end - yy) as u16,
+                                    color: premul,
+                                    alpha,
+                                });
+                                yy = band_end;
+                            }
                         }
                     }
                 }
@@ -31139,7 +31393,8 @@ mod tests {
 #[cfg(test)]
 mod ribbon_beam_tests {
     use super::{
-        BeamClip, GlowBlend, GlowQuad, RIBBON_CORE_SHARE, RibbonVertex, ribbon_beam, ribbon_profile,
+        BeamClip, GlowBlend, GlowQuad, RIBBON_CORE_SHARE, RibbonVertex, ribbon_beam, ribbon_beam_v,
+        ribbon_profile,
     };
 
     const W: usize = 160;
@@ -31650,6 +31905,918 @@ mod ribbon_beam_tests {
             4,
             100_000,
             crate::GlowBlend::Add
+        ));
+        assert!(none.is_empty());
+    }
+
+    /// **THE TWO AXES ARE EXACT TRANSPOSES OF ONE ANOTHER.** [`ribbon_beam_v`]
+    /// exists to draw the paths [`ribbon_beam`] refuses (spec D15), and the
+    /// only thing that makes a second rasterizer trustworthy is that it is the
+    /// SAME rasterizer with its walk turned ninety degrees: one
+    /// [`ribbon_profile`], one lift bump, one Bayer dither, one blend, the same
+    /// sub-pixel transverse edges. This is that contract, pinned.
+    ///
+    /// **THE MEASUREMENT.** Rasterize one 45° path through both. The vertex
+    /// struct is already stated in MAJOR/MINOR terms rather than x/y, so
+    /// "swap x and y in the inputs" is the identity on it — the twin reads
+    /// `x` as the sample's device Y and `spine` as its device X. Under a clip
+    /// box that is itself symmetric about the diagonal, the two quad sets must
+    /// be exact mirrors: same count, same coverage multiset, every coordinate
+    /// reflected `(x, y, w, h) -> (y, x, h, w)`. The `row` tag is deliberately
+    /// outside the comparison — it is a grid-row DAMAGE hint, derived from
+    /// real device Y on both axes, so it is the one field a transpose must not
+    /// move.
+    #[test]
+    fn the_two_ribbon_axes_are_exact_transposes_of_each_other() {
+        // Symmetric about the diagonal, and ONE cell band across the whole
+        // box — so a y-major column is never split at a band edge and the two
+        // sets are comparable quad for quad.
+        let clip = BeamClip {
+            x0: 0,
+            y0: 0,
+            x1: 128,
+            y1: 128,
+            cell_h: 128,
+            origin_y: 0,
+        };
+        // 45°: the minor coordinate advances exactly as fast as the major one,
+        // so neither primitive is on its degenerate axis. Reach, core, colour
+        // and coverage all vary along the path, which puts the lerps, the
+        // shoulder, the profile and the colour ramp inside the comparison.
+        let verts = [
+            vert(20.0, 20.0, 14.0, 5.0, 0x00FF_2010, 210.0),
+            vert(56.5, 56.5, 9.0, 3.5, 0x0020_FF40, 150.0),
+            vert(96.0, 96.0, 5.0, 2.0, 0x0010_30FF, 96.0),
+        ];
+        // …and the same path carrying the spine's LIFT, so the second C¹ term
+        // is transposed too and not merely the base profile.
+        let lifted: Vec<RibbonVertex> = verts
+            .iter()
+            .map(|&v| RibbonVertex {
+                lift: 40.0,
+                lift_span: 3.0,
+                ..v
+            })
+            .collect();
+        for path in [&verts[..], &lifted[..]] {
+            for blend in [GlowBlend::Add, GlowBlend::Over] {
+                let mut major_x = Vec::new();
+                let mut major_y = Vec::new();
+                assert!(ribbon_beam(
+                    &mut major_x,
+                    clip,
+                    path,
+                    0.55,
+                    4,
+                    100_000,
+                    blend
+                ));
+                assert!(ribbon_beam_v(
+                    &mut major_y,
+                    clip,
+                    path,
+                    0.55,
+                    4,
+                    100_000,
+                    blend
+                ));
+                assert!(!major_x.is_empty(), "the witness must actually paint");
+                assert_eq!(
+                    major_x.len(),
+                    major_y.len(),
+                    "the transpose emits quad for quad ({blend:?})"
+                );
+                // The twin's SHAPE law, read off the primitives: one quad per
+                // device COLUMN where the x-major twin emits one per device
+                // ROW.
+                assert!(major_x.iter().all(|q| q.h == 1));
+                assert!(major_y.iter().all(|q| q.w == 1));
+                // Mirror the x-major set about the diagonal and compare as
+                // multisets — the emission ORDER transposes as well, so the
+                // comparison is order-free by construction.
+                let mut mirrored: Vec<(u16, u16, u16, u16, u32, u8)> = major_x
+                    .iter()
+                    .map(|q| (q.y, q.x, q.h, q.w, q.color, q.alpha))
+                    .collect();
+                let mut got: Vec<(u16, u16, u16, u16, u32, u8)> = major_y
+                    .iter()
+                    .map(|q| (q.x, q.y, q.w, q.h, q.color, q.alpha))
+                    .collect();
+                mirrored.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(
+                    mirrored, got,
+                    "the y-major twin is not the transpose of the x-major one \
+                     ({blend:?})"
+                );
+            }
+        }
+    }
+
+    /// **A VERTICAL FLIGHT PAINTS THROUGH THE TWIN AND NOWHERE ELSE** — the
+    /// defect spec D15 names, pinned from both sides so the twin can never be
+    /// deleted as redundant. [`ribbon_beam`] tiles `[ceil(a.x), ceil(b.x))`
+    /// and `continue`s any segment whose `|Δx| < 1e-3`; a device-vertical path
+    /// (a cold `Enter`, a history recall, a vertical meteor) is made ENTIRELY
+    /// of such segments, so it emits ZERO quads — the mark is not thin, not
+    /// dim, it is absent. Expressed major-first, the identical device path
+    /// paints through [`ribbon_beam_v`].
+    #[test]
+    fn a_vertical_path_paints_only_through_the_transposed_twin() {
+        // ONE device polyline: a column of pixels at x = 64, running down.
+        let path = [(64.0f32, 24.0f32), (64.0, 60.0), (64.0, 96.0)];
+        // As the X-MAJOR primitive reads it — `x` is device X, `spine` is
+        // device Y — every segment has zero major extent.
+        let flat: Vec<RibbonVertex> = path
+            .iter()
+            .map(|&(px, py)| vert(px, py, 9.0, 4.0, 0x00FF_C020, 200.0))
+            .collect();
+        let mut none = Vec::new();
+        assert!(ribbon_beam(
+            &mut none,
+            clip(),
+            &flat,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        assert!(
+            none.is_empty(),
+            "the x-major primitive draws NOTHING on a vertical path — the \
+             defect the twin exists for — but emitted {} quads",
+            none.len()
+        );
+        // As the Y-MAJOR twin reads it — `x` is device Y, `spine` is device X.
+        let turned: Vec<RibbonVertex> = path
+            .iter()
+            .map(|&(px, py)| vert(py, px, 9.0, 4.0, 0x00FF_C020, 200.0))
+            .collect();
+        let mut out = Vec::new();
+        assert!(ribbon_beam_v(
+            &mut out,
+            clip(),
+            &turned,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        assert!(!out.is_empty(), "the twin paints the same path");
+        // …and it paints THAT path, not merely something: every quad is one
+        // device column inside the mark's own transverse reach around x = 64
+        // (spine − up = 55, spine + dn = 68), and the flight is CONTINUOUS
+        // down its whole major extent — no slab dropped, no gap at a segment
+        // boundary.
+        assert!(out.iter().all(|q| q.w == 1));
+        let cols: std::collections::BTreeSet<u16> = out.iter().map(|q| q.x).collect();
+        assert!(
+            cols.iter().all(|&x| (55..=68).contains(&x)),
+            "the mark keeps to its own transverse reach: {cols:?}"
+        );
+        assert!(cols.contains(&64), "…and the spine itself is lit");
+        let lit: std::collections::BTreeSet<u16> =
+            out.iter().flat_map(|q| q.y..q.y + q.h).collect();
+        for y in 24u16..96 {
+            assert!(
+                lit.contains(&y),
+                "the flight is continuous down its major axis; row {y} is dark"
+            );
+        }
+    }
+
+    /// **THE CLIP READS THE SAME ON BOTH AXES.** A flight that runs out of the
+    /// effects box must lose exactly the pixels outside it and keep exactly
+    /// the pixels inside — the law [`ribbon_beam`] already holds, mirrored.
+    /// The witness leaves the box at BOTH ends of its major axis and hangs its
+    /// transverse reach over BOTH transverse edges in the middle, so the major
+    /// clamp and the per-pixel transverse rejection are each exercised; under
+    /// a box symmetric about the diagonal what survives on one axis must be
+    /// the exact transpose of what survives on the other.
+    #[test]
+    fn the_transposed_twin_clips_exactly_as_its_x_major_twin_does() {
+        let clip = BeamClip {
+            x0: 24,
+            y0: 24,
+            x1: 100,
+            y1: 100,
+            cell_h: 100,
+            origin_y: 0,
+        };
+        let verts = [
+            vert(-30.0, 30.0, 36.0, 30.0, 0x00FF_4020, 220.0),
+            vert(150.0, 100.0, 30.0, 26.0, 0x0040_20FF, 150.0),
+        ];
+        let mut major_x = Vec::new();
+        let mut major_y = Vec::new();
+        assert!(ribbon_beam(
+            &mut major_x,
+            clip,
+            &verts,
+            0.55,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        assert!(ribbon_beam_v(
+            &mut major_y,
+            clip,
+            &verts,
+            0.55,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        assert!(
+            !major_x.is_empty() && !major_y.is_empty(),
+            "the witness must survive the clip with something to compare"
+        );
+        let inside = |q: &GlowQuad| {
+            i32::from(q.x) >= clip.x0
+                && i32::from(q.x + q.w) <= clip.x1
+                && i32::from(q.y) >= clip.y0
+                && i32::from(q.y + q.h) <= clip.y1
+        };
+        assert!(major_x.iter().all(inside));
+        assert!(
+            major_y.iter().all(inside),
+            "the transposed twin let a quad out of the effects box"
+        );
+        // Non-vacuous: the path really is bigger than the box on both axes.
+        assert!(
+            major_y.iter().map(|q| q.x).min() == Some(clip.x0 as u16)
+                && major_y.iter().map(|q| q.y).min() == Some(clip.y0 as u16),
+            "the witness must actually reach the near edges it is clipped at"
+        );
+        let mut mirrored: Vec<(u16, u16, u16, u16, u32, u8)> = major_x
+            .iter()
+            .map(|q| (q.y, q.x, q.h, q.w, q.color, q.alpha))
+            .collect();
+        let mut got: Vec<(u16, u16, u16, u16, u32, u8)> = major_y
+            .iter()
+            .map(|q| (q.x, q.y, q.w, q.h, q.color, q.alpha))
+            .collect();
+        mirrored.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(
+            mirrored, got,
+            "the two axes disagree about what the clip kept"
+        );
+    }
+
+    /// **A TRANSPOSED COLUMN NEVER STRADDLES A CELL ROW.** The x-major twin's
+    /// quads are one device row tall and so cannot cross a band boundary; a
+    /// y-major column is the slab's WHOLE length and can, which is the one
+    /// place the transpose is not free. The dirty gate and the GPU scissor
+    /// read `row` as the band a quad lives in, so a quad spanning two of them
+    /// is a mis-scissored draw, not a cosmetic slip — the twin splits every
+    /// column at the grid-anchored band edges, exactly as `push_glow_rect`
+    /// does, and each piece carries its own band's tag (an above-grid piece
+    /// tags row 0).
+    ///
+    /// Stride 5 against `cell_h` 7 puts a slab edge inside a band on purpose,
+    /// and `origin_y` 10 with `y0` 2 puts the head of the flight ABOVE the
+    /// grid, in a negative band.
+    ///
+    /// **AND THE PIECES RE-TILE THE COLUMN EXACTLY** — containment alone would
+    /// pass a split that skipped a row, dropped its last piece or doubled the
+    /// boundary row (a dark or ~1.8×-bright hairline on every cell edge of a
+    /// vertical train, the comb class the owner already reported on the
+    /// ribbon). So: no pixel has two owners, and the surface is pixel for
+    /// pixel the transpose of the x-major twin's under the transposed clip —
+    /// whose rows are one pixel tall and never split, so it is the unsplit
+    /// ground truth.
+    #[test]
+    fn a_transposed_column_is_split_at_every_cell_row_boundary() {
+        let clip = BeamClip {
+            x0: 5,
+            y0: 2,
+            x1: 40,
+            y1: 60,
+            cell_h: 7,
+            origin_y: 10,
+        };
+        let verts = [
+            vert(0.0, 20.0, 9.0, 5.0, 0x00ff_8040, 190.0),
+            vert(64.0, 20.0, 9.0, 5.0, 0x00ff_8040, 190.0),
+        ];
+        let mut out = Vec::new();
+        assert!(ribbon_beam_v(
+            &mut out,
+            clip,
+            &verts,
+            1.0,
+            5,
+            100_000,
+            GlowBlend::Add
+        ));
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|q| {
+            let first = (i32::from(q.y) - clip.origin_y).div_euclid(clip.cell_h);
+            let last = (i32::from(q.y + q.h) - 1 - clip.origin_y).div_euclid(clip.cell_h);
+            q.w == 1
+                && q.h >= 1
+                && i32::from(q.x) >= clip.x0
+                && i32::from(q.x + q.w) <= clip.x1
+                && i32::from(q.y) >= clip.y0
+                && i32::from(q.y + q.h) <= clip.y1
+                && first == last
+                && q.row == first.max(0) as u16
+        }));
+        assert!(
+            out.iter().any(|q| q.row == 0) && out.iter().any(|q| q.row > 1),
+            "the witness must cross the grid origin and several band boundaries"
+        );
+        assert!(
+            out.iter().any(|q| q.h < 5),
+            "…and at least one column must actually have been SPLIT short of \
+             its stride"
+        );
+        // OWNERSHIP, read off the primitives (a composite would hide a double
+        // under saturation): no pixel is covered by two pieces.
+        let mut owners = std::collections::BTreeMap::new();
+        for q in &out {
+            for y in q.y..q.y + q.h {
+                *owners.entry((y, q.x)).or_insert(0u32) += 1;
+            }
+        }
+        let doubled: Vec<_> = owners.iter().filter(|&(_, &n)| n > 1).collect();
+        assert!(
+            doubled.is_empty(),
+            "a pixel is owned by two pieces (a doubled band edge): {doubled:?}"
+        );
+        // COMPLETENESS: the x-major twin draws the identical mark one device
+        // row at a time under the transposed clip, and its surface transposed
+        // must be this surface exactly — a gapped or dropped piece at any band
+        // edge is a missing pixel here.
+        let transposed = BeamClip {
+            x0: clip.y0,
+            y0: clip.x0,
+            x1: clip.y1,
+            y1: clip.x1,
+            cell_h: clip.cell_h,
+            origin_y: clip.origin_y,
+        };
+        let mut flat = Vec::new();
+        assert!(ribbon_beam(
+            &mut flat,
+            transposed,
+            &verts,
+            1.0,
+            5,
+            100_000,
+            GlowBlend::Add
+        ));
+        assert!(flat.iter().all(|q| q.h == 1));
+        let mirrored: std::collections::BTreeMap<(i32, i32), u32> = paint(&flat)
+            .into_iter()
+            .map(|((y, x), c)| ((x, y), c))
+            .collect();
+        assert_eq!(
+            mirrored,
+            paint(&out),
+            "the band-split pieces do not re-tile the unsplit column"
+        );
+    }
+
+    /// The two rasterizers as one shape, so a law can be stated of BOTH.
+    type Beam =
+        fn(&mut Vec<GlowQuad>, BeamClip, &[RibbonVertex], f32, usize, usize, GlowBlend) -> bool;
+    /// A quad's MAJOR-axis coordinate — device X for the x-major twin, device
+    /// Y for the y-major one.
+    type Major = fn(&GlowQuad) -> u16;
+
+    /// **A REVERSED POLYLINE IS THE SAME MARK.** Tiling starts at the LOWER
+    /// major coordinate whichever way a segment runs — `[ceil(min), ceil(max))`
+    /// — so the same path in the opposite vertex order lands on the same
+    /// slabs, samples them at the same centres and dithers them by the same
+    /// ordinals: with rounding-free lerps the quad multiset is identical, on
+    /// both axes (the non-dyadic law is pinned separately below). That is what a
+    /// mirrored flight (Home ↔ End; a downward Enter through the twin) relies
+    /// on, and it is what a `continue` on a negative span or a walk anchored
+    /// at the segment's own start would break. The segments are still walked
+    /// in VERTEX order — the head segment's quads come first — which is the
+    /// granularity at which head-first shedding is exact.
+    ///
+    /// The comparison is EXACT, not "within a level": 32-px spans with 4-px
+    /// slabs make every `t` a dyadic fraction and every per-vertex field is
+    /// dyadic too (the cores are set by hand — `vert`'s `0.2 × up` is not),
+    /// so the forward and reversed lerps are the same reals computed without
+    /// rounding.
+    #[test]
+    fn a_reversed_polyline_paints_the_same_mark_on_both_axes() {
+        let forward = [
+            RibbonVertex {
+                core_up: 2.75,
+                core_dn: 1.0,
+                ..vert(0.0, 40.0, 14.0, 5.0, 0x00FF_2010, 210.0)
+            },
+            RibbonVertex {
+                core_up: 1.75,
+                core_dn: 0.75,
+                ..vert(32.0, 52.0, 9.0, 3.5, 0x0020_FF40, 150.0)
+            },
+            RibbonVertex {
+                core_up: 1.0,
+                core_dn: 0.5,
+                ..vert(64.0, 60.0, 5.0, 2.0, 0x0010_30FF, 96.0)
+            },
+        ];
+        let lifted: Vec<RibbonVertex> = forward
+            .iter()
+            .map(|&v| RibbonVertex {
+                lift: 40.0,
+                lift_span: 3.0,
+                ..v
+            })
+            .collect();
+        let beams: [(&str, Beam, Major); 2] = [
+            ("x-major", ribbon_beam, |q| q.x),
+            ("y-major", ribbon_beam_v, |q| q.y),
+        ];
+        for path in [&forward[..], &lifted[..]] {
+            let reversed: Vec<RibbonVertex> = path.iter().rev().copied().collect();
+            for blend in [GlowBlend::Add, GlowBlend::Over] {
+                for (name, beam, major) in beams {
+                    let mut fwd = Vec::new();
+                    let mut rev = Vec::new();
+                    assert!(beam(&mut fwd, clip(), path, 0.55, 4, 100_000, blend));
+                    assert!(beam(&mut rev, clip(), &reversed, 0.55, 4, 100_000, blend));
+                    assert!(!fwd.is_empty(), "the witness must paint ({name})");
+                    let key = |q: &GlowQuad| (q.row, q.x, q.y, q.w, q.h, q.color, q.alpha);
+                    let mut a: Vec<_> = fwd.iter().map(key).collect();
+                    let mut b: Vec<_> = rev.iter().map(key).collect();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    assert_eq!(
+                        a, b,
+                        "the reversed polyline is a different mark ({name}, {blend:?})"
+                    );
+                    // Vertex order still orders the SEGMENTS: the reversed
+                    // path's head segment (major 32..64) is emitted first and
+                    // its tail segment last.
+                    assert!(
+                        major(&rev[0]) >= 32 && major(rev.last().expect("lit")) < 32,
+                        "segments must be walked in vertex order ({name})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A REVERSED NON-DYADIC POLYLINE IS THE SAME MARK TO WITHIN A LEVEL.**
+    /// The dyadic witness above pins bit-identity where the lerps are exact;
+    /// this pins what the law promises everywhere else. Non-dyadic spans,
+    /// spines, reaches, cores and coverages make every `t` and every lerp
+    /// round, and the two directions compute the same reals in the other
+    /// order (`a + (b − a)·t` against `b + (a − b)·(1 − t)`), so their `f32`s
+    /// differ by ulps — enough to move an `as u8` truncation by ONE level,
+    /// never more. Pinned per PIXEL, a missing quad counting as zero: under
+    /// [`GlowBlend::Over`] a quad's `alpha` IS the truncated coverage, so it
+    /// may differ by at most 1, and a premultiplied channel
+    /// (`round(ch × c / 255)`, `ch` and `c` each at most one off) by at most
+    /// 2. The witness is chosen so the rounding actually BITES: most coverage
+    /// triples truncate to the same bytes both ways (an ulp only tells when a
+    /// level boundary lies inside it), and a bound nothing approaches pins
+    /// nothing, so the sweep must find at least one pixel where the two
+    /// directions differ — this triple is one an `f32` emulation of the walk
+    /// turned up. What it catches: a ramp measured from the segment's
+    /// lower end rather than its first vertex (which mirrors every reversed
+    /// segment's colours and coverages, tens of levels) fails the per-pixel
+    /// bound; tiling from `floor(min)` fails the column-owner check the pixel
+    /// map performs (the shared vertex's column is emitted twice). A wrongly
+    /// KEYED dither is not this test's business — a different Bayer cell
+    /// moves a byte by at most one level, inside the bound — it is pinned by
+    /// `the_dither_is_anchored_to_the_screen_not_the_mark`.
+    #[test]
+    fn a_reversed_non_dyadic_polyline_is_the_same_mark_to_within_a_level() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let forward = [
+            vert(0.3, 40.3, 14.3, 5.7, 0x00FF_2010, 151.5),
+            vert(31.7, 52.9, 9.1, 3.3, 0x0020_FF40, 113.1),
+            vert(63.1, 60.7, 5.3, 2.1, 0x0010_30FF, 96.1),
+        ];
+        let lifted: Vec<RibbonVertex> = forward
+            .iter()
+            .map(|&v| RibbonVertex {
+                lift: 40.3,
+                lift_span: 3.1,
+                ..v
+            })
+            .collect();
+        // Every device pixel of a mark: x-major quads are one row tall and
+        // `w` wide, y-major ones one column wide and `h` tall.
+        fn pixels(quads: &[GlowQuad], name: &str) -> BTreeMap<(u16, u16), (u32, u8)> {
+            let mut map = BTreeMap::new();
+            for q in quads {
+                for x in q.x..q.x + q.w {
+                    for y in q.y..q.y + q.h {
+                        assert!(
+                            map.insert((x, y), (q.color, q.alpha)).is_none(),
+                            "pixel ({x}, {y}) emitted twice ({name})"
+                        );
+                    }
+                }
+            }
+            map
+        }
+        let beams: [(&str, Beam); 2] = [("x-major", ribbon_beam), ("y-major", ribbon_beam_v)];
+        let mut differing = 0usize;
+        for path in [&forward[..], &lifted[..]] {
+            let reversed: Vec<RibbonVertex> = path.iter().rev().copied().collect();
+            for blend in [GlowBlend::Add, GlowBlend::Over] {
+                for (name, beam) in beams {
+                    let mut fwd = Vec::new();
+                    let mut rev = Vec::new();
+                    assert!(beam(&mut fwd, clip(), path, 0.55, 4, 100_000, blend));
+                    assert!(beam(&mut rev, clip(), &reversed, 0.55, 4, 100_000, blend));
+                    let (a, b) = (pixels(&fwd, name), pixels(&rev, name));
+                    assert!(a.len() > 500, "the witness must paint a real mark ({name})");
+                    let keys: BTreeSet<(u16, u16)> = a.keys().chain(b.keys()).copied().collect();
+                    for k in keys {
+                        let (ca, aa) = a.get(&k).copied().unwrap_or((0, 0));
+                        let (cb, ab) = b.get(&k).copied().unwrap_or((0, 0));
+                        differing += usize::from((ca, aa) != (cb, ab));
+                        assert!(
+                            aa.abs_diff(ab) <= 1,
+                            "pixel {k:?}: coverage {aa} vs {ab} reversed ({name}, {blend:?})"
+                        );
+                        for sh in [16, 8, 0] {
+                            let (u, v) = ((ca >> sh) & 0xff, (cb >> sh) & 0xff);
+                            assert!(
+                                u.abs_diff(v) <= 2,
+                                "pixel {k:?}: channel {sh} {u} vs {v} reversed ({name}, {blend:?})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            differing >= 1,
+            "the witness must round differently somewhere, or the bound pins nothing"
+        );
+    }
+
+    /// **THE DITHER IS ANCHORED TO THE SCREEN, NOT THE MARK.** Both
+    /// rasterizers key their Bayer cell off the slab's SCREEN ordinal
+    /// (`p / step`) and the transverse device coordinate, never off the walk,
+    /// which is what keeps the pattern from crawling as a mark moves. So a
+    /// mark moved ONE slab along its major axis meets a different matrix
+    /// column at every slab — some of its truncations change, each by at most
+    /// one level, a Bayer cell being under a level — while a mark moved FOUR
+    /// slabs meets the same columns again and is a pure translation, byte for
+    /// byte. A dither keyed off the walk instead (`(p − start) / step`, riding
+    /// along with the mark) makes the one-slab move a pure translation too and
+    /// fails here. Integer vertices on the slab lattice, so the moved mark's
+    /// tiling is exactly the translated tiling and its lerps the same reals,
+    /// and the dither is the only thing that can differ.
+    #[test]
+    fn the_dither_is_anchored_to_the_screen_not_the_mark() {
+        use std::collections::{BTreeMap, BTreeSet};
+        const STEP: usize = 4;
+        let beams: [(&str, Beam, bool); 2] = [
+            ("x-major", ribbon_beam, true),
+            ("y-major", ribbon_beam_v, false),
+        ];
+        for (name, beam, x_major) in beams {
+            // The mark's pixels, keyed by device position translated BACK by
+            // `by` along the major axis, so a moved mark reads as the unmoved.
+            let pixels = |at: f32, by: u16| -> BTreeMap<(u16, u16), (u32, u8)> {
+                let verts = [
+                    vert(at, 40.0, 9.0, 5.0, 0x00FF_8040, 190.3),
+                    vert(at + 32.0, 52.0, 9.0, 5.0, 0x0020_FF40, 150.7),
+                ];
+                let mut quads = Vec::new();
+                assert!(beam(
+                    &mut quads,
+                    clip(),
+                    &verts,
+                    0.55,
+                    STEP,
+                    100_000,
+                    GlowBlend::Over
+                ));
+                let mut map = BTreeMap::new();
+                for q in &quads {
+                    for x in q.x..q.x + q.w {
+                        for y in q.y..q.y + q.h {
+                            let key = if x_major { (x - by, y) } else { (x, y - by) };
+                            assert!(
+                                map.insert(key, (q.color, q.alpha)).is_none(),
+                                "pixel {key:?} emitted twice ({name})"
+                            );
+                        }
+                    }
+                }
+                map
+            };
+            let (here, one_slab, four_slabs) = (pixels(8.0, 0), pixels(12.0, 4), pixels(24.0, 16));
+            assert!(
+                here.len() > 200,
+                "the witness must paint a real mark ({name})"
+            );
+            assert_eq!(
+                four_slabs, here,
+                "four slabs on is a pure translation ({name})"
+            );
+            let keys: BTreeSet<(u16, u16)> = here.keys().chain(one_slab.keys()).copied().collect();
+            let mut changed = 0usize;
+            for k in keys {
+                let (ca, aa) = here.get(&k).copied().unwrap_or((0, 0));
+                let (cb, ab) = one_slab.get(&k).copied().unwrap_or((0, 0));
+                changed += usize::from((ca, aa) != (cb, ab));
+                assert!(
+                    aa.abs_diff(ab) <= 1,
+                    "pixel {k:?}: a Bayer cell moves a byte by at most one level, not {aa} → {ab} ({name})"
+                );
+            }
+            assert!(
+                changed > 0,
+                "one slab on must meet a different matrix column somewhere ({name})"
+            );
+        }
+    }
+
+    /// **A SEGMENT NO LONGER THAN `step` IS ONE SLAB; AN EXCESS `e` ADDS AT
+    /// MOST `ceil(e)` PIXELS.** The tiling arithmetic the rasterizer doc's
+    /// `step + e` sentence rests on, on both axes: a segment of major length
+    /// `≤ step` tiles `[ceil(min), ceil(max))` as ONE slab wherever it starts
+    /// (the historical `floor(min)..ceil(max)` gave a fractional origin two),
+    /// and one of `step + e` covers at most `step + ceil(e)` pixels — a `step`
+    /// slab and then ONE trailing slab of at most `ceil(e)` px, never a third,
+    /// and not always a second at all: whether an excess costs a pixel depends
+    /// on where the origin falls. Swept over sub-pixel origins and the
+    /// excesses the meteor can show (its stride's rounding, half a pixel; its
+    /// station cap, a little more), head first (reversed) as the meteor states
+    /// a downward flight.
+    #[test]
+    fn a_segment_no_longer_than_step_is_one_slab_and_an_excess_adds_at_most_its_ceiling_in_pixels()
+    {
+        use std::collections::BTreeSet;
+        const STEP: usize = 6;
+        type Extent = fn(&GlowQuad) -> (u16, u16);
+        let beams: [(&str, Beam, Extent); 2] = [
+            ("x-major", ribbon_beam, |q| (q.x, q.w)),
+            ("y-major", ribbon_beam_v, |q| (q.y, q.h)),
+        ];
+        let (mut two_slabs, mut one_slab_longer) = (0, 0);
+        for (name, beam, extent) in beams {
+            for twentieth in 0..20 {
+                let origin = 4.0 + twentieth as f32 / 20.0;
+                for excess in [-0.5f32, 0.0, 0.5, 0.9, 1.5] {
+                    let len = STEP as f32 + excess;
+                    // Head first: the head sits at the HIGHER coordinate.
+                    let verts = [
+                        vert(origin + len, 40.0, 9.0, 5.0, 0x00FF_8040, 200.0),
+                        vert(origin, 40.0, 9.0, 5.0, 0x00FF_8040, 200.0),
+                    ];
+                    let mut quads = Vec::new();
+                    assert!(beam(
+                        &mut quads,
+                        clip(),
+                        &verts,
+                        1.0,
+                        STEP,
+                        100_000,
+                        GlowBlend::Add
+                    ));
+                    let slabs: Vec<(u16, u16)> = quads
+                        .iter()
+                        .map(extent)
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    let (first, rest) = slabs.split_first().expect("the segment must paint");
+                    let covered: usize = slabs.iter().map(|&(_, n)| usize::from(n)).sum();
+                    if excess <= 0.0 {
+                        assert!(
+                            rest.is_empty() && covered <= STEP,
+                            "{name} origin {origin} len {len}: one slab, not {slabs:?}"
+                        );
+                    } else {
+                        let allowed = excess.ceil() as usize;
+                        assert!(
+                            covered <= STEP + allowed,
+                            "{name} origin {origin} len {len}: over step + {allowed} px: {slabs:?}"
+                        );
+                        match rest {
+                            [] => one_slab_longer += 1,
+                            [second] => {
+                                assert!(
+                                    usize::from(first.1) == STEP
+                                        && second.0 == first.0 + STEP as u16
+                                        && usize::from(second.1) <= allowed,
+                                    "{name} origin {origin} len {len}: a step slab then one trailing slab of at most {allowed} px, not {slabs:?}"
+                                );
+                                two_slabs += 1;
+                            }
+                            _ => panic!("{name} origin {origin} len {len}: three slabs {slabs:?}"),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            two_slabs > 0 && one_slab_longer > 0,
+            "the sweep must see the rounding both cost a pixel and not ({two_slabs}, {one_slab_longer})"
+        );
+    }
+
+    /// **A SATURATED BUDGET ON A DOWNWARD FLIGHT SHEDS BY WHOLE SEGMENTS.**
+    /// The twin tiles a reversed segment (`b.x < a.x`: a head-first DOWNWARD
+    /// flight, `x` being device Y) from its lower coordinate, so head-first
+    /// shedding is exact at SEGMENT granularity and no finer — the law the
+    /// function documents. Swept over EVERY saturating cap: the primitive
+    /// reports the cut; the cut is a prefix; every segment nearer the head
+    /// than the one the budget ran out in is whole; nothing beyond that
+    /// segment is emitted; and what survives of it is ONE contiguous run, so
+    /// the gap is confined to that one segment. (WHERE inside the segment the
+    /// run lies is the lower-coordinate walk's business and deliberately not
+    /// pinned — a producer keeps its segments near `step`, as the meteor does,
+    /// so the difference is one slab plus the excess, the rasterizer doc's
+    /// `step + e` bound.)
+    #[test]
+    fn a_saturated_budget_on_a_downward_flight_sheds_by_whole_segments() {
+        // Head at device y = 64, tail at 0: four 16-px segments of four 4-px
+        // slabs each, ALL reversed.
+        const SEG: i32 = 16;
+        let verts: Vec<RibbonVertex> = (0..=4)
+            .rev()
+            .map(|k| vert((k * SEG) as f32, 20.0, 9.0, 5.0, 0x00FF_8040, 190.0))
+            .collect();
+        let mut full = Vec::new();
+        assert!(ribbon_beam_v(
+            &mut full,
+            clip(),
+            &verts,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Add
+        ));
+        let mut inside_a_segment = 0;
+        for cap in 1..full.len() {
+            let mut cut = Vec::new();
+            assert!(
+                !ribbon_beam_v(&mut cut, clip(), &verts, 1.0, 4, cap, GlowBlend::Add),
+                "cap {cap}: a saturated budget reports it"
+            );
+            assert!(cut.len() <= cap && cut.len() < full.len());
+            assert_eq!(
+                cut.as_slice(),
+                &full[..cut.len()],
+                "cap {cap}: not a prefix"
+            );
+            let lit: std::collections::BTreeSet<i32> = cut
+                .iter()
+                .flat_map(|q| i32::from(q.y)..i32::from(q.y + q.h))
+                .collect();
+            // From the head segment toward the tail: whole, whole, …, then at
+            // most one partial (and contiguous) segment, then nothing.
+            let mut beyond = false;
+            for k in (0..4).rev() {
+                let rows: Vec<i32> = lit.range(k * SEG..(k + 1) * SEG).copied().collect();
+                let n = rows.len() as i32;
+                if beyond {
+                    assert_eq!(
+                        n, 0,
+                        "cap {cap}: light beyond the segment the budget ran out in: {rows:?}"
+                    );
+                } else if n < SEG {
+                    beyond = true;
+                    if let (Some(&lo), Some(&hi)) = (rows.first(), rows.last()) {
+                        assert_eq!(
+                            n,
+                            hi - lo + 1,
+                            "cap {cap}: the cut segment's survivors are not one run: {rows:?}"
+                        );
+                        inside_a_segment += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            inside_a_segment > 0,
+            "the sweep must land inside a segment at least once"
+        );
+    }
+
+    /// **THE TWIN'S BUDGET STOPS IT, AND IT STOPS ON A WHOLE COLUMN.** The one
+    /// line of the twin that is not a transpose of the x-major's flat `+ 2`
+    /// admission: a y-major column splits into as many pieces as the cell-row
+    /// bands it crosses, so the check charges `bands + 1` BEFORE the column's
+    /// first piece — a column is emitted whole or not at all, never cut at a
+    /// band edge (which would notch a cell boundary at the tail of every
+    /// capped vertical train). Swept over EVERY saturating cap under a
+    /// multi-band clip whose 16-px stride crosses up to four 7-px bands: the
+    /// primitive reports the cut; the cut never exceeds the cap (a `+ 2`
+    /// regression overshoots by up to `bands − 1`); the cut is a prefix; and
+    /// the last column present carries every piece the uncapped run gives it
+    /// (a per-piece check would cut it mid-way). Degenerate inputs are no-ops,
+    /// as documented.
+    #[test]
+    fn a_saturated_budget_sheds_whole_columns_on_the_transposed_twin() {
+        let clip = BeamClip {
+            x0: 5,
+            y0: 2,
+            x1: 40,
+            y1: 60,
+            cell_h: 7,
+            origin_y: 10,
+        };
+        let verts = [
+            vert(0.0, 20.0, 12.0, 6.0, 0x00ff_8040, 190.0),
+            vert(64.0, 20.0, 12.0, 6.0, 0x00ff_8040, 190.0),
+        ];
+        let mut full = Vec::new();
+        assert!(ribbon_beam_v(
+            &mut full,
+            clip,
+            &verts,
+            1.0,
+            16,
+            100_000,
+            GlowBlend::Add
+        ));
+        // A column's pieces are pushed consecutively, y-contiguous, at one x;
+        // `bounds` marks where each column starts (plus the end).
+        let mut bounds: Vec<usize> = (0..full.len())
+            .filter(|&i| {
+                i == 0 || full[i].x != full[i - 1].x || full[i].y != full[i - 1].y + full[i - 1].h
+            })
+            .collect();
+        bounds.push(full.len());
+        assert!(
+            bounds.windows(2).any(|w| w[1] - w[0] >= 4),
+            "the witness must have a column split into four bands"
+        );
+        let mut split_at_cut = 0;
+        for cap in 1..full.len() {
+            let mut cut = Vec::new();
+            assert!(
+                !ribbon_beam_v(&mut cut, clip, &verts, 1.0, 16, cap, GlowBlend::Add),
+                "cap {cap}: a saturated budget reports it"
+            );
+            assert!(
+                cut.len() <= cap,
+                "cap {cap}: emitted {} — the cap is a ceiling, not a hint",
+                cut.len()
+            );
+            assert_eq!(
+                cut.as_slice(),
+                &full[..cut.len()],
+                "cap {cap}: not a prefix"
+            );
+            if cut.is_empty() {
+                continue;
+            }
+            let (i, &end) = bounds
+                .iter()
+                .enumerate()
+                .find(|&(_, &b)| b >= cut.len())
+                .expect("the cut ends inside the full run");
+            assert_eq!(
+                end,
+                cut.len(),
+                "cap {cap}: the last column was cut mid-way through its pieces"
+            );
+            if end - bounds[i - 1] > 1 {
+                split_at_cut += 1;
+            }
+        }
+        assert!(
+            split_at_cut > 0,
+            "the sweep must end on a band-split column at least once"
+        );
+        // Degenerate inputs are no-ops, not panics.
+        let mut none = Vec::new();
+        assert!(ribbon_beam_v(
+            &mut none,
+            clip,
+            &verts[..1],
+            1.0,
+            16,
+            100_000,
+            GlowBlend::Add
+        ));
+        assert!(ribbon_beam_v(
+            &mut none,
+            clip,
+            &[],
+            1.0,
+            16,
+            100_000,
+            GlowBlend::Add
+        ));
+        assert!(ribbon_beam_v(
+            &mut none,
+            BeamClip { cell_h: 0, ..clip },
+            &verts,
+            1.0,
+            16,
+            100_000,
+            GlowBlend::Add
         ));
         assert!(none.is_empty());
     }

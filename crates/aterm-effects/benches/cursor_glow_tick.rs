@@ -327,6 +327,7 @@ fn beam_for(style: GlowStyle) -> bool {
 /// A shipped-shaped config at full intensity.
 fn cfg_for(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         // Mirrors the shipping resolver: tall is the default; only an explicit
         // underline style opts into the quieter shoulder.
         ribbon_tall: true,
@@ -361,6 +362,7 @@ fn cfg_for(style: GlowStyle) -> GlowConfig {
 /// per-run `layered_beam_quads` walk inside the budget.
 fn beam_family_cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         duration: Duration::from_millis(320),
         ..cfg_for(style)
     }

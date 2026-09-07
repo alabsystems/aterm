@@ -2777,6 +2777,7 @@ mod tests {
                         head_rgb: None,
                         paint: None,
                         ground: None,
+                        flare_at: None,
                     },
                     &mut quads,
                 );
@@ -3636,14 +3637,20 @@ mod tests {
     fn committing_the_typing_sound_row_auditions_one_keystroke() {
         let mut app = app_with_capture();
         app.config.trail_sound_volume = Some(0.25);
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("music box"));
+        assert_eq!(
+            captured_typed(&mut app),
+            vec![(SoundVoice::RainbowKittyV2, 0.25)]
+        );
+        // "Play it again": the same value auditions again.
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("music box"));
+        assert_eq!(captured_typed(&mut app).len(), 1);
+        // The deleted glass bell's spelling is an alias of the music box.
         app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("glass bell"));
         assert_eq!(
             captured_typed(&mut app),
-            vec![(SoundVoice::Of(GlowStyle::RainbowKitty), 0.25)]
+            vec![(SoundVoice::RainbowKittyV2, 0.25)]
         );
-        // "Play it again": the same value auditions again.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("glass bell"));
-        assert_eq!(captured_typed(&mut app).len(), 1);
         // Scrubbing: each step auditions the voice it lands on (aliases too).
         for (raw, voice) in [
             ("typewriter", SoundVoice::Typewriter),

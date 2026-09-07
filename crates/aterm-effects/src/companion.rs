@@ -1272,6 +1272,15 @@ impl CompanionOwner {
         self.pet.needs_frames()
     }
 
+    /// THE COARSE OFFER (Rainbow Kitty v2 A/B #19): a settled resident owes
+    /// no frames but names the instant of its next VISIBLE step — a breath
+    /// pixel, a blink, a tail beat — [`PetBrain::next_change_deadline`].
+    /// `None` when nothing will change (deep asleep, hidden, gone).
+    #[must_use]
+    pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
+        self.pet.next_change_deadline(now)
+    }
+
     /// THE GRIEF GATE's read (gauntlet F4a): the brain's failure droop is on
     /// glass or owed ([`PetBrain::grieving`]). The host hushes the glow's
     /// caret-jump fanfare every frame this is `true` — the pet cannot reach

@@ -4149,7 +4149,7 @@ fn setting_choice_label(key: &str, value: &str) -> String {
     }
     // The typing-sound picker's `auto` is "follow the trail" — its meaning,
     // not the generic "Automatic"; every instrument falls to sentence case
-    // ("Glass bell", "Ice chime", "Typewriter", …).
+    // ("Music box", "Ice chime", "Typewriter", …).
     if key == prefs::EDIT_TRAIL_SOUND_STYLE {
         let value = value.trim();
         let (raw, annotated) = match value.strip_suffix(" (default)") {
@@ -18593,6 +18593,13 @@ mod tests {
             //   halo), while the preview's bounded script deliberately types
             //   single-cell moves only. Making these four body-observable
             //   requires scripting a jump into the preview motion.
+            // - cursor_trail_wake_ms is PARSED BUT INERT since the previous
+            //   rainbow kitty's deletion (2026-09-06, `RAINBOW-KITTY-V2.md`
+            //   §17.3 phase 7): it still reaches `GlowConfig::wake_persist_s`
+            //   (pinned by `the_rainbow_wake_row_lands_on_the_kitty_page_and_
+            //   reaches_the_glow`), and no style reads that field any more —
+            //   the v1 wake walk was its only consumer. The row's disclosure
+            //   is in `app_config::Config::cursor_trail_wake_ms`.
             let body_exempt = matches!(
                 key,
                 prefs::EDIT_MERGED_LIGATURES
@@ -18600,6 +18607,7 @@ mod tests {
                     | prefs::EDIT_CURSOR_TRAIL_RADIUS
                     | prefs::EDIT_CURSOR_TRAIL_RING
                     | prefs::EDIT_CURSOR_TRAIL_ACCENT
+                    | prefs::EDIT_CURSOR_TRAIL_WAKE_MS
             )
             // - font_thicken is CoreText FONT SMOOTHING at raster time;
             //   `Renderer::set_font_thicken` is a no-op beyond recording the
@@ -33642,7 +33650,7 @@ enabled = true
             "the unset row keeps its default annotation"
         );
         for (value, label) in [
-            ("glass bell", "Glass bell"),
+            ("music box", "Music box"),
             ("ice chime", "Ice chime"),
             ("typewriter", "Typewriter"),
             ("mechanical", "Mechanical"),
@@ -33677,7 +33685,11 @@ enabled = true
             &crate::app_config::ThemeCatalog::default(),
         );
         assert_eq!(picker.options[0].label, "Follow the trail");
-        assert!(picker.options.iter().any(|o| o.label == "Glass bell"));
+        assert!(picker.options.iter().any(|o| o.label == "Music box"));
+        assert!(
+            picker.options.iter().all(|o| o.label != "Glass bell"),
+            "the glass bell died with v1 (§17.3 phase 7)"
+        );
     }
 
     /// THE UNDERLINE ROW FITS ITS OWN BUTTON. `rainbow kitty underline` is the
@@ -34126,9 +34138,11 @@ enabled = true
         //
         // THE RAINBOW WAKE DIAL (2026-08-10): +1 on every platform. Same
         // conscious decision as the intensity slider above, taken for the same
-        // reason: `cursor_trail_wake_ms` has shipped for a long time, is read
-        // every frame through `GlowConfig::wake_persist_s`, is clamped at the
-        // resolver, and was reachable only from Manual — and it is the ONE
+        // reason: `cursor_trail_wake_ms` has shipped for a long time, is
+        // carried every frame through `GlowConfig::wake_persist_s` (read by
+        // no style since the v1 deletion, 2026-09-06 — parsed but inert, see
+        // `Config::cursor_trail_wake_ms`), is clamped at the resolver, and
+        // was reachable only from Manual — and it is the ONE
         // tuning knob that belongs to the cursor kitty rather than to the trail
         // engine, so the cat's new page would otherwise carry a picker and
         // nothing else. Its live consumer is pinned by

@@ -862,11 +862,17 @@ impl App {
         let gpu_post_fx = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::GpuPostFx);
+        // Per-style bloom radius (rainbow kitty 1.8, else 2.2; the knob
+        // overrides): the same config-generation presentation the frame path
+        // reads, resolved before the `&mut` backend borrow.
+        let bloom_radius = self
+            .config
+            .cursor_trail_bloom_radius_or_default(self.trail_presentation());
         if let Backend::Gpu(g) = self.backend.ready_mut() {
             g.set_bloom(gpu_post_fx && self.config.cursor_trail_bloom_or_default());
             g.set_bloom_params(
                 self.config.cursor_trail_bloom_strength_or_default(),
-                self.config.cursor_trail_bloom_radius_or_default(),
+                bloom_radius,
             );
             // Heat shimmer above burning cells (the bloom's parity class —
             // GPU only, like the bloom; the CPU path has no shimmer).

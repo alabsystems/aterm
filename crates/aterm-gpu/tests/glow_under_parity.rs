@@ -30,9 +30,9 @@
 // gates. Byte-exact additive gates additionally skip on downlevel
 // (sRGB-offscreen) adapters via `additive_is_byte_exact`, the glow idiom.
 
-use aterm_core::render::{CharFg, GlowQuad};
+use aterm_core::render::{CharFg, GlowBlend, GlowQuad};
 use aterm_core::terminal::Terminal;
-use aterm_render::{Theme, WindowCpu};
+use aterm_render::{BeamClip, RibbonVertex, Theme, WindowCpu};
 
 mod common;
 use common::{backends, bb, gg, max_channel_delta, rr};
@@ -649,5 +649,180 @@ fn source_over_glow_under_is_byte_exact_and_leaves_the_additive_half_alone() {
         );
     } else {
         eprintln!("SKIP byte-exact source-over gate: downlevel sRGB offscreen (linear blend)");
+    }
+}
+
+/// **THE TRANSPOSED RIBBON TWIN THROUGH THE GPU, BYTE FOR BYTE** — the
+/// `glow_under_parity` pin spec D15 / §6.1 / §17.3 (the phase-1 gate) name
+/// beside `ribbon_beam_v`. Every other fixture in this file emits whole
+/// row-band rects; the twin's stream is a different SHAPE — one-pixel-wide
+/// columns as tall as a slab, split at every cell-row edge into `row`-tagged
+/// pieces — and that shape had never been through the GPU's dirty gate,
+/// scissor and blend. Two trains rasterized by the SAME `ribbon_beam_v` the
+/// meteor calls: a device-vertical one flying DOWN (head first, so every
+/// segment is reversed) composited source-over as the bed is, and a steep
+/// diagonal flying up composited additive as the light is. The base frame is
+/// byte-exact, so the train frame's delta is the twin's alone; then the
+/// cached hot path with the train moving ONE ROW between frames — a real
+/// change that must MISS the dirty gate, repaint prev∪cur, and land
+/// byte-exact and equal to a fresh render, over pieces that are several rows
+/// tall rather than one.
+#[test]
+fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
+    let theme = Theme::default();
+    let Some((mut cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    let mut win = aterm_gpu::WindowGpu::new();
+    let (rows, cols) = (10usize, 40usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process("\x1b[?25l".as_bytes());
+    for r in 1..8usize {
+        term.process(format!("\x1b[{};1H{}", r + 1, "█".repeat(30)).as_bytes());
+    }
+    let (cw, ch) = cpu.cell_size();
+    // `glow_under` is WINDOW-ABSOLUTE and this fixture's window IS the grid, so
+    // the effects box is the grid box with its bands anchored at 0.
+    let clip = BeamClip::grid(cols * cw, rows * ch, ch);
+
+    let base_input = term.cell_frame(rows, cols);
+    let cpu_base = cpu.render_input(&base_input);
+    let gpu_base = gpu.render_input(&mut win, &base_input, None);
+    assert_eq!(
+        max_channel_delta(&cpu_base.pixels, &gpu_base.pixels),
+        0,
+        "procedural-block base must be byte-exact so the train's delta is the twin's alone"
+    );
+
+    // A vertex as the meteor states one for the twin: `x` is the sample's
+    // device Y (the MAJOR axis), `spine` its device X; `up` reaches left.
+    let vert = |y: f32, x: f32, reach: f32, color: u32, cov: f32| RibbonVertex {
+        x: y,
+        spine: x,
+        up: reach,
+        dn: reach * 0.55,
+        core_up: reach * 0.2,
+        core_dn: reach * 0.11,
+        color,
+        cov,
+        lift: 0.0,
+        lift_span: 0.0,
+    };
+    let (cw_f, ch_f) = (cw as f32, ch as f32);
+    // The trains, at a row offset `dy` (px) so the cached-path half can move
+    // them by exactly one row. Both keep to columns 30..40, the bare ground
+    // right of the block text where a bed is actually visible.
+    let trains = |dy: f32| -> Vec<GlowQuad> {
+        let mut quads = Vec::new();
+        // Vertical, head at the BOTTOM: every segment is `b.x < a.x`.
+        let vertical = [
+            vert(6.5 * ch_f + dy, 34.5 * cw_f, 0.9 * cw_f, 0x00FF_3020, 120.0),
+            vert(3.5 * ch_f + dy, 34.5 * cw_f, 0.7 * cw_f, 0x0030_FF60, 90.0),
+            vert(0.5 * ch_f + dy, 34.5 * cw_f, 0.5 * cw_f, 0x0020_40FF, 60.0),
+        ];
+        assert!(aterm_render::ribbon_beam_v(
+            &mut quads,
+            clip,
+            &vertical,
+            0.55,
+            4,
+            100_000,
+            GlowBlend::Over
+        ));
+        // Steep diagonal (|dy| > |dx|), head at the TOP, additive.
+        let diagonal = [
+            vert(0.5 * ch_f + dy, 31.5 * cw_f, 0.8 * cw_f, 0x00FF_C020, 200.0),
+            vert(6.5 * ch_f + dy, 37.5 * cw_f, 0.4 * cw_f, 0x0040_20FF, 110.0),
+        ];
+        assert!(aterm_render::ribbon_beam_v(
+            &mut quads,
+            clip,
+            &diagonal,
+            0.55,
+            4,
+            100_000,
+            GlowBlend::Add
+        ));
+        quads
+    };
+    let quads = trains(0.0);
+    // Non-vacuous, and the twin's own shape: one device column per quad, pieces
+    // taller than one row, split at band edges (some shorter than the stride),
+    // both blend modes present, several row bands touched.
+    assert!(quads.iter().all(|q| q.w == 1));
+    assert!(
+        quads.iter().any(|q| q.h > 1),
+        "column pieces taller than a row"
+    );
+    assert!(
+        quads.iter().any(|q| q.h < 4),
+        "…and some split short of the stride"
+    );
+    assert!(quads.iter().any(|q| q.alpha > 0) && quads.iter().any(|q| q.alpha == 0));
+    assert!(
+        quads
+            .iter()
+            .map(|q| q.row)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            >= 6,
+        "the trains must cross several row bands"
+    );
+    let mut input = term.cell_frame(rows, cols);
+    input.glow_under = quads;
+    let cpu_train = cpu.render_input(&input);
+    let gpu_train = gpu.render_input(&mut win, &input, None);
+    assert_ne!(
+        cpu_train.pixels, cpu_base.pixels,
+        "the trains must actually paint (non-vacuous)"
+    );
+    let delta = max_channel_delta(&cpu_train.pixels, &gpu_train.pixels);
+    eprintln!("ribbon_beam_v trains CPU vs GPU max per-channel delta = {delta}");
+    if gpu.additive_is_byte_exact() {
+        assert_eq!(
+            delta, 0,
+            "a ribbon_beam_v train must be BYTE-EXACT CPU==GPU (got {delta})"
+        );
+    } else {
+        eprintln!("SKIP byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
+    }
+
+    // THE CACHED HOT PATH: frame A primes both caches, frame B moves the trains
+    // one row down.
+    let mut win_cpu = WindowCpu::new();
+    let mut win_gpu = aterm_gpu::WindowGpu::new();
+    let mut in_a = term.cell_frame(rows, cols);
+    in_a.glow_under = trains(0.0);
+    let _ = cpu.render_input_cached(&mut win_cpu, &in_a);
+    let _ = gpu.render_input_cached(&mut win_gpu, &in_a);
+    let mut in_b = term.cell_frame(rows, cols);
+    in_b.glow_under = trains(ch_f);
+    let misses_before = gpu.gate_misses();
+    let cpu_b = cpu
+        .render_input_cached(&mut win_cpu, &in_b)
+        .pixels()
+        .to_vec();
+    let gpu_b = gpu
+        .render_input_cached(&mut win_gpu, &in_b)
+        .pixels()
+        .to_vec();
+    assert!(
+        gpu.gate_misses() > misses_before,
+        "a moved train must MISS the GPU dirty gate (real re-render)"
+    );
+    let cpu_fresh = cpu.render_input(&in_b).pixels.clone();
+    assert_eq!(
+        cpu_b, cpu_fresh,
+        "CPU cached-damaged train frame must equal a fresh full render"
+    );
+    let delta = max_channel_delta(&cpu_b, &gpu_b);
+    eprintln!("damaged-path ribbon_beam_v CPU vs GPU max per-channel delta = {delta}");
+    if gpu.additive_is_byte_exact() {
+        assert_eq!(
+            delta, 0,
+            "a moved ribbon_beam_v train via the cached path must be BYTE-EXACT CPU==GPU (got {delta})"
+        );
+    } else {
+        eprintln!("SKIP damaged-path byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
     }
 }

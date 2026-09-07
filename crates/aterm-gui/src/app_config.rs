@@ -162,6 +162,18 @@ pub(crate) struct Config {
     /// (`nyan rainbow`, `nyan` and `rainbow` are back-compat aliases for
     /// `rainbow kitty flying` — the animal they have always drawn;
     /// `kitty`/`kitty pet`/`pet kitty` for the resident pet.)
+    ///
+    /// THE RAINBOW KITTY IS v2 (`docs/design/RAINBOW-KITTY-V2.md`; switched
+    /// 2026-09-05, the previous engine deleted 2026-09-06): every
+    /// rainbow-kitty spelling above — the default included — draws the
+    /// rebuilt engine (the meteor on Ctrl-A/Ctrl-E, stardust, the music-box
+    /// typing voice under `trail_sound_style = "auto"`). The seam-era `… v2`
+    /// spellings are accepted and mean the same as the bare ones; the old
+    /// `… v1` escape (`rainbow kitty v1`, `kitty v1`, `nyan v1`, `rainbow
+    /// v1`, `… v1 pet`/`flying`/`underline`/`tall`) names nothing now — it
+    /// falls back to the default like any unknown spelling, and the fallback
+    /// is reported (`--validate-config`, the load-time warning, `trail
+    /// status`'s `resolved=`). Neither word is offered in the Settings picker.
     pub(crate) cursor_trail_style: Option<String>,
     /// Trail Pack manifests — user-generated cursor trails as data (design
     /// `docs/trail-packs.md`). Each entry is a path to a `*.toml` Trail Pack
@@ -195,8 +207,9 @@ pub(crate) struct Config {
     /// sound" picker. `"auto"` follows the visual trail style (each style's
     /// signature palette — today's sound, bit for bit). Every other value
     /// picks an instrument spoken whatever the trail looks like: the nine
-    /// palettes by what they SOUND like — `"glass bell"` (the rainbow
-    /// kitty's bell), `"warm pluck"` (lumen), `"glitter"` (sparkle), `"ice
+    /// palettes by what they SOUND like — `"music box"` (the rainbow
+    /// kitty's; `"glass bell"`, the deleted v1 instrument's name, is an
+    /// alias of it), `"warm pluck"` (lumen), `"glitter"` (sparkle), `"ice
     /// chime"` (comet), `"droplet"` (water), `"pew"` (phaser), `"zap"`
     /// (laser), `"tick"` (beam), `"crackle"` (fire) — the `"mechanical"`
     /// keyboard (switch click + case thock), and three sound-only voices:
@@ -332,11 +345,14 @@ pub(crate) struct Config {
     pub(crate) cursor_trail_radius: Option<f32>,
     /// Landing-ring "ping" on a jump (LUMEN styles). Default true.
     pub(crate) cursor_trail_ring: Option<bool>,
-    /// TYPING WAKE length, in milliseconds of recent travel (`rainbow kitty`
-    /// style). The plume under the line you are typing shows exactly this much
-    /// of your recent hand movement, so the number IS its length: raise it for a
-    /// longer trail, lower it for a terser one, and set `0` to turn the wake off
-    /// while keeping the rainbow ribbon. Default 300 ms; clamped 0..=1500.
+    /// TYPING WAKE length, in milliseconds of recent travel. PARSED BUT INERT
+    /// since 2026-09-06: it was the previous rainbow kitty's wake dial, and
+    /// the wake walk that read it died with that engine
+    /// (`docs/design/RAINBOW-KITTY-V2.md` §17.3 phase 7); the rebuilt
+    /// ribbon's length follows typing momentum (§3) and no style reads this
+    /// number. Still accepted — a config that sets it keeps loading, and the
+    /// Settings row still edits it — so the key can be retired on its own
+    /// compatibility schedule. Default 300 ms; clamped 0..=1500.
     pub(crate) cursor_trail_wake_ms: Option<u64>,
     /// GPU-only cursor-comet BLOOM: a soft gaussian halo around the streak,
     /// composited at present time on the GPU (all wgpu backends — DX12/Vulkan/Metal);
@@ -2093,6 +2109,10 @@ pub(crate) struct ResolvedTrailPresentation {
     pub(crate) style: ResolvedTrailStyle,
     pub(crate) beam: bool,
     pub(crate) ribbon_tall: bool,
+    /// The classic wake's COLOUR FACE — the spectrum (`false`) or the
+    /// theme-following two-tone tracer (`true`). A spelling fork like the
+    /// ribbon geometry beside it, not a style of its own.
+    pub(crate) classic_mono: bool,
     pub(crate) pet_species: Option<aterm_effects::kitty_pet::PetSpecies>,
     pub(crate) comet: bool,
 }
@@ -2110,6 +2130,7 @@ impl Default for ResolvedTrailPresentation {
             },
             beam: aterm_effects::cursor_glow::style_has_beam_of(style, raw),
             ribbon_tall: true,
+            classic_mono: false,
             pet_species: Some(aterm_effects::kitty_pet::PetSpecies::Cat),
             comet: false,
         }
@@ -3337,6 +3358,36 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// [`Self::trail_sound_voice`] for a TRAIL gesture under one resolved
+    /// presentation (`RAINBOW-KITTY-V2.md` §16 row 9): `auto` follows the
+    /// visual trail, and while the trail is the rainbow kitty (the style
+    /// resolved to `RainbowKitty` — every spelling, the default, a typo's
+    /// fallback) the trail's own instrument is the MUSIC BOX
+    /// ([`aterm_effects::trail_sound::SoundVoice::RainbowKittyV2`]). The
+    /// voice is named on the event itself, which is how the synth knows
+    /// (§16 row 9: "an explicit instrument wins" — the seam's host-side latch
+    /// died with v1 at phase 7, and the resolved voice is the only signal
+    /// left). An explicit voice is the user's and is never overridden; every
+    /// other presentation is the exact identity of the plain read. Trail
+    /// gestures ONLY — the bonk, the sing-along riff and the output pips are
+    /// style-agnostic and keep their own chain whatever the trail draws, so
+    /// their seams keep calling the plain read.
+    pub(crate) fn trail_sound_voice_for(
+        &self,
+        presentation: ResolvedTrailPresentation,
+    ) -> aterm_effects::trail_sound::SoundVoice {
+        use aterm_effects::trail_sound::SoundVoice;
+        match self.trail_sound_voice() {
+            SoundVoice::Style
+                if presentation.style.style
+                    == Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty) =>
+            {
+                SoundVoice::RainbowKittyV2
+            }
+            voice => voice,
+        }
+    }
+
     /// The `--validate-config` domain warning for `trail_sound_style`: an
     /// unknown spelling is not an error at load (the voice falls back to
     /// `auto` and the sound keeps playing), but it IS a silent no-op the
@@ -3548,9 +3599,11 @@ impl Config {
 
     /// TYPING-WAKE length in SECONDS of recent travel, default 0.30 s (the
     /// engine's own [`aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST`]), clamped
-    /// to 0..=1.5 s. `0` turns the wake off and is a legitimate setting, not a
-    /// failure, so — unlike the aurora's intensity — there is nothing here that
-    /// can fail open: every representable `u64` maps into the closed range.
+    /// to 0..=1.5 s. `0` is a legitimate setting, not a failure, so — unlike
+    /// the aurora's intensity — there is nothing here that can fail open:
+    /// every representable `u64` maps into the closed range. INERT since the
+    /// v1 deletion (see [`Config::cursor_trail_wake_ms`]): still resolved
+    /// into `GlowConfig::wake_persist_s`, which no style reads.
     pub(crate) fn cursor_trail_wake_persist_or_default(&self) -> f32 {
         let ms = self
             .cursor_trail_wake_ms
@@ -4862,15 +4915,52 @@ impl Config {
         }
     }
 
-    /// Bloom radius (half-res texels), default 2.2, clamped 0.5..=8.0.
-    /// Non-finite falls back to the default (a NaN radius would poison the
-    /// GPU blur weights; the strength resolver owns the fail-OFF arm).
-    pub(crate) fn cursor_trail_bloom_radius_or_default(&self) -> f32 {
-        let v = self.cursor_trail_bloom_radius.unwrap_or(2.2);
+    /// The bloom radius (half-res blur texels) every style other than the
+    /// rainbow kitty has always had — the one global value the knob used to
+    /// default to for all of them, kept byte-identical.
+    pub(crate) const CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT: f32 = 2.2;
+
+    /// The rainbow kitty's bloom radius, `RAINBOW-KITTY-V2.md` §21 row 14:
+    /// **1.8 texels** — a tighter halo than the 2.2 default, for a theme
+    /// whose stars are already haloed. The row's derivation: the bloom is a
+    /// post pass on `out` fed by the head core, the white heat, the landing
+    /// pin, the ring and the stars, and v2's stars carry their own halos
+    /// (the `halos` lane), so the post-pass halo they get on top is the
+    /// tighter one; the colour train (`under`) and the ribbon never bloom, so
+    /// text stays crisp at either radius. The row called this a host
+    /// follow-up because the knob was one global value; it is per-style now,
+    /// with the knob as the explicit override.
+    pub(crate) const RAINBOW_KITTY_BLOOM_RADIUS: f32 = 1.8;
+
+    /// Bloom radius (half-res texels) for the resolved trail style, clamped
+    /// 0.5..=8.0: the user's explicit `cursor_trail_bloom_radius` when set
+    /// (the override — for every style), else PER-STYLE —
+    /// [`Self::RAINBOW_KITTY_BLOOM_RADIUS`] (1.8) when the style resolved to
+    /// [`aterm_effects::cursor_glow::GlowStyle::RainbowKitty`], else
+    /// [`Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT`] (2.2, byte-identical to
+    /// what every other style, `off` and a pack always had). Takes the
+    /// config-generation [`ResolvedTrailPresentation`] so the answer comes
+    /// from the same pre-parsed resolution the frame path reads (no string
+    /// parsing at the three GPU pin seams: launch, the deferred join, the
+    /// config reload). Non-finite falls back to the per-style default (a NaN
+    /// radius would poison the GPU blur weights; the strength resolver owns
+    /// the fail-OFF arm).
+    pub(crate) fn cursor_trail_bloom_radius_or_default(
+        &self,
+        presentation: ResolvedTrailPresentation,
+    ) -> f32 {
+        let per_style = if presentation.style.style
+            == Some(aterm_effects::cursor_glow::GlowStyle::RainbowKitty)
+        {
+            Self::RAINBOW_KITTY_BLOOM_RADIUS
+        } else {
+            Self::CURSOR_TRAIL_BLOOM_RADIUS_DEFAULT
+        };
+        let v = self.cursor_trail_bloom_radius.unwrap_or(per_style);
         if v.is_finite() {
             v.clamp(0.5, 8.0)
         } else {
-            2.2
+            per_style
         }
     }
 
@@ -7625,6 +7715,7 @@ pub(crate) fn resolve_trail_presentation_from_style(
         style,
         beam: style_has_beam_of(glow_style, token),
         ribbon_tall: !GlowStyle::style_names_underline_ribbon(token),
+        classic_mono: GlowStyle::style_names_classic_mono(token),
         pet_species,
         comet: style.style == Some(GlowStyle::Comet),
     }
@@ -7741,6 +7832,10 @@ pub(crate) fn resolve_cursor_glow(
         // which had flipped the default on a claimed ruling the owner did not
         // give; the explicit spellings for BOTH looks survive.
         ribbon_tall: presentation.ribbon_tall,
+        // The classic wake's colour face rides the RESOLVED spelling, exactly
+        // as the ribbon geometry above does: plain `classic` is v0.28's
+        // shipped spectrum, `classic mono` its theme-following tracer.
+        classic_mono: presentation.classic_mono,
     }
 }
 
@@ -10172,6 +10267,11 @@ impl App {
         } else {
             Some(config.cursor_trail_bloom_or_default())
         };
+        // The radius is PER-STYLE (rainbow kitty 1.8, else 2.2; the knob
+        // overrides), so it reads the presentation of THIS generation: both
+        // `self.config` and the asset catalog were swapped above, and this is
+        // resolved before the `&mut` backend borrow below.
+        let bloom_radius = config.cursor_trail_bloom_radius_or_default(self.trail_presentation());
         if let Backend::Gpu(g) = self.backend.ready_mut() {
             g.set_hdr_glow(config.hdr_glow_or_default());
             // SDR crown budget hot-reload: takes effect on the next present (the
@@ -10187,7 +10287,7 @@ impl App {
             }
             g.set_bloom_params(
                 config.cursor_trail_bloom_strength_or_default(),
-                config.cursor_trail_bloom_radius_or_default(),
+                bloom_radius,
             );
             // EFFECT-PIPELINE WARM-UP, and the ONE seam that gets it.
             //
@@ -16296,6 +16396,175 @@ mod trail_style_resolution_tests {
         );
     }
 
+    /// Does a FRESH engine, handed this spelling's resolved config, own the
+    /// frame as v2 on its first drawing tick? The host carries no engine
+    /// flag since phase 7, so "engages v2" can only be asked of the engine
+    /// itself — `CursorGlow::v2_status` is `Some` exactly while v2 owns the
+    /// frame.
+    fn engine_is_v2_for(raw: &str) -> bool {
+        use aterm_effects::cursor_glow::{CursorGlow, Geom};
+        let cfg = glow(raw, true);
+        let mut engine = CursorGlow::default();
+        let mut out = Vec::new();
+        engine.tick(
+            Some((2, 4)),
+            std::time::Instant::now(),
+            &cfg,
+            Geom {
+                cw: 8,
+                ch: 16,
+                rows: 24,
+                cols: 80,
+                origin_x: 0,
+                origin_y: 0,
+                win_w: 640,
+                win_h: 384,
+                head: 0,
+            },
+            &mut out,
+        );
+        engine.v2_status().is_some()
+    }
+
+    /// THE SPELLING LAW AFTER THE DELETION (§17.3 phase 7, 2026-09-06): every
+    /// `cursor_trail_style` that resolves to `RainbowKitty` — each picker
+    /// entry and each documented alias that is the rainbow kitty, the
+    /// unconfigured default, and a typo's fallback onto it — is v2: the
+    /// engine engages itself from the resolved config alone, and the `auto`
+    /// typing voice is the music box. There is no second rainbow kitty: the
+    /// old `… v1` escape is an unknown spelling that falls back to the
+    /// default with the `Unknown` issue reported, and every other style,
+    /// `off` and a pack stay off v2 and off the music box. `Default` and the
+    /// resolver agree, so the first frame and the first config generation
+    /// draw the same engine.
+    #[test]
+    fn every_rainbow_kitty_spelling_is_v2() {
+        use aterm_effects::trail_sound::SoundVoice;
+        let catalog = TrailPackCatalog::empty();
+        let default = crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE;
+        assert_eq!(
+            ResolvedTrailPresentation::default(),
+            resolve_trail_presentation(default, &catalog),
+            "`Default` must be the resolver's answer for the default spelling"
+        );
+        assert_eq!(
+            resolve_trail_presentation(default, &catalog).style.style,
+            Some(GlowStyle::RainbowKitty),
+            "the default {default:?} is the rainbow kitty"
+        );
+        let auto = Config::default();
+        let marimba = Config {
+            trail_sound_style: Some("marimba".to_string()),
+            ..Config::default()
+        };
+        let mut rainbow_kitties = 0;
+        let spellings = crate::prefs::CURSOR_TRAIL_STYLES.iter().copied().chain(
+            crate::prefs::CURSOR_TRAIL_STYLE_ALIASES
+                .iter()
+                .map(|&(alias, _)| alias),
+        );
+        for raw in spellings {
+            let p = resolve_trail_presentation(raw, &catalog);
+            assert_eq!(p.style.issue, None, "{raw:?} is a documented spelling");
+            let is_kitty = p.style.style == Some(GlowStyle::RainbowKitty);
+            rainbow_kitties += usize::from(is_kitty);
+            assert_eq!(
+                engine_is_v2_for(raw),
+                is_kitty,
+                "{raw:?}: the engine owns the frame as v2 iff the spelling is the rainbow kitty"
+            );
+            assert_eq!(
+                auto.trail_sound_voice_for(p),
+                if is_kitty {
+                    SoundVoice::RainbowKittyV2
+                } else {
+                    SoundVoice::Style
+                },
+                "{raw:?}: `auto` is the music box iff the spelling is the rainbow kitty"
+            );
+            assert_eq!(
+                marimba.trail_sound_voice_for(p),
+                SoundVoice::Marimba,
+                "{raw:?}: an explicit instrument is the user's"
+            );
+        }
+        assert!(
+            rainbow_kitties >= 20,
+            "the picker and the alias table name the rainbow kitty {rainbow_kitties} ways"
+        );
+        // The old escape and every other unknown word: the default, reported.
+        let fallback = resolve_trail_presentation(default, &catalog);
+        for v1 in [
+            "rainbow kitty v1",
+            "RAINBOW KITTY V1",
+            "rainbow kitty v1 pet",
+            "rainbow kitty v1 flying",
+            "rainbow kitty v1 underline",
+            "rainbow kitty v1 tall",
+            "kitty v1",
+            "nyan v1",
+            "rainbow v1",
+            "rainbow kity v1",
+            "rainbow kity v2",
+            "v1",
+            "v2",
+            "",
+        ] {
+            let p = resolve_trail_presentation(v1, &catalog);
+            assert_eq!(
+                p.style.issue,
+                Some(TrailStyleIssue::Unknown),
+                "{v1:?} names no style and says so"
+            );
+            assert_eq!(
+                ResolvedTrailStyle {
+                    issue: None,
+                    ..p.style
+                },
+                fallback.style,
+                "{v1:?} falls back to the default"
+            );
+            assert!(
+                engine_is_v2_for(v1),
+                "{v1:?} draws the default, which is v2"
+            );
+            assert_eq!(auto.trail_sound_voice_for(p), SoundVoice::RainbowKittyV2);
+        }
+        // The generation cache agrees with the resolver, escape included.
+        let config = Config {
+            cursor_trail_style: Some("rainbow kitty v1".to_string()),
+            ..Config::default()
+        };
+        let cached = config
+            .resolve_trail_pack_catalog()
+            .presentation_for(config.cursor_trail_style_raw());
+        assert_eq!(cached.style.issue, Some(TrailStyleIssue::Unknown));
+        assert_eq!(cached.style.style, Some(GlowStyle::RainbowKitty));
+        assert_eq!(
+            config.trail_sound_voice_for(cached),
+            SoundVoice::RainbowKittyV2
+        );
+        // …and nothing else is v2 or the music box.
+        for other in ["phaser", "comet", "lumen", "classic", "pack:v1", "pack:"] {
+            let p = resolve_trail_presentation(other, &catalog);
+            assert!(!engine_is_v2_for(other), "{other:?} must not engage v2");
+            assert_eq!(
+                auto.trail_sound_voice_for(p),
+                SoundVoice::Style,
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            resolve_trail_presentation("off", &catalog).style.style,
+            None,
+            "`off` resolves to no style at all"
+        );
+        assert_eq!(
+            auto.trail_sound_voice_for(resolve_trail_presentation("off", &catalog)),
+            SoundVoice::Style
+        );
+    }
+
     /// A MISTYPED STYLE FALLS BACK AND SAYS SO. It used to switch the whole
     /// cursor effect off with nothing on screen to explain it — `trail status`
     /// printed `effective=false` beside the look that had been asked for.
@@ -16403,5 +16672,42 @@ mod trail_style_resolution_tests {
                 "raw {raw:?}"
             );
         }
+    }
+
+    /// RAINBOW-KITTY-V2.md §21 row 14 closed: the bloom radius is per-style —
+    /// 1.8 half-res texels for the rainbow kitty (whose stars are already
+    /// haloed), the 2.2 every other style has always had — and the
+    /// `cursor_trail_bloom_radius` knob is the explicit override for all of
+    /// them.
+    #[test]
+    fn the_bloom_radius_is_per_style_with_the_knob_as_the_override() {
+        fn radius(style: &str, knob: Option<f32>) -> f32 {
+            let config = Config {
+                cursor_trail_style: Some(style.to_string()),
+                cursor_trail_bloom_radius: knob,
+                ..Config::default()
+            };
+            let catalog = config.resolve_trail_pack_catalog();
+            config.cursor_trail_bloom_radius_or_default(
+                catalog.presentation_for(config.cursor_trail_style_raw()),
+            )
+        }
+        assert_eq!(radius("rainbow kitty", None), 1.8);
+        assert_eq!(radius("rainbow kitty pet", None), 1.8);
+        assert_eq!(radius("laser", None), 2.2);
+        assert_eq!(radius("comet", None), 2.2);
+        assert_eq!(radius("lumen", None), 2.2);
+        assert_eq!(radius("rainbow kitty", Some(3.0)), 3.0);
+        assert_eq!(radius("laser", Some(3.0)), 3.0);
+        // The default spelling IS the rainbow kitty, so an unconfigured
+        // style resolves to the tighter halo too.
+        let config = Config::default();
+        let catalog = config.resolve_trail_pack_catalog();
+        assert_eq!(
+            config.cursor_trail_bloom_radius_or_default(
+                catalog.presentation_for(config.cursor_trail_style_raw())
+            ),
+            1.8
+        );
     }
 }

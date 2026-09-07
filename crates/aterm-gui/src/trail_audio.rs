@@ -29,7 +29,7 @@
 
 use std::time::Duration;
 
-use aterm_effects::trail_sound::SoundEvent;
+use aterm_effects::trail_sound::{EventMeta, SoundEvent};
 
 /// Whether this build has a real platform audio-output host. The synth is
 /// portable, but non-macOS [`TrailAudio`] implementations intentionally discard
@@ -94,7 +94,7 @@ mod mac {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use aterm_effects::trail_sound::{CHANNELS, SoundEvent, TrailSynth};
+    use aterm_effects::trail_sound::{CHANNELS, EventMeta, SoundEvent, TrailSynth};
 
     use super::{BUFFER_COUNT, BUFFER_FRAMES, PAUSE_AFTER_SILENT, SAMPLE_RATE};
 
@@ -487,13 +487,13 @@ mod mac {
                 project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
             )
         )]
-        pub fn push(&mut self, ev: SoundEvent) -> bool {
+        pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> bool {
             {
                 let mut synth = match self.shared.synth.lock() {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                synth.push(ev);
+                synth.push_meta(ev, meta);
                 self.shared.silent.store(0, Ordering::Release);
             }
             if !self.shared.running.load(Ordering::Relaxed) {
@@ -628,6 +628,26 @@ mod mac {
 /// full queue drops newest sound only — visual/input correctness always wins.
 const COMMAND_CAPACITY: usize = 64;
 
+/// ONE QUEUED CUE: the gesture and its side-car (`RAINBOW-KITTY-V2.md` §16
+/// rows 6-8 — the host input-clock stamp, the glyph class, the meteor's
+/// origin pan). The worker hands both to `TrailSynth::push_meta`; a host
+/// with nothing to stamp pushes the identity side-car ([`EventMeta::default`])
+/// through [`TrailAudio::push`], which is byte-for-byte the pre-v2 path.
+#[derive(Clone, Copy, Debug)]
+struct Cue {
+    ev: SoundEvent,
+    meta: EventMeta,
+}
+
+impl From<SoundEvent> for Cue {
+    fn from(ev: SoundEvent) -> Self {
+        Self {
+            ev,
+            meta: EventMeta::default(),
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnqueueDisposition {
@@ -638,8 +658,8 @@ enum EnqueueDisposition {
 
 #[cfg(target_os = "macos")]
 fn cue_channel() -> (
-    std::sync::mpsc::SyncSender<SoundEvent>,
-    std::sync::mpsc::Receiver<SoundEvent>,
+    std::sync::mpsc::SyncSender<Cue>,
+    std::sync::mpsc::Receiver<Cue>,
 ) {
     std::sync::mpsc::sync_channel(COMMAND_CAPACITY)
 }
@@ -684,21 +704,32 @@ impl Drop for PlatformBusy<'_> {
     }
 }
 
+/// The worker's shared control words, borrowed for the loop's lifetime: the
+/// shutdown request, the lifecycle state it reports and its platform-busy
+/// stamp.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct WorkerFlags<'a> {
+    shutdown: &'a std::sync::atomic::AtomicBool,
+    state: &'a std::sync::atomic::AtomicU8,
+    busy: &'a std::sync::atomic::AtomicU64,
+}
+
 /// The complete UI-thread ingress decision. `try_send` is structurally
 /// nonblocking; a full channel preserves all queued cues, drops only the newest
 /// cue, and records that loss with a saturating counter. Both formal actions
 /// refine this one shipping branch point.
 #[cfg(target_os = "macos")]
 trait AudioWorkerOutput {
-    fn push(&mut self, ev: SoundEvent) -> bool;
+    fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> bool;
     fn on_tick(&mut self) -> Result<bool, ()>;
     fn is_running(&self) -> bool;
 }
 
 #[cfg(target_os = "macos")]
 impl AudioWorkerOutput for mac::MacOut {
-    fn push(&mut self, ev: SoundEvent) -> bool {
-        mac::MacOut::push(self, ev)
+    fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) -> bool {
+        mac::MacOut::push_meta(self, ev, meta)
     }
 
     fn on_tick(&mut self) -> Result<bool, ()> {
@@ -760,10 +791,8 @@ impl AudioWorkerOutput for mac::MacOut {
     )
 )]
 fn worker_loop<Output, Open>(
-    rx: std::sync::mpsc::Receiver<SoundEvent>,
-    shutdown: &std::sync::atomic::AtomicBool,
-    state: &std::sync::atomic::AtomicU8,
-    busy: &std::sync::atomic::AtomicU64,
+    rx: std::sync::mpsc::Receiver<Cue>,
+    flags: WorkerFlags<'_>,
     seed: u32,
     housekeeping_interval: Duration,
     mut open: Open,
@@ -774,6 +803,11 @@ fn worker_loop<Output, Open>(
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::RecvTimeoutError;
 
+    let WorkerFlags {
+        shutdown,
+        state,
+        busy,
+    } = flags;
     let mut output: Option<Output> = None;
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -831,7 +865,10 @@ fn worker_loop<Output, Open>(
                 return;
             }
         }
-        if output.as_mut().is_none_or(|out| !out.push(cue)) {
+        if output
+            .as_mut()
+            .is_none_or(|out| !out.push_meta(cue.ev, cue.meta))
+        {
             state.store(STATE_FAILED, Ordering::Release);
             return;
         }
@@ -857,14 +894,14 @@ fn worker_loop<Output, Open>(
     )
 )]
 fn enqueue_cue(
-    tx: &std::sync::mpsc::SyncSender<SoundEvent>,
+    tx: &std::sync::mpsc::SyncSender<Cue>,
     dropped: &std::sync::atomic::AtomicU64,
-    ev: SoundEvent,
+    cue: Cue,
 ) -> EnqueueDisposition {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::TrySendError;
 
-    match tx.try_send(ev) {
+    match tx.try_send(cue) {
         Ok(()) => EnqueueDisposition::Queued,
         Err(TrySendError::Full(_)) => {
             let mut current = dropped.load(Ordering::Relaxed);
@@ -905,22 +942,8 @@ const STATE_STOPPED: u8 = 4;
         project = "aterm_gui::trail_audio::trail_audio_conformance::project_worker"
     )
 )]
-fn worker_main(
-    rx: std::sync::mpsc::Receiver<SoundEvent>,
-    shutdown: &std::sync::atomic::AtomicBool,
-    state: &std::sync::atomic::AtomicU8,
-    busy: &std::sync::atomic::AtomicU64,
-    seed: u32,
-) {
-    worker_loop(
-        rx,
-        shutdown,
-        state,
-        busy,
-        seed,
-        HOUSEKEEPING_INTERVAL,
-        mac::MacOut::new,
-    );
+fn worker_main(rx: std::sync::mpsc::Receiver<Cue>, flags: WorkerFlags<'_>, seed: u32) {
+    worker_loop(rx, flags, seed, HOUSEKEEPING_INTERVAL, mac::MacOut::new);
 }
 
 /// Cross-platform host face. On macOS, the UI owns only a bounded `SyncSender`:
@@ -930,7 +953,7 @@ fn worker_main(
 /// construct the inert form and create no thread at all.
 pub struct TrailAudio {
     #[cfg(target_os = "macos")]
-    tx: Option<std::sync::mpsc::SyncSender<SoundEvent>>,
+    tx: Option<std::sync::mpsc::SyncSender<Cue>>,
     #[cfg(target_os = "macos")]
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "macos")]
@@ -958,7 +981,7 @@ pub struct TrailAudio {
     /// its own arithmetic. Platform-independent by construction: the seam
     /// under test is host-side policy, not CoreAudio.
     #[cfg(test)]
-    capture: Option<Vec<SoundEvent>>,
+    capture: Option<Vec<(SoundEvent, EventMeta)>>,
 }
 
 impl TrailAudio {
@@ -995,9 +1018,11 @@ impl TrailAudio {
                 .spawn(move || {
                     worker_main(
                         rx,
-                        &worker_shutdown,
-                        &worker_state,
-                        &worker_busy,
+                        WorkerFlags {
+                            shutdown: &worker_shutdown,
+                            state: &worker_state,
+                            busy: &worker_busy,
+                        },
                         0x5EED_50FD,
                     );
                 })
@@ -1040,6 +1065,15 @@ impl TrailAudio {
     /// Take the cues recorded since the last call (test-only).
     #[cfg(test)]
     pub(crate) fn take_captured_for_test(&mut self) -> Vec<SoundEvent> {
+        self.take_captured_with_meta_for_test()
+            .into_iter()
+            .map(|(ev, _)| ev)
+            .collect()
+    }
+
+    /// [`Self::take_captured_for_test`] with each cue's side-car.
+    #[cfg(test)]
+    pub(crate) fn take_captured_with_meta_for_test(&mut self) -> Vec<(SoundEvent, EventMeta)> {
         self.capture
             .as_mut()
             .map(std::mem::take)
@@ -1053,6 +1087,8 @@ impl TrailAudio {
     /// output dispose its queue. This is the serious-mode edge seam; no
     /// already-playing decorative tail survives a healthy teardown returning.
     pub fn replace(&mut self, active: bool) {
+        // Nothing to carry across (§17.3 phase 7): the music box is named on
+        // each event's voice, so a fresh worker's synth needs no latch.
         *self = Self::new(active);
     }
 
@@ -1063,16 +1099,25 @@ impl TrailAudio {
     /// [`Self::revive_or_seal`] — so a stuck device costs seconds of silence,
     /// not the rest of the session.
     pub fn push(&mut self, ev: SoundEvent) {
+        self.push_meta(ev, EventMeta::default());
+    }
+
+    /// [`Self::push`] with the v2 side-car (`RAINBOW-KITTY-V2.md` §16 rows
+    /// 6-8) — the host input-clock stamp and the glyph class, stamped on BOTH
+    /// delivery paths (the keyed seam and the frame drain). Same nonblocking
+    /// ingress, same drop policy; `push` is exactly this with the identity
+    /// side-car.
+    pub fn push_meta(&mut self, ev: SoundEvent, meta: EventMeta) {
         #[cfg(test)]
         if let Some(captured) = self.capture.as_mut() {
-            captured.push(ev);
+            captured.push((ev, meta));
             return;
         }
         #[cfg(target_os = "macos")]
         match self
             .tx
             .as_ref()
-            .map(|tx| enqueue_cue(tx, &self.dropped, ev))
+            .map(|tx| enqueue_cue(tx, &self.dropped, Cue { ev, meta }))
         {
             Some(EnqueueDisposition::Disconnected) => {
                 self.tx = None;
@@ -1085,7 +1130,7 @@ impl TrailAudio {
             _ => {}
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = ev;
+        let _ = (ev, meta);
     }
 
     /// Whether cues pushed here can ever reach a device: `false` for the
@@ -1182,7 +1227,7 @@ impl TrailAudio {
             return;
         }
         let revives_left = self.revives_left - 1;
-        *self = Self::new(true);
+        self.replace(true);
         self.revives_left = revives_left;
     }
 
@@ -1210,7 +1255,7 @@ impl TrailAudio {
     }
 
     #[cfg(all(test, target_os = "macos"))]
-    fn test_ingress() -> (Self, std::sync::mpsc::Receiver<SoundEvent>) {
+    fn test_ingress() -> (Self, std::sync::mpsc::Receiver<Cue>) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
@@ -1360,14 +1405,15 @@ mod tests {
 
     use aterm_effects::cursor_glow::GlowStyle;
     use aterm_effects::trail_sound::{
-        CHANNELS, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth, WordGesture,
+        CHANNELS, EventMeta, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
+        WordGesture,
     };
 
     use super::mac::{QueueCycle, prime_and_start, stop_and_reclaim};
     use super::{
-        AudioWorkerOutput, COMMAND_CAPACITY, DETACH_DEADLINE, STATE_DORMANT, STATE_FAILED,
-        STATE_PAUSED, STATE_RUNNING, STATE_STOPPED, TrailAudio, WEDGE_REVIVES, cue_channel,
-        monotonic_ms, worker_loop,
+        AudioWorkerOutput, COMMAND_CAPACITY, Cue, DETACH_DEADLINE, STATE_DORMANT, STATE_FAILED,
+        STATE_PAUSED, STATE_RUNNING, STATE_STOPPED, TrailAudio, WEDGE_REVIVES, WorkerFlags,
+        cue_channel, monotonic_ms, worker_loop,
     };
 
     fn cue() -> SoundEvent {
@@ -1797,6 +1843,8 @@ mod tests {
         /// While set, `push` spins in place — the deterministic stand-in for a
         /// platform call that has stopped returning (the wedge).
         block_push: AtomicBool,
+        /// The last cue's `at_ms`, so a test can prove the side-car arrived.
+        last_at_ms: std::sync::atomic::AtomicU32,
     }
 
     struct FakeOutput {
@@ -1805,8 +1853,10 @@ mod tests {
     }
 
     impl AudioWorkerOutput for FakeOutput {
-        fn push(&mut self, _ev: SoundEvent) -> bool {
-            self.shared.pushes.fetch_add(1, Ordering::Relaxed);
+        fn push_meta(&mut self, _ev: SoundEvent, meta: EventMeta) -> bool {
+            // The stamp lands BEFORE the count a test waits on.
+            self.shared.last_at_ms.store(meta.at_ms, Ordering::Release);
+            self.shared.pushes.fetch_add(1, Ordering::Release);
             while self.shared.block_push.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -1833,7 +1883,7 @@ mod tests {
     /// What [`spawn_fake_worker`] hands back: cue ingress, the shutdown flag,
     /// the state and busy cells, and the worker's join handle.
     type FakeWorkerHandles = (
-        std::sync::mpsc::SyncSender<SoundEvent>,
+        std::sync::mpsc::SyncSender<Cue>,
         Arc<AtomicBool>,
         Arc<AtomicU8>,
         Arc<std::sync::atomic::AtomicU64>,
@@ -1852,9 +1902,11 @@ mod tests {
             let factory_shared = Arc::clone(&shared);
             worker_loop(
                 rx,
-                &worker_shutdown,
-                &worker_state,
-                &worker_busy,
+                WorkerFlags {
+                    shutdown: &worker_shutdown,
+                    state: &worker_state,
+                    busy: &worker_busy,
+                },
                 7,
                 std::time::Duration::from_millis(2),
                 move |_| {
@@ -1999,7 +2051,7 @@ mod tests {
         assert_eq!(shared.pushes.load(Ordering::Relaxed), 0);
         assert_eq!(shared.ticks.load(Ordering::Relaxed), 0);
 
-        tx.send(cue()).unwrap();
+        tx.send(cue().into()).unwrap();
         wait_until("worker start", || {
             state.load(Ordering::Acquire) == STATE_RUNNING
                 && shared.pushes.load(Ordering::Relaxed) == 1
@@ -2047,7 +2099,7 @@ mod tests {
         );
 
         shared.pause_on_tick.store(false, Ordering::Release);
-        tx.send(cue()).unwrap();
+        tx.send(cue().into()).unwrap();
         wait_until("worker resume", || {
             state.load(Ordering::Acquire) == STATE_RUNNING
                 && shared.pushes.load(Ordering::Relaxed) == 2
@@ -2055,7 +2107,7 @@ mod tests {
         assert_eq!(shared.opens.load(Ordering::Relaxed), 1);
 
         shutdown.store(true, Ordering::Release);
-        let _ = tx.send(cue());
+        let _ = tx.send(cue().into());
         worker.join().unwrap();
         assert_eq!(state.load(Ordering::Acquire), STATE_STOPPED);
     }
@@ -2065,14 +2117,14 @@ mod tests {
         let shared = Arc::new(FakeShared::default());
         shared.fail_open.store(true, Ordering::Relaxed);
         let (tx, _shutdown, state, _busy, worker) = spawn_fake_worker(Arc::clone(&shared));
-        tx.send(cue()).unwrap();
+        tx.send(cue().into()).unwrap();
         wait_until("explicit open failure", || {
             state.load(Ordering::Acquire) == STATE_FAILED
         });
         worker.join().unwrap();
         assert_eq!(shared.opens.load(Ordering::Relaxed), 1);
         assert_eq!(shared.pushes.load(Ordering::Relaxed), 0);
-        assert!(tx.send(cue()).is_err(), "failed worker is terminal");
+        assert!(tx.send(cue().into()).is_err(), "failed worker is terminal");
     }
 
     #[test]
@@ -2114,7 +2166,7 @@ mod tests {
         shared.block_push.store(true, Ordering::Release);
         let (tx, shutdown, state, busy, worker) = spawn_fake_worker(Arc::clone(&shared));
 
-        tx.send(cue()).unwrap();
+        tx.send(cue().into()).unwrap();
         wait_until("worker entered the blocked platform call", || {
             shared.pushes.load(Ordering::Relaxed) == 1
         });
@@ -2139,7 +2191,7 @@ mod tests {
         );
 
         shutdown.store(true, Ordering::Release);
-        let _ = tx.send(cue());
+        let _ = tx.send(cue().into());
         worker.join().unwrap();
     }
 
@@ -2294,5 +2346,59 @@ mod tests {
         // Worker-owned housekeeping eventually pauses without any render tick.
         std::thread::sleep(std::time::Duration::from_secs(2));
         assert_ne!(audio.state(), STATE_FAILED);
+    }
+
+    /// `push` IS `push_meta` with the identity side-car (`RAINBOW-KITTY-V2.md`
+    /// §16 rows 6-8): every pre-v2 caller keeps its behaviour by
+    /// construction, and a stamped cue reaches the host with the stamp the
+    /// seam gave it — both delivery paths hand the same two numbers over.
+    #[test]
+    fn a_plain_push_carries_the_identity_side_car_and_a_stamped_one_its_stamp() {
+        let mut audio = TrailAudio::capturing_for_test();
+        audio.push(cue());
+        audio.push_meta(
+            cue(),
+            EventMeta {
+                at_ms: 4242,
+                glyph_class: 2,
+                pan_from: -0.5,
+            },
+        );
+        let captured = audio.take_captured_with_meta_for_test();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].1, EventMeta::default(), "push stamps nothing");
+        assert_eq!(captured[1].1.at_ms, 4242);
+        assert_eq!(captured[1].1.glyph_class, 2);
+        assert_eq!(captured[1].1.pan_from, -0.5);
+        assert_eq!(
+            Cue::from(cue()).meta,
+            EventMeta::default(),
+            "the channel's identity conversion is the identity side-car"
+        );
+    }
+
+    /// The worker hands the synth exactly the side-car the host queued.
+    #[test]
+    fn a_stamped_cue_reaches_the_worker_output_with_its_stamp() {
+        use std::sync::atomic::Ordering;
+
+        let shared = Arc::new(FakeShared::default());
+        let (tx, shutdown, _state, _busy, worker) = spawn_fake_worker(Arc::clone(&shared));
+        tx.send(Cue {
+            ev: cue(),
+            meta: EventMeta {
+                at_ms: 31_337,
+                glyph_class: 1,
+                pan_from: 0.0,
+            },
+        })
+        .unwrap();
+        wait_until("stamped push", || {
+            shared.pushes.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(shared.last_at_ms.load(Ordering::Acquire), 31_337);
+        shutdown.store(true, Ordering::Release);
+        drop(tx);
+        worker.join().unwrap();
     }
 }

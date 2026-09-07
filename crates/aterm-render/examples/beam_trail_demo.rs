@@ -27,6 +27,7 @@ const COLS: usize = 68;
 
 fn cfg() -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Beam,

@@ -16,8 +16,17 @@
 //!
 //! So a passing assertion here is a literal before/after equality across the
 //! license commit, per style, over emitted quads, frame fingerprints, spawn
-//! counts, live spark counts, momentum, and sound cues. It uses the PUBLIC API
-//! only, so the same file can be replayed against either tree.
+//! counts, the live light census, momentum, and sound cues. It uses the PUBLIC
+//! API only, so the same file can be replayed against either tree.
+//!
+//! THE LIGHT CENSUS FORKS ON THE ENGINE THAT OWNS THE FRAME (`live_light`).
+//! Since §17.3 phase 7 of `docs/design/RAINBOW-KITTY-V2.md` the rainbow kitty
+//! IS its v2 engine, whose light is ribbon cells, stars and meteors and never a
+//! v1 spark — `CursorGlow::live_sparks` stays v1's spark census on purpose (the
+//! lib pins that v2 lays no spark) — so for that one style the census reads
+//! the same `Status` rows `trail status` reports. The other eight styles read
+//! `live_sparks` exactly as before, which is why their golden entries did not
+//! move when the fork landed.
 //!
 //! Set `ATERM_CAPTURE_TYPED_PARITY=1` to reprint the fold instead of asserting
 //! (that is how step 1 and step 3 were run).
@@ -60,6 +69,7 @@ fn geom() -> Geom {
 
 fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
+        classic_mono: false,
         // This parity script follows the shipping default; explicit underline
         // geometry has its own resolver, geometry, and live-paint pins.
         ribbon_tall: true,
@@ -93,6 +103,30 @@ fn trail_cfg() -> TrailConfig {
     }
 }
 
+/// The live per-cell light population, read from whichever engine owns the
+/// frame: v2's resident ribbon cells + live stars + live meteors while the
+/// rainbow kitty's engine is engaged (`CursorGlow::v2_status` is `Some`
+/// exactly then), v1's spark census for every other style. See the module
+/// header for why this is a fork and not a change to `live_sparks`.
+fn live_light(glow: &CursorGlow) -> usize {
+    glow.v2_status().map_or_else(
+        || glow.live_sparks(),
+        |s| (s.cells + s.stars + s.meteors) as usize,
+    )
+}
+
+/// The RESIDENT typed band — the cells the ribbon holds, lit or not. Under v2
+/// `CursorGlow::ribbon_segments` deliberately answers what is LIT on the glass
+/// (boundaries at or over the status coverage floor after the edge-in fade),
+/// so on the very frame a press lays its first cell it reads 0 while the cell
+/// is resident; `Status::cells` keeps the resident count and is what the
+/// split-batch law's "the suffix cut the resident ribbon" is about. For every
+/// other style the two readings are the same count.
+fn resident_ribbon(glow: &CursorGlow) -> usize {
+    glow.v2_status()
+        .map_or_else(|| glow.ribbon_segments(), |s| s.cells as usize)
+}
+
 /// A TYPED script — the shape the license exists to admit. Six glyph echoes at
 /// human cadence, a wrap at the right margin, three more glyphs on the new
 /// row, a gesture jump, and the decay tail.
@@ -110,7 +144,7 @@ struct TypedScriptOutcome {
     licensed: u64,
     declined: u64,
     spawns: u64,
-    peak_live_sparks: usize,
+    peak_live_light: usize,
     peak_ribbon_segments: usize,
 }
 
@@ -124,20 +158,20 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
     let mut trail_out = Vec::new();
     let t0 = Instant::now();
     let mut acc: u64 = 0;
-    let mut peak_live_sparks = 0;
+    let mut peak_live_light = 0;
     let mut peak_ribbon_segments = 0;
 
     let mut step =
         |glow: &mut CursorGlow, trail: &mut CursorTrail, at: Instant, cell: (u16, u16)| {
             let fp = glow.tick(Some(cell), at, &c, g, &mut out);
             trail.tick(Some(cell), at, &tc, &mut trail_out);
-            let live_sparks = glow.live_sparks();
+            let light = live_light(glow);
             let ribbon_segments = glow.ribbon_segments();
-            peak_live_sparks = peak_live_sparks.max(live_sparks);
+            peak_live_light = peak_live_light.max(light);
             peak_ribbon_segments = peak_ribbon_segments.max(ribbon_segments);
             fold(&mut acc, &fp.to_le_bytes());
             fold(&mut acc, &glow.spawns().to_le_bytes());
-            fold(&mut acc, &(live_sparks as u64).to_le_bytes());
+            fold(&mut acc, &(light as u64).to_le_bytes());
             fold(&mut acc, &(ribbon_segments as u64).to_le_bytes());
             fold(&mut acc, &glow.typing_momentum(at).to_bits().to_le_bytes());
             for q in &out {
@@ -189,7 +223,7 @@ fn typed_script(style: GlowStyle, licensed: bool) -> TypedScriptOutcome {
         licensed: tally.licensed,
         declined: tally.declined,
         spawns: glow.spawns(),
-        peak_live_sparks,
+        peak_live_light,
         peak_ribbon_segments,
     }
 }
@@ -218,7 +252,7 @@ fn earned_light_survives_a_cold_program_move() {
         trail.note_synthetic_typed(typed);
         glow.tick(Some((2, 4)), typed, &c, g, &mut out);
         trail.tick(Some((2, 4)), typed, &tc, &mut trail_out);
-        let earned = glow.live_sparks();
+        let earned = live_light(&glow);
         let earned_trail = trail_out.len();
         assert!(earned > 0, "{style:?}: the typed echo must earn light");
         assert!(earned_trail > 0, "{style:?}: the comet must exist");
@@ -227,7 +261,7 @@ fn earned_light_survives_a_cold_program_move() {
         glow.tick(Some((4, 20)), typed, &c, g, &mut out);
         trail.tick(Some((4, 20)), typed, &tc, &mut trail_out);
         assert_eq!(
-            glow.live_sparks(),
+            live_light(&glow),
             earned,
             "{style:?}: earned light was wiped by a cold program move"
         );
@@ -268,12 +302,12 @@ fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
     trail.tick(Some((2, 4)), first, &tc, &mut trail_out);
 
     let earned_spawns = glow.spawns();
-    let earned_sparks = glow.live_sparks();
-    let earned_ribbon = glow.ribbon_segments();
+    let earned_light = live_light(&glow);
+    let earned_ribbon = resident_ribbon(&glow);
     let earned_trail: Vec<(usize, usize)> =
         trail_out.iter().map(|cell| (cell.row, cell.col)).collect();
     assert_eq!(earned_spawns, 1, "the first batch spends the press once");
-    assert!(earned_sparks > 0, "the first batch must earn rainbow light");
+    assert!(earned_light > 0, "the first batch must earn rainbow light");
     assert!(earned_ribbon > 0, "the first batch must lay the ribbon");
     assert!(
         !earned_trail.is_empty(),
@@ -293,12 +327,12 @@ fn split_batch_suffix_is_dark_but_keeps_resident_light_and_advances_anchors() {
 
     assert_eq!(glow.spawns(), earned_spawns, "the suffix minted glow");
     assert_eq!(
-        glow.live_sparks(),
-        earned_sparks,
+        live_light(&glow),
+        earned_light,
         "the suffix erased resident rainbow light"
     );
     assert_eq!(
-        glow.ribbon_segments(),
+        resident_ribbon(&glow),
         earned_ribbon,
         "the suffix cut the resident ribbon"
     );
@@ -332,6 +366,16 @@ const ALL_STYLES: [GlowStyle; 9] = [
     GlowStyle::Water,
     GlowStyle::Comet,
 ];
+// `GlowStyle::Classic` is DELIBERATELY ABSENT. This suite's subject is the
+// LICENSE SEAM — every test here asserts that a style draws nothing for a move
+// no keystroke asked for. The salvaged v0.28 engine does not consult that seam
+// at all (it spawns on observed cursor motion, which is what brings the
+// screen-crossing jump comet back), so listing it here would not extend the
+// suite's coverage — it would assert a property the style is defined not to
+// have, and the four failures are immediate. The classic engine's own
+// determinism and idle-zero pins live beside it in `classic_wake`, and its
+// whole-frame fold is pinned by
+// `builtins_are_byte_identical_and_never_touch_the_custom_path`.
 
 #[test]
 fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
@@ -656,7 +700,18 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // byte-identical because they do not.
         8_384_014_991_348_537_604,
         16_554_105_343_338_789_366,
-        1_074_721_155_938_290_065,
+        // RE-BASELINED 2026-09-06 — v1 DELETED (RAINBOW-KITTY-V2.md §17.3
+        // phase 7): `rainbow kitty` is its v2 engine unconditionally, so this
+        // entry is v2's fold of the same script (and the fold's light channel
+        // is now `live_light`, v2's cells + stars + meteors for this style —
+        // v1's spark census reads 0 over a lit v2 ribbon). Captured with
+        // `ATERM_CAPTURE_TYPED_PARITY=1` on the deletion tree: the other EIGHT
+        // entries came back byte-identical (their light channel is still
+        // `live_sparks`, unchanged), and the control below re-proves that
+        // withholding every key hint still moves this entry — v2 admits its
+        // moves through the same style-agnostic licence gate v1 did (seam
+        // point 1 sits AFTER it), so a cold script reaches it with nothing.
+        9_913_598_197_427_658_676,
         6_783_487_424_150_533_517,
         17_288_162_128_308_037_669,
         14_938_859_424_317_138_785,
@@ -731,11 +786,11 @@ fn an_unlicensed_script_moves_every_golden_entry() {
         assert_eq!(licensed.spawns, 10, "{style:?}: an admitted move was lost");
         assert_eq!(cold.spawns, 0, "{style:?}: a denied move minted light");
         assert!(
-            licensed.peak_live_sparks > 0,
+            licensed.peak_live_light > 0,
             "{style:?}: the licensed control never carried live light"
         );
         assert_eq!(
-            cold.peak_live_sparks, 0,
+            cold.peak_live_light, 0,
             "{style:?}: the unlicensed control carried live light"
         );
         if style == GlowStyle::RainbowKitty {

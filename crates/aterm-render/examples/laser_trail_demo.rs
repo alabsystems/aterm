@@ -48,6 +48,7 @@ fn main() {
         head: 0,
     };
     let cfg = GlowConfig {
+        classic_mono: false,
         ribbon_tall: false,
         enabled: true,
         style: GlowStyle::Laser,

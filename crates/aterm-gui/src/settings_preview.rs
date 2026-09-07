@@ -129,6 +129,8 @@ pub(crate) enum PreviewTrailStyle {
     Water,
     Beam,
     Comet,
+    /// THE CLASSIC WAKE — the salvaged v0.28 trail.
+    Classic,
     /// A loaded user-authored Trail Pack. Its actual data travels separately in
     /// [`CursorPreviewSpec::trail_pack`], so two packs remain distinguishable
     /// even though both use the shared engine's `GlowStyle::Custom` dispatch.
@@ -169,6 +171,7 @@ impl PreviewTrailStyle {
             Some(GlowStyle::Water) => Self::Water,
             Some(GlowStyle::Beam) => Self::Beam,
             Some(GlowStyle::Comet) => Self::Comet,
+            Some(GlowStyle::Classic) => Self::Classic,
             Some(GlowStyle::Custom) => Self::Custom,
             None if resolved.issue.is_none() => Self::Off,
             None if raw.trim().starts_with("pack:") => Self::Custom,
@@ -189,6 +192,7 @@ impl PreviewTrailStyle {
             Self::Water => "water",
             Self::Beam => "beam",
             Self::Comet => "comet",
+            Self::Classic => "classic",
             Self::Custom => "custom pack",
         }
     }

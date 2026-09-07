@@ -512,9 +512,6 @@ pub const SPECTRUM_CYAN_HI: f64 = 200.0;
 /// asks the ruling's own question of the COMPOSITED pixel, at emit time, of every
 /// quad the rainbow puts under the ink.
 pub const SPECTRUM_CYAN_SAT_MIN: f64 = 0.3;
-/// §2.3.4's bound on how much of `t` may lie inside the window.
-#[cfg(test)]
-pub(crate) const SPECTRUM_CYAN_DWELL_MAX: f64 = 0.04;
 
 /// **THE CHROMA FLOOR**, in levels of channel spread (`max − min`): below it a
 /// colour is a GREY, not a cyan, and §2.3.4's ruling is about colours.
@@ -1023,25 +1020,6 @@ pub(crate) fn spectrum_crossing_width() -> f32 {
     SPECTRUM_CROSSING_ENTRIES as f32 / (SPECTRUM_LUT_LEN - 1) as f32
 }
 
-/// **THE PACE, INVERTED** — the PATH position, normalized to `[0, 1]`, that a
-/// table position `t` came from.
-///
-/// The legibility ceilings `super::cursor_glow` solves are properties of a
-/// COLOUR, and the table was solved on an even grid of the path. A re-pace moves
-/// a colour's `t` without moving the colour, so the ceiling has to follow it —
-/// this is the map that lets a derivation state that in one line, and it is the
-/// only thing outside this module that needs to know the pace exists.
-#[cfg(test)]
-#[must_use]
-pub(crate) fn spectrum_path_of(t: f32) -> f32 {
-    static PATH: std::sync::LazyLock<[f32; SPECTRUM_LUT_LEN]> =
-        std::sync::LazyLock::new(|| generate_spectrum_table().path_at);
-    let x = t.clamp(0.0, 1.0) * (SPECTRUM_LUT_LEN - 1) as f32;
-    let i = (x as usize).min(SPECTRUM_LUT_LEN - 1);
-    let j = (i + 1).min(SPECTRUM_LUT_LEN - 1);
-    (PATH[i] + (PATH[j] - PATH[i]) * (x - i as f32)) / (SPECTRUM_LUT_LEN - 1) as f32
-}
-
 /// Where along a leg the pace has spent `want` — the inverse of the cumulative
 /// cost, by binary search and one linear step inside the bracket it lands in.
 fn spectrum_pace_at(cum: &[(f64, [f64; 3])], cost: &impl Fn([f64; 3]) -> f64, want: f64) -> f64 {
@@ -1129,19 +1107,6 @@ fn spectrum_roof_hsv(slot: f64) -> (f64, f64, f64) {
         pchip_eval(&xs, &sat, slot),
         pchip_eval(&xs, &val, slot),
     )
-}
-
-/// **THE INVERSE OF [`spectrum_hsv`], IN ONE SPELLING.** The roof's generator and
-/// `super::cursor_glow`'s `rainbow_bed_true_hue` both have to turn an `(H, S, V)`
-/// back into the byte triple this family compares against, and a second spelling
-/// of the same rounding is how a table and its consumer come to disagree by a
-/// level. `hue` may be any real; it wraps.
-#[inline]
-#[must_use]
-pub(crate) fn spectrum_from_hsv(hue: f64, sat: f64, val: f64) -> u32 {
-    let rgb = hsv_srgb(hue, sat, val);
-    let byte = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
-    (byte(rgb[0]) << 16) | (byte(rgb[1]) << 8) | byte(rgb[2])
 }
 
 /// Monotone cubic Hermite (Fritsch–Carlson) through `(xs, ys)`, endpoint

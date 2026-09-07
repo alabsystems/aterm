@@ -9624,14 +9624,46 @@ impl WindowState {
         // `nextDrawable`, with the user's next keyDown queued in the OS behind it
         // — the trail's entire measured +8 ms on key->present-return. Half the
         // effect frames buys back the whole park; see the constant's doc.
-        if has_glass
+        // THE FRAME LANE'S OWN ANSWER, resolved before the arms so that arm 1
+        // can REFUSE a train nobody asked for. The predicate is a LEVEL (light
+        // is on glass), but the wake it owes is a question the owners answer
+        // separately: something needs the frame train, or the glow names its
+        // next visible change. When every owner answers "nothing" — the one
+        // way in is v2's fingerprint holding `is_active` with no deadline —
+        // the fall-through here used to be `phase_locked_effect_deadline`'s
+        // `now + interval`: a frame-cadence train re-armed on every turn for
+        // frames that could not differ from the last. That is exactly the
+        // "arms with nothing to draw" the confirmation capture measured
+        // (`after2-measure.md`, residual (i)), so the lane now falls to the
+        // one-shot / park arms instead; the next input wakes it as ever.
+        // THE PET'S COARSE OFFER (Rainbow Kitty v2 A/B #19): a settled
+        // companion no longer asks for the frame train while it breathes,
+        // blinks and flicks — `needs_frames` is false the moment the body is
+        // still — and instead names the instant of its next VISIBLE step,
+        // exactly as the glow names its ember poll and v2 its star deaths.
+        // It folds into the same coarse slot below (the earliest offer wins;
+        // a `None` from everyone parks) and, like the glow's own `is_active`,
+        // it holds the lane's predicate open on its own so the wake it
+        // names is armed at all. Gated as the cursor effects are gated:
+        // pixels on glass, a front terminal, focus (or the typed wake, or a
+        // recording), and the pet animating at all — an unfocused pet is
+        // under Reduced motion and draws one still, so it may not wake the
+        // loop for a breath it will not draw.
+        let pet_deadline = (has_glass
+            && cursor_cat_motion
+            && self.front_terminal().is_some()
+            && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher))
+            .then(|| self.cursor_pet.next_change_deadline(now))
+            .flatten();
+        let frame_lane = (has_glass
             && (deco_wake
+                || pet_deadline.is_some()
                 || self.terminal_effect_frame_active_with_recording(
                     now,
                     cursor_cat_motion,
                     recording_watcher,
-                ))
-        {
+                )))
+        .then(|| {
             let aurora_interval = effect_present_interval(self.frame_interval);
             // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember tail.
             // If the ONLY live cursor effect is the glow's slowly-cooling ember
@@ -9653,8 +9685,23 @@ impl WindowState {
             // below and pace Robi's walk at ~11 fps — the exact drift the
             // `cursor_dependents` split was introduced to end.
             let others_need_cadence = fade_wake || cursor_dependents || deco_wake;
-            let glow_deadline = self.cursor_glow.next_change_deadline(now, aurora_interval);
+            // The coarse slot: the earliest of the glow's offer and the
+            // pet's (see `pet_deadline` above) — `min` where both answer,
+            // whichever one answers otherwise.
+            let glow_deadline = match (
+                self.cursor_glow.next_change_deadline(now, aurora_interval),
+                pet_deadline,
+            ) {
+                (Some(glow), Some(pet)) => Some(glow.min(pet)),
+                (glow, pet) => glow.or(pet),
+            };
             let needs_frame_cadence = others_need_cadence || self.cursor_glow.needs_frame_cadence();
+            (aurora_interval, glow_deadline, needs_frame_cadence)
+        })
+        .filter(|(_, glow_deadline, needs_frame_cadence)| {
+            *needs_frame_cadence || glow_deadline.is_some()
+        });
+        if let Some((aurora_interval, glow_deadline, needs_frame_cadence)) = frame_lane {
             // PHASE-LOCKED re-arm: continue the previous deadline train (`fired +
             // interval`) so the effective cadence stays the cap instead of
             // `interval + frame cost`. A fired deadline more than one interval old
@@ -9691,11 +9738,21 @@ impl WindowState {
             // can only land EARLIER, never later — and the tick that refreshes
             // the latch is always due inside it.
             //
-            // Confined to `needs_frame_cadence`: the coarse-only path (a glow
-            // ember alone, ~90 ms) legitimately owns a slot longer than a frame
-            // and keeps the old byte-for-byte behaviour.
+            // …and neither may a COARSE arm. This clamp used to be confined to
+            // `needs_frame_cadence`, on the ground that the coarse-only path (a
+            // glow ember alone, ~90 ms) "legitimately owns a slot longer than a
+            // frame". It does — and for v1's fixed polls (the ember's 90 ms, the
+            // poof hint's 40 ms) a held slot is never later than a fresh one, so
+            // keeping it was `min` by another name. Rainbow Kitty v2 answers
+            // EXACT instants instead (a star's death, a swoosh's end, a fade's
+            // next u8 step), and an exact instant can be EARLIER than the slot
+            // a previous turn held — the held slot then delivered that change
+            // late. The earliest of the two is the only answer that is right
+            // for both: byte-identical for v1's polls, on time for v2's edges,
+            // and — the freeze case again — never a slot seconds away when a
+            // real deadline is due inside it.
             let d = match self.next_trail_tick {
-                Some(held) if !needs_frame_cadence || held <= fresh => held,
+                Some(held) if held <= fresh => held,
                 _ => fresh,
             };
             self.next_trail_tick = Some(d);
@@ -24178,9 +24235,17 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             g.set_bloom(
                 !config.serious_mode_or_default() && config.cursor_trail_bloom_or_default(),
             );
+            // Per-style bloom radius (rainbow kitty 1.8, else 2.2; the knob
+            // overrides) from the startup generation's pre-parsed presentation
+            // — the same catalog value the windowed pin reads.
             g.set_bloom_params(
                 config.cursor_trail_bloom_strength_or_default(),
-                config.cursor_trail_bloom_radius_or_default(),
+                config.cursor_trail_bloom_radius_or_default(
+                    startup_config_snapshot
+                        .assets
+                        .trail_packs
+                        .presentation_for(config.cursor_trail_style_raw()),
+                ),
             );
             // Heat shimmer above burning cells (bloom parity class), applied
             // through the same effect-source path in headless introspection.
@@ -32737,6 +32802,384 @@ mod tests {
         assert!(model.fire("PaintSettle", &mut settled));
         assert_eq!(settled["pixels_lit"], 0);
         assert_eq!(settled["effect_active"], 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE EFFECT LANE'S WAKE CENSUS (`after2-measure.md`, residual (i)).
+    // -----------------------------------------------------------------------
+
+    use std::time::{Duration, Instant};
+
+    /// One gesture of the confirmation capture's schedule.
+    #[derive(Clone, Copy, Debug)]
+    enum LaneGesture {
+        Key,
+        JumpTo(u16),
+        Backspace,
+        Enter,
+    }
+
+    /// The BEFORE capture's schedule, in ms from the first key: 35 keys at
+    /// 70 ms, a 1.5 s pause, 9 keys at 35 ms, a 1 s pause, four Ctrl-A /
+    /// Ctrl-E jumps 500 ms apart, four backspaces at 100 ms, Enter — and the
+    /// tail the lane is judged on. The seam's twin of this list lives in
+    /// `cursor_glow::tests::census_schedule`.
+    fn lane_census_schedule() -> Vec<(u64, LaneGesture)> {
+        let mut s = Vec::new();
+        let mut t = 0u64;
+        for _ in 0..35 {
+            s.push((t, LaneGesture::Key));
+            t += 70;
+        }
+        t += 1_500 - 70;
+        for _ in 0..9 {
+            s.push((t, LaneGesture::Key));
+            t += 35;
+        }
+        t += 1_000 - 35;
+        for k in 0..4u64 {
+            let to = if k % 2 == 0 { 0 } else { 48 };
+            s.push((t, LaneGesture::JumpTo(to)));
+            t += 500;
+        }
+        for _ in 0..4 {
+            s.push((t, LaneGesture::Backspace));
+            t += 100;
+        }
+        t += 400;
+        s.push((t, LaneGesture::Enter));
+        s
+    }
+
+    /// The host-level terms that can make the lane's predicate true — the
+    /// owners an arm is charged to, in the planner's own order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    enum LaneOwner {
+        /// The glow (v1 or v2) asks for the frame train.
+        GlowTrain,
+        /// A chrome decoration mid-motion.
+        Deco,
+        /// The M2 stream fade.
+        Fade,
+        /// A non-caret cursor dependent: trail, companion, pet, word décor,
+        /// another cursor body.
+        Dependents,
+        /// The rainbow CARET block's `is_active` — its cool (`paint > 0.02`).
+        CaretCool,
+        /// The glow offers a coarse next change (a tail, an edge, a poll).
+        GlowCoarse,
+        /// The glow is `is_active` by state alone: no train, no deadline.
+        GlowStateOnly,
+    }
+
+    const LANE_OWNERS: [LaneOwner; 7] = [
+        LaneOwner::GlowTrain,
+        LaneOwner::Deco,
+        LaneOwner::Fade,
+        LaneOwner::Dependents,
+        LaneOwner::CaretCool,
+        LaneOwner::GlowCoarse,
+        LaneOwner::GlowStateOnly,
+    ];
+
+    /// The census of one scripted session through the REAL lane planner.
+    #[derive(Debug, Default)]
+    struct LaneCensus {
+        /// Turns on which the planner armed a `CursorEffect` deadline.
+        arms: u32,
+        /// Frames the modelled loop rendered (one per wake).
+        frames: u32,
+        /// Frames whose fingerprint differed from the last (the present gate
+        /// lets these through; the rest are wasted renders).
+        presents: u32,
+        /// Arms on which each owner was live (an arm can be charged to several).
+        live: [u32; 7],
+        /// Arms on which the owner was the ONLY live term.
+        sole: [u32; 7],
+        /// Arms after the last gesture.
+        tail_arms: u32,
+        /// ms after the last gesture at which the planner first parked (and
+        /// stayed parked); `None` if it never did inside the tail.
+        park_ms: Option<u64>,
+        /// The lane's effect-present interval.
+        interval: Duration,
+    }
+
+    impl LaneCensus {
+        fn arms_per_frame(&self) -> f64 {
+            f64::from(self.arms) / f64::from(self.frames.max(1))
+        }
+
+        fn renders_per_present(&self) -> f64 {
+            f64::from(self.frames) / f64::from(self.presents.max(1))
+        }
+
+        fn line(&self, tag: &str) -> String {
+            let mut owners = String::new();
+            for (k, owner) in LANE_OWNERS.iter().enumerate() {
+                if self.live[k] > 0 {
+                    owners.push_str(&format!(" {owner:?}={}/{}", self.live[k], self.sole[k]));
+                }
+            }
+            format!(
+                "lane census {tag}: interval {:?} arms {} frames {} presents {} → {:.2} arms/frame, \
+                 {:.2} renders/present; tail arms {} park +{:?} ms; live/sole by owner:{owners}",
+                self.interval,
+                self.arms,
+                self.frames,
+                self.presents,
+                self.arms_per_frame(),
+                self.renders_per_present(),
+                self.tail_arms,
+                self.park_ms
+            )
+        }
+    }
+
+    /// Drive one window's REAL lane planner through [`lane_census_schedule`]
+    /// the way `about_to_wait` does: a wake at every gesture and at every
+    /// armed tick; on each wake the due tick is serviced, the lane plans
+    /// (arm A — the turn that requested the redraw), the frame renders (the
+    /// glow seam + the caret block, exactly the two engines the render path
+    /// ticks for this style), and the lane plans again (arm B — the turn
+    /// after the redraw, which keeps the slot). The glow is the rainbow
+    /// kitty, which is v2 (there is no other engine since phase 7); `caret`
+    /// ticks the rainbow caret block beside the glow (the shipping window
+    /// does; `false` isolates the glow's own lane).
+    fn lane_wake_census(caret: bool) -> LaneCensus {
+        use crate::cursor_glow::Geom;
+        use crate::cursor_rainbow::RainbowConfig;
+
+        let mut app = App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        assert!(matches!(
+            glow_cfg.style,
+            crate::cursor_glow::GlowStyle::RainbowKitty
+        ));
+        let geom = Geom {
+            cw: 18,
+            ch: 40,
+            rows: 26,
+            cols: 190,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 3420,
+            win_h: 1040,
+            head: 0,
+        };
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        let interval = super::effect_present_interval(ws.frame_interval);
+        let mut census = LaneCensus {
+            interval,
+            ..LaneCensus::default()
+        };
+        let script = lane_census_schedule();
+        let t0 = Instant::now();
+        let last_at = t0 + Duration::from_millis(script.last().map_or(0, |s| s.0));
+        let end = last_at + Duration::from_secs(6);
+        let mut cell = (12u16, 4u16);
+        let mut next_ev = 0usize;
+        let mut out = Vec::new();
+        let mut last_fp = 0u64;
+        let fold = |a: u64, b: u64| (a ^ b).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
+        let mut now = t0 - Duration::from_millis(50);
+        // Seed: one dark frame so both engines have a source cell.
+        ws.cursor_glow
+            .tick(Some(cell), now, &glow_cfg, geom, &mut out);
+        let charge = |ws: &mut super::WindowState, now: Instant, census: &mut LaneCensus| {
+            let armed = ws.plan_terminal_effect_lane(now, true, true).is_some();
+            if !armed {
+                return false;
+            }
+            census.arms += 1;
+            let glow_train = ws.cursor_glow.needs_frame_cadence();
+            let glow_coarse =
+                !glow_train && ws.cursor_glow.next_change_deadline(now, interval).is_some();
+            let caret_cool = ws.cursor_rainbow.is_active();
+            let live = [
+                glow_train,
+                ws.deco_anim_frame_active(now),
+                !ws.is_split() && (ws.fade_shown || ws.stream_fade.is_active(now)),
+                ws.cursor_dependents_need_frame_cadence(now, true) && !caret_cool,
+                caret_cool,
+                glow_coarse,
+                ws.cursor_glow.is_active() && !glow_train && !glow_coarse,
+            ];
+            let n = live.iter().filter(|l| **l).count();
+            for (k, l) in live.iter().enumerate() {
+                if *l {
+                    census.live[k] += 1;
+                    if n == 1 {
+                        census.sole[k] += 1;
+                    }
+                }
+            }
+            true
+        };
+        loop {
+            let ev_at = script
+                .get(next_ev)
+                .map(|(ms, _)| t0 + Duration::from_millis(*ms));
+            let wake = match (ws.next_trail_tick, ev_at) {
+                (Some(d), Some(e)) => d.min(e),
+                (Some(d), None) => d,
+                (None, Some(e)) => e,
+                (None, None) => break,
+            };
+            if wake > end {
+                break;
+            }
+            assert!(
+                wake > now || ev_at == Some(wake),
+                "the lane armed a deadline at `now` — a busy re-arm"
+            );
+            now = wake;
+            if ev_at == Some(now) {
+                match script[next_ev].1 {
+                    LaneGesture::Key => {
+                        ws.cursor_glow.note_synthetic_typed(now, 1);
+                        ws.typing_cadence.on_keystroke(now);
+                        cell.1 += 1;
+                    }
+                    LaneGesture::JumpTo(col) => {
+                        ws.cursor_glow.note_motion(now);
+                        cell.1 = col;
+                    }
+                    LaneGesture::Backspace => {
+                        ws.cursor_glow.note_backspace(now);
+                        cell.1 = cell.1.saturating_sub(1);
+                    }
+                    LaneGesture::Enter => {
+                        ws.cursor_glow.note_return(now);
+                        cell = (cell.0 + 1, 0);
+                    }
+                }
+                ws.last_key_at = Some(now);
+                next_ev += 1;
+            }
+            ws.service_due_terminal_effect_tick(now);
+            // Arm A: the turn that requested this redraw.
+            let a = charge(ws, now, &mut census);
+            // The frame.
+            let glow_fp = ws
+                .cursor_glow
+                .tick(Some(cell), now, &glow_cfg, geom, &mut out);
+            ws.cursor_glow.drain_sound_cues().for_each(drop);
+            let caret_cfg = RainbowConfig {
+                enabled: caret,
+                intensity: 1.0,
+                blinking: false,
+                base: None,
+                head_rgb: ws.cursor_glow.rainbow_head_rgb(&glow_cfg),
+                paint: Some(ws.cursor_glow.caret_paint(now)),
+                ground: Some(glow_cfg.theme_bg),
+                flare_at: ws.cursor_glow.caret_flare_at(),
+            };
+            let (energy, _) = ws.typing_cadence.sample(now);
+            let (phase, field) = (
+                ws.cursor_glow.rainbow_phase(),
+                ws.cursor_glow.rainbow_field(),
+            );
+            let caret_frame = ws.cursor_rainbow.tick_with_family_phase(
+                Some(cell),
+                now,
+                energy,
+                phase,
+                field,
+                false,
+                true,
+                geom,
+                &caret_cfg,
+                &mut out,
+            );
+            let fp = fold(glow_fp, caret_frame.fp);
+            census.frames += 1;
+            if fp != last_fp {
+                census.presents += 1;
+                last_fp = fp;
+            }
+            // Arm B: the turn after the redraw.
+            let b = charge(ws, now, &mut census);
+            if now >= last_at {
+                let since = now.saturating_duration_since(last_at).as_millis() as u64;
+                census.tail_arms += u32::from(a) + u32::from(b);
+                // The park is the POST-redraw decision: arm A judged the state
+                // before this frame; arm B is the level the loop sleeps on.
+                if b {
+                    census.park_ms = None;
+                } else if census.park_ms.is_none() {
+                    census.park_ms = Some(since);
+                }
+            }
+        }
+        census
+    }
+
+    /// THE LANE'S WAKE CENSUS, printed for the record (`--nocapture`): the
+    /// confirmation capture's schedule through the real planner, with and
+    /// without the caret block, arms by owner. The LAW it pins is residual
+    /// (i)'s first half, restated without its v1 control (the v2-vs-v1 arm
+    /// bound was measured and held until v1's deletion at phase 7 — v2 armed
+    /// the lane no more than v1 on this schedule; the engine-side census
+    /// `cursor_glow::tests` keeps the frame-train law): the lane never arms
+    /// a frame train for a glow that offered no next change — every arm the
+    /// glow is charged with is a cadence it asked for or a deadline it named
+    /// — and the whole session renders no more than one frame per arm (a
+    /// wasted render is a frame whose fingerprint did not move).
+    #[test]
+    fn the_effect_lane_never_arms_for_a_glow_with_no_next_change() {
+        let full = lane_wake_census(true);
+        let bare = lane_wake_census(false);
+        for (tag, c) in [("v2 + caret", &full), ("v2 glow only", &bare)] {
+            println!("{}", c.line(tag));
+            assert!(c.arms > 0 && c.frames > 0, "{tag}: the session rendered");
+            assert_eq!(
+                c.sole[LANE_OWNERS
+                    .iter()
+                    .position(|o| *o == LaneOwner::GlowStateOnly)
+                    .expect("owner")],
+                0,
+                "{tag}: the lane armed a frame train for a glow that offered no next change"
+            );
+            assert!(
+                c.frames <= c.arms,
+                "{tag}: {} frames rendered on {} arms — a frame nobody armed",
+                c.frames,
+                c.arms
+            );
+        }
+        // The caret block only adds arms; it never takes the glow's away.
+        assert!(
+            full.arms >= bare.arms,
+            "the caret block took arms off the glow: {} < {}",
+            full.arms,
+            bare.arms
+        );
+    }
+
+    /// Residual (i)'s second half: once the last key is in, the glow's own
+    /// lane parks within two seconds under v2 (the engine idles at ≤ 1.54 s
+    /// — the ribbon's swoosh — and no v1 term may outlive it). Measured on
+    /// the glow alone: the rainbow caret block pins `is_active` for ≈ 3.3 s
+    /// of identical u8 fills after typing stops (spec §7.1's host follow-up,
+    /// `cursor_rainbow.rs`), and that pin is charged to it by name in the
+    /// census above rather than hidden inside this law.
+    #[test]
+    fn the_effect_lane_parks_within_two_seconds_of_the_last_key_under_v2() {
+        let v2 = lane_wake_census(false);
+        println!("{}", v2.line("v2 glow only"));
+        let park = v2
+            .park_ms
+            .expect("the lane never parked after the last key");
+        assert!(
+            park <= 2_000,
+            "the lane parked {park} ms after the last key"
+        );
+        // And it does not wake again once parked: the tail's arms all precede
+        // the park (the census clears `park_ms` on any later arm).
+        assert!(v2.tail_arms > 0, "the tail owed at least the swoosh");
     }
 
     #[test]

@@ -334,6 +334,10 @@ impl EffectsPipeline {
                 // so the presentation flag is exactly `false` here rather than
                 // a guess: `apply` overwrites it from the real spelling.
                 ribbon_tall: false,
+                // …and the same for the classic wake's colour face: Lumen is
+                // not the classic style, so this is `false` by fact rather
+                // than by guess, and `apply` re-derives it from the spelling.
+                classic_mono: false,
                 // A COHERENT cold-start pair for `dark_theme: true` — the
                 // documented default palette. Never `0`/`0`: that is `fg == bg`,
                 // which the glyph tint reads as a conceal-shaped theme and
@@ -501,14 +505,17 @@ impl EffectsPipeline {
     /// not at the display's 60/120 Hz rAF rate.
     ///
     /// THE CADENCE LAW for the pet: it is a resident, so its term is
-    /// `needs_frames()` (something is moving), never the brain's `is_active`
-    /// (a cat exists) — a sleeping cat pins no frame lane.
+    /// `needs_frames()` (something is moving) or a named next visible step
+    /// (a settled cat breathing — its coarse offer, paced by
+    /// [`Self::next_deadline_ms`]), never the brain's `is_active` (a cat
+    /// exists) — a deeply sleeping cat pins no lane at all.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.trail.is_active()
             || self.glow.is_active()
             || self.decos.is_active(self.now())
             || self.companion.needs_frames()
+            || self.companion.next_change_deadline(self.now()).is_some()
             || self.rain.as_ref().is_some_and(|r| r.is_active())
             || self.streak.as_ref().is_some_and(|s| s.is_active())
     }
@@ -539,6 +546,15 @@ impl EffectsPipeline {
             Some(_) => return None, // live motion → display-rAF
             None => None,           // glow settled
         };
+        // The pet: a settled resident owes no frames but names the instant of
+        // its next VISIBLE step (a breath pixel, a blink, a tail beat) — the
+        // coarse offer of Rainbow Kitty v2 A/B #19, folded exactly as the
+        // glow's ember poll is. An overdue offer is a step due now.
+        let pet_ms = match self.companion.next_change_deadline(now) {
+            Some(d) if d > now => Some(d.duration_since(now).as_secs_f64() * 1000.0),
+            Some(_) => return None, // a step due now → display-rAF
+            None => None,           // deep asleep, hidden or gone
+        };
         let rain_ms = self
             .rain
             .as_ref()
@@ -554,7 +570,7 @@ impl EffectsPipeline {
         } else {
             None
         };
-        [glow_ms, rain_ms, streak_ms]
+        [glow_ms, pet_ms, rain_ms, streak_ms]
             .into_iter()
             .flatten()
             .reduce(f64::min)
@@ -816,6 +832,9 @@ impl EffectsPipeline {
             // highlighter-plus-under-baseline alternate. Keep this embedder
             // twin aligned with the native resolver.
             ribbon_tall: !crate::cursor_glow::GlowStyle::style_names_underline_ribbon(style),
+            // The classic wake's colour face is a spelling too, and re-derives
+            // here for the same reason — keep aligned with the native resolver.
+            classic_mono: crate::cursor_glow::GlowStyle::style_names_classic_mono(style),
             // CARRIED FORWARD, not reset — the same discipline `pack` and
             // `wake_persist_s` follow below. A reconfigure between two frames
             // must not clobber a ground the fold already resolved, or a live
@@ -2538,6 +2557,48 @@ mod tests {
 
     // ── the resident pet ────────────────────────────────────────────────────
 
+    /// THE WEB HOST DRAWS THE SAME RAINBOW KITTY AS THE NATIVE ONE (§17.3
+    /// phases 6-7): every rainbow-kitty spelling `set_cursor_glow` accepts —
+    /// the bare word, the pet, the historical `nyan rainbow`, the seam-era
+    /// `… v2` alias — engages v2 with no flag to set (a pipeline that never
+    /// set the seam's flag once drew v1 for every web spelling while the
+    /// native default drew v2), and the old `… v1` escape is an unknown word
+    /// now: it parses to the embedder's default (`Lumen`, the parser's
+    /// fallback) and v2 never engages for it.
+    #[test]
+    fn every_web_rainbow_kitty_spelling_is_v2() {
+        for (style, v2) in [
+            ("rainbow kitty", true),
+            ("rainbow kitty pet", true),
+            ("nyan rainbow", true),
+            ("rainbow kitty v2", true),
+            ("kitty v2", true),
+            ("rainbow kitty v1", false),
+            ("kitty v1", false),
+        ] {
+            let mut p = EffectsPipeline::new();
+            rainbow_kitty_glow(&mut p, style);
+            assert_eq!(
+                p.glow_cfg.style,
+                if v2 {
+                    GlowStyle::RainbowKitty
+                } else {
+                    GlowStyle::Lumen
+                },
+                "{style:?}: a v1 spelling names no style and falls to the default"
+            );
+            let (mut term, mut input) = glass(8, 40);
+            for _ in 0..6 {
+                commit_ascii(&mut p, &mut term, &mut input, b"k", 33.0);
+            }
+            assert_eq!(
+                p.glow.v2_status().is_some(),
+                v2,
+                "{style:?}: v2 engaged should be {v2}"
+            );
+        }
+    }
+
     /// The rainbow-kitty trail with the pet spelling `style` — the owner's
     /// two terms besides the opt-in.
     fn rainbow_kitty_glow(p: &mut EffectsPipeline, style: &str) {
@@ -3331,12 +3392,16 @@ mod tests {
         assert!(!p.deco_cfg.reduced_motion && !p.rain_reduced_motion);
     }
 
-    /// THE CADENCE LAW in the scheduler: while the resident owes frames
-    /// (`needs_frames`) there is no exact deadline — display-rAF cadence —
-    /// even with rain's 12 Hz engine wake armed and every other frame lane
-    /// settled; once it sleeps the pet forces nothing.
+    /// THE CADENCE LAW in the scheduler, in the three states of one resident:
+    /// while the pet MOVES (`needs_frames`) there is no exact deadline —
+    /// display-rAF cadence — even with rain's 12 Hz engine wake armed and
+    /// every other frame lane settled; once it has SETTLED it owes no frames
+    /// but names the instant of its next visible step (a breath pixel, a
+    /// blink, a tail beat — Rainbow Kitty v2 A/B #19), which folds into the
+    /// exact wake beside rain's; and in DEEP SLEEP it forces nothing — what
+    /// remains is rain's own verdict.
     #[test]
-    fn next_deadline_ms_is_none_while_the_pet_needs_frames() {
+    fn next_deadline_ms_is_none_while_the_pet_moves_and_exact_while_it_breathes() {
         let mut p = pet_pipeline(7);
         enable_classic_rain(&mut p);
         assert_eq!(
@@ -3347,16 +3412,10 @@ mod tests {
         assert!(!p.companion.needs_frames());
         let (mut term, mut input) = glass(8, 40);
         materialize_pet(&mut p, &mut term, &mut input);
-        // Let every other frame-cadence lane settle: the wake, the comet,
-        // the word engine. The resident is still in its settle-in window.
-        idle(&mut p, &mut term, &mut input, 60, 50.0);
-        assert!(
-            !p.trail.is_active() && !p.glow.is_active() && !p.decos.is_active(p.now()),
-            "fixture: only the pet holds a frame lane"
-        );
+        // Just arrived: the body is still coming in — motion.
         assert!(
             p.companion.needs_frames(),
-            "fixture: the resident owes frames"
+            "fixture: the resident is still moving"
         );
         assert_eq!(
             p.next_deadline_ms(),
@@ -3366,10 +3425,46 @@ mod tests {
         assert!(p.is_active());
         assert!(matches!(p.wake(), Wake::Frames));
 
+        // Let every other frame-cadence lane settle — the wake, the comet,
+        // the word engine — and the resident come to rest on its seat.
+        let mut settled = false;
+        for _ in 0..200 {
+            idle(&mut p, &mut term, &mut input, 1, 50.0);
+            if !p.companion.needs_frames()
+                && !p.trail.is_active()
+                && !p.glow.is_active()
+                && !p.decos.is_active(p.now())
+            {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "fixture: the resident and every other frame lane settle within 10 s"
+        );
+        assert!(
+            p.companion.next_change_deadline(p.now()).is_some(),
+            "settled: the resident names its next visible step"
+        );
+        let ms = p
+            .next_deadline_ms()
+            .expect("settled: an exact wake, not the frame train");
+        assert!(
+            ms > 0.0 && ms <= 83.0,
+            "the earliest of the pet's offer and rain's wake: {ms} ms"
+        );
+        assert!(p.is_active(), "a breathing pet keeps the scheduler armed");
+        assert!(matches!(p.wake(), Wake::At(_)));
+
         idle(&mut p, &mut term, &mut input, 350, 100.0);
         assert!(
             !p.companion.needs_frames(),
             "asleep: the pet forces nothing"
+        );
+        assert!(
+            p.companion.next_change_deadline(p.now()).is_none(),
+            "deep sleep: nothing left to offer"
         );
         assert!(
             p.next_deadline_ms().is_some() || !p.is_active(),

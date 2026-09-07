@@ -728,6 +728,41 @@ pub(crate) fn keystroke_click_audible(
     worker_live && sounds_on && volume > 0.0 && sound_allowed && !resize_quiet
 }
 
+/// WHAT KIND OF GLYPH the key landed, for Rainbow Kitty v2's engine
+/// ([`aterm_effects::rainbow_kitty::TypedClass`], §5.8's hero deal): the
+/// spacebar's rest, the `!` hero, a CAPITAL — what LANDED is a capital
+/// whichever way it was shifted (Shift, Caps Lock, a shifted-layout key), so
+/// the glyph itself is asked, not the modifier — and every other printable.
+/// A committed IME run (`typed == None`) is ordinary text: `Glyph`. Pure, so
+/// the pricing is provable without a window.
+#[inline]
+pub(crate) fn typed_class_for(typed: Option<char>) -> aterm_effects::rainbow_kitty::TypedClass {
+    use aterm_effects::rainbow_kitty::TypedClass;
+    match typed {
+        Some(' ') => TypedClass::Space,
+        Some('!') => TypedClass::Bang,
+        Some(c) if c.is_uppercase() => TypedClass::Capital,
+        _ => TypedClass::Glyph,
+    }
+}
+
+/// The SYNTH'S glyph class ([`aterm_effects::trail_sound::EventMeta::glyph_class`],
+/// `RAINBOW-KITTY-V2.md` §16 row 8): `0` letter/unknown, `1` `?`, `2` `!`,
+/// `3` digit, `4` punctuation. Filled at the keyed seam ONLY — an echo-born
+/// cue has no key behind it and carries `0`, exactly as it carries
+/// `shifted: false`. ASCII digits and punctuation, deliberately: the grafts
+/// this reads are keyboard-shaped taste, not Unicode categories.
+#[inline]
+pub(crate) fn typed_glyph_class(typed: Option<char>) -> u8 {
+    match typed {
+        Some('?') => 1,
+        Some('!') => 2,
+        Some(c) if c.is_ascii_digit() => 3,
+        Some(c) if c.is_ascii_punctuation() => 4,
+        _ => 0,
+    }
+}
+
 /// Whether an input event carries fresh, discrete intent that may start one new
 /// bounded presentation-recovery episode. Pointer motion is deliberately a
 /// stutter here: a stationary app can receive an unbounded hover/drag stream,
@@ -3388,7 +3423,10 @@ impl App {
                     // term a physical keypress satisfies by definition.
                     let click_synth = click_audible.then(|| KeyClickSynth {
                         style: self.glow_style(),
-                        voice: self.config.trail_sound_voice(),
+                        // The trail-gesture voice — the same read the frame
+                        // drain makes, so a v2 trail's click is the music
+                        // box on both delivery paths.
+                        voice: self.trail_gesture_voice(),
                         gain: self.config.trail_sound_volume(),
                         bed: self.config.trail_sound_bed_or_default(),
                         tone_melody: self.config.tone_melody_or_default(),
@@ -3650,7 +3688,18 @@ impl App {
                             // stamped at the KEY. The engine spends the license
                             // when the echo actually arrives — one hint, one
                             // echo.
-                            ws.cursor_glow.note_typed_cells(input_now, typed_cells);
+                            // …and the GLYPH itself, spelled for Rainbow Kitty
+                            // v2's hero deal (§5.8: a capital or `!` earns an
+                            // m1, a space lays ribbon and deals no star) —
+                            // priced at the key exactly like the click's
+                            // shiftedness, because an echo cannot tell `A`
+                            // from `a`. v1 reads only the cell count.
+                            ws.cursor_glow.note_typed_glyph(
+                                input_now,
+                                typed_cells,
+                                glyph_shifted && !spacebar,
+                                typed_class_for(typed),
+                            );
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
                             // audio): past ~20 ms a click stops feeling attached
@@ -3723,7 +3772,15 @@ impl App {
                                 let delivered =
                                     match (click_synth.as_ref(), ws.cursor_glow.take_key_cue()) {
                                         (Some(synth), Some(cue)) => {
-                                            pending_key_sound = Some((cue, *synth, term_cols));
+                                            // The glyph CLASS rides the keyed
+                                            // cue only (§16 row 8): the echo
+                                            // path has no key to read.
+                                            pending_key_sound = Some((
+                                                cue,
+                                                *synth,
+                                                term_cols,
+                                                typed_glyph_class(typed),
+                                            ));
                                             true
                                         }
                                         _ => false,
@@ -3756,7 +3813,8 @@ impl App {
                             if let (Some(synth), Some(cue)) =
                                 (click_synth.as_ref(), ws.cursor_glow.take_key_cue())
                             {
-                                pending_key_sound = Some((cue, *synth, term_cols));
+                                // A bare modifier lands no glyph: class 0.
+                                pending_key_sound = Some((cue, *synth, term_cols, 0));
                             }
                         }
                         // The companion's delete reaction is independent of
@@ -4064,7 +4122,7 @@ impl App {
                 // after the inline write returned (or the ordered FIFO accepted
                 // the job). A slow or unexpectedly expensive sound policy can
                 // therefore never delay terminal input egress.
-                if let Some((cue, synth, cols)) = pending_key_sound
+                if let Some((cue, synth, cols, glyph_class)) = pending_key_sound
                     && let Some(ws) = self.windows.get(&wid)
                 {
                     let policy = crate::app_render::TrailSoundPolicy {
@@ -4073,13 +4131,25 @@ impl App {
                         tone: ws.tone_tracker.effective(synth.tone_melody),
                         bed: synth.bed,
                     };
-                    self.trail_audio.push(crate::app_render::trail_sound_event(
-                        &cue,
-                        synth.style,
-                        cols,
-                        &policy,
-                        synth.gain,
-                    ));
+                    // THE KEYED SEAM'S STAMP (`RAINBOW-KITTY-V2.md` §16 rows
+                    // 7-8): the host input clock in ms — the same clock the
+                    // frame drain stamps its echo-born cues with — and the
+                    // glyph class only this seam can know. Stamped AFTER the
+                    // egress above, like everything else on this path.
+                    self.trail_audio.push_meta(
+                        crate::app_render::trail_sound_event(
+                            &cue,
+                            synth.style,
+                            cols,
+                            &policy,
+                            synth.gain,
+                        ),
+                        aterm_effects::trail_sound::EventMeta {
+                            at_ms: crate::app_render::input_clock_ms(),
+                            glyph_class,
+                            pan_from: 0.0,
+                        },
+                    );
                 }
                 // COSMETIC TYPING FEEDS — deliberately AFTER the egress above.
                 //
@@ -14656,7 +14726,10 @@ mod paste_cursor_gesture_tests {
 mod predictive_echo_input_gate_tests {
     use std::time::{Duration, Instant};
 
-    use super::{keystroke_click_audible, prediction_visibility_requires_redraw};
+    use super::{
+        keystroke_click_audible, prediction_visibility_requires_redraw, typed_class_for,
+        typed_glyph_class,
+    };
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_predict::PredictMode;
@@ -14733,6 +14806,47 @@ mod predictive_echo_input_gate_tests {
             predictor.next_deadline().is_none(),
             "Codex input must not arm a delayed erase"
         );
+    }
+
+    /// WHAT THE KEY LANDED, priced for Rainbow Kitty v2 at the one seam that
+    /// can see the glyph: a space rests, `!` is a hero, a capital is a
+    /// capital however it was shifted, everything else — a letter, a digit,
+    /// a committed IME run — is an ordinary glyph.
+    #[test]
+    fn the_typed_class_reads_the_glyph_that_landed() {
+        use aterm_effects::rainbow_kitty::TypedClass;
+        assert_eq!(typed_class_for(Some(' ')), TypedClass::Space);
+        assert_eq!(typed_class_for(Some('!')), TypedClass::Bang);
+        assert_eq!(typed_class_for(Some('A')), TypedClass::Capital);
+        assert_eq!(typed_class_for(Some('É')), TypedClass::Capital);
+        assert_eq!(typed_class_for(Some('a')), TypedClass::Glyph);
+        assert_eq!(typed_class_for(Some('7')), TypedClass::Glyph);
+        assert_eq!(typed_class_for(Some('?')), TypedClass::Glyph);
+        assert_eq!(typed_class_for(Some('漢')), TypedClass::Glyph);
+        assert_eq!(
+            typed_class_for(None),
+            TypedClass::Glyph,
+            "an IME run is text"
+        );
+    }
+
+    /// The synth's glyph class (§16 row 8): `0` letter/unknown, `1` `?`,
+    /// `2` `!`, `3` digit, `4` punctuation — keyboard-shaped, ASCII only, and
+    /// `0` for the space, the IME run and every non-ASCII glyph.
+    #[test]
+    fn the_synth_glyph_class_is_the_documented_five_way_split() {
+        assert_eq!(typed_glyph_class(Some('?')), 1);
+        assert_eq!(typed_glyph_class(Some('!')), 2);
+        for digit in '0'..='9' {
+            assert_eq!(typed_glyph_class(Some(digit)), 3, "{digit:?}");
+        }
+        for punct in [',', '.', ';', ':', '-', '(', ')', '"', '\'', '/'] {
+            assert_eq!(typed_glyph_class(Some(punct)), 4, "{punct:?}");
+        }
+        for letter in ['a', 'Z', ' ', 'é', '漢', '٣'] {
+            assert_eq!(typed_glyph_class(Some(letter)), 0, "{letter:?}");
+        }
+        assert_eq!(typed_glyph_class(None), 0, "an IME run stamps nothing");
     }
 
     /// The key-time click's host gate. Every conjunct is a case where the
