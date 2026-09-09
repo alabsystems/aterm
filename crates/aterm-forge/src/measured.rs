@@ -461,12 +461,23 @@ pub struct Baseline {
 // (7) the same day's objc-w7 residual: the `+arrayWithObjects:count:` SAFETY
 //     comment in vendor/winit window_delegate.rs grew from one line to two
 //     (`@@:r^@Q`, and why). +1 winit line; every winit-resolving cell +1.
+// (8) 2026-09-07, the macOS 14 launch fix: +22 lines in vendor/winit, all of
+//     them comment — app_state.rs (+19) says why the application delegate's
+//     `NSApplicationDelegate` claim is true on a host whose AppKit does not
+//     register the protocol (aterm-objc supplies a name-only one; v0.72.0
+//     through v0.75.0 asserted the host had it and died at launch on 14.4.1)
+//     and what AppKit actually asks of that delegate; window.rs (+3) names the
+//     host its NSWindow layout numbers were measured on. No code line moved
+//     and no `// LOCAL PATCH (aterm):` marker was added (attest.rs stays at
+//     121). winit's dominator cost 83,310 -> 83,332; mac-arm 391,436 ->
+//     391,458, linux 2,739,645 -> 2,739,667, win 3,586,874 -> 3,586,896 —
+//     the same +22 on each cell that vendors winit.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
     resolved: 109,
     workspace: 69,
     third_party: 40,
-    third_party_loc: 391_436,
+    third_party_loc: 391_458,
     build_scripts: 9,
     proc_macros: 2,
     duplicate_names: 1,
@@ -477,7 +488,7 @@ pub const LINUX: Baseline = Baseline {
     resolved: 259,
     workspace: 71,
     third_party: 188,
-    third_party_loc: 2_739_645,
+    third_party_loc: 2_739_667,
     build_scripts: 31,
     proc_macros: 16,
     duplicate_names: 6,
@@ -488,7 +499,7 @@ pub const WIN: Baseline = Baseline {
     resolved: 160,
     workspace: 69,
     third_party: 91,
-    third_party_loc: 3_586_874,
+    third_party_loc: 3_586_896,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,
@@ -708,13 +719,14 @@ pub struct Dom {
 /// `objc2-foundation` are GONE from the graph — the campaign's second prize,
 /// asserted as absence in `dominator::tests` like wgpu's — and `winit` is
 /// +288 for the port that took them out. `rustybuzz` and `serde` move up into
-/// the anchor list; neither moved by a line.
+/// the anchor list; neither moved by a line. +22 more on 2026-09-07 (note (8)):
+/// comment lines only, for the macOS 14 launch fix.
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
     Dom {
         name: "winit",
         version: None,
         pkgs: 12,
-        loc: 83_310,
+        loc: 83_332,
     },
     // RE-PINNED 2026-09-01 by the `once_cell` row, and it is the first time a
     // first-party patch target has moved an anchor in this file. `rustls` is

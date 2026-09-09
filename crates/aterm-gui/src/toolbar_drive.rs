@@ -837,7 +837,12 @@ mod macos {
         println!("      superclass {}", sup.to_string_lossy());
         if let Some(p) = d.conforms {
             let proto = protocol(p);
-            cx.check(!proto.is_null(), format!("{p:?} is loaded"));
+            // Registered by the HOST's AppKit, not supplied by aterm: a
+            // name-only stand-in would make the conformance below true of
+            // nothing AppKit knows.
+            let hosts =
+                !proto.is_null() && !aterm_objc::protocols_registered_by_aterm().contains(&p);
+            cx.check(hosts, format!("{p:?} is registered by this host's AppKit"));
             // SAFETY: `+conformsToProtocol:` is a read-only `NSObject` query
             // on a live class object.
             let ok = unsafe {

@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The own-rendered, cross-platform SOFTWARE UPDATE overlay: a floating [`DrawPrim`] card
-//! (same simple native-window style as [`crate::about`]) that shows the running build, the
-//! staged update (if any) with its "what's new" notes rendered from Markdown
+//! The RETIRED own-rendered SOFTWARE UPDATE overlay: a floating [`DrawPrim`] card
+//! (same simple native-window style as [`crate::about`]) that showed the running build,
+//! the staged update (if any) with its "what's new" notes rendered from Markdown
 //! ([`crate::markdown`]), and the actions — Check for Updates, Apply Now (only
-//! when a strictly-newer build is staged), and Close. It is the DETAILED update screen the
-//! tab-strip ↻ icon, the App-menu "Software Update…" item, the macOS toolbar ↻ button, and
-//! the fading "update ready" nudge all open. Shipping update details now render in the
-//! native Settings `/updates` route, where `controls update` serializes that route's exact
-//! compiled semantic frame. This former card model remains a regression fixture: ONE
-//! structured snapshot ([`UpdateState`], captured from [`aterm_update::status`]) drives its
-//! pixels and test projection, and ONE pure [`update_layout`] drives its painter and mouse
-//! hit-test.
+//! when a strictly-newer build is staged), and Close. NOTHING SHIPPING OPENS IT:
+//! `Overlay::Update` is `cfg(test)`-only. The tab-strip ↻ icon, the App-menu "Software
+//! Update…" item, the toolbar ↻ button and the update bar's press all land on the one-click
+//! apply (`App::apply_update_or_details`) or the native Settings `/updates` route, where
+//! `controls update` serializes that route's exact compiled semantic frame; the update
+//! lane's own moments live on the status bar (`status_bars`, 2026-09-07). This former card
+//! model remains a regression fixture: ONE structured snapshot ([`UpdateState`], captured
+//! from [`aterm_update::status`]) drives its pixels and test projection — and is the LIVE
+//! model behind the native `/updates` page — and ONE pure [`update_layout`] drives its
+//! painter and mouse hit-test.
 
 use aterm_render::Theme;
 

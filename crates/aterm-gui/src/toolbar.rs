@@ -4990,7 +4990,11 @@ mod macos {
         fn the_toolbar_delegate_conforms_to_nstoolbardelegate() {
             let cls = ToolbarDelegate::class();
             let proto = aterm_objc::protocol(c"NSToolbarDelegate");
-            assert!(!proto.is_null(), "AppKit is linked, so is its protocol");
+            assert!(
+                !proto.is_null()
+                    && !aterm_objc::protocols_registered_by_aterm().contains(&c"NSToolbarDelegate"),
+                "this host's AppKit registers NSToolbarDelegate — not one aterm had to supply"
+            );
             // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:`
             // are side-effect-free NSObject queries on a live class object.
             unsafe {
@@ -5038,7 +5042,12 @@ mod macos {
         fn the_rename_rows_encode_to_the_protocol_authority() {
             let cls = TabRenameTarget::class();
             let proto = aterm_objc::protocol(c"NSTextFieldDelegate");
-            assert!(!proto.is_null(), "AppKit is linked, so is its protocol");
+            assert!(
+                !proto.is_null()
+                    && !aterm_objc::protocols_registered_by_aterm()
+                        .contains(&c"NSTextFieldDelegate"),
+                "this host's AppKit registers NSTextFieldDelegate — not one aterm had to supply"
+            );
             // SAFETY: `+conformsToProtocol:` is a side-effect-free `NSObject`
             // query on a live class object.
             assert!(

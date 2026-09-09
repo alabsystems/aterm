@@ -207,6 +207,41 @@ if test -d "$HOME/.aterm/shell.d"
     end
 end
 
+# ─── The reroute directory, FIRST ───
+#
+# $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
+# stubs for the upstream Rust names (`aterm help reroute`), which the seam already
+# put FIRST on the PATH it handed this shell. That position is not final: fish
+# loads this file from conf.d, EARLY — before config.fish, where a user's
+# `fish_add_path ~/.cargo/bin` lands — and the package blocks just above may
+# prepend too. Measured 2026-09-07: ~/.cargo/bin at position 17, ahead of the
+# managed store at 19, so a bare `cargo` ran upstream Rust silently. An ORDER
+# failure — which is why this is move-to-front (every existing occurrence removed,
+# then prepended), never skip-if-present. Asserted here, and once more from a
+# one-shot on the first fish_prompt event, by which time config.fish has run.
+# Inert outside a session: the variable is unset, or the directory (Windows lays
+# none) does not exist. `test -n`, this file's rule for every ATERM_* variable.
+#
+# An explicit equality loop rather than `string match -v`: `string match` reads its
+# pattern as a wildcard, so a directory named with `*` or `[` would not be removed
+# by equality. The quoted `"$d"` keeps an EMPTY entry — the user's — intact.
+function __aterm_reroute_path_front
+    if test -n "$ATERM_REROUTE_DIR"; and test -d "$ATERM_REROUTE_DIR"
+        set -l rest
+        for d in $PATH
+            if test "$d" != "$ATERM_REROUTE_DIR"
+                set -a rest "$d"
+            end
+        end
+        set -gx PATH "$ATERM_REROUTE_DIR" $rest
+    end
+end
+__aterm_reroute_path_front
+function __aterm_reroute_first_prompt --on-event fish_prompt
+    functions -e __aterm_reroute_first_prompt
+    __aterm_reroute_path_front
+end
+
 # State tracking
 set -g __aterm_last_status 0
 

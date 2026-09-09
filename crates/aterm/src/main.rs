@@ -236,7 +236,7 @@ fn main() -> ExitCode {
     // printed at all; testing the value here would send `ATERM_HEADLESS=0` into
     // the SESSION, where nothing would ever mention it — the silent outcome
     // this whole path exists to prevent.
-    let mode_args = strip_mode_flags(&rest);
+    let mode_args = take_no_reroute(&strip_mode_flags(&rest));
     if windowish {
         // SINGLE-INSTANCE ROUTING (S12), applied to a PLAIN window launch —
         // Explorer / the Start menu / a pinned tile / `aterm --window` with
@@ -258,6 +258,41 @@ fn main() -> ExitCode {
 
     // The session: flags → quiet, then the passthrough (never returns).
     let quiet = aterm_cli::parse_args(mode_args);
+
+    // THE REROUTE SEAM of the session lane (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
+    // §"Reaching PATH" 1): resolve the configured store, lay the session-scoped stubs
+    // of the upstream Rust names (idempotent, eight tiny files, never over a foreign
+    // file — so the very first session is covered before `atpkg seed` ever runs), and
+    // hand the directory to `session_main` as `$ATERM_REROUTE_DIR`. The environment is
+    // the handoff because aterm-cli links atpkg for its tests only (its Cargo.toml:
+    // "the router composes these crates, aterm-cli does not call atpkg"); the session
+    // reads it at its own edge, puts it FIRST on the child PATH (move-to-front) and
+    // re-exports it for the shell integration. Same trusted-launcher discipline as
+    // `take_no_reroute`: set HERE, before the update checker below spawns the first
+    // thread. `ATERM_NO_REROUTE` engaged (`--no-reroute` above, or the variable; empty
+    // and `0` do not count) ⇒ nothing laid, nothing handed over, and the session
+    // prepends and exports nothing. On Windows `lay` lays nothing and the directory
+    // does not exist, so the handoff is skipped there too (TARGET).
+    if !atpkg::reroute::engaged(
+        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+            .ok()
+            .as_deref(),
+    ) && let Some(layout) = atpkg::store::resolve_configured()
+    {
+        // A failed `lay` must not produce a SILENT un-rerouted session — the
+        // exact thing the reroute exists to end — so it is said, once, here.
+        // (A recorded decline lays nothing and says nothing: that is the
+        // user's own instruction.)
+        if let Err(error) = atpkg::reroute::lay(&layout) {
+            eprintln!(
+                "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this session — `aterm pkg doctor` explains (aterm help reroute)"
+            );
+        }
+        let dir = layout.reroute_dir();
+        if dir.is_dir() {
+            aterm_log::env::set(atpkg::reroute::REROUTE_DIR_ENV, &dir);
+        }
+    }
 
     // THE SESSION UPDATE LANE (round-11). The one-binary era made a terminal
     // session an ordinary launch of aterm, but only the WINDOW entry ran the
@@ -373,11 +408,14 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
 /// answered with the window parser's `unknown option '--session'`, exit 2.
 /// Silently swallowing a mode request would be a worse answer than refusing it,
 /// so that one is left exactly where it was.
+///
+/// `--no-reroute` is consumed here as well (`take_no_reroute`): the alias IS the
+/// window, and the window must honour it exactly as the front door does.
 fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
     if let Some(code) = plain_launch_policy(&rest) {
         return code;
     }
-    aterm_gui::main_entry(strip_flags(&rest, &["--window"]));
+    aterm_gui::main_entry(strip_flags(&take_no_reroute(&rest), &["--window"]));
     ExitCode::SUCCESS
 }
 
@@ -412,6 +450,33 @@ fn strip_mode_flags(rest: &[OsString]) -> Vec<OsString> {
     strip_flags(rest, MODE_FLAGS)
 }
 
+/// `--no-reroute`: restore the upstream Rust names in this session (`aterm help
+/// reroute`; `docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH" 3).
+/// Consumed by [`take_no_reroute`] exactly like a mode flag: stripped before the
+/// payload boundary (neither mode library knows it) and, when present, turned into
+/// `ATERM_NO_REROUTE=1` in THIS process's environment — so both lanes read it
+/// through the same env gate a bare variable takes, and every child inherits it.
+const NO_REROUTE_FLAG: &str = "--no-reroute";
+
+/// `rest` with [`NO_REROUTE_FLAG`] stripped, the flag ESTABLISHED as
+/// `ATERM_NO_REROUTE=1` when it was present. Trusted-launcher idiom (the
+/// `--containment` precedent in aterm-cli's parser): single-threaded startup,
+/// before the update checker's thread and before any PTY byte flows, through the
+/// workspace's one lock-scoped env helper. Inside a `-e`/`--` payload the token
+/// belongs to the child command line and is neither read nor stripped. A launch
+/// carrying the flag is deliberately NOT a "plain" launch for the single-instance
+/// routing policy (which reads the unstripped `rest`): a tab forwarded to another
+/// instance would not carry the environment the flag asked for, so it opens here.
+fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
+    if rest[..payload_boundary(rest)]
+        .iter()
+        .any(|a| a.to_string_lossy() == NO_REROUTE_FLAG)
+    {
+        aterm_log::env::set(atpkg::reroute::NO_REROUTE_ENV, "1");
+    }
+    strip_flags(rest, &[NO_REROUTE_FLAG])
+}
+
 /// The request a PLAIN window launch would forward, or `None` when this launch
 /// must not be routed by policy at all.
 ///
@@ -434,6 +499,16 @@ fn plain_launch_request(
         return None;
     }
     if !aterm_cli::plain_launch_is_policy_eligible(argv, env) {
+        return None;
+    }
+    // `ATERM_NO_REROUTE=1 aterm` is the documented twin of `--no-reroute`, and
+    // a tab forwarded to a running instance would not carry that environment:
+    // it fails closed to a local spawn, exactly as the flag does.
+    if atpkg::reroute::engaged(
+        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
         return None;
     }
     let dir = plain_launch_dir(argv).ok()?;
@@ -829,6 +904,10 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
     ),
     ("--sandbox", "shorthand for --containment containment"),
     ("--no-sandbox", "shorthand for --containment user"),
+    (
+        "--no-reroute",
+        "restore the upstream Rust names in this session (see aterm help reroute)",
+    ),
     ("--quiet", "suppress the interactive startup notice"),
     ("--help", "print help and exit"),
     ("--version", "print the version and exit"),
@@ -837,6 +916,11 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ATERM_NO_REROUTE` is process-global and two tests here read or set it
+    /// (`plain_launch_request` fails closed on it since the 2026-09-07 review);
+    /// they take this lock so a parallel test never sees the other's value.
+    static NO_REROUTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `-d` must reach the running instance as an ABSOLUTE native path: the
     /// process that serves the request has its own working directory, so a
@@ -910,6 +994,10 @@ mod tests {
     /// itself.
     #[test]
     fn a_child_command_payload_is_never_routed_by_policy() {
+        let _env_lock = NO_REROUTE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        aterm_log::env::unset(atpkg::reroute::NO_REROUTE_ENV);
         let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
         let env = aterm_cli::LaunchEnv::default();
         for argv in [
@@ -1055,6 +1143,53 @@ mod tests {
         assert_eq!(
             strip_flags(&osv(&["--window", "--session"]), &["--window"]),
             osv(&["--session"])
+        );
+    }
+
+    /// `--no-reroute` is consumed like a mode flag — stripped for both lanes (neither
+    /// mode library knows it), never inside a payload — and ESTABLISHES
+    /// `ATERM_NO_REROUTE=1` in the process environment: the one reading both lanes
+    /// and every child share. The flag also completes.
+    #[test]
+    fn no_reroute_is_stripped_before_dispatch_and_sets_the_env() {
+        let _env_lock = NO_REROUTE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        let env = atpkg::reroute::NO_REROUTE_ENV;
+        let engaged = || atpkg::reroute::engaged(std::env::var(env).ok().as_deref());
+        // This test OWNS the variable for its duration (the lock above serializes
+        // it with the routing tests that read it) and clears it on the way out
+        // (and first, in case the developer is running the suite under
+        // `aterm --no-reroute`).
+        aterm_log::env::unset(env);
+        // The bare-variable spelling of the escape is never forwarded to a running
+        // instance either: a forwarded tab would not carry this environment.
+        aterm_log::env::set(env, "1");
+        assert_eq!(
+            plain_launch_request(&osv(&["--window"]), aterm_cli::LaunchEnv::default()),
+            None,
+            "an engaged {env} must fail closed to a local spawn, exactly like the flag"
+        );
+        aterm_log::env::unset(env);
+        // A payload token is the child's: neither stripped nor read.
+        assert_eq!(
+            take_no_reroute(&osv(&["-e", "sh", "--no-reroute"])),
+            osv(&["-e", "sh", "--no-reroute"])
+        );
+        assert!(!engaged(), "a payload token must not engage the escape");
+        // Before the boundary: stripped, and the environment carries it.
+        assert_eq!(
+            take_no_reroute(&osv(&["--window", "--no-reroute", "-d", "/tmp"])),
+            osv(&["--window", "-d", "/tmp"])
+        );
+        assert!(engaged(), "the flag must establish {env}=1");
+        aterm_log::env::unset(env);
+        assert!(
+            COMPLETION_FLAGS
+                .iter()
+                .any(|(flag, _)| *flag == NO_REROUTE_FLAG),
+            "the flag completes"
         );
     }
 

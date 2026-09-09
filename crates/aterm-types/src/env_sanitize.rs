@@ -264,6 +264,21 @@ mod tests {
         assert!(!is_ai_env_var("ATERM_SHELL_NONCE"));
     }
 
+    /// The reroute seam's three variables (`atpkg::reroute`, 2026-09-07) must reach
+    /// EVERY child: `ATERM_REROUTE_DIR` is what the shell integration re-asserts
+    /// first on PATH after the rc files ran; `ATERM_NO_REROUTE` is the one escape
+    /// hatch (`aterm --no-reroute`) — an upstream `cargo` exec'd under it hands it
+    /// to its own `rustc`/`rustdoc` spawns, or they are refused; `ATERM_Z3_IS_ORACLE`
+    /// is the ORACLE row's key. A deny-list hit here would silently strip the escape
+    /// from a nested aterm's children — the `ATERM_NO_*` update knobs above ARE
+    /// denied by name, so this pin keeps the family from being deny-listed by prefix.
+    #[test]
+    fn test_reroute_seam_vars_survive_sanitization() {
+        assert!(!is_ai_env_var("ATERM_NO_REROUTE"));
+        assert!(!is_ai_env_var("ATERM_REROUTE_DIR"));
+        assert!(!is_ai_env_var("ATERM_Z3_IS_ORACLE"));
+    }
+
     /// Item 4/5: the recursion-provisioning identity/edge vars and the
     /// control-socket selectors are denied by exact name, so an INHERITED copy
     /// never leaks past one hop (each direct child is re-injected a fresh set).

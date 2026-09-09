@@ -4550,6 +4550,14 @@ impl App {
             .level_up
             .as_ref()
             .map(|l| (l.wash_alpha(Instant::now()), l.border_alpha(Instant::now())));
+        // The surge's colour and rim thickness at the same instant — the two
+        // parameters the glow adds over the drop target's fixed ones.
+        let level_up_style = self.level_up.as_ref().map(|l| {
+            (
+                l.accent(accent, Instant::now()),
+                l.border_scale_q4(Instant::now()),
+            )
+        });
         let tray_floor_y = self.config_notice_tray_floor_y(front);
         self.bind_window_renderer_state(front);
         // Disjoint borrows: `self.backend` (renderer), the introspection GPU
@@ -4646,9 +4654,10 @@ impl App {
                     frame.width,
                     frame.height,
                     OverlayGlow {
-                        accent,
+                        accent: level_up_style.map_or(accent, |s| s.0),
                         wash_a,
                         border_a,
+                        border_scale_q4: level_up_style.map_or(0, |s| s.1),
                     },
                 );
             }
@@ -5686,6 +5695,14 @@ impl App {
             .level_up
             .as_ref()
             .map(|l| (l.wash_alpha(Instant::now()), l.border_alpha(Instant::now())));
+        // The surge's colour and rim thickness at the same instant — the two
+        // parameters the glow adds over the drop target's fixed ones.
+        let level_up_style = self.level_up.as_ref().map(|l| {
+            (
+                l.accent(accent, Instant::now()),
+                l.border_scale_q4(Instant::now()),
+            )
+        });
         let tray_floor_y = self.config_notice_tray_floor_y(front);
         let theme_fingerprint = presented_authority.map_or_else(
             || self.image_theme_fingerprint(),
@@ -5812,9 +5829,10 @@ impl App {
                         frame.width,
                         frame.height,
                         OverlayGlow {
-                            accent,
+                            accent: level_up_style.map_or(accent, |s| s.0),
                             wash_a,
                             border_a,
+                            border_scale_q4: level_up_style.map_or(0, |s| s.1),
                         },
                     );
                 }
@@ -9319,6 +9337,7 @@ mod terminal_split_capture_tests {
             accent: 0x0012_3456,
             wash_a: 17,
             border_a: 203,
+            border_scale_q4: 0,
         };
         {
             let window = app.windows.get_mut(&wid).unwrap();
@@ -9388,6 +9407,7 @@ mod terminal_split_capture_tests {
             accent: 0x0065_43AA,
             wash_a: 21,
             border_a: 177,
+            border_scale_q4: 0,
         };
         {
             let window = app.windows.get_mut(&wid).unwrap();

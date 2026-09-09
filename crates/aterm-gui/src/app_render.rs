@@ -4889,6 +4889,7 @@ mod trail_present_pacing_tests {
             accent: 0x0012_3456,
             wash_a: 17,
             border_a: 203,
+            border_scale_q4: 0,
         };
         let plan = app.active_visible_leaf_plan(id).expect("visible plan");
 
@@ -9003,6 +9004,46 @@ pub(crate) struct OverlayGlow {
     pub(crate) wash_a: u8,
     /// Inset-border alpha (0..255).
     pub(crate) border_a: u8,
+    /// Border thickness as a multiple of the size-derived law
+    /// ([`drop_border_px`]), in 1/16 units; `0` (or `16`) is the plain law.
+    /// The upgrade surge thickens its rim through this; the drop target never
+    /// does. The GPU (`aterm_gpu::DropOverlay::border_scale_q4`) applies the
+    /// same arithmetic, so both backends draw one rim.
+    pub(crate) border_scale_q4: u8,
+}
+
+/// The size-derived border thickness scaled by an [`OverlayGlow::border_scale_q4`]
+/// (1/16 units; `0` and `16` leave it alone), never below one pixel — the SAME
+/// arithmetic as `aterm_gpu`'s twin.
+fn scaled_border_px(base: usize, scale_q4: u8) -> usize {
+    if scale_q4 == 0 {
+        return base;
+    }
+    ((base * usize::from(scale_q4)) / 16).max(1)
+}
+
+#[cfg(test)]
+mod scaled_border_px_tests {
+    use super::scaled_border_px;
+
+    /// The surge's rim-thickness law, pinned on BOTH twins with one table (the
+    /// GPU's is `aterm_gpu::renderer::scaled_border_px`): `0` means unscaled,
+    /// sixteenths otherwise, never thinner than one pixel.
+    #[test]
+    fn scaled_border_px_is_sixteenths_never_thinner_than_a_pixel() {
+        for (base, q4, want) in [
+            (6, 0, 6),
+            (6, 16, 6),
+            (6, 24, 9),
+            (6, 40, 15),
+            (6, 44, 16),
+            (1, 1, 1),
+            (0, 16, 1),
+            (0, 0, 0),
+        ] {
+            assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
+        }
+    }
 }
 
 /// Blend `fg` over `bg` (both packed `0x00RRGGBB`) at alpha `a` (0..=255), per
@@ -9062,6 +9103,7 @@ pub(crate) fn apply_drop_overlay_at(
             accent,
             wash_a: DROP_WASH_ALPHA as u8,
             border_a: DROP_BORDER_ALPHA as u8,
+            border_scale_q4: 0,
         },
     );
 }
@@ -9088,7 +9130,10 @@ pub(crate) fn apply_overlay_at(
     if fw == 0 || fh == 0 || sw == 0 || sh == 0 {
         return;
     }
-    let border = drop_border_px(fw, fh);
+    let border = scaled_border_px(drop_border_px(fw, fh), glow.border_scale_q4)
+        .min(fw / 2)
+        .min(fh / 2)
+        .max(1);
     let accent = glow.accent & 0x00ff_ffff;
     let (wash_a, border_a) = (u32::from(glow.wash_a), u32::from(glow.border_a));
     // The frame rows/cols visible on the surface (intersection; crop-safe).
@@ -9330,6 +9375,7 @@ mod drop_overlay_tests {
             accent: 0x0000_FF00,
             wash_a: 128,
             border_a: 0,
+            border_scale_q4: 0,
         };
         apply_host_chrome_at(
             &mut pixels,
@@ -25612,15 +25658,17 @@ impl App {
                 accent: self.theme.cursor,
                 wash_a: DROP_WASH_ALPHA as u8,
                 border_a: DROP_BORDER_ALPHA as u8,
+                border_scale_q4: 0,
             })
         } else {
             self.level_up
                 .as_ref()
                 .filter(|_| !overlay_open)
                 .map(|level| OverlayGlow {
-                    accent: self.theme.cursor,
+                    accent: level.accent(self.theme.cursor, now),
                     wash_a: level.wash_alpha(now),
                     border_a: level.border_alpha(now),
+                    border_scale_q4: level.border_scale_q4(now),
                 })
         };
         HostVisualState { invert, overlay }
@@ -28549,9 +28597,16 @@ impl App {
             });
             // LEVEL-UP celebration — quantized to its ~30fps step so the glow/arrow re-
             // present every frame while up; `0` when idle (byte-identical no-celebration).
+            // `0` while an overlay covers the window too, and while a drag hovers
+            // it with no arrow on glass: the rim is not painted under an overlay
+            // and a drag paints the fixed drop glow instead (`host_visual_state`),
+            // so its ticking would only re-present an identical frame at 30 fps.
             let level_up_fp = self
                 .level_up
                 .as_ref()
+                .filter(|l| {
+                    !ws.overlay_open() && (!ws.drag_hover || l.arrow_alpha(frame_started) > 0.0)
+                })
                 .map_or(0, |l| l.fingerprint(frame_started));
             // The status bars: 0 when none is up — the key stays byte-identical
             // to the no-bar path (FL-1).
@@ -29257,15 +29312,17 @@ impl App {
                 accent: self.theme.cursor,
                 wash_a: DROP_WASH_ALPHA as u8,
                 border_a: DROP_BORDER_ALPHA as u8,
+                border_scale_q4: 0,
             })
         } else {
             self.level_up
                 .as_ref()
                 .filter(|_| !overlay_open)
                 .map(|l| OverlayGlow {
-                    accent: self.theme.cursor,
+                    accent: l.accent(self.theme.cursor, frame_started),
                     wash_a: l.wash_alpha(frame_started),
                     border_a: l.border_alpha(frame_started),
+                    border_scale_q4: l.border_scale_q4(frame_started),
                 })
         };
         let visuals = HostVisualState { invert, overlay };
@@ -29991,6 +30048,7 @@ impl App {
                 accent: g.accent,
                 wash_a: g.wash_a,
                 border_a: g.border_a,
+                border_scale_q4: g.border_scale_q4,
             });
             let source_shift = i32::try_from(source_crop_top).ok();
             let effects_shifted = source_shift.is_some_and(|shift| {
@@ -33290,7 +33348,17 @@ impl App {
         let notice_fp = self.notice.as_ref().map_or(0, |n| {
             n.fingerprint(std::time::Instant::now(), self.notice_is_sparkling())
         });
-        let level_up_fp = self.level_up.as_ref().map_or(0, |l| l.fingerprint(now));
+        // (`0` under an open overlay or an arrow-less drag hover, as in the
+        // single-pane key: no rim is painted there.)
+        let (overlay_covers, drag_covers) = self
+            .windows
+            .get(&wid)
+            .map_or((false, false), |ws| (ws.overlay_open(), ws.drag_hover));
+        let level_up_fp = self
+            .level_up
+            .as_ref()
+            .filter(|l| !overlay_covers && (!drag_covers || l.arrow_alpha(now) > 0.0))
+            .map_or(0, |l| l.fingerprint(now));
         // The status bars — same term as the single-pane key: they are WINDOW
         // chrome rows over the finished composite; 0 when none is up (FL-1).
         let status_bars_fp = self.status_bars.fingerprint();
@@ -35457,9 +35525,6 @@ impl App {
             }
             return;
         }
-        // Accent = the live cursor colour (like the notice's LevelUp flourish + the border
-        // glow above), so the arrow and the frame it rises within share one hue.
-        let accent = crate::settings::u32_rgb(self.theme.cursor);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as u32;
         let pad_top = self.win_pad_top(wid) as u32;
@@ -35468,6 +35533,10 @@ impl App {
         let Some(level_up) = self.level_up.as_ref() else {
             return;
         };
+        // Accent = the surge's own hue at this instant (the cursor colour, pulled
+        // toward the electric tint through the burst), so the arrow and the rim
+        // it rises within share one colour frame by frame.
+        let accent = crate::settings::u32_rgb(level_up.accent(self.theme.cursor, now));
         let geom = crate::settings::SettingsGeom {
             cw: cw as f32,
             ch: ch as f32,

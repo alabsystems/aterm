@@ -1629,8 +1629,8 @@ fn worker_reject_and_reap_handoff_child(
         "the worker must retain its unique reaper ownership"
     );
     if outcome == crate::UpdateHandoffOutcome::ChildDied {
-        // WRITE THE EVIDENCE DOWN. The completion detail paints a pill and stays
-        // short, so the durable log is where a future field report finds out which
+        // WRITE THE EVIDENCE DOWN. The completion detail lands on the update bar's
+        // row and stays short, so the durable log is where a future field report finds out which
         // of the three `ChildDied` events this was — and, when the answer is
         // `Unobserved`, that the answer is genuinely unknown rather than assumed.
         aterm_log::warn!(
@@ -1980,7 +1980,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         return;
     }
     let Some(outgoing) =
-        crate::seamless::write_outgoing(&job.manifest, &job.fds, &job.screens, job.window)
+        crate::seamless::write_outgoing(&job.manifest, &job.fds, &job.screens, job.window.clone())
     else {
         send_handoff_preparation_failure(
             &job,
@@ -2786,8 +2786,8 @@ fn run_handoff_decision(
         // degraded-authority exit in `main_entry`), and the reject path below adds
         // what the PARENT saw (`handoff_child_death`). Point the next reader at
         // both rather than leaving `ChildDied` looking like an accusation against
-        // the bytes. Log-only: the completion detail stays short because it paints
-        // a pill.
+        // the bytes. Log-only: the completion detail stays short because it is a
+        // status-bar row's detail.
         if proof_outcome == crate::UpdateHandoffOutcome::ChildDied {
             aterm_log::warn!(
                 "update apply: the successor closed the readiness channel without proving \
@@ -3178,15 +3178,15 @@ impl App {
         // never leaks into the user's shell children (`App::take_just_updated`).
         #[cfg(unix)]
         {
-            // THE CARD IS RETIRED BY WHOEVER BROKE THE PROMISE. `start_unix_update_
-            // handoff` raises "Installing update…" just before it parks, and several
-            // of its later `Err` exits (a missed 20 ms park deadline, masters closed
-            // under it, a reservation failure) return WITHOUT producing a completion
-            // — so the completion path cannot be the only place that clears it, or a
-            // refused attempt leaves a card claiming an install that never started
-            // standing for its whole (deliberately long) lifetime. Binding the result
-            // at the ONE call site covers every such exit and cannot rot as new ones
-            // are added.
+            // THE ROW IS RETIRED BY WHOEVER BROKE THE PROMISE. `start_unix_update_
+            // handoff` puts "Installing aterm vX" (or "Installing update") on the
+            // update bar before it builds the carry, and several of its later `Err`
+            // exits (a missed 20 ms park deadline, masters closed under it, a
+            // reservation failure) return WITHOUT producing a completion — so the
+            // completion path cannot be the only place that clears it, or a refused
+            // attempt leaves a row claiming an install that never started standing
+            // to its `HANDOFF_STALE` cap. Binding the result at the ONE call site
+            // covers every such exit and cannot rot as new ones are added.
             let started = self.start_unix_update_handoff(
                 exe,
                 build,
@@ -3196,8 +3196,7 @@ impl App {
                 debug_seamless,
             );
             if started.is_err() {
-                self.notice = None;
-                self.request_redraw_all_windows();
+                self.retire_update_installing();
             }
             return started;
         }
@@ -3589,6 +3588,30 @@ impl App {
         let fds = crate::session_store::HandoffFds {
             entries: adoption.clone(),
         };
+        // APPLY BEGINS ON THE STATUS BAR (2026-09-07) — sited BEFORE the carry
+        // below is built, so the row count and words the successor inherits are
+        // the ones the user is looking at. An update row already up changes its
+        // WORDS — "Installing aterm vX — your shells are safe; the screen pauses
+        // for a moment" — a repaint, never a re-grid. With no row up, an EXPLICIT
+        // apply (the Version menu, Software Update, a clean quit) ADDS the row
+        // here: its re-grid moves `ws.rows` before the carry reads it and before
+        // `exact_layout` freezes what Commit compares, so the successor is sized
+        // for the row it is told about. The AUTOMATIC lane never adds one: the
+        // re-grid's SIGWINCH is PTY activity its own re-check (below) reads as a
+        // revocation, so there the border SURGE — charging from this instant
+        // until the successor takes over — is the whole explanation of the
+        // frozen frame. Every refusal from here on puts the words (or the
+        // absence of a row) back and ends the surge: the synchronous ones through
+        // the caller's `retire_update_installing`, the asynchronous ones after
+        // the park through `reduce_returned_handoff_completion`.
+        self.begin_update_installing(
+            build,
+            matches!(
+                mode,
+                crate::native_updater_service::ApplyMode::Immediate
+                    | crate::native_updater_service::ApplyMode::CleanQuit
+            ),
+        );
         let window = self.windows.values().next().map(|state| {
             let position = state
                 .os_window
@@ -3599,6 +3622,11 @@ impl App {
                 cols: state.cols,
                 outer_x: position.map(|point| point.x),
                 outer_y: position.map(|point| point.y),
+                // The committed status-bar rows and their words, so the
+                // successor reserves the same rows before it sizes its window
+                // and paints carried content in them until Commit.
+                status_bar_rows: self.status_bar_rows,
+                bars: self.status_bars.carried(),
             }
         });
 
@@ -3772,24 +3800,6 @@ impl App {
         // visible-only rather than risking the deadline for a bonus. This is what
         // makes carrying history safe to enable by default — the failure mode is
         // "less scrollback", never "the update did not apply".
-        // SAY IT BEFORE THE SCREEN STOPS. Everything below parks the readers, and
-        // from here until the successor attaches its own the terminal echoes
-        // nothing — and, once the kernel PTY buffer fills, the user's own programs
-        // stall against it. That is a defensible few seconds; being given it with
-        // no explanation is not. Raised HERE on purpose: above this line every
-        // early return is a refusal that never froze anything (the card would be a
-        // lie), and below it the allocation would land inside the 20 ms budget this
-        // function hoists work out of.
-        //
-        // A CARD, NEVER A STATUS-BAR ROW. A row re-grids, which moves `ws.rows` —
-        // the exact value `exact_layout` compares un-normalized at Commit — so the
-        // bar explaining the freeze would REFUSE the update after the user sat
-        // through it; and the re-grid's SIGWINCH is itself activity the plain
-        // automatic lane's own re-check reads as a revocation.
-        self.surface_update_status_for(
-            "\u{2191} Installing update — your shells are safe; the screen pauses for a moment.",
-            crate::HANDOFF_PENDING_NOTICE_TTL,
-        );
         const HANDOFF_HISTORY_COMFORT: std::time::Duration = std::time::Duration::from_millis(10);
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
         // user experiences, and the zero point of the two numbers reported at
@@ -4812,7 +4822,7 @@ impl App {
         // THE MODE IS CARRIED, NOT DROPPED. It used to reach only this line and
         // then vanish, so a failure a PERSON asked for was charged to the
         // automatic budget — converging the background lane on human retries and
-        // silencing the pill for the human who asked.
+        // silencing the row for the human who asked.
         //
         // AND NEITHER IS THE OUTCOME, WHICH IS THE SAME BUG ONE LEVEL DOWN. The
         // outcome used to be collapsed into a bare `activity_revoked` bool here,
@@ -4845,6 +4855,12 @@ impl App {
             (_, teardown) => teardown,
         };
         self.rollback_overlap(nonce.as_deref(), &pending.live);
+        // THE ROW SAID "INSTALLING" FOR THIS ATTEMPT, and the attempt is over:
+        // put the words (or the absence of a row) back and end the charging
+        // surge BEFORE the outcome below decides whether to say anything — a
+        // silent outcome (the automatic lane standing down on activity) must not
+        // leave a frozen "Installing" on the bar.
+        self.retire_update_installing();
         // QA SEAM, READ BEFORE THE MATCH CONSUMES IT. A `None` ticket reaches this
         // reduction from exactly one place — `ATERM_DEBUG_SEAMLESS_REEXEC`, which
         // `start_native_update_handoff` is the only caller allowed to pair with a

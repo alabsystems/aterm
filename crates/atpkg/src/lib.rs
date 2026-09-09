@@ -114,6 +114,7 @@ pub mod relocate;
 /// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
 /// set-completion pass, the OS-installed reconcile and the update pass.
 pub mod requires;
+pub mod reroute;
 /// The rustup toolchain seam owner (Lockstep S1): `<rustup_home>/toolchains/trust` ->
 /// `<prefix>/store/trust/current`, laid, adopted, re-asserted and recorded by atpkg.
 pub mod seam;

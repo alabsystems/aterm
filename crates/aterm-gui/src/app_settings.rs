@@ -2274,7 +2274,8 @@ impl App {
                 detail: (!bar.text.stats.is_empty()).then(|| bar.text.stats.clone()),
                 progress: bar.fill,
                 // A press on a band opens its deliberate surface (Settings ▸ Packages /
-                // Software Update), and so does a screen reader's activate.
+                // Software Update) — or, on a STAGED update row, applies the build
+                // (`App::press_update_bar`) — and so does a screen reader's activate.
                 activates: true,
                 // The row this band reserved, which is where the tree says it is —
                 // `bars()` yields them in the painted order the splice consumes.
@@ -2394,8 +2395,10 @@ impl App {
                 self.request_redraw_all_windows();
             }
             // The band's own click route (`App::on_mouse_button`): open the lane's
-            // deliberate surface. Gated on the band still occupying a committed row, so
-            // an activate on a folded bar opens nothing.
+            // deliberate surface — or, on a staged update row, APPLY the build in
+            // place (`App::press_update_bar`, the one press rule shared with the
+            // mouse). Gated on the band still occupying a committed row, so an
+            // activate on a folded bar does nothing.
             ChromeMessage::ToolchainStatus | ChromeMessage::UpdateStatus => {
                 let lane = match message {
                     ChromeMessage::ToolchainStatus => crate::status_bars::Lane::Toolchain,
@@ -2409,15 +2412,14 @@ impl App {
                 if !live {
                     return;
                 }
-                let route = match lane {
+                match lane {
                     crate::status_bars::Lane::Toolchain => {
-                        crate::native_settings::SettingsRoute::Packages
+                        let _ =
+                            self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
                     }
-                    crate::status_bars::Lane::Update => {
-                        crate::native_settings::SettingsRoute::SoftwareUpdate
-                    }
-                };
-                let _ = self.open_settings_tab(route);
+                    // The same press rule as the mouse path: a staged row applies.
+                    crate::status_bars::Lane::Update => self.press_update_bar(),
+                }
             }
             // Neither carries a Click in the published tree. The paste question is
             // answered by Enter/Escape and a generic activate names neither answer, which

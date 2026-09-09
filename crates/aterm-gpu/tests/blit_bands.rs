@@ -213,6 +213,7 @@ fn asymmetric_crop_keeps_raw_bands_outside_invert_and_drop_overlay() {
             accent: 0x00ff_0000,
             wash_a: 0,
             border_a: u8::MAX,
+            border_scale_q4: 0,
         }),
         crop,
         fw as u32,

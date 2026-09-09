@@ -1829,24 +1829,18 @@ impl App {
                                 | NativeUpdateReconcilePurpose::StageAvailable
                         )
                     {
-                        self.notice = Some(crate::notice::TransientNotice::update_ready(
-                            stage.version.clone(),
+                        // A NEWLY STAGED BUILD IS ANNOUNCED BY THE STATUS BAR
+                        // (2026-09-07): the updater's own `Staged` report already
+                        // painted the update lane's row — "aterm vX is ready … click
+                        // to apply now" — held for as long as the apply is armed.
+                        // The floating "Update ready" card and the stage-time border
+                        // glow are retired: the glow is the UPGRADE's, and fires
+                        // when the apply actually runs.
+                        aterm_log::info!(
+                            "update staged: build {} (v{}) announced on the status bar",
                             stage.build,
-                            std::time::Instant::now(),
-                        ));
-                        // The border glow is a motion effect: gated exactly like its
-                        // two sibling producers (JUST_UPDATED, the QA seam). This
-                        // block was dead until the announcement fix landed, which is
-                        // how an ungated producer survived.
-                        if self
-                            .serious_mode_policy()
-                            .allows(crate::motion::SeriousEffect::LevelUp)
-                        {
-                            self.level_up = Some(crate::level_up::LevelUp::new(
-                                stage.build,
-                                std::time::Instant::now(),
-                            ));
-                        }
+                            stage.version
+                        );
                         self.request_redraw_all_windows();
                     }
 
@@ -5503,7 +5497,12 @@ impl App {
         });
         let (attempt_build, quiet) = match decision {
             PollDecision::Clear => {
-                self.auto_apply_intent = None;
+                // The lane just dropped its promise: a Staged row still saying
+                // "applies in place within ~N min" restates to the posture that
+                // now holds (and to its shorter hold).
+                if let Some(intent) = self.auto_apply_intent.take() {
+                    self.restate_staged_bar_posture(intent.build);
+                }
                 return;
             }
             PollDecision::Wait(WaitReason::Deadline) => return,
@@ -5810,8 +5809,11 @@ impl App {
                         // the only way out; neither half is true. Say the two
                         // things a user can act on: it comes back by itself, and
                         // there is a control that does it right now.
-                        self.surface_nonmodal_update_status(
-                            "↑ Update waiting — retries on its own, or use the Version menu",
+                        self.note_update_outcome(
+                            '\u{2191}',
+                            "Update waiting",
+                            "retries on its own, or use the Version menu",
+                            crate::status_bars::Tone::Info,
                         );
                     }
                 }
@@ -9204,7 +9206,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freshly_imported_stage_is_announced_once_and_then_stays_quiet() {
+    fn a_freshly_imported_stage_raises_no_card_and_no_glow_and_a_repeat_import_is_quiet() {
         let mut app = App::headless_for_test();
         let running = app.native_updater_service.snapshot().current_build;
         let build = running + 1;
@@ -9245,14 +9247,15 @@ mod tests {
             Some(build),
             "PRECONDITION: the stage imported"
         );
+        // THE ANNOUNCEMENT IS THE STATUS BAR'S (2026-09-07): the updater's own
+        // `Staged` report paints the row, so the reconcile raises no floating
+        // card and no border glow — the surge is the upgrade's, and fires when
+        // the apply actually runs.
         assert!(
-            app.notice
-                .as_ref()
-                .is_some_and(crate::notice::TransientNotice::is_update_ready),
-            "a newly imported stage shows the Update ready toast (present: {})",
-            app.notice.is_some()
+            app.notice.is_none(),
+            "a newly imported stage raises no floating card"
         );
-        assert!(app.level_up.is_some(), "…and the level-up");
+        assert!(app.level_up.is_none(), "…and no stage-time glow");
         // The SAME stage again is not news.
         app.notice = None;
         app.level_up = None;
@@ -9621,7 +9624,7 @@ mod tests {
             "the newer facts imported the stage, got outcome {outcome:?}"
         );
         assert!(
-            app.notice.is_some()
+            app.update_row_text().is_some()
                 || app.native_updater_service.snapshot().phase != UpdaterPhase::Staged,
             "the control apply was acted on (surfaced or moved the phase), not dropped"
         );
@@ -10948,7 +10951,7 @@ mod tests {
             "PRECONDITION: the staged build armed automatic intent"
         );
 
-        app.notice = None;
+        app.status_bars = crate::status_bars::StatusBars::default();
         spend_one_preflight_block_budget(&mut app);
         // THE FIRST BUDGET IS ALREADY THREE PROBES. Even before the cooldown
         // schedule is reached, none of them may have taken the screen.
@@ -10979,9 +10982,7 @@ mod tests {
         // The ONE pill. Its wording has to survive too: the old text asserted the
         // automatic lane had given up, which is now false.
         let pill = app
-            .notice
-            .as_ref()
-            .map(crate::notice::TransientNotice::text)
+            .update_row_text()
             .expect("the first exhaustion tells the user once");
         assert!(
             pill.contains("retries on its own"),
@@ -10991,7 +10992,7 @@ mod tests {
         // SECOND ROUND. Each further attempt costs exactly ONE probe (not three)
         // and must add nothing to the screen.
         for round in 0..4 {
-            app.notice = None;
+            app.status_bars = crate::status_bars::StatusBars::default();
             force_auto_apply_attempt_now(&mut app);
             app.try_pending_native_auto_apply(false);
             let again = app
@@ -11012,13 +11013,11 @@ mod tests {
                 "round {round}: still spaced by the cooldown"
             );
             assert!(
-                app.notice.is_none(),
+                app.update_row_text().is_none(),
                 "round {round}: THE NAG. The user was already told once; telling \
                  them again on a two-hour schedule is the regression this test exists \
                  for (got {:?})",
-                app.notice
-                    .as_ref()
-                    .map(crate::notice::TransientNotice::text)
+                app.update_row_text()
             );
             // THE OTHER HALF OF THE NAG, and the half no `notice` assertion can
             // ever see: the pill is one-shot, but the tab switch / focus theft /
@@ -11057,7 +11056,7 @@ mod tests {
              binary instead of returning"
         );
         discard_settings_drafts(&mut app, settings);
-        app.notice = None;
+        app.status_bars = crate::status_bars::StatusBars::default();
         force_auto_apply_attempt_now(&mut app);
         app.try_pending_native_auto_apply(false);
 
@@ -11069,11 +11068,9 @@ mod tests {
         // fired), no manual-only latch, no physical failure booked, the intent
         // retained.
         assert!(
-            app.notice.is_none(),
+            app.update_row_text().is_none(),
             "a refused re-probe past the exhaustion pill paints nothing: {:?}",
-            app.notice
-                .as_ref()
-                .map(crate::notice::TransientNotice::text)
+            app.update_row_text()
         );
         let refusal = app
             .native_updater_service
@@ -11341,9 +11338,7 @@ mod tests {
         assert!(
             app.notice.is_none(),
             "a refused re-probe past the exhaustion pill paints nothing: {:?}",
-            app.notice
-                .as_ref()
-                .map(crate::notice::TransientNotice::text)
+            app.update_row_text()
         );
         // WHICH GATE REFUSED IS PART OF THE PREMISE, not decoration. The fixture's
         // candidate carries a PASSED pre-park verification, so a real attempt is
@@ -11682,7 +11677,7 @@ mod tests {
         let mut pills = Vec::new();
         for _ in 0..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) {
             ticket.make_current_apply_for_test(&mut app.native_updater_service);
-            app.notice = None;
+            app.status_bars = crate::status_bars::StatusBars::default();
             let outcome = app.abort_reaped_native_apply_before_reconcile(
                 &ticket,
                 "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
@@ -11695,11 +11690,7 @@ mod tests {
                     .retry_at
                     .map(|at| at.saturating_duration_since(std::time::Instant::now())),
             );
-            pills.push(
-                app.notice
-                    .as_ref()
-                    .map(crate::notice::TransientNotice::text),
-            );
+            pills.push(app.update_row_text());
         }
 
         // 600 s, 1800 s, stand-down — three times over, and the last stand-down is
@@ -11745,7 +11736,7 @@ mod tests {
         );
         assert_eq!(
             pills.first().and_then(Clone::clone).as_deref(),
-            Some("↑ Update delayed — retries on its own"),
+            Some("Update delayed — retries on its own"),
             "the first failure tells the user the lane is handling it"
         );
         assert!(
@@ -11758,7 +11749,7 @@ mod tests {
         );
         assert_eq!(
             pills.last().and_then(Clone::clone).as_deref(),
-            Some("↑ Update paused — see Version menu"),
+            Some("Update paused — see Version menu"),
             "the ONE actionable moment — the lane is out of retries — must name a \
              control, not repeat 'retries on its own'"
         );

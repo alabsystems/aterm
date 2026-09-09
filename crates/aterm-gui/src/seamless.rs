@@ -4585,6 +4585,8 @@ mod tests {
                 cols: 80,
                 outer_x: Some(120),
                 outer_y: Some(64),
+                status_bar_rows: 0,
+                bars: Vec::new(),
             }),
             // Tokenless connection carry (§1.4#6): a full `both` set 0 → 1
             // whenever the stage has two shells, `(src, dst, op)`-sorted like
@@ -4606,7 +4608,7 @@ mod tests {
         let fds = HandoffFds {
             entries: live.clone(),
         };
-        let outgoing = write_outgoing(&manifest, &fds, &screens, manifest.window)
+        let outgoing = write_outgoing(&manifest, &fds, &screens, manifest.window.clone())
             .expect("outgoing handoff is written");
 
         // The PARENT's layout commitment is a pure function of the bytes it

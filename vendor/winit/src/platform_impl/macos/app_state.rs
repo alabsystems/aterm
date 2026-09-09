@@ -107,11 +107,22 @@ aterm_objc::declare_class! {
     /// owner of the whole event-loop state machine.
     ///
     /// The protocol list is not decoration: objc2's `unsafe impl <Proto> for X
-    /// {}` called `class_addProtocol` for each one, so dropping either would
-    /// make `-conformsToProtocol:` start answering NO to AppKit for the class
-    /// whose whole job is to be the application's delegate. `NSObject` is in
-    /// the list because that is what objc2's
+    /// {}` called `class_addProtocol` for each one — WHEN the runtime had the
+    /// protocol; objc2 silently skipped one it did not — so dropping either
+    /// would make `-conformsToProtocol:` start answering NO for the class
+    /// whose whole job is to be the application's delegate. That answer is for
+    /// aterm's own audits and typed consumers, not for AppKit, which reaches
+    /// every `@optional` row here by `-respondsToSelector:` (measured).
+    /// `NSObject` is in the list because that is what objc2's
     /// `unsafe impl NSObjectProtocol for ApplicationDelegate {}` added.
+    ///
+    /// `NSApplicationDelegate` is the one protocol in this tree the host's
+    /// AppKit may NOT register: macOS 14.4.1's does not (only SwiftUI's image
+    /// carries it there, and aterm never loads SwiftUI), macOS 26's does.
+    /// `aterm_objc::protocol_or_register` supplies a name-only protocol on such
+    /// a host, so this claim is true everywhere; v0.72.0 through v0.75.0
+    /// asserted the host had it instead and died here, before the first
+    /// window, on every macOS 14.4.1 install.
     #[derive(Debug)]
     pub(super) struct ApplicationDelegate: NSObject {
         const NAME: &str = "WinitApplicationDelegate";
@@ -368,11 +379,17 @@ impl ApplicationDelegate {
     ///
     /// `ProtocolObject` was a COMPILE-TIME statement that this class conforms;
     /// a raw `id` says nothing. The claim is moved rather than dropped: this
-    /// asserts `-conformsToProtocol:` on the instance — the question AppKit
-    /// itself asks before sending an `@optional` row — and the live-class audit
-    /// checks the same on the registered class. All three rows here are
-    /// `@optional`, so a class that failed to claim the protocol would not
-    /// crash; the app would simply never finish launching.
+    /// asserts `-conformsToProtocol:` on the instance, and the live-class audit
+    /// checks the same on the registered class. It is NOT the question AppKit
+    /// asks — AppKit reaches each of the three `@optional` rows here by
+    /// `-respondsToSelector:` (measured: a delegate with an EMPTY protocol list
+    /// received every launch and termination row, and v0.71.0 ran on macOS
+    /// 14.4.1 without this claim, objc2 having skipped it). So a class that
+    /// failed to claim the protocol would launch and run; what the assertion
+    /// guards is that `class_addProtocol` ran, so aterm's own audits and typed
+    /// consumers see the conformance the source declares. On a host whose
+    /// AppKit does not register `NSApplicationDelegate` the protocol object
+    /// here is the name-only one `aterm_objc` supplied at declaration.
     pub(super) fn as_delegate_id(&self) -> Id {
         let id = self.as_id();
         debug_assert!(
@@ -390,9 +407,11 @@ impl ApplicationDelegate {
                     .as_bool()
                 }
             },
-            "WinitApplicationDelegate does not conform to NSApplicationDelegate; \
-             class_addProtocol did not run, and AppKit will never send its three \
-             @optional rows"
+            "WinitApplicationDelegate does not conform to NSApplicationDelegate: \
+             class_addProtocol did not run at declaration, so aterm's live-class \
+             audit and typed consumers see a delegate that does not claim the \
+             protocol (AppKit itself reaches the @optional rows by \
+             -respondsToSelector: and is unaffected)"
         );
         id
     }

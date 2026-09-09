@@ -851,7 +851,11 @@ mod macos {
                 assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
             }
             let proto = aterm_objc::protocol(c"NSMenuDelegate");
-            assert!(!proto.is_null(), "AppKit is linked, so is its protocol");
+            assert!(
+                !proto.is_null()
+                    && !aterm_objc::protocols_registered_by_aterm().contains(&c"NSMenuDelegate"),
+                "this host's AppKit registers NSMenuDelegate — not one aterm had to supply"
+            );
             // SAFETY: `+conformsToProtocol:` and `+instancesRespondToSelector:`
             // are side-effect-free NSObject queries on a live class object.
             unsafe {

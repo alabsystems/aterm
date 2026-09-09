@@ -47,6 +47,15 @@ pub(crate) struct DiagInfo {
     pub privacy: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
+    /// Of the Objective-C protocols the window layer's declared classes claim
+    /// ([`CLAIMED_OBJC_PROTOCOLS`]), the ones THIS HOST's frameworks do not
+    /// register. Empty means every claimed protocol is the framework's own; a
+    /// name here is one `aterm-objc` supplies at declaration — v0.72.0 through
+    /// v0.75.0 died at launch on such a host instead (macOS 14.4.1 lacks
+    /// `NSApplicationDelegate`; the macOS 26 release cutter does not), which is
+    /// why the cut's own `--diagnose` transcript now carries this line. Off
+    /// macOS nothing is claimed and the list is empty.
+    pub objc_protocols_absent: Vec<&'static str>,
     pub config_path: String,
     pub config_exists: bool,
     pub env: Vec<(String, String)>,
@@ -78,6 +87,21 @@ impl DiagInfo {
         let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
         let _ = writeln!(s, "primer:    {}", self.agent_primer);
         let _ = writeln!(s, "privacy:   {}", self.privacy);
+        if !cfg!(target_os = "macos") {
+            let _ = writeln!(s, "objc:      n/a (not macOS)");
+        } else if self.objc_protocols_absent.is_empty() {
+            let _ = writeln!(
+                s,
+                "objc:      every claimed protocol is registered by this host"
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "objc:      protocols this host does not register: {} (aterm supplies a \
+                 name-only stand-in at declaration)",
+                self.objc_protocols_absent.join(", ")
+            );
+        }
         let _ = writeln!(
             s,
             "config:    {} [{}]",
@@ -307,10 +331,46 @@ pub(crate) fn collect() -> DiagInfo {
             ("a11y-accesskit", cfg!(a11y_tree)),
         ],
         capabilities: capability_list(),
+        objc_protocols_absent: objc_protocols_absent(),
         config_path,
         config_exists,
         env,
     }
+}
+
+/// Every Objective-C protocol a `declare_class!` site in the shipped window
+/// layer claims — the union of the `protocols:` lists in `vendor/winit`'s
+/// macOS backend and this crate — pinned so `--diagnose` can ask the host about
+/// each BEFORE any class is declared (declaration is what would supply a
+/// missing one). `claimed_objc_protocols_are_pinned` reads the sites and keeps
+/// this list equal to them, so a new claim must be added here consciously.
+#[cfg(target_os = "macos")]
+pub(crate) const CLAIMED_OBJC_PROTOCOLS: &[&std::ffi::CStr] = &[
+    c"NSApplicationDelegate",
+    c"NSDraggingDestination",
+    c"NSMenuDelegate",
+    c"NSObject",
+    c"NSTextFieldDelegate",
+    c"NSTextInputClient",
+    c"NSToolbarDelegate",
+    c"NSWindowDelegate",
+];
+
+/// The claimed protocols this host's frameworks do NOT register — a pure
+/// lookup, never a registration, so the answer is the host's and not ours.
+#[cfg(target_os = "macos")]
+fn objc_protocols_absent() -> Vec<&'static str> {
+    CLAIMED_OBJC_PROTOCOLS
+        .iter()
+        .copied()
+        .filter(|p| aterm_objc::protocol(p).is_null())
+        .map(|p| p.to_str().unwrap_or("?"))
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn objc_protocols_absent() -> Vec<&'static str> {
+    Vec::new()
 }
 
 /// One deterministic, source-addressable warning shared by `--validate-config`
@@ -3694,10 +3754,99 @@ ink = "rainbow"
                 .into(),
             features: vec![("sixel", true), ("accessibility", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
+            objc_protocols_absent: vec!["NSApplicationDelegate"],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
             config_exists: false,
             env: vec![("ATERM_GPU".into(), "1".into())],
         }
+    }
+
+    /// The one line that would have named the v0.72.0 launch crash in the
+    /// cut's own transcript: which claimed protocols the host lacks.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn report_names_the_protocols_the_host_does_not_register() {
+        let r = sample().render();
+        assert!(
+            r.contains(
+                "objc:      protocols this host does not register: NSApplicationDelegate \
+                 (aterm supplies a name-only stand-in at declaration)"
+            ),
+            "the absent protocol is named: {r}"
+        );
+        let mut all_present = sample();
+        all_present.objc_protocols_absent.clear();
+        assert!(
+            all_present
+                .render()
+                .contains("objc:      every claimed protocol is registered by this host"),
+            "and the cutter's shape says so too"
+        );
+    }
+
+    /// The pinned list IS the union of every `protocols:` list in the shipped
+    /// window layer — read from the sources, every `.rs` file under both roots
+    /// including subdirectories and `#[cfg(test)]` probes (a test-only claim
+    /// is a name the host is asked about too, which costs nothing) — so a new
+    /// claim cannot land without `--diagnose` learning to ask about it. A list
+    /// that does not close on its own line is refused rather than half-read.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claimed_objc_protocols_are_pinned() {
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rs_files(&root.join("src"), &mut files);
+        rs_files(
+            &root.join("../../vendor/winit/src/platform_impl/macos"),
+            &mut files,
+        );
+        let mut claimed = std::collections::BTreeSet::new();
+        for path in &files {
+            let src = std::fs::read_to_string(path).expect("source is readable");
+            for line in src.lines() {
+                let l = line.trim_start();
+                // A claim is a `protocols: [...]` line that is not a comment.
+                if l.starts_with("//") {
+                    continue;
+                }
+                let Some(rest) = l.strip_prefix("protocols: [") else {
+                    continue;
+                };
+                let Some((list, _)) = rest.split_once(']') else {
+                    panic!(
+                        "{}: a `protocols: [` list must close on its own line, or this pin \
+                         cannot read it",
+                        path.display()
+                    )
+                };
+                for name in list.split(',') {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        claimed.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+        let pinned: std::collections::BTreeSet<String> = super::CLAIMED_OBJC_PROTOCOLS
+            .iter()
+            .map(|p| p.to_str().expect("ASCII").to_owned())
+            .collect();
+        assert_eq!(
+            claimed, pinned,
+            "the `protocols:` lists in the window layer and CLAIMED_OBJC_PROTOCOLS differ"
+        );
     }
 
     #[test]

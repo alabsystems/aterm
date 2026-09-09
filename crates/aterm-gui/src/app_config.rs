@@ -1043,7 +1043,7 @@ pub(crate) struct Config {
     /// [`PackagesConfig`].
     pub(crate) packages: Option<PackagesConfig>,
     /// macOS consent posture (`[privacy]`, the TCC lane): the master switch, the
-    /// silent full-disk-access probe, the at-most-once notice, the owner-initiated
+    /// silent full-disk-access probe, the one-time macOS access card, the owner-initiated
     /// folder warm-up and the protected-root set the consent tier shares with
     /// Containment. Absent ⇒ today's behavior (report the posture, probe silently,
     /// offer the warm-up only on an explicit gesture). See [`PrivacyConfig`].
@@ -2579,7 +2579,7 @@ impl PrivacyWarmup {
 /// [privacy]
 /// # enabled            = true            # master switch; false ⇒ every consent field reads `unknown`
 /// # check              = true            # the silent, prompt-free full-disk-access probe
-/// # notice             = true            # the at-most-once transient pill
+/// # notice             = true            # the one-time macOS access card (Open Settings / Not now)
 /// # report_attribution = true            # per-session responsible-pid corroboration
 /// # warmup             = "on-request"    # "never" | "on-request"  (no first-launch value, by design)
 /// # warmup_folders     = ["documents", "desktop", "downloads"]
@@ -2608,7 +2608,10 @@ pub(crate) struct PrivacyConfig {
     /// one already-protected file read-only and closes it; it cannot raise a
     /// dialog, and it reads nothing.
     pub(crate) check: Option<bool>,
-    /// The at-most-once transient notice. Absent ⇒ ON.
+    /// The one-time macOS ACCESS CARD (`consent_card`): the passive card,
+    /// raised at launch while Full Disk Access is denied on a grant-stable
+    /// build, whose *Open Settings* deep-links to the pane and whose *Not now*
+    /// records the answer for the life of the config directory. Absent ⇒ ON.
     pub(crate) notice: Option<bool>,
     /// Per-session responsible-process corroboration on the reports. Absent ⇒
     /// ON. It only corroborates: aterm's own adoption record is what decides
@@ -4476,10 +4479,10 @@ impl Config {
         self.privacy.as_ref().and_then(|p| p.check).unwrap_or(true)
     }
 
-    /// The `[privacy]` `notice` bit (default TRUE): the at-most-once transient
-    /// pill. Also gated by the master switch, which is why `enabled = false`
-    /// with `notice = true` earns a `--validate-config` warning instead of
-    /// silently never firing.
+    /// The `[privacy]` `notice` bit (default TRUE): the one-time macOS access
+    /// card (`consent_card`). Also gated by the master switch, which is why
+    /// `enabled = false` with `notice = true` earns a `--validate-config`
+    /// warning instead of silently never firing.
     pub(crate) fn privacy_notice(&self) -> bool {
         self.privacy.as_ref().and_then(|p| p.notice).unwrap_or(true)
     }
@@ -8602,9 +8605,39 @@ impl App {
     /// RepaintKey's quantized `status_bars_fp` keeps a byte-identical tick from
     /// re-presenting).
     pub(crate) fn sync_status_bars(&mut self) {
-        let _ = self.status_bars.settle(std::time::Instant::now());
+        let _ = self.settle_status_bars(std::time::Instant::now());
         let _ = self.sync_status_bar_rows();
         self.request_redraw_all_windows();
+    }
+
+    /// Retire the bars that have expired. While a handoff is pending the HOLDS
+    /// are suspended: the row count is frozen for Commit
+    /// (`sync_status_bar_rows` refuses), so a bar folding on its hold would
+    /// paint the committed row as a hole for the rest of the freeze — the words
+    /// outlive it instead and fold on the trailing sync
+    /// (`Wake::UpdateHandoffFinished`, or Commit on the successor). The
+    /// STALENESS CAPS keep running: `incoming_handoff_pending` is cleared only
+    /// by Commit, so a successor whose Commit never arrives must not be left
+    /// holding a carried "finishing" row for the life of the process — that is
+    /// what `HANDOFF_STALE` is for. Returns whether the glass changed.
+    pub(crate) fn settle_status_bars(&mut self, now: std::time::Instant) -> bool {
+        self.status_bars
+            .settle_with(now, !self.status_bar_holds_frozen())
+    }
+
+    /// Whether a handoff is freezing the bars' holds right now
+    /// ([`Self::settle_status_bars`]). ONE predicate, read by the settle and by
+    /// the deadline that arms it ([`Self::status_bars_deadline`]), so the loop
+    /// can never arm a wake its own settle will decline to act on.
+    fn status_bar_holds_frozen(&self) -> bool {
+        self.pending_update_handoff.is_some() || self.incoming_handoff_pending
+    }
+
+    /// The next instant the status bars need the loop back — what
+    /// [`Self::settle_status_bars`] would act on, freeze included.
+    pub(crate) fn status_bars_deadline(&self) -> Option<std::time::Instant> {
+        self.status_bars
+            .deadline_with(!self.status_bar_holds_frozen())
     }
 
     /// The grid `(rows, cols)` window `wid` gets for raw window `size` — the

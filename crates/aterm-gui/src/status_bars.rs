@@ -73,6 +73,21 @@ pub(crate) const HOLD_OK: Duration = Duration::from_secs(8);
 /// read a sentence and may want to click through; bounded because a status bar
 /// that never leaves is the floating card's mistake in a different shape.
 pub(crate) const HOLD_WARN: Duration = Duration::from_secs(45);
+/// How long a STAGED update bar stays up while the AUTOMATIC lane is armed to
+/// apply it — the pull-down IS the "update ready" surface now (2026-09-07),
+/// so it holds until the apply lands (forced within ~2 min; the typing hold can
+/// stand the lane down for up to ten) rather than folding after eight seconds
+/// and leaving the moment to a floating card.
+pub(crate) const HOLD_STAGED_AUTOMATIC: Duration = Duration::from_secs(10 * 60);
+/// How long a STAGED bar holds when the build applies only on a press: long
+/// enough to be seen and clicked, short enough that a declined update does not
+/// keep a row (the Version menu's ⬆️ stays after it folds).
+pub(crate) const HOLD_STAGED_MANUAL: Duration = Duration::from_secs(60);
+/// The staleness cap on the "installing" / "finishing" bars that bracket the
+/// in-session handoff: the readiness deadline that bounds the whole attempt is
+/// env-clamped to 120 s, and every path that ends the freeze replaces the bar
+/// explicitly — this is the backstop, not the lifetime.
+pub(crate) const HANDOFF_STALE: Duration = Duration::from_secs(125);
 /// How long a LIVE toolchain bar fed by the progress tailer may go without a
 /// report before it folds quietly. The tailer posts every heartbeat change
 /// (≤ 2 s apart while atpkg is alive) and one final read at child exit, so a
@@ -186,8 +201,102 @@ const APPLY_FROM_MENU: &str = if cfg!(target_os = "macos") {
     "apply it from the Version menu or the \u{21bb} button"
 };
 
-/// The Staged bar's detail: `build N — verified; <how it applies>`. One sentence
-/// per posture, each true of the mechanism it names and none of them a restart.
+/// The press affordance on a Staged bar (2026-09-07): a left press on the row
+/// applies the build in place, the way the retired floating card's press did.
+/// Not offered where the handoff is off — there a press can only open the
+/// details page, which the bar does for every other state.
+const CLICK_TO_APPLY: &str = "click to apply now";
+
+/// The "Installing / Finishing" row's title: names the version when there is
+/// one, and says "update" when there is not (the re-exec QA seam applies with
+/// no staged version — a bare "aterm v" was measured on glass 2026-09-07).
+fn handoff_title(verb: &str, version: &str) -> String {
+    let v = sanitize_for_tty(version, 32);
+    if v.trim().is_empty() {
+        format!("{verb} update")
+    } else {
+        format!("{verb} aterm v{v}")
+    }
+}
+
+/// The separator between a bar title and the press affordance appended to it.
+const TITLE_SEP: &str = " \u{b7} ";
+
+/// `base` plus the press affordance ([`CLICK_TO_APPLY`]) wherever a press
+/// applies — in the TITLE, which the layout keeps whole at every ordinary
+/// width, never at the truncated end of the detail (where it was measured cut
+/// off at 100 columns on 2026-09-07). Omitted where the handoff is off: there
+/// a press can only open the details page.
+fn with_affordance(base: &str, posture: Option<ApplyPosture>) -> String {
+    if matches!(posture, Some(ApplyPosture::HandoffDisabled { .. })) {
+        base.to_string()
+    } else {
+        format!("{base}{TITLE_SEP}{CLICK_TO_APPLY}")
+    }
+}
+
+/// Re-state one STAGED bar for `build` under `posture`: its words, and its hold
+/// re-anchored by posture — extended to the armed stretch for a lane that will
+/// apply by itself, shortened to the manual hold for one standing down for good.
+/// `false` (and untouched) for any other bar, or when nothing changed.
+fn restate_staged_bar(bar: &mut Bar, build: u64, posture: ApplyPosture, now: Instant) -> bool {
+    if bar.staged_build != Some(build) || bar.text.glyph != '\u{2713}' {
+        return false;
+    }
+    let hold = now + staged_hold(Some(posture));
+    bar.fold_at = Some(match posture {
+        ApplyPosture::Automatic | ApplyPosture::ManualOnlyLatched { lapses: true } => {
+            bar.fold_at.map_or(hold, |at| at.max(hold))
+        }
+        _ => bar.fold_at.map_or(hold, |at| at.min(hold)),
+    });
+    let base = without_affordance(&bar.text.title).to_string();
+    let title = with_affordance(&base, Some(posture));
+    let detail = staged_detail(build, posture);
+    if bar.text.detail == detail && bar.text.title == title {
+        return false;
+    }
+    bar.text.detail = detail;
+    bar.text.title = title;
+    true
+}
+
+/// A title without the press affordance — exact-suffix, so a version string
+/// that happens to contain the separator is left alone. What the ledger
+/// records (`appstatus` cannot click) and what a restatement rebuilds from.
+fn without_affordance(title: &str) -> &str {
+    title
+        .strip_suffix(CLICK_TO_APPLY)
+        .and_then(|t| t.strip_suffix(TITLE_SEP))
+        .unwrap_or(title)
+}
+
+/// The Staged bar's title: "aterm vX is ready", with the press affordance
+/// ([`with_affordance`]).
+fn staged_title(version: &str, posture: Option<ApplyPosture>) -> String {
+    with_affordance(
+        &format!("aterm v{} is ready", sanitize_for_tty(version, 32)),
+        posture,
+    )
+}
+
+/// How long a Staged bar holds: while the AUTOMATIC lane is armed (or stands
+/// down but retries by itself) the pull-down IS the update-ready surface and
+/// waits for the apply; where the build applies only on a press it holds long
+/// enough to be seen and clicked.
+fn staged_hold(posture: Option<ApplyPosture>) -> Duration {
+    match posture {
+        Some(ApplyPosture::Automatic | ApplyPosture::ManualOnlyLatched { lapses: true }) => {
+            HOLD_STAGED_AUTOMATIC
+        }
+        _ => HOLD_STAGED_MANUAL,
+    }
+}
+
+/// The Staged bar's detail: `build N — verified; <how it applies>`. One
+/// sentence per posture, each true of the mechanism it names and none of them
+/// a restart. The press affordance is the TITLE's ([`staged_title`]), where
+/// the width law keeps it visible.
 #[must_use]
 pub(crate) fn staged_detail(build: u64, posture: ApplyPosture) -> String {
     let how = match posture {
@@ -292,6 +401,11 @@ pub(crate) struct Bar {
 }
 
 impl Bar {
+    /// The "Installing" row ([`installing_bar`]) — what a refusal retires.
+    fn is_installing(&self) -> bool {
+        self.text.glyph == '\u{2191}' && self.text.title.starts_with("Installing ")
+    }
+
     fn terminal(&self) -> bool {
         self.fold_at.is_some()
     }
@@ -349,6 +463,27 @@ impl Lane {
     }
 }
 
+/// The "Installing" row: the words the outgoing process shows from the park
+/// until the successor takes over ([`StatusBars::update_installing`]). Not a
+/// Staged bar (`staged_build: None`): a press on it opens the details, and the
+/// posture restatement leaves it alone.
+fn installing_bar(version: &str, now: Instant) -> Bar {
+    Bar {
+        text: BarText {
+            glyph: '\u{2191}',
+            title: handoff_title("Installing", version),
+            detail: "your shells are safe; the screen pauses for a moment".to_string(),
+            stats: String::new(),
+            tone: Tone::Info,
+        },
+        fill: None,
+        fold_at: None,
+        stale_at: Some(now + HANDOFF_STALE),
+        pass_id: None,
+        staged_build: None,
+    }
+}
+
 /// The two-lane state.
 #[derive(Default, Debug)]
 pub(crate) struct StatusBars {
@@ -356,9 +491,40 @@ pub(crate) struct StatusBars {
     update: Option<Bar>,
     /// Finished activities, oldest first, capped at [`LEDGER_ROWS`].
     ledger: std::collections::VecDeque<LedgerRow>,
+    /// The words of a toolchain bar re-seeded from a handoff carry
+    /// ([`Self::seed_carried`]): this process has no feed for the pass they
+    /// describe. Compared at Commit, so a bar this process has since written
+    /// itself is recognised by its different words and left alone.
+    carried_toolchain: Option<BarText>,
+    /// The Staged bar an OUTCOME row was posted over ([`Self::update_outcome`]):
+    /// the build is still staged and the press still applies it, so when the
+    /// outcome folds the ready row comes back — within its own hold — rather
+    /// than leaving the lane empty after one transient blocker. Cleared by
+    /// any new report on the lane.
+    staged_behind_outcome: Option<Bar>,
 }
 
 impl StatusBars {
+    /// The successor's bars at construction: the rows the outgoing process
+    /// carried ([`crate::session_store::WindowCarry::bars`]), re-seeded live,
+    /// with the update lane's words replaced by "finishing" (`finishing` is the
+    /// running build's version) when this process is the handed-off successor
+    /// and the carry had an update row. Empty carry ⇒ the default (no bars).
+    pub(crate) fn from_handoff_carry(
+        bars: &[crate::session_store::CarriedBar],
+        finishing: Option<&str>,
+        now: Instant,
+    ) -> Self {
+        let mut this = Self::default();
+        this.seed_carried(bars, now);
+        if let Some(version) = finishing
+            && this.update.is_some()
+        {
+            this.update_finishing(version, now);
+        }
+        this
+    }
+
     /// How many chrome rows the bars take right now (0, 1 or 2).
     pub(crate) fn rows(&self) -> u16 {
         u16::from(self.toolchain.is_some()) + u16::from(self.update.is_some())
@@ -378,26 +544,45 @@ impl StatusBars {
     }
 
     /// Retire every bar whose hold has elapsed — or whose feed went silent past
-    /// its staleness cap. Returns whether the ROW COUNT changed — the caller's
-    /// re-grid trigger.
+    /// its staleness cap. Returns whether the GLASS changed: a row count that
+    /// moved (the caller's re-grid trigger), or the Staged row put back in
+    /// place of a folded outcome ([`Self::update_outcome`]).
+    /// Shipping code settles through `App::settle_status_bars`, which knows
+    /// whether a handoff is freezing the holds; this is the plain form the
+    /// tests read.
+    #[cfg(test)]
     pub(crate) fn settle(&mut self, now: Instant) -> bool {
+        self.settle_with(now, true)
+    }
+
+    /// [`Self::settle`], with the HOLDS optionally suspended: `holds == false`
+    /// retires only what has passed its STALENESS CAP. That is the shape a
+    /// handoff freeze needs — the row count is frozen for Commit while the
+    /// screen is parked, so a bar folding on its hold would leave the committed
+    /// row painted as a hole for the rest of the freeze — without disarming the
+    /// cap that exists for exactly the case where Commit never comes.
+    pub(crate) fn settle_with(&mut self, now: Instant, holds: bool) -> bool {
         let before = self.rows();
         let mut retired: Vec<LedgerRow> = Vec::new();
+        let mut update_retired = false;
         for (lane, slot) in [
             (Lane::Toolchain, &mut self.toolchain),
             (Lane::Update, &mut self.update),
         ] {
-            if slot
-                .as_ref()
-                .is_some_and(|b| b.retires_at().is_some_and(|at| now >= at))
-            {
+            if slot.as_ref().is_some_and(|b| {
+                let at = if holds { b.retires_at() } else { b.stale_at };
+                at.is_some_and(|at| now >= at)
+            }) {
                 // THE ROW OUTLIVES THE BAR. What the user could have read goes
                 // into the ledger as it leaves the glass, so `appstatus` can
                 // answer for it afterwards.
                 if let Some(bar) = slot.take() {
+                    update_retired |= lane == Lane::Update;
                     retired.push(LedgerRow {
                         lane,
-                        title: bar.text.title,
+                        // Never "click to apply now" in the record of a row
+                        // that is no longer on glass.
+                        title: without_affordance(&bar.text.title).to_string(),
                         detail: bar.text.detail,
                         outcome: match bar.text.tone {
                             Tone::Warn => Outcome::Warn,
@@ -414,7 +599,18 @@ impl StatusBars {
             }
             self.ledger.push_back(row);
         }
-        self.rows() != before
+        // The outcome has had its say: the ready row it covered returns, if its
+        // own hold has not run out meanwhile. Same row count — a repaint, not a
+        // re-grid.
+        let mut restored = false;
+        if update_retired
+            && let Some(staged) = self.staged_behind_outcome.take()
+            && staged.fold_at.is_some_and(|at| now < at)
+        {
+            self.update = Some(staged);
+            restored = true;
+        }
+        self.rows() != before || restored
     }
 
     /// The finished activities, oldest first — the `appstatus` ledger.
@@ -463,8 +659,22 @@ impl StatusBars {
 
     /// The next instant a bar leaves on its own: a held outcome's fold, or a
     /// live bar's staleness cap. `None` with no bar up.
+    /// Shipping code arms through `App::status_bars_deadline`, the twin of
+    /// `App::settle_status_bars`; this is the plain form the tests read.
+    #[cfg(test)]
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.bars().filter_map(|(_, b)| b.retires_at()).min()
+        self.deadline_with(true)
+    }
+
+    /// [`Self::deadline`] for a settle whose HOLDS are suspended
+    /// (`holds == false`, the handoff freeze — see [`Self::settle_with`]): the
+    /// next instant that settle would actually act on, which is a staleness cap.
+    /// The two MUST agree: an armed deadline the settle then declines to act on
+    /// is a wake that does nothing and re-arms the same past instant.
+    pub(crate) fn deadline_with(&self, holds: bool) -> Option<Instant> {
+        self.bars()
+            .filter_map(|(_, b)| if holds { b.retires_at() } else { b.stale_at })
+            .min()
     }
 
     /// The repaint-key term: **exactly `0` when no bar is up** (the byte-identical
@@ -785,6 +995,8 @@ impl StatusBars {
     ) {
         use aterm_update::Progress as P;
         let v = |version: &str| sanitize_for_tty(version, 32);
+        // A new report is the lane's newest truth: nothing older waits behind it.
+        self.staged_behind_outcome = None;
         match p {
             P::Downloading {
                 version,
@@ -840,7 +1052,7 @@ impl StatusBars {
                 self.update = Some(Bar {
                     text: BarText {
                         glyph: '\u{2713}',
-                        title: format!("aterm v{} is ready", v(version)),
+                        title: staged_title(version, posture),
                         detail: posture.map_or_else(
                             || staged_detail_unknown(*build),
                             |posture| staged_detail(*build, posture),
@@ -848,8 +1060,10 @@ impl StatusBars {
                         stats: String::new(),
                         tone: Tone::Success,
                     },
-                    fill: Some(1.0),
-                    fold_at: Some(now + HOLD_OK),
+                    // No meter: a full bar says nothing the ✓ does not, and
+                    // its columns are the detail's at ordinary widths.
+                    fill: None,
+                    fold_at: Some(now + staged_hold(posture)),
                     stale_at: None,
                     pass_id: None,
                     staged_build: Some(*build),
@@ -896,22 +1110,271 @@ impl StatusBars {
     /// Re-state HOW a staged build applies on the live update bar — the
     /// refinement the App posts once the lane has actually armed (or stood down)
     /// for `build`, a moment after the `Staged` report painted the policy line.
-    /// Rewrites only the detail of a Staged bar for exactly `build`; the fold
-    /// deadline is untouched, so the bar still leaves on time. Returns whether the
-    /// words changed, so the caller can skip a repaint that would present nothing.
-    pub(crate) fn restate_apply_posture(&mut self, build: u64, posture: ApplyPosture) -> bool {
-        let Some(bar) = self.update.as_mut() else {
-            return false;
-        };
-        if bar.staged_build != Some(build) {
+    /// Rewrites only the words of a STAGED bar for exactly `build` (never the
+    /// "Installing" row that replaces it). The hold is re-anchored BY POSTURE:
+    /// a lane that will apply by itself extends it to the armed stretch (the
+    /// `Staged` report's hold began at staging, and a lane that arms late in it
+    /// must not fold the pull-down out from under the apply it promises — never
+    /// shortened), and a lane standing down for good shortens it to the manual
+    /// hold (a row that now says "until you apply it" does not keep the ten
+    /// minutes it was armed with — never extended). Returns whether the words
+    /// changed, so the caller can skip a repaint that would present nothing.
+    pub(crate) fn restate_apply_posture(
+        &mut self,
+        build: u64,
+        posture: ApplyPosture,
+        now: Instant,
+    ) -> bool {
+        // The row on glass AND the one waiting behind an outcome
+        // ([`Self::staged_behind_outcome`]): a lane that changes its mind while
+        // an outcome covers the ready row must not hand back the old promise
+        // when that outcome folds.
+        let stash = self
+            .staged_behind_outcome
+            .as_mut()
+            .is_some_and(|bar| restate_staged_bar(bar, build, posture, now));
+        let live = self
+            .update
+            .as_mut()
+            .is_some_and(|bar| restate_staged_bar(bar, build, posture, now));
+        let _ = stash;
+        // Only a change ON GLASS is a repaint.
+        live
+    }
+
+    // -----------------------------------------------------------------------
+    // THE UPDATE LANE'S OWN MOMENTS (2026-09-07): the bar is the ONE surface
+    // the self-update speaks through — the floating cards are retired.
+    // -----------------------------------------------------------------------
+
+    /// APPLY BEGINS: the outgoing process is about to park its readers. Rewrite
+    /// the LIVE update bar — if one is up — to say so. Never ADDS a row: the
+    /// automatic lane's own re-check reads a re-grid's SIGWINCH as activity
+    /// (the explicit lane adds one through [`Self::update_installing_added`]).
+    /// The previous bar is returned so a refusal can put it back
+    /// ([`Self::retire_installing`]).
+    pub(crate) fn update_installing(&mut self, version: &str, now: Instant) -> Option<Bar> {
+        let previous = self.update.clone()?;
+        self.update = Some(installing_bar(version, now));
+        Some(previous)
+    }
+
+    /// APPLY BEGINS on an EXPLICIT lane (the Version menu, Software Update, a
+    /// clean quit) with NO row up: the row is ADDED — `true`, and the caller
+    /// commits the re-grid at once, before the handoff carry is built and before
+    /// the readers park, so the successor inherits the row it is told about.
+    /// `false` with a row already up (then [`Self::update_installing`] is the
+    /// call).
+    pub(crate) fn update_installing_added(&mut self, version: &str, now: Instant) -> bool {
+        if self.update.is_some() {
             return false;
         }
-        let detail = staged_detail(build, posture);
-        if bar.text.detail == detail {
-            return false;
-        }
-        bar.text.detail = detail;
+        self.update = Some(installing_bar(version, now));
         true
+    }
+
+    /// The handoff did not take over — a synchronous refusal before the park or
+    /// an asynchronous one after it: the row goes back to what it was — the
+    /// stashed words, or NO row where the explicit lane added one. A row that
+    /// already moved on (an outcome posted over it) is left alone, so this is
+    /// idempotent.
+    pub(crate) fn retire_installing(&mut self, previous: Option<Bar>) {
+        if self.update.as_ref().is_some_and(Bar::is_installing) {
+            self.update = previous;
+        }
+    }
+
+    /// THE SUCCESSOR, before Commit: it inherited a committed update row from the
+    /// outgoing process (`WindowCarry::status_bar_rows`) and paints its own
+    /// phase in it. Never a new row — the row is the carried one.
+    pub(crate) fn update_finishing(&mut self, version: &str, now: Instant) {
+        self.staged_behind_outcome = None;
+        self.update = Some(Bar {
+            text: BarText {
+                glyph: '\u{2191}',
+                title: handoff_title("Finishing", version),
+                detail: "keys you type now are queued and will arrive".to_string(),
+                stats: String::new(),
+                tone: Tone::Info,
+            },
+            fill: None,
+            fold_at: None,
+            stale_at: Some(now + HANDOFF_STALE),
+            pass_id: None,
+            staged_build: None,
+        });
+    }
+
+    /// THE NEW BUILD TOOK OVER (or a cold-lane boot found it already running):
+    /// the good news, held [`HOLD_OK`] and then folded into the ledger.
+    pub(crate) fn update_landed(&mut self, version: &str, build: u64, now: Instant) {
+        self.staged_behind_outcome = None;
+        let v = sanitize_for_tty(version, 32);
+        let title = if v.is_empty() {
+            format!("Updated \u{2014} now on build {build}")
+        } else {
+            format!("Updated \u{2014} now on v{v}")
+        };
+        self.update = Some(Bar {
+            text: BarText {
+                glyph: '\u{2726}',
+                title,
+                detail: "your shells kept running".to_string(),
+                stats: String::new(),
+                tone: Tone::Success,
+            },
+            fill: None,
+            fold_at: Some(now + HOLD_OK),
+            stale_at: None,
+            pass_id: None,
+            staged_build: None,
+        });
+    }
+
+    /// One apply-lane OUTCOME the lane used to say on a floating card — waiting,
+    /// delayed, paused, stopped, installed-and-activating, or a persistent
+    /// failure. Info holds [`HOLD_OK`]; Warn holds [`HOLD_WARN`].
+    pub(crate) fn update_outcome(
+        &mut self,
+        glyph: char,
+        title: &str,
+        detail: &str,
+        tone: Tone,
+        now: Instant,
+    ) {
+        let hold = match tone {
+            Tone::Warn => HOLD_WARN,
+            Tone::Info | Tone::Success => HOLD_OK,
+        };
+        // A Staged row the outcome covers comes back when the outcome folds
+        // (`settle`): the stage is still there and the press still applies it.
+        if let Some(staged) = self
+            .update
+            .as_ref()
+            .filter(|bar| bar.staged_build.is_some() && bar.text.glyph == '\u{2713}')
+        {
+            self.staged_behind_outcome = Some(staged.clone());
+        }
+        self.update = Some(Bar {
+            text: BarText {
+                glyph,
+                title: sanitize_for_tty(title, 80),
+                detail: sanitize_for_tty(detail, 160),
+                stats: String::new(),
+                tone,
+            },
+            fill: None,
+            fold_at: Some(now + hold),
+            stale_at: None,
+            pass_id: None,
+            staged_build: None,
+        });
+    }
+
+    /// Drop the Staged row waiting behind an outcome ([`Self::update_outcome`]):
+    /// for an outcome that means the stage is no longer merely waiting — it is
+    /// installed and activating — handing back "is ready · click to apply now"
+    /// when the outcome folds would offer a build that is already on its way in.
+    pub(crate) fn forget_staged_behind_outcome(&mut self) {
+        self.staged_behind_outcome = None;
+    }
+
+    /// Whether the live update bar is a STAGED one — the state in which a press
+    /// on it applies the build rather than opening the details page.
+    pub(crate) fn update_bar_is_staged(&self) -> bool {
+        self.update
+            .as_ref()
+            .is_some_and(|bar| bar.staged_build.is_some() && bar.text.glyph == '\u{2713}')
+    }
+
+    /// The bars as plain data for the handoff carry, top to bottom.
+    pub(crate) fn carried(&self) -> Vec<crate::session_store::CarriedBar> {
+        self.bars()
+            .map(|(lane, bar)| crate::session_store::CarriedBar {
+                lane: lane.as_str().to_string(),
+                glyph: bar.text.glyph,
+                title: bar.text.title.clone(),
+                detail: bar.text.detail.clone(),
+                stats: bar.text.stats.clone(),
+                tone: match bar.text.tone {
+                    Tone::Info => "info",
+                    Tone::Success => "success",
+                    Tone::Warn => "warn",
+                }
+                .to_string(),
+                fill_permille: bar
+                    .fill
+                    .map(|f| (f.clamp(0.0, 1.0) * 1000.0).round() as u16),
+            })
+            .collect()
+    }
+
+    /// COMMIT on the successor: a carried TOOLCHAIN bar describes a pass this
+    /// process never drove and will not hear from again — its words are the
+    /// outgoing process's last, so it folds into the ledger after the ordinary
+    /// hold instead of sitting live until the staleness cap. (The update lane's
+    /// carried row is rewritten by the landing, not folded.) A toolchain bar
+    /// this process has since written itself no longer says the carried words
+    /// and is left alone.
+    pub(crate) fn after_handoff_commit(&mut self, now: Instant) {
+        if let Some(carried) = self.carried_toolchain.take()
+            && let Some(bar) = self.toolchain.as_mut()
+            && bar.text == carried
+        {
+            // Its last words, held long enough to read (by tone, like any
+            // outcome), and NO meter: a feed this process cannot hear must not
+            // be completed to 100 % by the terminal-outcome guard in
+            // `toolchain_snapshot`.
+            bar.fill = None;
+            bar.fold_at = Some(
+                now + match bar.text.tone {
+                    Tone::Warn => HOLD_WARN,
+                    Tone::Info | Tone::Success => HOLD_OK,
+                },
+            );
+            bar.stale_at = None;
+        }
+    }
+
+    /// Re-seed the bars a handoff carried (the successor's first frames, before
+    /// Commit): each becomes a LIVE bar under the handoff's staleness cap, so a
+    /// lane that never reports again folds on its own. The update lane's carried
+    /// words are the outgoing process's "installing"; the successor says
+    /// "finishing" instead ([`Self::update_finishing`]) right after this.
+    /// Unknown lanes and tones are dropped rather than guessed.
+    pub(crate) fn seed_carried(&mut self, bars: &[crate::session_store::CarriedBar], now: Instant) {
+        for carried in bars {
+            let tone = match carried.tone.as_str() {
+                "info" => Tone::Info,
+                "success" => Tone::Success,
+                "warn" => Tone::Warn,
+                _ => continue,
+            };
+            let bar = Bar {
+                text: BarText {
+                    glyph: carried.glyph,
+                    title: sanitize_for_tty(&carried.title, 80),
+                    detail: sanitize_for_tty(&carried.detail, 160),
+                    stats: sanitize_for_tty(&carried.stats, 40),
+                    tone,
+                },
+                fill: carried
+                    .fill_permille
+                    .map(|p| f32::from(p.min(1000)) / 1000.0),
+                fold_at: None,
+                stale_at: Some(now + HANDOFF_STALE),
+                pass_id: None,
+                staged_build: None,
+            };
+            match carried.lane.as_str() {
+                "toolchain" => {
+                    self.carried_toolchain = Some(bar.text.clone());
+                    self.toolchain = Some(bar);
+                }
+                "update" => self.update = Some(bar),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1575,16 +2038,18 @@ mod tests {
             now,
         );
         assert_eq!(bars.rows(), 2);
+        // A staged build with no computed posture holds the MANUAL stretch —
+        // longer than a warning's hold — so the toolchain's warning folds first.
         assert_eq!(
             bars.deadline(),
-            Some(now + HOLD_OK),
+            Some(now + HOLD_WARN),
             "the earliest fold wins"
         );
         assert!(!bars.settle(now), "nothing due yet");
-        assert!(bars.settle(now + HOLD_OK), "the update bar folded");
+        assert!(bars.settle(now + HOLD_WARN), "the toolchain bar folded");
         assert_eq!(bars.rows(), 1);
-        assert_eq!(bars.lane_at(0), Some(Lane::Toolchain));
-        assert!(bars.settle(now + HOLD_WARN));
+        assert_eq!(bars.lane_at(0), Some(Lane::Update));
+        assert!(bars.settle(now + HOLD_STAGED_MANUAL));
         assert_eq!(bars.rows(), 0);
         assert_eq!(bars.fingerprint(), 0);
     }
@@ -1607,34 +2072,39 @@ mod tests {
         );
         assert_eq!(bars.ledger().count(), 0, "nothing has folded yet");
 
-        assert!(bars.settle(now + HOLD_OK), "the update bar folded first");
+        // The warn bar folds first; the armed staged row holds its automatic
+        // stretch (the pull-down is the update-ready surface).
+        assert!(bars.settle(now + HOLD_WARN), "the warn bar folded first");
         let rows: Vec<_> = bars.ledger().collect();
         assert_eq!(rows.len(), 1, "only the folded lane is recorded");
-        assert_eq!(rows[0].lane, Lane::Update);
-        assert_eq!(rows[0].outcome, Outcome::Ok);
-        assert_eq!(rows[0].finished, now + HOLD_OK);
+        assert_eq!(rows[0].lane, Lane::Toolchain);
+        assert_eq!(
+            rows[0].outcome,
+            Outcome::Warn,
+            "a warn tone retires as a warn outcome, not an ok one"
+        );
+        assert_eq!(rows[0].finished, now + HOLD_WARN);
         assert!(
             !rows[0].title.is_empty(),
             "the words the user could have read survive the fold"
         );
-        assert!(
-            rows[0].detail.contains("applies in place") && !rows[0].detail.contains("restart"),
-            "the ledger row carries the honest sentence: {:?}",
-            rows[0].detail
-        );
 
-        assert!(bars.settle(now + HOLD_WARN), "then the warn bar");
+        assert!(
+            bars.settle(now + HOLD_STAGED_AUTOMATIC),
+            "then the staged row"
+        );
         let rows: Vec<_> = bars.ledger().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(
             (rows[0].lane, rows[1].lane),
-            (Lane::Update, Lane::Toolchain),
+            (Lane::Toolchain, Lane::Update),
             "oldest first — the order they left the glass"
         );
-        assert_eq!(
-            rows[1].outcome,
-            Outcome::Warn,
-            "a warn tone retires as a warn outcome, not an ok one"
+        assert_eq!(rows[1].outcome, Outcome::Ok);
+        assert!(
+            rows[1].detail.contains("applies in place") && !rows[1].detail.contains("restart"),
+            "the ledger row carries the honest sentence: {:?}",
+            rows[1].detail
         );
         assert_eq!(bars.rows(), 0, "the ledger holds no rows on the glass");
         assert_eq!(
@@ -1727,7 +2197,7 @@ mod tests {
                 None,
                 now,
             );
-            now += HOLD_OK;
+            now += HOLD_STAGED_MANUAL;
             assert!(bars.settle(now), "each staged bar folds in turn");
         }
         let rows: Vec<_> = bars.ledger().collect();
@@ -1795,14 +2265,20 @@ mod tests {
             now,
         );
         let bar = bars.bars().next().unwrap().1;
-        assert_eq!(bar.text.title, "aterm v0.48.0 is ready");
+        assert_eq!(
+            bar.text.title,
+            "aterm v0.48.0 is ready · click to apply now"
+        );
         assert_eq!(
             bar.text.detail,
             "build 99 — verified; applies in place within ~2 min — your shells keep running"
         );
+        assert_eq!(bar.fill, None, "no meter on a staged row");
         assert!(!bar.text.detail.contains("restart"));
         assert_eq!(bar.staged_build, Some(99));
-        assert_eq!(bar.fold_at, Some(now + HOLD_OK));
+        // The pull-down IS the update-ready surface: it holds while the
+        // automatic lane is armed to apply.
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_AUTOMATIC));
         bars.update_progress(
             &P::Failed {
                 detail: "zip sha256 mismatch".into(),
@@ -1814,6 +2290,290 @@ mod tests {
         assert_eq!(bar.text.tone, Tone::Warn);
         assert!(bar.text.detail.contains("Software Update"));
         assert_eq!(bar.fold_at, Some(now + HOLD_WARN));
+    }
+
+    /// THE UPDATE LANE'S OWN MOMENTS (2026-09-07). A staged row holds for the
+    /// automatic stretch when the lane is armed, for the manual stretch
+    /// otherwise, and carries the press affordance except where the handoff is
+    /// off; "installing" REWRITES the live row (the EXPLICIT lane adds one
+    /// through `update_installing_added`, which a refusal takes away again) and hands back the
+    /// words a synchronous refusal restores; "finishing" and "landed" say their
+    /// piece; an outcome holds by its tone; and the staged predicate is exactly
+    /// the state a press applies in.
+    #[test]
+    fn the_update_lane_speaks_through_its_row_at_every_moment() {
+        use ApplyPosture as P;
+        let now = t0();
+        let staged = |bars: &mut StatusBars, posture: Option<P>| {
+            bars.update_progress(
+                &aterm_update::Progress::Staged {
+                    version: "0.76.0".into(),
+                    build: 7,
+                },
+                posture,
+                now,
+            );
+        };
+        // Holds by posture.
+        let mut bars = StatusBars::default();
+        staged(&mut bars, Some(P::Automatic));
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_AUTOMATIC));
+        assert!(
+            bar.text.title.ends_with(CLICK_TO_APPLY),
+            "the press affordance rides in the title: {}",
+            bar.text.title
+        );
+        assert!(bars.update_bar_is_staged());
+        staged(&mut bars, Some(P::ManualOnlyLatched { lapses: true }));
+        assert_eq!(
+            bars.bars().next().unwrap().1.fold_at,
+            Some(now + HOLD_STAGED_AUTOMATIC)
+        );
+        staged(&mut bars, Some(P::ManualByConfig));
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_MANUAL));
+        assert!(bar.text.title.ends_with(CLICK_TO_APPLY));
+        staged(&mut bars, None);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_MANUAL));
+        assert!(bar.text.title.ends_with(CLICK_TO_APPLY));
+        // Where the handoff is off a press can only open the details.
+        for why in HandoffUnavailable::ALL {
+            staged(&mut bars, Some(P::HandoffDisabled { why, veto: None }));
+            let bar = bars.bars().next().unwrap().1;
+            assert!(
+                !bar.text.title.contains(CLICK_TO_APPLY),
+                "{}",
+                bar.text.title
+            );
+            assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_MANUAL));
+        }
+
+        // INSTALLING rewrites the live row and returns the previous words…
+        let mut bars = StatusBars::default();
+        staged(&mut bars, Some(P::Automatic));
+        let previous = bars.update_installing("0.76.0", now);
+        assert!(previous.is_some());
+        assert_eq!(bars.rows(), 1, "never a new row");
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "Installing aterm v0.76.0");
+        assert!(bar.text.detail.contains("shells are safe"));
+        assert_eq!(bar.fold_at, None, "live until the successor takes over");
+        assert_eq!(bar.stale_at, Some(now + HANDOFF_STALE));
+        assert!(!bars.update_bar_is_staged(), "a press no longer applies");
+        assert_eq!(
+            bar.staged_build, None,
+            "not a staged row: the posture restatement leaves it alone"
+        );
+        assert!(!bars.restate_apply_posture(7, P::Automatic, now));
+        // …which a refusal restores exactly.
+        bars.retire_installing(previous);
+        assert!(bars.update_bar_is_staged());
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "aterm v0.76.0 is ready · click to apply now"
+        );
+        // With NO row up, installing adds none…
+        let mut none = StatusBars::default();
+        assert!(none.update_installing("0.76.0", now).is_none());
+        assert_eq!(none.rows(), 0);
+        none.retire_installing(None);
+        assert_eq!(none.rows(), 0);
+        // …unless the EXPLICIT lane adds one, which a refusal takes away again.
+        assert!(none.update_installing_added("0.76.0", now));
+        assert_eq!(none.rows(), 1);
+        assert!(
+            !none.update_installing_added("0.76.0", now),
+            "one row, once"
+        );
+        assert!(!none.update_bar_is_staged());
+        none.retire_installing(None);
+        assert_eq!(none.rows(), 0);
+        // A row that moved on to an outcome is not retired.
+        let mut moved = StatusBars::default();
+        staged(&mut moved, Some(P::Automatic));
+        let previous = moved.update_installing("0.76.0", now);
+        moved.update_outcome('\u{21bb}', "Update waiting", "x", Tone::Info, now);
+        moved.retire_installing(previous);
+        assert_eq!(moved.bars().next().unwrap().1.text.title, "Update waiting");
+        // With no staged VERSION (the re-exec seam) the title says "update",
+        // never a bare "aterm v".
+        let mut unversioned = StatusBars::default();
+        staged(&mut unversioned, Some(P::Automatic));
+        let _ = unversioned.update_installing("", now);
+        assert_eq!(
+            unversioned.bars().next().unwrap().1.text.title,
+            "Installing update"
+        );
+        unversioned.update_finishing("  ", now);
+        assert_eq!(
+            unversioned.bars().next().unwrap().1.text.title,
+            "Finishing update"
+        );
+
+        // FINISHING (the successor's inherited row) and LANDED.
+        let mut bars = StatusBars::default();
+        bars.update_finishing("0.76.0", now);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "Finishing aterm v0.76.0");
+        assert!(bar.text.detail.contains("queued"));
+        assert_eq!(bar.stale_at, Some(now + HANDOFF_STALE));
+        bars.update_landed("0.76.0", 7, now);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "Updated \u{2014} now on v0.76.0");
+        assert_eq!(bar.text.tone, Tone::Success);
+        assert_eq!(bar.fold_at, Some(now + HOLD_OK));
+        bars.update_landed("", 7, now);
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "Updated \u{2014} now on build 7"
+        );
+
+        // OUTCOMES hold by tone.
+        let mut bars = StatusBars::default();
+        bars.update_outcome(
+            '\u{2191}',
+            "Update delayed",
+            "retries on its own",
+            Tone::Info,
+            now,
+        );
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_OK));
+        assert_eq!(bar.text.title, "Update delayed");
+        bars.update_outcome(
+            '\u{26a0}',
+            "Update paused",
+            "see Version menu",
+            Tone::Warn,
+            now,
+        );
+        assert_eq!(bars.bars().next().unwrap().1.fold_at, Some(now + HOLD_WARN));
+        assert!(!bars.update_bar_is_staged());
+    }
+
+    /// THE HANDOFF CARRY: the bars cross the swap as plain words, re-seed as
+    /// live bars under the handoff's staleness cap, keep their order, and the
+    /// successor's update row moves on to "finishing" only when the carry had
+    /// one; an unknown lane or tone is dropped, not guessed.
+    #[test]
+    fn the_bars_cross_the_handoff_as_carried_words() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_announced("installing ay, trust", now);
+        bars.update_progress(
+            &aterm_update::Progress::Staged {
+                version: "0.76.0".into(),
+                build: 7,
+            },
+            Some(ApplyPosture::Automatic),
+            now,
+        );
+        let _ = bars.update_installing("0.76.0", now);
+        let carried = bars.carried();
+        assert_eq!(carried.len(), 2);
+        assert_eq!(carried[0].lane, "toolchain");
+        assert_eq!(carried[1].lane, "update");
+        assert_eq!(carried[1].title, "Installing aterm v0.76.0");
+        assert_eq!(carried[1].tone, "info");
+
+        let later = now + Duration::from_secs(3);
+        let successor = StatusBars::from_handoff_carry(&carried, Some("0.76.0"), later);
+        assert_eq!(successor.rows(), 2);
+        assert_eq!(successor.lane_at(0), Some(Lane::Toolchain));
+        let (_, update) = successor.bars().nth(1).unwrap();
+        assert_eq!(update.text.title, "Finishing aterm v0.76.0");
+        assert_eq!(update.stale_at, Some(later + HANDOFF_STALE));
+        let (_, toolchain) = successor.bars().next().unwrap();
+        assert_eq!(toolchain.text.title, "Installing the ALab toolchain");
+        assert_eq!(toolchain.fold_at, None);
+        assert_eq!(toolchain.stale_at, Some(later + HANDOFF_STALE));
+
+        // No update row carried: nothing invented.
+        let only_toolchain = &carried[..1];
+        let successor = StatusBars::from_handoff_carry(only_toolchain, Some("0.76.0"), later);
+        assert_eq!(successor.rows(), 1);
+        assert_eq!(successor.lane_at(0), Some(Lane::Toolchain));
+        // COMMIT: the carried toolchain words fold after the ordinary hold —
+        // this process has no feed for that pass — and the update row is the
+        // landing's to rewrite.
+        let mut successor = successor;
+        successor.after_handoff_commit(later);
+        let toolchain = successor.bars().next().unwrap().1;
+        assert_eq!(toolchain.fold_at, Some(later + HOLD_OK));
+        assert_eq!(toolchain.stale_at, None);
+        assert_eq!(
+            toolchain.fill, None,
+            "no meter for a feed this process cannot hear"
+        );
+        assert!(
+            successor.settle(later + HOLD_OK),
+            "the carried toolchain row folds into the ledger"
+        );
+        assert_eq!(successor.rows(), 0);
+        // A carried WARNING keeps the warning's read time, and a carried live
+        // meter is dropped rather than completed by the successor's first
+        // snapshot.
+        let warned = vec![crate::session_store::CarriedBar {
+            lane: "toolchain".into(),
+            glyph: '\u{26a0}',
+            title: "ALab toolchain".into(),
+            detail: "trust — extracting 120 MB / 900 MB".into(),
+            stats: String::new(),
+            tone: "warn".into(),
+            fill_permille: Some(430),
+        }];
+        let mut warned = StatusBars::from_handoff_carry(&warned, None, later);
+        assert_eq!(warned.bars().next().unwrap().1.fill, Some(0.43));
+        warned.after_handoff_commit(later);
+        let bar = warned.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(later + HOLD_WARN));
+        assert_eq!(bar.fill, None);
+        warned.toolchain_snapshot(Some(&snap(true)), later);
+        assert_eq!(
+            warned.bars().next().unwrap().1.fill,
+            None,
+            "the terminal-outcome guard has no meter to complete"
+        );
+        // …and only the CARRIED words: a toolchain bar this process has since
+        // written itself keeps its own deadlines.
+        let mut own = StatusBars::from_handoff_carry(&carried, Some("0.76.0"), later);
+        own.toolchain_announced("installing ay, trust (900 MB)", later);
+        own.after_handoff_commit(later);
+        assert_eq!(own.bars().next().unwrap().1.fold_at, None);
+        // Not the successor of a handoff: the words come back as they were.
+        let plain = StatusBars::from_handoff_carry(&carried, None, later);
+        assert_eq!(
+            plain.bars().nth(1).unwrap().1.text.title,
+            "Installing aterm v0.76.0"
+        );
+        // Junk is dropped.
+        let junk = vec![
+            crate::session_store::CarriedBar {
+                lane: "mystery".into(),
+                glyph: '?',
+                title: "x".into(),
+                detail: String::new(),
+                stats: String::new(),
+                tone: "info".into(),
+                fill_permille: None,
+            },
+            crate::session_store::CarriedBar {
+                lane: "update".into(),
+                glyph: '?',
+                title: "x".into(),
+                detail: String::new(),
+                stats: String::new(),
+                tone: "loud".into(),
+                fill_permille: Some(7000),
+            },
+        ];
+        assert_eq!(StatusBars::from_handoff_carry(&junk, None, later).rows(), 0);
+        assert_eq!(
+            StatusBars::from_handoff_carry(&[], Some("0.76.0"), later).rows(),
+            0
+        );
     }
 
     #[test]
@@ -2051,7 +2811,17 @@ mod tests {
             let mut bars = StatusBars::default();
             bars.update_progress(&staged, Some(posture), now);
             let bar = bars.bars().next().unwrap().1;
-            assert_eq!(bar.text.title, "aterm v0.67.0 is ready");
+            assert!(
+                bar.text.title.starts_with("aterm v0.67.0 is ready"),
+                "{}",
+                bar.text.title
+            );
+            assert_eq!(
+                bar.text.title.contains(CLICK_TO_APPLY),
+                !matches!(posture, P::HandoffDisabled { .. }),
+                "the press affordance rides in the title wherever a press applies: {}",
+                bar.text.title
+            );
             assert_eq!(bar.staged_build, Some(7));
             assert_eq!(bar.text.detail, staged_detail(7, posture));
             assert!(
@@ -2103,30 +2873,85 @@ mod tests {
         );
 
         // RESTATE: the App refines the line once the lane has actually armed —
-        // the same bar, the same hold.
+        // the same bar; the hold re-anchored to the armed stretch.
         let fold_at = bars.bars().next().unwrap().1.fold_at;
+        assert_eq!(
+            fold_at,
+            Some(now + HOLD_STAGED_MANUAL),
+            "no posture yet: the short hold"
+        );
         assert!(
-            bars.restate_apply_posture(7, P::Automatic),
+            bars.restate_apply_posture(7, P::Automatic, now),
             "the live Staged bar for build 7 is rewritten"
         );
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.detail, staged_detail(7, P::Automatic));
-        assert_eq!(bar.fold_at, fold_at, "the hold is untouched");
         assert!(
-            !bars.restate_apply_posture(7, P::Automatic),
-            "the same words again are not a repaint"
+            bar.text.title.ends_with(CLICK_TO_APPLY),
+            "{}",
+            bar.text.title
+        );
+        assert_eq!(
+            bar.fold_at,
+            Some(now + HOLD_STAGED_AUTOMATIC),
+            "arming re-anchors the hold: the pull-down waits for the apply it promises"
         );
         assert!(
-            !bars.restate_apply_posture(8, P::ManualByConfig),
+            !bars.restate_apply_posture(7, P::Automatic, now),
+            "the same words again are not a repaint"
+        );
+        // STANDING DOWN FOR GOOD shortens the hold to the manual one and keeps
+        // the affordance (a press still applies); the handoff going OFF strips
+        // the affordance; arming again restores both.
+        let title_before = bars.bars().next().unwrap().1.text.title.clone();
+        assert!(bars.restate_apply_posture(7, P::ManualOnlyLatched { lapses: false }, now));
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.fold_at, Some(now + HOLD_STAGED_MANUAL), "shortened");
+        assert_eq!(bar.text.title, title_before);
+        assert!(bars.restate_apply_posture(
+            7,
+            P::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: None,
+            },
+            now,
+        ));
+        let bar = bars.bars().next().unwrap().1;
+        assert!(
+            !bar.text.title.contains(CLICK_TO_APPLY),
+            "{}",
+            bar.text.title
+        );
+        assert_eq!(bar.text.title, without_affordance(&title_before));
+        assert!(bars.restate_apply_posture(7, P::Automatic, now));
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(
+            bar.text.title, title_before,
+            "rebuilt from the exact suffix"
+        );
+        assert_eq!(
+            bar.fold_at,
+            Some(now + HOLD_STAGED_AUTOMATIC),
+            "extended again"
+        );
+        assert!(
+            !bars.restate_apply_posture(8, P::ManualByConfig, now),
             "another build's posture is not this bar's"
         );
         assert_eq!(
             bars.bars().next().unwrap().1.text.detail,
             staged_detail(7, P::Automatic)
         );
-        assert!(bars.settle(now + HOLD_OK), "the bar folds on time");
         assert!(
-            !bars.restate_apply_posture(7, P::ManualOnlyLatched { lapses: true }),
+            !bars.settle(now + HOLD_OK),
+            "an armed staged bar outlives the plain hold: the pull-down waits for the apply"
+        );
+        assert!(
+            bars.settle(now + HOLD_STAGED_AUTOMATIC),
+            "the bar folds on time"
+        );
+        assert!(
+            !bars.restate_apply_posture(7, P::ManualOnlyLatched { lapses: true }, now),
             "nothing to restate once the bar has folded"
         );
         // A bar that is not a Staged bar is never restated.
@@ -2137,7 +2962,202 @@ mod tests {
             None,
             now,
         );
-        assert!(!bars.restate_apply_posture(7, P::Automatic));
+        assert!(!bars.restate_apply_posture(7, P::Automatic, now));
+    }
+
+    /// THE PRESS AFFORDANCE IS ON GLASS AT ORDINARY WIDTHS (2026-09-07): it
+    /// rides in the title, which the layout keeps whole; the detail is what a
+    /// narrow window truncates — and where "click to apply now" used to be cut
+    /// off at 100 columns.
+    #[test]
+    fn the_staged_rows_press_affordance_survives_ordinary_widths() {
+        let now = Instant::now();
+        let staged = aterm_update::Progress::Staged {
+            version: "0.76.0".into(),
+            build: 7,
+        };
+        let mut bars = StatusBars::default();
+        bars.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        for cols in [80usize, 100, 120] {
+            let rows = paint_rows(&bars, cols, Theme::default());
+            let text = text_of(&rows[0]);
+            assert!(text.contains(CLICK_TO_APPLY), "{cols} cols: {text}");
+        }
+        // Where the handoff is off a press only opens the details: no affordance.
+        let mut off = StatusBars::default();
+        off.update_progress(
+            &staged,
+            Some(ApplyPosture::HandoffDisabled {
+                why: HandoffUnavailable::Headless,
+                veto: None,
+            }),
+            now,
+        );
+        let text = text_of(&paint_rows(&off, 120, Theme::default())[0]);
+        assert!(!text.contains(CLICK_TO_APPLY), "{text}");
+    }
+
+    /// A HANDOFF FREEZE SUSPENDS THE HOLDS, NOT THE CAPS (2026-09-08): the row
+    /// count is frozen for Commit, so a hold that elapses mid-freeze must not
+    /// leave the committed row a hole — but a successor whose Commit never
+    /// arrives still gets its carried row back at `HANDOFF_STALE`, which is the
+    /// only thing that ends it (`incoming_handoff_pending` is cleared at Commit
+    /// and nowhere else).
+    #[test]
+    fn a_frozen_settle_suspends_holds_and_still_honours_the_staleness_cap() {
+        let now = Instant::now();
+        // A HOLD: kept through the freeze, retired once it is over.
+        let mut held = StatusBars::default();
+        held.update_outcome(
+            '\u{2726}',
+            "Updated",
+            "your shells kept running",
+            Tone::Success,
+            now,
+        );
+        assert!(
+            !held.settle_with(now + HOLD_OK, false),
+            "the freeze keeps the words"
+        );
+        assert_eq!(held.rows(), 1);
+        assert!(held.settle_with(now + HOLD_OK, true));
+        assert_eq!(held.rows(), 0);
+        // A CAP: retired even while frozen — the successor whose Commit never came.
+        let carried = vec![crate::session_store::CarriedBar {
+            lane: "update".into(),
+            glyph: '\u{2191}',
+            title: "Installing aterm v0.76.0".into(),
+            detail: "your shells are safe".into(),
+            stats: String::new(),
+            tone: "info".into(),
+            fill_permille: None,
+        }];
+        let mut stuck = StatusBars::from_handoff_carry(&carried, Some("0.76.0"), now);
+        assert_eq!(stuck.rows(), 1);
+        assert!(!stuck.settle_with(now + HANDOFF_STALE - Duration::from_millis(1), false));
+        assert_eq!(
+            stuck.deadline_with(false),
+            Some(now + HANDOFF_STALE),
+            "and THAT is the instant the loop arms while frozen — never the hold \
+             it would decline to act on"
+        );
+        assert!(
+            stuck.settle_with(now + HANDOFF_STALE, false),
+            "the cap runs even under the freeze"
+        );
+        assert_eq!(stuck.rows(), 0);
+        // The armed deadline and the settle agree in both directions: a bar
+        // whose HOLD has already passed arms nothing while frozen (an armed
+        // past instant is a wake that does nothing and re-arms itself).
+        let mut held_past = StatusBars::default();
+        held_past.update_outcome('\u{2726}', "Updated", "x", Tone::Success, now);
+        assert_eq!(held_past.deadline_with(true), Some(now + HOLD_OK));
+        assert_eq!(held_past.deadline_with(false), None);
+    }
+
+    /// A TRANSIENT OUTCOME DOES NOT LOSE THE READY ROW (2026-09-08): the outcome
+    /// covers the Staged bar for its hold and the ready row returns when it
+    /// folds — within the ready row's own hold, and never after a newer report.
+    #[test]
+    fn the_staged_row_returns_when_an_outcome_over_it_folds() {
+        let now = Instant::now();
+        let staged = aterm_update::Progress::Staged {
+            version: "0.76.0".into(),
+            build: 7,
+        };
+        let mut bars = StatusBars::default();
+        bars.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        bars.update_outcome(
+            '\u{2191}',
+            "Update waiting",
+            "unsaved text",
+            Tone::Info,
+            now,
+        );
+        assert!(
+            !bars.update_bar_is_staged(),
+            "the outcome is up, not the ready row"
+        );
+        assert!(!bars.settle(now + HOLD_OK - Duration::from_millis(1)));
+        assert!(
+            bars.settle(now + HOLD_OK),
+            "the glass changed: the ready row is back"
+        );
+        assert_eq!(bars.rows(), 1, "in place — no re-grid");
+        assert!(bars.update_bar_is_staged());
+        assert!(
+            bars.bars()
+                .next()
+                .unwrap()
+                .1
+                .text
+                .title
+                .ends_with(CLICK_TO_APPLY),
+            "with its affordance"
+        );
+        assert_eq!(bars.ledger().last().unwrap().title, "Update waiting");
+        // An outcome that means the stage is on its way in gives nothing back.
+        let mut installed = StatusBars::default();
+        installed.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        installed.update_outcome(
+            '\u{2191}',
+            "Update installed",
+            "activating",
+            Tone::Info,
+            now,
+        );
+        installed.forget_staged_behind_outcome();
+        assert!(installed.settle(now + HOLD_OK));
+        assert_eq!(installed.rows(), 0);
+        // A LANE THAT CHANGES ITS MIND while the outcome covers the ready row
+        // hands back the NEW promise, not the old one.
+        let mut turned = StatusBars::default();
+        turned.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        turned.update_outcome('\u{2191}', "Update waiting", "x", Tone::Info, now);
+        assert!(
+            !turned.restate_apply_posture(7, ApplyPosture::ManualByConfig, now),
+            "nothing on glass changed: the outcome row is up"
+        );
+        assert!(turned.settle(now + HOLD_OK));
+        let back = turned.bars().next().unwrap().1;
+        assert_eq!(
+            back.text.detail,
+            staged_detail(7, ApplyPosture::ManualByConfig)
+        );
+        assert_eq!(
+            back.fold_at,
+            Some(now + HOLD_STAGED_MANUAL),
+            "and the hold the new posture asks for"
+        );
+        // …but not past its own hold.
+        let mut late = StatusBars::default();
+        late.update_progress(&staged, Some(ApplyPosture::ManualByConfig), now);
+        late.update_outcome('\u{2191}', "Update waiting", "x", Tone::Info, now);
+        assert!(late.settle(now + HOLD_STAGED_MANUAL));
+        assert_eq!(late.rows(), 0, "the ready row's minute had run out");
+        // …and never over a newer report on the lane.
+        let mut newer = StatusBars::default();
+        newer.update_progress(&staged, Some(ApplyPosture::Automatic), now);
+        newer.update_outcome('\u{2191}', "Update waiting", "x", Tone::Info, now);
+        newer.update_progress(
+            &aterm_update::Progress::Verifying {
+                version: "0.77.0".into(),
+            },
+            None,
+            now,
+        );
+        assert!(!newer.settle(now + HOLD_OK));
+        assert!(
+            newer
+                .bars()
+                .next()
+                .unwrap()
+                .1
+                .text
+                .detail
+                .contains("verifying"),
+            "the newer report stands"
+        );
     }
 
     /// THE DISABLED-HANDOFF LINE SAYS WHAT THE ADMISSION CLASSIFIER DOES.
@@ -2359,9 +3379,56 @@ mod tests {
             ),
         ));
         surfaces.push((
-            "status pill",
-            crate::app_update_screen::UPDATE_INSTALLED_ACTIVATING.to_string(),
+            "update row (installed)",
+            format!(
+                "{} — {}",
+                crate::app_update_screen::UPDATE_INSTALLED_TITLE,
+                crate::app_update_screen::UPDATE_INSTALLED_DETAIL
+            ),
         ));
+        // The update lane's other row words (2026-09-07): every moment the
+        // floating cards used to carry, now on the bar.
+        let now = std::time::Instant::now();
+        let mut lane = StatusBars::default();
+        assert!(
+            lane.update_installing_added("9.9.9", now),
+            "PRECONDITION: the installing row is up, so its words are read"
+        );
+        surfaces.push((
+            "update row (installing)",
+            lane.bars()
+                .next()
+                .map(|(_, b)| format!("{} — {}", b.text.title, b.text.detail))
+                .expect("the installing row is up"),
+        ));
+        lane.update_finishing("9.9.9", now);
+        surfaces.push((
+            "update row (finishing)",
+            lane.bars()
+                .next()
+                .map(|(_, b)| format!("{} — {}", b.text.title, b.text.detail))
+                .unwrap_or_default(),
+        ));
+        lane.update_landed("9.9.9", 7, now);
+        surfaces.push((
+            "update row (landed)",
+            lane.bars()
+                .next()
+                .map(|(_, b)| format!("{} — {}", b.text.title, b.text.detail))
+                .unwrap_or_default(),
+        ));
+        for (title, detail) in [
+            ("Update waiting", "see Version menu"),
+            (
+                "Update waiting",
+                "retries on its own, or use the Version menu",
+            ),
+            ("Update delayed", "retries on its own"),
+            ("Update paused", "see Version menu"),
+            ("Update stopped safely", "see Settings ▸ Software Update"),
+        ] {
+            surfaces.push(("update row (outcome)", format!("{title} — {detail}")));
+        }
         assert!(surfaces.len() >= 25, "the guard covers the whole lane");
         for (surface, text) in surfaces {
             // An environment variable's NAME is an identifier, not a prompt.

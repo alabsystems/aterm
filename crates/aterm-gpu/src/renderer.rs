@@ -1627,6 +1627,11 @@ pub struct DropOverlay {
     pub wash_a: u8,
     /// Inset border alpha, 0..=255.
     pub border_a: u8,
+    /// Border thickness as a multiple of the size-derived law
+    /// (`drop_border_px_gpu`), in 1/16 units; `0` (or `16`) is the plain
+    /// law. The upgrade surge thickens its rim through this; the drag-drop
+    /// target and the CPU twin (`apply_overlay_at`) read the same scale.
+    pub border_scale_q4: u8,
 }
 
 /// Vertical interval of the renderer's raw offscreen that a frontend exposes.
@@ -1715,6 +1720,39 @@ pub(crate) struct TrayOverlay {
 /// sync with `app_render::drop_border_px` so GPU and CPU/headless agree.
 fn drop_border_px_gpu(w: u32, h: u32) -> u32 {
     (w.min(h) / 200).clamp(2, 6)
+}
+
+/// The size-derived border thickness scaled by a `DropOverlay::border_scale_q4`
+/// (1/16 units; `0` and `16` leave it alone), never below one pixel — the SAME
+/// arithmetic as the CPU twin in `aterm-gui`, so both backends draw one rim.
+pub(crate) fn scaled_border_px(base: u32, scale_q4: u8) -> u32 {
+    if scale_q4 == 0 {
+        return base;
+    }
+    ((base * u32::from(scale_q4)) / 16).max(1)
+}
+
+#[cfg(test)]
+mod scaled_border_px_tests {
+    use super::scaled_border_px;
+
+    /// The CPU twin's table (`aterm_gui::app_render::scaled_border_px`),
+    /// verbatim: the two must never drift.
+    #[test]
+    fn scaled_border_px_is_sixteenths_never_thinner_than_a_pixel() {
+        for (base, q4, want) in [
+            (6, 0, 6),
+            (6, 16, 6),
+            (6, 24, 9),
+            (6, 40, 15),
+            (6, 44, 16),
+            (1, 1, 1),
+            (0, 16, 1),
+            (0, 0, 0),
+        ] {
+            assert_eq!(scaled_border_px(base, q4), want, "base {base} × {q4}/16");
+        }
+    }
 }
 
 fn valid_present_crop(crop: PresentCrop, raw_height: u32) -> bool {
@@ -3082,7 +3120,15 @@ fn present_blit_uniform(
             BlitUniform {
                 flag: invert as u32,
                 overlay: 1,
-                border_px: drop_border_px_gpu(source_width, visible_height) as f32,
+                border_px: scaled_border_px(
+                    drop_border_px_gpu(source_width, visible_height),
+                    overlay.border_scale_q4,
+                )
+                // The CPU twin's clamp: a rim is never more than half the frame,
+                // so no scale can turn the border into a whole-frame wash.
+                .min(source_width / 2)
+                .min(visible_height / 2)
+                .max(1) as f32,
                 accent: [chan(16), chan(8), chan(0), 1.0],
                 wash_a: f32::from(overlay.wash_a) / 255.0,
                 border_a: f32::from(overlay.border_a) / 255.0,

@@ -3414,65 +3414,176 @@ impl crate::App {
 }
 
 /// CLIENT-2: when aterm runs from a macOS .app bundle, its co-located CLI tools
-/// (`aterm-ctl`, `atpkg`) sit NEXT TO the executable in `Contents/MacOS` — return the
-/// `("PATH", value)` pair that prepends that directory to the child sessions' PATH, so
-/// the workflows the bundled Help teaches (`aterm-ctl send/text/image/…`) run in every
-/// aterm shell with ZERO install step. `None` outside a bundle (a dev-tree
-/// `target/release/aterm-gui` resolves tools from the workspace as before) and when the
-/// directory is already on the inherited PATH (an idempotent aterm-inside-aterm nesting
-/// doesn't stack duplicates).
-pub(crate) fn bundle_path_env(
-    exe: Option<&std::path::Path>,
-    inherited: Option<&str>,
-) -> Option<(String, String)> {
+/// (`aterm-ctl`, `atpkg`) sit NEXT TO the executable in `Contents/MacOS` — the
+/// directory to put on the child sessions' PATH, so the workflows the bundled Help
+/// teaches (`aterm-ctl send/text/image/…`) run in every aterm shell with ZERO install
+/// step. `None` outside a bundle (a dev-tree `target/release/aterm-gui` resolves tools
+/// from the workspace as before).
+pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
     let dir = exe?.parent()?;
     // Component-wise suffix match: only a real `<Name>.app/Contents/MacOS` layout
     // qualifies (the shape codesign seals), so this is inert for dev/CI binaries.
     if !dir.ends_with("Contents/MacOS") {
         return None;
     }
-    let dir_s = dir.to_str()?;
-    match inherited {
-        Some(p) if p.split(':').any(|c| c == dir_s) => None, // already reachable
-        Some(p) if !p.is_empty() => Some(("PATH".to_string(), format!("{dir_s}:{p}"))),
-        _ => Some(("PATH".to_string(), dir_s.to_string())),
+    dir.to_str().map(str::to_owned)
+}
+
+/// THE ONE `("PATH", value)` pair the baseline `env_add` carries — composed, because
+/// `aterm_pty::build_child_env` applies `env_add` by KEY-OVERWRITE, so a second
+/// `PATH` pair would silently drop the first
+/// (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH"). Front to back:
+///
+/// 1. `reroute_dir` — the session-scoped stub directory of the upstream Rust names
+///    (`atpkg::reroute`), MOVED TO THE FRONT: every occurrence already in `inherited`
+///    is removed first, so a nested aterm (whose inherited PATH lists the parent's
+///    copy somewhere later) and a user PATH that already names it still end up with
+///    it FIRST. Skip-if-present would be wrong here — the measured failure
+///    (2026-09-07: `~/.cargo/bin` at PATH position 17, the managed store at 19) was an
+///    ORDER, not a presence.
+/// 2. `bundle_dir` — the co-located CLI tools, if given and not already present (an
+///    aterm-inside-aterm nesting doesn't stack duplicates).
+/// 3. `inherited` — the PATH this process was launched with, verbatim: an EMPTY entry
+///    means "here" to a POSIX shell and is the user's to keep.
+///
+/// `None` when there is nothing to inject (no reroute dir, and the bundle dir is
+/// absent or already reachable), so a dev build off a bare PATH adds no pair at all.
+pub(crate) fn reroute_path_env(
+    reroute_dir: Option<&str>,
+    bundle_dir: Option<&str>,
+    inherited: Option<&str>,
+) -> Option<(String, String)> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut entries: Vec<&str> = inherited
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split(sep).collect())
+        .unwrap_or_default();
+    let mut injected = false;
+    if let Some(bundle) = bundle_dir
+        && !entries.contains(&bundle)
+    {
+        entries.insert(0, bundle);
+        injected = true;
     }
+    if let Some(reroute) = reroute_dir {
+        entries.retain(|entry| *entry != reroute);
+        entries.insert(0, reroute);
+        injected = true;
+    }
+    injected.then(|| ("PATH".to_string(), entries.join(&sep.to_string())))
 }
 
 #[cfg(test)]
-mod bundle_path_env_tests {
-    use super::bundle_path_env;
+mod reroute_path_env_tests {
+    use super::{bundle_dir, reroute_path_env};
     use std::path::Path;
 
-    /// Inside a .app bundle, the executable's own directory is prepended to the
-    /// inherited PATH — the co-located `aterm-ctl`/`atpkg` become runnable in every
-    /// spawned shell without an installer.
+    const SEP: char = if cfg!(windows) { ';' } else { ':' };
+    const REROUTE: &str = "/Users//u/Library/Application Support/aterm/pkg/reroute";
+    const BUNDLE: &str = "/Applications/aterm.app/Contents/MacOS";
+
+    fn path(parts: &[&str]) -> String {
+        parts.join(&SEP.to_string())
+    }
+
+    /// The reroute dir lands FIRST, ahead of the bundle dir and the inherited PATH.
     #[test]
-    fn bundle_dir_is_prepended_to_the_inherited_path() {
-        let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        let got = bundle_path_env(Some(exe), Some("/usr/bin:/bin"));
+    fn reroute_dir_is_first_then_bundle_then_inherited() {
+        let got = reroute_path_env(
+            Some(REROUTE),
+            Some(BUNDLE),
+            Some(&path(&["/usr/bin", "/bin"])),
+        );
         assert_eq!(
             got,
             Some((
                 "PATH".to_string(),
-                "/Applications/aterm.app/Contents/MacOS:/usr/bin:/bin".to_string()
+                path(&[REROUTE, BUNDLE, "/usr/bin", "/bin"])
             ))
         );
-        // No inherited PATH at all (odd launchd edge): the bundle dir alone.
-        let got = bundle_path_env(Some(exe), None).expect("still injects");
-        assert_eq!(got.1, "/Applications/aterm.app/Contents/MacOS");
     }
 
-    /// Inert outside a bundle (dev builds), idempotent when the dir is already on
-    /// PATH (aterm-inside-aterm nesting), and safe with no exe at all.
+    /// MOVE-TO-FRONT, not skip-if-present: a nested aterm inherits a PATH that
+    /// already lists the reroute dir somewhere later (behind `~/.cargo/bin`, the
+    /// measured 2026-09-07 shape) — it must still come out first, exactly once, and
+    /// applying the seam to its own output changes nothing.
     #[test]
-    fn dev_builds_and_nested_sessions_inject_nothing() {
-        let dev = Path::new("/Users//u/aterm/target/release/aterm-gui");
-        assert_eq!(bundle_path_env(Some(dev), Some("/usr/bin")), None);
-        let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
-        let already = "/Applications/aterm.app/Contents/MacOS:/usr/bin";
-        assert_eq!(bundle_path_env(Some(exe), Some(already)), None);
-        assert_eq!(bundle_path_env(None, Some("/usr/bin")), None);
+    fn a_later_occurrence_moves_to_the_front_without_duplicates() {
+        let inherited = path(&[
+            "/opt/homebrew/bin",
+            "/Users//u/.cargo/bin",
+            REROUTE,
+            "/usr/bin",
+            REROUTE,
+        ]);
+        let (_, value) = reroute_path_env(Some(REROUTE), None, Some(&inherited)).expect("injects");
+        assert_eq!(
+            value,
+            path(&[
+                REROUTE,
+                "/opt/homebrew/bin",
+                "/Users//u/.cargo/bin",
+                "/usr/bin"
+            ])
+        );
+        assert_eq!(value.matches(REROUTE).count(), 1);
+        let (_, again) = reroute_path_env(Some(REROUTE), None, Some(&value)).expect("injects");
+        assert_eq!(again, value, "idempotent under nesting");
+    }
+
+    /// The bundle dir composes behind the reroute dir and is never stacked when it
+    /// is already reachable; without a reroute dir (Windows, `--no-reroute`) the pair
+    /// is the old bundle-only contract, byte for byte.
+    #[test]
+    fn bundle_dir_composes_once() {
+        let already = path(&[BUNDLE, "/usr/bin"]);
+        let (_, value) =
+            reroute_path_env(Some(REROUTE), Some(BUNDLE), Some(&already)).expect("injects");
+        assert_eq!(value, path(&[REROUTE, BUNDLE, "/usr/bin"]));
+        assert_eq!(
+            reroute_path_env(None, Some(BUNDLE), Some("/usr/bin")),
+            Some(("PATH".to_string(), path(&[BUNDLE, "/usr/bin"])))
+        );
+        assert_eq!(reroute_path_env(None, Some(BUNDLE), Some(&already)), None);
+    }
+
+    /// No inherited PATH at all (odd launchd edge) or an empty one: the injected dirs
+    /// alone, no dangling separator; nothing to inject ⇒ no pair; an empty entry
+    /// ("here") inside the inherited PATH is the user's and survives.
+    #[test]
+    fn empty_or_absent_inherited_path_and_nothing_to_inject() {
+        assert_eq!(
+            reroute_path_env(Some(REROUTE), Some(BUNDLE), None).map(|p| p.1),
+            Some(path(&[REROUTE, BUNDLE]))
+        );
+        assert_eq!(
+            reroute_path_env(Some(REROUTE), None, Some("")).map(|p| p.1),
+            Some(REROUTE.to_string())
+        );
+        assert_eq!(reroute_path_env(None, None, Some("/usr/bin")), None);
+        assert_eq!(reroute_path_env(None, None, None), None);
+        let (_, value) =
+            reroute_path_env(Some(REROUTE), None, Some(&path(&["/usr/bin", "", "/bin"])))
+                .expect("injects");
+        assert_eq!(value, path(&[REROUTE, "/usr/bin", "", "/bin"]));
+    }
+
+    /// Inside a .app bundle the executable's own directory is the bundle dir; inert
+    /// outside one (dev builds) and safe with no exe at all.
+    #[test]
+    fn bundle_dir_is_only_a_real_app_layout() {
+        assert_eq!(
+            bundle_dir(Some(Path::new(
+                "/Applications/aterm.app/Contents/MacOS/aterm"
+            )))
+            .as_deref(),
+            Some(BUNDLE)
+        );
+        assert_eq!(
+            bundle_dir(Some(Path::new("/Users//u/aterm/target/release/aterm-gui"))),
+            None
+        );
+        assert_eq!(bundle_dir(None), None);
     }
 }
 

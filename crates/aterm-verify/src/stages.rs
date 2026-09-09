@@ -368,9 +368,12 @@ pub fn objc_class_audit_build_args() -> Vec<String> {
 /// NOT RUN, declared in `crates/aterm-gui/examples/objc_live_class_audit.rs`).
 ///
 /// A FUNCTION, and tested, for the same reason [`redraw_outcome`] is: `2` means
-/// no window server answered or no delegate was installed, and read as green it
-/// would restore exactly the silence this gate exists to remove — the two
-/// plants it was built against both left a GREEN build behind them.
+/// no window server answered, no delegate was installed, or the audit ran and
+/// some rows had no authority on this host because a protocol the class claims
+/// is one its AppKit does not register (aterm supplies a name-only stand-in —
+/// macOS 14.4.1's `NSApplicationDelegate`); read as green it would restore
+/// exactly the silence this gate exists to remove — the two plants it was
+/// built against both left a GREEN build behind them.
 #[must_use]
 pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
     match code {
@@ -384,7 +387,7 @@ pub fn objc_audit_outcome(code: Option<i32>) -> (Outcome, String) {
         ),
         Some(2) => (
             Outcome::Fail(Severity::CouldNotRun),
-            "objc live-class audit: NOT RUN — no event loop or no delegate was installed, so nothing was proven about the registered class (exit 2, never a pass)".to_string(),
+            "objc live-class audit: NOT RUN — no event loop, no delegate was installed, or rows whose claimed protocol this host's AppKit does not register (aterm's name-only stand-in declares nothing; the auditor's NOT CHECKED lines name them), so the registered class was not fully proven (exit 2, never a pass)".to_string(),
         ),
         Some(c) => (
             Outcome::Fail(Severity::GateFailed),

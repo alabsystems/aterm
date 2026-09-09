@@ -35,6 +35,22 @@ if ($HOME) {
     }
 }
 
+# The reroute directory, FIRST. $env:ATERM_REROUTE_DIR is set by aterm's spawn
+# seam: the session-scoped directory of stubs for the upstream Rust names
+# (aterm help reroute), which the seam already put first on the PATH it handed
+# this shell. The user's own profile runs AFTER that injected environment and
+# may prepend over it, and so may the package blocks just above (measured
+# 2026-09-07 on macOS: ~/.cargo/bin at position 17, ahead of the managed store
+# at 19, so a bare cargo ran upstream Rust silently - an ORDER failure). So this
+# is move-to-front: every existing occurrence is removed by equality, then the
+# directory is prepended. Inert outside a session (variable unset) and on
+# Windows, where no stubs are laid and the directory does not exist.
+if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container)) {
+    $__aterm_sep = [string][System.IO.Path]::PathSeparator
+    $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATERM_REROUTE_DIR })
+    $env:PATH = (@($env:ATERM_REROUTE_DIR) + $__aterm_rest) -join $__aterm_sep
+}
+
 # Capture the capability nonce into a PowerShell variable so we can
 # immediately drop it from the environment (#8015). Leaving
 # ATERM_SHELL_NONCE in the exported env lets every child process (env,

@@ -422,79 +422,35 @@ pub(crate) fn admin_step_marker_path(
 /// The marker's text, when a REGULAR, non-symlink file of at most
 /// [`MAX_ADMIN_STEP_MARKER_BYTES`] sits at `path` — the symlink-refusing, size-capped
 /// rule every other prefix marker follows (`atpkg::store::Layout::retired_date`,
-/// `optin_exists`). A planted link, a directory, an oversized or non-UTF-8 file is not a
-/// dismissal this machine recorded: `None`, and the card shows.
+/// `optin_exists`), spelled once in [`crate::config_marker`]. A planted link, a
+/// directory, an oversized or non-UTF-8 file is not a dismissal this machine recorded:
+/// `None`, and the card shows.
 pub(crate) fn read_admin_step_marker(path: &std::path::Path) -> Option<String> {
-    use std::io::Read as _;
-    // The handle is opened without following a final-component link and checked AS A
-    // HANDLE, not by a separate stat something could swap under: the same boundary the
-    // theme files use (`app_config::open_regular_theme_file`).
-    let file = crate::app_config::open_regular_theme_file(path).ok()?;
-    let mut bytes = Vec::with_capacity(256);
-    file.take((MAX_ADMIN_STEP_MARKER_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() > MAX_ADMIN_STEP_MARKER_BYTES {
-        return None;
-    }
-    String::from_utf8(bytes).ok()
+    crate::config_marker::read_marker(path, MAX_ADMIN_STEP_MARKER_BYTES)
 }
 
 /// Record "Not now" for `names`. Best-effort: an unwritable config dir means the card
 /// comes back next pass, which errs toward disclosure.
 ///
-/// Never writes THROUGH anything already at the marker path: the text lands in a fresh
-/// sibling created exclusively (`create_new`, owner-only on unix) and is renamed over
-/// the marker — a rename replaces a planted link rather than following it — and a
-/// non-regular occupant (a link, a directory) fails closed and is left alone, exactly as
-/// atpkg's `record_retired`/`record_optin` refuse an occupied marker path.
+/// Never writes THROUGH anything already at the marker path — the exclusive-sibling
+/// plus rename rule and the occupied-path refusal are [`crate::config_marker`]'s,
+/// shared with the macOS access card's answer marker; a set too large for a marker
+/// is refused there, never truncated.
 pub(crate) fn record_admin_step_dismissal(
     config_path: Option<&std::path::Path>,
     names: &[String],
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
     let Some(path) = admin_step_marker_path(config_path) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no config directory to record the dismissal in",
         ));
     };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) if m.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "dismissal marker path is occupied by something that is not a marker",
-            ));
-        }
-        Err(_) => {}
-    }
-    let text = admin_step_marker_text(names);
-    if text.len() > MAX_ADMIN_STEP_MARKER_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "dismissal set is larger than a marker may hold",
-        ));
-    }
-    let tmp = path.with_file_name(format!("{ADMIN_STEP_MARKER}.tmp-{}", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let written = options
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(text.as_bytes()).and_then(|()| f.sync_all()))
-        .and_then(|()| std::fs::rename(&tmp, &path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    crate::config_marker::write_marker(
+        &path,
+        &admin_step_marker_text(names),
+        MAX_ADMIN_STEP_MARKER_BYTES,
+    )
 }
 
 /// Whether the admin card should be raised NOW for the rows `status.toml` carries —

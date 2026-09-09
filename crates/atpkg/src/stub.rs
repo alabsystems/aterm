@@ -171,7 +171,7 @@ pub const STUB_UNREACHABLE_MSG: &str =
 /// the stub body must never let a crafted name break out of its quotes. (A local
 /// twin of the platform backend's private helper — same rule, one screen away from
 /// its use.)
-fn sh_single_quote(s: &str) -> String {
+pub(crate) fn sh_single_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
         if c == '\'' {
@@ -343,7 +343,7 @@ fn cmd_stub_name_safe(name: &str) -> bool {
 /// The co-located `atpkg` alias beside the running executable — fallback 1's
 /// embedded path. Canonicalized so an argv0 alias (`atpkg` → `aterm`) or a
 /// `~/.local/bin` symlink resolves to the real bundle before the sibling join.
-fn embedded_atpkg_path() -> std::path::PathBuf {
+pub(crate) fn embedded_atpkg_path() -> std::path::PathBuf {
     // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
     // embedded a path that exists on no Windows install — the same probe bug
     // the GUI's co-located resolver fixed — so fallback 1 always missed there
@@ -495,7 +495,7 @@ pub fn write_pending_stub_with(
 
 /// Temp+rename an executable script onto `dest` (the tombstone writer's discipline,
 /// restated here because that helper hard-codes its own body).
-fn write_executable_atomic(dest: &Path, body: &str) -> io::Result<()> {
+pub(crate) fn write_executable_atomic(dest: &Path, body: &str) -> io::Result<()> {
     let file_name = dest
         .file_name()
         .and_then(std::ffi::OsStr::to_str)

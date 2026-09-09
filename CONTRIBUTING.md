@@ -47,6 +47,9 @@ holds the compiler. Run `aterm pkg doctor`: it names the seam that broke, and
 `aterm pkg doctor --fix` re-points the link at `store/trust/current`. Do not
 rebuild a toolchain from source to answer that message, and do not add a
 `cargo`/`rustc`/`rustup` shim — the managed `bin/` never carries one by design.
+The one place those names exist as files aterm lays is the session-scoped
+reroute directory (`<prefix>/reroute`, `docs/DESIGN-toolchain-reroute-2026-09-07.md`),
+which only an aterm session puts first on its own PATH — and it is not `bin/`.
 On this public snapshot the message cannot occur: it pins a stock toolchain.
 
 Run the focused tests for every crate you change; they are expected to pass on

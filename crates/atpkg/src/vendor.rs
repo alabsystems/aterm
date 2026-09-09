@@ -1005,10 +1005,14 @@ pub fn system_binary_on_path(
 
 /// The RAW form of [`system_binary_on_path`]: the same walk (absolute entries only, the
 /// managed prefix skipped, store-resolving hits skipped, `PATHEXT` on Windows) for any
-/// bare file name, WITHOUT the [`ToolName`] deny-list. For the `system-pm` lane's
-/// manager lookup only: `cargo` is (rightly) a name no shim may take, and it is also a
-/// package manager the table names. Never a satisfaction or shadow probe — those keep
-/// the deny-list, so a `git` on `PATH` still satisfies nothing.
+/// bare file name, WITHOUT the [`ToolName`] deny-list. Two callers, both needing a
+/// deny-listed name: the `system-pm` lane's manager lookup (`cargo` is (rightly) a name
+/// no shim may take, and it is also a package manager the table names), and
+/// `reroute::exec_upstream` — the `ATERM_NO_REROUTE` escape execs the first upstream
+/// `cargo`/`rustc`/… this finds, and because the reroute dir sits UNDER the prefix the
+/// walk skips it, which is exactly why a stub can never find itself. Never a
+/// satisfaction or shadow probe — those keep the deny-list, so a `git` on `PATH` still
+/// satisfies nothing.
 #[must_use]
 pub fn executable_on_path(prefix: &Path, name: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
     first_foreign_on_path(prefix, name, path_var, AtManaged::Skip)

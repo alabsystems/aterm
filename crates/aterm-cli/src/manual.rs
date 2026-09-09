@@ -104,6 +104,11 @@ GOTCHAS
     (TCC), not a broken tool — and it can arrive with NO dialog at all. `aterm doctor` has a
     `privacy:` row, `aterm ctl privacy` has the whole posture, and `aterm help permissions`
     says what to do about it. Only a human can grant it; aterm cannot.
+  * Inside a session the upstream toolchain names are REROUTED: a bare `cargo build` is
+    refused (exit 2) naming `targo trust` / `targo --unverified` with your arguments,
+    `rustc` likewise names `trustc`, and `clippy`/`rustfmt`/`rustdoc`/`lean` run the
+    branded tool after one stderr line. `aterm help reroute` has the table and the exit
+    codes; ATERM_NO_REROUTE=1 (or `aterm --no-reroute`) restores every upstream tool.
   * `-h`/`--help` prints the terse CLI usage; `aterm help` (this manual) is the full guide."#,
         ),
     },
@@ -412,6 +417,114 @@ GOTCHAS (in the order they bite)
     as THE cure for a missing toolchain.)
   * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
     test-pinned to the dispatch table — it never advertises a verb that does not run."#,
+        ),
+    },
+    Topic {
+        name: "reroute",
+        tagline: "cargo/rustc inside a session — rerouted, announced, escapable (ATERM_NO_REROUTE=1)",
+        body: Some(
+            r#"reroute — the upstream toolchain names inside an aterm session: announced, escapable,
+never silently substituting.
+
+WHAT IT IS
+  In a shell aterm started, `cargo`, `rustc`, `clippy`, `rustfmt`, `rustdoc`, `lean`,
+  `tlc` and `z3` resolve FIRST to tiny stubs in a session-scoped directory, and each
+  name follows its own row of a policy table (the table is data, in
+  `crates/atpkg/src/reroute.rs`; the record is `docs/DESIGN-toolchain-reroute-2026-09-07.md`).
+  Nothing is substituted silently: a DIRECT row runs the branded tool and says so on
+  stderr; a SIGNPOST row refuses and prints the branded command with YOUR arguments
+  filled in; the ORACLE row refuses unless you say the real tool is what you meant.
+  Measured 2026-09-07: without this, `~/.cargo/bin` sat ahead of the managed store on a
+  session's PATH, so a bare `cargo build` ran upstream Rust with no verification claim
+  and no announcement — the silence Trust exists to refuse.
+
+THE TABLE (one row per name; the policy per row IS the design)
+  invoked    policy     behaviour
+  clippy     DIRECT     run `tippy`, one stderr line
+  rustfmt    DIRECT     run `trustfmt`, one stderr line
+  rustdoc    DIRECT     run `trustdoc`, one stderr line
+  lean       DIRECT     run `clean`, one stderr line
+  tlc        SIGNPOST   announce, then run upstream; name `ty`; equivalence not claimed
+  rustc      SIGNPOST   announce, then run upstream; `trustc <args>` /
+                        `trustc -Ztrust-verify=off <args>`
+  cargo      SIGNPOST   announce, then run upstream; `targo trust <args>` /
+                        `targo --unverified <args>`; `cargo clippy`/`cargo fmt` → the one
+                        branded spelling (`targo tippy` / `targo fmt`)
+  z3         ORACLE     refuse (exit 2); `ATERM_Z3_IS_ORACLE=1` reaches the real z3
+  `rustup` is NOT rerouted — `rustup run trust <tool>` is the sanctioned spelling, and it
+  never looks the tool up on PATH. Neither is `rust-analyzer` (a long-lived LSP an editor
+  spawns: a stderr line is invisible there and a refusal breaks the editor).
+
+WHAT YOU SEE — `cargo build --release` in a session prints this on stderr, and then your
+build runs:
+  aterm: 'cargo' is the Rust name; on Trust the tool is 'targo'. Trust will not
+         pick a verification lane for you:
+           targo trust build --release          VERIFIED   — emits a proof claim
+           targo --unverified build --release   UNVERIFIED — no proof claim
+         Running upstream 'cargo' now — nothing it produces carries a proof claim.
+         (ATERM_REROUTE_QUIET=1 silences this; ATERM_REROUTE_STRICT=1 refuses instead of running.)
+  A SIGNPOST ANNOUNCES; IT DOES NOT PREVENT. Nothing is substituted — you asked for
+  upstream cargo and you get upstream cargo — and the lines above are how you learn the
+  spelling that would have carried a proof claim. A DIRECT row is one line and then the
+  tool runs — `rustfmt src/lib.rs`:
+  aterm: 'rustfmt' is the Rust name; on Trust the tool is 'trustfmt' — running trustfmt. (ATERM_NO_REROUTE=1 restores upstream 'rustfmt'.)
+
+EXIT CODES
+  The exec'd tool's own (a DIRECT row, a SIGNPOST row, an escape, a `+toolchain`
+  passthrough). 2 for a refusal: ORACLE, a SIGNPOST row under ATERM_REROUTE_STRICT, or a
+  stub whose atpkg is unreachable — it fails CLOSED, names the escape, and never quietly
+  runs upstream. 127 when a tool could not run: a
+  DIRECT target that is not installed (`aterm pkg install` provisions the toolset), or no
+  upstream copy on PATH after an escape. Every announcement goes to stderr ONLY; stdout
+  stays machine-parseable.
+
+ESCAPES (all of them)
+  ATERM_NO_REROUTE=1 cargo …   one command: every upstream tool restored. The stub decides
+                               this in /bin/sh before aterm is consulted, so it works with
+                               no atpkg reachable; the upstream child inherits it, so
+                               cargo's own rustc/rustdoc spawns are never re-announced.
+                               Present-but-empty or 0 is NOT engaged.
+  aterm --no-reroute           the same for a whole session (it sets that variable, and
+                               every child inherits it).
+  ATERM_REROUTE_QUIET=1        run the SIGNPOST rows with no announcement at all. It
+                               silences a line and nothing else — the tool was going to
+                               run either way. (It does NOT silence a DIRECT row, whose
+                               announcement is the promise that nothing was substituted
+                               behind your back, nor a refusal, which must say why.)
+  ATERM_REROUTE_STRICT=1       the opposite knob: a SIGNPOST row refuses (exit 2) instead
+                               of running, which is what shipped before 2026-09-08 and is
+                               still the letter of philosophy §4. Keep the friction if you
+                               want it.
+  ATERM_Z3_IS_ORACLE=1 z3 …    the real z3 — the ORACLE row's own key.
+  cargo +stable build          naming a non-Trust toolchain explicitly is you naming
+                               upstream: it runs, with one loud line saying nothing it
+                               produces is verified. `+trust…` keeps the lane question
+                               and is signposted like a bare cargo.
+  An absolute path (`~/.cargo/bin/cargo`) and `rustup run <toolchain> cargo` never meet a
+  stub: the reroute answers a NAME looked up on PATH, nothing else.
+
+WHERE THE STUBS LIVE
+  <prefix>/reroute — one stub per row, under the package manager's prefix. They are laid
+  at session spawn (so the very first tab is covered), at `aterm pkg seed`, after each
+  `aterm pkg install` pass and by `aterm pkg repair`; `aterm pkg uninstall --all` removes
+  them. NEVER the managed bin/: `cargo`/`rustc`/`rustup` stay on the sensitive-shim
+  deny-list, and a stub is not a managed tool (it resolves to no store target and is
+  never proof of an install; a foreign file under one of those names is never touched).
+  Only aterm's own sessions put the directory first on PATH — $ATERM_REROUTE_DIR names
+  it, and the shell integration re-asserts it after your rc files ran (`. ~/.cargo/env`
+  in a .zshrc prepends ~/.cargo/bin AFTER the environment was injected). Machine-wide,
+  shell.d still APPENDS bin/ and nothing points at the reroute directory.
+
+GOTCHAS
+  * `aterm pkg doctor` reports every row (laid / missing / foreign) and whether the
+    reroute directory PRECEDES the first upstream copy on the session's PATH — order, not
+    presence, was the measured failure. `aterm pkg which cargo` answers with the same
+    sentence the stub prints: one "which copy runs and why" surface.
+  * A script that spawns a bare `cargo` from inside a session meets the signpost: it
+    gets the lines on stderr and then runs, unchanged. Give it ATERM_REROUTE_QUIET=1 if
+    the noise is unwanted, or name the lane to get a proof claim.
+  * Windows: no stubs are laid and nothing is prepended — the reroute is TARGET there,
+    and a Windows session runs whatever PATH says, as before."#,
         ),
     },
     Topic {

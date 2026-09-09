@@ -1466,6 +1466,18 @@ fn run_with_take(
         ));
     }
     println!("    compiler: {compiler_line}  (Trust provenance gate passed)");
+    // The host-registration line, echoed so the cut transcript records what
+    // THIS cutter's frameworks register. A NOTE, not a gate: the cutter's
+    // macOS registering everything is what let v0.72.0-v0.75.0 ship green
+    // while macOS 14.4.1 lacked `NSApplicationDelegate`; the fix is in the
+    // objc layer (it supplies a missing protocol itself), and this line is
+    // how a reader of the transcript can see which host the proof ran on.
+    let objc_line = diagnose
+        .lines()
+        .find_map(|l| l.strip_prefix("objc:"))
+        .map(str::trim)
+        .unwrap_or("(no objc: line in --diagnose — binary predates the probe)");
+    println!("    objc: {objc_line}");
 
     Ok(BuildOutput {
         aterm: shipped[0].clone(),

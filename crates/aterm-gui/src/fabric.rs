@@ -51,15 +51,15 @@
 //! restarting `aterm-gui`. That is a real gap, recorded as one: building the
 //! lift is a change to the GUI modules, not to this one.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 
 use aterm_control::wire::pct_encode;
 use aterm_session::SessionId;
 
 use crate::SessionCtx;
-use crate::session_store::Store;
+use crate::session_store::{SessionStore, Store};
 use crate::turn_ledger::now_ms;
 
 /// How many message rows one session's inbox retains. Drop-oldest past this, and
@@ -553,7 +553,18 @@ struct FabricLink {
     /// membership test is O(log n), and [`note_bridge_touched`] prunes the set
     /// against the live registry once it passes [`TOUCHED_PRUNE_AT`] — so its
     /// size is bounded by the live sessions plus that slack, not by uptime.
-    touched: Mutex<BTreeSet<String>>,
+    ///
+    /// KEYED BY REGISTRY, because the prune's evidence is. The set is
+    /// process-global; the predicate that shrinks it — "still in the registry" —
+    /// can only ever speak for the ONE store the calling bridge verb was handed.
+    /// Unkeyed, a verb on registry A intersected the whole set with A's live
+    /// handles and so evicted every sid registry B was still owed a halt for,
+    /// silently, on a path whose entire purpose is to fail closed. Production
+    /// runs one registry and never saw it; the test suite builds one per test
+    /// and saw it as a schedule-dependent flake (see
+    /// `the_governed_sid_set_drops_sessions_that_have_left_the_registry`, whose
+    /// 2026-09-01 count-to-membership repair fixed the reporting and left this).
+    touched: Mutex<BTreeMap<usize, TouchedRegistry>>,
     /// Whether a bridge SUPERVISOR is running in this process.
     ///
     /// `state` answers "is a bridge attached RIGHT NOW"; this answers the
@@ -570,9 +581,35 @@ struct FabricLink {
 static LINK: FabricLink = FabricLink {
     state: AtomicU8::new(FABRIC_ABSENT),
     generation: Mutex::new(0),
-    touched: Mutex::new(BTreeSet::new()),
+    touched: Mutex::new(BTreeMap::new()),
     supervised: AtomicBool::new(false),
 };
+
+/// One registry's governed sids, held under [`FabricLink::touched`].
+///
+/// THE KEY IS THE ALLOCATION ADDRESS, AND IT CANNOT BE REUSED WHILE WE REMEMBER
+/// IT. `Store` is an `Arc`, and an `Arc`'s allocation is freed only once BOTH
+/// its strong and its weak count reach zero — so the `Weak` this slot holds pins
+/// the address for exactly as long as the slot exists. No second registry can
+/// ever be handed a key that still names a first one, and the classic
+/// pointer-as-identity hazard is structurally absent rather than argued about.
+///
+/// The `Weak` is also what keeps the size bound honest: a registry that has been
+/// dropped fails to upgrade, and the next prune takes its sids with it, so the
+/// set stays bounded by the LIVE sessions of the LIVE registries.
+struct TouchedRegistry {
+    /// The registry these sids were governed under, held weakly — `touched` must
+    /// never be the reason a registry outlives the code that owns it.
+    registry: Weak<RwLock<SessionStore>>,
+    /// The sids this registry has governed and not yet been pruned of.
+    sids: BTreeSet<String>,
+}
+
+/// The [`FabricLink::touched`] key for a registry. See [`TouchedRegistry`] for
+/// why an address is a sound identity here.
+fn registry_key(store: &Store) -> usize {
+    Arc::as_ptr(store) as *const () as usize
+}
 
 /// How many sids [`FabricLink::touched`] may hold before the next insert prunes
 /// the ones whose sessions have left the registry. A slack bound, not a cap: the
@@ -692,10 +729,21 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
 /// then the store, so taking them in the other order here is the one shape that
 /// could deadlock, and it is structurally avoided rather than argued about.
 fn note_bridge_touched(store: &Store, sid: &str) {
+    let key = registry_key(store);
     let over = {
         let mut touched = LINK.touched.lock().unwrap_or_else(|p| p.into_inner());
-        touched.insert(sid.to_string());
-        touched.len() > TOUCHED_PRUNE_AT
+        let slot = touched.entry(key).or_insert_with(|| TouchedRegistry {
+            registry: Arc::downgrade(store),
+            sids: BTreeSet::new(),
+        });
+        // The slot's own `Weak` pins this address, so an existing slot under
+        // this key IS this registry — never a freed one wearing its number.
+        debug_assert!(
+            slot.registry.upgrade().is_some(),
+            "a live registry's key resolved to a dead registry's slot"
+        );
+        slot.sids.insert(sid.to_string());
+        touched.values().map(|r| r.sids.len()).sum::<usize>() > TOUCHED_PRUNE_AT
     };
     if !over {
         return;
@@ -707,7 +755,19 @@ fn note_bridge_touched(store: &Store, sid: &str) {
             .collect()
     };
     let mut touched = LINK.touched.lock().unwrap_or_else(|p| p.into_inner());
-    touched.retain(|s| live.contains(s));
+    // Three separate fates, and the middle one is the whole point of the key: a
+    // registry that is GONE takes its sids with it; the CALLING registry keeps
+    // only what it still holds; every OTHER live registry is left exactly as it
+    // was, because this snapshot is no evidence at all about its sessions.
+    touched.retain(|k, r| {
+        if r.registry.upgrade().is_none() {
+            return false;
+        }
+        if *k == key {
+            r.sids.retain(|s| live.contains(s));
+        }
+        !r.sids.is_empty()
+    });
 }
 
 /// THE SAFETY PROPERTY. Either bridge fd closed, so the halt this instance was
@@ -736,12 +796,16 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
             LINK.state.store(FABRIC_DISCONNECTED, Ordering::Relaxed);
         }
     }
+    // EVERY registry's sids, not just this store's. Each one is looked up in
+    // `store` below and skipped if it is not there, so the answer is identical
+    // to filtering by key first — and on a fail-closed sweep the version that
+    // cannot be narrowed by a keying mistake is the one to run.
     let sids: Vec<String> = LINK
         .touched
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .cloned()
+        .values()
+        .flat_map(|r| r.sids.iter().cloned())
         .collect();
     let mut held = 0usize;
     for sid in sids {
@@ -1215,20 +1279,24 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Whether [`FabricLink::touched`] currently holds `sid`. Test-only. Unlike an
-/// exact global count, MEMBERSHIP of a sid this test itself minted is meaningful
-/// even while unlocked sibling tests insert THEIR sids concurrently — which is
-/// exactly what they do: 17 tests in `inbox_hold` call `deliver` outside
-/// [`with_link_reset`]'s mutex, so any exact global count raced and the
-/// governed-set test flaked whenever the schedule overlapped it with one of
-/// them (2 of 3 full-suite samples, 2026-09-01).
+/// Whether [`FabricLink::touched`] currently holds `sid`, under ANY registry.
+/// Test-only.
+///
+/// Membership of a sid a test itself minted is schedule-proof in a way an exact
+/// global count is not — 27 tests in `inbox_hold` call `deliver` outside
+/// [`with_link_reset`]'s mutex, so a count raced them (2 of 3 full-suite
+/// samples, 2026-09-01). Membership alone was NOT enough, and saying so is the
+/// point of this paragraph: those siblings do not merely insert, they can also
+/// trip the prune, and while `touched` was one flat set a sibling's prune
+/// evicted the caller's live sids as readily as its own dead ones. That is
+/// closed at the root by [`TouchedRegistry`], not here.
 #[cfg(test)]
 pub(crate) fn touched_contains(sid: &str) -> bool {
     LINK.touched
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .any(|s| s == sid)
+        .values()
+        .any(|r| r.sids.contains(sid))
 }
 
 /// [`apply_hold`] for a caller that already holds the ctx — the `status` test's
@@ -4377,6 +4445,76 @@ mod inbox_hold {
             assert!(
                 touched_contains(&last),
                 "the one live session survives the prune"
+            );
+        });
+    }
+
+    /// A PRUNE SPEAKS ONLY FOR THE REGISTRY THAT DROVE IT.
+    ///
+    /// `touched` is process-global and its prune predicate is "still in the
+    /// registry" — but the only registry a bridge verb can ask is the one it was
+    /// handed. While the set was one flat `BTreeSet`, a verb on registry A
+    /// intersected the WHOLE set with A's live handles, so every sid registry B
+    /// still owed a `bridge_lost` halt to was dropped on the floor by a message
+    /// that had nothing to do with B. Nothing failed loudly: `bridge_lost` just
+    /// held fewer sessions than it had promised, on the path whose entire
+    /// contract is to fail closed.
+    ///
+    /// Production runs one registry, which is why this never showed there. The
+    /// test suite runs one per test, which is why it showed here — as
+    /// `the_governed_sid_set_drops_sessions_that_have_left_the_registry` losing
+    /// its own live sids whenever a sibling's `deliver` happened to land while
+    /// the set was over [`TOUCHED_PRUNE_AT`].
+    #[test]
+    fn one_registrys_prune_does_not_evict_another_registrys_governed_sids() {
+        with_link(|| {
+            // The bystander: one live, governed session in a registry that takes
+            // no further part in anything below.
+            let bystander = new_store();
+            let (b_sid, _b_ctx) = registered_as(&bystander, 1);
+            assert_eq!(deliver(&bystander, &b_sid, 1, "h-a", "note", "x"), "OK 1\n");
+            assert!(touched_contains(&b_sid), "the bystander is governed");
+
+            // A second registry, driven past the threshold so its verbs prune.
+            let driver = new_store();
+            let n = TOUCHED_PRUNE_AT + 8;
+            let mut d_sids = Vec::with_capacity(n);
+            for local in 1..=n as u64 {
+                let (sid, _ctx) = registered_as(&driver, local);
+                assert_eq!(deliver(&driver, &sid, local, "h-a", "note", "x"), "OK 1\n");
+                d_sids.push(sid);
+            }
+            assert!(
+                touched_contains(&b_sid),
+                "a prune driven by one registry must not forget another's live session"
+            );
+
+            // ...and the prune is not merely inert: the driver's OWN departed
+            // sessions still go, which is the property the keying must not cost.
+            for local in 1..n as u64 {
+                driver
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .deregister_local(local);
+            }
+            let last = d_sids.last().expect("a session").clone();
+            assert_eq!(
+                deliver(&driver, &last, 9_999, "h-a", "note", "again"),
+                "OK 2\n"
+            );
+            for sid in &d_sids[..n - 1] {
+                assert!(
+                    !touched_contains(sid),
+                    "the driver's own dead sids are still pruned"
+                );
+            }
+            assert!(
+                touched_contains(&last),
+                "the driver's live session survives"
+            );
+            assert!(
+                touched_contains(&b_sid),
+                "and the bystander is still governed after the driver's prune"
             );
         });
     }

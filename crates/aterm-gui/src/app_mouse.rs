@@ -3924,15 +3924,16 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if let Some(lane) = self.status_bar_lane_at(wid, px, py) {
-                let route = match lane {
+                match lane {
                     crate::status_bars::Lane::Toolchain => {
-                        crate::native_settings::SettingsRoute::Packages
+                        let _ =
+                            self.open_settings_tab(crate::native_settings::SettingsRoute::Packages);
                     }
-                    crate::status_bars::Lane::Update => {
-                        crate::native_settings::SettingsRoute::SoftwareUpdate
-                    }
-                };
-                let _ = self.open_settings_tab(route);
+                    // THE UPDATE ROW IS THE ONE-CLICK APPLY (2026-09-07): a staged
+                    // build applies in place on a press — what the retired
+                    // floating card did — and any other state opens the details.
+                    crate::status_bars::Lane::Update => self.press_update_bar(),
+                }
                 return;
             }
         }

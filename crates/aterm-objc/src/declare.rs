@@ -49,7 +49,7 @@ use std::mem::MaybeUninit;
 use crate::runtime::{
     ClassPtr, Id, Sel, class, class_addIvar, class_addMethod, class_addProtocol,
     class_getInstanceVariable, ivar_getOffset, objc_allocateClassPair, objc_registerClassPair,
-    protocol, superclass_of,
+    protocol_or_register, superclass_of,
 };
 
 /// The name of the single ivar every declared class carries.
@@ -285,7 +285,10 @@ impl<T> IvarSlot<T> {
     /// `vendor/winit/src/platform_impl/macos/window.rs` used to say it was.
     /// Measured with four purpose-built substitutions against a class whose
     /// slot the runtime places at offset 513 of an `NSWindow`, inside its tail
-    /// padding (`winit_seam.rs`'s
+    /// padding — on the macOS 26 release cutter; macOS 14.4.1's `NSWindow` is
+    /// 448 bytes with no tail padding and the slot lands AT 448, past the
+    /// allocation, which the test measures rather than assumes
+    /// (`winit_seam.rs`'s
     /// `a_substituting_initializer_defeats_the_initialized_flag`): a same-class
     /// survivor reads `false` and panics (the guard working); a plain `NSWindow`
     /// survivor panics only because that padding is currently zero; a SIBLING
@@ -525,18 +528,24 @@ impl ClassBuilder {
 
     /// Declare conformance to a protocol, by name.
     ///
-    /// Panics if the protocol is absent from the process: for an AppKit
-    /// protocol that means AppKit is not linked into THIS binary, which is a
-    /// build defect rather than a runtime condition to tolerate.
+    /// The protocol object comes from [`protocol_or_register`]: the host's
+    /// framework supplies it when it registers one, and this crate supplies a
+    /// name-only one when it does not. Whether a framework registers a
+    /// protocol it declares is a fact about THAT HOST's build of the
+    /// framework, not about what this binary links — `NSApplicationDelegate`
+    /// is absent from macOS 14.4.1's AppKit and present on macOS 26 — and a
+    /// class that must claim a protocol cannot make its launch conditional on
+    /// it. v0.72.0 through v0.75.0 asserted presence here and died at launch on
+    /// 14.4.1 before the first window, with a message blaming a framework that
+    /// was not linked, which was never the case.
+    ///
+    /// Panics only if the runtime refuses the claim itself — a protocol that
+    /// cannot be supplied at all, or `class_addProtocol` answering NO — both
+    /// genuine runtime failures rather than host facts.
     pub fn add_protocol(&mut self, name: &'static CStr) {
-        let proto = protocol(name);
-        assert!(
-            !proto.is_null(),
-            "aterm-objc: protocol {name:?} not present in this process (its \
-             framework is not linked)"
-        );
+        let proto = protocol_or_register(name);
         // SAFETY: `self.cls` is a live class pair and `proto` a live, immortal
-        // protocol object.
+        // protocol object — `protocol_or_register` never returns null.
         let ok = unsafe { class_addProtocol(self.cls, proto) };
         assert!(
             ok.as_bool(),

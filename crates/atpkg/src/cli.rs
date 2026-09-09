@@ -327,6 +327,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     if verb == Some("__pending") {
         return cmd_pending(args.get(1));
     }
+    // The HIDDEN reroute verb (philosophy §4, `crate::reroute`): what a reroute stub
+    // execs for `cargo`/`rustfmt`/… typed inside a session. Same discipline as
+    // `__pending` — unlisted, dispatched before the match so the roster scraper sees
+    // only real verbs, and BEFORE the store lock: it must answer while the installer
+    // HOLDS the lock, and it never mutates the store.
+    if verb == Some(crate::reroute::HIDDEN_VERB) {
+        return cmd_reroute(&args[1..]);
+    }
     // THE single-writer-per-store gate ([`crate::lock`]): every store-MUTATING verb
     // TRY-acquires the store-wide `store.lock` here — at the ONE dispatch edge, so
     // internal verb re-routing (`update <p>` → install) can
@@ -541,6 +549,48 @@ fn cmd_pending(tool: Option<&String>) -> ExitCode {
         return ExitCode::from(1);
     };
     run_pending(&layout, tool)
+}
+
+/// `atpkg __reroute <upstream> [args…]` — the hidden verb a reroute stub execs
+/// (philosophy §4, [`crate::reroute::run`]). Unlisted for the reason `__pending` is:
+/// it is machinery a stub reaches, not vocabulary a user types, so it is dispatched
+/// before the verb match and the roster scraper never sees it. Dispatched BEFORE the
+/// store lock too: a `cargo build` typed while the installer HOLDS `store.lock` must
+/// still get its signpost instantly, and the verb never mutates the store — it
+/// announces, refuses, or execs a copy that is already there. The arguments after
+/// the upstream name are the caller's, VERBATIM: the stub inserts no separator of
+/// its own, so a leading `--` here is the user's and is kept (`rustc -- x.rs`).
+fn cmd_reroute(rest: &[String]) -> ExitCode {
+    let Some((upstream, args)) = rest.split_first() else {
+        eprintln!(
+            "usage: atpkg {} <upstream> [args…]",
+            crate::reroute::HIDDEN_VERB
+        );
+        return ExitCode::from(2);
+    };
+    let Some(layout) = layout() else {
+        // No resolvable store (no `HOME`, an `env -i` wrapper): the same
+        // fail-closed answer the stub gives when atpkg is unreachable — the
+        // escape named, exit 2 — never an unexplained 1.
+        eprintln!("{}", crate::reroute::unreachable_message(upstream));
+        return ExitCode::from(crate::reroute::REFUSAL_EXIT);
+    };
+    crate::reroute::run(&layout, upstream, args)
+}
+
+/// Lay (or refresh) the reroute stubs beside the pending-stub reconcile — at seed,
+/// after each install pass, and on `repair` — and never let a failure fail the pass:
+/// the stubs are a session convenience the spawn seam re-lays anyway, while the pass
+/// that called this just installed a toolchain the user is waiting for. One stderr
+/// line names what did not happen.
+fn lay_reroute_stubs(layout: &crate::store::Layout) {
+    if let Err(err) = crate::reroute::lay(layout) {
+        eprintln!(
+            "atpkg: warn — reroute stubs not laid under {}: {err} (an aterm session lays \
+             them at spawn; `aterm pkg repair` retries)",
+            crate::reroute::dir(layout).display()
+        );
+    }
 }
 
 /// The pending verb's body, shared by `__pending` and `atpkg run`'s pending arm so
@@ -1200,6 +1250,9 @@ fn cmd_which(tool: Option<&String>) -> ExitCode {
 /// * a pending default-set stub ⇒ named as such;
 /// * a recorded `installed via` / `needs admin` / `unavailable on` / `blocked by` row ⇒
 ///   that row's words;
+/// * a REROUTED upstream name (`cargo`, `rustfmt`, … — [`crate::reroute::TABLE`]) ⇒ the
+///   reroute stub, its state, and the row's policy in the stub's own words
+///   ([`reroute_which_line`]), answered before every other arm;
 /// * nothing at all ⇒ `Err` with the one-line fix.
 ///
 /// # Errors
@@ -1209,6 +1262,17 @@ fn which_line(
     tool: &str,
     path_var: Option<&std::ffi::OsStr>,
 ) -> Result<String, String> {
+    // A REROUTED upstream name (philosophy §4) is answered by the table, ahead of the
+    // deny-list gate and the store: inside an aterm session the reroute dir is FIRST on
+    // PATH, so the stub is the copy that runs whatever else PATH holds (measured
+    // 2026-09-07, before it was: `~/.cargo/bin` at position 17 ran upstream cargo
+    // silently), and the managed bin/ never carries these names — `cargo`/`rustc` are
+    // deny-listed, and no index program exposes the other six. Without this arm `which
+    // cargo` refused the name and `which rustfmt` promised an install; neither said
+    // what runs.
+    if let Some(row) = crate::reroute::row_for(tool) {
+        return Ok(reroute_which_line(layout, row));
+    }
     let Some(tn) = crate::store::ToolName::new(tool) else {
         return Err(format!("atpkg: {tool:?} is not a tool name"));
     };
@@ -1327,6 +1391,29 @@ fn which_line(
         return Err(no_alias_line(layout, tool, base.as_str()));
     }
     Err(not_installed_fix(tool))
+}
+
+/// The `which` answer for a REROUTED upstream name (philosophy §4): the stub that runs
+/// inside a session, its state (`laid` / `missing` / `foreign`, [`crate::reroute::states`]),
+/// and the row's policy in the stub's own words ([`crate::reroute::policy_summary`]) —
+/// `<args>` standing for the caller's arguments, since `which` has none to fill in.
+fn reroute_which_line(layout: &crate::store::Layout, row: &crate::reroute::Row) -> String {
+    use crate::reroute::StubState;
+    let stub = crate::reroute::stub_path(layout, row.upstream);
+    let state = crate::reroute::states(layout)
+        .into_iter()
+        .find(|(name, _)| *name == row.upstream)
+        .map_or("missing", |(_, state)| match state {
+            StubState::Laid => "laid",
+            StubState::Missing => "missing",
+            StubState::Foreign => "foreign",
+        });
+    format!(
+        "{} → {} (reroute stub, {state}) — rerouted inside aterm sessions: {}",
+        row.upstream,
+        stub.display(),
+        crate::reroute::policy_summary(row)
+    )
 }
 
 /// The one-line answer for `alias` (`alab-<base>`) when no such shim is laid — the reverse
@@ -1988,6 +2075,9 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     // with nothing installed still leaves repair better wired than it arrived.
     crate::hooks::refresh(&layout);
     println!("repair: shell integration rewritten (~/.aterm/shell.d + rc wiring)");
+    // The reroute stubs are the other store-less half: they embed this atpkg's path,
+    // so a relocated or self-updated binary is exactly what repair re-lays for.
+    lay_reroute_stubs(&layout);
 
     let installed = crate::list_installed(&layout);
     if installed.is_empty() {
@@ -2415,6 +2505,7 @@ fn cmd_uninstall_all() -> ExitCode {
         // The decline extends to the pending stubs: a declined machine keeps NO
         // default-set names on PATH promising an install that will never come.
         crate::stub::remove_all_stubs(&layout);
+        crate::reroute::remove_all(&layout);
         println!(
             "atpkg: removed nothing (nothing installed) — noted that this machine declines \
              the ALab toolset: no later pass installs it (not the first-run seed, not the \
@@ -2465,6 +2556,7 @@ fn cmd_uninstall_all() -> ExitCode {
     // Same stub discipline as the empty-store branch: `uninstall --all` removes
     // every pending stub with the toolset it declines.
     crate::stub::remove_all_stubs(&layout);
+    crate::reroute::remove_all(&layout);
     if removed.is_empty() {
         eprintln!("atpkg: removed nothing");
         return ExitCode::from(1);
@@ -3616,6 +3708,15 @@ fn extra_stub_candidates_with(
                     .and_then(|bin| {
                         crate::vendor::system_binary_on_path(&layout.prefix, bin, path_var)
                     })
+                    .is_none()
+                // A stub is a courtesy for a name that would otherwise be "command not
+                // found". A FOREIGN copy of the program's own name anywhere on PATH
+                // (the vendor's native installer under ~/.local/bin, a brew codex) already
+                // answers — and, laid ahead of it, a consent stub would HIJACK a working
+                // install with `Install claude? [y/N]` (2026-09-07 review). `system =`
+                // above is the owner's explicit satisfaction rule; this is the weaker
+                // "do not shadow what runs" rule, and it needs no flag.
+                && crate::vendor::system_binary_on_path(&layout.prefix, name, path_var)
                     .is_none()
         })
         .map(|(name, _)| name.clone())
@@ -5463,6 +5564,9 @@ fn install_default_set_inner(
         &crate::active_builds(layout),
         &requires_of,
     );
+    // The reroute stubs ride the same reconcile: the embedded atpkg path is refreshed
+    // and a row that left the table is swept (philosophy §4).
+    lay_reroute_stubs(layout);
     // ALIAS reconcile over what is live NOW: every ALab program's `alab-<tool>` names
     // stand beside its shims (an install a pre-alias client made gets them here), and a
     // program the signed index no longer calls ALab's own loses them.
@@ -6016,6 +6120,9 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // install state (`atpkg __pending`) instead of "command not found". Compiled
     // roster only; the first index resolve reconciles it against the signed set.
     crate::stub::lay_adoption_stubs(&layout);
+    // REROUTE STUBS beside them (philosophy §4): the upstream Rust names answer inside a
+    // session from the first seed on, not only once the spawn seam has laid them.
+    lay_reroute_stubs(&layout);
     let Some(seed_dir) = crate::bundled_seed_dir() else {
         // DO NOT PROMISE WHAT THE INDEX CANNOT DELIVER. This used to assert the
         // toolset would be "kept current and complete from here on" without asking
@@ -8790,6 +8897,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// `aterm pkg which` for a REROUTED upstream name (design S6, philosophy §4): the
+    /// answer is the row — the branded command(s) with `<args>`, the escape variable —
+    /// and the stub's state, for a name the deny-list refuses (`cargo`) and one it admits
+    /// (`rustfmt`) alike; a foreign occupant is named, never claimed; every other name
+    /// keeps its behaviour (`rustup` is not a row and stays refused as a tool name).
+    #[cfg(unix)]
+    #[test]
+    fn which_answers_a_rerouted_name_from_the_table() {
+        let layout = temp_layout("which-reroute");
+        let empty = std::ffi::OsString::new();
+        // Before any stub is laid the row still answers, and says so.
+        let line = which_line(&layout, "cargo", Some(&empty)).unwrap();
+        assert!(line.contains("(reroute stub, missing)"), "{line}");
+        crate::reroute::lay(&layout).unwrap();
+        let cargo = which_line(&layout, "cargo", Some(&empty)).unwrap();
+        assert_eq!(cargo.lines().count(), 1, "{cargo}");
+        assert!(
+            cargo.starts_with(&format!(
+                "cargo → {} (reroute stub, laid) — rerouted inside aterm sessions: announced, \
+                 naming ",
+                crate::reroute::stub_path(&layout, "cargo").display()
+            )),
+            "{cargo}"
+        );
+        for needle in [
+            "'targo trust <args>' / 'targo --unverified <args>'",
+            "'cargo clippy' → 'targo tippy'",
+            // The 2026-09-08 ruling, on the "which copy runs and why" surface:
+            // a SIGNPOST row is not a refusal and must not read as one here.
+            ", then run upstream ",
+            "(ATERM_NO_REROUTE=1 restores upstream 'cargo'.)",
+        ] {
+            assert!(!cargo.contains("refused"), "{cargo}");
+            assert!(cargo.contains(needle), "{needle:?} missing from {cargo}");
+        }
+        let rustfmt = which_line(&layout, "rustfmt", Some(&empty)).unwrap();
+        assert!(rustfmt.contains("runs 'trustfmt <args>'"), "{rustfmt}");
+        assert!(
+            rustfmt.contains("ATERM_NO_REROUTE=1 restores upstream 'rustfmt'"),
+            "{rustfmt}"
+        );
+        // A foreign occupant of a row's name: named as such, never claimed as ours.
+        std::fs::write(
+            crate::reroute::stub_path(&layout, "z3"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .unwrap();
+        let z3 = which_line(&layout, "z3", Some(&empty)).unwrap();
+        assert!(z3.contains("(reroute stub, foreign)"), "{z3}");
+        assert!(
+            z3.contains("ATERM_Z3_IS_ORACLE=1 reaches the real z3"),
+            "{z3}"
+        );
+        // Not a row: the deny-list still answers.
+        assert_eq!(
+            which_line(&layout, "rustup", Some(&empty)).unwrap_err(),
+            "atpkg: \"rustup\" is not a tool name"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     /// DESIGN S7 on the `which` surface: a managed shim that exports its manifest's
     /// `shim_env` answers with the canonical state and ONE trailing sentence —
     /// `self-update off (DISABLE_AUTOUPDATER=1)` — never inside the state; a foreign copy
@@ -9055,6 +9223,23 @@ mod tests {
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &installed, None),
             names(&["claude"])
+        );
+        // A FOREIGN copy under the program's OWN name (no `system =` flag on codex): a
+        // brew codex on PATH means the name already answers, and a stub laid ahead of it
+        // would hijack it with a consent prompt — so no stub. Remove it and codex pends
+        // again.
+        let exe = sys.join("codex");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            extra_stub_candidates_with(&layout, &index, &cfg, &none, Some(&path)),
+            names(&[]),
+            "a foreign codex on PATH must suppress the consent stub"
+        );
+        std::fs::remove_file(&exe).unwrap();
+        assert_eq!(
+            extra_stub_candidates_with(&layout, &index, &cfg, &none, Some(&path)),
+            names(&["codex"])
         );
         let _ = std::fs::remove_dir_all(&sys);
         let _ = std::fs::remove_dir_all(&layout.prefix);

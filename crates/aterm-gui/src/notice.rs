@@ -20,9 +20,11 @@
 //! One decoration borrows the widget wholesale: ROBI's tip bubble
 //! ([`NoticeKind::RobiTip`], anchored over the speaker).
 //!
-//! And one DISCLOSURE does: [`NoticeKind::PrivacyPrompts`] — the macOS
-//! privacy-prompt pill (design §3.4), shown at most once and never again
-//! (`privacy_notice_once`).
+//! And one more two-control card does: [`NoticeKind::MacosAccess`] — the macOS
+//! ACCESS CARD (design §3.4 as amended 2026-09-07; `consent_card` owns the
+//! decision and the lifecycle). It is the one prompt that stands in for the
+//! per-folder system dialogs: *Open Settings* deep-links to the Full Disk
+//! Access pane, *Not now* records the answer so it never nags.
 //!
 //! GLOBAL (App-level), painted into every window like `config_notice` — and it borrows the
 //! SAME timed-lifecycle shape (`is_expired` + `deadline`), but renders through the SACRED
@@ -97,8 +99,16 @@ const SLIDE_CELLS: f32 = 0.42;
 pub(crate) enum NoticeKind {
     /// A strictly-newer build staged and is ready to install. Clickable → APPLY (one
     /// click; see `App::notice_click`).
+    #[allow(
+        dead_code,
+        reason = "retired producer (2026-09-07): the update lane announces on the status bar; the kind and its chevron painter remain the widget's regression fixture"
+    )]
     UpdateReady { version: String, build: u64 },
     /// The app took over as a newer build (post-update celebration).
+    #[allow(
+        dead_code,
+        reason = "retired producer (2026-09-07): the landing is the update bar's row plus the upgrade surge; the kind and its sparkle painter remain the regression fixture"
+    )]
     LevelUp { build: u64 },
     /// Nonmodal updater status used by automatic/background paths. It is deliberately
     /// not clickable: details remain in Settings/the Version menu.
@@ -121,14 +131,26 @@ pub(crate) enum NoticeKind {
     /// Held for [`ADMIN_STEP_TTL`], not the transient [`TTL`]; a body click dismisses
     /// it for now without recording anything.
     AdminStep { names: Vec<String> },
-    /// The macOS PRIVACY-PROMPT disclosure (design §3.4): programs run in a
-    /// session can be stopped by a system privacy dialog that aterm neither
-    /// raises nor can see, and the place aterm says what it knows about that is
-    /// its own Security page. Shown AT MOST ONCE (`privacy_notice_once`), gated
-    /// on `[privacy] notice`, not clickable, and carrying no payload — the copy
-    /// is fixed ([`PRIVACY_PROMPTS_CAPTION`]) precisely so it cannot grow a
-    /// claim that has not been measured.
-    PrivacyPrompts,
+    /// The macOS ACCESS CARD (design §3.4, amended 2026-09-07; the decision
+    /// and lifecycle are `consent_card`'s): programs run in a session are
+    /// interrupted by per-folder system privacy dialogs that aterm neither
+    /// raises nor can see, and the ONE switch macOS offers instead is a Full
+    /// Disk Access grant made by a human in System Settings. The card carries
+    /// TWO controls, painted exactly like the admin card's — *Open Settings*
+    /// (the Full Disk Access deep link, an owner gesture on the main thread)
+    /// and *Not now* (an answer marker beside `aterm.toml`). Held for
+    /// [`ADMIN_STEP_TTL`]; a body click dismisses it for now without recording
+    /// anything. The copy is fixed ([`MACOS_ACCESS_CAPTION`]) precisely so it
+    /// cannot grow a coverage claim that has not been measured.
+    MacosAccess,
+    /// The access card's OWN follow-up pill after *Open Settings*: the route
+    /// in words (`consent_card::opened_settings_caption`), quiet and not
+    /// clickable, held for `consent_card::OPENED_SETTINGS_TTL`. A kind of its
+    /// own rather than an `UpdateStatus` so the card's lifecycle can tell its
+    /// pill from anyone else's: the ✓ confirmation may replace THIS pill the
+    /// moment the grant is observed, and a displaced card knows this one is
+    /// not a displacement.
+    MacosAccessRoute { text: String },
 }
 
 /// How long the admin card waits before it lifts away on its own — an unanswered card
@@ -136,38 +158,46 @@ pub(crate) enum NoticeKind {
 /// is a ceiling on how long it may float over the terminal, not the offer's lifetime.
 pub(crate) const ADMIN_STEP_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// The macOS privacy-prompt pill's WHOLE copy, in this module's
-/// `"<marker> <title> — <detail>"` grammar (design §3.4).
+/// The macOS access card's WHOLE copy, in this module's
+/// `"<marker> <title> — <detail>"` grammar (design §3.4, amended 2026-09-07).
 ///
 /// # What it says, and what it deliberately does not
 ///
-/// It states one measured fact — a program running in a session can be stopped
-/// by a macOS privacy dialog — and points at the page that carries the detail.
-/// It does NOT name a folder, does NOT say which folders any grant covers, and
-/// does NOT promise the interruptions go away. Coverage is §7 S4's claim to
-/// make and S4 has not been run on this machine; scope is S1's and S1 has not
-/// been run either, so no scope sentence ships at all (§3.4's own escalation).
-/// The owner's ruling is that mitigating this annoyance is acceptable — so the
-/// pill must never read as elimination.
+/// The ASK is the title — "fewer" prompts, which is mitigation and nothing
+/// stronger — and the detail names the ONE switch macOS offers, exactly as
+/// the Security page does ("Full Disk Access is the single grant macOS offers
+/// for this"). It does NOT name a folder, does NOT say which folders the grant
+/// covers, and does NOT promise the interruptions go away. Coverage is §7 S4's
+/// claim to make and S4 has not been run on this machine; scope is S1's and S1
+/// has not been run either, so no scope sentence ships at all (§3.4's own
+/// escalation). The owner's ruling is that mitigating this annoyance is
+/// acceptable — so the card must never read as elimination.
+///
+/// # Why it is short
+///
+/// The fit order drops the DETAIL first and elides the title last, and the
+/// two capsules are never dropped — so on an ordinary window the sentence
+/// must fit beside "Open Settings" and "Not now" or the owner sees a topic
+/// with two buttons and no ask. Title and detail together are held under
+/// ~75 characters, which survives a 100-column window (pinned by the layout
+/// test below).
 ///
 /// # Why the wording is a const, and why it is here
 ///
-/// A pill that fires once per install is a string nobody re-reads in the
+/// A card that fires once per install is a string nobody re-reads in the
 /// running app, so it is the easiest place in the product for an unmeasured
 /// claim to sit unchallenged. Pinned as one const, it is one grep away and the
 /// copy test below can hold it to the fence.
 ///
 /// The gear is the badge glyph this widget already renders (the admin card and
-/// Robi's tips use it); the tone, not the glyph, is what separates them — this
-/// one is [`Tone::Quiet`] because it asks for nothing.
-pub(crate) const PRIVACY_PROMPTS_CAPTION: &str = "\u{2699} Programs run in aterm can be interrupted \
-     by macOS privacy prompts \u{2014} Settings \u{25b8} Security";
+/// Robi's tips use it); like the admin card it wears [`Tone::Action`], because
+/// it carries two controls and asks for one decision.
+pub(crate) const MACOS_ACCESS_CAPTION: &str = "\u{2699} Fewer macOS file prompts \u{2014} \
+     one Full Disk Access switch in System Settings";
 
-/// The marker file that latches the at-most-once privacy pill, beside
-/// `aterm.toml` — the config-dir latch idiom
-/// (`connections::first_use_notice_should_show`, `packages_screen`'s
-/// `packages-admin-step-dismissed`).
-const PRIVACY_NOTICE_MARKER: &str = "privacy-prompts-notice-shown";
+/// The access card's primary control. It opens a Settings pane; it grants
+/// nothing, and the label must not suggest otherwise.
+const OPEN_SETTINGS_LABEL: &str = "Open Settings";
 
 /// A single transient, self-expiring notice.
 pub(crate) struct TransientNotice {
@@ -188,6 +218,13 @@ pub(crate) struct TransientNotice {
 }
 
 impl TransientNotice {
+    /// RETIRED PRODUCER (2026-09-07): a newly staged build is announced by the
+    /// update STATUS BAR (`status_bars`), whose row is the click-to-apply
+    /// affordance; nothing in the shipping tree raises this card any more. The
+    /// kind and its painter (the accent badge + chevron) stay as the widget's
+    /// regression fixture until those tests migrate — the same arrangement the
+    /// retired Software Update modal has.
+    #[cfg(test)]
     pub(crate) fn update_ready(version: String, build: u64, now: Instant) -> Self {
         Self {
             kind: NoticeKind::UpdateReady { version, build },
@@ -197,6 +234,11 @@ impl TransientNotice {
         }
     }
 
+    /// RETIRED PRODUCER (2026-09-07): the landed build is announced by the
+    /// update STATUS BAR ("Updated — now on vX") and celebrated by the upgrade
+    /// surge's landing burst (`level_up`); nothing in the shipping tree raises
+    /// this card any more. Kept as the sparkle painter's regression fixture.
+    #[cfg(test)]
     pub(crate) fn level_up(build: u64, now: Instant) -> Self {
         Self {
             kind: NoticeKind::LevelUp { build },
@@ -212,11 +254,10 @@ impl TransientNotice {
 
     /// [`Self::update_status`] with an explicit lifetime, for a card that
     /// reports work still in progress (the [`Self::ttl`] override that field's
-    /// doc anticipates). The handoff's "installing / finishing" cards use it:
-    /// the default 5.4 s has under a second of headroom over a cold 4.5 s apply
-    /// and none at all over the ready deadline's ceiling, and its last 800 ms
-    /// are the fade ramp — so the card explaining the freeze would visibly
-    /// dissolve part-way through the freeze it is explaining.
+    /// doc anticipates). The first-open install doctor uses it with the admin
+    /// step's lifetime: the default 5.4 s, whose last 800 ms are the fade ramp,
+    /// is a glance, not a step someone has to go and take. (The handoff's
+    /// "installing / finishing" moments are status-bar rows, 2026-09-07.)
     pub(crate) fn update_status_for(text: impl Into<String>, ttl: Duration, now: Instant) -> Self {
         Self {
             kind: NoticeKind::UpdateStatus { text: text.into() },
@@ -272,19 +313,86 @@ impl TransientNotice {
         }
     }
 
-    /// The macOS privacy-prompt pill ([`PRIVACY_PROMPTS_CAPTION`]).
-    ///
-    /// Private to the at-most-once gate on purpose: [`privacy_notice_once`] is
-    /// the only way to build one, so a card that has already been shown cannot
-    /// be raised a second time by a caller that forgot to ask. It rides the
-    /// ordinary transient [`TTL`] — this is a disclosure, not an offer, and
-    /// there is nothing on it to press.
-    fn privacy_prompts(now: Instant) -> Self {
+    /// The macOS access card ([`MACOS_ACCESS_CAPTION`]): the admin card's
+    /// shape — a STILL card held for [`ADMIN_STEP_TTL`], two controls on the
+    /// trailing edge — for the one-time Full Disk Access decision. Whether it
+    /// is due at all is `consent_card::card_due`'s call, made on the event loop
+    /// against the cached probe; this only builds the card.
+    pub(crate) fn macos_access(now: Instant) -> Self {
         Self {
-            kind: NoticeKind::PrivacyPrompts,
+            kind: NoticeKind::MacosAccess,
             spawned: now,
             anchor: None,
-            ttl: TTL,
+            ttl: ADMIN_STEP_TTL,
+        }
+    }
+
+    /// Whether this is the macOS access card (the other two-control variant).
+    pub(crate) fn is_macos_access(&self) -> bool {
+        matches!(self.kind, NoticeKind::MacosAccess)
+    }
+
+    /// The access card's follow-up pill ([`NoticeKind::MacosAccessRoute`]),
+    /// held for `ttl` — the caller's `consent_card::OPENED_SETTINGS_TTL`.
+    pub(crate) fn macos_access_route(text: String, ttl: Duration, now: Instant) -> Self {
+        Self {
+            kind: NoticeKind::MacosAccessRoute { text },
+            spawned: now,
+            anchor: None,
+            ttl,
+        }
+    }
+
+    /// Whether the access card's lifecycle OWNS this notice: the card itself
+    /// or its follow-up pill. What `consent_card` may replace with the ✓
+    /// confirmation, and what does not count as a displacement.
+    pub(crate) fn is_macos_access_owned(&self) -> bool {
+        matches!(
+            self.kind,
+            NoticeKind::MacosAccess | NoticeKind::MacosAccessRoute { .. }
+        )
+    }
+
+    /// The label of the PRIMARY control, for the two kinds that carry
+    /// controls; `None` for every other kind. This is the one predicate the
+    /// layout, the painter and the hit test read, so a card either has both
+    /// capsules or neither.
+    pub(crate) fn primary_control_label(&self) -> Option<&'static str> {
+        match self.kind {
+            NoticeKind::AdminStep { .. } => Some(INSTALL_LABEL),
+            NoticeKind::MacosAccess => Some(OPEN_SETTINGS_LABEL),
+            _ => None,
+        }
+    }
+
+    /// Whether another card may take this one's slot when a DISCLOSURE wants
+    /// to be raised: only an empty slot, a status pill that has visibly
+    /// lifted (its alpha is below the click floor, or it has expired), or a
+    /// decoration (Robi's tip) yields. An update-ready card, the level-up
+    /// flourish, the admin card, the first-use disclosure, a live status pill
+    /// and the access card's own surfaces are never clobbered by a
+    /// disclosure. "Visibly lifted" rather than "past its hold": the hold
+    /// ends at the exact instant the pill's own wake fires with its alpha
+    /// still 1.0, and a pill replaced there pops instead of fading — and
+    /// ONLY in the exit tail, never on the entrance ramp, where the alpha is
+    /// just as low for the first ~30 ms of a pill that has not yet had a
+    /// legible frame (a producer writes the slot and the very next park
+    /// asks this question).
+    pub(crate) fn yields_to_disclosure(&self, now: Instant) -> bool {
+        match self.kind {
+            NoticeKind::RobiTip { .. } => true,
+            NoticeKind::UpdateStatus { .. } => {
+                let elapsed = now.duration_since(self.spawned);
+                self.is_expired(now)
+                    || (elapsed >= self.ttl.saturating_sub(FADE)
+                        && self.alpha(now) < CLICK_MIN_ALPHA)
+            }
+            NoticeKind::UpdateReady { .. }
+            | NoticeKind::LevelUp { .. }
+            | NoticeKind::SessionConnection { .. }
+            | NoticeKind::AdminStep { .. }
+            | NoticeKind::MacosAccess
+            | NoticeKind::MacosAccessRoute { .. } => false,
         }
     }
 
@@ -301,7 +409,11 @@ impl TransientNotice {
         }
     }
 
-    /// Whether this is the admin card (the two-control variant).
+    /// Whether this is the admin card. Production reads the kind through
+    /// [`Self::admin_step_names`] (the click path needs the names) and
+    /// [`Self::primary_control_label`] (layout, paint and hit test); this
+    /// predicate is the tests' spelling.
+    #[cfg(test)]
     pub(crate) fn is_admin_step(&self) -> bool {
         matches!(self.kind, NoticeKind::AdminStep { .. })
     }
@@ -454,7 +566,11 @@ impl TransientNotice {
                 5u8.hash(&mut h);
                 names.hash(&mut h);
             }
-            NoticeKind::PrivacyPrompts => 6u8.hash(&mut h),
+            NoticeKind::MacosAccess => 6u8.hash(&mut h),
+            NoticeKind::MacosAccessRoute { text } => {
+                7u8.hash(&mut h);
+                text.hash(&mut h);
+            }
         }
         // Quantize BOTH animated quantities so a moving card re-rasterizes on each step
         // while a held one hashes stable. 48 steps over a ≤0.8s ramp is finer than the
@@ -526,87 +642,10 @@ impl TransientNotice {
             NoticeKind::AdminStep { names } => crate::packages_screen::admin_step_caption(names),
             // Fixed copy, pinned as a const so the one string this feature shows
             // cannot drift into a claim nothing measured. See its doc.
-            NoticeKind::PrivacyPrompts => PRIVACY_PROMPTS_CAPTION.to_string(),
-        }
-    }
-}
-
-/// The macOS privacy-prompt pill — **at most once**, or `None`, which is the
-/// answer on every launch after the first.
-///
-/// # One door, because the decision and the record must not come apart
-///
-/// Deciding and latching are the SAME step: the marker is created with
-/// `create_new`, so the file system arbitrates. Two racing processes — an
-/// instance and the successor that replaces it when an in-place apply lands,
-/// or two aterm instances started together — cannot both claim the first show,
-/// and a caller cannot raise the card without recording that it did. That is
-/// why [`TransientNotice::privacy_prompts`] is private to this module: this is
-/// the only way to build one.
-///
-/// # Mirrored from the packages screen, not called
-///
-/// The design names `packages_screen::admin_step_due` /
-/// `record_admin_step_dismissal` as the pattern. Those two are `pub(crate)`
-/// but not reusable here: `admin_step_due` is keyed to an `atpkg::Status` row
-/// set and re-shows when that set CHANGES, and `record_admin_step_dismissal`
-/// writes the admin marker's own path and its own text. So the PATTERN is
-/// mirrored — a marker file beside `aterm.toml`, owner-only, never written
-/// through an occupant — while the atomic decide-and-latch shape is
-/// `connections::first_use_notice_should_show`'s, which is what "once" needs.
-/// `create_new` also does the packages reader's hardening for free: anything
-/// already at the path — a regular file, a directory, a planted symlink — is
-/// `AlreadyExists`, so nothing is followed, nothing is overwritten, and the
-/// answer is "already shown".
-///
-/// # Which way it fails, and why that is the opposite of the connections latch
-///
-/// `connections::first_use_notice_should_show` SHOWS when it cannot latch:
-/// that notice fires on a user gesture, so an unlatchable state repeats a
-/// disclosure only when the user acts. This one fires on its own. A pill that
-/// could not latch would therefore return on every launch, which is precisely
-/// the nagging the design forbids — so an absent config dir or an unwritable
-/// one is `None`. Nothing is lost by staying quiet: the same facts, in more
-/// detail, live on the Security page and on `aterm ctl privacy`, and neither
-/// needs this marker.
-///
-/// # "Per install" is really per CONFIG LIFETIME
-///
-/// The marker lives beside `aterm.toml`, so it survives an update (the pill is
-/// not re-shown after every apply — the point of the exercise) and it survives
-/// a reinstall that keeps the config. Removing the config directory re-arms
-/// it. That is the same durability the two neighbouring markers have, and it
-/// is stricter than "once per install" in the only direction that matters.
-///
-/// `allow(dead_code)`: the raise site is `lib.rs`'s, one launch-time call
-/// gated on `Config::privacy_notice()`; the allow comes off with it.
-#[allow(dead_code)]
-pub(crate) fn privacy_notice_once(
-    enabled: bool,
-    config_path: Option<&std::path::Path>,
-    now: Instant,
-) -> Option<TransientNotice> {
-    if !enabled {
-        return None;
-    }
-    let dir = config_path.and_then(std::path::Path::parent)?;
-    // Best-effort on a fresh install where the config dir does not exist yet
-    // (the connections latch's precedent): a failed create just falls through,
-    // and `create_new`'s own error decides.
-    let _ = std::fs::create_dir_all(dir);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    match options.open(dir.join(PRIVACY_NOTICE_MARKER)) {
-        Ok(_) => Some(TransientNotice::privacy_prompts(now)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-        Err(e) => {
-            aterm_log::warn!("privacy notice latch not written, so the notice stays quiet: {e}");
-            None
+            NoticeKind::MacosAccess => MACOS_ACCESS_CAPTION.to_string(),
+            // Authored by `consent_card::opened_settings_caption`, in the
+            // grammar, with the route in words.
+            NoticeKind::MacosAccessRoute { text } => text.clone(),
         }
     }
 }
@@ -733,9 +772,11 @@ impl Tone {
             // The admin card asks for a press (two of them, painted as controls), so
             // it wears the actionable badge — the same accent its Install capsule uses.
             NoticeKind::AdminStep { .. } => Self::Action,
-            // A disclosure that asks for nothing: the accent badge and the
-            // chevron mean "there is something to press", and there is not.
-            NoticeKind::PrivacyPrompts => Self::Quiet,
+            // The access card asks for one decision through two controls,
+            // exactly like the admin card, and wears the same accent.
+            NoticeKind::MacosAccess => Self::Action,
+            // Its follow-up names a route and asks for no press.
+            NoticeKind::MacosAccessRoute { .. } => Self::Quiet,
         }
     }
 
@@ -845,17 +886,22 @@ struct Pill {
     title_x: f32,
     detail: Option<(String, f32)>,
     chevron_cx: Option<f32>,
-    /// The admin card's two controls; `None` on every other kind.
-    buttons: Option<AdminButtons>,
+    /// The two controls of a card that carries them (the admin card, the macOS
+    /// access card); `None` on every other kind.
+    buttons: Option<CardControls>,
+    /// The primary control's label, for the painter — `Install` or
+    /// `Open Settings`. Meaningless while `buttons` is `None`.
+    primary_label: &'static str,
     baseline: f32,
     tone: Tone,
 }
 
-/// The admin card's Install / Not now capsules — `(x, w)` each on the trailing edge,
-/// sharing one `y`/`h`. Laid out and hit-tested from the same numbers ([`notice_hit`]).
+/// A two-control card's primary / Not now capsules — `(x, w)` each on the trailing
+/// edge, sharing one `y`/`h`. Laid out and hit-tested from the same numbers
+/// ([`notice_hit`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct AdminButtons {
-    pub(crate) install: (f32, f32),
+pub(crate) struct CardControls {
+    pub(crate) primary: (f32, f32),
     pub(crate) not_now: (f32, f32),
     pub(crate) y: f32,
     pub(crate) h: f32,
@@ -916,25 +962,27 @@ fn layout(
     } else {
         (0.0, 0.0)
     };
-    // The admin card's two controls ride the trailing edge in place of the chevron:
-    // "Install" as a filled accent capsule, "Not now" as a quiet outlined one. They are
-    // never dropped by the fit order below — a card whose only exits have been elided
-    // is a trap — so the sentence gives way first.
-    let admin = n.is_admin_step();
+    // A two-control card's controls ride the trailing edge in place of the chevron:
+    // the primary ("Install" / "Open Settings") as a filled accent capsule, "Not now"
+    // as a quiet outlined one. They are never dropped by the fit order below — a card
+    // whose only exits have been elided is a trap — so the sentence gives way first.
+    let primary_label = n.primary_control_label();
+    let with_controls = primary_label.is_some();
+    let primary_label = primary_label.unwrap_or("");
     let btn_pad = s * 0.55;
     let btn_gap = s * 0.40;
-    let install_w = if admin {
-        ui_text_width_for(TextFace::UiBold, INSTALL_LABEL, s) + 2.0 * btn_pad
+    let primary_w = if with_controls {
+        ui_text_width_for(TextFace::UiBold, primary_label, s) + 2.0 * btn_pad
     } else {
         0.0
     };
-    let not_now_w = if admin {
+    let not_now_w = if with_controls {
         ui_text_width_for(TextFace::Ui, NOT_NOW_LABEL, s) + 2.0 * btn_pad
     } else {
         0.0
     };
-    let buttons_w = if admin {
-        s * 1.15 + install_w + btn_gap + not_now_w
+    let buttons_w = if with_controls {
+        s * 1.15 + primary_w + btn_gap + not_now_w
     } else {
         0.0
     };
@@ -997,12 +1045,12 @@ fn layout(
     let detail_x = title_x + title_w(&title) + gap_detail;
     let detail = detail.map(|d| (d, detail_x));
     let chevron_cx = n.is_update_ready().then_some(x + w - pad_x - chev_w * 0.5);
-    let buttons = (admin && w > 0.0).then(|| {
+    let buttons = (with_controls && w > 0.0).then(|| {
         let bh = s * 1.55;
         let not_now_x = x + w - pad_x - not_now_w;
-        let install_x = not_now_x - btn_gap - install_w;
-        AdminButtons {
-            install: (install_x, install_w),
+        let primary_x = not_now_x - btn_gap - primary_w;
+        CardControls {
+            primary: (primary_x, primary_w),
             not_now: (not_now_x, not_now_w),
             y: y + (h - bh) * 0.5,
             h: bh,
@@ -1026,6 +1074,7 @@ fn layout(
         detail,
         chevron_cx,
         buttons,
+        primary_label,
         baseline: row_baseline(y, h, s),
         tone,
     }
@@ -1050,8 +1099,8 @@ pub(crate) fn notice_hit(
         return None;
     }
     if let Some(b) = p.buttons.as_ref() {
-        if px >= b.install.0 && px < b.install.0 + b.install.1 {
-            return Some(NoticeHit::Install);
+        if px >= b.primary.0 && px < b.primary.0 + b.primary.1 {
+            return Some(NoticeHit::Primary);
         }
         if px >= b.not_now.0 && px < b.not_now.0 + b.not_now.1 {
             return Some(NoticeHit::NotNow);
@@ -1065,9 +1114,10 @@ pub(crate) fn notice_hit(
 pub(crate) enum NoticeHit {
     /// The caption or the badge — dismiss (and, on "Update ready", apply).
     Body,
-    /// The admin card's Install capsule.
-    Install,
-    /// The admin card's Not now capsule.
+    /// A two-control card's primary capsule: the admin card's Install, the
+    /// access card's Open Settings.
+    Primary,
+    /// A two-control card's Not now capsule.
     NotNow,
 }
 
@@ -1413,27 +1463,28 @@ pub(crate) fn notice_tray(
             color,
         });
     }
-    // The admin card's controls: Install as a filled accent capsule with contrast-picked
-    // ink, Not now as a hairline-outlined quiet one. Same accent the badge wears, so the
-    // card reads as one thing asking for one decision.
+    // A two-control card's controls: the primary (Install / Open Settings) as a filled
+    // accent capsule with contrast-picked ink, Not now as a hairline-outlined quiet one.
+    // Same accent the badge wears, so the card reads as one thing asking for one
+    // decision.
     if let Some(b) = p.buttons.as_ref() {
         let s = p.size.get();
         let fill = legible_on(r.accent, r.elevated);
         let capsule_r = (b.h * 0.5).min(12.0);
         prims.push(DrawPrim::Panel {
-            x: b.install.0,
+            x: b.primary.0,
             y: b.y,
-            w: b.install.1,
+            w: b.primary.1,
             h: b.h,
             radius: capsule_r,
             fill: rgba(fill, sa(0xFF)),
             blur: false,
         });
-        let install_tw = ui_text_width_for(TextFace::UiBold, INSTALL_LABEL, s);
+        let primary_tw = ui_text_width_for(TextFace::UiBold, p.primary_label, s);
         prims.push(text_prim(
-            b.install.0 + (b.install.1 - install_tw) * 0.5,
+            b.primary.0 + (b.primary.1 - primary_tw) * 0.5,
             p.baseline,
-            INSTALL_LABEL.to_string(),
+            p.primary_label.to_string(),
             p.size,
             TextWeight::Bold,
             TextFace::UiBold,
@@ -1547,8 +1598,8 @@ mod tests {
         let cy = y + h * 0.5;
         let p = layout(&n, &g, hold, 0.0, 1.0);
         let b = p.buttons.expect("the admin card lays out its two controls");
-        assert!(b.install.0 > p.title_x, "controls trail the caption");
-        assert!(b.install.0 + b.install.1 <= b.not_now.0);
+        assert!(b.primary.0 > p.title_x, "controls trail the caption");
+        assert!(b.primary.0 + b.primary.1 <= b.not_now.0);
         assert!(b.not_now.0 + b.not_now.1 <= x + w);
         assert!(b.y >= y && b.y + b.h <= y + h);
         let hit = |px: f32| notice_hit(&n, &g, hold, 0.0, 1.0, px, cy);
@@ -1556,15 +1607,15 @@ mod tests {
         assert_eq!(hit(x + w + 1.0), None);
         assert_eq!(hit(p.title_x + 2.0), Some(NoticeHit::Body));
         assert_eq!(
-            hit(b.install.0 + b.install.1 * 0.5),
-            Some(NoticeHit::Install)
+            hit(b.primary.0 + b.primary.1 * 0.5),
+            Some(NoticeHit::Primary)
         );
         assert_eq!(
             hit(b.not_now.0 + b.not_now.1 * 0.5),
             Some(NoticeHit::NotNow)
         );
         assert_eq!(
-            notice_hit(&n, &g, hold, 0.0, 1.0, b.install.0 + 1.0, y - 1.0),
+            notice_hit(&n, &g, hold, 0.0, 1.0, b.primary.0 + 1.0, y - 1.0),
             None,
             "above the card is not a press on Install"
         );
@@ -2305,64 +2356,7 @@ mod tests {
         }
     }
 
-    // ---- the macOS privacy-prompt pill (design §3.4) ---------------------------
-
-    /// AT MOST ONCE. The first ask builds the card AND records that it did, in
-    /// one `create_new`; every later ask in the same config lifetime is `None`.
-    /// `[privacy] notice = false` is `None` and must not even latch, so turning
-    /// the setting back on still shows the pill once. And an unlatchable state —
-    /// no config dir, or a marker path already occupied by something else — is
-    /// `None` too: this pill fires on its own, so failing OPEN would put it on
-    /// screen at every launch, which is the nagging it exists to avoid.
-    #[test]
-    fn the_privacy_pill_is_shown_at_most_once() {
-        use super::{PRIVACY_NOTICE_MARKER, privacy_notice_once};
-        use std::time::Instant;
-
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-test-privacy-notice-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let cfg = dir.join("aterm.toml");
-        let now = Instant::now();
-
-        // Switched off: nothing shown, and nothing latched.
-        assert!(privacy_notice_once(false, Some(&cfg), now).is_none());
-        assert!(
-            !dir.join(PRIVACY_NOTICE_MARKER).exists(),
-            "a disabled notice must not spend the one showing"
-        );
-
-        // First ask: the card, and the marker beside aterm.toml.
-        let first = privacy_notice_once(true, Some(&cfg), now);
-        assert!(first.is_some(), "the first ask shows the pill");
-        assert!(dir.join(PRIVACY_NOTICE_MARKER).exists(), "…and latches it");
-
-        // Every later ask, forever.
-        assert!(privacy_notice_once(true, Some(&cfg), now).is_none());
-        assert!(privacy_notice_once(true, Some(&cfg), now).is_none());
-
-        // An occupant that is not our marker is not followed and not
-        // overwritten: it reads as "already shown".
-        let _ = std::fs::remove_file(dir.join(PRIVACY_NOTICE_MARKER));
-        std::fs::create_dir_all(dir.join(PRIVACY_NOTICE_MARKER)).unwrap();
-        assert!(
-            privacy_notice_once(true, Some(&cfg), now).is_none(),
-            "an occupied marker path fails closed"
-        );
-        assert!(
-            dir.join(PRIVACY_NOTICE_MARKER).is_dir(),
-            "…and is left alone"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // No config dir at all: quiet, not repeated.
-        assert!(privacy_notice_once(true, None, now).is_none());
-    }
+    // ---- the macOS access card (design §3.4, amended 2026-09-07) --------------
 
     /// THE COPY. It is the one string this feature shows unprompted, so it is
     /// held to three fences at once: the owner's restart-phrase ruling
@@ -2372,27 +2366,16 @@ mod tests {
     /// elimination. It also has to parse as this module's caption grammar, or
     /// the badge would paint a word as a pictogram.
     #[test]
-    fn the_privacy_pill_copy_is_honest_and_fence_clean() {
+    fn the_macos_access_card_copy_is_honest_and_fence_clean() {
         use super::{
-            NoticeKind, PRIVACY_PROMPTS_CAPTION, Tone, TransientNotice, caption_parts,
-            privacy_notice_once,
+            MACOS_ACCESS_CAPTION, NoticeKind, OPEN_SETTINGS_LABEL, Tone, TransientNotice,
+            caption_parts,
         };
         use std::time::Instant;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aterm-test-privacy-copy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let card = privacy_notice_once(true, Some(&dir.join("aterm.toml")), Instant::now())
-            .expect("the first ask shows the pill");
-        let _ = std::fs::remove_dir_all(&dir);
-
+        let card = TransientNotice::macos_access(Instant::now());
         let text = card.text();
-        assert_eq!(text, PRIVACY_PROMPTS_CAPTION, "the card renders the const");
+        assert_eq!(text, MACOS_ACCESS_CAPTION, "the card renders the const");
         let lower = text.to_ascii_lowercase();
 
         // 1. The restart-phrase fence, in the shapes B12 scans for.
@@ -2415,11 +2398,10 @@ mod tests {
 
         // 2. No coverage claim and no scope sentence: which folders a grant
         //    reaches is S4's measurement and how far it reaches is S1's, and
-        //    NEITHER has been run. The pill names no folder and no grant.
+        //    NEITHER has been run. The card names the grant — the Security
+        //    page already does — and names no folder.
         for unmeasured in [
             "cover",
-            "full disk",
-            "all files",
             "documents",
             "desktop",
             "downloads",
@@ -2428,6 +2410,8 @@ mod tests {
             "retires",
             "this process",
             "new processes",
+            "every folder",
+            "all folders",
         ] {
             assert!(
                 !lower.contains(unmeasured),
@@ -2435,7 +2419,7 @@ mod tests {
             );
         }
 
-        // 3. Mitigate, never eliminate (owner's ruling). The pill says prompts
+        // 3. Mitigate, never eliminate (owner's ruling). The card says prompts
         //    CAN interrupt; it must never promise that they stop.
         for promise in [
             "never again",
@@ -2444,51 +2428,274 @@ mod tests {
             "not be interrupted",
             "never be interrupted",
             "without interruption",
+            "stops the",
+            "ends the",
         ] {
             assert!(
                 !lower.contains(promise),
-                "the pill must not promise elimination ({promise:?}): {text:?}"
+                "the card must not promise elimination ({promise:?}): {text:?}"
             );
         }
 
         // 4. It parses as the caption grammar: a pictogram for the badge, the
-        //    fact as the title, the destination as the detail.
+        //    fact as the title, the one switch as the detail.
         let parts = caption_parts(&text);
         assert_eq!(parts.marker.as_deref(), Some("\u{2699}"));
+        assert_eq!(parts.title, "Fewer macOS file prompts");
+        let detail = parts
+            .detail
+            .clone()
+            .expect("the detail names the one switch");
+        assert!(detail.contains("Full Disk Access"), "{detail}");
+        assert!(detail.contains("System Settings"), "{detail}");
         assert!(
-            parts.title.starts_with("Programs run in aterm"),
-            "the fact is the title: {:?}",
-            parts.title
-        );
-        assert_eq!(
-            parts.detail.as_deref(),
-            Some("Settings \u{25b8} Security"),
-            "the detail is where aterm says what it knows"
+            parts.title.chars().count() + detail.chars().count() <= 75,
+            "short enough to survive an ordinary window: {text:?}"
         );
 
-        // 5. It asks for nothing: a quiet badge, no chevron, and none of the
-        //    kinds the click paths look for.
+        // 5. The primary control opens a pane; it grants nothing, and its
+        //    label must not read as if it did.
+        let label = OPEN_SETTINGS_LABEL.to_ascii_lowercase();
+        for grant in ["grant", "allow", "enable", "turn on"] {
+            assert!(
+                !label.contains(grant),
+                "{OPEN_SETTINGS_LABEL:?} must not read as granting"
+            );
+        }
+
+        // 6. It asks for one decision: the actionable badge and the two
+        //    controls, exactly like the admin card; none of the other kinds
+        //    the click paths look for.
         assert_eq!(
-            Tone::of(&NoticeKind::PrivacyPrompts, parts.marker.as_deref()),
+            Tone::of(&NoticeKind::MacosAccess, parts.marker.as_deref()),
+            Tone::Action
+        );
+        assert!(card.is_macos_access());
+        assert!(card.is_macos_access_owned());
+        assert_eq!(card.primary_control_label(), Some(OPEN_SETTINGS_LABEL));
+        assert!(!card.is_update_ready());
+        assert!(!card.is_admin_step());
+        assert!(!card.is_robi_tip());
+        assert!(!card.is_level_up());
+        assert_eq!(card.admin_step_names(), None);
+
+        // 7. The follow-up pill is the card's own — owned, quiet, no
+        //    controls — and renders the text it was given.
+        let route = TransientNotice::macos_access_route(
+            "\u{2699} Opened \u{2014} the route".to_string(),
+            std::time::Duration::from_secs(90),
+            Instant::now(),
+        );
+        assert!(route.is_macos_access_owned());
+        assert!(!route.is_macos_access());
+        assert_eq!(route.primary_control_label(), None);
+        assert_eq!(route.text(), "\u{2699} Opened \u{2014} the route");
+        assert_eq!(
+            Tone::of(
+                &NoticeKind::MacosAccessRoute {
+                    text: String::new()
+                },
+                Some("\u{2699}")
+            ),
             Tone::Quiet
         );
-        assert!(
-            !card.is_update_ready(),
-            "the pill is not clickable-to-apply"
-        );
-        assert!(!card.is_admin_step(), "the pill carries no controls");
-        assert!(!card.is_robi_tip());
+        assert!(!route.is_expired(Instant::now() + std::time::Duration::from_secs(80)));
+        assert!(route.is_expired(Instant::now() + std::time::Duration::from_secs(91)));
+    }
 
-        // 6. It is a STILL card on the ordinary transient lifetime.
+    /// The access card is the admin card's shape: STILL for [`ADMIN_STEP_TTL`]
+    /// (one wake at the fade boundary, a stable fingerprint through the hold),
+    /// and its two controls lay out and hit-test from the painter's numbers —
+    /// with the primary capsule sized to ITS label, not the admin card's.
+    #[test]
+    fn the_macos_access_card_holds_still_and_its_two_controls_resolve() {
+        use super::{
+            ADMIN_STEP_TTL, FADE, FRAME, NoticeHit, SettingsGeom, TransientNotice, layout,
+            notice_hit, notice_rect,
+        };
+        use std::time::{Duration, Instant};
+
         let t0 = Instant::now();
-        let held = t0 + super::TTL - super::FADE - std::time::Duration::from_millis(200);
-        let still = TransientNotice::privacy_prompts(t0);
-        assert!(!still.animates(true), "a disclosure does not sparkle");
-        assert_eq!(
-            still.fingerprint(held, true),
-            still.fingerprint(held + std::time::Duration::from_millis(100), true),
-            "a still card must not wake the compositor through its hold"
+        let n = TransientNotice::macos_access(t0);
+        let hold = t0 + Duration::from_secs(30);
+        let fade_start = t0 + (ADMIN_STEP_TTL - FADE);
+        for sparkling in [false, true] {
+            assert!(!n.animates(sparkling));
+            assert_eq!(n.deadline(hold, sparkling), fade_start);
+            assert_ne!(n.deadline(hold, sparkling), hold + FRAME);
+            assert_eq!(
+                n.fingerprint(hold, sparkling),
+                n.fingerprint(hold + Duration::from_secs(120), sparkling)
+            );
+        }
+        assert_eq!(n.alpha(hold), 1.0);
+        assert!(!n.is_expired(hold));
+        assert!(n.is_expired(t0 + ADMIN_STEP_TTL));
+
+        let g = SettingsGeom {
+            cw: 8.0,
+            ch: 16.0,
+            font_px: 14.0,
+            cols: 200,
+            panel_rows: 0,
+        };
+        let (x, y, w, h) = notice_rect(&n, &g, hold, 0.0, 1.0);
+        assert!(w > 0.0, "a 200-column window fits the card");
+        let cy = y + h * 0.5;
+        let p = layout(&n, &g, hold, 0.0, 1.0);
+        let b = p
+            .buttons
+            .expect("the access card lays out its two controls");
+        assert_eq!(p.primary_label, "Open Settings");
+        assert!(b.primary.0 > p.title_x, "controls trail the caption");
+        assert!(b.primary.0 + b.primary.1 <= b.not_now.0);
+        assert!(b.not_now.0 + b.not_now.1 <= x + w);
+        assert!(b.y >= y && b.y + b.h <= y + h);
+        // The primary capsule is measured from its OWN label: wider than the
+        // admin card's "Install" capsule at the same size, beside the same
+        // "Not now".
+        let admin = layout(
+            &TransientNotice::admin_step(vec!["clt".to_string()], t0),
+            &g,
+            hold,
+            0.0,
+            1.0,
         );
-        assert!(still.is_expired(t0 + super::TTL));
+        let ab = admin
+            .buttons
+            .expect("the admin card lays out its two controls");
+        assert_eq!(admin.primary_label, "Install");
+        assert!(
+            b.primary.1 > ab.primary.1,
+            "\"Open Settings\" is wider than \"Install\""
+        );
+        assert_eq!(b.not_now.1, ab.not_now.1, "the same Not now capsule");
+        let hit = |px: f32| notice_hit(&n, &g, hold, 0.0, 1.0, px, cy);
+        assert_eq!(hit(x - 1.0), None);
+        assert_eq!(hit(x + w + 1.0), None);
+        assert_eq!(hit(p.title_x + 2.0), Some(NoticeHit::Body));
+        assert_eq!(
+            hit(b.primary.0 + b.primary.1 * 0.5),
+            Some(NoticeHit::Primary)
+        );
+        assert_eq!(
+            hit(b.not_now.0 + b.not_now.1 * 0.5),
+            Some(NoticeHit::NotNow)
+        );
+
+        // THE ASK SURVIVES AN ORDINARY WINDOW: at 100 and 120 columns the
+        // detail — the one switch — is still on the card beside both
+        // capsules. (The fit order drops the detail first, so a long caption
+        // would leave a topic with two buttons and no sentence.)
+        for cols in [100usize, 120] {
+            let g = SettingsGeom {
+                cw: 8.0,
+                ch: 16.0,
+                font_px: 14.0,
+                cols,
+                panel_rows: 0,
+            };
+            let p = layout(&n, &g, hold, 0.0, 1.0);
+            assert!(p.w > 0.0, "{cols} cols fits the card");
+            assert!(p.detail.is_some(), "{cols} cols keeps the ask (w={})", p.w);
+            assert!(p.buttons.is_some());
+        }
+        // The controls survive the fit order: a narrow window drops the
+        // detail and elides the title before it touches the capsules — and
+        // a window too narrow for even the capsules gets NO card, never a
+        // card with its exits elided.
+        let narrow = SettingsGeom {
+            cw: 8.0,
+            ch: 16.0,
+            font_px: 14.0,
+            cols: 64,
+            panel_rows: 0,
+        };
+        let np = layout(&n, &narrow, hold, 0.0, 1.0);
+        assert!(np.w > 0.0, "64 cols fits a card");
+        let nb = np.buttons.expect("controls stay on a narrow card");
+        assert!(nb.not_now.0 + nb.not_now.1 <= np.x + np.w);
+        assert!(np.detail.is_none(), "the qualifier goes first");
+        let sliver = SettingsGeom {
+            cw: 8.0,
+            ch: 16.0,
+            font_px: 14.0,
+            cols: 16,
+            panel_rows: 0,
+        };
+        let sp = layout(&n, &sliver, hold, 0.0, 1.0);
+        assert_eq!(sp.w, 0.0, "no card rather than a card without its exits");
+        assert!(sp.buttons.is_none());
+    }
+
+    /// Which cards yield their slot to a disclosure: a decoration yields; a
+    /// status pill yields only once it has VISIBLY lifted — not at the
+    /// instant its hold ends, when its alpha is still 1.0 and a replacement
+    /// would pop instead of fade; every actionable, celebratory, first-use,
+    /// two-control or access-owned card holds the slot.
+    #[test]
+    fn only_a_decoration_or_a_lifting_status_pill_yields_to_a_disclosure() {
+        use super::{ADMIN_STEP_TTL, CLICK_MIN_ALPHA, FADE, TTL, TransientNotice};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let soon = t0 + Duration::from_millis(500);
+        assert!(TransientNotice::robi_tip("tip", None, t0).yields_to_disclosure(soon));
+        let status = TransientNotice::update_status("\u{21e3} Installing", t0);
+        // The ENTRANCE is not a lift: at spawn and one frame in, the alpha is
+        // below the click floor but the pill has not had a legible frame yet.
+        assert!(status.alpha(t0) < CLICK_MIN_ALPHA);
+        assert!(
+            !status.yields_to_disclosure(t0),
+            "a pill written this very turn holds its slot"
+        );
+        assert!(
+            !status.yields_to_disclosure(t0 + Duration::from_millis(16)),
+            "…and one frame later too"
+        );
+        assert!(
+            !status.yields_to_disclosure(soon),
+            "a live status pill holds"
+        );
+        let fade_start = t0 + TTL - FADE;
+        assert_eq!(status.alpha(fade_start), 1.0);
+        assert!(
+            !status.yields_to_disclosure(fade_start),
+            "at the fade boundary the pill is still fully on the glass"
+        );
+        let faint = t0 + TTL - Duration::from_millis(60);
+        assert!(
+            status.alpha(faint) < CLICK_MIN_ALPHA,
+            "{}",
+            status.alpha(faint)
+        );
+        assert!(
+            status.yields_to_disclosure(faint),
+            "…once it has visibly lifted"
+        );
+        assert!(
+            status.yields_to_disclosure(t0 + TTL),
+            "…and once it is gone"
+        );
+        let held = TransientNotice::update_status_for("held", ADMIN_STEP_TTL, t0);
+        assert!(
+            !held.yields_to_disclosure(t0 + TTL),
+            "a held status pill holds for its own lifetime"
+        );
+        assert!(held.yields_to_disclosure(t0 + ADMIN_STEP_TTL));
+        for holder in [
+            TransientNotice::update_ready("9.9.9".to_string(), 7, t0),
+            TransientNotice::level_up(7, t0),
+            TransientNotice::session_connection("first use".to_string(), t0),
+            TransientNotice::admin_step(vec!["clt".to_string()], t0),
+            TransientNotice::macos_access(t0),
+            TransientNotice::macos_access_route("route".to_string(), TTL, t0),
+        ] {
+            assert!(
+                !holder.yields_to_disclosure(soon),
+                "{:?} holds its slot",
+                holder.text()
+            );
+        }
     }
 }

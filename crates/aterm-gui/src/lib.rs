@@ -162,6 +162,10 @@ mod command_registry;
 /// exact same code against real `-vV` fixtures.
 #[cfg(test)]
 mod compiler_probe;
+/// Config-directory MARKER files (`packages-admin-step-dismissed`,
+/// `privacy-access-card-answered`): the exclusive, bounded, never-written-
+/// through read/write rules, spelled once.
+mod config_marker;
 mod config_notice;
 mod config_watcher;
 /// The connection confirm/configure card (design §3.3 + §2.5 — one shared component).
@@ -177,6 +181,12 @@ mod connection_map;
 /// The GUI connection core (§1.4): the process-local `ConnectionRecord` store,
 /// connect/disconnect, the §4.1 mark-role predicate, and the close-time sweep.
 mod connections;
+/// THE macOS ACCESS CARD (design §3.4, amended 2026-09-07): the one passive
+/// card that stands in for the per-folder system dialogs — *Open Settings*
+/// deep-links to the Full Disk Access pane, *Not now* records the answer. The
+/// decision is pure and made on the event loop against the cached probe; the
+/// identity warm-up and the marker read happen on a worker.
+mod consent_card;
 /// The `tccd` consent OBSERVER and the EPERM-driven attention path (design
 /// §3.6). Off by default (`[privacy] observer = false`), config-only — no
 /// environment variable and no control verb, because a consent surface an agent
@@ -2419,7 +2429,9 @@ struct RepaintKey {
     /// Fingerprint of the LEVEL-UP celebration ([`crate::level_up`]), quantized to its
     /// ~30fps frame step so the pulsing border glow + rising up-arrow re-present every
     /// frame while up. `0` when no celebration is active ⇒ byte-identical to the pre-
-    /// celebration path (the idle-repaint invariant: an idle terminal stays at 0% CPU).
+    /// celebration path (the idle-repaint invariant: an idle terminal stays at 0% CPU)
+    /// — and `0` while this window's overlay is open or an arrow-less drag hovers it,
+    /// where no rim is painted (the key sites in `app_render.rs`).
     level_up_fp: u64,
     /// Fingerprint of the STATUS BARS ([`status_bars::StatusBars`] — the toolchain
     /// install and the self-update rows): everything the bar painter reads, with
@@ -2779,6 +2791,18 @@ enum Wake {
     /// spawned it. A lost poke is survivable: the next park drains, and the
     /// channel's disconnect edge is what ends the stream.
     ConsentObserver,
+    /// THE macOS ACCESS CARD's worker half finished (`consent_card`, design
+    /// §3.4 as amended 2026-09-07): the signing identity is warm (the
+    /// `codesign` spawn that must never land on the event loop) and the
+    /// answer marker beside `aterm.toml` has been read (a disk read, likewise).
+    /// `marker` is what that file recorded, if anything. The DECISION is made
+    /// by the handler, on the main thread, against the cached Full Disk
+    /// Access probe — the same state the Security page renders, so the two
+    /// cannot disagree — and no consent authority crosses this event: the
+    /// card it may raise opens a Settings pane on a press and grants nothing.
+    MacosAccessCardDecided {
+        marker: Option<consent_card::Marker>,
+    },
     /// `dims` needs the selected terminal grid and main-thread window geometry
     /// from one coherent event turn. The handler samples `term` with `try_lock`
     /// and then projects it through the LIVE font/padding metrics and raw surface
@@ -11085,16 +11109,6 @@ fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventC
 /// and said, which is what [`App::handoff_deferred_input_dropped`] is for.
 const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
 
-/// How long the handoff's "installing / finishing update" cards live.
-///
-/// Longer than the ordinary notice TTL (5.4 s) because it must not expire inside
-/// the window it explains: a cold apply is measured at ~4.5 s, and the readiness
-/// deadline that bounds the whole attempt is env-clamped to 120 s. Five seconds
-/// past that ceiling is the smallest value that cannot leave a user staring at a
-/// frozen terminal whose explanation already faded. Every path that ends the
-/// freeze retires the card explicitly rather than waiting for this.
-const HANDOFF_PENDING_NOTICE_TTL: Duration = Duration::from_secs(125);
-
 fn handoff_deferrable_input(event: &WindowEvent) -> bool {
     matches!(
         event,
@@ -12347,6 +12361,17 @@ struct App {
     /// is not retried on every park. A config that simply says no does not set
     /// it, so turning `[privacy] observer` on takes effect at the next park.
     consent_observer_started: bool,
+    /// THE macOS ACCESS CARD's per-process lifecycle (`consent_card`, design
+    /// §3.4 as amended 2026-09-07): the launch-time one-shot, the wait for a
+    /// free notice slot, and the bounded watch for the grant. Driven from the
+    /// park point (`App::tick_macos_access_card`); pure state.
+    consent_card: consent_card::CardState,
+    /// Where the card's marker lives — the `aterm.toml` whose directory
+    /// holds it — resolved ONCE at construction. `None` on the headless /
+    /// unit-test instance, so a test that presses the card can never write
+    /// into the developer's real config directory (the same reason
+    /// `headless_for_test` points the update ledger at a scratch root).
+    consent_card_config: Option<std::path::PathBuf>,
     /// Shared queue of control-socket `image` requests, drained on
     /// [`Wake::Control`] (the control thread cannot touch the renderer).
     image_queue: control::ImageQueue,
@@ -12670,6 +12695,16 @@ struct App {
     /// ROWS in every window; hidden = every FL-1 term is byte-identical to the
     /// no-bar path.
     status_bars: status_bars::StatusBars,
+    /// The update bar as it read BEFORE `begin_update_installing` rewrote it
+    /// to "installing", so a refusal — synchronous before the park, or the
+    /// returned completion after it — can put the words back
+    /// (`retire_update_installing`). `None` outside an attempt; an outcome
+    /// posted over the row clears it.
+    update_bar_before_install: Option<status_bars::Bar>,
+    /// The cold lane's "Updated" row, waiting for the first present: a re-grid
+    /// inside `resumed` would run before the Linux initial-frame settle has seen
+    /// the grid the attach asked for. `Some(build)` until it is raised.
+    landed_row_pending: Option<u64>,
     /// The bars' row count as COMMITTED to the window geometry — the term
     /// [`Self::chrome_rows`] adds to `tab_strip_rows`. Moved only by
     /// [`Self::sync_status_bar_rows`], which re-grids every window (a bar
@@ -13186,6 +13221,251 @@ impl App {
     pub(crate) fn consent_warmup_last_pass_ms(&mut self) -> Option<u128> {
         self.consent_warmup.drain();
         self.consent_warmup.last_pass_ms()
+    }
+
+    // -----------------------------------------------------------------------
+    // THE macOS ACCESS CARD (design §3.4, amended 2026-09-07)
+    // -----------------------------------------------------------------------
+
+    /// One step of the card's lifecycle, from the park point. The machine is
+    /// `consent_card::CardState`; this is the glue that touches `App`.
+    ///
+    /// * `Idle` → spawn the worker ONCE (identity warm-up + marker read, off
+    ///   this thread). The `[privacy]` switch is read here, once: a config that
+    ///   silences the card at launch silences it for the process.
+    /// * `Due` → re-read the CACHED probe first (a grant made while the slot
+    ///   was busy — from the Security page's own button, say — must not raise
+    ///   a card that says otherwise), then raise the card the first time the
+    ///   shared notice slot is free. An actionable card, the admin card and a
+    ///   live status pill are never clobbered
+    ///   (`TransientNotice::yields_to_disclosure`).
+    /// * `Watching` → if the slot no longer holds the card or its own
+    ///   follow-up pill and the owner never pressed it, the card was DISPLACED
+    ///   by another producer (every other writer of the slot is unconditional)
+    ///   and goes back to `Due` for as long as its own hold would have run;
+    ///   and one CACHED probe per `probe_interval_ms`, for at most
+    ///   `consent_card::WATCH_FOR`, so a switch flipped while the owner is in
+    ///   Settings is noticed with nothing further pressed.
+    fn tick_macos_access_card(&mut self, now: Instant) {
+        if !cfg!(target_os = "macos") || self.headless {
+            return;
+        }
+        match self.consent_card.phase() {
+            consent_card::CardPhase::Idle => {
+                if !(self.config.privacy_enabled() && self.config.privacy_notice()) {
+                    self.consent_card.settle();
+                    return;
+                }
+                let Some(proxy) = self.proxy.clone() else {
+                    self.consent_card.settle();
+                    return;
+                };
+                let config = self.consent_card_config.clone();
+                if self.consent_card.begin_deciding()
+                    && !post_macos_access_card_facts(proxy, config)
+                {
+                    aterm_log::warn!(
+                        "macOS access card: no worker could be spawned; not offered this launch"
+                    );
+                    self.consent_card.settle();
+                }
+            }
+            consent_card::CardPhase::Deciding | consent_card::CardPhase::Settled => {}
+            // The grant was observed while another card held the slot: the ✓
+            // waits for the slot exactly as the card does, and gives up only
+            // after its patience — leaving the `opened` marker for the next
+            // process to acknowledge.
+            consent_card::CardPhase::Confirming { .. } => {
+                if self.consent_card.confirmation_expired(now) {
+                    aterm_log::info!(
+                        "macOS access card: the granted pill never found the slot; \
+                         a later launch will say it"
+                    );
+                    return;
+                }
+                if self.show_macos_access_granted(now) {
+                    self.clear_macos_access_opened_marker();
+                    self.consent_card.settle();
+                }
+            }
+            consent_card::CardPhase::Due => {
+                if self.macos_access_probe_reads_granted() {
+                    self.note_macos_access_granted(now);
+                    return;
+                }
+                if !self.consent_card.raise_allowed(now) {
+                    aterm_log::info!("macOS access card: past its own hold; not raised again");
+                    return;
+                }
+                let free = self
+                    .notice
+                    .as_ref()
+                    .is_none_or(|n| n.yields_to_disclosure(now));
+                if free {
+                    self.notice = Some(notice::TransientNotice::macos_access(now));
+                    self.consent_card.on_raised(now);
+                    aterm_log::info!(
+                        "macOS access card: offered (full disk access denied for this bundle)"
+                    );
+                    self.request_redraw_all_windows();
+                }
+            }
+            consent_card::CardPhase::Watching { .. } => {
+                let ours_on_glass = self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|n| n.is_macos_access_owned());
+                if !ours_on_glass && self.consent_card.on_displaced(now) {
+                    aterm_log::info!("macOS access card: displaced; waiting for the slot again");
+                    return;
+                }
+                if self.consent_card.wants_probe(now) && self.macos_access_probe_reads_granted() {
+                    self.note_macos_access_granted(now);
+                }
+            }
+        }
+    }
+
+    /// The cached Full Disk Access verdict, re-probed at most once per
+    /// `probe_interval_ms` (`ConsentState::fda`).
+    fn macos_access_probe_reads_granted(&self) -> bool {
+        self.consent_panel_facts().fda == aterm_containment::consent::FdaState::Granted
+    }
+
+    /// The worker's facts arrived ([`Wake::MacosAccessCardDecided`]): decide
+    /// on this thread, against the cached probe — the same state the Security
+    /// page renders — and log every reason not to show, by name. A `Confirm`
+    /// verdict (the owner opened Settings from an earlier process, and the
+    /// grant is now held) shows the ✓ pill once and clears the marker.
+    fn decide_macos_access_card(&mut self, marker: Option<consent_card::Marker>) {
+        let panel = self.consent_panel_facts();
+        let facts = consent_card::CardFacts {
+            offered: self.config.privacy_enabled() && self.config.privacy_notice(),
+            headless: self.headless,
+            fda: panel.fda,
+            dr: panel.dr,
+        };
+        let verdict = consent_card::decide(&facts, marker);
+        match &verdict {
+            consent_card::Verdict::Offer => {}
+            consent_card::Verdict::Confirm => {
+                aterm_log::info!(
+                    "macOS access card: the grant the owner started in an earlier process is held"
+                );
+            }
+            consent_card::Verdict::Quiet(why) => {
+                aterm_log::info!("macOS access card: not offered \u{2014} {why}");
+            }
+        }
+        let now = Instant::now();
+        if self.consent_card.on_decided(&verdict, now)
+            && verdict == consent_card::Verdict::Confirm
+            && self.show_macos_access_granted(now)
+        {
+            self.clear_macos_access_opened_marker();
+            self.consent_card.settle();
+        }
+    }
+
+    /// The probe observed the grant while the card was watching (or waiting
+    /// to return): acknowledge it and consume an `opened` marker — now if the
+    /// slot allows, else as soon as it does (`CardPhase::Confirming`).
+    fn note_macos_access_granted(&mut self, now: Instant) {
+        aterm_log::info!("macOS access card: full disk access observed granted");
+        if self.show_macos_access_granted(now) {
+            self.clear_macos_access_opened_marker();
+            self.consent_card.settle();
+        } else {
+            self.consent_card.on_grant_awaiting_slot(now);
+        }
+    }
+
+    /// The ✓ pill: replaces the card or its own follow-up pill, or fills a
+    /// free slot; never clobbers another card — `false` when it could not be
+    /// shown. Deliberately says nothing about scope or coverage (design §3.4:
+    /// S1 and S4 are unrun).
+    fn show_macos_access_granted(&mut self, now: Instant) -> bool {
+        let ours = self
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.is_macos_access_owned());
+        let free = self
+            .notice
+            .as_ref()
+            .is_none_or(|n| n.yields_to_disclosure(now));
+        if !(ours || free) {
+            return false;
+        }
+        self.notice = Some(notice::TransientNotice::update_status(
+            consent_card::GRANTED_CAPTION,
+            now,
+        ));
+        self.request_redraw_all_windows();
+        true
+    }
+
+    /// Record a marker beside `aterm.toml`, off the UI thread (a tiny file,
+    /// but still a disk write). A failure only means the card comes back at
+    /// the next launch, which errs toward disclosure. An instance with no
+    /// marker location (headless, tests) records nothing and says nothing.
+    pub(crate) fn record_macos_access_marker(&self, marker: consent_card::Marker) {
+        let Some(config_path) = self.consent_card_config.clone() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("aterm-macos-access-answer".into())
+            .spawn(move || {
+                if let Err(error) = consent_card::record_marker(Some(&config_path), marker) {
+                    aterm_log::warn!("macOS access card marker not recorded: {error}");
+                }
+            });
+        if let Err(error) = spawned {
+            aterm_log::warn!("macOS access card marker not recorded: {error}");
+        }
+    }
+
+    /// Consume an `opened` marker once its grant has been acknowledged, off
+    /// the UI thread. A `not-now` answer is never touched.
+    fn clear_macos_access_opened_marker(&self) {
+        let Some(config_path) = self.consent_card_config.clone() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("aterm-macos-access-answer".into())
+            .spawn(move || {
+                if let Err(error) = consent_card::clear_opened(Some(&config_path)) {
+                    aterm_log::warn!("macOS access card marker not cleared: {error}");
+                }
+            });
+        if let Err(error) = spawned {
+            aterm_log::warn!("macOS access card marker not cleared: {error}");
+        }
+    }
+
+    /// *Open Settings* on the card: the Full Disk Access deep link through
+    /// this instance's gesture arm (the Security page's own seam — a headless
+    /// instance's arm reaches no `NSWorkspace`), then the card's OWN follow-up
+    /// pill naming the route in words, because `openURL:` reports only that
+    /// Settings TOOK the URL, never that it scrolled to the row. The `opened`
+    /// marker is recorded so a later process can acknowledge the flip (Apple's
+    /// own sheet offers Quit & Reopen). The card keeps watching for the grant;
+    /// nothing here grants anything.
+    pub(crate) fn open_macos_access_settings(&mut self, now: Instant) {
+        let pane = menu::PrivacyPane::FullDiskAccess;
+        let opened = matches!(
+            native_settings::ConsentGestures::for_instance(self.headless).open_settings(pane),
+            menu::SettingsOpen::Anchored | menu::SettingsOpen::PaneRoot
+        );
+        let text =
+            consent_card::opened_settings_caption(opened, menu::privacy_settings_path_words(pane));
+        self.notice = Some(notice::TransientNotice::macos_access_route(
+            text,
+            consent_card::OPENED_SETTINGS_TTL,
+            now,
+        ));
+        self.request_redraw_all_windows();
+        self.record_macos_access_marker(consent_card::Marker::Opened);
+        self.consent_card.on_opened_settings(now);
     }
 
     // -----------------------------------------------------------------------
@@ -15046,6 +15326,8 @@ impl App {
             consent_observer: consent_observer::ObserverState::inert(),
             consent_attention: consent_observer::AttentionGate::new(),
             consent_observer_started: false,
+            consent_card: consent_card::CardState::new(),
+            consent_card_config: None,
             image_queue,
             encode_tx: None,
             trace_latency: false,
@@ -15085,6 +15367,8 @@ impl App {
             level_up: None,
             status_bars: status_bars::StatusBars::default(),
             status_bar_rows: 0,
+            update_bar_before_install: None,
+            landed_row_pending: None,
             job_probe: crate::quit_safety::JobProbe::default(),
             relaunch: None,
             auto_apply_intent: None,
@@ -17619,7 +17903,13 @@ impl ApplicationHandler<Wake> for App {
             // deadline — the grid gets its row back (a re-grid, exactly like a
             // `tab_strip_rows` edit) and every window repaints the clearing frame.
             // Outside the `windows` borrow below: the re-grid resizes each window.
-            let bars_folded = self.status_bars.settle(now) && self.sync_status_bar_rows();
+            // The row count is re-synced on every timer wake as well as on the
+            // way to every wait (`about_to_wait`): a refused apply retires the
+            // row it added without syncing (see `retire_update_installing`),
+            // and its outcome may add none. Folds are held back while a handoff
+            // freezes the count (`settle_status_bars`).
+            let bars_settled = self.settle_status_bars(now);
+            let bars_folded = self.sync_status_bar_rows() || bars_settled;
             for (id, ws) in self.windows.iter_mut() {
                 // Flash over: repaint the normal (un-inverted) frame.
                 let mut dirty = ws.bell_flash.expire(now);
@@ -17915,6 +18205,11 @@ impl ApplicationHandler<Wake> for App {
         if !self.consent_observer_started && self.config.privacy_observer() {
             let _ = self.start_consent_observer();
         }
+        // THE macOS ACCESS CARD (design §3.4, amended 2026-09-07): the launch-time
+        // one-shot that decides whether the one prompt is due, the wait for a free
+        // notice slot, and the bounded watch for the grant. Settled, this is one
+        // enum compare per park; headless and off-macOS it is nothing at all.
+        self.tick_macos_access_card(Instant::now());
         // A title snapshot that lost a nonblocking terminal-lock race is retried from
         // this event-loop-owned lane. Its short fixed deadline below preserves
         // one-shot OSC/block transitions without ever waiting on the parser mutex.
@@ -17932,6 +18227,28 @@ impl ApplicationHandler<Wake> for App {
             && (self.pending_restore.is_some() || !self.seamless_adopt.is_empty())
         {
             self.apply_pending_restore(el);
+            self.request_redraw_all_windows();
+        }
+        // THE COLD LANE'S "UPDATED" ROW, deferred out of `resumed` (see the
+        // landing there): the first frame is on glass, so this re-grid is an
+        // ordinary one.
+        if self.first_present_done
+            && let Some(build) = self.landed_row_pending.take()
+        {
+            self.status_bars.update_landed(
+                crate::build_info::version_display(),
+                build,
+                Instant::now(),
+            );
+            self.sync_status_bars();
+        }
+        // THE ROW COUNT CONVERGES ON THE WAY TO EVERY WAIT. A refused apply
+        // retires the row it added without a sync of its own
+        // (`retire_update_installing`), and its outcome may add none — so the
+        // committed count is checked here, not only when a bar folds on a timer
+        // wake. An early-out when the counts agree; refused while a handoff is
+        // pending (the count is frozen for Commit).
+        if self.sync_status_bar_rows() {
             self.request_redraw_all_windows();
         }
         // SEAMLESS CONNECTION RE-MINT (design §1.4#6): once the restore above has
@@ -18645,7 +18962,11 @@ impl ApplicationHandler<Wake> for App {
         // bar holding a terminal outcome. A live bar folds nothing (its next paint
         // arrives with its next `Wake::PkgProgress` / `Wake::UpdateProgress`), and
         // no bar folds nothing — an idle window never wakes for them (FL-1).
-        if let Some(d) = self.status_bars.deadline() {
+        // ASKED THROUGH THE APP, not the bars directly: while a handoff freezes
+        // the holds the settle declines them, and arming a hold the settle will
+        // not act on is a wake that does nothing and re-arms the same past
+        // instant for the length of the freeze.
+        if let Some(d) = self.status_bars_deadline() {
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
@@ -19018,6 +19339,73 @@ impl ApplicationHandler<Wake> for App {
                 w.set_maximized(true);
             }
         }
+        // SITED BEFORE THE DIRECT FIRST PRESENT BELOW: on the overlap lane the
+        // successor's first revealed frame must already carry the charging rim
+        // (the surge continued from the outgoing process), or the swap dips to
+        // a bare frame for one present.
+        // Post-update flourish: the first window is up and this run was re-exec'd by an
+        // update apply ([`JUST_UPDATED`]) — fire the upgrade surge ONCE (continued
+        // across the swap on the overlap lane, the landing burst on the cold one) and
+        // queue the "Updated" status-bar row. The rim fades on its own; the
+        // badge/version chrome returns after.
+        if !self.level_up_done {
+            self.level_up_done = true;
+            if JUST_UPDATED.get().copied().unwrap_or(false) {
+                let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
+                // ...and the full "LEVEL UP" celebration (border glow + rising arrow) to
+                // mark the swap into the newer build — a bigger burst than the available
+                // nudge, right as the fresh window comes up. See [`crate::level_up`].
+                // NOT WHILE THE WINDOW IS STILL EATING KEYSTROKES. On the overlap
+                // lane this frame is the successor's FIRST — revealed carrying the
+                // user's own pre-update screen, already the key window, and
+                // deferring every key it receives until Commit. Celebrating over
+                // that is the wrong sentence in the one moment the user is most
+                // likely to be typing into it: what they need is why nothing is
+                // happening. The celebration is not cancelled, only DEFERRED — the
+                // Commit arm fires it once the terminal is genuinely live — and
+                // `level_up_done` above stays set unconditionally, so a second
+                // `resumed` (suspend/resume) still cannot re-raise it.
+                //
+                // The explanation is the carried status-bar row ("Finishing
+                // aterm vX — keys you type now are queued and will arrive"),
+                // which carries no serious-mode gate: the celebration keeps its
+                // policy, but a user in serious mode still gets told why their
+                // terminal is frozen instead of being handed a mute dead window
+                // — WHEN the carry had a row. The automatic lane can apply with
+                // none up (its ready row folded, or it never had one), and then
+                // the continued rim is the whole explanation, and serious mode
+                // has none: a known residual of the automatic lane's no-re-grid
+                // rule (`begin_update_installing`).
+                if self.incoming_handoff_pending {
+                    // THE SURGE CONTINUES ACROSS THE SWAP: the outgoing process
+                    // charged its rim from the park; this process, revealed with
+                    // the carried pixels, charges its own until Commit. The status
+                    // bar row it inherited (`WindowCarry::status_bar_rows`) was
+                    // seeded at construction with "finishing" — a row, never a
+                    // floating card, and never a NEW row (a re-grid before Commit
+                    // would refuse the handoff).
+                    self.level_up_deferred = Some(build);
+                    self.spawn_upgrade_surge_continued(build);
+                } else {
+                    // The cold lane: no handoff to wait for — this IS the landing.
+                    // Its "Updated" row waits for the first present: a re-grid
+                    // here, inside `resumed`, would run before the Linux
+                    // initial-frame settle has seen the grid the attach asked for.
+                    self.spawn_upgrade_surge(crate::level_up::Phase::Landing, build);
+                    self.landed_row_pending = Some(build);
+                }
+                // The REALIZED ⬆️ arrow: for the next REALIZED_ARROW_TTL the version
+                // menu reads "v<new> ⬆️" with an "Updated to v<new> just now" first item
+                // (and the palette's Version section shows the time-faded twin) —
+                // drawing the eye to the version-number menu, then decaying via the
+                // about_to_wait sweep. The menu handle already exists: attach_os_window
+                // (above) installed the bar before this block runs.
+                self.upgrade_realized = Some(Instant::now());
+                self.refresh_version_menu();
+                self.request_redraw_all_windows();
+            }
+        }
+
         // OVERLAP HANDOFF: the window was created HIDDEN (reveal-at-first-
         // present), and macOS does not reliably deliver `RedrawRequested` to a
         // hidden window — waiting for the OS could park the boot on the reveal
@@ -19040,59 +19428,6 @@ impl ApplicationHandler<Wake> for App {
         // instead of blocking first paint on N synchronous shell forks. `pending_restore`
         // stays set for that deferred pass; the restored tabs fill in a frame later. One-
         // shot: `apply_pending_restore` drains `pending_restore`.
-        // Post-update flourish: the first window is up and this run was re-exec'd by an
-        // update apply ([`JUST_UPDATED`]) — show the quiet, cursor-themed "leveled-up"
-        // notice ONCE. It fades on its own; the badge/version chrome returns after.
-        if !self.level_up_done {
-            self.level_up_done = true;
-            if JUST_UPDATED.get().copied().unwrap_or(false) {
-                let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
-                // ...and the full "LEVEL UP" celebration (border glow + rising arrow) to
-                // mark the swap into the newer build — a bigger burst than the available
-                // nudge, right as the fresh window comes up. See [`crate::level_up`].
-                // NOT WHILE THE WINDOW IS STILL EATING KEYSTROKES. On the overlap
-                // lane this frame is the successor's FIRST — revealed carrying the
-                // user's own pre-update screen, already the key window, and
-                // deferring every key it receives until Commit. Celebrating over
-                // that is the wrong sentence in the one moment the user is most
-                // likely to be typing into it: what they need is why nothing is
-                // happening. The celebration is not cancelled, only DEFERRED — the
-                // Commit arm fires it once the terminal is genuinely live — and
-                // `level_up_done` above stays set unconditionally, so a second
-                // `resumed` (suspend/resume) still cannot re-raise it.
-                //
-                // The explanation is an `UpdateStatus` card, which carries no
-                // serious-mode gate: the celebration keeps its policy, but a user
-                // in serious mode still gets told why their terminal is frozen
-                // instead of being handed a mute dead window.
-                if self.incoming_handoff_pending {
-                    self.level_up_deferred = Some(build);
-                    self.surface_update_status_for(
-                        "\u{2191} Finishing update — keys you type now are queued and will arrive.",
-                        crate::HANDOFF_PENDING_NOTICE_TTL,
-                    );
-                } else if self
-                    .serious_mode_policy()
-                    .allows(crate::motion::SeriousEffect::LevelUp)
-                {
-                    self.notice = Some(crate::notice::TransientNotice::level_up(
-                        build,
-                        Instant::now(),
-                    ));
-                    self.level_up = Some(crate::level_up::LevelUp::new(build, Instant::now()));
-                }
-                // The REALIZED ⬆️ arrow: for the next REALIZED_ARROW_TTL the version
-                // menu reads "v<new> ⬆️" with an "Updated to v<new> just now" first item
-                // (and the palette's Version section shows the time-faded twin) —
-                // drawing the eye to the version-number menu, then decaying via the
-                // about_to_wait sweep. The menu handle already exists: attach_os_window
-                // (above) installed the bar before this block runs.
-                self.upgrade_realized = Some(Instant::now());
-                self.refresh_version_menu();
-                self.request_redraw_all_windows();
-            }
-        }
-
         // THE FIRST-OPEN INSTALL DOCTOR (owner, 2026-08-30). aterm can be opened
         // in ways that quietly cripple it: double-clicked inside the mounted disk
         // image, or unzipped and launched straight from ~/Downloads, where macOS
@@ -19770,6 +20105,12 @@ impl ApplicationHandler<Wake> for App {
                 self.consent_observer.drain(Instant::now());
                 self.announce_observed_consent_prompts();
             }
+            // The access card's worker finished: decide, on this thread, against
+            // the cached probe. Every reason NOT to show is logged by name so a
+            // quiet launch is explicable (`consent_card::NotDue`).
+            Wake::MacosAccessCardDecided { marker } => {
+                self.decide_macos_access_card(marker);
+            }
             // Assemble one coherent session/window/frame/surface geometry record
             // from the main-thread-owned per-window state. A dropped control
             // client only drops the reply; this read never mutates App state.
@@ -20104,20 +20445,23 @@ impl ApplicationHandler<Wake> for App {
                         self.window_event(el, winit_id, deferred);
                     }
                 }
-                // THE CELEBRATION THIS LANE HELD BACK. The terminal is live now:
+                // THE LANDING THIS LANE HELD BACK. The terminal is live now:
                 // readers are attached, the queue has replayed, and a burst over it
-                // is a flourish rather than a distraction from a frozen screen.
-                if let Some(build) = self.level_up_deferred.take()
-                    && self
-                        .serious_mode_policy()
-                        .allows(crate::motion::SeriousEffect::LevelUp)
-                {
-                    self.notice = Some(crate::notice::TransientNotice::level_up(
+                // is a flourish rather than a distraction from a frozen screen. The
+                // charging rim becomes the landing burst, and the carried
+                // "finishing" row says the new build is on — the update lane's
+                // words live on the status bar, never on a floating card.
+                // A carried TOOLCHAIN row has no feed in this process: it folds
+                // after the ordinary hold rather than sitting live to its cap.
+                self.status_bars.after_handoff_commit(Instant::now());
+                if let Some(build) = self.level_up_deferred.take() {
+                    self.spawn_upgrade_surge(crate::level_up::Phase::Landing, build);
+                    self.status_bars.update_landed(
+                        crate::build_info::version_display(),
                         build,
                         Instant::now(),
-                    ));
-                    self.level_up = Some(crate::level_up::LevelUp::new(build, Instant::now()));
-                    self.request_redraw_all_windows();
+                    );
+                    self.sync_status_bars();
                 }
                 // What the queue could not carry, said out loud; and a chord
                 // whose release it dropped disarmed rather than replayed.
@@ -20185,12 +20529,18 @@ impl ApplicationHandler<Wake> for App {
                 // menu that has no failure text (measured 2026-08-18: eight hours of
                 // publisher-side rejections, invisible in the app). And re-read the
                 // ledger so Settings ▸ Software Update headlines the same verdict.
-                let text = format!("{title}: {body} — see Settings ▸ Software Update");
-                self.surface_nonmodal_update_status(&text);
+                // On the update bar's row (2026-09-07), held the warning's stretch;
+                // never a floating card.
+                self.note_update_outcome(
+                    '\u{26a0}',
+                    &title,
+                    &format!("{body} — see Settings ▸ Software Update"),
+                    crate::status_bars::Tone::Warn,
+                );
                 // THE OS NOTIFICATION the updater's contract promises (no_token.rs:
                 // "the only surface the owner sees without going looking"): the
-                // 5.4-second pill above is visible only if a window is frontmost at
-                // that exact moment, which is not a surface for "this Mac has not
+                // bar row above is visible only while an aterm window is on screen
+                // and folds after 45 s, which is not a surface for "this Mac has not
                 // updated in weeks". The check thread latches this event once per
                 // process per class, so a short-lived delivery thread is cheap —
                 // and `notify::deliver` blocks on a notifier subprocess, which must
@@ -20280,17 +20630,10 @@ impl ApplicationHandler<Wake> for App {
                         build,
                         version: version.clone(),
                     });
-                    self.notice = Some(crate::notice::TransientNotice::update_ready(
-                        version,
-                        build,
-                        Instant::now(),
-                    ));
-                    if self
-                        .serious_mode_policy()
-                        .allows(crate::motion::SeriousEffect::LevelUp)
-                    {
-                        self.level_up = Some(crate::level_up::LevelUp::new(build, Instant::now()));
-                    }
+                    // The seam paints the update bar's Staged line and the surge's
+                    // landing, so both can be looked at without a release.
+                    self.note_update_progress(&aterm_update::Progress::Staged { version, build });
+                    self.spawn_upgrade_surge(crate::level_up::Phase::Landing, build);
                     self.refresh_version_menu();
                     self.palette_refresh_live();
                     self.request_redraw_all_windows();
@@ -21347,7 +21690,7 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
     // probe came up empty on EVERY Windows install — `atpkg.exe` sits right next
     // to the exe, bare `atpkg` does not — so the toolchain lane never started and
     // Settings ▸ Packages reported "Package manager unavailable" as if this were
-    // a dev build. The CLI's sibling probe (`aterm-cli`'s `front_door_path_env`)
+    // a dev build. The CLI's sibling probe (`aterm-cli`'s `front_door_bin_dir`)
     // already spells it this way.
     let candidate = exe
         .parent()?
@@ -22226,6 +22569,29 @@ fn post_admin_step(layout: Option<&atpkg::Layout>, proxy: &EventLoopProxy<Wake>)
     if let Some(names) = crate::packages_screen::admin_step_due(&status, config_path.as_deref()) {
         let _ = proxy.send_event(Wake::PkgNeedsAdmin { names });
     }
+}
+
+/// THE macOS ACCESS CARD's worker half (`consent_card`, design §3.4 as amended
+/// 2026-09-07): warm the signing identity — it may spawn `codesign`, a 50–150 ms
+/// stall that must never land on the event loop — and read the answer marker
+/// beside `aterm.toml` (a disk read, likewise), then post
+/// [`Wake::MacosAccessCardDecided`]. The decision itself is the main thread's,
+/// against the cached probe. `config` is the instance's marker location
+/// (`App::consent_card_config`). Worker thread only; `false` if no worker
+/// could be spawned, in which case the caller settles the card for this
+/// process.
+fn post_macos_access_card_facts(
+    proxy: EventLoopProxy<Wake>,
+    config: Option<std::path::PathBuf>,
+) -> bool {
+    std::thread::Builder::new()
+        .name("aterm-macos-access-card".into())
+        .spawn(move || {
+            let _ = control_privacy::signing_identity();
+            let marker = consent_card::read_marker(config.as_deref());
+            let _ = proxy.send_event(Wake::MacosAccessCardDecided { marker });
+        })
+        .is_ok()
 }
 
 /// Scan an `atpkg seed` child's stdout for the two STABLE marker lines the
@@ -23244,15 +23610,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // size over the user's current resized grid is a visible frame jump at the
     // swap instant. `carry_frame` is `Some` only after an authenticated
     // `take_incoming`, so fresh launches keep env > config > default exactly.
-    let carry_frame = seamless_window;
+    let carry_frame = seamless_window.clone();
     let cols = carry_frame
+        .as_ref()
         .map(|w| w.cols)
         .unwrap_or_else(|| app_config::resolve_initial_columns(&config))
         .clamp(20, 500);
     let rows = carry_frame
+        .as_ref()
         .map(|w| w.rows)
         .unwrap_or_else(|| app_config::resolve_initial_lines(&config))
         .clamp(5, 300);
+    // THE CARRIED STATUS-BAR ROWS (2026-09-07): the outgoing window reserved
+    // these above its grid, so this window reserves the same BEFORE it is
+    // sized — the grid rows above are the same either way, but without this the
+    // window itself came up one row shorter per bar at the swap instant.
+    // `chrome_rows` reads the committed count from the first frame on.
+    let carried_status_bar_rows = carry_frame.as_ref().map_or(0, |w| w.status_bar_rows.min(2));
     // Rows reserved at the TOP of the window for the visible tab strip (env > config
     // > default 1). `0` is the byte-identical no-strip path.
     let tab_strip_rows = resolve_tab_strip_rows(&config);
@@ -23670,17 +24044,67 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         lc_ctype.as_deref(),
         lang.as_deref(),
     ));
-    // CLIENT-2: a bundled aterm ships its control CLI co-located next to the executable
-    // (`Contents/MacOS/aterm-ctl`, beside `atpkg`) — prepend that directory to every
-    // session's PATH so the `aterm-ctl` workflows the bundled Help teaches work out of
-    // the box from the shipped .app. Inert for dev/CI builds (no bundle shape) and for
-    // nested aterm-inside-aterm sessions (the dir is already on the inherited PATH).
+    // THE session PATH — exactly ONE `("PATH", value)` pair, composed, because
+    // `build_child_env` is key-overwrite (a second PATH pair would silently drop the
+    // first). Front to back:
+    //
+    // 1. REROUTE (`docs/DESIGN-toolchain-reroute-2026-09-07.md` §"Reaching PATH";
+    //    philosophy §3: "Session PATH: prepend is legitimate … the only place
+    //    precedence is taken"): the session-scoped stub directory of the upstream
+    //    Rust names goes FIRST, so a bare `cargo`/`rustc` in any aterm shell is
+    //    announced or signposted instead of running upstream Rust silently
+    //    (measured 2026-09-07: `~/.cargo/bin` sat at PATH position 17, the managed
+    //    store — which never carries those names — at 19). `lay` is idempotent
+    //    (eight tiny files, never over a foreign file) and runs HERE so the very
+    //    first tab is covered before `atpkg seed` ever runs. Move-to-front, not
+    //    skip-if-present — see `spawn::reroute_path_env`. `ATERM_REROUTE_DIR` is
+    //    exported so the shell integration can re-assert the dir after the user's
+    //    rc files ran (a `.zshrc` sourcing `~/.cargo/env` prepends `~/.cargo/bin`
+    //    AFTER this environment was injected). `ATERM_NO_REROUTE` engaged
+    //    (`aterm --no-reroute`, or the variable itself; empty and `0` do not count)
+    //    ⇒ nothing laid, no prepend, no export. The directory must exist after
+    //    `lay`: on Windows nothing is laid (TARGET), so nothing is prepended there.
+    // 2. CLIENT-2: a bundled aterm ships its control CLI co-located next to the
+    //    executable (`Contents/MacOS/aterm-ctl`, beside `atpkg`) — that directory
+    //    next, so the `aterm-ctl` workflows the bundled Help teaches work out of the
+    //    box from the shipped .app. Inert for dev/CI builds (no bundle shape) and
+    //    for nested aterm-inside-aterm sessions (already on the inherited PATH).
+    // 3. The inherited PATH, verbatim.
+    let reroute_dir = if atpkg::reroute::engaged(
+        std::env::var(atpkg::reroute::NO_REROUTE_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        None
+    } else {
+        atpkg::store::resolve_configured().and_then(|layout| {
+            if let Err(error) = atpkg::reroute::lay(&layout) {
+                // Never a SILENT un-rerouted tab (see the router's twin).
+                eprintln!(
+                    "aterm: reroute stubs not laid ({error}); the upstream Rust names are NOT rerouted in this window's sessions — `aterm pkg doctor` explains (aterm help reroute)"
+                );
+            }
+            let dir = layout.reroute_dir();
+            dir.to_str().filter(|_| dir.is_dir()).map(str::to_owned)
+        })
+    };
     let current_exe = std::env::current_exe().ok();
+    let bundle_dir = spawn::bundle_dir(current_exe.as_deref());
     let inherited_path = std::env::var("PATH").ok();
-    if let Some(path_pair) =
-        spawn::bundle_path_env(current_exe.as_deref(), inherited_path.as_deref())
-    {
+    if let Some(path_pair) = spawn::reroute_path_env(
+        reroute_dir.as_deref(),
+        bundle_dir.as_deref(),
+        inherited_path.as_deref(),
+    ) {
         env_add.push(path_pair);
+    }
+    if let Some(dir) = &reroute_dir {
+        env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), dir.clone()));
+    } else if std::env::var_os(atpkg::reroute::REROUTE_DIR_ENV).is_some() {
+        // The escape is engaged (or nothing is laid) and an ENCLOSING session's
+        // directory travelled in by inheritance: blank it, so the shell
+        // integration's re-assert stays inert. "No export" has to mean "not set".
+        env_add.push((atpkg::reroute::REROUTE_DIR_ENV.to_string(), String::new()));
     }
     // Shell integration (OSC 133/633 command blocks for the AI `blocks`/`wait` verbs,
     // plus cwd + command-title tracking) is injected BY DEFAULT for any interactive
@@ -24589,7 +25013,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         _reduce_motion: None,
         objc_contained_seen: 0,
         // SEAMLESS WINDOW CARRY: reappear at the outgoing window's position.
-        seamless_position: seamless_window.and_then(|w| Some((w.outer_x?, w.outer_y?))),
+        seamless_position: seamless_window
+            .as_ref()
+            .and_then(|w| Some((w.outer_x?, w.outer_y?))),
         pool,
         link_estimates: HashMap::new(),
         find_origins: HashMap::new(),
@@ -24755,6 +25181,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         consent_observer: consent_observer::ObserverState::new(headless),
         consent_attention: consent_observer::AttentionGate::new(),
         consent_observer_started: false,
+        consent_card: consent_card::CardState::new(),
+        consent_card_config: if headless {
+            None
+        } else {
+            app_config::config_path()
+        },
         image_queue,
         // The PNG encode worker is spawned on the first `image`/`window` capture.
         encode_tx: None,
@@ -24803,8 +25235,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         boot_health_confirmation_dispatched: false,
         boot_health_confirmation_retry_at: None,
         level_up: None,
-        status_bars: status_bars::StatusBars::default(),
-        status_bar_rows: 0,
+        // THE CARRIED BARS (2026-09-07): the successor paints what the outgoing
+        // window carried in the rows it reserved, with the update lane's words
+        // moved on to "finishing" when this process is the handed-off successor.
+        status_bars: status_bars::StatusBars::from_handoff_carry(
+            carry_frame.as_ref().map_or(&[][..], |w| w.bars.as_slice()),
+            (just_updated && overlap_channels_present && adopting)
+                .then_some(crate::build_info::version_display()),
+            Instant::now(),
+        ),
+        status_bar_rows: carried_status_bar_rows,
+        update_bar_before_install: None,
+        landed_row_pending: None,
         job_probe: crate::quit_safety::JobProbe::default(),
         relaunch: None,
         auto_apply_intent: None,
@@ -26317,6 +26759,268 @@ mod overlap_handoff_tests {
             !app.consent_warmup.holds_automatic_apply(Instant::now()),
             "nothing started, so nothing holds"
         );
+    }
+
+    /// THE macOS ACCESS CARD NEVER REACHES A HEADLESS INSTANCE (design §3.4,
+    /// amended 2026-09-07). A headless `App` — which is what every unit test
+    /// is — ticks the card's lifecycle without spawning the worker, raising a
+    /// card, or moving off `Idle`; a verdict that arrives anyway is stale
+    /// against `Idle` and raises nothing; and asked directly, the decision
+    /// names headlessness. No probe is consulted: the inert arm answers
+    /// `unknown`, which is not a denial and would earn no card either.
+    #[test]
+    fn a_headless_instance_never_offers_the_macos_access_card() {
+        use super::consent_card::{CardFacts, CardPhase, NotDue, Verdict, decide};
+        use std::time::Instant;
+
+        let mut app = App::headless_for_test();
+        assert!(
+            app.consent_card_config.is_none(),
+            "a test instance has nowhere to write a marker"
+        );
+        app.tick_macos_access_card(Instant::now());
+        assert_eq!(app.consent_card.phase(), CardPhase::Idle);
+        assert!(app.notice.is_none(), "no card on a headless instance");
+        app.decide_macos_access_card(None);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Idle,
+            "a stray verdict is stale"
+        );
+        assert!(app.notice.is_none());
+        let panel = app.consent_panel_facts();
+        assert_eq!(panel.fda, aterm_containment::consent::FdaState::Unknown);
+        let facts = CardFacts {
+            offered: true,
+            headless: app.headless,
+            fda: panel.fda,
+            dr: panel.dr,
+        };
+        assert_eq!(decide(&facts, None), Verdict::Quiet(NotDue::Headless));
+        // The only headless path that reaches the decision code: a verdict
+        // in `Deciding` settles, and raises nothing.
+        assert!(app.consent_card.begin_deciding());
+        app.decide_macos_access_card(None);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+    }
+
+    /// THE CARD'S LIFECYCLE ON A WINDOWED INSTANCE, without a window: the
+    /// harness is headless-constructed — inert probe and gesture arms, so no
+    /// `tccd` and no `NSWorkspace` — and `headless` is flipped so the tick
+    /// runs its real branches. Every branch the park point can take is
+    /// driven: the switch, the missing proxy, the busy slot, the raise, a
+    /// displacement and its return, the hold's end, and the three presses.
+    #[test]
+    fn the_macos_access_card_waits_for_the_slot_returns_when_displaced_and_confirms() {
+        use super::consent_card::{
+            CardPhase, GRANTED_CAPTION, OPENED_SETTINGS_TTL, RERAISE_WITHIN, Verdict,
+            opened_settings_caption,
+        };
+        use super::notice::{NoticeHit, TransientNotice};
+        use std::time::{Duration, Instant};
+
+        let t0 = Instant::now();
+        let windowed = || {
+            let mut app = App::headless_for_test();
+            app.headless = false;
+            app
+        };
+        let raised = |app: &mut App, now: Instant| {
+            assert!(app.consent_card.begin_deciding());
+            assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+            app.tick_macos_access_card(now);
+            assert!(
+                app.notice.as_ref().is_some_and(|n| n.is_macos_access()),
+                "the card is on the glass"
+            );
+            assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
+        };
+
+        // IDLE with the notice switched off: settled, no worker, no card.
+        let mut app = windowed();
+        app.config.privacy = Some(crate::app_config::PrivacyConfig {
+            notice: Some(false),
+            ..Default::default()
+        });
+        app.tick_macos_access_card(t0);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+
+        // IDLE with the switch on but no event-loop proxy: settled — no
+        // worker can post a verdict, so nothing waits forever.
+        let mut app = windowed();
+        app.tick_macos_access_card(t0);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Settled,
+            "no proxy: no worker"
+        );
+        assert!(app.notice.is_none());
+
+        // A verdict in DECIDING against the inert arm: the probe is
+        // `unknown`, which is not a denial — quiet, nothing raised.
+        let mut app = windowed();
+        assert!(app.consent_card.begin_deciding());
+        app.decide_macos_access_card(None);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+
+        // DUE: the admin card holds the slot → the card waits and the admin
+        // card is untouched; a decoration yields → the card is raised.
+        let mut app = windowed();
+        assert!(app.consent_card.begin_deciding());
+        assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
+        app.tick_macos_access_card(t0);
+        assert_eq!(app.consent_card.phase(), CardPhase::Due);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.admin_step_names().is_some()),
+            "an admin card is never clobbered"
+        );
+        app.notice = Some(TransientNotice::robi_tip("tip", None, t0));
+        app.tick_macos_access_card(t0);
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_macos_access()));
+
+        // WATCHING, displaced by an unconditional producer: back to Due, the
+        // producer's pill is left alone, and the card returns once the pill
+        // has visibly lifted — within its own hold only.
+        let t1 = t0 + Duration::from_secs(3);
+        app.notice = Some(TransientNotice::update_status("\u{21e3} Installing", t1));
+        app.tick_macos_access_card(t1);
+        assert_eq!(app.consent_card.phase(), CardPhase::Due);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| !n.is_macos_access_owned()),
+            "the pill is left alone"
+        );
+        app.tick_macos_access_card(t1 + Duration::from_secs(1));
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Due,
+            "still on the glass"
+        );
+        let t2 = t1 + Duration::from_secs(10);
+        app.tick_macos_access_card(t2);
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t2 });
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_macos_access()));
+        let t3 = t0 + RERAISE_WITHIN + Duration::from_secs(1);
+        app.notice = None;
+        app.tick_macos_access_card(t3);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Watching { since: t2 },
+            "past its own hold it is not re-raised"
+        );
+        assert!(app.notice.is_none());
+
+        // OPEN SETTINGS: the card's OWN route pill (the inert arm refuses, so
+        // the "did not open" copy), held 90 s; the watch restarts; the pill is
+        // not a displacement; and a pressed card is never re-raised.
+        let mut app = windowed();
+        raised(&mut app, t0);
+        let t1 = t0 + Duration::from_secs(2);
+        app.notice_hit_dispatch(None, true, false, NoticeHit::Primary, t1);
+        let route = app.notice.as_ref().expect("the route pill");
+        assert!(route.is_macos_access_owned() && !route.is_macos_access());
+        assert_eq!(
+            route.text(),
+            opened_settings_caption(
+                false,
+                crate::menu::privacy_settings_path_words(crate::menu::PrivacyPane::FullDiskAccess)
+            )
+        );
+        assert!(!route.is_expired(t1 + OPENED_SETTINGS_TTL - Duration::from_secs(1)));
+        assert!(route.is_expired(t1 + OPENED_SETTINGS_TTL));
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t1 });
+        app.tick_macos_access_card(t1 + Duration::from_secs(1));
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Watching { since: t1 },
+            "our own pill is not a displacement"
+        );
+        app.notice = None;
+        app.tick_macos_access_card(t1 + Duration::from_secs(2));
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Watching { since: t1 },
+            "a pressed card is never re-raised"
+        );
+        assert!(app.notice.is_none());
+
+        // NOT NOW: settled, the slot empty.
+        let mut app = windowed();
+        raised(&mut app, t0);
+        app.notice_hit_dispatch(None, true, false, NoticeHit::NotNow, t0);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+
+        // BODY: dismissed for now — the watch continues, nothing returns.
+        let mut app = windowed();
+        raised(&mut app, t0);
+        app.notice_hit_dispatch(None, true, false, NoticeHit::Body, t0);
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
+        assert!(app.notice.is_none());
+        app.tick_macos_access_card(t0 + Duration::from_secs(5));
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: t0 });
+        assert!(app.notice.is_none());
+
+        // THE ✓ PILL replaces the card or its own route pill, or fills a free
+        // slot — never another card.
+        let mut app = windowed();
+        app.notice = Some(TransientNotice::macos_access_route(
+            "route".to_string(),
+            OPENED_SETTINGS_TTL,
+            t0,
+        ));
+        assert!(app.show_macos_access_granted(t0 + Duration::from_secs(20)));
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
+        assert!(!app.show_macos_access_granted(t0));
+        assert!(
+            app.notice.as_ref().unwrap().admin_step_names().is_some(),
+            "never over the admin card"
+        );
+        app.notice = None;
+        assert!(app.show_macos_access_granted(t0));
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+
+        // THE GRANT SEEN WHILE ANOTHER CARD HOLDS THE SLOT: the ✓ waits like
+        // the card does, and shows the moment the slot frees.
+        let mut app = windowed();
+        raised(&mut app, t0);
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
+        let t1 = t0 + Duration::from_secs(30);
+        app.note_macos_access_granted(t1);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Confirming { since: t1 }
+        );
+        assert!(
+            app.notice.as_ref().unwrap().admin_step_names().is_some(),
+            "the admin card is untouched"
+        );
+        app.tick_macos_access_card(t1 + Duration::from_secs(1));
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Confirming { since: t1 }
+        );
+        app.notice = None;
+        app.tick_macos_access_card(t1 + Duration::from_secs(2));
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        // …and a pending confirmation that never gets the slot gives up.
+        let mut app = windowed();
+        raised(&mut app, t0);
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
+        app.note_macos_access_granted(t1);
+        app.tick_macos_access_card(t1 + super::consent_card::WATCH_FOR);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
     }
 
     /// THE OBSERVER SHIPS OFF (design §3.6). A headless instance with the

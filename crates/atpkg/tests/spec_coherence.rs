@@ -710,11 +710,16 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
              request through the typed-name consent stub)",
             row.line_no
         );
+        // Owner direction 2026-09-08: the manifest-only releases of a vendor member
+        // ride the INDEX repo. A repo named after the vendor (`alabsystems/claude`)
+        // would be a Claude Code distribution channel in everything but bytes.
         assert_eq!(
             row.repo(&spec),
-            name,
-            "tools/atpkg-programs.spec:{}: {name:?} is a manifest-only \
-             release host named after the program",
+            "aterm",
+            "tools/atpkg-programs.spec:{}: {name:?}'s manifest-only releases \
+             ride the index repo (`aterm`), never a repo named after the vendor \
+             (owner direction 2026-09-08 — we host a signed pointer, not the \
+             program)",
             row.line_no
         );
     }

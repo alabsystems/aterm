@@ -122,6 +122,15 @@ impl Layout {
         self.prefix.join("bin")
     }
 
+    /// `reroute/` — the SESSION-SCOPED directory of upstream-name stubs
+    /// ([`crate::reroute`]), prepended FIRST only to the PATH aterm hands its own
+    /// children; never `bin/`, never the rc hook, so [`shim_allowed`]'s deny-list
+    /// keeps meaning exactly what it means for the managed `bin/`.
+    #[must_use]
+    pub fn reroute_dir(&self) -> PathBuf {
+        crate::reroute::dir(self)
+    }
+
     /// `bin/<tool>` — a single shim. The concrete file name is [`ToolName::shim_file`]
     /// (`bin/ay` on Unix, `bin/ay.cmd` on Windows).
     ///

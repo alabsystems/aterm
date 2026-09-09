@@ -453,6 +453,19 @@ unsafe extern "C" {
         types: *const c_char,
     ) -> crate::encode::Bool;
     pub(crate) fn class_addProtocol(cls: ClassPtr, protocol: ProtocolPtr) -> crate::encode::Bool;
+    // --- protocol REGISTRATION: the half of the protocol API `class_addProtocol`
+    // turned out to need. A protocol is present in a process only if some
+    // LOADED IMAGE carries it in its `__objc_protolist`, and a compiled
+    // Objective-C file carries only the protocols it adopts or names in
+    // `@protocol(…)` — a header declaration alone registers nothing. On macOS
+    // 14.4.1 AppKit's `__objc_protolist` has 415 entries and
+    // `NSApplicationDelegate` is not among them (only SwiftUI's image carries
+    // it there, and aterm never
+    // loads SwiftUI); the macOS 26 release cutter does register it. A Rust
+    // binary has no `__objc_protolist` of its own, so these two calls are how
+    // aterm supplies the missing object itself. See [`protocol_or_register`]. ---
+    fn objc_allocateProtocol(name: *const c_char) -> ProtocolPtr;
+    fn objc_registerProtocol(proto: ProtocolPtr);
     pub(crate) fn class_getInstanceVariable(cls: ClassPtr, name: *const c_char) -> IvarPtr;
     pub(crate) fn ivar_getOffset(ivar: IvarPtr) -> isize;
 
@@ -1061,15 +1074,138 @@ pub fn class(name: &'static CStr) -> ClassPtr {
 }
 
 /// Look up a protocol by name, e.g. `protocol(c"NSMenuDelegate")`. Null when
-/// the protocol is not present in the process — which, for an AppKit protocol,
-/// means AppKit is not linked into THIS binary rather than that the name is
-/// wrong.
+/// no loaded image registers it. A pure lookup: it never registers anything,
+/// so a test process can observe true absence.
+///
+/// Presence is a property of the LOADED IMAGES, not of what this binary links:
+/// the runtime registers a protocol only from an image whose
+/// `__objc_protolist` carries it, and a framework carries only the protocols
+/// its compiled files adopt or name in `@protocol(…)`. A framework that merely
+/// DECLARES a protocol in a header may not register it, and whether it does
+/// changes between macOS releases. Measured on macOS 14.4.1 with AppKit loaded:
+/// `NSWindowDelegate`, `NSMenuDelegate`, `NSToolbarDelegate`,
+/// `NSTextFieldDelegate`, `NSTextInputClient` and `NSDraggingDestination` are
+/// present and `NSApplicationDelegate` is ABSENT (the 415 entries of AppKit's
+/// `__objc_protolist` do not include it; only SwiftUI's image carries it
+/// there); on the
+/// macOS 26 release cutter it is present. So null does not mean the framework
+/// is unlinked — `class(c"NSApplication")` answers that — and a class that has
+/// to CLAIM a protocol goes through [`protocol_or_register`], which supplies
+/// the object when the host did not.
 #[inline]
 #[must_use]
 pub fn protocol(name: &'static CStr) -> ProtocolPtr {
     // SAFETY: `CStr` supplies the exact C-string contract. Protocol objects are
     // immortal and are never released.
     unsafe { objc_getProtocol(name.as_ptr()) }
+}
+
+/// The names of every protocol THIS CRATE registered because no loaded image
+/// had — in registration order, each once.
+///
+/// Empty on a host whose frameworks register everything the tree claims (the
+/// macOS 26 release cutter); `["NSApplicationDelegate"]` on macOS 14.4.1 once
+/// the application delegate's class has been built. An auditor or census uses
+/// this to tell "the host's framework does not register this protocol" from
+/// "the framework registered it", which matters because a protocol this crate
+/// registered is NAME-ONLY: it declares no methods, so it is never an
+/// authority an encoding can be checked against, and
+/// [`protocol_method_types`] answers `None` for every selector on it.
+#[must_use]
+pub fn protocols_registered_by_aterm() -> Vec<&'static CStr> {
+    registered()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The registry behind [`protocols_registered_by_aterm`], and the lock that
+/// serializes [`protocol_or_register`].
+fn registered() -> &'static std::sync::Mutex<Vec<&'static CStr>> {
+    static REGISTERED: std::sync::Mutex<Vec<&'static CStr>> = std::sync::Mutex::new(Vec::new());
+    &REGISTERED
+}
+
+/// The protocol object for `name`, supplied by this crate if no loaded image
+/// registers it.
+///
+/// This is what a class that CLAIMS a protocol needs, and the reason it cannot
+/// be plain [`protocol`]: `class_addProtocol` takes a protocol object, and
+/// whether the host's framework registered one is a fact about that host's
+/// build of the framework (see [`protocol`]). The alternatives were measured
+/// and rejected. Skipping the claim when the object is absent — what objc2's
+/// `declare_class!` did, silently, through v0.71.0 — leaves
+/// `-conformsToProtocol:` answering NO for a class whose whole job is to be
+/// that delegate, with nothing recording that it happened. Panicking — what
+/// v0.72.0 through v0.75.0 shipped — killed the app at launch on macOS 14.4.1
+/// before its first window, because the release cutter runs on macOS 26 where
+/// the one protocol AppKit does not register on 14.4.1 happens to be present.
+///
+/// When the lookup is null this allocates a protocol of that name with
+/// `objc_allocateProtocol`, registers it with `objc_registerProtocol`, and
+/// records the name for [`protocols_registered_by_aterm`]. The protocol is
+/// NAME-ONLY on purpose: no method descriptions, no parent protocols. What a
+/// claim needs from the object is its identity — `conformsToProtocol:`
+/// compares names — and AppKit reaches a claimant's rows by selector, never
+/// through the protocol's method table: the application delegate's rows by
+/// `-respondsToSelector:` (measured on 14.4.1: a delegate with an EMPTY
+/// protocol list received every launch and termination row, after 26
+/// `application*` `respondsToSelector:` probes and zero `conformsToProtocol:`
+/// sends), and a text input client's REQUIRED rows by direct send once the
+/// class conforms (see [`class_protocols`]) — which a name-only protocol does
+/// not change, since the rows live on the class. Descriptions copied from a Rust-side table
+/// would make this crate the AUTHORITY the seam census checks the port
+/// against, and a census that compares a port to its own transcription checks
+/// nothing.
+///
+/// Registration is serialized under one lock and is idempotent: a second
+/// caller finds the first's object through `objc_getProtocol`, and what is
+/// returned is always the runtime's answer, never the allocated pointer — two
+/// unserialized allocations of one name both succeed in libobjc and the loser
+/// is an orphan `objc_getProtocol` never returns (measured). If an image
+/// loaded LATER carries the real protocol (on 14.4.1, SwiftUI or ShareKit),
+/// the runtime keeps the object already registered under that name and remaps
+/// the image's own references to it, without a diagnostic (measured), so every
+/// `@protocol(…)` in the process still names one object.
+///
+/// # Panics
+/// If the runtime refuses to register — allocation answering nil although the
+/// lookup found nothing, or the lookup still nil after registration — which no
+/// caller can provoke and a class that must claim a protocol cannot proceed
+/// without.
+#[must_use]
+pub fn protocol_or_register(name: &'static CStr) -> ProtocolPtr {
+    let found = protocol(name);
+    if !found.is_null() {
+        return found;
+    }
+    let mut registered = registered()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Re-asked under the lock: another thread may have registered it between
+    // the lookup above and here.
+    let found = protocol(name);
+    if !found.is_null() {
+        return found;
+    }
+    // SAFETY: `name` is a valid C string; `objc_allocateProtocol` returns a
+    // fresh, unregistered protocol object, or nil if the name is taken.
+    let proto = unsafe { objc_allocateProtocol(name.as_ptr()) };
+    assert!(
+        !proto.is_null(),
+        "aterm-objc: objc_allocateProtocol({name:?}) answered nil although \
+         objc_getProtocol found nothing under that name"
+    );
+    // SAFETY: `proto` is a live, allocated, unregistered protocol object, and
+    // registering it is the documented terminal operation on one.
+    unsafe { objc_registerProtocol(proto) };
+    let now = protocol(name);
+    assert!(
+        !now.is_null(),
+        "aterm-objc: protocol {name:?} is still absent after objc_registerProtocol"
+    );
+    registered.push(name);
+    now
 }
 
 /// The class of a live object (`object_getClass`). Null for `nil`.
@@ -1190,12 +1326,28 @@ pub unsafe fn class_methods(cls: ClassPtr) -> Vec<(Sel, Option<String>)> {
 ///
 /// This is the half of a declared class that no encoding check can see. A
 /// `protocols:` list is not decoration: it is what makes `conformsToProtocol:`
-/// answer YES, and AppKit asks that question before it will treat an object as
-/// a delegate at all. Deleting `NSWindowDelegate` from `vendor/winit`'s
+/// answer YES — the question a typed consumer asks of a delegate, and the one
+/// every conformance assertion in this tree asks. Whether AppKit itself asks
+/// it depends on the protocol. For the APPLICATION DELEGATE it does not: AppKit
+/// dispatches those rows by `-respondsToSelector:` (measured on macOS 14.4.1:
+/// 26 `application*` probes and zero `conformsToProtocol:` sends before a
+/// delegate with an empty protocol list received every launch and termination
+/// row), which is exactly why deleting `NSWindowDelegate` from `vendor/winit`'s
 /// delegate left every registered encoding correct, the build green and the
-/// driven event log byte-identical — the class simply stopped saying it was a
-/// window delegate. Nothing in this crate could report that until this
-/// function; now an auditor can ask.
+/// driven event log byte-identical — the class simply stopped SAYING it was a
+/// window delegate, and nothing in this crate could report that until this
+/// function; now an auditor can ask. For `NSTextInputClient` it DOES:
+/// `-[NSView _inputContext]` creates an `NSTextInputContext` only for a view
+/// whose class conforms, and that init sends the protocol's REQUIRED
+/// `validAttributesForMarkedText` (measured the same day: a non-conforming
+/// view answered nil, a conforming view that implements the row got a
+/// context, and a conforming view that implements nothing aborted with
+/// `unrecognized selector`). So a claim is a promise to implement the required
+/// rows, and `vendor/winit`'s view keeps it.
+///
+/// A name in this list may be one this crate registered itself when the
+/// host's framework had not — see [`protocol_or_register`] and
+/// [`protocols_registered_by_aterm`]; the list does not say which.
 ///
 /// Names, not [`ProtocolPtr`]s, because the only thing a caller does with the
 /// answer is compare it to the list the source claims.

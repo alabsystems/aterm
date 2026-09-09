@@ -146,11 +146,14 @@ impl From<u64> for WindowId {
 // matter to the ivar slot:
 //
 //  1. THE OFFSET IS NOT THE INSTANCE SIZE, and on `NSWindow` it is not even
-//     ALIGNED. `-[NSWindow class]`'s instance size is 520 bytes, and
+//     ALIGNED. On the macOS 26 release cutter `-[NSWindow class]`'s instance
+//     size is 520 bytes, and
 //     `class_addIvar` places a 1-byte, align-1 slot — which is what
 //     `IvarSlot<()>` is — at offset **513**, inside the tail padding. An
 //     8-byte slot lands at 520 and a 16-byte one at 528. (`NSView` answers 536
-//     for the 8-byte case.) Nothing here may be derived from a size: the macro
+//     for the 8-byte case. macOS 14.4.1's `NSWindow` is 448 bytes with NO tail
+//     padding, so the 1-byte slot lands at 448 there — a HOST fact, which is
+//     the point.) Nothing here may be derived from a size: the macro
 //     reads `ivar_getOffset` after registration and that is the only correct
 //     source. Measured with `class_addIvar`/`ivar_getOffset` against
 //     `NSWindow` itself, three slot shapes.

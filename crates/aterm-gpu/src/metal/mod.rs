@@ -1659,6 +1659,7 @@ mod tests {
         accent: 0x0033_88ff,
         wash_a: 40,
         border_a: 200,
+        border_scale_q4: 0,
     };
 
     /// One differential case: a name, the destination, the uniform arms, and

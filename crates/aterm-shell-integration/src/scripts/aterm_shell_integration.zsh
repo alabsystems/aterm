@@ -151,6 +151,31 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
+# ─── The reroute directory, FIRST ───
+#
+# $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
+# stubs for the upstream Rust names (`aterm help reroute`), which the seam already
+# put FIRST on the PATH it handed this shell. That position is not final. This file
+# runs from the wrapper .zshenv — BEFORE /etc/zprofile (path_helper rebuilds PATH
+# from /etc/paths) and BEFORE ~/.zshrc (`. ~/.cargo/env` prepends ~/.cargo/bin) —
+# and the package blocks just above may prepend too. Measured 2026-09-07:
+# ~/.cargo/bin at position 17, ahead of the managed store at 19, so a bare `cargo`
+# ran upstream Rust silently. An ORDER failure — which is why this is move-to-front
+# (every existing occurrence removed, then prepended), never skip-if-present.
+# Asserted here, after the package blocks, and again from __aterm_first_precmd,
+# which runs after every rc file has had its say. Inert outside a session: the
+# variable is unset, or the directory (Windows lays none) does not exist.
+#
+# `${(@)path:#…}`: `:#` matches the expanded value LITERALLY (no GLOB_SUBST), so a
+# directory named with `[` or `*` is still removed by equality; `(@)` in quotes
+# keeps an EMPTY entry ("here", to a POSIX shell) — the user's — from being dropped.
+__aterm_reroute_path_front() {
+    if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
+        path=("$ATERM_REROUTE_DIR" "${(@)path:#$ATERM_REROUTE_DIR}")
+    fi
+}
+__aterm_reroute_path_front
+
 # State tracking
 typeset -g __aterm_in_command=0
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
@@ -452,6 +477,11 @@ __aterm_first_precmd() {
     if [[ -n "$ATERM_PROMPT_STYLE" && "$ATERM_PROMPT_STYLE" != "none" ]]; then
         __aterm_set_prompt
     fi
+
+    # The reroute directory, FIRST — for the last time: /etc/zprofile and ~/.zshrc
+    # have both run by now (see __aterm_reroute_path_front for why the load-time
+    # assert above is not final).
+    __aterm_reroute_path_front
 
     add-zsh-hook -d precmd __aterm_first_precmd
     return $last_status

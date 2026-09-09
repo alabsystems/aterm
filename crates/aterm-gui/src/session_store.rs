@@ -147,7 +147,7 @@ impl ScreenCarry {
 /// Window-frame carry: the outgoing window's grid size and outer position, so
 /// the post-update window reappears exactly where (and how big) the old one
 /// was instead of at config defaults — the visible half of "seamless".
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WindowCarry {
     /// Grid rows of the handed-off session's window.
     pub rows: u16,
@@ -158,6 +158,40 @@ pub struct WindowCarry {
     pub outer_x: Option<i32>,
     #[serde(default)]
     pub outer_y: Option<i32>,
+    /// STATUS-BAR ROWS the outgoing window had committed above its grid at
+    /// handoff time (`App::status_bar_rows`), with the words each row carried
+    /// (`bars`, top to bottom). The successor reserves the same rows BEFORE it
+    /// sizes its first window — the grid rows above are the same either way,
+    /// but the WINDOW is one row taller per bar, and without this the swap
+    /// showed a frame one row shorter than the one it replaced — and paints
+    /// the carried words in them until Commit, when its own lanes take over.
+    /// Additive: absent in pre-carry manifests, which reads as no bars.
+    #[serde(default)]
+    pub status_bar_rows: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bars: Vec<CarriedBar>,
+}
+
+/// One status-bar row's words at handoff time — the plain-data projection of
+/// `status_bars::Bar` that the successor re-seeds (design: the reveal shows
+/// carried content and nothing invented). No deadlines cross the boundary:
+/// the successor gives every carried bar the handoff's own staleness cap and
+/// replaces the update lane's words with its own phase.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct CarriedBar {
+    /// `toolchain` | `update` (`status_bars::Lane::as_str`).
+    pub lane: String,
+    pub glyph: char,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub stats: String,
+    /// `info` | `success` | `warn`.
+    pub tone: String,
+    /// Determinate meter fill in permille (`0..=1000`), if the bar had one —
+    /// an integer so the manifest stays `Eq`-comparable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_permille: Option<u16>,
 }
 
 /// One carried connection edge — the TOKENLESS projection of a live

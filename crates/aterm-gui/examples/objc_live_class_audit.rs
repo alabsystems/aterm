@@ -300,7 +300,10 @@
 //!   protocol the class implements but does not claim, or a live send that
 //!   answered with the wrong shape.
 //! * `2` — NOT RUN: no event loop is constructible here (headless, no window
-//!   server), or no delegate was installed. Never a pass.
+//!   server), or no delegate was installed — or the audit ran and could not
+//!   check every row, because a row's authority is a protocol THIS HOST's
+//!   AppKit does not register (aterm supplies a name-only stand-in at
+//!   declaration, and a stand-in declares nothing). Never a pass.
 
 /// Every row agreed with the runtime's own authority.
 ///
@@ -493,10 +496,16 @@ mod macos {
     /// which is why reading the registered table matters more here than
     /// anywhere else in this file. An `@optional` protocol row is reached only
     /// after `-respondsToSelector:` says yes, so a row that never registered
-    /// does not crash and does not raise: the application simply never finishes
-    /// launching, never applies its activation policy and never terminates
-    /// cleanly. There is no first message to fail at, and no test that sends
-    /// one would notice either.
+    /// does not crash and does not raise: AppKit moves on, the application
+    /// launches, and it simply never hears the row — never applies its
+    /// activation policy, never terminates cleanly. There is no first message
+    /// to fail at, and no test that sends one would notice either.
+    ///
+    /// `NSApplicationDelegate` is also the one protocol here a host's AppKit
+    /// may not register (macOS 14.4.1 does not; the macOS 26 cutter does), in
+    /// which case `aterm_objc` supplied a name-only stand-in at declaration and
+    /// these three rows have NO authority on that host: part A says so and the
+    /// verdict is NOT RUN rather than a pass.
     ///
     /// The `claimed` list is TWO names, transcribed from the fork's
     /// `protocols:` list, which is itself what objc2's
@@ -1216,6 +1225,12 @@ mod macos {
         findings: Vec<String>,
         /// Why the audit could not run at all, if it could not.
         blocked: Option<String>,
+        /// Rows that could not be checked ON THIS HOST because the protocol
+        /// that declares them is one its AppKit does not register (aterm
+        /// supplied a name-only stand-in). Not findings — the port is not
+        /// wrong — and not passes either: with any of these the verdict is
+        /// NOT RUN.
+        host_unchecked: Vec<String>,
     }
 
     impl Audit {
@@ -1444,6 +1459,18 @@ mod macos {
                             println!("      no authority: {}", row.why);
                             println!("      checked in part D against {}", row.rust);
                         } else {
+                            // The claimed protocols THIS HOST's AppKit does not
+                            // register: `aterm_objc` supplied a name-only
+                            // stand-in for each at declaration so the class
+                            // could claim it, and a stand-in declares nothing.
+                            // Consulted only AFTER the universal search below
+                            // comes back empty, so a plant some other loaded
+                            // protocol does declare is still a finding here.
+                            let supplied: Vec<String> = aterm_objc::protocols_registered_by_aterm()
+                                .iter()
+                                .filter(|p| target.claimed.contains(p))
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .collect();
                             // THE UNIVERSAL IS MEASURED BEFORE IT IS PRINTED.
                             // The sentence that stood here — "nothing in the
                             // runtime declares it" — was a statement about the
@@ -1477,6 +1504,24 @@ mod macos {
                                     declared.len(),
                                     loaded_protocol_count(),
                                     named.join(", ")
+                                ));
+                            } else if !supplied.is_empty() {
+                                // Nothing loaded declares it, and the target
+                                // claims a protocol this host does not
+                                // register: the row is NOT CHECKED here —
+                                // said so, counted, and the verdict refuses to
+                                // call the audit a pass on this host.
+                                println!(
+                                    "      NOT CHECKED on this host: its AppKit does not register {} \
+                                     (aterm supplied a name-only stand-in), and none of the {} \
+                                     protocols loaded here declares this row",
+                                    supplied.join(", "),
+                                    loaded_protocol_count()
+                                );
+                                self.host_unchecked.push(format!(
+                                    "{}: {name} — {} is not registered by this host's AppKit",
+                                    target.class_name,
+                                    supplied.join(", ")
                                 ));
                             } else {
                                 self.fail(format!(
@@ -1519,8 +1564,17 @@ mod macos {
             // THE DERIVED TOOTH. The question is whether the INSTANCE conforms,
             // not whether this class is the link that makes it conform:
             // `-conformsToProtocol:` walks the superclass chain, and that is
-            // the exact call AppKit makes before it will treat an object as a
-            // delegate, a text input client or a responder.
+            // the call a TYPED consumer makes of a delegate, a text input
+            // client or a responder. Whether AppKit makes it depends on the
+            // protocol: the application delegate's rows are reached by
+            // `-respondsToSelector:` (measured — a delegate with an empty
+            // protocol list received every launch row), so that claim is
+            // aterm's to audit and nobody else's to enforce; a TEXT INPUT
+            // CLIENT is the other way round — `-[NSView _inputContext]`
+            // creates a context only for a conforming view and then sends the
+            // protocol's required rows (measured: a bare view that claimed
+            // `NSTextInputClient` and implemented nothing aborted there), so
+            // for `WinitView` the claim is a promise AppKit collects on.
             //
             // The rule used to be "must appear in `class_copyProtocolList`",
             // which was right for `WindowDelegate` and WRONG in general, as
@@ -1569,7 +1623,13 @@ mod macos {
                     send(instance, sel!(conformsToProtocol:), protocol(p))
                 };
                 let informal = target.informal.iter().find(|(n, _)| *n == name.as_str());
-                let how = if claimed.contains(&name) {
+                let supplied_by_aterm = aterm_objc::protocols_registered_by_aterm()
+                    .iter()
+                    .any(|s| s.to_string_lossy() == name);
+                let how = if claimed.contains(&name) && supplied_by_aterm {
+                    "claimed by this class — against a name-only protocol aterm supplied, this \
+                     host's AppKit not registering it"
+                } else if claimed.contains(&name) {
                     "claimed by this class"
                 } else if conforms.as_bool() {
                     "inherited from a superclass"
@@ -2777,10 +2837,10 @@ mod macos {
             return NOT_RUN;
         }
         println!("\n=== VERDICT ===");
-        if driver.audit.findings.is_empty() {
-            println!("objc-live-class-audit: OK — every registered row agrees with the runtime.");
-            PASS
-        } else {
+        for row in &driver.audit.host_unchecked {
+            println!("  NOT CHECKED on this host: {row}");
+        }
+        if !driver.audit.findings.is_empty() {
             for f in &driver.audit.findings {
                 println!("  FAIL: {f}");
             }
@@ -2789,6 +2849,19 @@ mod macos {
                 driver.audit.findings.len()
             );
             FAIL
+        } else if !driver.audit.host_unchecked.is_empty() {
+            // Every checked row agreed, and some rows could not be checked here:
+            // that is not a pass, and it is not the port's fault either.
+            eprintln!(
+                "objc-live-class-audit: NOT RUN in full — {} row(s) have no authority on this \
+                 host because its AppKit does not register the protocol that declares them; \
+                 every other row agreed. A verdict needs a host that registers it.",
+                driver.audit.host_unchecked.len()
+            );
+            NOT_RUN
+        } else {
+            println!("objc-live-class-audit: OK — every registered row agrees with the runtime.");
+            PASS
         }
     }
 }

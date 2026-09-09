@@ -226,6 +226,12 @@ fn shell_command(shell: &str) -> Command {
         // is testing that session's identity, not the script's behaviour —
         // and the #8015 scrub it should be exercising becomes unobservable.
         "ATERM_SHELL_NONCE",
+        // The reroute seam's pair (2026-09-07): a developer running the suite
+        // inside an aterm session inherits a live `$ATERM_REROUTE_DIR`, and every
+        // script would then re-order the test shell's PATH; a live
+        // `$ATERM_NO_REROUTE` is that session's choice, not this fixture's.
+        "ATERM_REROUTE_DIR",
+        "ATERM_NO_REROUTE",
     ] {
         cmd.env_remove(var);
     }
@@ -405,6 +411,116 @@ fn test_zsh_survives_shell_d_with_only_zsh_dropins() {
         stdout.contains("DROPIN=loaded"),
         "the *.zsh shell.d drop-in must be sourced: stdout={stdout:?}"
     );
+}
+
+/// The reroute directory (`$ATERM_REROUTE_DIR`, set by aterm's spawn seam) ends up
+/// FIRST on PATH — MOVED there from wherever the inherited PATH already listed it,
+/// exactly once, the rest kept in order — and every script is inert when the
+/// variable is unset or names nothing on disk (Windows lays no stubs). Live shells
+/// sourcing the real script: `-c` has no first prompt, so this is the load-time
+/// assert; zsh's precmd copy and fish's first-prompt one-shot call the same
+/// function. bash and zsh (`-f`, no rc files) are checked byte-exactly; fish is
+/// checked for position and count only, because its own startup may add entries.
+#[cfg(unix)]
+#[test]
+fn test_reroute_dir_is_moved_to_the_front_of_path_by_each_shell() {
+    let reroute = std::env::temp_dir().join(format!("aterm-si-reroute-{}", std::process::id()));
+    std::fs::create_dir_all(&reroute).expect("mk reroute dir");
+    let reroute = reroute.to_str().expect("UTF-8 temp dir").to_owned();
+    let stale = "/nonexistent/aterm-reroute";
+    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
+        bash_shell(),
+        vec!["--noprofile", "--norc", "-i", "-c"],
+        "aterm_shell_integration.bash",
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
+        true,
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
+            zsh,
+            vec!["-f", "-i", "-c"],
+            "aterm_shell_integration.zsh",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\"",
+            true,
+        ));
+    }
+    if let Some(fish) = fish_shell() {
+        lanes.push((
+            fish,
+            vec!["-i", "-c"],
+            "aterm_shell_integration.fish",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' (string join : -- $PATH)",
+            false,
+        ));
+    }
+    for (shell, args, script_name, command, exact) in lanes {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let run = |reroute_dir: Option<&str>, path: &str| -> String {
+            let mut cmd = shell_command(shell);
+            cmd.args(&args)
+                .arg(command)
+                .env("ATERM_TEST_SCRIPT", &script)
+                .env("PATH", path);
+            if let Some(dir) = reroute_dir {
+                cmd.env("ATERM_REROUTE_DIR", dir);
+            }
+            let out = cmd
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // The LAST `PATH=` is the printf's: an interactive shell's preexec hook
+            // emits the OSC 633;E / OSC 0 marks — which quote the command line, and
+            // so its `PATH=` too — on the same line, BEFORE the command's output.
+            // The value ends at the first control byte (the newline, or a mark).
+            assert!(
+                stdout.contains("PATH="),
+                "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            stdout
+                .rsplit("PATH=")
+                .next()
+                .expect("rsplit yields at least one piece")
+                .chars()
+                .take_while(|c| !c.is_control())
+                .collect()
+        };
+        // Listed later, twice: moved to the front, once; the rest in order.
+        let got = run(
+            Some(&reroute),
+            &format!("/usr/bin:{reroute}:/bin:{reroute}"),
+        );
+        assert!(
+            got.starts_with(&format!("{reroute}:")),
+            "{shell}: the reroute dir must be first: {got:?}"
+        );
+        assert_eq!(got.matches(&reroute).count(), 1, "{shell}: once: {got:?}");
+        if exact {
+            assert_eq!(
+                got,
+                format!("{reroute}:/usr/bin:/bin"),
+                "{shell}: move-to-front"
+            );
+        }
+        // Already first: the same answer (a nested aterm stacks nothing).
+        let again = run(Some(&reroute), &got);
+        assert_eq!(again, got, "{shell}: idempotent");
+        // Unset, or naming nothing on disk: PATH untouched.
+        let unset = run(None, "/usr/bin:/bin");
+        let missing = run(Some(stale), "/usr/bin:/bin");
+        assert!(
+            !missing.contains(stale),
+            "{shell}: a missing dir is never prepended: {missing:?}"
+        );
+        if exact {
+            assert_eq!(unset, "/usr/bin:/bin", "{shell}: inert when unset");
+            assert_eq!(
+                missing, "/usr/bin:/bin",
+                "{shell}: inert for a missing directory"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir(&reroute);
 }
 
 #[test]

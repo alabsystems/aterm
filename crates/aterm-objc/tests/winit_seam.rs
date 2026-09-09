@@ -168,6 +168,25 @@
 //! answers nil in a bare test process (measured). The census `dlopen`s AppKit,
 //! which is the whole of its dependency on it — no `objc2-app-kit`, no new
 //! third-party line.
+//!
+//! # A protocol the host may not register
+//!
+//! Loading AppKit does not register every protocol its headers declare: the
+//! runtime registers a protocol only from an image whose `__objc_protolist`
+//! carries it, and a framework carries only the protocols its compiled files
+//! adopt or name. `NSApplicationDelegate` is such a protocol on macOS 14.4.1
+//! (the 415 entries of AppKit's `__objc_protolist` do not include it; only
+//! SwiftUI's image carries it there) and a present one on the macOS 26 release
+//! cutter. The
+//! product supplies a NAME-ONLY protocol for it at declaration
+//! (`aterm_objc::protocol_or_register`), which is exactly why this census must
+//! never read such a protocol as an authority: it declares no methods. Rows
+//! whose authority the host lacks are reported as unchecked ON THIS HOST, and
+//! the set of protocols that may be lacking is written down (`HOST_MAY_LACK`)
+//! so a new absence still goes red. This generalisation used to be read the
+//! other way — "absent means AppKit did not load" — and it was that reading,
+//! asserted in the product, that killed v0.72.0 through v0.75.0 at launch on
+//! 14.4.1.
 
 #![cfg(target_os = "macos")]
 
@@ -237,6 +256,77 @@ fn expand(spec: &str) -> String {
     spec.replace('B', Bool::ENCODING)
 }
 
+/// Protocols a host's AppKit may not register although AppKit is loaded.
+///
+/// Measured: macOS 14.4.1 registers none of these (`objc_getProtocol` is nil
+/// while `NSApplication` the class is present); the macOS 26 release cutter
+/// registers all of them. A row whose authority is on this list and absent is
+/// reported as unchecked on this host — never as agreement, never as a failure
+/// — and [`the_host_allowance_is_exactly_what_this_host_lacks`] keeps the list
+/// honest: an absent protocol NOT on it is a red census, by name.
+const HOST_MAY_LACK: &[&str] = &["NSApplicationDelegate"];
+
+/// Whether the HOST's own frameworks registered `name`: false when it is
+/// absent, and false when the only object under that name is the name-only one
+/// `aterm_objc` supplied (which a test in this process may have provoked by
+/// declaring a class that claims it).
+fn host_registers(name: &str) -> bool {
+    let p = protocol(static_cstr(name));
+    !p.is_null()
+        && !aterm_objc::protocols_registered_by_aterm()
+            .iter()
+            .any(|n| n.to_str() == Ok(name))
+}
+
+/// What the runtime says about one row.
+enum Reading {
+    /// The authority declares it with this offset-free encoding.
+    Declared(String),
+    /// Nothing in the runtime declares it (an [`Authority::None`] row); the
+    /// string is the written reason.
+    NoAuthority(&'static str),
+    /// The authority is a protocol THIS HOST's AppKit does not register, so
+    /// there is nothing to read; the string is the protocol.
+    HostLacksProtocol(&'static str),
+}
+
+/// The rows a host may leave unchecked, and the proof that it is exactly them.
+///
+/// Either the host registers every protocol in [`HOST_MAY_LACK`] and the list
+/// is empty, or the list is precisely the rows whose authority it lacks — the
+/// application delegate's three — printed, so a transcript from such a host
+/// says what it did not check.
+fn assert_host_lacking_is_the_allowance(host_lacking: &[(&str, &str, &str)]) {
+    let expected: Vec<(&str, &str, &str)> = ROWS
+        .iter()
+        .filter_map(|r| match r.authority {
+            Authority::Proto(name) if HOST_MAY_LACK.contains(&name) && !host_registers(name) => {
+                Some((r.site, r.sel, name))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        host_lacking,
+        &expected[..],
+        "the rows this host cannot check are exactly the rows whose protocol it does not register"
+    );
+    if expected.is_empty() {
+        return;
+    }
+    assert_eq!(
+        expected.len(),
+        3,
+        "the application delegate's three rows, and no other"
+    );
+    for (site, s, name) in &expected {
+        eprintln!(
+            "winit_seam: {site} {s}: {name} is not registered by this host's AppKit — \
+             unchecked here, checked on a host that registers it"
+        );
+    }
+}
+
 /// The seventy-two rows, in source order per file.
 ///
 /// Regenerating this table is `grep -n '#\[method' vendor/winit/src/
@@ -246,12 +336,12 @@ fn expand(spec: &str) -> String {
 #[rustfmt::skip]
 const ROWS: &[Row] = &[
     // ---- ApplicationDelegate : NSObject <NSApplicationDelegate>
-    Row { site: "app_state.rs:132",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:137",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
-    Row { site: "app_state.rs:142",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
+    Row { site: "app_state.rs:143",  sel: "applicationDidFinishLaunching:", authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:148",  sel: "applicationWillTerminate:",      authority: Authority::Proto("NSApplicationDelegate"), winit: "v@:@" },
+    Row { site: "app_state.rs:153",  sel: "applicationShouldTerminate:",    authority: Authority::Proto("NSApplicationDelegate"), winit: "Q@:@" },
     // ---- WinitWindow : NSWindow
-    Row { site: "window.rs:211",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
-    Row { site: "window.rs:217",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:214",    sel: "canBecomeMainWindow",            authority: Authority::Class("NSWindow"), winit: "B@:" },
+    Row { site: "window.rs:220",    sel: "canBecomeKeyWindow",             authority: Authority::Class("NSWindow"), winit: "B@:" },
     // ---- WinitApplication : NSApplication
     // ---- WindowDelegate : NSObject <NSWindowDelegate, NSDraggingDestination>
     Row { site: "window_delegate.rs:231", sel: "windowShouldClose:",                 authority: Authority::Proto("NSWindowDelegate"), winit: "B@:@" },
@@ -339,30 +429,52 @@ fn static_cstr(name: &str) -> &'static std::ffi::CStr {
     )
 }
 
-/// The runtime's own answer for one row, offset-free, or `None` where no
-/// authority exists.
-fn authority_encoding(row: &Row) -> Option<String> {
+/// The runtime's own answer for one row, offset-free, or why there is none.
+fn authority_encoding(row: &Row) -> Reading {
     let s = sel_uncached(static_cstr(row.sel));
     let raw = match row.authority {
         Authority::Proto(name) => {
+            if !host_registers(name) {
+                // Absence has two causes and only one is an allowance: AppKit
+                // not being loaded makes every census here vacuous, and is
+                // told apart by a class AppKit always registers.
+                assert!(
+                    !class(c"NSApplication").is_null(),
+                    "AppKit did not load, so this census would pass vacuously"
+                );
+                assert!(
+                    HOST_MAY_LACK.contains(&name),
+                    "protocol {name} is absent although AppKit is loaded — this host's \
+                     AppKit does not register it, and the census has no allowance written \
+                     for that; measure it and add it to HOST_MAY_LACK"
+                );
+                return Reading::HostLacksProtocol(name);
+            }
             let p = protocol(static_cstr(name));
-            assert!(
-                !p.is_null(),
-                "protocol {name} is absent — AppKit did not load, so this \
-                 census would pass vacuously"
-            );
-            // SAFETY: `p` is a live protocol object, asserted non-null.
-            unsafe { protocol_method_types(p, s, true) }
+            // SAFETY: `p` is a live protocol object the host registered.
+            let Some(t) = (unsafe { protocol_method_types(p, s, true) }) else {
+                // A REAL protocol that does not declare the row is a census
+                // failure, never a skip: the table says this protocol is the
+                // authority and the runtime says it is not.
+                panic!(
+                    "{} {}: {name} is registered by this host and does not declare it",
+                    row.site, row.sel
+                );
+            };
+            t
         }
         Authority::Class(name) => {
             let c = class(static_cstr(name));
             assert!(!c.is_null(), "class {name} is absent — AppKit did not load");
             // SAFETY: `c` is a live class object, asserted non-null.
-            unsafe { method_types(c, s) }
+            let Some(t) = (unsafe { method_types(c, s) }) else {
+                panic!("{} {}: {name} does not implement it", row.site, row.sel);
+            };
+            t
         }
-        Authority::None(_) => None,
+        Authority::None(reason) => return Reading::NoAuthority(reason),
     };
-    raw.map(|t| strip_method_offsets(&t))
+    Reading::Declared(strip_method_offsets(&raw))
 }
 
 // --------------------------------------------------------------------- tests
@@ -722,9 +834,10 @@ fn no_declared_winit_method_takes_a_block() {
         "AppKit must load for this census to mean anything"
     );
     let mut unchecked = Vec::new();
+    let mut host_lacking = Vec::new();
     for row in ROWS {
         match authority_encoding(row) {
-            Some(enc) => {
+            Reading::Declared(enc) => {
                 assert!(
                     !enc.contains("@?"),
                     "{} {} takes or returns a BLOCK ({enc}) — `@?` is on the \
@@ -740,11 +853,11 @@ fn no_declared_winit_method_takes_a_block() {
                     row.sel
                 );
             }
-            None => {
-                let Authority::None(reason) = row.authority else {
-                    unreachable!("only an Authority::None row has no encoding")
-                };
+            Reading::NoAuthority(reason) => {
                 unchecked.push((row.site, row.sel, expand(row.winit), reason));
+            }
+            Reading::HostLacksProtocol(name) => {
+                host_lacking.push((row.site, row.sel, name));
             }
         }
         assert!(
@@ -775,6 +888,9 @@ fn no_declared_winit_method_takes_a_block() {
         ],
         "the set of rows no protocol or class declares changed"
     );
+    // And the rows whose protocol THIS HOST does not register: exactly the
+    // allowance, or nothing.
+    assert_host_lacking_is_the_allowance(&host_lacking);
 }
 
 /// P2's other half — `@?` IS implemented, and correctly, measured against
@@ -843,9 +959,15 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
     );
     let mut disagreements = Vec::new();
     let mut checked = 0_usize;
+    let mut host_lacking = Vec::new();
     for row in ROWS {
-        let Some(authority) = authority_encoding(row) else {
-            continue;
+        let authority = match authority_encoding(row) {
+            Reading::Declared(authority) => authority,
+            Reading::NoAuthority(_) => continue,
+            Reading::HostLacksProtocol(name) => {
+                host_lacking.push((row.site, row.sel, name));
+                continue;
+            }
         };
         checked += 1;
         let ours = expand(row.winit);
@@ -853,9 +975,12 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
             disagreements.push((row.site, row.sel, ours, authority));
         }
     }
+    assert_host_lacking_is_the_allowance(&host_lacking);
     assert_eq!(
-        checked, 69,
-        "sixty-nine of the seventy-one have an authority"
+        checked + host_lacking.len(),
+        69,
+        "sixty-nine of the seventy-one have an authority — all sixty-nine checked on a host \
+         whose AppKit registers NSApplicationDelegate, sixty-six where it does not"
     );
 
     let named: Vec<String> = disagreements
@@ -881,6 +1006,47 @@ fn no_declared_row_disagrees_with_the_runtimes_own_authority() {
         "if BOOL and NSUInteger ever encoded alike the P3 row would have been \
          harmless and this whole census pointless"
     );
+}
+
+/// The allowance is exactly what this host lacks, in both directions: every
+/// protocol a row's authority names that this host does not register is on
+/// [`HOST_MAY_LACK`] — so a NEW absence is red, by name — and every name on
+/// the allowance is a real authority in the table, so it cannot outlive the
+/// rows it excuses.
+#[test]
+fn the_host_allowance_is_exactly_what_this_host_lacks() {
+    assert!(load_appkit(), "AppKit must load for this to mean anything");
+    assert!(
+        !class(c"NSApplication").is_null(),
+        "AppKit's classes are present, so an absent protocol is the host's doing"
+    );
+    let mut names: Vec<&str> = ROWS
+        .iter()
+        .filter_map(|r| match r.authority {
+            Authority::Proto(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let absent: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !host_registers(n))
+        .collect();
+    for n in &absent {
+        assert!(
+            HOST_MAY_LACK.contains(n),
+            "{n} is absent from this host's AppKit and not on the allowance"
+        );
+    }
+    for n in HOST_MAY_LACK {
+        assert!(
+            names.contains(n),
+            "{n} is on the allowance but is no row's authority"
+        );
+    }
+    eprintln!("winit_seam: this host's AppKit lacks {absent:?} of the authorities {names:?}");
 }
 
 /// The two rows next to it really ARE `BOOL`, which is what makes the one row
@@ -1083,8 +1249,9 @@ fn the_ported_signatures_encode_to_the_authority() {
         let registered = unsafe { method_types(cls, s) }
             .map(|t| strip_method_offsets(&t))
             .unwrap_or_else(|| panic!("{} is not registered on the mirror", row.sel));
-        let authority =
-            authority_encoding(row).unwrap_or_else(|| panic!("{} has no authority", row.sel));
+        let Reading::Declared(authority) = authority_encoding(row) else {
+            panic!("{} has no authority on this host", row.sel)
+        };
         assert_eq!(
             registered, authority,
             "{} {}: the port's Rust signature encodes to {registered}, the \
@@ -1146,8 +1313,11 @@ fn the_ported_signatures_encode_to_the_authority() {
 /// The subject carries a `u8` rather than the `()` `WinitWindow` uses, because
 /// `()` has no value to hand out wrongly and the sentence being corrected is
 /// about a class that carries STATE. The slot is therefore 2 bytes rather than
-/// 1, and the runtime still places it at 513 — `NSWindow` is 520 bytes with its
-/// last ivar ending at 513, and an align-1 slot goes in the padding either way.
+/// 1, and where the runtime places it is a HOST fact the test measures: on the
+/// macOS 26 release cutter `NSWindow` is 520 bytes with its last ivar ending at
+/// 513, and an align-1 slot goes in the padding either way; on macOS 14.4.1
+/// `NSWindow` is 448 bytes with no padding at all and the slot lands at 448,
+/// past the allocation. Three survivors in four defeat the flag on both.
 #[test]
 fn a_substituting_initializer_defeats_the_initialized_flag() {
     assert!(
@@ -1186,14 +1356,28 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
     let window_size = unsafe { class_getInstanceSize(class(c"NSWindow")) };
     let object_size = unsafe { class_getInstanceSize(class(c"NSObject")) };
     let slot = size_of::<aterm_objc::IvarSlot<u8>>();
-    // THE OFFSET IS INSIDE THE SUPERCLASS'S OWN ALLOCATION. That is not a
-    // detail, it is why case (b) below reads memory rather than faulting: the
-    // runtime places a small, align-1 slot in `NSWindow`'s TAIL PADDING instead
-    // of past its instance size.
+    // WHERE THE SLOT LANDS IS A HOST FACT, measured rather than assumed. On the
+    // macOS 26 release cutter `NSWindow` is 520 bytes with its last ivar ending
+    // at 513, so the runtime places a small, align-1 slot in the TAIL PADDING —
+    // inside the superclass's own allocation, which is why case (b) below can
+    // read memory there rather than fault. On macOS 14.4.1 `NSWindow` is 448
+    // bytes with its last ivar ending exactly at 448: there is no padding, the
+    // slot lands AT the instance size, and a plain `NSWindow`'s malloc block
+    // ends there too, so case (b) is settled by arithmetic instead — the read
+    // would be out of bounds, the shape of case (d).
+    //
+    // "Inside the allocation" is measured against the MALLOC BLOCK of the
+    // plain `NSWindow` case (b) reads, not against `class_getInstanceSize`:
+    // the block is the larger of the two (malloc rounds up to its quantum),
+    // and it is what "in bounds" means. A host whose instance size is not a
+    // multiple of the quantum has slack past its last ivar that is padding in
+    // every sense that matters here.
+    let superclass_instance = unsafe { class_createInstance(class(c"NSWindow"), 0) };
+    let block = unsafe { malloc_size(superclass_instance.as_ptr()) };
+    let in_padding = (off as usize) + slot <= block;
     assert!(
-        (off as usize) < window_size && (off as usize) + slot <= window_size,
-        "the slot at {off} lies inside NSWindow's own {window_size}-byte \
-         allocation — in the tail padding after its last ivar"
+        in_padding || (off as usize) >= block,
+        "the slot at {off} straddles the end of a plain NSWindow's {block}-byte block"
     );
 
     // Every instance below is deliberately leaked: `-dealloc` on an NSWindow
@@ -1227,24 +1411,40 @@ fn a_substituting_initializer_defeats_the_initialized_flag() {
     );
 
     // (b) A PLAIN `NSWindow`. It panics too, and NOT for the stated reason:
-    // there is no slot there at all, only tail padding that happens to be zero.
-    let superclass_instance = unsafe { class_createInstance(class(c"NSWindow"), 0) };
-    assert_eq!(
-        reads_a_value(superclass_instance),
-        None,
-        "NSWindow's tail padding is zero as allocated, so this panics — by \
-         accident of what has not been written there yet"
-    );
-    // SAFETY: `off` is inside NSWindow's own allocation (asserted above) and
-    // belongs to no ivar of NSWindow's; writing one byte of padding is what a
-    // future framework ivar would do for real.
-    unsafe { *superclass_instance.as_ptr().cast::<u8>().offset(off) = 1 };
-    assert!(
-        reads_a_value(superclass_instance).is_some(),
-        "set that one padding byte and the flag reads TRUE and `get` hands out a \
-         &T over padding — the panic in the line above was contingent on unused \
-         bytes, not on this crate's zero-fill"
-    );
+    // there is no slot there at all, only tail padding that happens to be zero
+    // — on a host that HAS tail padding. Where there is none the slot is past
+    // the block and no read is performed, because the read is the defect.
+    if in_padding {
+        assert_eq!(
+            reads_a_value(superclass_instance),
+            None,
+            "NSWindow's tail padding is zero as allocated, so this panics — by \
+             accident of what has not been written there yet"
+        );
+        // SAFETY: `off` is inside the plain NSWindow's own malloc block
+        // (`in_padding`, measured against `malloc_size`) and belongs to no
+        // ivar of NSWindow's; writing one byte of padding is what a future
+        // framework ivar would do for real.
+        unsafe { *superclass_instance.as_ptr().cast::<u8>().offset(off) = 1 };
+        assert!(
+            reads_a_value(superclass_instance).is_some(),
+            "set that one padding byte and the flag reads TRUE and `get` hands out a \
+             &T over padding — the panic in the line above was contingent on unused \
+             bytes, not on this crate's zero-fill"
+        );
+    } else {
+        assert!(
+            (off as usize) >= block,
+            "on this host the slot at {off} is past a plain NSWindow's {block}-byte block, \
+             so this survivor is read OUT OF BOUNDS — defeated by a load the arithmetic \
+             forbids, the shape of case (d)"
+        );
+        eprintln!(
+            "winit_seam: NSWindow is {window_size} bytes on this host with no tail padding; \
+             the slot at {off} is past its {block}-byte block, so case (b) is settled by \
+             arithmetic rather than by a padding read"
+        );
+    }
 
     // (c) A SIBLING SUBCLASS whose own slot the runtime placed at the same
     // offset. It initialises ITS OWN ivar honestly, and we read the value.

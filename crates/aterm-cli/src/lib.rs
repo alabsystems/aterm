@@ -121,6 +121,8 @@ const HELP_HEAD: &str = concat!(
     "                              network + credential reads via the macOS sandbox).\n",
     "        --no-sandbox          Shorthand for --containment user (no OS sandbox;\n",
     "                              full network/credential access — the default).\n",
+    "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
+    "                              this session; see `aterm help reroute`.\n",
     "    -q, --quiet               Suppress the one-line interactive startup notice\n",
     "                              (piped/scripted runs are always silent).\n",
     "    -h, --help                Print this help and exit.\n",
@@ -648,8 +650,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 enabled / check         the silent Full Disk Access probe. It reads state that already\n\
      \x20                         exists and raises NO dialog. Off, every field reads `unknown` —\n\
      \x20                         which is not `denied`, and the report says which it is.\n\
-     \x20 notice                  the at-most-once transient pill when a session may be waiting\n\
-     \x20                         on a consent dialog.\n\
+     \x20 notice                  the one-time macOS access card: while Full Disk Access is not\n\
+     \x20                         granted to aterm, ONE passive card offers Open Settings (the\n\
+     \x20                         Full Disk Access pane) and Not now; Not now is remembered.\n\
      \x20 warmup                  \"never\" | \"on-request\". The warm-up asks macOS for the folders\n\
      \x20                         up front, which RAISES the dialogs on purpose, so it happens\n\
      \x20                         only when the owner presses the button in Settings — never at\n\
@@ -1377,7 +1380,8 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
 
 /// Pure PATH-prepend: the `("PATH", value)` pair that puts `dir` first on the child's
 /// PATH. `None` when `dir` is already present (idempotent for aterm-inside-aterm nesting),
-/// mirroring aterm-gui's `bundle_path_env`. The platform separator is `;` on Windows.
+/// mirroring aterm-gui's bundle-dir arm of `spawn::reroute_path_env`. The platform
+/// separator is `;` on Windows.
 fn prepend_path(dir: &str, inherited: Option<&str>) -> Option<(String, String)> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     match inherited {
@@ -1387,14 +1391,13 @@ fn prepend_path(dir: &str, inherited: Option<&str>) -> Option<(String, String)> 
     }
 }
 
-/// The `("PATH", value)` to hand the child shell so the ONE front door — `aterm` itself, and
-/// thus every `aterm <verb>` — is reachable even when aterm was launched by an absolute path
-/// from a dir not on `$PATH`. Prepends aterm's own binary directory unconditionally: with ONE
-/// binary the dir IS the toolset when it is a REAL install — proven by the `aterm-ctl`
-/// argv0 alias the bundle and the source store both lay down beside the binary. A lone
-/// binary in an uncontrolled directory (~/Downloads) injects nothing, preserving the
-/// binary-era invariant. Idempotent when the dir is already on PATH.
-fn front_door_path_env() -> Option<(String, String)> {
+/// aterm's own binary directory, to hand the child shell so the ONE front door — `aterm`
+/// itself, and thus every `aterm <verb>` — is reachable even when aterm was launched by an
+/// absolute path from a dir not on `$PATH`. With ONE binary the dir IS the toolset when it
+/// is a REAL install — proven by the `aterm-ctl` argv0 alias the bundle and the source
+/// store both lay down beside the binary. A lone binary in an uncontrolled directory
+/// (~/Downloads) yields `None`, preserving the binary-era invariant.
+fn front_door_bin_dir() -> Option<String> {
     let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
     let dir = exe.parent()?;
     if !dir
@@ -1403,7 +1406,61 @@ fn front_door_path_env() -> Option<(String, String)> {
     {
         return None;
     }
-    prepend_path(dir.to_str()?, std::env::var("PATH").ok().as_deref())
+    dir.to_str().map(str::to_owned)
+}
+
+/// `atpkg::reroute::REROUTE_DIR_ENV` and `NO_REROUTE_ENV`, restated: this crate links
+/// `atpkg` for its tests only (Cargo.toml: "the router composes these crates, aterm-cli
+/// does not call atpkg"), and `reroute_env_names_match_atpkg` pins both spellings.
+const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
+const NO_REROUTE_ENV: &str = "ATERM_NO_REROUTE";
+
+/// The session's reroute directory, read at this edge from `$ATERM_REROUTE_DIR` — which the
+/// front door (`crates/aterm/src/main.rs`) resolves from the configured store, lays the
+/// stubs into, and establishes in THIS process's environment before `session_main` runs.
+/// `None` when `$ATERM_NO_REROUTE` is engaged (non-empty and not `0` — `env_flag_engaged`,
+/// THE reading, the same the stubs and the window apply), when the variable is unset or
+/// empty, or when it does not name an existing directory (Windows lays no stubs; a stale
+/// value must never put a nonexistent entry first on every child's PATH).
+fn reroute_dir_from_env() -> Option<String> {
+    if aterm_types::control_socket::env_flag_engaged(std::env::var(NO_REROUTE_ENV).ok().as_deref())
+    {
+        return None;
+    }
+    std::env::var(REROUTE_DIR_ENV)
+        .ok()
+        .filter(|dir| !dir.is_empty() && std::path::Path::new(dir).is_dir())
+}
+
+/// THE ONE `("PATH", value)` pair the session hands its shell (the pty seam's
+/// `build_child_env` is key-overwrite; a second PATH pair would drop the first):
+/// `reroute_dir` FIRST — MOVED to the front, every occurrence already in `inherited`
+/// removed, so a nested aterm or a user PATH that already lists it later still ends up
+/// with it first (the measured 2026-09-07 failure was an ORDER: `~/.cargo/bin` at position
+/// 17 ahead of the managed store at 19; skip-if-present would have left it there) — then
+/// `front_door_dir` through [`prepend_path`] (skip-if-present: a second front door is
+/// harmless, a shadowed reroute dir is not), then the inherited PATH verbatim. `None` when
+/// nothing is injected. Mirrors aterm-gui's `spawn::reroute_path_env`.
+fn session_path_env(
+    reroute_dir: Option<&str>,
+    front_door_dir: Option<&str>,
+    inherited: Option<&str>,
+) -> Option<(String, String)> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let Some(reroute) = reroute_dir else {
+        return front_door_dir.and_then(|dir| prepend_path(dir, inherited));
+    };
+    let front = front_door_dir
+        .and_then(|dir| prepend_path(dir, inherited))
+        .map(|(_, value)| value);
+    let base = front.as_deref().or(inherited).filter(|p| !p.is_empty());
+    let mut entries: Vec<&str> = vec![reroute];
+    entries.extend(
+        base.into_iter()
+            .flat_map(|p| p.split(sep))
+            .filter(|entry| *entry != reroute),
+    );
+    Some(("PATH".to_string(), entries.join(&sep.to_string())))
 }
 
 /// Whether `first` (the `argv[1]` operand) should be CONSIDERED for toolchain dispatch.
@@ -1573,11 +1630,37 @@ pub fn session_main(quiet: bool) -> ! {
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
 
-    // Guarantee the front door is reachable inside the shell: prepend aterm's own binary
-    // directory to the child PATH, so `aterm` (and thus every `aterm <verb>`) always resolves,
-    // even when aterm was launched by an absolute path from a dir not on $PATH. Mirrors
-    // aterm-gui's `bundle_path_env`; inert for a lone binary or when already on PATH.
-    let env_add: Vec<(String, String)> = front_door_path_env().into_iter().collect();
+    // THE session PATH — exactly ONE `("PATH", value)` pair, composed as the window's
+    // baseline `env_add` composes it (`docs/DESIGN-toolchain-reroute-2026-09-07.md`
+    // §"Reaching PATH"): the REROUTE dir first (move-to-front — a bare `cargo`/`rustc` in
+    // the session is announced or signposted instead of running upstream Rust silently),
+    // then aterm's own binary directory so `aterm` (and thus every `aterm <verb>`) always
+    // resolves even when aterm was launched by an absolute path from a dir not on $PATH
+    // (inert for a lone binary or when already on PATH), then the inherited PATH verbatim.
+    // The reroute dir arrives as `$ATERM_REROUTE_DIR` from the front door, which owns the
+    // store (`reroute_dir_from_env`); `ATERM_NO_REROUTE` engaged ⇒ no prepend and no
+    // export, the same rule the stubs and the window apply. The dir is re-exported so the
+    // shell integration can re-assert it first after the user's rc files have run.
+    let reroute_dir = reroute_dir_from_env();
+    let mut env_add: Vec<(String, String)> = session_path_env(
+        reroute_dir.as_deref(),
+        front_door_bin_dir().as_deref(),
+        std::env::var("PATH").ok().as_deref(),
+    )
+    .into_iter()
+    .collect();
+    if let Some(dir) = &reroute_dir {
+        env_add.push((REROUTE_DIR_ENV.to_string(), dir.clone()));
+    } else if std::env::var_os(REROUTE_DIR_ENV).is_some() {
+        // The escape is engaged (or nothing is laid) and an ENCLOSING session's
+        // directory travelled in by inheritance: blank it, so the shell
+        // integration's re-assert stays inert. "No export" has to mean "not set".
+        env_add.push((REROUTE_DIR_ENV.to_string(), String::new()));
+    }
+    // Deliberately NOT setting `ATERM_CHILD` here: this lane has never carried it,
+    // `net_listen`'s ROOT-ONLY nesting guard reads it, and the reroute gates on
+    // nothing but its own two variables. Changing what a headless aterm launched
+    // from an `aterm --session` shell counts as is a separate decision.
 
     // PROTECTED spawn: cap-gated, setrlimit-bounded in the child before execve,
     // fail-closed, and OS-sandbox-wrapped when `sandbox_wrap` is `Some`. Returns the
@@ -1641,11 +1724,12 @@ pub fn session_main(quiet: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, PrivacyFacts, ProbeLabel,
-        SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args, diag_report, doctor_checks,
-        doctor_report, explain_config_report, help_text, is_tool_candidate, list_fonts_report,
-        list_themes_report, prepend_path, session_model_armed, show_face_report,
-        validate_containment_value, verb_help_block, version_text,
+        CliAction, DIAG_COMMANDS, DrClass, FdaState, Mark, NO_REROUTE_ENV, PrivacyFacts,
+        ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV, VERB_BLURB_COLUMN, Verb, decide_args,
+        diag_report, doctor_checks, doctor_report, explain_config_report, help_text,
+        is_tool_candidate, list_fonts_report, list_themes_report, prepend_path,
+        session_model_armed, session_path_env, show_face_report, validate_containment_value,
+        verb_help_block, version_text,
     };
 
     fn decide(args: &[&str]) -> CliAction {
@@ -2022,6 +2106,67 @@ mod tests {
         // Already on PATH (aterm-inside-aterm): inject nothing, no duplicate stacking.
         let already = format!("/usr/bin{sep}{bin}{sep}/bin");
         assert_eq!(prepend_path(bin, Some(&already)), None);
+    }
+
+    /// The composed session PATH: the reroute dir FIRST — moved there from wherever the
+    /// inherited PATH already listed it (a nested aterm; the 2026-09-07 shape with
+    /// `~/.cargo/bin` ahead of the store), exactly once — then the front door, then the
+    /// rest; idempotent when applied to its own output; and, with no reroute dir, exactly
+    /// `prepend_path`'s answer.
+    #[test]
+    fn session_path_puts_the_reroute_dir_first_by_move_to_front_and_is_idempotent() {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let join = |parts: &[&str]| parts.join(&sep.to_string());
+        let reroute = "/Users//u/Library/Application Support/aterm/pkg/reroute";
+        let bin = "/opt/aterm/bin";
+        // Front position, ahead of the front door and the inherited PATH.
+        assert_eq!(
+            session_path_env(Some(reroute), Some(bin), Some(&join(&["/usr/bin", "/bin"]))),
+            Some((
+                "PATH".to_string(),
+                join(&[reroute, bin, "/usr/bin", "/bin"])
+            ))
+        );
+        // Listed later (twice) in the inherited PATH: moved to the front, once.
+        let inherited = join(&["/Users//u/.cargo/bin", reroute, bin, "/usr/bin", reroute]);
+        let (_, value) =
+            session_path_env(Some(reroute), Some(bin), Some(&inherited)).expect("injects");
+        assert_eq!(
+            value,
+            join(&[reroute, "/Users//u/.cargo/bin", bin, "/usr/bin"])
+        );
+        assert_eq!(value.matches(reroute).count(), 1);
+        // Applied to its own output: the same value (a nested aterm stacks nothing).
+        let (_, again) = session_path_env(Some(reroute), Some(bin), Some(&value)).expect("injects");
+        assert_eq!(again, value);
+        // No front door (a lone binary), no inherited PATH: the reroute dir alone.
+        assert_eq!(
+            session_path_env(Some(reroute), None, None).map(|p| p.1),
+            Some(reroute.to_string())
+        );
+        assert_eq!(
+            session_path_env(Some(reroute), None, Some("")).map(|p| p.1),
+            Some(reroute.to_string())
+        );
+        // No reroute dir (`--no-reroute`, Windows): `prepend_path`'s contract, unchanged.
+        assert_eq!(
+            session_path_env(None, Some(bin), Some("/usr/bin")),
+            prepend_path(bin, Some("/usr/bin"))
+        );
+        assert_eq!(
+            session_path_env(None, Some(bin), Some(&join(&["/usr/bin", bin]))),
+            None
+        );
+        assert_eq!(session_path_env(None, None, Some("/usr/bin")), None);
+    }
+
+    /// The two reroute variables this crate reads are atpkg's spellings — restated in
+    /// this crate because atpkg is a test-only dependency here, and pinned so the two
+    /// copies cannot drift apart.
+    #[test]
+    fn reroute_env_names_match_atpkg() {
+        assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
+        assert_eq!(NO_REROUTE_ENV, atpkg::reroute::NO_REROUTE_ENV);
     }
 
     #[test]

@@ -110,10 +110,13 @@ fn untouched_template_keys_survive_verbatim() {
     assert!(out.contains("<key>NSHighResolutionCapable</key>"), "{out}");
 }
 
-/// The seven TCC usage strings (design §3.2). They are static template keys —
-/// `stamp_info_plist` never names them — so the only way they can be lost is
-/// template drift or a stamp that rewrites the wrong `<string>`.
-const USAGE_KEYS: [&str; 7] = [
+/// The nine TCC usage strings (design §3.2, plus the two library services a
+/// home-directory walk was measured raising on 2026-09-07 — the music library
+/// prompted beside the folder ones, and the photo library is the same class).
+/// They are static template keys — `stamp_info_plist` never names them — so
+/// the only way they can be lost is template drift or a stamp that rewrites
+/// the wrong `<string>`.
+const USAGE_KEYS: [&str; 9] = [
     "NSDocumentsFolderUsageDescription",
     "NSDesktopFolderUsageDescription",
     "NSDownloadsFolderUsageDescription",
@@ -121,6 +124,8 @@ const USAGE_KEYS: [&str; 7] = [
     "NSRemovableVolumesUsageDescription",
     "NSFileProviderDomainUsageDescription",
     "NSAppDataUsageDescription",
+    "NSAppleMusicUsageDescription",
+    "NSPhotoLibraryUsageDescription",
 ];
 
 #[test]

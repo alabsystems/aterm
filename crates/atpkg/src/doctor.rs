@@ -300,6 +300,74 @@ pub fn run_with(
         );
     }
 
+    // (3b) REROUTE (philosophy §4, `crate::reroute`): per row, the stub's state; then
+    // ORDER, not presence. The failure this exists to name was an order — measured
+    // 2026-09-07, `~/.cargo/bin` sat at PATH position 17, ahead of everything managed,
+    // and a bare `cargo` in a session ran upstream Rust silently. Everything here is
+    // advisory (warn, exit 0): outside an aterm session the reroute dir is not on PATH
+    // BY DESIGN (the prepend is session-scoped, never machine-wide), and a missing stub
+    // is re-laid at the next spawn. Doctor names; it never lays.
+    let reroute_dir = layout.reroute_dir();
+    for (name, state) in crate::reroute::states(layout) {
+        match state {
+            crate::reroute::StubState::Laid => {
+                let _ = writeln!(out, "{p}: ok — reroute stub {name} laid");
+            }
+            crate::reroute::StubState::Missing if cfg!(windows) => {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — reroute stub {name} not laid: Windows lays no reroute stubs yet (TARGET)"
+                );
+            }
+            crate::reroute::StubState::Missing => {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — reroute stub {name} missing (an aterm session lays it at \
+                     spawn; `aterm pkg repair` re-lays it; a recorded decline lays none)"
+                );
+            }
+            crate::reroute::StubState::Foreign => {
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — {} is not ours (foreign file; never touched)",
+                    crate::reroute::stub_path(layout, name).display()
+                );
+            }
+        }
+    }
+    let path_entries: Vec<std::path::PathBuf> = path_var
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let reroute_at = path_entries.iter().position(|d| *d == reroute_dir);
+    let upstream_at = upstream_index_on_path(&path_entries, &layout.prefix, "cargo");
+    match (reroute_at, upstream_at) {
+        (None, _) => {
+            let _ = writeln!(
+                out,
+                "{p}: note — reroute dir not on this PATH (expected outside an aterm session)"
+            );
+        }
+        (Some(i), Some(j)) if i < j => {
+            let _ = writeln!(
+                out,
+                "{p}: ok — reroute dir precedes upstream cargo (PATH[{i}] < PATH[{j}])"
+            );
+        }
+        (Some(i), Some(j)) => {
+            let _ = writeln!(
+                out,
+                "{p}: warn — upstream cargo at PATH[{j}] precedes the reroute dir at PATH[{i}]; \
+                 inside an aterm session the spawn seam and shell integration put it first"
+            );
+        }
+        (Some(i), None) => {
+            let _ = writeln!(
+                out,
+                "{p}: ok — reroute dir on PATH (PATH[{i}]); no upstream cargo on this PATH"
+            );
+        }
+    }
+
     // (4) BROKEN SHIM SCAN of bin/ — a shim whose forward target is GONE (a dangling
     // symlink on Unix; on Windows a `.cmd` forwarding to a missing exe, which no symlink
     // scan could ever catch). `resolve_shim` reads the target cross-platform; a tombstone
@@ -1176,6 +1244,37 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
     }
 }
 
+/// The index (in `split_paths` order) of the first `PATH` entry holding an executable
+/// `name` OUTSIDE the managed `prefix` — the reroute dir lives under it, so a laid stub
+/// never counts as its own upstream. A local walk on purpose: the vendor probes are
+/// [`crate::store::ToolName`]-gated and `cargo` is deny-listed there. Relative entries
+/// are skipped (they name the cwd, not a toolchain), and only an executable regular file
+/// counts — a directory named `cargo` is not a copy that runs.
+fn upstream_index_on_path(
+    entries: &[std::path::PathBuf],
+    prefix: &Path,
+    name: &str,
+) -> Option<usize> {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    entries.iter().position(|dir| {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() || dir.starts_with(prefix) {
+            return false;
+        }
+        let Ok(meta) = std::fs::metadata(dir.join(&file)) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            meta.is_file()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,6 +1462,114 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (3b) REROUTE: per-row stub state (laid / missing / foreign) and PATH ORDER — the
+    /// measured failure (2026-09-07) was upstream `~/.cargo/bin` AHEAD of the reroute
+    /// dir, never the dir's absence — with the reroute dir compared against a fake
+    /// upstream `cargo` outside the prefix through the injected `path_var`. Every line
+    /// is advisory: the warn leaves a healthy toolset healthy.
+    #[cfg(unix)]
+    #[test]
+    fn reroute_section_reports_stub_state_and_path_order() {
+        let l = layout("reroute");
+        install(&l, "ay", 18);
+        let home = synthetic_home("reroute");
+        // A fake upstream cargo OUTSIDE the prefix (a sibling temp dir), so the walk
+        // counts it — a copy under the prefix would be the stub counting itself.
+        let upstream = std::env::temp_dir().join(format!(
+            "atpkg-doctor-reroute-upstream-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&upstream);
+        std::fs::create_dir_all(&upstream).unwrap();
+        std::fs::write(upstream.join("cargo"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            upstream.join("cargo"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let run = |entries: &[PathBuf]| {
+            let path = std::env::join_paths(entries).unwrap();
+            let mut out: Vec<u8> = Vec::new();
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &mut out,
+                &mut std::io::sink(),
+            );
+            (ok, String::from_utf8_lossy(&out).into_owned())
+        };
+        // Nothing laid and the reroute dir absent from PATH (a shell outside a session):
+        // every row missing as a warning, the order line a note, the toolset still healthy.
+        let (ok, out) = run(&[l.bin_dir(), upstream.clone()]);
+        assert!(ok, "missing reroute stubs are advisory:\n{out}");
+        for row in crate::reroute::TABLE {
+            assert!(
+                out.contains(&format!(
+                    "doctor: warn — reroute stub {} missing (an aterm session lays it at \
+                     spawn; `aterm pkg repair` re-lays it; a recorded decline lays none)",
+                    row.upstream
+                )),
+                "{out}"
+            );
+        }
+        assert!(
+            out.contains(
+                "doctor: note — reroute dir not on this PATH (expected outside an aterm session)"
+            ),
+            "{out}"
+        );
+        crate::reroute::lay(&l).unwrap();
+        let reroute = l.reroute_dir();
+        // Upstream AHEAD of the reroute dir: the measured failure, as a warning — exit 0.
+        let (ok, out) = run(&[upstream.clone(), reroute.clone(), l.bin_dir()]);
+        assert!(ok, "a mis-ordered PATH is advisory:\n{out}");
+        assert!(
+            out.contains("doctor: ok — reroute stub cargo laid"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "doctor: warn — upstream cargo at PATH[0] precedes the reroute dir at PATH[1]; \
+                 inside an aterm session the spawn seam and shell integration put it first"
+            ),
+            "{out}"
+        );
+        // The reroute dir first: the order a session guarantees.
+        let (ok, out) = run(&[reroute.clone(), upstream.clone(), l.bin_dir()]);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains("doctor: ok — reroute dir precedes upstream cargo (PATH[0] < PATH[1])"),
+            "{out}"
+        );
+        // On PATH with no upstream cargo anywhere: said, not warned.
+        let (_, out) = run(&[reroute.clone(), l.bin_dir()]);
+        assert!(
+            out.contains(
+                "doctor: ok — reroute dir on PATH (PATH[0]); no upstream cargo on this PATH"
+            ),
+            "{out}"
+        );
+        // A foreign occupant of a row's name is named by path and never claimed.
+        std::fs::write(reroute.join("z3"), "#!/bin/sh\nexit 0\n").unwrap();
+        let (ok, out) = run(&[reroute.clone(), upstream.clone(), l.bin_dir()]);
+        assert!(ok, "{out}");
+        assert!(
+            out.contains(&format!(
+                "doctor: warn — {} is not ours (foreign file; never touched)",
+                reroute.join("z3").display()
+            )),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&upstream);
     }
 
     /// THE QUESTION THE COMMAND EXISTS FOR. Every structural check passes vacuously

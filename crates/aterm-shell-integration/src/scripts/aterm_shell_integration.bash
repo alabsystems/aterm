@@ -147,6 +147,46 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
+# ─── The reroute directory, FIRST ───
+#
+# $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
+# stubs for the upstream Rust names (`aterm help reroute`), which the seam already
+# put FIRST on the PATH it handed this shell. The user's own rc files run AFTER
+# that injected environment (`. ~/.cargo/env` in a ~/.bashrc prepends ~/.cargo/bin),
+# and so may the package blocks just above. Measured 2026-09-07: ~/.cargo/bin at
+# position 17, ahead of the managed store at 19, so a bare `cargo` ran upstream
+# Rust silently. An ORDER failure — which is why this is move-to-front (every
+# existing occurrence removed, then prepended), never skip-if-present. This file
+# is sourced last, after the user's rc, so one assert here is final. Inert outside
+# a session: the variable is unset, or the directory (Windows lays none) does not
+# exist.
+#
+# Pure parameter expansion, no fork and no IFS surgery: framing PATH as `:$PATH:`
+# makes every entry `:entry:`-delimited, so /opt/x never matches /opt/xy; the
+# quoted pattern keeps `*`/`[` in the directory literal; the loop catches two
+# adjacent copies (the first pass consumes the colon between them); and an EMPTY
+# entry ("here", to a POSIX shell) — the user's — survives because exactly the one
+# framing colon is stripped from each end.
+__aterm_reroute_path_front() {
+    if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
+        local __aterm_p=":$PATH:" __aterm_q
+        # Fixpoint by POSIX equality, not by `[[ == pattern ]]`: under
+        # `shopt -s nocasematch` (a user's .bashrc runs before this file) the
+        # pattern test is case-insensitive while the replacement is not, and a
+        # case-variant spelling of the directory made the old loop spin forever
+        # before the prompt (2026-09-07 review).
+        while :; do
+            __aterm_q="${__aterm_p//":$ATERM_REROUTE_DIR:"/:}"
+            [ "$__aterm_q" = "$__aterm_p" ] && break
+            __aterm_p="$__aterm_q"
+        done
+        __aterm_p="${__aterm_p#:}"
+        __aterm_p="${__aterm_p%:}"
+        export PATH="$ATERM_REROUTE_DIR${__aterm_p:+:$__aterm_p}"
+    fi
+}
+__aterm_reroute_path_front
+
 # Store the real PROMPT_COMMAND before we modify it.
 # Detect array vs scalar to preserve bash 5.1+ array-style PROMPT_COMMAND.
 __aterm_prompt_cmd_is_array=0

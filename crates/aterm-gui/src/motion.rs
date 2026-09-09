@@ -113,6 +113,13 @@ pub(crate) enum MotionEffect {
     /// than an ease: an effect that answers PROGRAM OUTPUT is exactly the kind
     /// a motion-sensitive user needs GONE, not merely gentler.
     OutputStreak,
+    /// The UPGRADE SURGE's border (`crate::level_up`): the pulse, the climb,
+    /// the landing burst, the hue travel, the thickening and the arrow's rise
+    /// all scale with this amplitude. 0 ⇒ a STILL rim at a fixed alpha and
+    /// thickness for each phase, and an arrow that fades in place — the
+    /// information (an update is applying; it landed) is kept, the movement
+    /// is removed: the notice pill's rule, not the matrix rain's.
+    UpgradeSurge,
 }
 
 impl MotionEffect {
@@ -122,7 +129,7 @@ impl MotionEffect {
     /// cannot silently skip the reduced-motion invariant. Test-only, like
     /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SettingsDemo,
@@ -133,6 +140,7 @@ impl MotionEffect {
         Self::NoticePill,
         Self::Robi,
         Self::OutputStreak,
+        Self::UpgradeSurge,
     ];
 
     /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
@@ -152,6 +160,7 @@ impl MotionEffect {
             Self::NoticePill => 7,
             Self::Robi => 8,
             Self::OutputStreak => 9,
+            Self::UpgradeSurge => 10,
         }
     }
 }
@@ -298,7 +307,8 @@ impl MotionPolicy {
                 | MotionEffect::MatrixRain
                 | MotionEffect::NoticePill
                 | MotionEffect::Robi
-                | MotionEffect::OutputStreak => 0.0,
+                | MotionEffect::OutputStreak
+                | MotionEffect::UpgradeSurge => 0.0,
             },
         }
     }

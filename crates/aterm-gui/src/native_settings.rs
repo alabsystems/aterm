@@ -13122,6 +13122,17 @@ impl ConsentGestures {
         }
     }
 
+    /// Open a Privacy & Security pane through this instance's arm — the
+    /// macOS access card's *Open Settings* press (`App::notice_click`) is the
+    /// second owner gesture besides the Security page's button, and it takes
+    /// the same fence: a headless instance's arm reaches no `NSWorkspace`.
+    pub(crate) fn open_settings(
+        &self,
+        pane: crate::menu::PrivacyPane,
+    ) -> crate::menu::SettingsOpen {
+        (self.open_settings)(pane)
+    }
+
     /// The headless / unit-test arms: no `NSWorkspace`, no spawn.
     pub(crate) const fn inert() -> Self {
         Self {
