@@ -1031,7 +1031,18 @@ impl CompanionOwner {
             cell_h: geom.cell_h,
             reduced_motion,
             output_burst: pet_burst,
-            pointer: pet_pointer,
+            // Caret prewarming behind the singing face is not a touchable
+            // body. Preserve that lifecycle but only admit pointer contact
+            // when the last body was drawn and current pixel custody allows
+            // it; an envelope that rounds even opaque alpha dark admits none.
+            pointer: if self.last_alpha > 0
+                && pet_companion_admitted(pet_visible, sing.drive)
+                && shed_companion_alpha(255, host.shed_envelope) > 0
+            {
+                pet_pointer
+            } else {
+                None
+            },
         };
         let mut pet_frame = match host.capture {
             CaptureMode::Present => self.pet.tick(sense),
@@ -2631,6 +2642,70 @@ mod owner_tests {
             PressOutcome::Pass,
             "no body, no pet"
         );
+    }
+
+    #[test]
+    fn only_a_presented_resident_can_receive_pointer_strokes() {
+        for (sing_drive, shed, visible) in [
+            (0.0, 1.0, true),
+            (0.2, 1.0, false), // caret-fed prewarm behind the singing face
+            (0.0, 0.0, false),
+            (0.0, 0.001, false), // even opaque alpha rounds to zero
+        ] {
+            let mut decos = WordDecorations::default();
+            let mut owner = an_enabled_owner();
+            let now = materialize(&mut owner, &mut decos);
+            let mut now = settle(&mut owner, &mut decos, now);
+            // Stay well inside the ordinary seated window and away from the
+            // follower's final glide before introducing the pointer.
+            for _ in 0..20 {
+                now += Duration::from_millis(50);
+                frame(&mut owner, &mut decos, now, Some((4, 12)));
+            }
+            let (x0, x1, y0, y1) = owner.hit_rect().expect("fixture: a drawn resident");
+            let width = (x1 - x0) as f32;
+            let before = owner.brain().content();
+            let facts = facts_with(Some((4, 12)));
+            let mut answered = false;
+            for step in 0..=12 {
+                now += Duration::from_millis(25);
+                let mut host = host_at(now);
+                host.shed_envelope = shed;
+                host.pointer_px = Some((
+                    x0 as f32 + width * (0.20 + 0.60 * step as f32 / 12.0),
+                    (y0 + y1) as f32 * 0.5,
+                ));
+                let result = owner.sense(
+                    PetFacts {
+                        facts: &facts,
+                        host: &host,
+                        glow: pet_glow(),
+                        sing: SingFacts {
+                            drive: sing_drive,
+                            ..SingFacts::default()
+                        },
+                        focused: true,
+                    },
+                    &mut decos,
+                );
+                assert_eq!(result.on_glass, visible);
+                answered |= owner.brain().pending_pets() > 0
+                    || owner.brain().action() == crate::kitty_pet::PetAction::Purr;
+            }
+            if visible {
+                assert!(answered, "control: the same sweep strokes a drawn pet");
+                assert!(owner.brain().content() > before + 0.05);
+            } else {
+                assert!(
+                    !answered,
+                    "a hidden pet cannot be touched: sing={sing_drive}, shed={shed}"
+                );
+                assert!(
+                    owner.brain().content() <= before,
+                    "a hidden pet earned affection: sing={sing_drive}, shed={shed}"
+                );
+            }
+        }
     }
 
     /// The pointer is value-shadowed so the host bumps its frame gate only on

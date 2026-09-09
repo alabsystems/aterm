@@ -63,6 +63,7 @@ pub(crate) const EDIT_LIGATURES: &str = "ligatures";
 pub(crate) const EDIT_THEME: &str = "theme";
 pub(crate) const EDIT_CURSOR_STYLE: &str = "cursor_style";
 pub(crate) const EDIT_CURSOR_BLINK: &str = "cursor_blink";
+pub(crate) const EDIT_CURSOR_MOMENTUM_GLOW: &str = "cursor_momentum_glow";
 /// The cursor-trail master (`Config::cursor_trail`). Default
 /// [`crate::app_config::DEFAULT_DECORATIVE_EFFECTS`]: an opt-OUT everywhere except
 /// Windows, where the resident walking cat the default style rides makes it an
@@ -1188,6 +1189,12 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // names only the two decorative tables. Whoever registers the table's
     // visual keys owes them the same choice, one by one.
     EDIT_OUTPUT_STREAK_SOUND,
+    // The typing-momentum glow answers YOUR keystroke rate and cools when you
+    // stop; the workbench scene has no keystrokes to answer, so it is previewed
+    // by the thing itself — type, and the cursor warms (owner, 2026-09-08). A
+    // synthetic-typing projection joins the preview-matrix campaign with the
+    // other live-input rows.
+    EDIT_CURSOR_MOMENTUM_GLOW,
     EDIT_PALETTE,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
@@ -1605,6 +1612,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND
         | EDIT_CURSOR_BLINK
+        | EDIT_CURSOR_MOMENTUM_GLOW
         | EDIT_OPTION_AS_META
         | EDIT_CONFIRM_MULTILINE_PASTE
         | EDIT_SELECTION_INACTIVE
@@ -2551,6 +2559,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_PACKAGES_SEED_INSTALL => Section::Packages,
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
+        | EDIT_CURSOR_MOMENTUM_GLOW
         | EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
@@ -2680,7 +2689,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // The celebration sparkles ride beside the process-wide effect switch:
         // both answer "how much fun is this terminal allowed to have".
         EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE => ("Effect policy", 0),
-        EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
+        EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK | EDIT_CURSOR_MOMENTUM_GLOW => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
@@ -3200,6 +3209,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_SCROLLBACK => &["history", "buffer", "lines", "scroll"],
         EDIT_COPY_ON_SELECT => &["clipboard", "selection", "mouse"],
         EDIT_LIGATURES => &["font", "programming", "arrows"],
+        // "blink" is what a user annoyed by the blinking cursor searches for; the
+        // glow is what replaces it while they type.
+        EDIT_CURSOR_MOMENTUM_GLOW => &["blink", "glow", "typing", "speed", "momentum", "effect"],
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_STYLE
         | EDIT_CURSOR_TRAIL_MS
@@ -3969,6 +3981,16 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Bool,
             // Default ON (the checkbox reflects the resolved state directly).
             seed: Some(cfg.cursor_blink.unwrap_or(true).to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // The cursor glows with how fast you type and cools when you stop; while
+            // warm it does not blink (owner, 2026-09-08: "the blinking cursor is
+            // annoying"). Default ON; the checkbox reflects the resolved state.
+            label: "Typing momentum glow",
+            key: EDIT_CURSOR_MOMENTUM_GLOW,
+            kind: EditKind::Bool,
+            seed: Some(cfg.cursor_momentum_glow_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -6986,6 +7008,7 @@ listen = \"127.0.0.1:7777\" # local only
             (super::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH, set("1.4")),
             (super::EDIT_CURSOR_TRAIL_BLOOM_RADIUS, set("3.5")),
             (super::EDIT_CURSOR_FIRE_SHIMMER, set("false")),
+            (super::EDIT_CURSOR_MOMENTUM_GLOW, set("false")),
             (super::EDIT_HDR_GLOW, set("true")),
             (super::EDIT_CURSOR_GLOW_SDR_BOOST, set("0.4")),
         ];
@@ -7004,6 +7027,7 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(cfg.cursor_trail_bloom_strength, Some(1.4));
         assert_eq!(cfg.cursor_trail_bloom_radius, Some(3.5));
         assert_eq!(cfg.cursor_fire_shimmer, Some(false));
+        assert_eq!(cfg.cursor_momentum_glow, Some(false));
         assert_eq!(cfg.hdr_glow, Some(true));
         assert_eq!(cfg.cursor_glow_sdr_boost, Some(0.4));
 

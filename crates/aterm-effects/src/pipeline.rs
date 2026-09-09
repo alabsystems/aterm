@@ -3340,6 +3340,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn slow_pointer_strokes_reach_the_pet_through_host_pixel_coordinates() {
+        use crate::kitty_pet::PetAction;
+
+        let mut p = pet_pipeline(7);
+        let (mut term, mut input) = glass(8, 40);
+        materialize_pet(&mut p, &mut term, &mut input);
+        idle(&mut p, &mut term, &mut input, 60, 50.0);
+        let (x0, x1, y0, y1) = p.companion_hit_rect().expect("resident on glass");
+        let width = (x1 - x0) as f32;
+        let x = x0 as f32 + width * 0.20;
+        let y = (y0 + y1) as f32 * 0.5;
+        let before = p.companion.brain().content();
+
+        assert!(p.note_pointer_px(x, y));
+        for _ in 0..40 {
+            idle(&mut p, &mut term, &mut input, 1, 50.0);
+            assert!(!p.note_pointer_px(x, y));
+            assert_eq!(p.companion.brain().pending_pets(), 0);
+        }
+        assert!(
+            p.companion.brain().content() <= before,
+            "a stationary pointer cannot earn affection through host redraws"
+        );
+        let before_stroke = p.companion.brain().content();
+        let mut answered = false;
+        for step in 1..=20 {
+            let x = x0 as f32 + width * (0.20 + 0.60 * step as f32 / 20.0);
+            assert!(p.note_pointer_px(x, y));
+            idle(&mut p, &mut term, &mut input, 1, 50.0);
+            answered |= p.companion.brain().action() == PetAction::Purr;
+        }
+        assert!(
+            answered,
+            "frame-pixel input must reach the shared brain's stroke detector"
+        );
+        assert!(
+            p.companion.brain().content() > before_stroke + 0.05,
+            "the reaction was earned by pointer travel, not an idle pose"
+        );
+        assert!(pet_body_sprite(&input.free_sprites, CELL_H).is_some());
+
+        p.note_pointer_leave();
+        idle(&mut p, &mut term, &mut input, 350, 100.0);
+        assert!(!p.companion.needs_frames());
+        assert!(matches!(p.wake(), Wake::Idle));
+    }
+
     /// REDUCED MOTION IS A STATION PIN: the pet is drawn, and a program-owned
     /// caret jump moves it to its new station in ONE frame — no walk, no arc
     /// (feet on the new baseline) — where full motion walks there over many.

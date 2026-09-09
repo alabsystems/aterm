@@ -726,6 +726,26 @@ pub fn run_with(
             out,
             "{p}: warn — rustup not found (self-contained bundles are portable)"
         );
+    } else if layout.program_current("trust").join("bin").is_dir()
+        && !rustup_trust_channel_resolves()
+    {
+        // The managed Trust toolchain is HERE, but rustup does not know it, so
+        // `cargo +trust` and a `rust-toolchain.toml` pinning `channel = "trust"`
+        // both fail with `'rustc' is not installed for the custom toolchain
+        // 'trust'` — the message that reads as a blocked machine and is not one.
+        // Owner, 2026-09-08: the Trust toolchain is to be "very strongly
+        // encouraged by the aterm system itself"; a store that is invisible to
+        // the tool every Rust project resolves through is the opposite of that.
+        // The fix is one link, and it names the store's `current` symlink so a
+        // later `atpkg update` moves the channel with it.
+        let _ = writeln!(
+            out,
+            "{p}: warn — rustup has NO `trust` channel, so `cargo +trust` and a project pinning \
+             `channel = \"trust\"` fail here with `'rustc' is not installed for the custom \
+             toolchain 'trust'` — NOT a blocked machine: `targo`/`trustc` in the managed bin \
+             keep working. fix: rustup toolchain link trust {}",
+            layout.program_current("trust").display()
+        );
     }
 
     // (10) THE QUESTION A USER ACTUALLY CAME HERE WITH: do I have the toolchain?
@@ -1089,6 +1109,20 @@ fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
 fn rustup_present() -> bool {
     output_bounded(std::process::Command::new("rustup").arg("--version"))
         .is_some_and(|o| o.status.success())
+}
+
+/// Does rustup resolve a `trust` channel? `rustup which cargo --toolchain trust`
+/// exits non-zero (and prints the famous `'rustc' is not installed for the
+/// custom toolchain 'trust'`) when the channel is absent or dangling; a linked
+/// channel answers with the cargo path. Bounded like every other probe here.
+fn rustup_trust_channel_resolves() -> bool {
+    output_bounded(std::process::Command::new("rustup").args([
+        "which",
+        "cargo",
+        "--toolchain",
+        "trust",
+    ]))
+    .is_some_and(|o| o.status.success() && !o.stdout.is_empty())
 }
 
 /// How long ONE `--version` probe may take before `doctor` gives up on it.

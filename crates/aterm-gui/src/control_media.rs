@@ -2543,10 +2543,10 @@ impl crate::App {
     ) -> Result<(usize, usize), String> {
         let wid = self.hosting_window(session)?;
         self.clear_tab_surface_move_license(None);
-        self.close_confirm_suppressed = true;
+        self.close_confirm = crate::app_window::CloseConfirm::Programmatic;
         let state = self.apply_tab_cmd_in(wid, action);
         self.escalate_pending_close(el);
-        self.close_confirm_suppressed = false;
+        self.close_confirm = crate::app_window::CloseConfirm::Interactive;
         Ok(state)
     }
 }

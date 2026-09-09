@@ -763,6 +763,37 @@ pub(crate) fn typed_glyph_class(typed: Option<char>) -> u8 {
     }
 }
 
+/// THE KEYED SEAM'S `at_ms` — the melody's clock for this press, read at the
+/// cue's MINT rather than at its push.
+///
+/// The true hardware arrival ([`crate::metrics::key_arrival_ms`], already
+/// backdated by the NSEvent queue age) when the press armed one, else the
+/// host input clock at the mint. It must be read here, before the PTY write,
+/// because `note_pty_write` CONSUMES the arrival with a `swap(0)` and the
+/// audio push runs after that write by design (PTY first). Stamping at the
+/// push instead put the write's own duration into the melody's inter-key
+/// intervals: anything that made one write slower than the next moved the
+/// note, and the notes stopped lining up with the fingers.
+#[inline]
+fn key_sound_at_ms() -> u32 {
+    crate::metrics::key_arrival_ms().unwrap_or_else(crate::app_render::input_clock_ms)
+}
+
+/// The SYNTH'S glyph RANK ([`aterm_effects::trail_sound::EventMeta::rank`]) —
+/// the ordered, lossy alphabet position the DERIVED melody reads, filled at
+/// the keyed seam beside [`typed_glyph_class`] and `0` everywhere else.
+///
+/// The table itself lives with the field it fills
+/// ([`aterm_effects::trail_sound::typed_glyph_rank`]) rather than here,
+/// because three consumers read it — this seam, the offline
+/// `keyboard_song_ab` bench and the engine's own tests — and a melody derived
+/// from two disagreeing copies of the alphabet is not derived from anything.
+/// This is the host's name for it, at the seam the design names.
+#[inline]
+pub(crate) fn typed_glyph_rank(typed: Option<char>) -> u8 {
+    aterm_effects::trail_sound::typed_glyph_rank(typed)
+}
+
 /// Whether an input event carries fresh, discrete intent that may start one new
 /// bounded presentation-recovery episode. Pointer motion is deliberately a
 /// stutter here: a stationary app can receive an unbounded hover/drag stream,
@@ -3694,6 +3725,13 @@ impl App {
                             // priced at the key exactly like the click's
                             // shiftedness, because an echo cannot tell `A`
                             // from `a`. v1 reads only the cell count.
+                            // The momentum glow builds from PRINTABLE typing only —
+                            // this arm, never the navigation/kill arms above, and
+                            // never a bare modifier: "for typing faster".
+                            ws.momentum_glow.on_key(
+                                input_now,
+                                aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
+                            );
                             ws.cursor_glow.note_typed_glyph(
                                 input_now,
                                 typed_cells,
@@ -3772,14 +3810,17 @@ impl App {
                                 let delivered =
                                     match (click_synth.as_ref(), ws.cursor_glow.take_key_cue()) {
                                         (Some(synth), Some(cue)) => {
-                                            // The glyph CLASS rides the keyed
-                                            // cue only (§16 row 8): the echo
-                                            // path has no key to read.
+                                            // The glyph CLASS and RANK ride the
+                                            // keyed cue only (§16 row 8,
+                                            // §3.1's R2): the echo path has
+                                            // no key to read.
                                             pending_key_sound = Some((
                                                 cue,
                                                 *synth,
                                                 term_cols,
                                                 typed_glyph_class(typed),
+                                                typed_glyph_rank(typed),
+                                                key_sound_at_ms(),
                                             ));
                                             true
                                         }
@@ -3813,8 +3854,10 @@ impl App {
                             if let (Some(synth), Some(cue)) =
                                 (click_synth.as_ref(), ws.cursor_glow.take_key_cue())
                             {
-                                // A bare modifier lands no glyph: class 0.
-                                pending_key_sound = Some((cue, *synth, term_cols, 0));
+                                // A bare modifier lands no glyph: class 0,
+                                // rank 0.
+                                pending_key_sound =
+                                    Some((cue, *synth, term_cols, 0, 0, key_sound_at_ms()));
                             }
                         }
                         // The companion's delete reaction is independent of
@@ -4122,7 +4165,7 @@ impl App {
                 // after the inline write returned (or the ordered FIFO accepted
                 // the job). A slow or unexpectedly expensive sound policy can
                 // therefore never delay terminal input egress.
-                if let Some((cue, synth, cols, glyph_class)) = pending_key_sound
+                if let Some((cue, synth, cols, glyph_class, rank, at_ms)) = pending_key_sound
                     && let Some(ws) = self.windows.get(&wid)
                 {
                     let policy = crate::app_render::TrailSoundPolicy {
@@ -4132,10 +4175,13 @@ impl App {
                         bed: synth.bed,
                     };
                     // THE KEYED SEAM'S STAMP (`RAINBOW-KITTY-V2.md` §16 rows
-                    // 7-8): the host input clock in ms — the same clock the
-                    // frame drain stamps its echo-born cues with — and the
-                    // glyph class only this seam can know. Stamped AFTER the
-                    // egress above, like everything else on this path.
+                    // 7-8): the key's own hardware arrival on the host input
+                    // clock in ms — the same clock the frame drain stamps its
+                    // echo-born cues with — and the glyph class only this seam
+                    // can know. The stamp was TAKEN at the cue's mint, before
+                    // the egress above (`key_sound_at_ms`); it is only PUSHED
+                    // here, after the write returned, like everything else on
+                    // this path.
                     self.trail_audio.push_meta(
                         crate::app_render::trail_sound_event(
                             &cue,
@@ -4145,9 +4191,14 @@ impl App {
                             synth.gain,
                         ),
                         aterm_effects::trail_sound::EventMeta {
-                            at_ms: crate::app_render::input_clock_ms(),
+                            at_ms,
                             glyph_class,
+                            rank,
                             pan_from: 0.0,
+                            // The block pre-roll is the audio worker's to
+                            // stamp (`MacOut::push_meta`): only it knows
+                            // where the in-flight block stands.
+                            block_lead_s: 0.0,
                         },
                     );
                 }
@@ -14728,7 +14779,7 @@ mod predictive_echo_input_gate_tests {
 
     use super::{
         keystroke_click_audible, prediction_visibility_requires_redraw, typed_class_for,
-        typed_glyph_class,
+        typed_glyph_class, typed_glyph_rank,
     };
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
@@ -14847,6 +14898,41 @@ mod predictive_echo_input_gate_tests {
             assert_eq!(typed_glyph_class(Some(letter)), 0, "{letter:?}");
         }
         assert_eq!(typed_glyph_class(None), 0, "an IME run stamps nothing");
+    }
+
+    /// The synth's glyph RANK (§3.1's R2) — the ordered alphabet position the
+    /// derived melody reads. This seam's job is to fill it from the keyed cue
+    /// and `0` everywhere else; the table itself is the engine's, and its own
+    /// contract is pinned there.
+    #[test]
+    fn the_synth_glyph_rank_is_ordered_case_folded_and_zero_without_a_key() {
+        assert_eq!(typed_glyph_rank(None), 0, "an IME run stamps no rank");
+        assert_eq!(typed_glyph_rank(Some('a')), 1);
+        assert_eq!(typed_glyph_rank(Some('z')), 26);
+        assert_eq!(
+            typed_glyph_rank(Some('A')),
+            typed_glyph_rank(Some('a')),
+            "case is folded away — the capital has its own voice in `shifted`"
+        );
+        // ORDERED: the melody's whole use of this is the signed difference
+        // between consecutive keys, so the alphabet must run monotonically.
+        for (a, b) in "abcdefghijklmnopqrstuvwxyz"
+            .chars()
+            .zip("bcdefghijklmnopqrstuvwxyz".chars())
+        {
+            assert!(
+                typed_glyph_rank(Some(b)) == typed_glyph_rank(Some(a)) + 1,
+                "{a:?} -> {b:?} is not one step of the alphabet"
+            );
+        }
+        // …and it is the ENGINE's table, not a second copy that could drift.
+        for c in ['q', 'Q', '7', '?', '/', '漢', ' '] {
+            assert_eq!(
+                typed_glyph_rank(Some(c)),
+                aterm_effects::trail_sound::typed_glyph_rank(Some(c)),
+                "{c:?}"
+            );
+        }
     }
 
     /// The key-time click's host gate. Every conjunct is a case where the

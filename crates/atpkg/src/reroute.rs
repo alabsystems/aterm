@@ -358,8 +358,13 @@ fn signpost_closing(upstream: &str, strict: bool, rerun: &str) -> String {
     if strict {
         return format!("       {rerun}  {}", escape_clause(upstream));
     }
+    // The measuring page is named on every signpost (owner, 2026-09-08: the
+    // Trust default is to be "very strongly encouraged by the aterm system
+    // itself"): a reader who is about to run stock cargo anyway is told, in
+    // the same breath, the one command that answers which toolchain this
+    // directory actually gets — instead of guessing from the two lines above.
     format!(
-        "       Running upstream '{upstream}' now — nothing it produces carries a proof claim.\n       ({QUIET_ENV}=1 silences this; {STRICT_ENV}=1 refuses instead of running.)"
+        "       Running upstream '{upstream}' now — nothing it produces carries a proof claim.\n       `aterm help rust` measures which toolchain THIS directory gets; the default here is Trust.\n       ({QUIET_ENV}=1 silences this; {STRICT_ENV}=1 refuses instead of running.)"
     )
 }
 
@@ -955,6 +960,14 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("VERIFIED   — emits a proof claim"), "{text}");
+        // Every announce-and-run signpost names the page that MEASURES the
+        // answer, and says the default (owner, 2026-09-08). The strict/refusal
+        // closing is a different sentence and is pinned separately below.
+        assert!(
+            text.contains("`aterm help rust` measures which toolchain THIS directory gets"),
+            "{text}"
+        );
+        assert!(text.contains("the default here is Trust"), "{text}");
         assert!(text.contains("UNVERIFIED — no proof claim"), "{text}");
         // ANNOUNCE, NOT REFUSE: the default says upstream is about to run and
         // names both flags. The refusal's wording survives only under strict.

@@ -54,12 +54,20 @@ const SEED: u32 = 0xBEDA_0D10;
 
 /// The entrants, in bracket order. Filename stems double as candidate ids
 /// in the report, so keep them stable.
-const CANDIDATES: [(&str, BedVariant); 5] = [
+///
+/// `c5-rainbow-sky` is THE PRISM §3.2's bed — the music box's own pad, voiced
+/// from the live chord and coloured by the ribbon's hue — and it is also the
+/// body the music box's palette bed renders, so under this harness's
+/// rainbow-kitty script `c0-current` and `c5-rainbow-sky` are one texture.
+/// The comparison the owner is asked for is c5 against `c1-chord-drift` and
+/// `c4-silence`.
+const CANDIDATES: [(&str, BedVariant); 6] = [
     ("c0-current", BedVariant::Current),
     ("c1-chord-drift", BedVariant::ChordDrift),
     ("c2-breathing", BedVariant::Breathing),
     ("c3-shimmer", BedVariant::Shimmer),
     ("c4-silence", BedVariant::Silence),
+    ("c5-rainbow-sky", BedVariant::RainbowSky),
 ];
 
 // ---------------------------------------------------------------------------

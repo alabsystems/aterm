@@ -56,9 +56,17 @@ fn assert_transition(model: &Model, action: &str, before: &State, after: &State)
     );
 }
 
+/// **`Lumen`, not `RainbowKitty`.** The human-gap control below is v1's
+/// shared `MIN_GAP` governor, and the rainbow kitty look has been the music
+/// box (`rainbow_kitty_v2`) since §17.3 phase 7 — it forks out of `push_meta`
+/// before `MIN_GAP` is ever consulted. Since 2026-09-08 it may also never
+/// thin a keystroke at all (one keystroke is one melody step, at every typing
+/// speed), so an ordinary key there is admitted BY RULING and the control
+/// stops discriminating. Nothing in `OutputStreakEpisodeDelivery` is about a
+/// palette; the control is, so it runs on the palette that owns the gap.
 fn sound(kind: SoundGesture) -> SoundEvent {
     SoundEvent {
-        style: GlowStyle::RainbowKitty,
+        style: GlowStyle::Lumen,
         voice: SoundVoice::Style,
         kind,
         pan: 0.0,

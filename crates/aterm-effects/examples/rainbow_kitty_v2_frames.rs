@@ -16,7 +16,12 @@
 //!   70 ms/key, then 1.5 s idle; a frame every 4th tick (33 ms).
 //! * **B — meteor.** A same-row Ctrl-A (the line's end → column 0), then a
 //!   Ctrl-E back 400 ms later; a frame EVERY tick from the first spawn to the
-//!   second's `T + 350 ms`.
+//!   second's `T + 350 ms`. With `RK_FRAMES_CTRL_A_ONLY=1` in the environment
+//!   the Ctrl-E is dropped and B runs the lone Ctrl-A out to +720 ms, so one
+//!   impact can be read to its end with nothing retiring it (the owner's
+//!   2026-09-08 "bigger, more special rainbow impact" audit: frames at +0,
+//!   +8, +50, +100, +200, +350 and +500 ms are copied out as
+//!   `ctrl_a_T+<ms>ms.png` beside their 4× zooms).
 //! * **C — erase.** Six Backspaces at 80 ms/key; a frame every tick.
 //!
 //! Beside the frames: `index.json` (one row per frame), `stats.csv` (one row
@@ -1004,7 +1009,14 @@ fn scenarios() -> [Scenario; 4] {
     let ctrl_e = b0 + Sim::tick_of(400);
     // `T + 350` past the second spawn, with `T = flight_ms(48)`.
     let t_flight = flight(TEXT.len() as f32).as_micros() as u64;
-    let b_end = ctrl_e + (t_flight + 350_000).div_ceil(TICK_US);
+    let (b_sched, b_end) = if ctrl_a_only() {
+        (vec![(b0, Action::CtrlA)], b0 + Sim::tick_of(720))
+    } else {
+        (
+            vec![(b0, Action::CtrlA), (ctrl_e, Action::CtrlE)],
+            ctrl_e + (t_flight + 350_000).div_ceil(TICK_US),
+        )
+    };
 
     let c0 = b_end + 1 + Sim::tick_of(300);
     let erases: Vec<(u64, Action)> = (0..6u64)
@@ -1021,7 +1033,7 @@ fn scenarios() -> [Scenario; 4] {
         },
         Scenario {
             name: "B",
-            sched: vec![(b0, Action::CtrlA), (ctrl_e, Action::CtrlE)],
+            sched: b_sched,
             every: 1,
             end: b_end,
         },
@@ -1039,6 +1051,16 @@ fn scenarios() -> [Scenario; 4] {
         },
     ]
 }
+
+/// `RK_FRAMES_CTRL_A_ONLY=1`: scenario B is the lone Ctrl-A, run out to
+/// +720 ms (see the module doc).
+fn ctrl_a_only() -> bool {
+    std::env::var("RK_FRAMES_CTRL_A_ONLY").is_ok_and(|v| v == "1")
+}
+
+/// The instants of the lone-Ctrl-A audit, ms after the spawn — the seven
+/// frames the owner's impact review reads.
+const CTRL_A_AUDIT_MS: [u64; 7] = [0, 8, 50, 100, 200, 350, 500];
 
 /// For each meteor spawn in `ticks`: the spawn frame and its arc, the head's
 /// first-frame travel (§21.3 "Head already moving"), the nucleus at arrival,
@@ -1108,16 +1130,26 @@ fn main() {
     let t_flight = flight(TEXT.len() as f32);
     // B's pin frame: Ctrl-A's `T + 150 ms`, as a frame index from B's spawn.
     let pin_frame = ((t_flight.as_micros() as u64 + 150_000).div_ceil(TICK_US)) as usize;
-    let ctrl_e_frame = (b.sched[1].0 - b.sched[0].0) as usize;
-    let pin_frame_e = ctrl_e_frame + pin_frame;
+    // With the lone Ctrl-A there is no second spawn: the Ctrl-E frame index
+    // is parked past the run so no zoom claims it.
+    let ctrl_e_frame = b
+        .sched
+        .get(1)
+        .map_or(usize::MAX / 2, |&(t, _)| (t - b.sched[0].0) as usize);
+    let pin_frame_e = ctrl_e_frame.saturating_add(pin_frame);
+    let audit_frames: Vec<usize> = if ctrl_a_only() {
+        CTRL_A_AUDIT_MS
+            .iter()
+            .map(|&ms| Sim::tick_of(ms) as usize)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut keep_b = vec![0, pin_frame, pin_frame_e, ctrl_e_frame];
+    keep_b.extend(audit_frames.iter().copied());
 
     let ra = run(&mut sim, &a, &[], &mut sinks);
-    let rb = run(
-        &mut sim,
-        &b,
-        &[0, pin_frame, pin_frame_e, ctrl_e_frame],
-        &mut sinks,
-    );
+    let rb = run(&mut sim, &b, &keep_b, &mut sinks);
     let _ = run(&mut sim, &gap, &[], &mut sinks);
     let rc = run(&mut sim, &c, &[2], &mut sinks);
 
@@ -1173,6 +1205,19 @@ fn main() {
         let path = format!("{dir}/{name}");
         px.zoom(ZOOM).write_png(&path);
         zoom_lines.push(format!("{name}: {what}"));
+    }
+    // The lone-Ctrl-A audit: the seven instants, 1:1 and at 4×, named by
+    // their age so a before/after pair can be read side by side.
+    for (&ms, &frame) in CTRL_A_AUDIT_MS.iter().zip(&audit_frames) {
+        if let Some((_, px)) = rb.kept.iter().find(|(f, _)| *f == frame) {
+            let name = format!("ctrl_a_T+{ms:03}ms");
+            px.write_png(&format!("{dir}/{name}.png"));
+            px.zoom(ZOOM).write_png(&format!("{dir}/{name}_zoom.png"));
+            zoom_lines.push(format!(
+                "{name}.png: B/frame_{frame:04} ({:.1} ms after the Ctrl-A)",
+                Sim::ms(frame as u64)
+            ));
+        }
     }
 
     // ---- sinks ----

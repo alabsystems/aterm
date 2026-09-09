@@ -1209,6 +1209,52 @@ pub fn clear_thing_of_cyan(rgb: u32) -> u32 {
     rgb
 }
 
+/// **THE SEAM'S CHROMA, GIVEN BACK** — `rgb` with its HSV saturation raised to
+/// at least `s_min`; hue and value are exactly what they were, and a grey (no
+/// hue to keep), a black, or a non-finite floor comes back untouched.
+///
+/// Why it lives here and not only where it is spent: the arc's one authored
+/// dip in chroma is the green→blue crossing — [`SPECTRUM_CROSSING_ROOF`] holds
+/// `S 0.53` and [`SPECTRUM_ROOF_PACE`]'s inner knots `0.65` / `0.72` — and the
+/// roof's own account says what that taper was FOR: the cyan true-peak bound
+/// of the census the owner retired on 2026-09-01 ("you can have cyan so long
+/// as it's a rainbow"; the anti-cyan laws "were what greyed the arc"). The
+/// taper survives in the TABLE because every producer reads it (the meteor,
+/// the stardust, the caret's rim, and every golden that folds their bytes);
+/// this is the one operation a producer applies to give the seam its chroma
+/// back at ITS OWN read — `rainbow_kitty::ribbon::bed_ink` through
+/// `BED_SAT_FLOOR`, for the owner's 2026-09-08 "black gaps in the rainbow a
+/// few characters back from the cursor". Measured where it was spent: the
+/// bed's crossing cell went from composited `(45, 92, 93)` — `S 0.52`, the
+/// greyest cell on a typed line — to `(3, 95, 95)`, `S 0.97`, at the same
+/// relative luminance.
+///
+/// The move is HSV's own: every channel's distance below the maximum is
+/// scaled by `s_min · max / (max − min)`, so the maximum channel (the value)
+/// and the channel ORDER (the hue) are untouched and the minimum channel lands
+/// at `max · (1 − s_min)`. A colour already at or over the floor is returned
+/// bit for bit.
+#[must_use]
+pub fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
+    if !s_min.is_finite() {
+        return rgb;
+    }
+    let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    if mx == 0 || mx == mn {
+        return rgb;
+    }
+    let s_min = s_min.clamp(0.0, 1.0);
+    let spread = (mx - mn) as f32;
+    if spread >= s_min * mx as f32 {
+        return rgb;
+    }
+    let k = s_min * mx as f32 / spread;
+    let ch = |c: u32| (mx as f32 - (mx - c) as f32 * k + 0.5).clamp(0.0, 255.0) as u32;
+    (ch(r) << 16) | (ch(g) << 8) | ch(b)
+}
+
 /// [`smoothstep01`]'s `f32` twin, for the two laws that run per frame rather than
 /// per generated table entry.
 #[inline]
@@ -1441,9 +1487,10 @@ pub fn clear_light_of_cyan(premul: u32, alpha: u8, ground: u32) -> u32 {
 /// [`clear_light_of_cyan`] answers for a stack of ONE quad's own light and
 /// composites that stack itself. A caller whose marks are a PILE of different
 /// colours on the same pixel (the caret's concentric rim: see
-/// `cursor_rainbow`'s `clear_caret_light_of_cyan`) has to rasterize the pile
-/// before there is a pixel to ask about, and then it needs exactly this
-/// question and no other. Exposed rather than restated, because a law and its
+/// `cursor_rainbow`'s `rim_light_peak`, whose predecessor
+/// `clear_caret_light_of_cyan` asked this question until 2026-09-08) has to
+/// rasterize the pile before there is a pixel to ask about, and then it needs
+/// exactly this question and no other. Exposed rather than restated, because a law and its
 /// callers stating the window twice is how two of this family's gates came to
 /// measure something the ruling does not say.
 #[inline]
@@ -2217,6 +2264,108 @@ mod tests {
             clear_halo_of_cyan(colour, true, ground),
             colour,
             "an unreachable falloff weight changed the emitted halo"
+        );
+    }
+}
+
+#[cfg(test)]
+mod min_saturation {
+    //! The one chroma operation a producer may apply to its own read of the
+    //! arc ([`spectrum_with_min_saturation`]) — hue and value are invariants,
+    //! the floor is reached exactly, and nothing at or over it moves.
+    use super::*;
+
+    fn hsv(rgb: u32) -> (f64, f64, f64) {
+        spectrum_hsv(rgb)
+    }
+
+    #[test]
+    fn the_floor_is_reached_with_hue_and_value_untouched() {
+        for (i, &roof) in SPECTRUM_CROSSING_ROOF.iter().enumerate() {
+            let (h0, s0, v0) = hsv(roof);
+            assert!(
+                s0 < 0.60,
+                "roof sample {i} is authored under S 0.60 ({s0:.3})"
+            );
+            for floor in [0.65f32, 0.80, 0.90, 1.0] {
+                let got = spectrum_with_min_saturation(roof, floor);
+                let (h1, s1, v1) = hsv(got);
+                assert!(
+                    (h1 - h0).abs() < 1.0,
+                    "roof {i} at floor {floor}: hue moved {h0:.1}° → {h1:.1}° (#{got:06X})"
+                );
+                assert_eq!(
+                    (v1 * 255.0).round() as u32,
+                    (v0 * 255.0).round() as u32,
+                    "roof {i} at floor {floor}: value moved"
+                );
+                assert!(
+                    (s1 - f64::from(floor)).abs() <= 1.5 / 255.0 * 2.0,
+                    "roof {i} at floor {floor}: S landed at {s1:.3}, not on the floor"
+                );
+            }
+        }
+        // The eighth sample by hand: `#6FB1EB` = (111, 177, 235), spread 124,
+        // `k = 235 / 124`; G lands at `235 − 58 · k = 125`, R at 0, B stays 235
+        // — `(0, 125, 235)`, still hue 208°.
+        assert_eq!(spectrum_with_min_saturation(0x006F_B1EB, 1.0), 0x0000_7DEB);
+    }
+
+    #[test]
+    fn a_colour_at_or_over_the_floor_and_every_grey_is_returned_bit_for_bit() {
+        for &anchor in &SPECTRUM_ANCHORS {
+            assert_eq!(
+                spectrum_with_min_saturation(anchor, 1.0),
+                anchor,
+                "every anchor has a zero channel"
+            );
+        }
+        for grey in [0u32, 0x0080_8080, 0x00FF_FFFF, 0x0011_1111] {
+            assert_eq!(
+                spectrum_with_min_saturation(grey, 1.0),
+                grey,
+                "a grey has no hue to keep"
+            );
+        }
+        assert_eq!(
+            spectrum_with_min_saturation(0x006F_EBC2, 0.50),
+            0x006F_EBC2,
+            "S 0.53 is over a 0.50 floor"
+        );
+        assert_eq!(
+            spectrum_with_min_saturation(0x006F_EBC2, f32::NAN),
+            0x006F_EBC2,
+            "a non-finite floor is no floor"
+        );
+        assert_eq!(spectrum_with_min_saturation(0x006F_EBC2, 0.0), 0x006F_EBC2);
+    }
+
+    #[test]
+    fn the_shipped_arc_dips_under_the_floor_only_inside_the_green_blue_interval() {
+        // The floor asks nothing of the arc outside the one interval the roof
+        // redraws: every table entry from red to the green anchor and from
+        // the blue anchor to violet is at S ≥ 0.98 (each anchor has a zero
+        // channel and the per-channel PCHIP between them keeps it), so a
+        // producer applying `spectrum_with_min_saturation(·, 1.0)` to its read
+        // moves ONLY the green→blue interval — the crossing and its flanks.
+        let (green, blue) = (SPECTRUM_ANCHOR_AT[3], SPECTRUM_ANCHOR_AT[4]);
+        let mut dipped = Vec::new();
+        let mut inside_min = 1.0f64;
+        for (i, &c) in SPECTRUM_LUT.iter().enumerate() {
+            let (h, s, _) = hsv(c);
+            if (green..=blue).contains(&i) {
+                inside_min = inside_min.min(s);
+            } else if s < 0.98 {
+                dipped.push((i, format!("#{c:06X}"), h, s));
+            }
+        }
+        assert!(
+            dipped.is_empty(),
+            "entries under S 0.98 outside the green→blue interval: {dipped:?}"
+        );
+        assert!(
+            inside_min < 0.60,
+            "the control: the interval really does dip (its least saturated entry reads S {inside_min:.3}); a table that no longer dips makes the floor a no-op and this pin vacuous"
         );
     }
 }

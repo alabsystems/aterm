@@ -42,27 +42,70 @@
 //! are pure functions of `(born, seed, now)`. That is what §18's determinism
 //! rule and its "no per-star allocation" line mean in practice, and it is why
 //! a frame at the same `now` is byte-identical on CPU and GPU.
+//!
+//! ## The sky carries the rainbow (owner, 2026-09-08)
+//!
+//! The first ruling (A/B #15, 2026-09-05) chose white-hot stardust with the
+//! tint held to a 14 % halo and the arm tips. The owner reversed it: *"I feel
+//! like you are diminishing the specialness and emphasis of this theme?
+//! why?"* — *"make this rainbow theme truly magical and special and dynamic
+//! and beautiful"*. So the sky is coloured now, and the two laws that kept
+//! it white are re-derived rather than bent:
+//!
+//! * **D2 is inverted for the grain and the m2.** An m3 is the pure stop of
+//!   the cell it rose from, core and arms ([`Paint::draw_m3`]); an m2's body
+//!   is [`M2_BODY_TINT`] of the way from white to its tint, its disc and
+//!   stubs are the tint ([`Paint::draw_add`]); the hero keeps its white-hot
+//!   centre under a halo that is now its whole request
+//!   ([`M1_HALO_SHARE`]). The tint deal is [`TINT_FIELD_SHARE`] /
+//!   [`TINT_WHITE_SHARE`] / [`TINT_GOLD_SHARE`] = 75 / 10 / 15 for m1 and
+//!   m2, and a grain ALWAYS wears its cell's stop ([`class_tint`]).
+//! * **§3.2 rank 8 is "the halo may not outshine the core"**
+//!   ([`HALO_CAP_SHARE`]), not "14 %": what reads as colour on glass is a
+//!   halo pixel with a channel spread ≥ 40 at a max channel ≥ 60 (the
+//!   scanner's own floor), and at 14 % no halo pixel ever got there.
+//! * **The halo breathes its hue** — [`HALO_HUE_SWING_ENTRIES`] table
+//!   entries around the stop on the luminance clock ([`halo_rgb`]), never
+//!   off the arc, never onto a neighbouring name.
+//! * **A hot hand deals a denser sky** — every laid cell carries a field
+//!   star at `disp ≥` [`FIELD_HOT_DISP`] ([`FIELD_DEAL_IN_HOT`]).
+//! * **The aurora** (section 8): a rainbow veil in the sky band above the
+//!   live ribbon, one [`Veil`] cell per laid cell, carrying the ribbon's own
+//!   spectrum walk, priced by momentum at birth, riding the field lane's
+//!   envelope so it leaves with the ribbon and is exactly nothing when the
+//!   sky is.
+//!
+//! Every number below that changed for this says so at its definition, with
+//! the measurement it came from; the pinned laws that changed are re-pinned
+//! in section 9 with the owner's words as the reason.
 
-use aterm_render::{GlowQuad, HaloMode, RainHalo, premul_rgb};
+use aterm_render::{GlowQuad, HaloMode, RainHalo, add_sat, halo_row_ny, halo_weight, premul_rgb};
 use aterm_time::Instant;
 
 use super::timing::{
     CHROMA_CULL_ALPHA, EDGE_IN_S, FIELD_STAR_COV_CEIL, GLINT_CAP, GLINT_REFILL_PER_S,
     REDUCED_MOTION_FADE_MS, STAR_CULL_ALPHA, STAR_STACK_ADD, TRANSIENT_STAR_COV_CEIL, clamp01,
-    edge_in, half_life, half_life_life_s, spend,
+    edge_in, half_life, half_life_life_s, smoothstep01, spend,
 };
 use super::{Cadence, Config, Ctx, Event, Frame, TypedClass};
-use crate::cursor_glow::{Geom, InkRole, SoundCue};
+use crate::color_math::relative_luminance;
+use crate::cursor_glow::{
+    Geom, InkRole, RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_SPARKLE_LIGHT_SHARE, SoundCue,
+};
 use crate::effect_util::{
-    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT,
+    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_CORE_ADD, STAR_GLINT,
     STAR_GLINT_COV, STAR_OVER_CENTRE_LAYS, STAR_OVER_LAYS, STAR_TAPER_BODY, STAR_WAIST,
     TWINKLE_GLINT_FRAC, TWINKLE_OMEGA, push_fx_rect, push_twinkle_star, star_arm, star_body_px,
     twinkle_env, twinkle_peak,
 };
+use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::ribbon::{
-    BIRTH_EDGE_FLOOR, Ribbon, SWOOSH_TOTAL_S, expiry_melt, reduced_fade,
+    BIRTH_EDGE_FLOOR, EXPIRY_MELT_SHARE, Ribbon, SWOOSH_TOTAL_S, expiry_melt, reduced_fade,
 };
-use crate::spectrum::{SPECTRUM_STOPS, spectrum_snap, spectrum_snap_index, spectrum_stop};
+use crate::spectrum::{
+    SPECTRUM_ANCHOR_AT, SPECTRUM_LUT, SPECTRUM_LUT_LEN, SPECTRUM_STOPS, spectrum, spectrum_snap,
+    spectrum_snap_index, spectrum_stop,
+};
 use crate::trail_sound::SoundKind;
 
 // ===========================================================================
@@ -137,6 +180,29 @@ pub const FIELD_DEAL_IN: u32 = 2;
 /// 18 % m2/m1 against §5.6's ≥ 40 %; at 1-in-2 it is 41 % hot and 50 % cold,
 /// and the haloed count lands on §18's "6 halos" typical.
 pub const FIELD_M2_IN: u32 = 2;
+
+/// **THE HOT FIELD DEAL** (owner, 2026-09-08: "make this rainbow theme truly
+/// magical and special and dynamic") — one in this many laid cells carries a
+/// field star once the honest spine is at or over [`FIELD_HOT_DISP`]: every
+/// cell. Momentum is bought as DENSITY, on the honest metric the second
+/// grain already reads (`ctx.disp`, never the resume-floored birth spine —
+/// a resume must not buy a denser sky it did not earn).
+///
+/// Rates per typed key, as dealt — the strike deal (`1/12 + 1/4 + 1/2 =
+/// 0.83`), the second grain (`1.0` at `disp ≥ 0.5`) and the field: cold
+/// `0.83 + 0.50 = 1.33`; `disp ≥ 0.5` `2.33`; `disp ≥ 0.7` `0.83 + 1.0 +
+/// 1.0 = 2.83`. As BORN, measured on
+/// `a_hot_hand_deals_every_cell_a_field_star` (sixty keys on a probed-blank
+/// sky, stars born on the key's own edge): **cold 1.15, hot 2.73 per key**
+/// (hot was 2.15 before this deal) — the gap to the dealt rate is the hero
+/// spacing law and the one-pixel birth clearance, which stand. The 12 cps
+/// pool (`a_twelve_cps_sky_holds_about_twenty_stars`) is measured there,
+/// under the 40 cap and §18's quad budget.
+pub const FIELD_DEAL_IN_HOT: u32 = 1;
+
+/// The spine at or above which the field deal is [`FIELD_DEAL_IN_HOT`]
+/// instead of [`FIELD_DEAL_IN`].
+pub const FIELD_HOT_DISP: f32 = 0.7;
 
 /// **A FIELD STAR'S LIFE, s** (§5.6's Field row: "rides the cell's own edge
 /// envelope × retract — alpha only"; "its field stars die with their
@@ -222,16 +288,50 @@ pub const STRIKE_SECOND_M3_DISP: f32 = 0.5;
 /// cells read as one fat mark, not as two stars.
 pub const HERO_MIN_SPACING_CELLS: u16 = 3;
 
+/// **ONE SKY STAR PER CELL — the strike's reach when its cell is taken**,
+/// in cells toward the caret's leading edge: one, the lead cell, which is
+/// the cell the second grain already reaches and the cell the next key
+/// will lay. A strike dealt onto a cell that already carries a live sky
+/// star (the previous key's leading-edge grain, under a hot hand: every
+/// key) moves to the first free cell within this reach or is dropped; the
+/// cell keeps the star it has. Two cells ahead would put a star over glass
+/// the hand has not reached.
+///
+/// The bold round's open finding: the hot deal put two or three stars
+/// within a pixel or two on ONE cell (M1/Strike + M2/Field + the previous
+/// key's M3/Strike), each priced only over the sky laid BEFORE it, so a
+/// later star's core on an earlier star's pixels was unpriced — worst
+/// luminance 99.6–101.7 over the caret law's 72 on 8 of 40 frames of the
+/// 12 cps fixture. Fixed by design, not by dimming: a cell has one star
+/// ([`Stardust::sky_star_live`]), the field deal ADOPTS the star a cell
+/// already has ([`Stardust::deal_typed`]) instead of stacking a second,
+/// and the strike moves within this reach. Measured after:
+/// `one_sky_star_per_cell_and_no_pile_outshines_the_caret`.
+pub const STRIKE_REACH_CELLS: u16 = 1;
+
 /// At most this many heroes live on one row at a time (§5.2).
 pub const HERO_MAX_LIVE_PER_ROW: u8 = 2;
 
-/// Share of stars whose tint is `spectrum_snap(field at the birth cell)`
-/// (§5.3) — the sky inherits the spectrum's order along the line: warm stars
-/// over the old end, violet over the new.
-pub const TINT_FIELD_SHARE: f32 = 0.60;
+/// Share of m1/m2 stars whose tint is `spectrum_snap(field at the birth
+/// cell)` (§5.3) — the sky inherits the spectrum's order along the line: warm
+/// stars over the old end, violet over the new. **Was 0.60; now 0.75**
+/// (owner, 2026-09-08: more colour) — the A-type white share is what it
+/// gave up; gold keeps its 15 %, because gold is the glint class. A GRAIN is
+/// not dealt at all: every m3 wears its cell's stop ([`class_tint`]).
+pub const TINT_FIELD_SHARE: f32 = 0.75;
 
-/// Share that are `#FFFFFF` — an A-type star; halo and stubs white (§5.3).
-pub const TINT_WHITE_SHARE: f32 = 0.25;
+/// Share of m1/m2 that are `#FFFFFF` — an A-type star; halo and stubs white
+/// (§5.3). **Was 0.25; now 0.10.**
+pub const TINT_WHITE_SHARE: f32 = 0.10;
+
+/// **AN m2'S BODY IS TINTED** — how far from white toward the star's tint
+/// its `push_twinkle_star` body and nucleus are drawn (owner, 2026-09-08:
+/// "m2 tinted cores (colour at ~60 % into the core)"). The stack still
+/// composites to §5.2's 130 on the tint's own peak channel (the peak law is
+/// measured on the brightest channel), and the centre now carries a channel
+/// spread of `0.6 · 113 = 68` levels where it carried none. The hero keeps
+/// its white-hot centre (its colour is its halo); the grain is pure tint.
+pub const M2_BODY_TINT: f32 = 0.6;
 
 /// Share that are `#FFFF00` gold — **the only class that carries diagonal
 /// glints** (§5.3). The three shares sum to 1.
@@ -263,6 +363,40 @@ pub const SKY_BOTTOM_CH: f32 = 0.04;
 /// Horizontal jitter of a birth about the cell centre, in `cw` (§5.4, hashed).
 pub const SKY_JITTER_CW: f32 = 0.3;
 
+/// **THE 1× CELL — the reference every device-pixel size in this file is
+/// ruled at**, in `ch`: the owner's cell is 7×14 device px at 1× and 15×28
+/// on the retina screen he runs. Every `*_PX` number below (the stub
+/// length, the m2's arm floor and halo floor, the disc's shoulder, the
+/// lift, the throw reaches, the shed's sputter) is stated AT THIS CELL and
+/// scaled by [`px_scale`] where it is spent, exactly as `star_arm` scales
+/// the arm — so the 1× picture is byte-identical to what was ruled, and the
+/// 2× picture is the same picture twice the size (measured:
+/// `the_sky_at_two_x_is_the_sky_at_one_x_twice_the_size`). Before this the
+/// sizes were literal device px, and on the retina cell the sky was a
+/// quarter of the intended AREA with stars a quarter of the intended size
+/// (the halo radii rode the clocked INTEGER arm, 3 → 5 px from 1× to 2×,
+/// so a hero's halo grew 9 → 15 where the picture asked 16).
+pub const CELL_1X_CH: f32 = 14.0;
+
+/// The device-pixel scale of a cell of height `ch` against the 1× cell:
+/// `ch / CELL_1X_CH` — 1 at 1×, 2 on the retina cell, 9/7 at the test
+/// fixture's `ch` 18.
+#[inline]
+#[must_use]
+pub fn px_scale(ch: f32) -> f32 {
+    ch / CELL_1X_CH
+}
+
+/// An INTEGER pixel size ruled at 1×, at cell height `ch`: truncated, as
+/// `star_arm_px` truncates the arm (so a size never rounds UP into a bar
+/// on a fractional scale), floored at the one pixel any mark needs. Exact
+/// at 1× and at 2×.
+#[inline]
+#[must_use]
+pub fn px_at(ch: f32, at_1x: i32) -> i32 {
+    ((at_1x as f32 * px_scale(ch)) as i32).max(1)
+}
+
 /// Lower bound of the seeded ARM-SIZE scintillation rate, Hz (§5.5, D12).
 pub const SCINT_F_MIN: f32 = 8.0;
 
@@ -280,7 +414,9 @@ pub const SCINT_BBOX_MAX_PX: i32 = 10;
 /// `round(2.52 · (0.55 + 0.45·sin²))`, reaches 1 at its trough for a fifth of
 /// every cycle, and a 1-px arm is the GRAIN's silhouette — the m2 ↔ m3 step
 /// would flicker. The published table is the law, so the floor is stated once
-/// here and read by [`StarClass::arm_min_px`]. m1 (`3.53 · 0.88 = 3.1 → 3`)
+/// here and read by [`StarClass::arm_min_px`], which scales it by the cell
+/// ([`px_at`]: 2 at 1× and at `ch` 18, 4 at 2× — where the grain's arm
+/// reaches 3). m1 (`3.53 · 0.88 = 3.1 → 3`)
 /// and m3 (`1.89 · 0.55 = 1.04 → 1`) already round onto their published
 /// bands without one.
 pub const M2_ARM_MIN_PX: i32 = 2;
@@ -391,50 +527,212 @@ pub const M3_CENTRE_ADD: f32 = 1.6;
 /// white pixel), and [`STUB_LEN_PX`] makes it a tip rather than a dot.
 pub const STUB_COV_SHARE: f32 = 1.0;
 
-/// How long each tint stub is, px, running OUTBOARD from
-/// `star_body_px(arm) + 1` — two, so the arm visibly ENDS in colour (the
-/// judge's "monochrome" is exactly one tinted pixel lost under a white
-/// point). Still four quads per star.
+/// How long each tint stub is, px AT THE 1× CELL ([`CELL_1X_CH`]), running
+/// OUTBOARD from `star_body_px(arm) + 1` — two, so the arm visibly ENDS in
+/// colour (the judge's "monochrome" is exactly one tinted pixel lost under
+/// a white point). Still four quads per star. Spent through
+/// [`stub_len_px`]: 2 at 1× and at `ch` 18, 4 on the retina cell.
 pub const STUB_LEN_PX: i32 = 2;
 
-/// §3.2 rank 8: a halo peaks at no more than this share of the CORE it
-/// belongs to. The two halo shares below are set so their byte lands under
-/// it — `HALO_CAP_SHARE · STAR_STACK_ADD = 0.329` of `c` is the ceiling on a
-/// share, and the build refuses one that breaks it (see the `const _` block
-/// below).
-pub const HALO_CAP_SHARE: f32 = 0.14;
+/// [`STUB_LEN_PX`] at cell height `ch` ([`px_at`]).
+#[inline]
+#[must_use]
+pub fn stub_len_px(ch: f32) -> i32 {
+    px_at(ch, STUB_LEN_PX)
+}
+
+/// **§3.2 RANK 8, RE-DERIVED: THE HALO MAY NOT OUTSHINE THE CORE.** A halo's
+/// peak byte stays at or under this share of the composited centre it
+/// belongs to — ONE, i.e. the core is still the brightest pixel of its star
+/// on every channel the halo lights. It was 0.14 ("≤ 14 % of the core"),
+/// under which the owner measured the sky as white dust with a tint
+/// (A/B #15, reversed 2026-09-08: "I want ... a bigger more special rainbow
+/// impact"). The measurable reading of "colour on glass" is the scanner's:
+/// a pixel with a channel spread ≥ 40 at a max channel ≥ 60. At 14 % of a
+/// 143 core (19 levels, falling off from the centre) no halo pixel reached
+/// it; at the shares below the ring of halo pixels just outside the body
+/// does (`stardust_is_coloured_on_the_glass_not_white_with_a_tint`). The
+/// build refuses a share over the cap (see the `const _` block below).
+pub const HALO_CAP_SHARE: f32 = 1.0;
 
 /// The m1 halo's peak, as a share of `c` (§5.7).
 ///
-/// **Was 0.14; now 0.31.** The judge measured the tint invisible: at
-/// `0.14 · 61 = 8.5` levels the halo was 6 % of a 143 core and under the
-/// eye's threshold on the dark ground — "the §5.3 temperature story does not
-/// exist on glass" (`A/frame_0030`, sat p50 7). The polish brief asked for
-/// 0.40; that is 24 levels = 17 % of the core, and §3.2 rank 8 caps a halo at
-/// 14 % of its core, so the share is the cap: `0.31 · 61 = 19` levels, 13.3 %
-/// of 143 (transient: `0.31 · 50 = 16`, 13.6 % of 117). Note that the
-/// `RainHalo` falloff weighs `256/256` at its centre — the peak IS added on
-/// the core pixel in the composite — so "a halo is a falloff" keeps nothing
-/// under the 143 ceiling by itself; rank 8 is the binding law.
-pub const M1_HALO_SHARE: f32 = 0.31;
+/// **Was 0.31; now 1.00** — the hero's whole request, `61` levels in the
+/// sky and `50` transient, 43 % of the 143 core (the old 0.31 was 13 %, the
+/// 14 % cap's ceiling). Derived from the scanner's floor: the falloff at
+/// `d = 4` px on an 11 px halo weighs `0.65`, so a pure-stop halo needs a
+/// peak of `40 / 0.65 = 62` levels to put a spread-40 pixel just outside the
+/// hero's white body; the request is the nearest number the recipe already
+/// has. Note that the `RainHalo` falloff weighs `256/256` at its centre —
+/// the peak IS added on the core pixel in the composite — so the hero's
+/// centre ASKS for `143 + 61` on the tint's channel and reads white-hot
+/// with a coloured heart; the [`FIELD_STAR_COV_CEIL`] ceiling binds the
+/// RECIPE's stack, as it always did (rank 8 was never a ceiling on the
+/// composite), and the sky lives above the text, where nothing is priced
+/// against a glyph. **What the centre GETS is priced by the caret's law**
+/// ([`STAR_LIGHT_CEIL`], [`price_centre`]): the request is the whole of it
+/// on a ground with the room, and on the shipped ground the white body
+/// cedes luminance to the colour rather than the colour to the body.
+pub const M1_HALO_SHARE: f32 = 1.0;
 
-/// The m2 halo's peak, as a share of `c` (§5.7). **Was 0.09; now 0.30** —
-/// `0.09 · 48 = 4.3` levels was the judge's invisible atmosphere; 14 levels
-/// is 10.8 % of the 130 sky core and 12.7 % of the 79 transient one, under
-/// §3.2's 14 % cap either way.
-pub const M2_HALO_SHARE: f32 = 0.30;
+/// The m2 halo's peak, as a share of `c` (§5.7). **Was 0.30; now 0.80** —
+/// `0.80 · 48 = 38` levels in the sky (29 % of the 130 core), `27`
+/// transient (34 % of 80): a 6 px halo at 38 puts `0.56 · 38 = 21` levels of
+/// tint three pixels out, on top of the body's own 60 % tint, where 14 put
+/// four.
+pub const M2_HALO_SHARE: f32 = 0.80;
 
-/// The m1 halo's radius as a multiple of its integer arm (§5.7) — `2.6 · 3.5`
-/// is the 9 px of §5.2's table.
-pub const M1_HALO_R_ARM: f32 = 2.6;
+/// The m1 halo's radius as a multiple of its NOMINAL arm — `star_arm(ch,
+/// STAR_ARM_HERO)`, the float, not the clocked integer (§5.7). **Was 2.6
+/// (9 px at `ch` 18); now 3.0 — 8 px at 1×, 11 at `ch` 18, 16 at the
+/// retina cell** (owner: "bigger"). Not more: the halo's foot is the row
+/// the caret is on, and the ledger prices what lands on a glyph cell
+/// (§3.4).
+///
+/// **Off the integer arm, for two reasons.** The clocked arm truncates
+/// differently at every cell (3 at 1×, 5 at 2×: a 9 → 15 halo where the
+/// picture asks 8 → 16), and it steps at the seeded 8–12 Hz — which put a
+/// 33-px mark's SIZE on the arm clock, outside D12's exemption (bbox ≤ 10
+/// px at 2×). The halo's size is now the cell's; its luminance and its hue
+/// still breathe on the 2.86 Hz clock ([`halo_rgb`]).
+pub const M1_HALO_R_ARM: f32 = 3.0;
 
-/// The m2 halo's radius as a multiple of its integer arm (§5.7), floored at
-/// [`M2_HALO_R_MIN_PX`].
-pub const M2_HALO_R_ARM: f32 = 1.6;
+/// The m2 halo's radius as a multiple of its NOMINAL arm (`star_arm(ch,
+/// STAR_ARM_STD)`, §5.7), floored at [`M2_HALO_R_MIN_PX`]. **Was 1.6; now
+/// 2.4** — under the floor at every cell (4.7 px at 1×, 6 at `ch` 18, 9.4
+/// at 2×), so the floor IS the m2's halo: 6 / 7.7 / 12 px.
+pub const M2_HALO_R_ARM: f32 = 2.4;
 
-/// The m2 halo's radius floor in px (§5.7's `max(4, 1.6·arm)`) — below 4 px a
-/// radial falloff has no room to fall off and reads as a second, softer core.
-pub const M2_HALO_R_MIN_PX: f32 = 4.0;
+/// The m2 halo's radius floor in px AT THE 1× CELL (§5.7's `max(6,
+/// 2.4·arm)`) — below 6 px a radial falloff has no room to fall off around
+/// a 5 px body and reads as a second, softer core. **Was 4.** Spent through
+/// [`m2_halo_r_min_px`]: 6 at 1×, 12 on the retina cell.
+pub const M2_HALO_R_MIN_PX: f32 = 6.0;
+
+/// [`M2_HALO_R_MIN_PX`] at cell height `ch` ([`px_scale`]).
+#[inline]
+#[must_use]
+pub fn m2_halo_r_min_px(ch: f32) -> f32 {
+    M2_HALO_R_MIN_PX * px_scale(ch)
+}
+
+/// The m2's 3×3 disc, as a SHOULDER: how far the tinted disc reaches past
+/// the centre pixel on each axis, px at the 1× cell — one, so the disc is
+/// `(2·1 + 1)² = 3×3` at 1× and at `ch` 18, and `5×5` on the retina cell
+/// ([`m2_disc_shoulder_px`]). §5.7's `push_fx_rect(sx−1, sy−1, 3, 3)`,
+/// scaled.
+pub const M2_DISC_SHOULDER_PX: i32 = 1;
+
+/// [`M2_DISC_SHOULDER_PX`] at cell height `ch` ([`px_at`]).
+#[inline]
+#[must_use]
+pub fn m2_disc_shoulder_px(ch: f32) -> i32 {
+    px_at(ch, M2_DISC_SHOULDER_PX)
+}
+
+/// **THE HALO BREATHES ITS HUE** (owner, 2026-09-08: "the twinkle has more
+/// colour in it") — how far, in `SPECTRUM_LUT` entries, a halo's colour
+/// walks from its star's stop on the luminance clock: `+15` at the twinkle
+/// peak, `−15` at the trough, on the arc itself ([`halo_rgb`]). The nearest
+/// two anchors are 63 entries apart (`SPECTRUM_ANCHOR_AT`), so the halo
+/// never wears a neighbouring name; `15/510 ≈ 0.03` of the walk is a hue
+/// shift of a few degrees — a breath, not a change of colour. Gold and the
+/// A-type white have no stop to breathe around and hold their colour.
+pub const HALO_HUE_SWING_ENTRIES: i32 = 15;
+
+/// **THE CARET LAW, ON THE STAR'S OWN CENTRE** (`cursor_glow` §8 d, *"the
+/// brightest pixel of the frame is under the cursor — you must always be
+/// able to find your cursor"*): the relative luminance NO pixel a sky star
+/// composites may exceed, over the ground it actually sits on.
+///
+/// **DERIVED FROM THE CARET'S DIMMEST LAWFUL STATE, not chosen.** The
+/// block's fill is lifted to a luminance floor of
+/// [`RAINBOW_CARET_LIGHT_FLOOR`] (`80/255`) the moment the colour envelope
+/// clears its quarter-range knee — that is the least light the caret ever
+/// carries while a starfield is alive, at every energy, flare or no flare
+/// (the flare and the rim-headroom law only ever lift it HIGHER) — and the
+/// field is allowed [`RAINBOW_SPARKLE_LIGHT_SHARE`] of it: `Y = 72/255`,
+/// eight levels of luminance under the dimmest caret, which the gate holds
+/// less the two levels its own byte roundings can eat. Over black a white
+/// pixel at this luminance is level `145` — `RAINBOW_FIELD_LEVEL`, the very
+/// number `61 = 145 / 2.35` and so [`M1_COV_SKY`] were solved from. That
+/// solve was over BLACK and it priced the STACK alone: over the shipped
+/// ground (`#1A1B26`) the same luminance is a white add of `117`, and the
+/// hero's full-share halo stacks another `M1_HALO_SHARE · c` on the very
+/// centre pixel — measured, an A-type white hero at the default intensity
+/// composited to `#ACABB9`, `Y = 106`, eleven levels OVER a caret at `95`.
+///
+/// **IT IS AN ORIENTATION LAW, NOT COLOUR RESTRAINT.** Saturation costs no
+/// luminance: a pure stop at this `Y` has a far higher channel than a grey
+/// at it, and reads as colour. So [`price_centre`] spends the ceiling
+/// COLOUR FIRST — a tinted halo (and the m2's tinted disc) keeps its whole
+/// request and its whole saturation, and the WHITE body takes the luminance
+/// left; only an achromatic star (the A-type white, whose halo is more
+/// white) prices its body first and lets its halo have the remainder. On a
+/// ground already over the ceiling (not a dark theme in any sense the caret
+/// floor was written for) the request stands untouched: the law is the
+/// caret's to keep there, and the field ledger's.
+///
+/// Held per star, per frame: PRICED on the composited centre — the two
+/// crossing bodies, the nucleus, the disc and the halo's peak, in the
+/// rasterizer's own bytes ([`price_centre`]) — and then SETTLED on the
+/// pixels its recipe stacks light on away from the centre, read back from
+/// its own quads ([`settle_under_ceiling`]); both over [`sky_ground`], the
+/// theme ground plus everything the sky has already laid under this star
+/// this frame (the aurora, and the stars drawn before it).
+pub const STAR_LIGHT_CEIL: f32 = RAINBOW_CARET_LIGHT_FLOOR * RAINBOW_SPARKLE_LIGHT_SHARE / 255.0;
+
+// ---------------------------------------------------------------------------
+// 1a′. THE AURORA — the veil above the live ribbon (owner, 2026-09-08)
+// ---------------------------------------------------------------------------
+//
+// "make this rainbow theme truly magical and special and dynamic and
+// beautiful" — a soft rainbow glow in the sky band above the live ribbon,
+// carrying the ribbon's own spectrum walk so the two read as ONE rainbow
+// rising from the line. One [`Veil`] cell per laid cell, born on the key
+// that laid it, priced by momentum at birth, riding the FIELD lane's
+// envelope ([`field_lane_envelope`]) so it holds while the hand is on the
+// row, goes out from the hand, and is gone before the ribbon's retract
+// moves — "the aurora leaves with the ribbon". It sits strictly ABOVE the
+// glyph row (never a pixel of a glyph cell's own rows) inside the cell's own
+// column, and only over a cell whose sky the probe proved blank, so it costs
+// legibility nothing.
+
+/// The veil pool's fixed capacity — reserved once, never grown (§18). At 12
+/// cps a cell's veil lives the swoosh horizon (1.54 s), so ~19 are live under
+/// a hot hand; a 40-cell paste is bounded here by evicting the cell lit
+/// longest ago.
+pub const AURORA_CAP: usize = 64;
+
+/// How tall the veil is, in `ch`, above the line — the box is
+/// `[bottom − 0.35 ch, bottom)` where `bottom` is the sky band's own anchor
+/// (the ribbon's top under `tall`, the glyph row's top under `underline`,
+/// never lower than the glyph row's top). The brief's bound, exactly.
+pub const AURORA_TALL_CH: f32 = 0.35;
+
+/// The veil's peak coverage byte at full momentum, at the line — its
+/// brightest pixel, since the falloff is centred on the box's bottom edge
+/// and each cell's veil is clipped to its own column (no two veils sum).
+/// "≤ ~40 coverage at its brightest": 40.
+pub const AURORA_COV_PEAK: f32 = 40.0;
+
+/// Below this BIRTH spine a key lays no veil at all — "invisible cold". Its
+/// gain is `smoothstep((birth_disp − 0.15) / 0.85)`: `0.37` (15 levels,
+/// "plain") at 0.5, `0.71` (29) at 0.7, `1.0` (40, "full") at 1.0. Priced
+/// ONCE at birth from `Ctx::birth_disp`, exactly as the ribbon prices a
+/// cell's `cov0`: a veil never brightens without a keystroke behind it.
+pub const AURORA_COLD_DISP: f32 = 0.15;
+
+/// The veil's horizontal falloff radius in `cw`, centred on the cell: at the
+/// cell's own edge (`dx = 0.5 cw`) the weight is `0.88`, so a row of clipped
+/// per-cell veils reads as one band with a 12 % scallop, not as beads.
+pub const AURORA_REACH_CW: f32 = 2.0;
+
+/// Veil halos stardust may draw on one frame — the pool's own size, one
+/// `RainHalo` per live cell (the box lies in one cell row by construction,
+/// so a veil never splits). Counted beside [`STARDUST_HALO_BUDGET`], which
+/// stays the STAR halo budget; on light both spend [`STARDUST_LIGHT_HALO_BUDGET`].
+pub const AURORA_HALO_BUDGET: usize = AURORA_CAP;
 
 /// The composited centre of a sky m1 — `STAR_STACK_ADD · c` (§5.2, §3.2 rank
 /// 4). Rank 4 in the luminance hierarchy: brighter than the coma, dimmer than
@@ -494,14 +792,37 @@ const _: () = {
         CENTRE_M3_SKY < CENTRE_M2_SKY && CENTRE_M2_SKY < CENTRE_M1_SKY,
         "the sky magnitudes must stay ordered m3 < m2 < m1"
     );
-    // §3.2 rank 8: a halo peaks at ≤ 14 % of the core it belongs to — at the
+    // §3.2 rank 8, re-derived: the halo may not OUTSHINE the core — at the
     // top of the twinkle the core is `STAR_STACK_ADD · c` and the halo
     // `share · c`, and both lanes price the same shares, so one ratio covers
-    // all four halos.
+    // all four halos. Strict: the core is the peak.
     assert!(
-        M1_HALO_SHARE <= HALO_CAP_SHARE * STAR_STACK_ADD
-            && M2_HALO_SHARE <= HALO_CAP_SHARE * STAR_STACK_ADD,
-        "a star halo peaks over §3.2's 14 % of its core"
+        M1_HALO_SHARE < HALO_CAP_SHARE * STAR_STACK_ADD
+            && M2_HALO_SHARE < HALO_CAP_SHARE * STAR_STACK_ADD,
+        "a star halo outshines the core it belongs to (§3.2 rank 8)"
+    );
+    // The m2's tinted body still stacks to a peak that is the tint's own
+    // channel at full, so its composited centre is unchanged on that channel.
+    assert!(
+        M2_BODY_TINT > 0.0 && M2_BODY_TINT <= 1.0,
+        "the m2 body tint is a share of the way from white to the tint"
+    );
+    // The halo's hue breath stays inside its own stop's name: the nearest two
+    // anchors of `SPECTRUM_ANCHOR_AT` are 63 entries apart (0 → 63), and a
+    // breath of half that or more would let a red halo wear orange.
+    assert!(
+        HALO_HUE_SWING_ENTRIES > 0 && HALO_HUE_SWING_ENTRIES * 2 < 63,
+        "the halo's hue breath reaches a neighbouring stop"
+    );
+    // The aurora: a coverage byte under the sparkle ceiling by a wide margin
+    // (it is a veil, not a mark), and a pool the halo budget can carry.
+    assert!(
+        AURORA_COV_PEAK > 0.0 && AURORA_COV_PEAK <= 40.0,
+        "the aurora's brightest pixel is over the brief's ~40"
+    );
+    assert!(
+        AURORA_TALL_CH > 0.0 && AURORA_TALL_CH <= 0.35 && AURORA_HALO_BUDGET >= AURORA_CAP,
+        "the aurora's box is taller than the brief's 0.35 ch, or its pool outruns its budget"
     );
     // D1 for the grain: its tinted disc must stay well under its white core
     // at the twinkle TROUGH too (`core · 0.55` against a disc that rides
@@ -514,7 +835,7 @@ const _: () = {
     // §5.3's deal must be a partition.
     assert!(
         TINT_GOLD_SHARE > 0.0 && TINT_FIELD_SHARE + TINT_WHITE_SHARE + TINT_GOLD_SHARE == 1.0,
-        "the 60/25/15 tint deal must sum to one"
+        "the 75/10/15 tint deal must sum to one"
     );
     // §5.6's strike deal is ALSO a partition — one draw per cell, bucketed
     // m1 / m2 / m3 / none — so a cell can never carry two strike stars on
@@ -574,8 +895,134 @@ pub const TAU_M3_TRANSIENT_MS: f32 = 67.0;
 /// Small on purpose: at 460 ms it is 1.4 px, which the integer step renders as
 /// a single one-pixel rise somewhere in the star's life. A star that visibly
 /// TRAVELS is a particle; a star that has shifted by the time you look back is
-/// a sky.
+/// a sky. Stated at the 1× cell and spent through [`sky_lift_px_per_s`]
+/// (−6 px/s on the retina cell: the same rise in the same time).
 pub const SKY_LIFT_PX_PER_S: f32 = -3.0;
+
+/// [`SKY_LIFT_PX_PER_S`] at cell height `ch` ([`px_scale`]).
+#[inline]
+#[must_use]
+pub fn sky_lift_px_per_s(ch: f32) -> f32 {
+    SKY_LIFT_PX_PER_S * px_scale(ch)
+}
+
+// ---------------------------------------------------------------------------
+// 1d. THE SLIPSTREAM — the sky streams past a hand at speed
+// ---------------------------------------------------------------------------
+
+/// **THE SLIPSTREAM'S SHARE** — a sky star born under a hand at speed
+/// inherits a BACKWARD drift (toward the pane's first column) of
+/// `STREAM_SHARE_CW · cw / IOI` px/s, where `IOI` is the interval between
+/// the last two Typed keys ([`Stardust::note_cadence`]): 0.35 of a cell per
+/// key interval. 10 cps at `cw` 9 → 31 px/s; at the owner's `cw` 15 → 52;
+/// 12 cps → 63; 8 cps → 42.
+///
+/// The owner's criterion, verbatim: *"effects that somehow make typing feel
+/// faster or gain momentum are the best."* At speed the whole sky streams
+/// past the hand; at a stroll it stands still ([`STREAM_IOI_STROLL_MS`]);
+/// one star-life after the hand stops it is at rest ([`STREAM_END_MS`]).
+/// T4 holds: the velocity is the OBSERVED cadence — the IOI of the typed
+/// events, never the spine — and the spine only GATES the birth
+/// ([`STREAM_DISP`]). The field stars take it too; the aurora's veils do
+/// not (they belong to their cells).
+pub const STREAM_SHARE_CW: f32 = 0.35;
+/// The drift's decay, ms: `v(age) = v₀ · e^(−age/τ)`, so the sky slows
+/// from the instant it is born and a star's travel is bounded whatever the
+/// hand does next.
+pub const STREAM_TAU_MS: f32 = 300.0;
+/// Where the drift ENDS, ms after birth — the longest sky class life (the
+/// strike m1's published 460, `H + 2.32·τ` = 458.7;
+/// `the_sky_is_at_rest_one_star_life_after_the_last_key` pins the two
+/// within 1.5 ms), so "the sky is at rest one star-life after the last
+/// key" is true of EVERY star, the long-lived field star included.
+/// The path is the exponential's first `STREAM_END_MS` ([`stream_unit`]),
+/// then still; the whole travel is `v₀ · τ · STREAM_SPENT`.
+pub const STREAM_END_MS: f32 = 460.0;
+/// `1 − e^(−STREAM_END_MS / STREAM_TAU_MS)` — the share of the
+/// exponential's asymptote spent by the end of the drift, as a literal so
+/// the frame path never evaluates it
+/// (`the_stream_spent_share_is_the_exponential_s`).
+pub const STREAM_SPENT: f32 = 0.784_11;
+/// The IOI clamp's fast end, ms — the fastest priced hand (33 cps: 175
+/// px/s on the owner's cell, 2.6 cells of travel).
+pub const STREAM_IOI_MIN_MS: f32 = 30.0;
+/// The IOI clamp's slow end, ms — and the IOI a session's FIRST key is
+/// priced at, having no interval to read (under the stroll gate: nothing).
+pub const STREAM_IOI_MAX_MS: f32 = 600.0;
+/// The stroll gate, OPEN: an IOI at or under this (≥ 6.7 cps) streams at
+/// the whole priced velocity.
+pub const STREAM_IOI_RUN_MS: f32 = 150.0;
+/// The stroll gate, CLOSED: an IOI at or over this (≤ 3 cps) streams
+/// nothing; between the two the velocity is smoothstepped in. Without it
+/// a 2 cps peck would drift 3 px on the owner's cell: §23 measured a
+/// sustained 2 cps hand at a `disp` of 0.97, so the birth gate alone
+/// cannot make a stroll stand still — the cadence itself has to.
+pub const STREAM_IOI_STROLL_MS: f32 = 333.0;
+/// The spine gate: only a star born at `birth_disp ≥ 0.5` inherits the
+/// drift — the second grain's own threshold.
+pub const STREAM_DISP: f32 = 0.5;
+
+/// **THE SLIPSTREAM'S VELOCITY**, px/s backward, for a cell width `cw` and
+/// an observed key interval `ioi_ms`: `STREAM_SHARE_CW · cw / IOI` under
+/// the stroll gate, the IOI clamped to
+/// `[STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS]`. Zero for a stroll, a
+/// non-finite input, or no cell.
+#[must_use]
+pub fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
+    if !(cw.is_finite() && ioi_ms.is_finite()) || cw <= 0.0 {
+        return 0.0;
+    }
+    let ioi = ioi_ms.clamp(STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS);
+    let gate =
+        smoothstep01((STREAM_IOI_STROLL_MS - ioi) / (STREAM_IOI_STROLL_MS - STREAM_IOI_RUN_MS));
+    STREAM_SHARE_CW * cw * 1000.0 / ioi * gate
+}
+
+/// The whole travel, px, of a star born at `px_per_s` — the exponential's
+/// integral over the drift's life, `v₀ · τ · STREAM_SPENT`: 14.8 px at 12
+/// cps on the owner's cell, 9.9 at 8.
+#[must_use]
+pub fn stream_travel_px(px_per_s: f32) -> f32 {
+    px_per_s / 1000.0 * STREAM_TAU_MS * STREAM_SPENT
+}
+
+/// The drift's unit progress at `age_ms`, `0..=1`: the exponential's rise
+/// normalised to reach exactly 1 at [`STREAM_END_MS`], and 1 thereafter.
+/// The one curve the position and the cadence solver share.
+#[inline]
+#[must_use]
+fn stream_unit(age_ms: f32) -> f32 {
+    if age_ms >= STREAM_END_MS {
+        return 1.0;
+    }
+    ((1.0 - (-age_ms.max(0.0) / STREAM_TAU_MS).exp()) / STREAM_SPENT).min(1.0)
+}
+
+// ---------------------------------------------------------------------------
+// 1e. THE MEND'S PULL — the fix grabs the erased cell's light and pulls it
+//     into the caret's cell
+// ---------------------------------------------------------------------------
+
+/// **THE MEND'S PULL WINDOW**, ms. When a typed key MENDS a typo run
+/// ([`super::Mend`], §23's addendum "The mend") its strike star is an m2
+/// born at the ERASED cell's sky — the very star the Backspace was retiring,
+/// if one is live — and pulled ONE CELL into the caret's over this window on
+/// the throw's own ease-out (`1 − spend(age/T)`, the curve every radial
+/// throw in the theme draws), then PINNED there for the rest of its life:
+/// the fix visibly pulls the light back to where it belongs. The landing
+/// fan's own window ([`FAN_THROW_MS`]); on the owner's 15 px cell a
+/// one-cell pull peaks at ~270 px/s and is over inside the m2's hold plus
+/// thirty ms, so the star is at full the whole way.
+///
+/// A per-star travel like the slipstream's ([`Star::pull`]), NOT a lane
+/// motion, for three reasons measured on this tree: the pull must END —
+/// the shed's [`Motion::Drag`] at τ 90 stands at 70 % of the cell here and
+/// pins only at death; it must ask for exactly one brisk window
+/// ([`Star::brisk`]) where a dragging lane holds the frame cadence for the
+/// star's whole life; and it must survive the next key's field deal, whose
+/// adoption zeroes `v0` ([`Stardust::adopt_field`]) and would snap a
+/// lane-moved star to its home mid-pull.
+pub const MEND_PULL_MS: f32 = 110.0;
 
 /// The drag time constant of a SHED fragment, ms (§5.6: "drag τ 90 ms").
 /// Displacement is the closed-form integral `v₀·τ·(1 − e^(−age/τ))`, so a
@@ -702,21 +1149,26 @@ pub const FIELD_RETRACT_BASE_MS: f32 = 240.0;
 /// Per-cell term of a kill's retract span (§8.2: "12·n + 240").
 pub const FIELD_RETRACT_PER_CELL_MS: f32 = 12.0;
 
-/// Minimum radial reach of an erase throw, px (§5.6).
+/// Minimum radial reach of an erase throw, px at the 1× cell (§5.6; scaled
+/// by [`px_scale`] where thrown, like every reach and sputter below).
 pub const ERASE_REACH_MIN_PX: f32 = 2.0;
-/// Maximum radial reach of an erase throw, px (§5.6).
+/// Maximum radial reach of an erase throw, px at the 1× cell (§5.6).
 pub const ERASE_REACH_MAX_PX: f32 = 4.0;
-/// Minimum radial reach of a mini-fan throw, px (§5.6: "1-2 px throw").
+/// Minimum radial reach of a mini-fan throw, px at the 1× cell (§5.6: "1-2
+/// px throw").
 pub const MINI_FAN_REACH_MIN_PX: f32 = 1.0;
-/// Maximum radial reach of a mini-fan throw, px (§5.6).
+/// Maximum radial reach of a mini-fan throw, px at the 1× cell (§5.6).
 pub const MINI_FAN_REACH_MAX_PX: f32 = 2.0;
 
 /// Share of the meteor head's velocity a shed fragment inherits ALONG the path
 /// (§5.6: `v₀ = 0.12·v_head`).
 pub const SHED_ALONG_SHARE: f32 = 0.12;
-/// Minimum PERPENDICULAR sputter of a shed fragment, px/ms (§5.6).
+/// Minimum PERPENDICULAR sputter of a shed fragment, px/ms at the 1× cell
+/// (§5.6). The ALONG share needs no scale: the head's velocity is already
+/// in the cell's own pixels.
 pub const SHED_PERP_MIN: f32 = 0.4;
-/// Maximum perpendicular sputter of a shed fragment, px/ms (§5.6).
+/// Maximum perpendicular sputter of a shed fragment, px/ms at the 1× cell
+/// (§5.6).
 pub const SHED_PERP_MAX: f32 = 1.1;
 
 /// Erase: how many m3 grains one Backspace throws (§5.6's "3 m3 + 1 m2").
@@ -755,9 +1207,17 @@ pub const STARDUST_HALO_BUDGET: usize = 16;
 /// every light star as ink lays (the `push_twinkle_over` silhouette spends up
 /// to five per star, each split per crossed row) and §18 holds a light frame
 /// to ≤ 400 of `MAX_HALOS 512` with the meteor's train chain at 96 and its
-/// ring at 24 ahead of the sky, which is the LAST emitter and the one
-/// `halos.truncate` sheds: `400 − 96 − 24`.
-pub const STARDUST_LIGHT_HALO_BUDGET: usize = 280;
+/// ring at 36 ahead of the sky (`RING_LIGHT_DOTS`, 24 → 36 with the
+/// shockwave's 2.3× reach; NOT graded with the ring's radius — see its doc),
+/// which is the LAST emitter and the one `halos.truncate` sheds:
+/// `400 − 96 − 36`. The const assert holds the three to the law, so a
+/// retune of the ring's dots cannot silently overdraw the light frame.
+pub const STARDUST_LIGHT_HALO_BUDGET: usize = 268;
+
+const _: () = assert!(
+    STARDUST_LIGHT_HALO_BUDGET + 96 + super::meteor::RING_LIGHT_DOTS == 400,
+    "§18: the light frame's 400-halo law — train chain + ring dots + sky"
+);
 
 /// The source-over ceiling of a light-theme star mark (§3.3: `light_ink_bold`
 /// is `InkRole::Leading`, cap 236). Every light alpha this module emits is at
@@ -852,13 +1312,14 @@ impl StarClass {
         }
     }
 
-    /// The smallest INTEGER arm this class is ever drawn at (§5.5's table:
-    /// m1 3 ↔ 4, m2 2 ↔ 3, m3 1 ↔ 2 px). See [`M2_ARM_MIN_PX`] for why only
-    /// the m2 needs stating.
+    /// The smallest INTEGER arm this class is ever drawn at, at cell height
+    /// `ch` (§5.5's table at `ch` 18: m1 3 ↔ 4, m2 2 ↔ 3, m3 1 ↔ 2 px). See
+    /// [`M2_ARM_MIN_PX`] for why only the m2 needs stating — and why it
+    /// scales with the cell ([`px_at`]).
     #[must_use]
-    pub fn arm_min_px(self) -> i32 {
+    pub fn arm_min_px(self, ch: f32) -> i32 {
         match self {
-            Self::M2 => M2_ARM_MIN_PX,
+            Self::M2 => px_at(ch, M2_ARM_MIN_PX),
             Self::M1 | Self::M3 => 1,
         }
     }
@@ -1154,6 +1615,26 @@ pub struct Star {
     /// `[SCINT_F_MIN, SCINT_F_MAX]` (§5.5, D12). The audio glint that rides
     /// this star twinkles at **this same `f`** (§13) — one number, both halves.
     pub f: f32,
+    /// **THE SLIPSTREAM'S TRAVEL**, px ≥ 0 — how far this star drifts
+    /// BACKWARD (toward the pane's first column) over [`STREAM_END_MS`],
+    /// priced ONCE at birth from the hand's observed key interval
+    /// ([`stream_travel_px`] of [`stream_px_per_s`], T4) and clamped to the
+    /// blank frontier of its sky row ([`Stardust::stream_reach`], L4).
+    /// Integer-stepped like the lift: `x − round(stream · stream_unit(age))`
+    /// ([`Star::pos`]). Zero — the common case, answered before any `exp` —
+    /// for a star born under a stroll or a cold hand, and for every
+    /// transient. An adopted field star keeps the drift it was born with.
+    pub stream: f32,
+    /// **THE MEND'S PULL**, px ≥ 0 — how far LEFT of its home this star
+    /// was born, and is drawn in from over [`MEND_PULL_MS`] on the throw's
+    /// ease-out: `x − round(pull · spend(age / MEND_PULL_MS))`
+    /// ([`Star::pos`]). `x`, `y` are the HOME — the caret cell's own dealt
+    /// sky pixel, where the star is pinned from the window's end and what
+    /// every cell law reads ([`star_over_cell`]), so one-star-per-cell sees
+    /// the star where it lands. Zero for every star but a mend's
+    /// ([`Stardust::deal_star`] with a [`Pull`]); an adopted field star keeps
+    /// it, as it keeps its stream.
+    pub pull: f32,
     /// The finish this star is on, if any ([`Finish`]).
     pub finish: Option<Finish>,
 }
@@ -1268,25 +1749,15 @@ impl Star {
     pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
         let age = self.age_s(now);
         let fin = self.finish.map_or(1.0, |f| f.gain(now));
-        let field = self.lane == StarLane::Field;
+        if self.lane == StarLane::Field {
+            // The field lane's one envelope — shared with the aurora's veil,
+            // which rides the same cell the same way ([`Veil::envelope`]).
+            return field_lane_envelope(age, self.idle_s(now), fin, reduced_motion);
+        }
         if reduced_motion {
             let life = self.life_s();
             let fade = REDUCED_MOTION_FADE_MS / 1000.0;
-            let mut env = clamp01((life - age) / fade.max(f32::EPSILON)) * fin;
-            if field {
-                env *= reduced_fade(field_fade_life_s() - self.idle_s(now));
-            }
-            return env;
-        }
-        if field {
-            let life = self.life_s().max(f32::EPSILON);
-            let birth = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age);
-            let hand = half_life(
-                self.idle_s(now),
-                FIELD_HOLD_MS / 1000.0,
-                FIELD_TAU_MS / 1000.0,
-            );
-            return birth * expiry_melt(age / life) * hand * fin;
+            return clamp01((life - age) / fade.max(f32::EPSILON)) * fin;
         }
         let (hold, tau) = self.class.envelope_s(self.lane);
         half_life(age, hold, tau) * fin
@@ -1373,6 +1844,10 @@ impl Star {
         if self.lane == StarLane::Field && age_s < EDGE_IN_S {
             return true;
         }
+        // The mend's pull moves every frame of its window, like a throw (1e).
+        if self.pull > 0.0 && age_s * 1000.0 < MEND_PULL_MS {
+            return true;
+        }
         if self.v0.0 == 0.0 && self.v0.1 == 0.0 {
             return false;
         }
@@ -1403,7 +1878,7 @@ impl Star {
         {
             return None;
         }
-        let min = self.class.arm_min_px() as f32;
+        let min = self.class.arm_min_px(ch) as f32;
         let omega = std::f32::consts::TAU * self.f;
         let theta = omega * self.age_s(now) + self.lum_phase();
         let k0 = (nominal * floor - 0.5).ceil().max(min) as i32;
@@ -1458,17 +1933,71 @@ impl Star {
         best
     }
 
+    /// The slipstream's integer displacement at `age_ms`, px toward the
+    /// pane's first column: `round(stream · stream_unit(age))`. Zero for a
+    /// star with no drift — the common case, answered before any `exp`.
+    #[inline]
+    fn stream_px(&self, age_ms: f32) -> i32 {
+        if self.stream <= 0.0 {
+            return 0;
+        }
+        (self.stream * stream_unit(age_ms)).round() as i32
+    }
+
+    /// Seconds until a STREAMING star's integer position next steps (the
+    /// slipstream, integer-stepped like the lift): `x = origin −
+    /// round(stream · u(age))` steps where `stream · u(age)` next reaches a
+    /// half, and `u` is the normalised exponential ([`stream_unit`]), so the
+    /// step is solved in closed form — `age = −τ · ln(1 − u · STREAM_SPENT)`
+    /// — and never polled. `None` for a star with no drift, past
+    /// [`STREAM_END_MS`], or whose remaining travel rounds to nothing.
+    /// Offered to the cadence fold as a TAIL, under the floor.
+    #[must_use]
+    pub fn next_stream_step_s(&self, now: Instant) -> Option<f32> {
+        if self.stream <= 0.0 || !self.stream.is_finite() {
+            return None;
+        }
+        let age_ms = self.age_s(now) * 1000.0;
+        if age_ms >= STREAM_END_MS {
+            return None;
+        }
+        let n = (self.stream * stream_unit(age_ms)).round();
+        let u = (n + 0.5) / self.stream;
+        if u >= 1.0 {
+            return None;
+        }
+        let t_ms = -STREAM_TAU_MS * (1.0 - u * STREAM_SPENT).ln();
+        Some(((t_ms.min(STREAM_END_MS) - age_ms) / 1000.0).max(0.0))
+    }
+
+    /// The mend's pull at `age_ms`, px this star still stands LEFT of its
+    /// home: `round(pull · spend(age / MEND_PULL_MS))` — the whole pull at
+    /// birth, nothing from the window's end (1e). Zero for a star with no
+    /// pull, answered before any arithmetic.
+    #[inline]
+    fn pull_px(&self, age_ms: f32) -> i32 {
+        if self.pull <= 0.0 || age_ms >= MEND_PULL_MS {
+            return 0;
+        }
+        (self.pull * spend(age_ms / MEND_PULL_MS)).round() as i32
+    }
+
     /// The centre at `now`, PINNED TO A DEVICE PIXEL (§5.4: sub-pixel drift is
     /// expressed as integer steps of the centre, never as half-lit pixels).
     ///
     /// One of the three laws of [`Motion`], picked by the population. Reduced
-    /// motion freezes every mark at its birth pixel (§6.11).
+    /// motion freezes every mark at its birth pixel (§6.11) — for a mend's
+    /// star, its home.
     #[must_use]
     pub fn pos(&self, now: Instant, reduced_motion: bool) -> (i32, i32) {
         if reduced_motion {
             return self.origin();
         }
-        self.at_k(self.lane.motion().k_at(self.age_s(now) * 1000.0))
+        let age_ms = self.age_s(now) * 1000.0;
+        let (x, y) = self.at_k(self.lane.motion().k_at(age_ms));
+        // The slipstream (1d) and the mend's pull (1e) ride on top of the
+        // lane's own law, on X only.
+        (x - self.stream_px(age_ms) - self.pull_px(age_ms), y)
     }
 
     /// **WHERE THIS STAR COMES TO REST** — its position at the end of its
@@ -1481,7 +2010,9 @@ impl Star {
     #[must_use]
     pub fn rest(&self) -> (i32, i32) {
         let motion = self.lane.motion();
-        self.at_k(motion.k_at(motion.end_ms(self.life_s() * 1000.0)))
+        let end_ms = motion.end_ms(self.life_s() * 1000.0);
+        let (x, y) = self.at_k(motion.k_at(end_ms));
+        (x - self.stream_px(end_ms), y)
     }
 
     /// The birth pixel — `x`, `y` are integers by construction (§5.4).
@@ -1647,7 +2178,17 @@ pub struct Glint {
 /// * a row the probe never covered is `None` — *unknown*, and §5.4 is
 ///   emphatic that unknown means **no star is born**. There is no in-cell
 ///   fallback and no descender-gap fallback for ribbon cells; both are
-///   deleted (L4, D16).
+///   deleted (L4, D16);
+/// * a cell holding a **light horizontal rule** ([`CellInk::Rule`] — the
+///   `─` a TUI draws its input box with) is ink ONLY inside the rule's
+///   stroke band ([`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`]): the
+///   cell-level [`Self::at`] still says `Some(true)` (there is ink in the
+///   cell), the pixel-level [`Self::at_px`] says `Some(false)` above and
+///   below the stroke — which is where the sky band lies, so a sky star
+///   may be born there and its core never touches the stroke. Without this
+///   class every input line drawn under a full-width rule (Claude Code's,
+///   and every other bordered TUI prompt) probed as a wall of glyphs and
+///   the sky above it was dark for the life of the session.
 ///
 /// The host probes the caret's row and its two neighbours, so this holds at
 /// most three rows and evicts round-robin. Resident and cleared, never
@@ -1661,13 +2202,102 @@ pub struct GlyphProbe {
     at: usize,
 }
 
+/// **WHAT ONE PROBED CELL HOLDS**, for §5.4's gate — the host's per-column
+/// char reduced to the one distinction the sky cares about.
+///
+/// The gate is CELL-granular by design (a bitset, §18), and for text that is
+/// the right grain: a glyph's ink reaches the baseline and below, so the
+/// lower third of its cell — the sky band of the row beneath — is never
+/// provably clear. A light horizontal rule is the one glyph a TUI puts in
+/// EVERY column of the row above an input line, and its ink is a stroke
+/// through the cell's vertical centre and nothing else. [`cell_ink`] names
+/// that shape so the probe can answer for it per PIXEL rather than per cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CellInk {
+    /// A blank (`' '`): provably clear, `Some(false)` everywhere.
+    #[default]
+    Blank,
+    /// Any other glyph, a wide continuation (`'\0'`) included: `Some(true)`
+    /// at every pixel of the cell (L4's law, unchanged).
+    Glyph,
+    /// A LIGHT horizontal box-drawing rule (`─` U+2500 and its dashed and
+    /// half-length siblings): `Some(true)` only inside
+    /// [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`], `Some(false)` above and
+    /// below it. Heavy (`━`) and double (`═`) rules are NOT this class —
+    /// their strokes are up to three times thicker and, on a square cell,
+    /// reach into the sky band — so they stay [`Self::Glyph`].
+    Rule,
+}
+
+/// Classify one probed char for the glyph probe (the host's
+/// `Terminal::row_cols_into` convention: the resolved lead char at its
+/// column, `'\0'` at a wide continuation, `' '` for a blank).
+///
+/// The rule set is exactly the LIGHT horizontal members of the Box Drawing
+/// block — solid, triple-dash, quadruple-dash, double-dash, left half and
+/// right half. Everything with a vertical arm, a heavy or double stroke, or
+/// any other ink is a glyph.
+#[must_use]
+pub const fn cell_ink(ch: char) -> CellInk {
+    match ch {
+        ' ' => CellInk::Blank,
+        '\u{2500}' | '\u{2504}' | '\u{2508}' | '\u{254C}' | '\u{2574}' | '\u{2576}' => {
+            CellInk::Rule
+        }
+        _ => CellInk::Glyph,
+    }
+}
+
+/// Where a light horizontal rule's stroke BEGINS, as a fraction of the cell
+/// height from the cell's top (§5.4, the rule clause). The renderer draws
+/// the light stroke `round(min(cw, ch) / 8)` px thick (never under 1 px),
+/// centred in the cell (`aterm_render::procedural`'s one rounding rule), so
+/// its top edge sits at `(ch − stroke) / 2` — at or above `0.40 · ch` on any
+/// cell 8 px or taller, and at `0.46 · ch` on the 15 × 28 cell the owner
+/// types on. `0.35` leaves a margin for a font-drawn `─` where procedural
+/// synthesis is switched off.
+pub const RULE_INK_TOP_CH: f32 = 0.35;
+
+/// …and where it ENDS — the sky zone's own top edge under the shipped `tall`
+/// spelling, derived rather than chosen: the ribbon's top is
+/// [`super::ribbon::TALL_UP_CH`]` − 1 = 0.10 ch` above the typed cell, and
+/// the sky band reaches [`SKY_TOP_CH`] above that, so the zone's highest
+/// pixel is `1 − 0.10 − 0.30 = 0.60` of the way down row − 1. The stroke's
+/// bottom edge is `(ch + stroke) / 2 ≤ 0.57 · ch` on any cell 8 px or
+/// taller, so the band contains the stroke with a margin and is disjoint
+/// from the sky by construction — the assertion beneath pins both
+/// spellings.
+pub const RULE_INK_BOT_CH: f32 = 1.0 - (super::ribbon::TALL_UP_CH - 1.0) - SKY_TOP_CH;
+
+// THE RULE CLAUSE'S WHOLE CLAIM: a sky star born by §5.4's zone never has its
+// core on a rule's stroke, in either spelling. Under `tall` the zone is the
+// lower `[0.60, 0.86]` of row − 1 and the stroke band ends at 0.60; under
+// `underline` the zone is `[0.04, 0.30]` of the typed cell and the stroke
+// band starts at 0.35.
+const _: () = assert!(
+    RULE_INK_BOT_CH <= 1.0 - (super::ribbon::TALL_UP_CH - 1.0) - SKY_TOP_CH,
+    "the rule's stroke band must end at or above the tall sky zone's top edge"
+);
+const _: () = assert!(
+    SKY_TOP_CH <= RULE_INK_TOP_CH,
+    "the underline sky zone must end above the rule's stroke band"
+);
+const _: () = assert!(
+    RULE_INK_TOP_CH < 0.5 && 0.5 < RULE_INK_BOT_CH,
+    "the rule's stroke band must contain the cell's vertical centre"
+);
+
 /// One probed row of the grid: which columns carry ink.
 #[derive(Clone, Debug, Default)]
 struct ProbedRow {
     /// The grid row, signed so an off-grid probe is representable.
     row: i32,
     /// One bit per column, LSB-first — resident, cleared, never rebuilt.
+    /// Set for [`CellInk::Glyph`] AND [`CellInk::Rule`]: the cell has ink.
     ink: Vec<u64>,
+    /// One bit per column, set where that ink is a [`CellInk::Rule`] — the
+    /// pixel-level answer then depends on the row band asked.
+    rule: Vec<u64>,
     /// Columns actually captured; a column past this holds nothing to
     /// overprint (the same convention v1's own-cell gate always used).
     width: u16,
@@ -1687,9 +2317,44 @@ impl GlyphProbe {
     }
 
     /// Record that grid `row` was probed, with `occupied[col]` true where a
-    /// glyph stands. Replaces any earlier record of the same row.
+    /// glyph stands. Replaces any earlier record of the same row. The bool
+    /// view knows only [`CellInk::Blank`] and [`CellInk::Glyph`]; a host
+    /// with the chars in hand writes [`Self::probe_row_ink`] instead.
     pub fn probe_row(&mut self, row: i32, occupied: &[bool]) {
-        let words = occupied.len().div_ceil(64);
+        let slot = self.slot_for(row, occupied.len());
+        let r = &mut self.rows[slot];
+        for (col, &on) in occupied.iter().enumerate() {
+            if on {
+                r.ink[col / 64] |= 1u64 << (col % 64);
+            }
+        }
+    }
+
+    /// [`Self::probe_row`] with the per-cell class the host reduced its
+    /// chars to ([`cell_ink`]): a [`CellInk::Rule`] is recorded as ink
+    /// (the cell-level [`Self::at`] answer) AND as a rule (the pixel-level
+    /// [`Self::at_px`] answer inside/outside the stroke band).
+    pub fn probe_row_ink(&mut self, row: i32, cells: &[CellInk]) {
+        let slot = self.slot_for(row, cells.len());
+        let r = &mut self.rows[slot];
+        for (col, &cell) in cells.iter().enumerate() {
+            let bit = 1u64 << (col % 64);
+            match cell {
+                CellInk::Blank => {}
+                CellInk::Glyph => r.ink[col / 64] |= bit,
+                CellInk::Rule => {
+                    r.ink[col / 64] |= bit;
+                    r.rule[col / 64] |= bit;
+                }
+            }
+        }
+    }
+
+    /// The slot `row` is written into — its own if it is already held,
+    /// a fresh one while there is room, else the round-robin victim — with
+    /// both bitsets cleared and sized for `width` columns.
+    fn slot_for(&mut self, row: i32, width: usize) -> usize {
+        let words = width.div_ceil(64);
         let slot = if let Some(i) = self.rows.iter().position(|r| r.row == row) {
             i
         } else if self.rows.len() < Self::ROWS {
@@ -1702,14 +2367,12 @@ impl GlyphProbe {
         };
         let r = &mut self.rows[slot];
         r.row = row;
-        r.width = occupied.len().min(usize::from(u16::MAX)) as u16;
+        r.width = width.min(usize::from(u16::MAX)) as u16;
         r.ink.clear();
         r.ink.resize(words, 0);
-        for (col, &on) in occupied.iter().enumerate() {
-            if on {
-                r.ink[col / 64] |= 1u64 << (col % 64);
-            }
-        }
+        r.rule.clear();
+        r.rule.resize(words, 0);
+        slot
     }
 
     /// Forget everything — a reset, a layout change, a style switch.
@@ -1736,13 +2399,52 @@ impl GlyphProbe {
 
     /// [`Self::at`] asked of a WINDOW PIXEL: the cell under `(x, y)`. A
     /// pixel left or right of the grid is off-grid, hence `Some(false)`.
+    ///
+    /// Over a [`CellInk::Rule`] cell the answer is the STROKE's, not the
+    /// cell's: `Some(true)` for a pixel inside
+    /// [`RULE_INK_TOP_CH`]`..`[`RULE_INK_BOT_CH`] of the cell height,
+    /// `Some(false)` above or below it. This is the one place the probe
+    /// answers finer than a cell, and it is what lets §5.4's sky zone —
+    /// disjoint from that band by construction — be born over the rule a
+    /// TUI draws above its input line.
     #[must_use]
     pub fn at_px(&self, x: i32, y: i32, geom: Geom) -> Option<bool> {
         let col = px_col(x as f32, geom);
         if col < 0 || col as usize >= geom.cols {
             return Some(false);
         }
-        self.at(px_row(y as f32, geom), col as u16, geom.rows)
+        let row = px_row(y as f32, geom);
+        let inked = self.at(row, col as u16, geom.rows)?;
+        if inked && self.rule_at(row, col as u16) {
+            // The fraction of the cell height this pixel sits at, `0` at the
+            // cell's top edge.
+            let fy = (y as f32 - f32::from(geom.origin_y)) / geom.ch.max(1) as f32 - row as f32;
+            return Some((RULE_INK_TOP_CH..RULE_INK_BOT_CH).contains(&fy));
+        }
+        Some(inked)
+    }
+
+    /// [`Self::at`] for §5.4's SKY question: does this `row − 1` cell carry
+    /// ink the zone `[top − 0.30 ch, top − 0.04 ch]` could touch? A light
+    /// rule ([`CellInk::Rule`]) answers `Some(false)` here — its stroke band
+    /// ends where the zone begins (the assertions beside
+    /// [`RULE_INK_BOT_CH`]) — while [`Self::at`] keeps saying `Some(true)`
+    /// for it: the cell has ink, the sky above the ribbon does not. Every
+    /// other answer is [`Self::at`]'s, byte for byte.
+    #[must_use]
+    pub fn sky_at(&self, row: i32, col: u16, rows: usize) -> Option<bool> {
+        let inked = self.at(row, col, rows)?;
+        Some(inked && !self.rule_at(row, col))
+    }
+
+    /// Is the (in-grid, held) cell's ink a [`CellInk::Rule`]? Asked only
+    /// after [`Self::at`] answered `Some(true)`, so a miss is simply "no".
+    fn rule_at(&self, row: i32, col: u16) -> bool {
+        let Some(r) = self.rows.iter().find(|r| r.row == row) else {
+            return false;
+        };
+        let i = usize::from(col);
+        r.rule.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1)
     }
 
     /// True when the probe has no rows at all.
@@ -1852,6 +2554,22 @@ struct Deal {
     /// spacing law and no dry bucket demotes it; only a dealt one is spaced,
     /// row-capped, and degraded to m2 for want of a token (D5).
     earned: bool,
+    /// **THE MEND'S PULL** (1e): `Some` for the star of a key that mends a
+    /// typo run — born over the erased cell and pulled into `cell`, the
+    /// caret's.
+    pull: Option<Pull>,
+}
+
+/// Where a mend's star is pulled FROM, as [`Stardust::deal_star`] takes it
+/// ([`MEND_PULL_MS`]).
+#[derive(Clone, Copy, Debug)]
+struct Pull {
+    /// The erased cell ([`super::Mend::row`], [`super::Mend::col`]).
+    from: (u16, u16),
+    /// The momentum the deleting interrupted ([`super::Mend::disp`]): the
+    /// birth spine the star's slipstream is gated on, beside the live one —
+    /// a star born at the momentum the fix resumes.
+    disp: f32,
 }
 
 /// ONE FREE TRANSIENT, as [`Stardust::throw`] takes it (§5.6's Erase, Shed,
@@ -1926,6 +2644,22 @@ pub struct Stardust {
     /// The cell height of the last frame drawn, px — what the size clock's
     /// nominal arm is read at ([`Star::next_arm_step_s`]).
     cell_h: f32,
+    /// **THE AURORA** — one [`Veil`] per laid cell whose sky the probe proved
+    /// blank, [`AURORA_CAP`] at most, resident and reused (§18). Written by
+    /// [`Stardust::deal_veil`] on the key that laid the cell; re-lit,
+    /// finished, embered, scrolled and culled beside the field stars, whose
+    /// envelope it rides.
+    veil: Vec<Veil>,
+    /// The instant of the last Typed key this sky saw — the slipstream's
+    /// cadence memory ([`Stardust::note_cadence`], T4). `None` until the
+    /// session's first key; a reset forgets it.
+    last_typed: Option<Instant>,
+    /// **THE OBSERVED KEY INTERVAL**, ms, clamped to
+    /// `[STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS]` — the interval between the
+    /// last two Typed keys, the one number every slipstream birth is priced
+    /// from ([`stream_px_per_s`]). The slow end until two keys have been
+    /// seen: a first key streams nothing.
+    ioi_ms: f32,
 }
 
 impl Default for Stardust {
@@ -1950,7 +2684,16 @@ impl Stardust {
             minted: 0,
             reduced: false,
             cell_h: 0.0,
+            veil: Vec::with_capacity(AURORA_CAP),
+            last_typed: None,
+            ioi_ms: STREAM_IOI_MAX_MS,
         }
+    }
+
+    /// The aurora's live cells — what is in the veil pool, finishing ones
+    /// included (they are still on glass).
+    pub fn veil_iter(&self) -> impl Iterator<Item = &Veil> {
+        self.veil.iter()
     }
 
     /// The frame's glyph truth, for the host to write before the deal pass
@@ -2012,6 +2755,7 @@ impl Stardust {
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         match *ev {
             Event::Typed { cells, class, .. } => {
+                self.note_cadence(at);
                 self.relight_field(ctx.caret, at, ctx.geom);
                 self.deal_typed(cells, class, at, ctx, ribbon);
             }
@@ -2047,6 +2791,7 @@ impl Stardust {
             lane: StarLane::Strike,
             cell,
             earned: true,
+            pull: None,
         };
         self.deal_star(spec, at, ctx, ribbon);
     }
@@ -2086,8 +2831,9 @@ impl Stardust {
                 continue;
             }
             let side = if seed & 1 == 0 { 1.0 } else { -1.0 };
-            let perp =
-                side * (SHED_PERP_MIN + (SHED_PERP_MAX - SHED_PERP_MIN) * hash01(mix32(seed ^ 1)));
+            let perp = side
+                * (SHED_PERP_MIN + (SHED_PERP_MAX - SHED_PERP_MIN) * hash01(mix32(seed ^ 1)))
+                * px_scale(ctx.geom.ch as f32);
             let v0 = (
                 ux * speed * SHED_ALONG_SHARE - uy * perp,
                 uy * speed * SHED_ALONG_SHARE + ux * perp,
@@ -2198,13 +2944,14 @@ impl Stardust {
             }
             let a =
                 (f32::from(k) / f32::from(n) + hash01(s) / f32::from(n)) * std::f32::consts::TAU;
-            let reach = MINI_FAN_REACH_MIN_PX
-                + (MINI_FAN_REACH_MAX_PX - MINI_FAN_REACH_MIN_PX) * hash01(mix32(s ^ 5));
+            let reach = (MINI_FAN_REACH_MIN_PX
+                + (MINI_FAN_REACH_MAX_PX - MINI_FAN_REACH_MIN_PX) * hash01(mix32(s ^ 5)))
+                * px_scale(ctx.geom.ch as f32);
             let v0 = (
                 a.cos() * reach / MINI_FAN_THROW_MS,
                 a.sin() * reach / MINI_FAN_THROW_MS,
             );
-            let (tint, gold) = deal_tint(s, ctx.caret_t);
+            let (tint, gold) = class_tint(class, s, ctx.caret_t);
             self.throw(
                 Throw {
                     class,
@@ -2245,6 +2992,20 @@ impl Stardust {
     /// stars after a break, and the frame never exceeds
     /// [`STARDUST_QUAD_BUDGET`]; the halo budget counts haloed STARS, not the
     /// per-row splits a halo is cut into.
+    ///
+    /// **Brightest first: the heroes, then the m2s, then the grains.** A
+    /// star is priced over the sky laid BEFORE it ([`sky_ground`]); what a
+    /// star drawn later lays on its pixels is not priced. The only light
+    /// that reaches a neighbouring cell's star is a HALO's tail (a hero's 11
+    /// px at `ch` 18 against a 9 px cell; bodies and stubs stay inside
+    /// their own cell), so drawing the haloed classes first puts every tail
+    /// under every core it can reach — two heroes are three cells apart
+    /// (§5.2) and out of each other's reach, and an m2's floored halo does
+    /// not reach the next cell at any scale. Measured on the 12 cps fixture
+    /// with one star per cell: worst Y 73.2 in pool order (12 of 40 frames
+    /// over the caret law's 72 by a grain's core under a later hero's
+    /// tail), under the ceiling on every frame brightest-first
+    /// (`one_sky_star_per_cell_and_no_pile_outshines_the_caret`).
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
@@ -2265,27 +3026,40 @@ impl Stardust {
             });
         }
         self.cull(ctx.now);
-        if self.stars.is_empty() {
+        if self.stars.is_empty() && self.veil.is_empty() {
             return;
         }
         let quad_cap = frame.out.len() + STARDUST_QUAD_BUDGET;
         let halo_cap = frame.halos.len() + STARDUST_LIGHT_HALO_BUDGET;
+        // The aurora first: it is the sky's ground, and on light the stars'
+        // ink lays composite OVER it — and on dark the stars are PRICED over
+        // it ([`sky_ground`]), so the slice the sky lays this frame is kept.
+        let out_from = frame.out.len();
+        let sky_from = frame.halos.len();
+        self.draw_veil(ctx, frame.halos, halo_cap);
         let mut haloed = 0usize;
         let n = self.stars.len();
-        for (i, star) in self.stars.iter().enumerate() {
-            let Some(paint) = Paint::of(star, &self.probe, ctx) else {
-                continue;
-            };
-            let left = quad_cap.saturating_sub(frame.out.len());
-            if left == 0 {
-                break;
-            }
-            let share = (left / (n - i)).max(M3_QUADS).min(left);
-            let star_cap = frame.out.len() + share;
-            if ctx.cfg.dark_theme {
-                paint.draw_add(ctx.geom, frame, star_cap, &mut haloed);
-            } else {
-                paint.draw_over(ctx.geom, frame, halo_cap);
+        // `i` counts every star handed a turn, drawn or culled, so the fair
+        // share is what is left over the stars still to come.
+        let mut i = 0usize;
+        for class in [StarClass::M1, StarClass::M2, StarClass::M3] {
+            for star in self.stars.iter().filter(|s| s.class == class) {
+                let turn = i;
+                i += 1;
+                let Some(paint) = Paint::of(star, &self.probe, ctx) else {
+                    continue;
+                };
+                let left = quad_cap.saturating_sub(frame.out.len());
+                if left == 0 {
+                    return;
+                }
+                let share = (left / (n - turn)).max(M3_QUADS).min(left);
+                let star_cap = frame.out.len() + share;
+                if ctx.cfg.dark_theme {
+                    paint.draw_add(ctx, frame, star_cap, &mut haloed, (out_from, sky_from));
+                } else {
+                    paint.draw_over(ctx.geom, frame, halo_cap);
+                }
             }
         }
     }
@@ -2303,7 +3077,7 @@ impl Stardust {
     /// `Engine::next_change_deadline` folds (§18).
     #[must_use]
     pub fn at_rest(&self) -> bool {
-        self.stars.is_empty()
+        self.stars.is_empty() && self.veil.is_empty()
     }
 
     /// **THE CADENCE LAW, brisk half** — whether any star MOVES on every
@@ -2311,14 +3085,17 @@ impl Stardust {
     /// (§6.11), so never.
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
-        !self.reduced && self.stars.iter().any(|s| s.brisk(now))
+        !self.reduced
+            && (self.stars.iter().any(|s| s.brisk(now))
+                || self.veil.iter().any(|v| v.age_s(now) < EDGE_IN_S))
     }
 
     /// **THE CADENCE LAW** — the next instant a star changes what is on
     /// glass. `None` when the sky is empty (T6).
     ///
-    /// A star's life, read as offers to the [`Cadence`] fold — a throw or
-    /// a drag is BRISK (the next frame); everything else a star does is a
+    /// A star's life, read as offers to the [`Cadence`] fold — a throw, a
+    /// drag or a mend's pull ([`MEND_PULL_MS`]) is BRISK (the next frame);
+    /// everything else a star does is a
     /// TAIL, floored at the [`super::TAIL_FLOOR`] so a sky of many stars
     /// cannot interleave its steps into a finer cadence than the floor:
     ///
@@ -2348,6 +3125,39 @@ impl Stardust {
         let mut cad = Cadence::at(now);
         if self.brisk(now) {
             cad.brisk();
+        }
+        // The veil's clocks are the field star's: its hold's end, its fade's
+        // end, its finish's cull, its horizon — and under reduced motion the
+        // one linear fade's opening. Between those the arm clocks of the
+        // stars over it already sample the sky; a veil alone is a tail.
+        for v in &self.veil {
+            let idle = v.idle_s(now);
+            let age = v.age_s(now);
+            let fade_life = field_fade_life_s();
+            if let Some(f) = v.finish {
+                cad.tail_at(f.cull_at());
+                cad.tail(0.0);
+            }
+            if self.reduced {
+                let fade_from = fade_life - REDUCED_MOTION_FADE_MS / 1000.0;
+                cad.tail((fade_from - idle).max(0.0));
+                cad.tail((FIELD_LIFE_S - REDUCED_MOTION_FADE_MS / 1000.0 - age).max(0.0));
+            } else {
+                if idle < FIELD_HOLD_MS / 1000.0 {
+                    cad.tail(FIELD_HOLD_MS / 1000.0 - idle);
+                } else {
+                    cad.tail(0.0);
+                }
+                if age < EDGE_IN_S {
+                    cad.tail(EDGE_IN_S - age);
+                } else if age >= FIELD_LIFE_S * (1.0 - EXPIRY_MELT_SHARE) {
+                    // The horizon's melt is moving under a hand that is
+                    // still on the row.
+                    cad.tail(0.0);
+                }
+            }
+            cad.tail(fade_life - idle);
+            cad.tail(FIELD_LIFE_S - age);
         }
         for s in &self.stars {
             let age = s.age_s(now);
@@ -2394,6 +3204,12 @@ impl Stardust {
             if let Some(dt) = s.next_lift_step_s(now) {
                 cad.tail(dt);
             }
+            // The slipstream's integer steps, solved like the lift's and
+            // offered as tails: the sky streams at ≤ 22 Hz plus one step,
+            // never at frame rate (1d).
+            if let Some(dt) = s.next_stream_step_s(now) {
+                cad.tail(dt);
+            }
         }
         cad.take()
     }
@@ -2403,11 +3219,14 @@ impl Stardust {
     /// capital after it should chime.
     pub fn reset(&mut self) {
         self.stars.clear();
+        self.veil.clear();
         self.budget = StarBudget::new();
         self.last_hero = None;
         self.probe.clear();
         self.glints.clear();
         self.minted = 0;
+        self.last_typed = None;
+        self.ioi_ms = STREAM_IOI_MAX_MS;
     }
 
     /// **SEAM POINT 12** (`translate_scroll_state`), the sky's half: move every
@@ -2425,6 +3244,11 @@ impl Stardust {
             s.y -= dy;
         }
         self.stars.retain(|s| s.y >= 0.0);
+        // The veil moves with its row and leaves with it.
+        for v in &mut self.veil {
+            v.row = v.row.checked_sub(rows).unwrap_or(u16::MAX);
+        }
+        self.veil.retain(|v| v.row != u16::MAX);
         self.last_hero = self
             .last_hero
             .and_then(|(r, c)| r.checked_sub(rows).map(|r| (r, c)));
@@ -2445,6 +3269,32 @@ impl Stardust {
     /// slot outright. The second grain at `disp ≥ 0.5` is born on the NEXT
     /// cell (the caret's leading edge), priced on the honest spine — a resume
     /// must not buy a denser sky it did not earn (`spine.rs`).
+    ///
+    /// **ONE SKY STAR PER CELL** ([`STRIKE_REACH_CELLS`]). Every sky-lane
+    /// deal asks [`Stardust::sky_star_live`] first — the field's own guard,
+    /// generalised to the strike and the second grain — and a cell that has
+    /// a star keeps it:
+    ///
+    /// * the **strike** moves to the first free cell within its reach (the
+    ///   lead cell) or is dropped — under a hot hand the typed cell is
+    ///   always taken by the previous key's leading-edge grain, so the
+    ///   partition's classes (the heroes, the m2s) land one cell ahead
+    ///   rather than not at all;
+    /// * the **second grain** is dropped when the lead cell is taken;
+    /// * the **field** deal ADOPTS the cell's star into the field lane
+    ///   (`lane ← Field`, `lit ← at`, pinned) instead of stacking a second:
+    ///   the cell's star lives the cell's life from this key on, re-lit and
+    ///   finished with its cell like any field star. That is what keeps the
+    ///   hot sky DENSE ACROSS THE LINE — every laid cell carries one
+    ///   long-lived star of graded magnitude — where refusing the field
+    ///   would have left every cell a 225–460 ms wink (3–4 live at 12 cps
+    ///   where the pile had 22). A brighten with a keystroke behind it: the
+    ///   key that laid the cell;
+    /// * the key that **mends** a typo run ([`Ctx::mend`]) takes its strike
+    ///   as the PULLED m2 of 1e — born over the erased cell, grabbing the
+    ///   star there, home in the caret's cell ([`MEND_PULL_MS`]) — so the
+    ///   erased cell is free for the fix's own field star and the caret's
+    ///   is taken for the leading grain.
     fn deal_typed(
         &mut self,
         cells: u16,
@@ -2453,6 +3303,10 @@ impl Stardust {
         ctx: &Ctx<'_>,
         ribbon: &Ribbon,
     ) {
+        // THE AURORA rides the RIBBON, and the ribbon lays on a Space too:
+        // every laid cell gets its veil before the star deal asks what the
+        // key was.
+        self.deal_veil(cells, at, ctx, ribbon);
         // Space lays ribbon but deals no star (`TypedClass::Space`, §8.2).
         if class == TypedClass::Space {
             return;
@@ -2461,6 +3315,13 @@ impl Stardust {
             1.0
         } else {
             LIGHT_COUNT_SCALE
+        };
+        // A hot hand deals every cell a field star (`FIELD_DEAL_IN_HOT`), on
+        // the honest spine, like the second grain.
+        let field_in = if ctx.disp >= FIELD_HOT_DISP {
+            FIELD_DEAL_IN_HOT
+        } else {
+            FIELD_DEAL_IN
         };
         let m1 = scale / DEAL_M1_IN as f32;
         let m2 = m1 + scale / DEAL_M2_IN as f32;
@@ -2475,9 +3336,40 @@ impl Stardust {
             let cell = (row, col);
             let h = cell_hash(row, col, 0);
 
+            // -- the mend (1e; §23's addendum "The mend") --------------------
+            // The key that mends a typo run takes its strike as a PULLED
+            // star: born over the erased cell — the very star the Backspace
+            // was retiring, if one is live — and drawn one cell into the
+            // caret's over `MEND_PULL_MS`, then pinned there, where the
+            // leading grain finds its cell taken and the next key's field
+            // deal adopts it. An m2 by rule; an earned hero keeps its
+            // magnitude (§5.8: light is not rationed). Refused — the erased
+            // cell's sky inked, the caret's cell off the glass or taken to
+            // the pixel — the key is dealt as any other.
+            let mended = match ctx.mend {
+                Some(m) if (m.row, m.col) == cell => self.deal_star(
+                    Deal {
+                        class: if earned { StarClass::M1 } else { StarClass::M2 },
+                        lane: StarLane::Strike,
+                        cell: (row, col.saturating_add(1)),
+                        earned,
+                        pull: Some(Pull {
+                            from: cell,
+                            disp: m.disp,
+                        }),
+                    },
+                    at,
+                    ctx,
+                    ribbon,
+                ),
+                _ => false,
+            };
+
             // -- strike -----------------------------------------------------
             let u = hash01(mix32(h ^ SALT_STRIKE));
-            let dealt = if earned || u < m1 {
+            let dealt = if mended {
+                None
+            } else if earned || u < m1 {
                 Some(StarClass::M1)
             } else if u < m2 {
                 Some(StarClass::M2)
@@ -2486,13 +3378,16 @@ impl Stardust {
             } else {
                 None
             };
-            if let Some(class) = dealt {
+            if let Some(class) = dealt
+                && let Some(free) = self.free_sky_cell(cell, ctx.geom)
+            {
                 self.deal_star(
                     Deal {
                         class,
                         lane: StarLane::Strike,
-                        cell,
+                        cell: free,
                         earned,
+                        pull: None,
                     },
                     at,
                     ctx,
@@ -2500,15 +3395,20 @@ impl Stardust {
                 );
             }
             // A second grain from the caret's leading edge when the spine is
-            // up: fast typing makes the sky denser, on the HONEST metric.
-            if ctx.disp >= STRIKE_SECOND_M3_DISP && deal(h, SALT_SECOND_M3, 1, scale) {
-                let lead = (row, col.saturating_add(1));
+            // up: fast typing makes the sky denser, on the HONEST metric —
+            // and only onto a free cell.
+            let lead = (row, col.saturating_add(1));
+            if ctx.disp >= STRIKE_SECOND_M3_DISP
+                && deal(h, SALT_SECOND_M3, 1, scale)
+                && !self.sky_star_live(lead, ctx.geom)
+            {
                 self.deal_star(
                     Deal {
                         class: StarClass::M3,
                         lane: StarLane::Strike,
                         cell: lead,
                         earned: false,
+                        pull: None,
                     },
                     at,
                     ctx,
@@ -2518,9 +3418,21 @@ impl Stardust {
 
             // -- field ------------------------------------------------------
             // Stable per cell, so the sky does not shimmer as the ribbon
-            // re-plans, and guarded against a second birth on a cell that
-            // already carries one.
-            if deal(h, SALT_FIELD, FIELD_DEAL_IN, scale) && !self.field_star_live(cell, ctx.geom) {
+            // re-plans. A cell that already carries a sky star keeps it —
+            // ADOPTED into the field lane, so it lives the cell's life —
+            // and never a second birth on it. The mend's cell gives its
+            // light to the caret's (1e): ONE light moves, and a fresh field
+            // star born beside the pull's path would read as a copy left
+            // behind and lay its halo on the pulled centre in transit
+            // (measured: Y 85 over the caret law's 72 at +55 ms); the cell
+            // keeps its veil.
+            if mended {
+                continue;
+            }
+            if deal(h, SALT_FIELD, field_in, scale) {
+                if self.adopt_field(cell, at, ctx.geom) {
+                    continue;
+                }
                 let fc = if deal(h, SALT_FIELD_M2, FIELD_M2_IN, 1.0) {
                     StarClass::M2
                 } else {
@@ -2532,6 +3444,7 @@ impl Stardust {
                         lane: StarLane::Field,
                         cell,
                         earned: false,
+                        pull: None,
                     },
                     at,
                     ctx,
@@ -2602,8 +3515,9 @@ impl Stardust {
         }
         let (cx, cy) = ctx.geom.cell_center(row, col);
         let a = std::f32::consts::PI * (1.0 + hash01(seed));
-        let reach = ERASE_REACH_MIN_PX
-            + (ERASE_REACH_MAX_PX - ERASE_REACH_MIN_PX) * hash01(mix32(seed ^ 7));
+        let reach = (ERASE_REACH_MIN_PX
+            + (ERASE_REACH_MAX_PX - ERASE_REACH_MIN_PX) * hash01(mix32(seed ^ 7)))
+            * px_scale(ctx.geom.ch as f32);
         let v0 = (
             a.cos() * reach / ERASE_THROW_MS,
             a.sin() * reach / ERASE_THROW_MS,
@@ -2638,11 +3552,43 @@ impl Stardust {
     /// because a core on a stroke is the one thing L4 does not trade away,
     /// and the effects box, because a star clipped off the glass must not
     /// spend a token or a hero slot on a chime nobody can see the star of.
-    fn deal_star(&mut self, spec: Deal, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
-        let seed = self.mint_seed(spec.cell.0, spec.cell.1);
-        let Some((x, y)) = self.sky_birth_px(spec.cell, seed, ctx, ribbon) else {
-            return;
+    ///
+    /// **A mend's star** ([`Deal::pull`], 1e) is dealt at its HOME — the
+    /// caret's cell, through every gate above — and born over the erased
+    /// cell: the live sky star there, if one is, is GRABBED (re-minted in
+    /// place as the pulled star, its seed kept so the tint stays the cell's
+    /// deal and the finish the erase put it on pardoned), else the star is
+    /// born one cell left of home. Its lift is zero — pinned once home — and
+    /// its slipstream is gated on the momentum the fix resumes, clamped from
+    /// where it is born. Returns whether a star was dealt.
+    fn deal_star(&mut self, spec: Deal, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) -> bool {
+        // The grab: `Some(slot)` names the star over the erased cell, if any.
+        let mut grabbed: Option<Option<usize>> = None;
+        if let Some(p) = spec.pull {
+            let Some(g) = self.pull_origin(p.from, at, ctx) else {
+                return false;
+            };
+            grabbed = Some(g);
+        }
+        let seed = match grabbed {
+            Some(Some(i)) => self.stars[i].seed,
+            _ => self.mint_seed(spec.cell.0, spec.cell.1),
         };
+        let Some((x, y)) = self.sky_birth_px(spec.cell, seed, ctx, ribbon) else {
+            return false;
+        };
+        if grabbed.is_some() {
+            // THE CARET'S CELL IS THE MEND'S STAR'S: a live sky star already
+            // there — the typo key's own strike, still lifting — goes on the
+            // cap's finish ([`EVICT_FINISH_MS`]) as the pulled star sets out,
+            // gone before it arrives. One star per cell, at home too.
+            let g = ctx.geom;
+            for (i, s) in self.stars.iter_mut().enumerate() {
+                if grabbed != Some(Some(i)) && s.lane.is_sky() && star_over_cell(s, spec.cell, g) {
+                    s.finish_by(at, EVICT_FINISH_MS / 1000.0);
+                }
+            }
+        }
         let mut class = spec.class;
         if class == StarClass::M1 && !spec.earned && !self.hero_allowed(spec.cell, y, ctx.geom) {
             class = StarClass::M2;
@@ -2655,13 +3601,38 @@ impl Stardust {
                 class = StarClass::M2;
             }
         }
-        let (tint, gold) = deal_tint(seed, self.field_t(spec.cell, ctx, ribbon));
+        let (tint, gold) = class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon));
         let v0 = match (class, spec.lane) {
+            // A mend's star is pinned once home (1e: "then pinned").
+            _ if spec.pull.is_some() => (0.0, 0.0),
             // §5.6: a strike m1/m2 lifts; a grain and every FIELD star are
             // pinned. The zero `v0` is what expresses "pinned" — there is no
             // fourth motion law for it.
-            (StarClass::M1 | StarClass::M2, StarLane::Strike) => (0.0, SKY_LIFT_PX_PER_S / 1000.0),
+            (StarClass::M1 | StarClass::M2, StarLane::Strike) => {
+                (0.0, sky_lift_px_per_s(ctx.geom.ch as f32) / 1000.0)
+            }
             _ => (0.0, 0.0),
+        };
+        // THE MEND'S PULL (1e): from the grabbed star's own pixel — the
+        // light does not jump to be pulled — or one cell left of home.
+        let from_x = match grabbed {
+            Some(Some(i)) => self.stars[i].pos(at, self.reduced).0 as f32,
+            Some(None) => x - ctx.geom.cw as f32,
+            None => x,
+        };
+        let pull = (x - from_x).max(0.0);
+        // THE SLIPSTREAM (1d): a star born at speed inherits the hand's own
+        // backward drift — every sky lane, the field's included — priced by
+        // the observed key interval (T4) and clamped at the blank frontier
+        // (L4); only under a hand the spine calls hot — for a mend's star,
+        // the momentum the fix resumes, and from where it is born.
+        let birth_disp = spec
+            .pull
+            .map_or(ctx.birth_disp, |p| ctx.birth_disp.max(p.disp));
+        let stream = if birth_disp >= STREAM_DISP {
+            self.stream_reach(from_x, spec.cell.0, ctx)
+        } else {
+            0.0
         };
         if class == StarClass::M1 {
             self.last_hero = Some(spec.cell);
@@ -2673,7 +3644,7 @@ impl Stardust {
                 f: scint_rate(seed),
             });
         }
-        self.sow(Star {
+        let star = Star {
             class,
             lane: spec.lane,
             x,
@@ -2685,8 +3656,16 @@ impl Stardust {
             gold,
             v0,
             f: scint_rate(seed),
+            stream,
+            pull,
             finish: None,
-        });
+        };
+        match grabbed {
+            // The grab re-mints in place: one star, one slot, no churn.
+            Some(Some(i)) => self.stars[i] = star,
+            _ => self.sow(star),
+        }
+        true
     }
 
     /// Throw ONE free transient (§5.4: a free transient may be thrown
@@ -2707,6 +3686,10 @@ impl Stardust {
             gold: spec.gold,
             v0: spec.v0,
             f: scint_rate(spec.seed),
+            // A transient is thrown, not dealt to a cell: no slipstream, no
+            // pull.
+            stream: 0.0,
+            pull: 0.0,
             finish: None,
         };
         if self.settle(&mut star, spec.fixed, ctx) {
@@ -2751,7 +3734,12 @@ impl Stardust {
         if usize::from(row) >= ctx.geom.rows || usize::from(col) >= ctx.geom.cols {
             return None;
         }
-        if self.probe.at(i32::from(row) - 1, col, ctx.geom.rows) != Some(false) {
+        // §5.4's requirement — `probed_cell_glyph(row − 1) == Some(false)` —
+        // asked in its SKY form: a blank, an off-grid band and a light rule
+        // (whose stroke the zone never reaches, `RULE_INK_BOT_CH`) all say
+        // clear; a glyph says ink; an unprobed row says unknown. No star on
+        // anything but clear.
+        if self.probe.sky_at(i32::from(row) - 1, col, ctx.geom.rows) != Some(false) {
             return None;
         }
         let g = ctx.geom;
@@ -2802,6 +3790,81 @@ impl Stardust {
     /// is a neighbour, not a stack.
     fn pixel_taken(&self, x: f32, y: f32) -> bool {
         self.stars.iter().any(|s| s.x == x && s.y == y)
+    }
+
+    /// **THE OBSERVED CADENCE** (T4): the interval between this Typed key
+    /// and the last, clamped to `[STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS]` —
+    /// the one number the slipstream is priced from, read off the typed
+    /// events' own instants and never off the spine. A second event on the
+    /// same instant (a coalesced burst delivered as two) keeps the interval
+    /// already read: it is one keystroke's worth. Event-edge work.
+    fn note_cadence(&mut self, at: Instant) {
+        if let Some(last) = self.last_typed {
+            let gap_ms = at.saturating_duration_since(last).as_secs_f32() * 1000.0;
+            if gap_ms > 0.0 {
+                self.ioi_ms = gap_ms.clamp(STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS);
+            }
+        }
+        self.last_typed = Some(at);
+    }
+
+    /// **THE SLIPSTREAM'S TRAVEL FOR ONE BIRTH** (px ≥ 0): the priced travel
+    /// ([`stream_travel_px`] of [`stream_px_per_s`] at this cell width and
+    /// the observed interval), CLAMPED AT THE BLANK FRONTIER — L4 on a
+    /// moving star: the centre may drift left only over cells of `row − 1`
+    /// the probe proved blank, contiguously from the star's own, and never
+    /// past the pane's first column. The frontier is read ONCE, here, at
+    /// the birth edge — the probe forgets rows (an Enter, a scroll) and a
+    /// later frame must not re-ask it; a scroll drops the star anyway.
+    /// Event-edge work: a walk of at most one row's columns per birth,
+    /// nothing per frame.
+    fn stream_reach(&self, x: f32, row: u16, ctx: &Ctx<'_>) -> f32 {
+        let g = ctx.geom;
+        let want = stream_travel_px(stream_px_per_s(g.cw as f32, self.ioi_ms));
+        if !want.is_finite() || want < 0.5 {
+            return 0.0;
+        }
+        let col = px_col(x, g);
+        if col < 0 {
+            return 0.0;
+        }
+        let sky = i32::from(row) - 1;
+        let mut frontier = col;
+        while frontier > 0 {
+            let left = frontier - 1;
+            let blank =
+                u16::try_from(left).is_ok_and(|c| self.probe.at(sky, c, g.rows) == Some(false));
+            if !blank {
+                break;
+            }
+            frontier = left;
+        }
+        let floor_x = (g.fx_left() + frontier * g.cw as i32) as f32;
+        want.min(x - floor_x).max(0.0)
+    }
+
+    /// **WHERE A MEND'S STAR IS PULLED FROM** (1e): the erased cell `from`,
+    /// on the grid with its sky proven blank — §5.4's gate, asked of the
+    /// origin as it is of the home: a star is not born over a stroke to be
+    /// pulled off it — or `None`: no pull, and the key is dealt as any
+    /// other. `Some(slot)` names the live sky star over the erased cell, if
+    /// one is — LIVE at `at`: a star past its cull is this tick's to drop,
+    /// not to grab — the light the Backspace was retiring, which the fix
+    /// GRABS rather than leaves beside a second star: one star per cell,
+    /// the same law that has the field deal adopt. Event-edge work.
+    fn pull_origin(&self, from: (u16, u16), at: Instant, ctx: &Ctx<'_>) -> Option<Option<usize>> {
+        let g = ctx.geom;
+        if usize::from(from.0) >= g.rows || usize::from(from.1) >= g.cols {
+            return None;
+        }
+        if self.probe.at(i32::from(from.0) - 1, from.1, g.rows) != Some(false) {
+            return None;
+        }
+        Some(
+            self.stars
+                .iter()
+                .position(|s| s.lane.is_sky() && !s.dead(at) && star_over_cell(s, from, g)),
+        )
     }
 
     /// **§5.4's FREE TRANSIENT CLEARANCE**, on where the core comes to
@@ -2949,13 +4012,48 @@ impl Stardust {
         on_row < usize::from(HERO_MAX_LIVE_PER_ROW)
     }
 
-    /// Is a FIELD star already live on this cell? Field stars are dealt once
-    /// per laid cell and stably per cell (§5.6), so a re-lay must not stack a
-    /// second one on the same pixel.
-    fn field_star_live(&self, cell: (u16, u16), geom: Geom) -> bool {
+    /// **Is a SKY star already live on this cell?** — the one-star-per-cell
+    /// occupancy every sky-lane deal asks ([`STRIKE_REACH_CELLS`]). Was the
+    /// field lane's alone (a re-lay must not stack a second field star on
+    /// one pixel); now the strike's and the second grain's too, so no cell
+    /// carries a pile. Transients (fan, shed, erase) are thrown, not dealt
+    /// to a cell, and do not count.
+    fn sky_star_live(&self, cell: (u16, u16), geom: Geom) -> bool {
         self.stars
             .iter()
-            .any(|s| s.lane == StarLane::Field && star_over_cell(s, cell, geom))
+            .any(|s| s.lane.is_sky() && star_over_cell(s, cell, geom))
+    }
+
+    /// The first cell without a live sky star from `cell` toward the
+    /// caret's leading edge, within [`STRIKE_REACH_CELLS`] — where a strike
+    /// dealt onto a taken cell is born — or `None`: dropped.
+    fn free_sky_cell(&self, cell: (u16, u16), geom: Geom) -> Option<(u16, u16)> {
+        (0..=STRIKE_REACH_CELLS)
+            .map(|k| (cell.0, cell.1.saturating_add(k)))
+            .find(|&c| !self.sky_star_live(c, geom))
+    }
+
+    /// **THE FIELD DEAL ADOPTS THE STAR A CELL ALREADY HAS** instead of
+    /// stacking a second one on it: the star moves to the field lane —
+    /// pinned (the zero `v0`), re-lit by this key — and from here lives the
+    /// cell's own life ([`field_lane_envelope`]): held while the hand is on
+    /// the row, re-lit by every key on it, finished with its cell. Its
+    /// class, tint, seed and birth pixel are untouched, so a strike hero
+    /// stays a hero and a leading-edge grain stays the cell's stop. A
+    /// finish it is on stands. Returns whether a star was adopted; `false`
+    /// leaves the deal to birth a field star. In place — nothing allocates.
+    fn adopt_field(&mut self, cell: (u16, u16), at: Instant, geom: Geom) -> bool {
+        let Some(s) = self
+            .stars
+            .iter_mut()
+            .find(|s| s.lane.is_sky() && star_over_cell(s, cell, geom))
+        else {
+            return false;
+        };
+        s.lane = StarLane::Field;
+        s.lit = at;
+        s.v0 = (0.0, 0.0);
+        true
     }
 
     /// Put the FIELD stars of the cells the ribbon is retracting — from
@@ -2969,6 +4067,12 @@ impl Stardust {
             }
             if px_col(s.x, geom) >= i32::from(col) && in_sky_of_row(s.y, row, geom) {
                 s.finish_by(at, span_ms / 1000.0);
+            }
+        }
+        // The veil over the retracted cells goes with them.
+        for v in &mut self.veil {
+            if v.row == row && v.col >= col {
+                v.finish_by(at, span_ms / 1000.0);
             }
         }
     }
@@ -2992,6 +4096,11 @@ impl Stardust {
                 s.lit = at;
             }
         }
+        for v in &mut self.veil {
+            if v.row == caret.0 {
+                v.lit = at;
+            }
+        }
     }
 
     /// **FOCUS LOST** (§8.2): every star on the 300 ms `spend` ember beside
@@ -3000,6 +4109,9 @@ impl Stardust {
     fn ember(&mut self, at: Instant) {
         for s in &mut self.stars {
             s.finish_by(at, FOCUS_EMBER_MS / 1000.0);
+        }
+        for v in &mut self.veil {
+            v.finish_by(at, FOCUS_EMBER_MS / 1000.0);
         }
     }
 
@@ -3043,6 +4155,7 @@ impl Stardust {
     /// left as a grey speck).
     fn cull(&mut self, now: Instant) {
         self.stars.retain(|s| !s.dead(now));
+        self.veil.retain(|v| !v.dead(now));
     }
 
     /// One fresh seed, hashed from `(row, col, mint)` (§18). The mint counter
@@ -3052,6 +4165,127 @@ impl Stardust {
     fn mint_seed(&mut self, row: u16, col: u16) -> u32 {
         self.minted = self.minted.wrapping_add(1);
         cell_hash(row, col, self.minted)
+    }
+
+    // -- the aurora (section 1a′) -------------------------------------------
+
+    /// **LAY THE VEIL** over the cells this echo laid — one [`Veil`] per
+    /// cell, on the key (T2: it is on glass the frame that echoes the key,
+    /// from the cell's own [`BIRTH_EDGE_FLOOR`]).
+    ///
+    /// Three gates: the cell is on the grid; the spine at birth is at or
+    /// over [`AURORA_COLD_DISP`] (cold → nothing is laid, so an idle sky
+    /// keeps nothing invisible in the pool); and `row − 1` probes
+    /// `Some(false)` — §5.4's own requirement, because the veil lives in
+    /// row − 1's lower band and a veil over a glyph is a mark over a stroke
+    /// (L4). Its colour is the ribbon's own field at the cell (C2), folded
+    /// as the bed folds it (`tri`), so the veil and the bed under it are one
+    /// walk; its gain is priced ONCE from `Ctx::birth_disp`
+    /// ([`veil_gain`]) — a re-typed cell is re-laid at the new key's own
+    /// spine, with a keystroke behind it. At [`AURORA_CAP`] the cell lit
+    /// longest ago gives up its slot; the newborn is never refused.
+    fn deal_veil(&mut self, cells: u16, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
+        let gain = veil_gain(ctx.birth_disp);
+        if gain <= 0.0 {
+            return;
+        }
+        let (row, head) = ctx.caret;
+        let g = ctx.geom;
+        for k in 0..cells.max(1) {
+            let col = head.saturating_sub(cells.max(1) - k);
+            if usize::from(row) >= g.rows || usize::from(col) >= g.cols {
+                continue;
+            }
+            if self.probe.at(i32::from(row) - 1, col, g.rows) != Some(false) {
+                continue;
+            }
+            let veil = Veil {
+                row,
+                col,
+                t: self.field_t((row, col), ctx, ribbon),
+                gain,
+                born: at,
+                lit: at,
+                finish: None,
+            };
+            if let Some(v) = self.veil.iter_mut().find(|v| v.row == row && v.col == col) {
+                *v = veil;
+            } else if self.veil.len() < AURORA_CAP {
+                self.veil.push(veil);
+            } else if let Some(v) = self.veil.iter_mut().min_by_key(|v| v.lit) {
+                *v = veil;
+            }
+        }
+    }
+
+    /// **DRAW THE AURORA** — one clipped [`RainHalo`] per live veil cell.
+    ///
+    /// The ellipse is centred on the box's BOTTOM edge with `ry` the box's
+    /// own height, so the falloff is exactly "rising from the line": full
+    /// at the line, nothing at the top of the band; `rx` is
+    /// [`AURORA_REACH_CW`] so the cell's own edges sit at 0.88 of its
+    /// centre. The box is the cell's own column by the sky band's anchor
+    /// ([`Veil::bottom_px`]) less [`AURORA_TALL_CH`] — never a pixel of the
+    /// glyph row, never a neighbouring column (whose sky the probe may not
+    /// have proved), so a veil never splits a row and never sums with its
+    /// neighbour: its brightest pixel is its own byte,
+    /// `AURORA_COV_PEAK · gain · env · intensity`, at most 40.
+    ///
+    /// Dark: additive, `spectrum(tri(t))` premultiplied — the bed's own
+    /// arc colour, unbudgeted by the bed's luma cap because nothing under
+    /// the veil is text. Light: the same veil as source-over ink in the
+    /// over-text role (`InkRole::OverText`, §3.3), its alpha the same byte.
+    /// Culled below §3.2's chroma floor like every coloured mark.
+    fn draw_veil(&self, ctx: &Ctx<'_>, halos: &mut Vec<RainHalo>, light_cap: usize) {
+        let g = ctx.geom;
+        let ch = g.ch as f32;
+        let intensity = clamp01(ctx.cfg.intensity);
+        let cap = if ctx.cfg.dark_theme {
+            halos.len() + AURORA_HALO_BUDGET
+        } else {
+            light_cap
+        };
+        for v in &self.veil {
+            let env = v.envelope(ctx.now, ctx.cfg.reduced_motion);
+            if env < CHROMA_CULL_ALPHA {
+                continue;
+            }
+            let byte = cov_byte(AURORA_COV_PEAK * v.gain * env * intensity);
+            if byte == 0 {
+                continue;
+            }
+            let bottom = v.bottom_px(g, ctx.cfg);
+            let top = bottom - AURORA_TALL_CH * ch;
+            let (y0, y1) = (top.round() as i32, bottom.round() as i32);
+            if y1 <= y0 {
+                continue;
+            }
+            let (cx, _) = g.cell_center(v.row, v.col);
+            let x0 = i32::from(g.origin_x) + i32::from(v.col) * g.cw as i32;
+            let x1 = x0 + g.cw as i32;
+            let rgb = spectrum(clamp01(tri(v.t)));
+            let (color, mode) = if ctx.cfg.dark_theme {
+                (premul_rgb(rgb, byte), HaloMode::Add)
+            } else {
+                let a = u32::from(byte).clamp(1, InkRole::OverText.alpha_cap() as u32);
+                (
+                    (InkRole::OverText.ink(rgb) & 0x00FF_FFFF) | (a << 24),
+                    HaloMode::Over,
+                )
+            };
+            push_halo_quads_clipped(
+                halos,
+                g,
+                cap,
+                HaloSpec {
+                    centre: (cx.round() as i32, y1),
+                    radii: ((AURORA_REACH_CW * g.cw as f32).round() as i32, y1 - y0),
+                    color,
+                    mode,
+                },
+                (x0, y0, x1, y1),
+            );
+        }
     }
 }
 
@@ -3142,6 +4376,9 @@ struct Paint {
     /// Gold AND at twinkle peak: the only condition under which any mark in
     /// this theme throws diagonal glints (§5.2).
     glints: bool,
+    /// A dealt GOLD star — its halo holds gold rather than breathing a hue
+    /// ([`halo_rgb`]).
+    gold: bool,
 }
 
 impl Paint {
@@ -3168,7 +4405,10 @@ impl Paint {
         let mut c = star.class.cov(star.lane) * alpha * clamp01(ctx.cfg.intensity);
         // §5.2: "coverage over probed-occupied or unknown cells is divided by
         // 3 — v1's text-safe arm, kept" — asked of the TRANSIENTS only. A sky
-        // star was proven blank at birth and never leaves its cell; the probe
+        // star was proven blank at birth, streams only over the blank
+        // frontier it was clamped to there (`Stardust::stream_reach`) and is
+        // pulled only between two cells both proven blank
+        // (`Stardust::pull_origin`); the probe
         // forgets rows (Enter, a scroll) and, under `underline`, reports the
         // star's own just-echoed glyph, so re-asking it here is a 3× pop, not
         // a clearance (see `TEXT_SAFE_DIV`).
@@ -3191,6 +4431,7 @@ impl Paint {
             env,
             tint: star.tint,
             glints: !rm && star.glinting(ctx.now),
+            gold: star.gold,
         })
     }
 
@@ -3207,12 +4448,120 @@ impl Paint {
     /// which is the `2.35·34 = 80` §5.2 publishes.
     ///
     /// `quad_cap` is this star's own share of the frame's quad budget;
-    /// `haloed` counts the STARS given a halo so far this frame.
-    fn draw_add(&self, geom: Geom, frame: &mut Frame<'_>, quad_cap: usize, haloed: &mut usize) {
+    /// `haloed` counts the STARS given a halo so far this frame; `laid_from`
+    /// is where this frame's sky begins in `frame.out` and `frame.halos` —
+    /// the ground a star is priced over ([`sky_ground`]).
+    ///
+    /// **EVERY CLASS IS HELD UNDER THE CARET LAW** ([`STAR_LIGHT_CEIL`]),
+    /// in two steps. The haloed classes are PRICED before they are drawn
+    /// ([`price_centre`]): the body's coverage, the disc's and the halo's
+    /// peak are what the law leaves of the recipe's request on this ground
+    /// at the centre — the whole request where the ground has the room (a
+    /// black ground at the published `143` has it), colour before white
+    /// where it has not. Then every class is SETTLED after it is drawn
+    /// ([`settle_under_ceiling`]): the pixels its recipe stacks light on
+    /// away from the centre — the arm's first pixel, where a full-request
+    /// tint stub, the taper's brightest span and the halo's ring meet — are
+    /// read back from its own quads, and the whole star is dimmed by one
+    /// factor until they fit. The second step is the one a yellow or green
+    /// hero at full intensity needs: those stops are most of the eye's
+    /// luminance, and `61 + 56` levels of them beside a white taper is over
+    /// the ceiling where the same levels of red or violet are not.
+    fn draw_add(
+        &self,
+        ctx: &Ctx<'_>,
+        frame: &mut Frame<'_>,
+        quad_cap: usize,
+        haloed: &mut usize,
+        laid_from: (usize, usize),
+    ) {
+        let geom = ctx.geom;
+        let (out_from, sky_from) = laid_from;
+        // The pixels this star's recipe stacks on, and the sky under each —
+        // read BEFORE its own quads go out, since they would be in the slice.
+        let d = if self.class == StarClass::M3 {
+            1
+        } else {
+            star_body_px(self.arm) + 1
+        };
+        let mut watch = [((0i32, 0i32), 0u32); SETTLE_PIXELS];
+        for (slot, (dx, dy)) in watch.iter_mut().zip([
+            (0, 0),
+            (d, 0),
+            (-d, 0),
+            (0, d),
+            (0, -d),
+            (1, 0),
+            (-1, 0),
+            (0, 1),
+            (0, -1),
+        ]) {
+            let p = (self.x + dx, self.y + dy);
+            *slot = (
+                p,
+                sky_ground(
+                    ctx.cfg.theme_bg,
+                    &frame.out[out_from..],
+                    &frame.halos[sky_from..],
+                    p.0,
+                    p.1,
+                ),
+            );
+        }
+        let ground = watch[0].1;
+        let q0 = frame.out.len();
+        let h0 = frame.halos.len();
         match self.class {
             StarClass::M3 => self.draw_m3(geom, frame.out, quad_cap),
             StarClass::M2 => {
-                let cov = cov_byte(self.c * self.core);
+                // The body is `M2_BODY_TINT` of the way from white to the
+                // tint (owner, 2026-09-08: "m2 tinted cores"); the disc is
+                // the tint itself, and the SKY m2's shoulder only (D1).
+                let body = mix_rgb(TINT_WHITE_RGB, self.tint, M2_BODY_TINT);
+                let disc = if self.lane.is_sky() {
+                    cov_byte(self.c * M2_DISC_ADD)
+                } else {
+                    0
+                };
+                let r = self.halo_r(geom.ch as f32);
+                let (halo_rgb, halo) = self.halo_request(M2_HALO_SHARE, *haloed);
+                let (cov, disc, peak) = price_centre(
+                    ground,
+                    self.tint == TINT_WHITE_RGB,
+                    (body, cov_byte(self.c * self.core)),
+                    (self.tint, disc),
+                    (halo_rgb, halo),
+                );
+                push_twinkle_star(
+                    frame.out, geom, self.x, self.y, self.arm, cov, false, body, quad_cap,
+                );
+                if disc > 0 && frame.out.len() < quad_cap {
+                    // The 3×3 disc (5×5 on the retina cell): an m2's one
+                    // addition, and a SHOULDER rather than a second core (D1).
+                    let sh = m2_disc_shoulder_px(geom.ch as f32);
+                    push_fx_rect(
+                        frame.out,
+                        geom,
+                        self.x - sh,
+                        self.y - sh,
+                        2 * sh + 1,
+                        2 * sh + 1,
+                        premul_rgb(self.tint, disc),
+                    );
+                }
+                self.draw_stubs(geom, frame.out, quad_cap);
+                self.draw_halo(geom, frame.halos, r, (halo_rgb, peak), haloed);
+            }
+            StarClass::M1 => {
+                let r = self.halo_r(geom.ch as f32);
+                let (halo_rgb, halo) = self.halo_request(M1_HALO_SHARE, *haloed);
+                let (cov, _, peak) = price_centre(
+                    ground,
+                    self.tint == TINT_WHITE_RGB,
+                    (TINT_WHITE_RGB, cov_byte(self.c * self.core)),
+                    (self.tint, 0),
+                    (halo_rgb, halo),
+                );
                 push_twinkle_star(
                     frame.out,
                     geom,
@@ -3220,44 +4569,15 @@ impl Paint {
                     self.y,
                     self.arm,
                     cov,
-                    false,
-                    TINT_WHITE_RGB,
-                    quad_cap,
-                );
-                if self.lane.is_sky() && frame.out.len() < quad_cap {
-                    // The 3×3 disc: an m2's one addition, and a SHOULDER rather
-                    // than a second core (D1).
-                    push_fx_rect(
-                        frame.out,
-                        geom,
-                        self.x - 1,
-                        self.y - 1,
-                        3,
-                        3,
-                        premul_rgb(TINT_WHITE_RGB, cov_byte(self.c * M2_DISC_ADD)),
-                    );
-                }
-                self.draw_stubs(geom, frame.out, quad_cap);
-                let r = (M2_HALO_R_ARM * self.arm as f32).max(M2_HALO_R_MIN_PX);
-                self.draw_halo(geom, frame.halos, r, M2_HALO_SHARE, haloed);
-            }
-            StarClass::M1 => {
-                push_twinkle_star(
-                    frame.out,
-                    geom,
-                    self.x,
-                    self.y,
-                    self.arm,
-                    cov_byte(self.c * self.core),
                     self.glints,
                     TINT_WHITE_RGB,
                     quad_cap,
                 );
                 self.draw_stubs(geom, frame.out, quad_cap);
-                let r = M1_HALO_R_ARM * self.arm as f32;
-                self.draw_halo(geom, frame.halos, r, M1_HALO_SHARE, haloed);
+                self.draw_halo(geom, frame.halos, r, (halo_rgb, peak), haloed);
             }
         }
+        settle_under_ceiling(frame, q0, h0, &watch);
     }
 
     /// §5.7's m3: a white 1-px `core = 1.6·c·env`, plus four TINTED arms of
@@ -3283,7 +4603,10 @@ impl Paint {
     /// tail (`an_over_budget_frame_keeps_every_star_s_core`; the push-by-push
     /// law itself is `a_grain_s_share_is_honoured_push_by_push_core_first`).
     fn draw_m3(&self, geom: Geom, out: &mut Vec<GlowQuad>, quad_cap: usize) {
-        let core = premul_rgb(TINT_WHITE_RGB, cov_byte(self.c * M3_CENTRE_ADD * self.core));
+        // The grain is PURE TINT, core included (owner, 2026-09-08: "m3 ...
+        // fully coloured at the spectrum position of the cell they rose
+        // from"); the peak law holds on the tint's own brightest channel.
+        let core = premul_rgb(self.tint, cov_byte(self.c * M3_CENTRE_ADD * self.core));
         let disc = premul_rgb(self.tint, cov_byte(self.c * M3_CROSS_ADD));
         let a = self.arm;
         // Core first, so a star truncated by the quad budget keeps its peak.
@@ -3309,7 +4632,7 @@ impl Paint {
     /// tinted pixel under a white point. Four quads, as before.
     fn draw_stubs(&self, geom: Geom, out: &mut Vec<GlowQuad>, quad_cap: usize) {
         let d = star_body_px(self.arm) + 1;
-        let l = STUB_LEN_PX;
+        let l = stub_len_px(geom.ch as f32);
         let c = premul_rgb(self.tint, cov_byte(self.c * STUB_COV_SHARE));
         for (x, y, w, h) in [
             (self.x - d - (l - 1), self.y, l, 1),
@@ -3324,23 +4647,49 @@ impl Paint {
         }
     }
 
-    /// The star's HALO — the tint's atmosphere, riding `env` undiluted so the
-    /// colour breathes while the white core holds (§5.5's "chromatic
-    /// scintillation with no chroma fade"). Budgeted per STAR
+    /// **THE HALO'S RADIUS IS THE CELL'S** — [`M1_HALO_R_ARM`] /
+    /// [`M2_HALO_R_ARM`] times the class's NOMINAL arm (`star_arm`, the
+    /// float the arm clock modulates), the m2's floored at
+    /// [`m2_halo_r_min_px`]: 8 / 6 px at the 1× cell, 11 / 7.7 at `ch` 18,
+    /// 16 / 12 on the retina cell — twice the 1× picture, exactly. Not the
+    /// clocked integer arm: that truncates unevenly across cells and steps
+    /// at 8–12 Hz, which is a size flicker D12 exempts only for marks under
+    /// 10 px. `0` for the grain, which has no halo.
+    fn halo_r(&self, ch: f32) -> f32 {
+        let nominal = star_arm(ch, self.class.arm_ratio());
+        match self.class {
+            StarClass::M1 => M1_HALO_R_ARM * nominal,
+            StarClass::M2 => (M2_HALO_R_ARM * nominal).max(m2_halo_r_min_px(ch)),
+            StarClass::M3 => 0.0,
+        }
+    }
+
+    /// The star's HALO REQUEST — its colour at this instant ([`halo_rgb`])
+    /// and the peak the recipe asks for: the tint's atmosphere, riding `env`
+    /// undiluted so the colour breathes while the white core holds (§5.5's
+    /// "chromatic scintillation with no chroma fade"). Budgeted per STAR
     /// ([`STARDUST_HALO_BUDGET`]), and culled below §3.2's chroma floor
-    /// (`α·env < 0.12`: nothing coloured is drawn below α 0.12).
+    /// (`α·env < 0.12`: nothing coloured is drawn below α 0.12) — a peak of
+    /// `0` for either, so a halo the frame will not draw is never priced
+    /// against the body it belongs to.
+    fn halo_request(&self, share: f32, haloed: usize) -> (u32, u8) {
+        let rgb = halo_rgb(self.tint, self.gold, self.env);
+        if haloed >= STARDUST_HALO_BUDGET || self.alpha * self.env < CHROMA_CULL_ALPHA {
+            return (rgb, 0);
+        }
+        (rgb, cov_byte(self.c * share * self.env))
+    }
+
+    /// Lay the halo [`Self::halo_request`] asked for, at the `peak` the
+    /// caret law left it ([`price_centre`]) — nothing at `0`.
     fn draw_halo(
         &self,
         geom: Geom,
         halos: &mut Vec<RainHalo>,
         r: f32,
-        share: f32,
+        (rgb, peak): (u32, u8),
         haloed: &mut usize,
     ) {
-        if *haloed >= STARDUST_HALO_BUDGET || self.alpha * self.env < CHROMA_CULL_ALPHA {
-            return;
-        }
-        let peak = cov_byte(self.c * share * self.env);
         if peak == 0 {
             return;
         }
@@ -3352,7 +4701,7 @@ impl Paint {
             usize::MAX,
             (self.x, self.y),
             (ri, ri),
-            premul_rgb(self.tint, peak),
+            premul_rgb(rgb, peak),
             HaloMode::Add,
         );
         if halos.len() > before {
@@ -3428,7 +4777,7 @@ impl Paint {
 /// — and under reduced motion it stays there.
 fn arm_px(star: &Star, ch: f32, reduced_motion: bool, now: Instant) -> i32 {
     let nominal = star_arm(ch, star.class.arm_ratio());
-    let min = star.class.arm_min_px();
+    let min = star.class.arm_min_px(ch);
     if reduced_motion || star.in_hold(now) {
         return (nominal.round() as i32).max(min);
     }
@@ -3535,12 +4884,26 @@ fn scint_rate(seed: u32) -> f32 {
     SCINT_F_MIN + (SCINT_F_MAX - SCINT_F_MIN) * hash01(mix32(seed ^ SALT_RATE))
 }
 
-/// **THE 60/25/15 TINT DEAL** (§5.3), dealt by seed and CONSTANT FOR LIFE —
-/// `(tint, gold)`.
+/// **THE TINT BY CLASS** (§5.3 as re-ruled 2026-09-08): a GRAIN always wears
+/// the stop of the cell it rose from — "m3 fully coloured at the spectrum
+/// position of the cell they rose from" — and never gold (a grain has no
+/// glints to carry); an m1 or m2 takes the [`deal_tint`] deal.
+#[inline]
+fn class_tint(class: StarClass, seed: u32, field_t: f32) -> (u32, bool) {
+    if class == StarClass::M3 {
+        (spectrum_snap(field_t), false)
+    } else {
+        deal_tint(seed, field_t)
+    }
+}
+
+/// **THE 75/10/15 TINT DEAL** (§5.3; was 60/25/15 until the owner asked for
+/// more colour, 2026-09-08), dealt by seed and CONSTANT FOR LIFE — `(tint,
+/// gold)` — for an m1 or m2 ([`class_tint`] routes the grain past it).
 ///
-/// 60 % take `spectrum_snap(field at the birth cell)` — the sky inherits the
+/// 75 % take `spectrum_snap(field at the birth cell)` — the sky inherits the
 /// spectrum's order along the line, warm stars over the old end and violet
-/// over the new; 25 % are an A-type white; 15 % are gold, and gold is the only
+/// over the new; 10 % are an A-type white; 15 % are gold, and gold is the only
 /// class that carries diagonal glints. Gold-ness is the DEAL's answer, not the
 /// colour's: the arc's yellow stop is the same RGB as gold, and a yellow field
 /// star does not glint.
@@ -3703,11 +5066,59 @@ fn push_halo_quads(
     color: u32,
     mode: HaloMode,
 ) {
+    let glass = (
+        geom.fx_left(),
+        geom.fx_top(),
+        geom.fx_right(),
+        geom.fx_bot(),
+    );
+    let spec = HaloSpec {
+        centre,
+        radii,
+        color,
+        mode,
+    };
+    push_halo_quads_clipped(out, geom, cap, spec, glass);
+}
+
+/// One radial falloff as [`push_halo_quads_clipped`] takes it — the four
+/// numbers of a halo that are not its box.
+#[derive(Clone, Copy, Debug)]
+struct HaloSpec {
+    /// The falloff's centre, window px.
+    centre: (i32, i32),
+    /// Its radii, px.
+    radii: (i32, i32),
+    /// Premultiplied (`Add`) or ink-with-ceiling (`Over`).
+    color: u32,
+    /// The operator.
+    mode: HaloMode,
+}
+
+/// [`push_halo_quads`] with an explicit CLIP BOX `(x0, y0, x1, y1)`
+/// (half-open, window px) intersected with the glass — the aurora's veil is
+/// a falloff whose box is the cell's own column above the line, not the
+/// ellipse's whole extent ([`Stardust::draw_veil`]). Same law as the
+/// unclipped twin: the centre is the falloff's truth and is stored, never
+/// clamped into the box.
+fn push_halo_quads_clipped(
+    out: &mut Vec<RainHalo>,
+    geom: Geom,
+    cap: usize,
+    spec: HaloSpec,
+    clip: (i32, i32, i32, i32),
+) {
+    let HaloSpec {
+        centre,
+        radii,
+        color,
+        mode,
+    } = spec;
     if color == 0 {
         return;
     }
-    let (bl, br) = (geom.fx_left(), geom.fx_right());
-    let (bt, bb) = (geom.fx_top(), geom.fx_bot());
+    let (bl, bt) = (geom.fx_left().max(clip.0), geom.fx_top().max(clip.1));
+    let (br, bb) = (geom.fx_right().min(clip.2), geom.fx_bot().min(clip.3));
     let (rx, ry) = (radii.0.max(1), radii.1.max(1));
     let (cx, cy) = centre;
     let x0 = (cx - rx).max(bl);
@@ -3740,6 +5151,388 @@ fn push_halo_quads(
             mode,
         });
         yy = band_end;
+    }
+}
+
+// ===========================================================================
+// 8a. The aurora's cell, and the colour helpers the coloured sky needs
+// ===========================================================================
+
+/// ONE CELL OF THE AURORA — the veil above one laid ribbon cell (section
+/// 1a′). `Copy` and flat like a [`Star`]: everything on glass is derived
+/// from these fields and `now`.
+#[derive(Clone, Copy, Debug)]
+pub struct Veil {
+    /// The laid cell's row.
+    pub row: u16,
+    /// The laid cell's column — the veil's box is this column, and only this
+    /// column.
+    pub col: u16,
+    /// The ribbon's field at the cell (C2), unfolded — the bed folds it with
+    /// `tri` when it draws, and so does the veil.
+    pub t: f32,
+    /// The veil's peak, as a share of [`AURORA_COV_PEAK`], priced ONCE at
+    /// birth from `Ctx::birth_disp` ([`veil_gain`]).
+    pub gain: f32,
+    /// The key that laid the cell — the `edge-in` and the horizon read it.
+    pub born: Instant,
+    /// The last key on the row — the field fade reads it
+    /// ([`Stardust::relight_field`]).
+    pub lit: Instant,
+    /// The finish this cell is on, if any: its retract, or the focus ember.
+    pub finish: Option<Finish>,
+}
+
+impl Veil {
+    /// Seconds since the key that laid the cell, saturating at zero.
+    #[must_use]
+    pub fn age_s(&self, now: Instant) -> f32 {
+        now.saturating_duration_since(self.born).as_secs_f32()
+    }
+
+    /// Seconds since the last key on the row, saturating at zero.
+    #[must_use]
+    pub fn idle_s(&self, now: Instant) -> f32 {
+        now.saturating_duration_since(self.lit).as_secs_f32()
+    }
+
+    /// The veil's alpha at `now` — the FIELD lane's own envelope
+    /// ([`field_lane_envelope`]): it is the sky of the cell it rides, and it
+    /// leaves with the ribbon the way the field stars do.
+    #[must_use]
+    pub fn envelope(&self, now: Instant, reduced_motion: bool) -> f32 {
+        let fin = self.finish.map_or(1.0, |f| f.gain(now));
+        field_lane_envelope(self.age_s(now), self.idle_s(now), fin, reduced_motion)
+    }
+
+    /// True once the cell must leave the pool — the field star's own three
+    /// exits ([`Star::dead`]).
+    #[must_use]
+    pub fn dead(&self, now: Instant) -> bool {
+        self.age_s(now) >= FIELD_LIFE_S
+            || self.idle_s(now) >= field_fade_life_s()
+            || self.finish.is_some_and(|f| f.gain(now) < STAR_CULL_ALPHA)
+    }
+
+    /// Put this cell on a finish ending at `at + span_s`, unless one that
+    /// ends sooner already stands ([`Star::finish_by`]'s rule).
+    pub fn finish_by(&mut self, at: Instant, span_s: f32) {
+        let next = Finish { at, span_s };
+        if self.finish.is_none_or(|f| next.ends() < f.ends()) {
+            self.finish = Some(next);
+        }
+    }
+
+    /// The window-absolute Y the veil's box ENDS at (exclusive) and its
+    /// falloff is centred on: the sky band's own anchor for the row —
+    /// [`default_band_top`], the ribbon's top under `tall` — and never below
+    /// the glyph row's own top, so under `underline` (whose band anchor is
+    /// inside the cell) the veil still sits wholly above the text.
+    #[must_use]
+    pub fn bottom_px(&self, geom: Geom, cfg: &Config) -> f32 {
+        let cell_top = f32::from(geom.origin_y) + f32::from(self.row) * geom.ch as f32;
+        default_band_top(geom, cfg, self.row).min(cell_top)
+    }
+}
+
+/// **THE FIELD LANE'S ONE ENVELOPE** — shared by the field star
+/// ([`Star::envelope`]) and the aurora's veil ([`Veil::envelope`]), because
+/// both ARE the cell's sky (§5.6's Field row: "rides the cell's own edge
+/// envelope × retract — alpha only"), as the product of three alpha clocks:
+///
+/// * **the birth** — the cell's 18 ms `edge-in` from [`BIRTH_EDGE_FLOOR`]
+///   (T2: on glass, above the cull, on the frame that echoes the key);
+/// * **the horizon** — the ribbon's own `expiry_melt` over [`FIELD_LIFE_S`],
+///   the swoosh span at which the cell is guaranteed gone;
+/// * **the hand** — [`FIELD_HOLD_MS`] / [`FIELD_TAU_MS`] from the last key
+///   on the row: full while the hand is there, half at 550 ms after it
+///   leaves, culled at 880 ms — before the ribbon's retract moves.
+///
+/// Times `fin`, the finish if one is on. Under reduced motion the theme's
+/// one linear fade replaces both curves at each span's end.
+#[must_use]
+pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
+    if reduced_motion {
+        let fade = REDUCED_MOTION_FADE_MS / 1000.0;
+        return clamp01((FIELD_LIFE_S - age_s) / fade.max(f32::EPSILON))
+            * reduced_fade(field_fade_life_s() - idle_s)
+            * fin;
+    }
+    let birth = BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age_s);
+    let hand = half_life(idle_s, FIELD_HOLD_MS / 1000.0, FIELD_TAU_MS / 1000.0);
+    birth * expiry_melt(age_s / FIELD_LIFE_S.max(f32::EPSILON)) * hand * fin
+}
+
+/// **THE AURORA'S GAIN** at a birth spine — `0` below [`AURORA_COLD_DISP`]
+/// ("invisible cold"), `smoothstep` up to `1` at a spine of one: 0.37 at
+/// 0.5 ("plain"), 0.71 at 0.7, 1.0 at 1.0 ("full").
+#[must_use]
+pub fn veil_gain(birth_disp: f32) -> f32 {
+    if !birth_disp.is_finite() || birth_disp < AURORA_COLD_DISP {
+        return 0.0;
+    }
+    smoothstep01((birth_disp - AURORA_COLD_DISP) / (1.0 - AURORA_COLD_DISP))
+}
+
+/// `a` moved `k` of the way toward `b`, per channel, rounded — the m2's
+/// body colour ([`M2_BODY_TINT`]).
+#[inline]
+#[must_use]
+fn mix_rgb(a: u32, b: u32, k: f32) -> u32 {
+    let k = clamp01(k);
+    let ch = |sh: u32| -> u32 {
+        let (x, y) = (((a >> sh) & 0xff) as f32, ((b >> sh) & 0xff) as f32);
+        (x + (y - x) * k).round().clamp(0.0, 255.0) as u32
+    };
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// **THE HALO'S COLOUR AT THIS INSTANT** — the star's stop, breathed
+/// [`HALO_HUE_SWING_ENTRIES`] table entries along the arc on the luminance
+/// clock: `env` runs `0.55..=1`, and the halo walks `−15` at the trough to
+/// `+15` at the peak from its stop's own anchor (`SPECTRUM_ANCHOR_AT`),
+/// landing on a whole `SPECTRUM_LUT` entry so the colour is one the arc
+/// itself holds — never off the spectrum, never onto a neighbouring name.
+/// The A-type white and a dealt gold have no stop and hold their colour;
+/// so does any tint that is not one of the seven names (C1 says there is
+/// none, and the fallback is the tint itself).
+#[must_use]
+fn halo_rgb(tint: u32, gold: bool, env: f32) -> u32 {
+    if gold || tint == TINT_WHITE_RGB {
+        return tint;
+    }
+    let Some(stop) = (0..SPECTRUM_STOPS).find(|&i| spectrum_stop(i) == tint) else {
+        return tint;
+    };
+    // `env ∈ [0.55, 1]` → `[−1, 1]`.
+    let breath = clamp01((env - 0.55) / 0.45) * 2.0 - 1.0;
+    let step = (breath * HALO_HUE_SWING_ENTRIES as f32).round() as i32;
+    let at = (SPECTRUM_ANCHOR_AT[stop] as i32 + step).clamp(0, SPECTRUM_LUT_LEN as i32 - 1);
+    SPECTRUM_LUT[at as usize]
+}
+
+/// **THE GROUND UNDER A STAR** — the theme ground plus everything the sky
+/// has already laid on this frame at `(x, y)`: the additive quads of the
+/// stars drawn before this one (`add_sat`, as `draw_flat_add` lays them)
+/// and every `Add` halo — the aurora's veils and the earlier stars'
+/// atmospheres — through the renderers' own falloff bytes (`halo_row_ny` /
+/// `halo_weight`, the halo-parity contract). It is what [`price_centre`]
+/// prices against, so a hero standing in a full-momentum veil, or dealt
+/// onto the cell another star already holds, is held to the SAME ceiling
+/// as one on bare glass. `laid` and `sky` are the slices from this frame's
+/// first sky quad and halo — bounded by [`STARDUST_QUAD_BUDGET`] and
+/// [`AURORA_HALO_BUDGET`] + [`STARDUST_HALO_BUDGET`].
+///
+/// What a star drawn LATER lays on this one's pixels is not here — its
+/// arms and its halo's tail land after this star is priced and settled —
+/// so the ceiling is exact on each star's own watched pixels over the sky
+/// under it, and a pair the deal puts within a halo's reach of each other
+/// is bounded by the later star's tail on the earlier one's pixels.
+#[must_use]
+fn sky_ground(bg: u32, laid: &[GlowQuad], sky: &[RainHalo], x: i32, y: i32) -> u32 {
+    let mut ground = bg & 0x00FF_FFFF;
+    for q in laid {
+        if quad_covers(q, x, y) {
+            ground = add_sat(ground, q.color);
+        }
+    }
+    for h in sky {
+        if h.mode == HaloMode::Add {
+            ground = add_sat(ground, halo_add_at(h, x, y));
+        }
+    }
+    ground
+}
+
+/// What one `Add` halo lays on `(x, y)` — its premultiplied colour through
+/// the renderers' own elliptical falloff (`halo_row_ny` / `halo_weight`,
+/// the halo-parity contract), `0` outside its box or its reach.
+#[must_use]
+fn halo_add_at(h: &RainHalo, x: i32, y: i32) -> u32 {
+    if !(i32::from(h.x)..i32::from(h.x) + i32::from(h.w)).contains(&x)
+        || !(i32::from(h.y)..i32::from(h.y) + i32::from(h.h)).contains(&y)
+    {
+        return 0;
+    }
+    let ny = halo_row_ny(y - i32::from(h.cy), i32::from(h.ry) * i32::from(h.ry));
+    if ny >= 256 {
+        return 0;
+    }
+    let wt = halo_weight(x - i32::from(h.cx), ny, i32::from(h.rx) * i32::from(h.rx));
+    if wt <= 0 {
+        return 0;
+    }
+    premul_rgb(h.color, wt.min(255) as u8)
+}
+
+/// Does this additive quad cover `(x, y)`?
+#[inline]
+#[must_use]
+fn quad_covers(q: &GlowQuad, x: i32, y: i32) -> bool {
+    q.alpha == 0
+        && (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).contains(&x)
+        && (i32::from(q.y)..i32::from(q.y) + i32::from(q.h)).contains(&y)
+}
+
+/// The pixels [`settle_under_ceiling`] watches on one star: its centre, the
+/// first pixel of each arm past the body (the stub, the taper's brightest
+/// span and the halo's ring meet there), and its four orthogonal
+/// neighbours (the disc's and the nucleus's pixels).
+pub const SETTLE_PIXELS: usize = 9;
+
+/// **THE CLOSER** ([`STAR_LIGHT_CEIL`]) — one star, just drawn, read back
+/// from its own quads `frame.out[q0..]` and its own halo `frame.halos[h0..]`
+/// (one `RainHalo` per text row it spans — `push_halo_quads` splits on the
+/// row, so a pixel is under exactly one piece) at each of the `watch`ed
+/// pixels (each carried with the sky already under it), and
+/// DIMMED BY ONE FACTOR until every one of them composites under the
+/// ceiling. The factor is found on the bytes themselves: a probe scales
+/// every own lay by `k/255` through `premul_rgb` — the very rounding the
+/// scaled quads are then written with — so what is checked is what is
+/// drawn. Nothing moves when the star already fits, which on the shipped
+/// ground at the default intensity is every star but a yellow or green
+/// hero at its twinkle peak; a star that does not is the same star at a
+/// lower light — body, disc, stubs and halo in their designed ratio,
+/// colour and saturation intact.
+///
+/// Bounded: ≤ 8 probes × [`SETTLE_PIXELS`] × the star's own quads (≤ 15)
+/// and halo pieces (one per row spanned); no allocation.
+fn settle_under_ceiling(
+    frame: &mut Frame<'_>,
+    q0: usize,
+    h0: usize,
+    watch: &[((i32, i32), u32); SETTLE_PIXELS],
+) {
+    let own_at = |k: u8, (x, y): (i32, i32)| -> u32 {
+        let mut own = 0u32;
+        for q in &frame.out[q0..] {
+            if quad_covers(q, x, y) {
+                own = add_sat(own, premul_rgb(q.color, k));
+            }
+        }
+        for h in &frame.halos[h0..] {
+            let piece = RainHalo {
+                color: premul_rgb(h.color, k),
+                ..*h
+            };
+            own = add_sat(own, halo_add_at(&piece, x, y));
+        }
+        own
+    };
+    let fits = |k: u8| {
+        watch
+            .iter()
+            .all(|&(p, ground)| under_ceil(add_sat(ground, own_at(k, p))))
+    };
+    let k = fit_byte(u8::MAX, fits);
+    if k == u8::MAX {
+        return;
+    }
+    for q in &mut frame.out[q0..] {
+        q.color = premul_rgb(q.color, k);
+    }
+    for h in &mut frame.halos[h0..] {
+        h.color = premul_rgb(h.color, k);
+    }
+}
+
+/// Under [`STAR_LIGHT_CEIL`]?
+#[inline]
+#[must_use]
+fn under_ceil(px: u32) -> bool {
+    relative_luminance(px) <= STAR_LIGHT_CEIL
+}
+
+/// What `push_twinkle_star` stacks on the crossing pixel at coverage `cov`
+/// in `rgb` — the two crossing bodies and the nucleus, in its own bytes
+/// (`premul_rgb(rgb, cov)` twice and `premul_rgb(rgb, (cov · 0.35) as u8)`
+/// once), over `base`. The recipe's `STAR_STACK_ADD 2.35`, integer-exact.
+#[must_use]
+fn stacked_centre(base: u32, rgb: u32, cov: u8) -> u32 {
+    let lay = premul_rgb(rgb, cov);
+    let core = premul_rgb(rgb, (f32::from(cov) * STAR_CORE_ADD) as u8);
+    add_sat(add_sat(add_sat(base, lay), lay), core)
+}
+
+/// The largest `k ≤ want` for which `under(k)` holds — `under` is monotone
+/// (more light is never less luminance), so this is a bisection over the
+/// byte, at most eight probes, none of them an allocation. `0` when even
+/// nothing passes.
+#[must_use]
+fn fit_byte(want: u8, under: impl Fn(u8) -> bool) -> u8 {
+    if under(want) {
+        return want;
+    }
+    if !under(0) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0u8, want);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if under(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// **THE CARET LAW, SPENT ON ONE STAR'S CENTRE** ([`STAR_LIGHT_CEIL`]).
+///
+/// `body` is the crossing's colour and requested coverage (stacked as
+/// `push_twinkle_star` stacks it), `disc` the m2's 3×3 shoulder (`0` for
+/// the hero), `halo` the atmosphere's colour and peak — the peak IS added
+/// on the centre pixel, the falloff weighing `256/256` there. Returns what
+/// each may be so that the composited centre over `ground` stays under the
+/// ceiling:
+///
+/// * **a COLOURED star spends colour first** — the halo's whole request,
+///   then the disc's, and the white body takes the luminance left. That is
+///   "saturation costs no luminance" made exact: the centre lands at the
+///   same `Y` it may have anyway, and reads as the tint rather than as
+///   white. On the shipped ground at the default intensity the hero's
+///   red, blue, indigo and violet halos fit beside the whole body; a
+///   yellow or green one costs the body about a quarter, because those
+///   stops are most of the eye's luminance, and at the full intensity —
+///   where even the bare white `143` is over the ceiling on that ground —
+///   the body is what the colour leaves (measured, per stop, by
+///   `the_caret_law_spends_colour_first_and_white_last_on_a_star_s_centre`);
+/// * **an ACHROMATIC star spends its body first** — the A-type white's
+///   halo is more white, exactly the light the law is about, so it has the
+///   remainder: `16` levels on the shipped ground at the default intensity
+///   where it asked `43`, and one level over black at the published `143`;
+/// * **a ground already over the ceiling leaves the request as it is** —
+///   there is no answer on it, and the law there is the caret's to keep.
+///
+/// Every probe composites in the rasterizers' own integer arithmetic, so
+/// the ceiling holds on the byte the eye gets, not on a model of it.
+#[must_use]
+fn price_centre(
+    ground: u32,
+    achromatic: bool,
+    body: (u32, u8),
+    disc: (u32, u8),
+    halo: (u32, u8),
+) -> (u8, u8, u8) {
+    if !under_ceil(ground) {
+        return (body.1, disc.1, halo.1);
+    }
+    let lay = |base: u32, rgb: u32, k: u8| add_sat(base, premul_rgb(rgb, k));
+    if achromatic {
+        let cov = fit_byte(body.1, |k| under_ceil(stacked_centre(ground, body.0, k)));
+        let centre = stacked_centre(ground, body.0, cov);
+        let d = fit_byte(disc.1, |k| under_ceil(lay(centre, disc.0, k)));
+        let centre = lay(centre, disc.0, d);
+        let peak = fit_byte(halo.1, |k| under_ceil(lay(centre, halo.0, k)));
+        (cov, d, peak)
+    } else {
+        let peak = fit_byte(halo.1, |k| under_ceil(lay(ground, halo.0, k)));
+        let lit = lay(ground, halo.0, peak);
+        let d = fit_byte(disc.1, |k| under_ceil(lay(lit, disc.0, k)));
+        let lit = lay(lit, disc.0, d);
+        let cov = fit_byte(body.1, |k| under_ceil(stacked_centre(lit, body.0, k)));
+        (cov, d, peak)
     }
 }
 
@@ -3886,8 +5679,8 @@ fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rainbow_kitty::KillScope;
     use crate::rainbow_kitty::ribbon::RETRACT_START_S;
+    use crate::rainbow_kitty::{KillScope, Mend};
     use aterm_render::add_sat;
     use std::time::Duration;
 
@@ -3920,16 +5713,35 @@ mod tests {
         }
     }
 
+    /// [`geom`] at another cell — the same 120×40 grid under the same 40 px
+    /// chrome band, at `cw × ch` device px: the owner's 7×14 (1×) and 15×28
+    /// (retina) cells for the optical-size law.
+    fn geom_cell(cw: usize, ch: usize) -> Geom {
+        Geom {
+            cw,
+            ch,
+            win_w: (120 * cw) as u16,
+            win_h: (40 + 40 * ch) as u16,
+            ..geom()
+        }
+    }
+
     fn ctx(now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
+        ctx_in(geom(), now, cfg, caret)
+    }
+
+    /// [`ctx`] over a chosen geometry.
+    fn ctx_in(geom: Geom, now: Instant, cfg: &Config, caret: (u16, u16)) -> Ctx<'_> {
         Ctx {
             now,
-            geom: geom(),
+            geom,
             cfg,
             disp: 0.4,
             birth_disp: 0.4,
             phase: 0.0,
             caret,
             caret_t: 0.5,
+            mend: None,
         }
     }
 
@@ -4023,6 +5835,8 @@ mod tests {
             gold: tint == TINT_GOLD_RGB,
             v0: (0.0, 0.0),
             f: 10.0,
+            stream: 0.0,
+            pull: 0.0,
             finish: None,
         }
     }
@@ -4109,10 +5923,13 @@ mod tests {
     /// over the whole skirt, and a measured peak of 70/255.
     ///
     /// Re-derived for the art polish: the grain's disc is now tinted and
-    /// outboard at `0.45·c` (98 : 27 at the crest, 54 : 27 at the trough) and
-    /// the halos sit at §3.2's 14 % cap (19 / 14 levels) — the two-sided
-    /// centre, the 30 % margin over every 8-neighbour and the 14 % halo law
-    /// all still hold, and all three are still measured here, on the pixel.
+    /// outboard at `0.45·c` (98 : 27 at the crest, 54 : 27 at the trough) —
+    /// and again on 2026-09-08, when the grain's core and the m2's body took
+    /// the tint: the centre is measured on its BRIGHTEST channel, which is
+    /// the tint's own at full, so the two-sided centre and the 30 % margin
+    /// over every 8-neighbour hold unchanged; §3.2 rank 8 is now "the halo
+    /// may not outshine the core" (61 under 143, 38 under 130) and is
+    /// measured here as such.
     #[test]
     fn a_star_is_a_peak_not_a_blob() {
         let c = cfg(true);
@@ -4165,11 +5982,14 @@ mod tests {
                     );
                 }
             }
-            // §3.2 rank 8: a halo peaks at ≤ 14 % of the core it belongs to.
+            // §3.2 rank 8, as re-ruled 2026-09-08 (owner: "I want ... a
+            // bigger more special rainbow impact"): the halo may not
+            // OUTSHINE the core it belongs to — under the old 14 % no halo
+            // pixel ever read as colour on glass.
             for h in &sc.halos {
                 assert!(
-                    lum(h.color) * 100 <= best.0 * 14,
-                    "{class:?}/{lane:?} halo peak {} over 14 % of the core {}",
+                    lum(h.color) < best.0,
+                    "{class:?}/{lane:?} halo peak {} outshines the core {}",
                     lum(h.color),
                     best.0
                 );
@@ -4177,22 +5997,25 @@ mod tests {
         }
     }
 
-    /// **D2 — THE BODY IS WHITE; ONLY THE HALO, THE STUBS AND THE GRAIN'S
-    /// DISC ARE TINTED** (§5.2, §20.1).
+    /// **THE STARS CARRY THE RAINBOW — THE GRAIN IS PURE TINT, THE m2 IS
+    /// TINTED TO ITS CORE, THE HERO KEEPS A WHITE-HOT CENTRE UNDER A RAINBOW
+    /// HALO** (§5.2 / §5.3 as re-ruled 2026-09-08, §20.1).
     ///
-    /// `push_twinkle_star` draws body AND nucleus in one colour, which is
-    /// exactly why the tint cannot live there: a coloured body would drag the
-    /// peak off white and put the star back in the 93 %-grey population by a
-    /// different route. So the centre pixel composites GREY in every class,
-    /// no tinted quad covers it, and every tinted quad lies outside the white
-    /// body — at least `star_body_px(arm) + 1 ≥ 2` px out for an m1/m2 (the
-    /// stubs) and one pixel out for the grain (its four arms start where the
-    /// 1-px core ends); and every class carries exactly its four tinted
-    /// quads. Re-derived when the grain's disc took the tint: the old form
-    /// asked every tinted quad to sit ≥ 2 px from the centre, which a grain's
-    /// arm at 1 px cannot and must not.
+    /// Re-pinned from `the_star_body_is_white_and_only_the_halo_and_stubs_are_tinted`
+    /// (D2: "the peak is white in every class") on the owner's words: *"I
+    /// feel like you are diminishing the specialness and emphasis of this
+    /// theme? why?"* — *"make this rainbow theme truly magical and special
+    /// and dynamic and beautiful"*. D2 was the law that kept 93 % of the
+    /// sky's pixels grey under a tint no eye found. Now, on the composited
+    /// pixel: an m3's centre and every one of its quads is the pure stop
+    /// (`spread == max channel`); an m2's centre carries `M2_BODY_TINT` of
+    /// the tint (spread `≥ 0.5·max` — the body, the disc and the stubs are
+    /// all tinted, no quad of it is grey); an m1's centre stays white in
+    /// its quads (`r == g == b`) with exactly its four tinted stubs outside
+    /// the body — its colour is the halo, measured by
+    /// `stardust_is_coloured_on_the_glass_not_white_with_a_tint`.
     #[test]
-    fn the_star_body_is_white_and_only_the_halo_and_stubs_are_tinted() {
+    fn the_grain_and_the_m2_wear_their_tint_to_the_core_and_the_hero_stays_white_hot() {
         let c = cfg(true);
         let t0 = Instant::now();
         for (class, lane, _) in every_class() {
@@ -4201,31 +6024,49 @@ mod tests {
             let sc = frame_at(&mut sky, t0 + Duration::from_millis(1), &c);
             let centre = px(&sc.out, 200, 100);
             let (r, g, b) = ((centre >> 16) & 0xff, (centre >> 8) & 0xff, centre & 0xff);
-            assert!(
-                r == g && g == b && r > 0,
-                "{class:?}/{lane:?} centre {centre:#08x} is not white"
-            );
-            let floor = if class == StarClass::M3 { 1 } else { 2 };
-            let mut tinted = 0usize;
-            for q in sc.out.iter().filter(|q| chroma(q.color) > 0) {
-                tinted += 1;
-                // Chebyshev distance from the centre to the quad's NEAREST
-                // pixel — zero means the quad covers the centre.
-                let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w) - 1);
-                let (y0, y1) = (i32::from(q.y), i32::from(q.y) + i32::from(q.h) - 1);
-                let dx = (x0 - 200).max(200 - x1).max(0);
-                let dy = (y0 - 100).max(100 - y1).max(0);
-                assert!(
-                    dx.max(dy) >= floor,
-                    "{class:?}/{lane:?} tinted {}x{} quad at ({dx},{dy}) is inside the body",
-                    q.w,
-                    q.h
-                );
+            let grey = sc.out.iter().filter(|q| chroma(q.color) == 0).count();
+            match class {
+                StarClass::M3 => {
+                    assert!(
+                        r == 0 && g == 0 && b > 0,
+                        "{class:?}/{lane:?} centre {centre:#08x} is not the pure stop"
+                    );
+                    assert_eq!(grey, 0, "{class:?}/{lane:?} carries a grey quad");
+                }
+                StarClass::M2 => {
+                    assert!(
+                        chroma(centre) * 2 >= lum(centre) && b > r && r == g,
+                        "{class:?}/{lane:?} centre {centre:#08x} is not tinted to its core"
+                    );
+                    assert_eq!(grey, 0, "{class:?}/{lane:?} carries a grey quad");
+                }
+                StarClass::M1 => {
+                    assert!(
+                        r == g && g == b && r > 0,
+                        "{class:?}/{lane:?} centre {centre:#08x} is not white-hot"
+                    );
+                    let mut tinted = 0usize;
+                    for q in sc.out.iter().filter(|q| chroma(q.color) > 0) {
+                        tinted += 1;
+                        // Chebyshev distance from the centre to the quad's
+                        // NEAREST pixel — the stubs lie outside the body.
+                        let (x0, x1) = (i32::from(q.x), i32::from(q.x) + i32::from(q.w) - 1);
+                        let (y0, y1) = (i32::from(q.y), i32::from(q.y) + i32::from(q.h) - 1);
+                        let dx = (x0 - 200).max(200 - x1).max(0);
+                        let dy = (y0 - 100).max(100 - y1).max(0);
+                        assert!(
+                            dx.max(dy) >= 2,
+                            "{class:?}/{lane:?} tinted {}x{} quad at ({dx},{dy}) is inside the body",
+                            q.w,
+                            q.h
+                        );
+                    }
+                    assert_eq!(
+                        tinted, 4,
+                        "{class:?}/{lane:?} carries {tinted} stubs, not four"
+                    );
+                }
             }
-            assert_eq!(
-                tinted, 4,
-                "{class:?}/{lane:?} carries {tinted} tinted quads, not its four"
-            );
         }
     }
 
@@ -4276,30 +6117,27 @@ mod tests {
         let c = cfg(true);
         let t0 = Instant::now();
         let mut sky = sky();
-        // A coloured tint, so the stubs (which run past the point) are not
-        // counted into the WHITE body's extent below.
-        sky.sow(star(
-            StarClass::M2,
-            StarLane::Strike,
-            t0,
-            spectrum_snap(0.2),
-        ));
+        // A coloured tint, so the stubs and the disc (pure tint) are not
+        // counted into the BODY's extent below — the body is
+        // `M2_BODY_TINT` of the way to the tint, a colour of its own.
+        let tint = spectrum_snap(0.2);
+        let body = mix_rgb(TINT_WHITE_RGB, tint, M2_BODY_TINT);
+        sky.sow(star(StarClass::M2, StarLane::Strike, t0, tint));
         let life_ms = (StarClass::M2.life_s(StarLane::Strike) * 1000.0) as u64;
         let mut extents = std::collections::BTreeSet::new();
         for ms in 0..life_ms {
             let sc = frame_at(&mut sky, t0 + Duration::from_millis(ms), &c);
-            // The white body's horizontal extent on the centre row.
+            // The body's horizontal extent on the centre row.
             let (mut lo, mut hi) = (i32::MAX, i32::MIN);
             for q in sc.out.iter().filter(|q| {
-                i32::from(q.y) == 100
-                    && q.color == premul_rgb(TINT_WHITE_RGB, (q.color & 0xff) as u8)
+                i32::from(q.y) == 100 && q.color == premul_rgb(body, lum(q.color) as u8)
             }) {
                 lo = lo.min(i32::from(q.x));
                 hi = hi.max(i32::from(q.x) + i32::from(q.w));
             }
             let extent = hi - lo;
             assert!(
-                extent > 2 * M2_ARM_MIN_PX,
+                extent > 2 * StarClass::M2.arm_min_px(geom().ch as f32),
                 "at {ms} ms the m2's arm collapsed to a {extent}-px extent"
             );
             extents.insert(extent);
@@ -4339,10 +6177,23 @@ mod tests {
                     q.color
                 );
             }
+            // The halo BREATHES its hue (owner, 2026-09-08: "the twinkle
+            // has more colour in it"): its colour is a whole entry of the
+            // arc within `HALO_HUE_SWING_ENTRIES` of the stop's own anchor —
+            // on the spectrum, and never a neighbouring name.
+            let anchor = SPECTRUM_ANCHOR_AT[spectrum_snap_index(0.62)] as i32;
             for h in &sc.halos {
-                let ok = (0..=255u16).any(|k| premul_rgb(tint, k as u8) == h.color);
-                assert!(ok, "halo colour {:#08x} left the tint", h.color);
+                let ok =
+                    (anchor - HALO_HUE_SWING_ENTRIES..=anchor + HALO_HUE_SWING_ENTRIES).any(|j| {
+                        let rgb = SPECTRUM_LUT[j as usize];
+                        (0..=255u16).any(|k| premul_rgb(rgb, k as u8) == h.color)
+                    });
+                assert!(ok, "halo colour {:#08x} left the stop's breath", h.color);
             }
+            // …and both ends of the breath still snap to the star's own name.
+            let name = |j: i32| spectrum_snap_index(j as f32 / (SPECTRUM_LUT_LEN - 1) as f32);
+            assert_eq!(name(anchor - HALO_HUE_SWING_ENTRIES), name(anchor));
+            assert_eq!(name(anchor + HALO_HUE_SWING_ENTRIES), name(anchor));
         }
         // D3: the last frame a star draws is still a visible point.
         let sc = frame_at(&mut sky, t0 + Duration::from_millis(last_lit), &c);
@@ -4473,6 +6324,194 @@ mod tests {
             (100..=200).contains(&golds),
             "the gold deal is not ~15 %: {golds}/1000"
         );
+    }
+
+    /// **§5.4, THE RULE CLAUSE — A LIGHT HORIZONTAL RULE ABOVE THE INPUT
+    /// LINE IS NOT A DARK SKY.** The owner's report (2026-09-08): *"I don't
+    /// see cursor sparkles when I'm using claude code, but I see them for
+    /// codex and normal terminal use."* Claude Code draws its input line
+    /// directly under a full-width `─` rule; the host probed that row as
+    /// 120 glyphs, the cell-level gate refused every sky birth, and the
+    /// ribbon typed on with no star over it for the life of the session —
+    /// measured live: `licensed=45 ribbon_active=true momentum=0.70
+    /// v2_stars=0` against the shell's `v2_stars=5` for the same keys.
+    ///
+    /// The rule's ink is a stroke through the cell's centre; the sky zone
+    /// is the lower `[0.60, 0.86]` of that cell. Disjoint — so the probe
+    /// records the rule as a class of its own and the sky is born over it,
+    /// with no core on the stroke. A row of TEXT above the line still
+    /// darkens the sky (L4 stands), and so does a HEAVY rule, whose stroke
+    /// can reach the zone on a square cell.
+    #[test]
+    fn a_light_rule_over_the_typing_row_keeps_the_sky_alive() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let g = geom();
+        let ch = g.ch as f32;
+        // Forty keys on row 5 under a probed row 4, as the host feeds it.
+        let type_under = |row_4: &[CellInk]| -> Stardust {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row_ink(4, row_4);
+            sky.probe_mut().probe_row(5, &[false; 120]);
+            for k in 0..40u16 {
+                sky.on_event(
+                    &typed(TypedClass::Glyph),
+                    t0,
+                    &ctx(t0, &c, (5, 10 + k)),
+                    &ribbon,
+                );
+            }
+            sky
+        };
+        let row_of = |s: &str| -> Vec<CellInk> { s.repeat(120).chars().map(cell_ink).collect() };
+
+        // 1. The TUI input box: a full-width light rule above the line.
+        let rule = row_of("─");
+        assert!(rule.iter().all(|&cell| cell == CellInk::Rule));
+        let sky = type_under(&rule);
+        assert!(
+            sky.live() > 0,
+            "a light rule above the input line darkened the sky"
+        );
+        for s in sky.live_iter() {
+            assert_eq!(
+                px_row(s.y, g),
+                4,
+                "a sky star was born outside row − 1, at ({}, {})",
+                s.x,
+                s.y
+            );
+            let fy = (s.y - f32::from(g.origin_y)) / ch - 4.0;
+            assert!(
+                fy >= RULE_INK_BOT_CH,
+                "a star core sits in the rule's stroke band: fy = {fy}"
+            );
+            assert_eq!(
+                sky.probe().at_px(s.x as i32, s.y as i32, g),
+                Some(false),
+                "the pixel probe called a sky pixel over the rule inked at ({}, {})",
+                s.x,
+                s.y
+            );
+        }
+        // …and the same census as a BLANK row: the rule costs the sky nothing.
+        let blank = type_under(&row_of(" "));
+        assert_eq!(
+            sky.live(),
+            blank.live(),
+            "the sky over a light rule is not the sky over a blank row"
+        );
+
+        // 2. A row of text above the line: L4, unchanged.
+        assert_eq!(
+            type_under(&row_of("x")).live(),
+            0,
+            "a row of text above the input line minted stars"
+        );
+
+        // 3. A heavy rule is text for this purpose.
+        assert_eq!(
+            type_under(&row_of("━")).live(),
+            0,
+            "a heavy rule above the input line minted stars"
+        );
+    }
+
+    /// The probe's two grains, stated: over a [`CellInk::Rule`] the CELL is
+    /// inked ([`GlyphProbe::at`]), the SKY is not ([`GlyphProbe::sky_at`]),
+    /// and a PIXEL is inked exactly inside the stroke band
+    /// ([`GlyphProbe::at_px`]). A glyph is inked at every grain, a blank at
+    /// none, and an unprobed row is unknown at every grain.
+    #[test]
+    fn the_pixel_probe_answers_ink_only_inside_a_rules_stroke_band() {
+        let g = geom();
+        let mut probe = GlyphProbe::new();
+        let mut row = vec![CellInk::Blank; 120];
+        row[10] = CellInk::Rule;
+        row[11] = CellInk::Glyph;
+        probe.probe_row_ink(4, &row);
+        // A window pixel `f` of the way down row 4.
+        let y_at = |f: f32| (f32::from(g.origin_y) + (4.0 + f) * g.ch as f32) as i32;
+        let (rx, _) = g.cell_center(4, 10);
+        let (gx, _) = g.cell_center(4, 11);
+        let (bx, _) = g.cell_center(4, 12);
+
+        assert_eq!(probe.at(4, 10, g.rows), Some(true), "the rule cell has ink");
+        assert_eq!(
+            probe.sky_at(4, 10, g.rows),
+            Some(false),
+            "the rule's sky is clear"
+        );
+        assert_eq!(
+            probe.at_px(rx as i32, y_at(0.50), g),
+            Some(true),
+            "the stroke"
+        );
+        assert_eq!(
+            probe.at_px(rx as i32, y_at(0.10), g),
+            Some(false),
+            "above the stroke"
+        );
+        assert_eq!(
+            probe.at_px(rx as i32, y_at(0.80), g),
+            Some(false),
+            "the sky band"
+        );
+
+        assert_eq!(probe.at(4, 11, g.rows), Some(true));
+        assert_eq!(
+            probe.sky_at(4, 11, g.rows),
+            Some(true),
+            "a glyph darkens the sky"
+        );
+        for f in [0.10, 0.50, 0.80] {
+            assert_eq!(
+                probe.at_px(gx as i32, y_at(f), g),
+                Some(true),
+                "a glyph is ink at {f}"
+            );
+        }
+
+        assert_eq!(probe.at(4, 12, g.rows), Some(false));
+        assert_eq!(probe.sky_at(4, 12, g.rows), Some(false));
+        assert_eq!(probe.at_px(bx as i32, y_at(0.50), g), Some(false));
+
+        assert_eq!(probe.at(3, 10, g.rows), None, "an unprobed row is unknown");
+        assert_eq!(probe.sky_at(3, 10, g.rows), None);
+        assert_eq!(probe.at_px(rx as i32, y_at(-0.50), g), None);
+
+        // The bool view is the class view with no rules in it.
+        let mut bools = GlyphProbe::new();
+        let mut occupied = [false; 120];
+        occupied[11] = true;
+        bools.probe_row(4, &occupied);
+        for col in [10u16, 11, 12] {
+            assert_eq!(bools.at(4, col, g.rows), Some(col == 11));
+            assert_eq!(bools.sky_at(4, col, g.rows), Some(col == 11));
+        }
+        // Re-probing a row as bools forgets its rules (the slot is rebuilt).
+        probe.probe_row(4, &occupied);
+        assert_eq!(probe.at(4, 10, g.rows), Some(false));
+        assert_eq!(probe.at_px(rx as i32, y_at(0.50), g), Some(false));
+    }
+
+    /// The rule class is exactly the LIGHT horizontal members of the Box
+    /// Drawing block; a vertical arm, a heavy or double stroke, a block
+    /// element, a dash or an underscore is a glyph, a space is a blank, and
+    /// a wide continuation is a glyph (its lead is content).
+    #[test]
+    fn cell_ink_classifies_the_light_horizontal_rules_and_nothing_else() {
+        for ch in ['─', '┄', '┈', '╌', '╴', '╶'] {
+            assert_eq!(cell_ink(ch), CellInk::Rule, "{ch:?} (U+{:04X})", ch as u32);
+        }
+        for ch in [
+            '━', '┅', '┉', '╍', '╸', '╺', '╼', '╾', '═', '│', '┃', '┼', '╭', '╮', '▁', '▔', '█',
+            '-', '_', '—', '=', '~', 'a', 'A', '0', '\0', '\u{2588}',
+        ] {
+            assert_eq!(cell_ink(ch), CellInk::Glyph, "{ch:?} (U+{:04X})", ch as u32);
+        }
+        assert_eq!(cell_ink(' '), CellInk::Blank);
     }
 
     /// **L4 / D16 — NO MARK IS EVER DRAWN OVER A PROBED GLYPH** (§5.4, §20.1).
@@ -5541,8 +7580,12 @@ mod tests {
         assert_eq!(horizon, 1540, "the swoosh horizon is §4's 1.54 s");
         type_until(&mut sky, horizon);
         let sc = frame_at(&mut sky, at(horizon + 1), &c);
+        // The STARS are gone; the aurora the same keys laid is the ribbon's
+        // own light and is still under a hand that typed 46 ms ago — it
+        // leaves with the ribbon (`the_aurora_leaves_with_the_ribbon`), not
+        // with the grain.
         assert!(
-            sc.out.is_empty() && sky.at_rest(),
+            sc.out.is_empty() && sky.live() == 0,
             "a field star outlived the exit swoosh"
         );
 
@@ -5704,12 +7747,17 @@ mod tests {
     /// The bound is the arithmetic's, not the prose's: `12 · (½ · 1.54)` of
     /// field plus 5.5 of strike is 14.7 expected, and the field's 1-in-2 over
     /// an 18-cell window is a binomial with σ ≈ 2 — this run's own hash
-    /// realization sits at 13-14 (min 10, max 16). So the steady mean must
-    /// lie in `12..=40` (12.1 is the same arithmetic on a cold spine with no
-    /// second grain — the floor a 12 cps sky may never fall through), no
-    /// frame is under eight or over the cap, and a typical frame's quads and
-    /// haloed stars are §18's order (~120 / 6), inside the budgets so
-    /// nothing is thinned. The judge's 5 sat at a third of the floor.
+    /// realization sat at 13 (min 10, max 16), 104 quads, 5 haloed stars.
+    /// **With the hot field deal (2026-09-08, `FIELD_DEAL_IN_HOT`: every
+    /// cell at `disp ≥ 0.7`) the same run measures 22 live (min 16, max
+    /// 26), 179 quads, 9 haloed stars** — the owner's denser sky, still
+    /// under the cap and both budgets. So the steady mean must lie in
+    /// `12..=40` (12.1 is the same arithmetic on a cold spine with no second
+    /// grain — the floor a 12 cps sky may never fall through), no frame is
+    /// under eight or over the cap, and a typical frame's quads and haloed
+    /// STARS (the aurora's veils are ellipses, budgeted apart) are inside
+    /// the budgets so nothing is thinned. The judge's 5 sat at a third of
+    /// the floor.
     #[test]
     fn a_twelve_cps_sky_holds_about_twenty_stars() {
         let c = cfg(true);
@@ -5732,8 +7780,14 @@ mod tests {
             if k >= 24 {
                 live.push(n);
                 quads.push(sc.out.len());
-                let stars: std::collections::BTreeSet<(u16, u16)> =
-                    sc.halos.iter().map(|h| (h.cx, h.cy)).collect();
+                // Star halos are ROUND; the aurora's veils are the wide
+                // ellipses (`rx != ry`) and are budgeted on their own.
+                let stars: std::collections::BTreeSet<(u16, u16)> = sc
+                    .halos
+                    .iter()
+                    .filter(|h| h.rx == h.ry)
+                    .map(|h| (h.cx, h.cy))
+                    .collect();
                 haloed.push(stars.len());
             }
         }
@@ -5749,6 +7803,7 @@ mod tests {
         );
         assert!(lo >= 8, "a 12 cps sky thinned to {lo} stars");
         let (q, h) = (mean(&quads), mean(&haloed));
+        eprintln!("12 cps sky: {m} live (min {lo}, max {hi}), {q} quads, {h} haloed stars");
         assert!(
             (60..=STARDUST_QUAD_BUDGET).contains(&q) && (3..=STARDUST_HALO_BUDGET).contains(&h),
             "a typical 12 cps frame is {q} quads / {h} haloed, not §18's ~120 / 6"
@@ -6284,12 +8339,14 @@ mod tests {
         assert!(s.twinkle(t0) < 0.58, "the fixture is not at its trough");
         first.sow(s);
         let hold_ms = HOLD_M2_TRANSIENT_MS as u64;
-        // The white body's extent on the centre row, and the centre itself.
+        // The body's extent on the centre row (the body is `M2_BODY_TINT`
+        // of the way to the tint — its own colour, not the stubs'), and the
+        // centre itself.
+        let body = mix_rgb(TINT_WHITE_RGB, tint, M2_BODY_TINT);
         let read = |sc: &Scratch| -> (u32, i32) {
             let (mut lo, mut hi) = (i32::MAX, i32::MIN);
             for q in sc.out.iter().filter(|q| {
-                i32::from(q.y) == 100
-                    && q.color == premul_rgb(TINT_WHITE_RGB, (q.color & 0xff) as u8)
+                i32::from(q.y) == 100 && q.color == premul_rgb(body, lum(q.color) as u8)
             }) {
                 lo = lo.min(i32::from(q.x));
                 hi = hi.max(i32::from(q.x) + i32::from(q.w));
@@ -6411,10 +8468,11 @@ mod tests {
         let (ox, oy) = geom().cell_center(5, 10);
         let origin = (ox.round() as i32, oy.round() as i32);
         let t_full = t0 + Duration::from_millis(ERASE_THROW_MS as u64);
+        let scale = px_scale(geom().ch as f32);
         for s in sky.live_iter() {
             let d = dist(s.pos(t_full, false), origin);
             assert!(
-                (ERASE_REACH_MIN_PX - 1.0..=ERASE_REACH_MAX_PX + 1.0).contains(&d),
+                (ERASE_REACH_MIN_PX * scale - 1.0..=ERASE_REACH_MAX_PX * scale + 1.0).contains(&d),
                 "an erase star sits {d} px out at 80 ms"
             );
             assert_eq!(
@@ -6612,7 +8670,7 @@ mod tests {
         let t0 = Instant::now();
         let mut sky = sky();
         let mut s = star(StarClass::M2, StarLane::Strike, t0, TINT_WHITE_RGB);
-        s.v0 = (0.0, SKY_LIFT_PX_PER_S / 1000.0);
+        s.v0 = (0.0, sky_lift_px_per_s(geom().ch as f32) / 1000.0);
         sky.sow(s);
         let life_ms = (StarClass::M2.life_s(StarLane::Strike) * 1000.0) as u64;
         let mut widths = std::collections::BTreeSet::new();
@@ -6731,5 +8789,1564 @@ mod tests {
         }
         let white = star(StarClass::M1, StarLane::Strike, t0, TINT_WHITE_RGB);
         assert!(white.next_glint_toggle_s(t0).is_none());
+    }
+
+    // -- the coloured sky and the aurora (owner, 2026-09-08) ----------------
+
+    /// The example renderer's dark ground, `(17, 19, 24)` — the default dark
+    /// theme the scanner reads.
+    const GROUND: u32 = 0x0011_1318;
+
+    /// The scanner's own floor for "this pixel is COLOUR": a channel spread
+    /// of at least this…
+    const SCAN_SPREAD_FLOOR: u32 = 40;
+
+    /// …at a max channel of at least this.
+    const SCAN_LIT_FLOOR: u32 = 60;
+
+    /// Composite one frame's `out` quads and halos over the dark ground on a
+    /// `w × h` canvas whose top-left is `(x0, y0)` — the CPU reference's own
+    /// arithmetic (`add_sat` for additive quads and `Add` halos through the
+    /// shared `halo_row_ny` / `halo_weight` falloff), so a test measures the
+    /// pixel the eye gets.
+    fn composite(sc: &Scratch, x0: i32, y0: i32, w: usize, h: usize) -> Vec<u32> {
+        composite_over(sc, GROUND, x0, y0, w, h)
+    }
+
+    /// The shipped dark theme's ground, `#1A1B26` — the one `cursor_glow`'s
+    /// whole-frame gates composite over, and the one the A-type hero's
+    /// `#ACABB9` was measured on.
+    const SHIPPED_GROUND: u32 = 0x001A_1B26;
+
+    /// [`composite`] over a chosen ground.
+    fn composite_over(sc: &Scratch, ground: u32, x0: i32, y0: i32, w: usize, h: usize) -> Vec<u32> {
+        let mut canvas = vec![ground; w * h];
+        for q in &sc.out {
+            for y in i32::from(q.y)..i32::from(q.y) + i32::from(q.h) {
+                for x in i32::from(q.x)..i32::from(q.x) + i32::from(q.w) {
+                    let (cx, cy) = (x - x0, y - y0);
+                    if cx < 0 || cy < 0 || cx as usize >= w || cy as usize >= h {
+                        continue;
+                    }
+                    let p = &mut canvas[cy as usize * w + cx as usize];
+                    *p = add_sat(*p, q.color);
+                }
+            }
+        }
+        for a in &sc.halos {
+            assert_eq!(a.mode, HaloMode::Add, "a dark frame emitted an Over halo");
+            let (rx2, ry2) = (
+                i32::from(a.rx) * i32::from(a.rx),
+                i32::from(a.ry) * i32::from(a.ry),
+            );
+            for y in i32::from(a.y)..i32::from(a.y) + i32::from(a.h) {
+                let ny = halo_row_ny(y - i32::from(a.cy), ry2);
+                if ny >= 256 {
+                    continue;
+                }
+                for x in i32::from(a.x)..i32::from(a.x) + i32::from(a.w) {
+                    let wt = halo_weight(x - i32::from(a.cx), ny, rx2).min(255);
+                    let (cx, cy) = (x - x0, y - y0);
+                    if wt == 0 || cx < 0 || cy < 0 || cx as usize >= w || cy as usize >= h {
+                        continue;
+                    }
+                    let p = &mut canvas[cy as usize * w + cx as usize];
+                    *p = add_sat(*p, premul_rgb(a.color, wt as u8));
+                }
+            }
+        }
+        canvas
+    }
+
+    /// The aurora's halos on a dark frame — the wide ellipses; a star's halo
+    /// is round.
+    fn veils(sc: &Scratch) -> Vec<RainHalo> {
+        sc.halos.iter().filter(|h| h.rx != h.ry).copied().collect()
+    }
+
+    /// **STARDUST IS COLOURED ON THE GLASS, NOT WHITE WITH A TINT** (owner,
+    /// 2026-09-08: "I feel like you are diminishing the specialness and
+    /// emphasis of this theme? why?").
+    ///
+    /// Forty keys at 12 cps on the engine's own spine, the field walking
+    /// the whole arc; from key 20 every frame is composited over the dark
+    /// ground and read by the scanner's rule — a STAR pixel is one at a max
+    /// channel ≥ 60, and it is COLOUR if its channel spread is ≥ 40. At
+    /// least 60 % of the star pixels are colour. Under the 14 % halo cap
+    /// with white cores the sky measured **30 %** (457 of 1 486 star pixels
+    /// — this test, run before the change); the coloured sky measures the
+    /// share this test prints.
+    #[test]
+    fn stardust_is_coloured_on_the_glass_not_white_with_a_tint() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let (mut lit, mut coloured) = (0usize, 0usize);
+        for k in 0..40u16 {
+            let at = key_at(t0, k);
+            let mut cx = ctx(at, &c, (5, 10 + k));
+            cx.disp = disp_at_12cps(k);
+            cx.birth_disp = cx.disp;
+            cx.caret_t = f32::from(k) / 40.0;
+            sky.budget.refill(at);
+            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+            let mut sc = Scratch::default();
+            sky.emit(&cx, &mut sc.frame());
+            if k < 20 {
+                continue;
+            }
+            // Rows 3-5 of the fixture: the sky band, the line, and below.
+            let canvas = composite(&sc, 0, 94, 1080, 54);
+            for &p in &canvas {
+                if lum(p) >= SCAN_LIT_FLOOR {
+                    lit += 1;
+                    coloured += usize::from(chroma(p) >= SCAN_SPREAD_FLOOR);
+                }
+            }
+        }
+        eprintln!(
+            "scanner: {coloured} of {lit} star pixels are colour ({}%)",
+            coloured * 100 / lit.max(1)
+        );
+        assert!(lit >= 200, "only {lit} star pixels over twenty frames");
+        assert!(
+            coloured * 100 >= lit * 60,
+            "only {coloured} of {lit} star pixels ({}%) are colour by the scanner's rule — \
+             the sky reads as white dust with a tint",
+            coloured * 100 / lit.max(1)
+        );
+    }
+
+    /// **NO STAR OUTSHINES THE CARET'S FLOOR SHARE ON THE SHIPPED GROUND**
+    /// (`cursor_glow` §8 d, *"you must always be able to find your
+    /// cursor"*; [`STAR_LIGHT_CEIL`]).
+    ///
+    /// Every class in both lanes, every tint the deal can hand out — the
+    /// seven stops, gold and the A-type white — at the default intensity
+    /// and at full, one star at a time over `#1A1B26`: its whole life
+    /// composited with its halo in the renderers' bytes and read in
+    /// relative luminance, and no pixel of it reaches past `72/255`, the
+    /// share of the caret's `80` floor the field is allowed. Non-vacuous:
+    /// the white hero at full intensity stands within one level of the
+    /// ceiling, so the law is measured binding — before the pricing that
+    /// star's bare `143` body composited to `Y = 100` on this ground, and
+    /// with its halo the 18 ms burst's A-type hero to `106`.
+    ///
+    /// One star at a time on purpose: what the deal stacks on ONE cell —
+    /// a strike star, its second grain and a hot-hand field star can land
+    /// within two pixels of each other — is priced star by star over the
+    /// sky laid before it ([`sky_ground`]) and is not held here; see the
+    /// note on [`sky_ground`].
+    #[test]
+    fn no_star_outshines_the_caret_s_floor_share_on_the_shipped_ground() {
+        let t0 = Instant::now();
+        let ceil = STAR_LIGHT_CEIL * 255.0;
+        let tints: Vec<u32> = (0..SPECTRUM_STOPS)
+            .map(spectrum_stop)
+            .chain([TINT_GOLD_RGB, TINT_WHITE_RGB])
+            .collect();
+        let mut worst = (0.0f32, String::new());
+        let mut white_hero_at_full = 0.0f32;
+        for intensity in [0.7f32, 1.0] {
+            let mut c = cfg(true);
+            c.theme_bg = SHIPPED_GROUND;
+            c.intensity = intensity;
+            for (class, lane, _) in every_class() {
+                for &tint in &tints {
+                    let mut sky = sky();
+                    sky.sow(star(class, lane, t0, tint));
+                    let life_ms = (class.life_s(lane) * 1000.0) as u64;
+                    let mut peak = 0.0f32;
+                    for ms in (0..life_ms).step_by(5) {
+                        let sc = frame_at(&mut sky, t0 + Duration::from_millis(ms), &c);
+                        // A 60 px window on the star at (200, 100).
+                        for &p in &composite_over(&sc, SHIPPED_GROUND, 170, 70, 60, 60) {
+                            peak = peak.max(relative_luminance(p) * 255.0);
+                        }
+                    }
+                    if peak > worst.0 {
+                        worst = (
+                            peak,
+                            format!("{class:?}/{lane:?} {tint:#08x} at intensity {intensity}"),
+                        );
+                    }
+                    if class == StarClass::M1
+                        && lane == StarLane::Strike
+                        && tint == TINT_WHITE_RGB
+                        && intensity == 1.0
+                    {
+                        white_hero_at_full = peak;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "the brightest star pixel over the shipped ground: Y {:.1} of the ceiling {ceil:.1} — {}",
+            worst.0, worst.1
+        );
+        assert!(
+            worst.0 <= ceil,
+            "{} reached Y {:.1} over the caret law's {ceil:.1}",
+            worst.1,
+            worst.0
+        );
+        assert!(
+            white_hero_at_full >= ceil - 1.0,
+            "NON-VACUOUS: the white hero at full intensity stands at Y {white_hero_at_full:.1}, \
+             not against the ceiling {ceil:.1}"
+        );
+    }
+
+    /// **THE CLOSER DIMS A STAR THAT STACKS OVER THE CEILING AWAY FROM ITS
+    /// CENTRE, BY ONE FACTOR, AND LEAVES ONE THAT FITS ALONE**
+    /// ([`settle_under_ceiling`]).
+    ///
+    /// A synthetic star: a white centre lay under the ceiling and a
+    /// full-request yellow stub beside a yellow halo's ring — the pixel a
+    /// yellow hero's arm stacks — over the shipped ground. The centre is
+    /// lawful and the stub pixel is not; after the closer every watched
+    /// pixel is under the ceiling, the stub pixel stands within two levels
+    /// of it (the factor is the largest that fits, on the bytes), every own
+    /// lay carries the SAME factor to within the byte's rounding, the halo's
+    /// colour is still the pure stop, and a quad laid before the star is
+    /// not touched. A star that already fits is byte-identical afterwards.
+    #[test]
+    fn the_closer_dims_a_star_by_one_factor_until_its_arms_fit_and_leaves_one_that_fits() {
+        let g = geom();
+        let ceil = STAR_LIGHT_CEIL * 255.0;
+        let y = |p: u32| relative_luminance(p) * 255.0;
+        let yellow = spectrum_stop(2);
+        let mut sc = Scratch::default();
+        // An earlier star's quad, off to the side: the closer's slice starts
+        // after it.
+        push_fx_rect(&mut sc.out, g, 300, 100, 1, 1, 0x0030_3030);
+        let q0 = sc.out.len();
+        // A priced centre (white 40 under a 61 yellow halo is Y 52), and the
+        // arm's first pixel as the hero lays it: the taper's first span at
+        // `0.87 · 40`, the tint stub at the full 61, the halo's ring at 0.92.
+        push_fx_rect(
+            &mut sc.out,
+            g,
+            200,
+            100,
+            1,
+            1,
+            premul_rgb(TINT_WHITE_RGB, 40),
+        );
+        push_fx_rect(&mut sc.out, g, 203, 100, 2, 1, premul_rgb(yellow, 61));
+        push_fx_rect(
+            &mut sc.out,
+            g,
+            203,
+            100,
+            1,
+            1,
+            premul_rgb(TINT_WHITE_RGB, 35),
+        );
+        let h0 = sc.halos.len();
+        push_halo_quads(
+            &mut sc.halos,
+            g,
+            usize::MAX,
+            (200, 100),
+            (15, 15),
+            premul_rgb(yellow, 61),
+            HaloMode::Add,
+        );
+        // One piece per text row the 15 px halo spans.
+        assert!(sc.halos.len() > h0, "no halo was laid");
+        assert!(
+            sc.halos[h0..].iter().all(|h| h.color == sc.halos[h0].color),
+            "the pieces of one halo carry one colour"
+        );
+        let before: Vec<u32> = sc.out[q0..].iter().map(|q| q.color).collect();
+        let halo_before = sc.halos[h0].color;
+        let watch: [((i32, i32), u32); SETTLE_PIXELS] = [
+            ((200, 100), SHIPPED_GROUND),
+            ((203, 100), SHIPPED_GROUND),
+            ((197, 100), SHIPPED_GROUND),
+            ((200, 103), SHIPPED_GROUND),
+            ((200, 97), SHIPPED_GROUND),
+            ((201, 100), SHIPPED_GROUND),
+            ((199, 100), SHIPPED_GROUND),
+            ((200, 101), SHIPPED_GROUND),
+            ((200, 99), SHIPPED_GROUND),
+        ];
+        let at = |sc: &Scratch, p: (i32, i32)| {
+            let mut px = SHIPPED_GROUND;
+            for q in &sc.out[q0..] {
+                if quad_covers(q, p.0, p.1) {
+                    px = add_sat(px, q.color);
+                }
+            }
+            for h in &sc.halos[h0..] {
+                px = add_sat(px, halo_add_at(h, p.0, p.1));
+            }
+            px
+        };
+        assert!(
+            y(at(&sc, (200, 100))) <= ceil,
+            "the centre is lawful as laid"
+        );
+        assert!(
+            y(at(&sc, (203, 100))) > ceil,
+            "the stub pixel is over as laid"
+        );
+        {
+            let mut f = sc.frame();
+            settle_under_ceiling(&mut f, q0, h0, &watch);
+        }
+        for &(p, _) in &watch {
+            assert!(
+                y(at(&sc, p)) <= ceil,
+                "({}, {}) is at Y {:.1} after the closer",
+                p.0,
+                p.1,
+                y(at(&sc, p))
+            );
+        }
+        assert!(
+            y(at(&sc, (203, 100))) >= ceil - 2.0,
+            "the closer dimmed past the ceiling: the stub pixel is at Y {:.1}",
+            y(at(&sc, (203, 100)))
+        );
+        let k = lum(sc.halos[h0].color) as f32 / lum(halo_before) as f32;
+        assert!(k > 0.3 && k < 1.0, "the factor {k} is not a dimming");
+        for (q, &was) in sc.out[q0..].iter().zip(&before) {
+            for sh in [16, 8, 0] {
+                let (now, then) = (((q.color >> sh) & 0xff) as f32, ((was >> sh) & 0xff) as f32);
+                assert!(
+                    (now - then * k).abs() <= 1.0,
+                    "a lay carries {now} where the factor {k} says {}",
+                    then * k
+                );
+            }
+        }
+        assert!(chroma(sc.halos[h0].color) > 0, "the halo lost its colour");
+        for h in &sc.halos[h0..] {
+            assert_eq!(
+                premul_rgb(yellow, lum(h.color) as u8),
+                h.color,
+                "the halo is no longer the pure stop"
+            );
+        }
+        assert_eq!(sc.out[0].color, 0x0030_3030, "the earlier quad moved");
+
+        // A star that fits is left byte-identical.
+        let mut sc = Scratch::default();
+        push_fx_rect(
+            &mut sc.out,
+            g,
+            200,
+            100,
+            1,
+            1,
+            premul_rgb(TINT_WHITE_RGB, 40),
+        );
+        push_fx_rect(&mut sc.out, g, 203, 100, 2, 1, premul_rgb(yellow, 30));
+        push_halo_quads(
+            &mut sc.halos,
+            g,
+            usize::MAX,
+            (200, 100),
+            (15, 15),
+            premul_rgb(yellow, 20),
+            HaloMode::Add,
+        );
+        let (out, halos) = (sc.out.clone(), sc.halos.clone());
+        {
+            let mut f = sc.frame();
+            settle_under_ceiling(&mut f, 0, 0, &watch);
+        }
+        assert!(sc.out.iter().zip(&out).all(|(a, b)| a.color == b.color));
+        assert!(sc.halos.iter().zip(&halos).all(|(a, b)| a.color == b.color));
+    }
+
+    /// **THE CARET LAW SPENDS COLOUR FIRST AND WHITE LAST ON A STAR'S
+    /// CENTRE** ([`price_centre`]) — the numbers, so the derivation is
+    /// pinned and not merely described:
+    ///
+    /// * the A-type hero of the failing frame (`c = 61 · 0.7`, cov 43, halo
+    ///   asked 43) keeps its whole body and gets 16 levels of halo, landing
+    ///   at `Y 71.8` where it composited to `#ACABB9`, `Y 106`;
+    /// * over black at the published `143` the white hero keeps its centre
+    ///   to the byte and its halo has the one level the ceiling leaves;
+    /// * every one of the seven stops, at the full intensity over the
+    ///   shipped ground, keeps its halo's WHOLE request — 61, the pure stop
+    ///   — and a body the ceiling can carry beside it; the centre lands at
+    ///   or under `Y 72` on a max channel the grey at that `Y` (145) could
+    ///   never reach, which is what "saturation costs no luminance" means
+    ///   on the byte;
+    /// * a ground already over the ceiling leaves the request as it is.
+    #[test]
+    fn the_caret_law_spends_colour_first_and_white_last_on_a_star_s_centre() {
+        let y = |p: u32| relative_luminance(p) * 255.0;
+        let ceil = STAR_LIGHT_CEIL * 255.0;
+        let white = TINT_WHITE_RGB;
+        assert_eq!(fit_byte(255, |k| k <= 100), 100);
+        assert_eq!(fit_byte(50, |_| true), 50);
+        assert_eq!(fit_byte(50, |k| k == 0), 0);
+        assert_eq!(fit_byte(50, |_| false), 0);
+
+        let (cov, _, peak) =
+            price_centre(SHIPPED_GROUND, true, (white, 43), (white, 0), (white, 43));
+        assert_eq!((cov, peak), (43, 16), "the failing frame's A-type hero");
+        let centre = add_sat(
+            stacked_centre(SHIPPED_GROUND, white, 43),
+            premul_rgb(white, 16),
+        );
+        assert!(
+            y(centre) <= ceil && y(centre) > ceil - 1.0,
+            "the A-type centre lands at Y {:.1}, not just under {ceil:.1}",
+            y(centre)
+        );
+        let (cov, _, peak) = price_centre(0, true, (white, 61), (white, 0), (white, 61));
+        assert_eq!((cov, peak), (61, 1), "the white hero over black");
+        assert_eq!(lum(stacked_centre(0, white, 61)), 143);
+
+        let grey_at_ceiling = 145;
+        for i in 0..SPECTRUM_STOPS {
+            let tint = spectrum_stop(i);
+            let (cov, _, peak) =
+                price_centre(SHIPPED_GROUND, false, (white, 61), (tint, 0), (tint, 61));
+            assert_eq!(peak, 61, "stop {i} lost its halo's request");
+            let centre = stacked_centre(add_sat(SHIPPED_GROUND, premul_rgb(tint, 61)), white, cov);
+            eprintln!(
+                "stop {i} {tint:#08x}: body cov {cov} of 61, centre #{centre:06X} — max channel {}, Y {:.1}",
+                lum(centre),
+                y(centre)
+            );
+            assert!(
+                y(centre) <= ceil,
+                "stop {i}: centre Y {:.1} over {ceil:.1}",
+                y(centre)
+            );
+            assert!(
+                cov >= 20 && lum(centre) > grey_at_ceiling,
+                "stop {i}: body {cov}, max channel {} — the colour bought nothing",
+                lum(centre)
+            );
+        }
+        let bright = 0x00A0_A0A0;
+        assert!(!under_ceil(bright));
+        assert_eq!(
+            price_centre(
+                bright,
+                false,
+                (white, 61),
+                (spectrum_stop(0), 17),
+                (spectrum_stop(0), 61)
+            ),
+            (61, 17, 61),
+            "a ground over the ceiling leaves the request as it is"
+        );
+    }
+
+    /// **A STAR IS PRICED OVER THE SKY UNDER IT** ([`sky_ground`]): the
+    /// theme ground plus the halos already laid — at a veil's centre the
+    /// veil's whole colour, off its box nothing, and never an `Over` halo.
+    #[test]
+    fn a_star_is_priced_over_the_veils_and_halos_already_under_it() {
+        let veil = RainHalo {
+            row: 4,
+            x: 90,
+            y: 100,
+            w: 9,
+            h: 6,
+            color: 0x0020_0008,
+            cx: 94,
+            cy: 106,
+            rx: 18,
+            ry: 6,
+            mode: HaloMode::Add,
+        };
+        let over = RainHalo {
+            mode: HaloMode::Over,
+            ..veil
+        };
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[], &[], 94, 105),
+            SHIPPED_GROUND
+        );
+        // One row above the veil's bottom edge on its axis: `ny = 256/36 = 7`,
+        // `wt = (256 − 7)² >> 8 = 242`, `premul(#200008, 242) = #1E0008`.
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[], &[veil], 94, 105),
+            add_sat(SHIPPED_GROUND, 0x001E_0008)
+        );
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[], &[veil], 94, 99),
+            SHIPPED_GROUND,
+            "above the box"
+        );
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[], &[veil], 89, 105),
+            SHIPPED_GROUND,
+            "off the column"
+        );
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[], &[over], 94, 105),
+            SHIPPED_GROUND,
+            "an Over halo"
+        );
+        let stacked = sky_ground(SHIPPED_GROUND, &[], &[veil, veil], 94, 105);
+        assert!(lum(stacked) > lum(sky_ground(SHIPPED_GROUND, &[], &[veil], 94, 105)));
+        assert_eq!(
+            sky_ground(0xFF1A_1B26, &[], &[], 0, 0),
+            SHIPPED_GROUND,
+            "the top byte is not a colour"
+        );
+        let quad = GlowQuad {
+            row: 4,
+            x: 93,
+            y: 104,
+            w: 3,
+            h: 3,
+            color: 0x0010_2030,
+            alpha: 0,
+        };
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[quad], &[], 94, 105),
+            add_sat(SHIPPED_GROUND, 0x0010_2030),
+            "an earlier star's quad"
+        );
+        assert_eq!(
+            sky_ground(SHIPPED_GROUND, &[quad], &[], 96, 105),
+            SHIPPED_GROUND,
+            "off the quad"
+        );
+        assert_eq!(
+            sky_ground(
+                SHIPPED_GROUND,
+                &[GlowQuad { alpha: 255, ..quad }],
+                &[],
+                94,
+                105
+            ),
+            SHIPPED_GROUND,
+            "a source-over quad is not the sky's"
+        );
+    }
+
+    /// **THE AURORA RISES WITH MOMENTUM AND NEVER ENTERS A GLYPH ROW**
+    /// (owner, 2026-09-08: "make this rainbow theme truly magical and
+    /// special and dynamic and beautiful").
+    ///
+    /// Forty keys at 12 cps on the engine's own spine, red at the caret so
+    /// a veil's byte is its red channel. Cold (key 0, spine 0) lays no veil;
+    /// at one second (spine 0.51, "plain") the newest veil is 12-18; at the
+    /// last key (spine 1.0, "full") it is 38-40 and brighter than at one
+    /// second. Every veil on every frame lies wholly inside row 4 — the sky
+    /// above the line, never a pixel of row 5's own rows — inside its own
+    /// column, and never over a column whose row-4 cell the probe found
+    /// inked (cols 25-30 here). And the veil walks the spectrum: with the
+    /// field walking the arc, the last frame carries at least four hues.
+    #[test]
+    fn the_aurora_rises_with_momentum_and_never_enters_a_glyph_row() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let g = geom();
+        let run = |walk: bool| -> Vec<(u16, f32, Vec<RainHalo>)> {
+            let mut sky = Stardust::new();
+            let mut above = [false; 120];
+            above[25..=30].fill(true);
+            sky.probe_mut().probe_row(4, &above);
+            let mut frames = Vec::new();
+            for k in 0..40u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp_at_12cps(k);
+                cx.birth_disp = cx.disp;
+                cx.caret_t = if walk { f32::from(k) / 40.0 } else { 0.0 };
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let mut sc = Scratch::default();
+                sky.emit(&cx, &mut sc.frame());
+                frames.push((k, cx.disp, veils(&sc)));
+            }
+            frames
+        };
+        let row5_top = i32::from(g.origin_y) + 5 * g.ch as i32;
+        let inked =
+            (i32::from(g.origin_x) + 25 * g.cw as i32)..(i32::from(g.origin_x) + 31 * g.cw as i32);
+        let red = run(false);
+        assert!(red[0].2.is_empty(), "a cold key laid a veil");
+        let peak = |vs: &[RainHalo]| vs.iter().map(|h| lum(h.color)).max().unwrap_or(0);
+        let plain = peak(&red[12].2);
+        let full = peak(&red[39].2);
+        eprintln!(
+            "aurora: {plain} at spine {:.2}, {full} at spine {:.2}; {} veils on the last frame",
+            red[12].1,
+            red[39].1,
+            red[39].2.len()
+        );
+        assert!(
+            (12..=18).contains(&plain),
+            "at spine {} the veil is {plain}, not plain",
+            red[12].1
+        );
+        assert!(
+            (38..=40).contains(&full) && full > plain,
+            "at spine {} the veil is {full} (plain was {plain}), not full",
+            red[39].1
+        );
+        for (k, _, vs) in &red {
+            for h in vs {
+                let (y0, y1) = (i32::from(h.y), i32::from(h.y) + i32::from(h.h));
+                assert!(
+                    y1 <= row5_top && y0 >= row5_top - g.ch as i32 && h.row == 4,
+                    "key {k}: a veil at y {y0}..{y1} enters a glyph row (row 5 top {row5_top})"
+                );
+                assert!(
+                    i32::from(h.h) <= (AURORA_TALL_CH * g.ch as f32).ceil() as i32,
+                    "key {k}: a veil {} px tall is over 0.35 ch",
+                    h.h
+                );
+                let (x0, x1) = (i32::from(h.x), i32::from(h.x) + i32::from(h.w));
+                assert!(
+                    x1 - x0 <= g.cw as i32 && (x0 - i32::from(g.origin_x)) % g.cw as i32 == 0,
+                    "key {k}: a veil at x {x0}..{x1} is not one cell's own column"
+                );
+                assert!(
+                    x1 <= inked.start || x0 >= inked.end,
+                    "key {k}: a veil at x {x0}..{x1} sits over an inked sky cell"
+                );
+            }
+        }
+        let walked = run(true);
+        let hues: std::collections::BTreeSet<u32> = walked[39].2.iter().map(|h| h.color).collect();
+        assert!(
+            hues.len() >= 4,
+            "the veil wears {} colours over the walked field, not a rainbow",
+            hues.len()
+        );
+    }
+
+    /// **THE AURORA LEAVES WITH THE RIBBON** (owner, 2026-09-08). Twenty hot
+    /// keys, then the hand stops: the veil holds its 38-40 through the
+    /// field hold (300 ms), is at half by 550, and is gone — off glass, out
+    /// of the pool, no deadline — by 900 ms, before the ribbon's retract
+    /// moves (`RETRACT_START_S`). A Backspace puts the erased cells' veil
+    /// on the ribbon's own 240 ms retract while the cells before the caret
+    /// keep theirs.
+    #[test]
+    fn the_aurora_leaves_with_the_ribbon() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let g = geom();
+        let hot = |sky: &mut Stardust, keys: u16| -> Instant {
+            let mut last = t0;
+            for k in 0..keys {
+                last = key_at(t0, k);
+                let mut cx = ctx(last, &c, (5, 10 + k));
+                cx.disp = 1.0;
+                cx.birth_disp = 1.0;
+                cx.caret_t = 0.0;
+                sky.budget.refill(last);
+                sky.on_event(&typed(TypedClass::Glyph), last, &cx, &ribbon);
+            }
+            last
+        };
+        let peak_at = |sky: &mut Stardust, now: Instant| -> u32 {
+            let mut sc = Scratch::default();
+            sky.emit(&ctx(now, &c, (5, 29)), &mut sc.frame());
+            veils(&sc).iter().map(|h| lum(h.color)).max().unwrap_or(0)
+        };
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let last = hot(&mut sky, 20);
+        let at = |ms: u64| last + Duration::from_millis(ms);
+        let (p0, p300, p550, p900) = (
+            peak_at(&mut sky, at(0)),
+            peak_at(&mut sky, at(300)),
+            peak_at(&mut sky, at(550)),
+            peak_at(&mut sky, at(900)),
+        );
+        eprintln!(
+            "aurora after the last key: {p0} at +0, {p300} at +300, {p550} at +550, {p900} at +900 ms"
+        );
+        assert!((38..=40).contains(&p0), "the veil is {p0} on the last key");
+        assert!(
+            (38..=40).contains(&p300),
+            "the veil is {p300} at the end of the hold"
+        );
+        assert!(
+            (15..=25).contains(&p550),
+            "the veil is {p550} at 550 ms, not about half"
+        );
+        assert_eq!(p900, 0, "the veil outlived the ribbon's grace");
+        assert!(
+            (RETRACT_START_S * 1000.0) as u64 >= 900,
+            "the fixture's 900 ms is not before the retract"
+        );
+        assert!(sky.at_rest(), "the veil is still in the pool");
+        assert!(sky.next_change_deadline(at(900)).is_none());
+
+        // -- the erase arm --------------------------------------------------
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let last = hot(&mut sky, 10);
+        let erase = last + Duration::from_millis(20);
+        sky.on_event(&Event::Erase, erase, &ctx(erase, &c, (5, 19)), &ribbon);
+        let mut sc = Scratch::default();
+        let done = erase + Duration::from_millis(240);
+        sky.emit(&ctx(done, &c, (5, 19)), &mut sc.frame());
+        let col_of = |h: &RainHalo| (i32::from(h.x) - i32::from(g.origin_x)) / g.cw as i32;
+        let cols: std::collections::BTreeSet<i32> = veils(&sc).iter().map(col_of).collect();
+        assert!(
+            !cols.contains(&19),
+            "the erased cell's veil survived the ribbon's retract: {cols:?}"
+        );
+        assert!(
+            cols.contains(&10),
+            "a cell before the caret lost its veil to the Backspace: {cols:?}"
+        );
+    }
+
+    /// **A HOT HAND DEALS EVERY CELL A FIELD STAR** ([`FIELD_DEAL_IN_HOT`],
+    /// owner 2026-09-08: "dynamic"). Sixty keys on a probed-blank sky at a
+    /// fixed spine: cold (0.4) the births per key are the strike deal plus
+    /// half a field star, `1.33`; hot (0.8) the second grain and a field star
+    /// on every cell, `2.83` — measured as stars born on the key's own edge.
+    #[test]
+    fn a_hot_hand_deals_every_cell_a_field_star() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        // Births per key, and the share of the last twenty laid cells that
+        // carry a live FIELD-lane star (dealt or adopted) on the last key.
+        let census = |disp: f32| -> (f32, f32, usize) {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let mut born = 0usize;
+            for k in 0..60u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp;
+                cx.birth_disp = disp;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                born += sky.live_iter().filter(|s| s.born == at).count();
+            }
+            let field: std::collections::BTreeSet<i32> = sky
+                .live_iter()
+                .filter(|s| s.lane == StarLane::Field)
+                .map(col_of)
+                .collect();
+            // The last SIXTEEN laid cells — 1.33 s at 12 cps, inside the
+            // 1.54 s field horizon (`FIELD_LIFE_S`) an adopted star's own
+            // birth still runs from.
+            let held = (53..69).filter(|col| field.contains(col)).count();
+            (born as f32 / 60.0, held as f32 / 16.0, sky.live())
+        };
+        let (cold, hot) = (census(0.4), census(0.8));
+        eprintln!(
+            "births per key: cold {:.2}, hot {:.2}; field-held cells of the last sixteen: cold {:.2}, hot {:.2}; live: cold {}, hot {}",
+            cold.0, hot.0, cold.1, hot.1, cold.2, hot.2
+        );
+        assert!(
+            (0.8..=1.0).contains(&cold.0),
+            "a cold hand bears {} stars per key, not about 0.92",
+            cold.0
+        );
+        assert!(
+            (0.95..=1.05).contains(&hot.0),
+            "a hot hand bears {} stars per key, not one per cell",
+            hot.0
+        );
+        assert!(
+            hot.1 >= 0.999,
+            "a hot hand left {} of the last sixteen cells without a field star",
+            1.0 - hot.1
+        );
+        assert!(
+            cold.1 <= 0.75 && hot.1 > cold.1 + 0.2,
+            "momentum bought no density: field-held {} → {}",
+            cold.1,
+            hot.1
+        );
+    }
+
+    /// **ONE SKY STAR PER CELL, AND NO PILE OUTSHINES THE CARET**
+    /// ([`STRIKE_REACH_CELLS`], [`Stardust::sky_star_live`],
+    /// [`Stardust::adopt_field`]).
+    ///
+    /// Forty keys at 12 cps on the engine's own spine over the shipped
+    /// ground, the glass composited in the renderers' bytes on every key's
+    /// echo frame. No two live sky stars share a cell — and no pixel of the
+    /// sky rows reaches past the caret law's `72/255`. The bold round left
+    /// the hot deal stacking a strike star, a field star and the previous
+    /// key's leading-edge grain within a pixel or two on one cell, each
+    /// priced only over the sky laid before it: this test read Y 99.6–101.7
+    /// on 8 of the 40 frames there (the FAIL pasted at
+    /// [`STRIKE_REACH_CELLS`]).
+    #[test]
+    fn one_sky_star_per_cell_and_no_pile_outshines_the_caret() {
+        let mut c = cfg(true);
+        c.theme_bg = SHIPPED_GROUND;
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let ceil = STAR_LIGHT_CEIL * 255.0;
+        let (mut worst, mut over) = (0.0f32, 0usize);
+        let mut piles = Vec::new();
+        for k in 0..40u16 {
+            let at = key_at(t0, k);
+            let mut cx = ctx(at, &c, (5, 10 + k));
+            cx.disp = disp_at_12cps(k);
+            cx.birth_disp = cx.disp;
+            cx.caret_t = f32::from(k) / 40.0;
+            sky.budget.refill(at);
+            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+            let mut sc = Scratch::default();
+            sky.emit(&cx, &mut sc.frame());
+            let mut cells = std::collections::BTreeMap::new();
+            for s in sky.live_iter().filter(|s| s.lane.is_sky()) {
+                *cells.entry(col_of(s)).or_insert(0usize) += 1;
+            }
+            piles.extend(
+                cells
+                    .iter()
+                    .filter(|&(_, &n)| n > 1)
+                    .map(|(&col, &n)| (k, col, n)),
+            );
+            // Rows 3-5 of the fixture: the sky band, the line, and below.
+            let peak = composite_over(&sc, SHIPPED_GROUND, 0, 94, 1080, 54)
+                .iter()
+                .map(|&p| relative_luminance(p) * 255.0)
+                .fold(0.0, f32::max);
+            over += usize::from(peak > ceil);
+            worst = worst.max(peak);
+        }
+        eprintln!(
+            "pile census: {over} of 40 frames over the ceiling {ceil:.1}, worst Y {worst:.1}; piles (key, col, stars): {piles:?}"
+        );
+        assert!(
+            piles.is_empty(),
+            "a cell carries more than one sky star: {piles:?}"
+        );
+        assert!(
+            over == 0,
+            "{over} of 40 frames reach past the caret law's {ceil:.1} — worst Y {worst:.1}"
+        );
+    }
+
+    /// **THE SKY AT 2× IS THE SKY AT 1× TWICE THE SIZE** ([`CELL_1X_CH`],
+    /// [`px_scale`]). The owner runs a retina cell (15×28 device px); the
+    /// stardust's pixel sizes were ruled at the 1× cell (7×14) and spent as
+    /// literal device px, so on his screen the sky was a quarter of the
+    /// intended AREA with stars a quarter of the intended size.
+    ///
+    /// The 12 cps fixture (forty keys on the engine's own spine) at 7×14
+    /// and at 15×28, its last twenty echo frames composited over the dark
+    /// ground: the STAR-PIXEL AREA the halos light (pixels at the scanner's
+    /// lit floor) is four times larger at 2× to within the bound — the whole
+    /// lit area 3.3×, short of four by the family's 1 px hairlines, which
+    /// double in length and not in width — every star halo's radius is
+    /// twice its 1× twin's, and the aurora's veil box is twice as
+    /// tall and as wide as the cell (`15/7` across — the owner's cell is not
+    /// exactly twice as wide). Before: area 1.87×, halo radii 1.41× (the
+    /// clocked integer arm, and the m2's 6 px floor at both cells), the veil
+    /// already 2.14×2.00 — measured on this fixture.
+    #[test]
+    fn the_sky_at_two_x_is_the_sky_at_one_x_twice_the_size() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        struct Sky {
+            lit: usize,
+            lit_halo: usize,
+            halo_r: f32,
+            veil_rx: f32,
+            veil_ry: f32,
+        }
+        let measure = |g: Geom| -> Sky {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let (mut lit, mut lit_halo) = (0usize, 0usize);
+            let (mut halo_r, mut veil_rx, mut veil_ry) = (Vec::new(), Vec::new(), Vec::new());
+            for k in 0..40u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx_in(g, at, &c, (5, 10 + k));
+                cx.disp = disp_at_12cps(k);
+                cx.birth_disp = cx.disp;
+                cx.caret_t = f32::from(k) / 40.0;
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                let mut sc = Scratch::default();
+                sky.emit(&cx, &mut sc.frame());
+                if k < 20 {
+                    continue;
+                }
+                let y0 = i32::from(g.origin_y) + 3 * g.ch as i32;
+                let count = |sc: &Scratch| {
+                    composite(sc, 0, y0, g.cols * g.cw, 3 * g.ch)
+                        .iter()
+                        .filter(|&&p| lum(p) >= SCAN_LIT_FLOOR)
+                        .count()
+                };
+                lit += count(&sc);
+                // The halos alone — the sky's AREA, apart from the hairlines.
+                let halos_only = Scratch {
+                    halos: sc.halos.clone(),
+                    ..Scratch::default()
+                };
+                lit_halo += count(&halos_only);
+                for h in &sc.halos {
+                    if h.rx == h.ry {
+                        halo_r.push(f32::from(h.rx));
+                    } else {
+                        veil_rx.push(f32::from(h.rx));
+                        veil_ry.push(f32::from(h.ry));
+                    }
+                }
+            }
+            let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+            assert!(
+                !halo_r.is_empty() && !veil_rx.is_empty(),
+                "no halos at {}x{}",
+                g.cw,
+                g.ch
+            );
+            Sky {
+                lit,
+                lit_halo,
+                halo_r: mean(&halo_r),
+                veil_rx: mean(&veil_rx),
+                veil_ry: mean(&veil_ry),
+            }
+        };
+        let one = measure(geom_cell(7, 14));
+        let two = measure(geom_cell(15, 28));
+        let area = two.lit as f32 / one.lit.max(1) as f32;
+        let area_halo = two.lit_halo as f32 / one.lit_halo.max(1) as f32;
+        let halo = two.halo_r / one.halo_r;
+        let (vx, vy) = (two.veil_rx / one.veil_rx, two.veil_ry / one.veil_ry);
+        eprintln!(
+            "1x: {} star px ({} halo-lit), halo r {:.2}, veil {:.1}x{:.1}; 2x: {} star px ({} halo-lit), halo r {:.2}, veil {:.1}x{:.1}; ratios: area {area:.2} (halos alone {area_halo:.2}), halo {halo:.2}, veil {vx:.2}x{vy:.2}",
+            one.lit,
+            one.lit_halo,
+            one.halo_r,
+            one.veil_rx,
+            one.veil_ry,
+            two.lit,
+            two.lit_halo,
+            two.halo_r,
+            two.veil_rx,
+            two.veil_ry
+        );
+        // The halos' area — the sky's, apart from the hairlines — is four
+        // times; the whole lit area falls short of four by exactly the
+        // needles, stubs and grain cores the family keeps ONE pixel wide at
+        // every cell (`STAR_WAIST`, `star_waist_px`: a 1 px hairline until
+        // the arm reaches 8 px), which double in length and not in width.
+        assert!(
+            (3.4..=4.6).contains(&area_halo),
+            "the 2x sky's halos light {area_halo:.2}x the pixels of the 1x sky's, not about four"
+        );
+        assert!(
+            area >= 3.2,
+            "the 2x sky has {area:.2}x the star pixels of the 1x sky — less than the hairlines alone can explain"
+        );
+        assert!(
+            (1.8..=2.2).contains(&halo),
+            "the 2x halos are {halo:.2}x the 1x radii, not twice"
+        );
+        assert!(
+            (1.8..=2.2).contains(&vy) && (vx - 15.0 / 7.0).abs() <= 0.2,
+            "the 2x veil box is {vx:.2}x wide and {vy:.2}x tall, not the cell's own 15/7 x 2"
+        );
+    }
+
+    // -- 1d. the slipstream ---------------------------------------------------
+
+    /// A hand at `cps` on the owner's retina cell (15×28): `keys` typed
+    /// glyphs from column `col0` on row 5, the sky row (4) probed blank
+    /// past its first `ink_to` columns, the spine held HOT (0.9) — on
+    /// purpose: §23 measured a sustained 2 cps hand at a `disp` of 0.97, so
+    /// the birth gate is not what makes a stroll stand still, and the
+    /// fixture must not let it stand in for the cadence. Returns the sky
+    /// and the last key's instant.
+    fn stream_sky(
+        cps: f32,
+        keys: u16,
+        col0: u16,
+        ink_to: usize,
+        c: &Config,
+        t0: Instant,
+    ) -> (Stardust, Instant) {
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        let mut occupied = [false; 120];
+        for slot in occupied.iter_mut().take(ink_to) {
+            *slot = true;
+        }
+        sky.probe_mut().probe_row(4, &occupied);
+        let mut last = t0;
+        for k in 0..keys {
+            last = t0 + Duration::from_secs_f32(f32::from(k) / cps);
+            let mut cx = ctx_in(g, last, c, (5, col0 + k));
+            cx.disp = 0.9;
+            cx.birth_disp = 0.9;
+            sky.budget.refill(last);
+            sky.on_event(&typed(TypedClass::Glyph), last, &cx, &ribbon);
+        }
+        (sky, last)
+    }
+
+    /// **1d — STARS BORN AT SPEED STREAM BACKWARDS AT THE HAND'S OWN
+    /// CADENCE** (T4). Twenty-four keys at 8, 12 and 2 cps on the owner's
+    /// cell, the spine hot at every cadence. Every sky star the last key
+    /// bore is read at its birth and 200 ms on: at 8 and 12 cps its
+    /// backward travel, as px/s over the window, is within 10 % of the
+    /// priced curve's (`0.35·cw/IOI` at birth — 42 and 63 px/s — decaying
+    /// on τ 300); at 2 cps it is exactly zero, by the cadence and not by
+    /// the gate. Fails before: every star measured 0 px/s against 30.7 and
+    /// 46.0.
+    #[test]
+    fn stars_born_at_speed_stream_backwards_at_the_hand_s_own_cadence() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let window_ms = 200.0f32;
+        let window = Duration::from_secs_f32(window_ms / 1000.0);
+        for (cps, priced_v0) in [(8.0f32, 42.0f32), (12.0, 63.0), (2.0, 0.0)] {
+            let v0 = stream_px_per_s(g.cw as f32, 1000.0 / cps);
+            assert!(
+                (v0 - priced_v0).abs() <= 0.01 * priced_v0.max(1.0),
+                "{cps} cps on the owner's cell prices {v0:.2} px/s, not {priced_v0}"
+            );
+            let (sky, last) = stream_sky(cps, 24, 30, 0, &c, t0);
+            let newborn: Vec<&Star> = sky
+                .live_iter()
+                .filter(|s| s.born == last && s.lane.is_sky())
+                .collect();
+            assert!(
+                !newborn.is_empty(),
+                "the last key at {cps} cps bore no sky star"
+            );
+            let priced_mean = stream_travel_px(v0) * stream_unit(window_ms) / (window_ms / 1000.0);
+            for s in &newborn {
+                let (x0, y0) = s.pos(last, false);
+                let (x1, _) = s.pos(last + window, false);
+                let back = x0 - x1;
+                let measured = back as f32 / (window_ms / 1000.0);
+                eprintln!(
+                    "{cps} cps: {:?} at ({x0}, {y0}) travels {back} px back in {window_ms} ms = {measured:.1} px/s (priced v0 {v0:.1} px/s, {window_ms} ms mean {priced_mean:.1})",
+                    s.class
+                );
+                if cps < 3.0 {
+                    assert_eq!(
+                        back, 0,
+                        "a 2 cps stroll streams {back} px in {window_ms} ms; a stroll stands still"
+                    );
+                } else {
+                    assert!(
+                        (measured - priced_mean).abs() <= 0.10 * priced_mean,
+                        "{cps} cps: {measured:.1} px/s measured against {priced_mean:.1} priced — not within 10 %"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **1d / L4 — A STREAMING STAR NEVER CROSSES INK OR THE PANE EDGE.**
+    /// (a) The sky row inked up to column 18 and a 12 cps hand typing from
+    /// column 18: every star's centre, swept 5 ms at a time through the
+    /// whole drift and beyond, stays over a cell the probe proved blank and
+    /// never left of column 18 — and at least one star DID stream, so the
+    /// clamp was a clamp and not an absence. (b) The hand typing from
+    /// column 0: a star born inside its own travel of the pane's first
+    /// column stops at the effects box's left edge. Fails before: nothing
+    /// streams, so the "streamed at all" clause is what fails.
+    #[test]
+    fn a_streaming_star_never_crosses_ink_or_the_pane_edge() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let g = geom_cell(15, 28);
+        let sweep = |sky: &Stardust, min_col: i32| -> (usize, usize) {
+            let (mut streamed, mut clamped) = (0usize, 0usize);
+            for s in sky.live_iter().filter(|s| s.lane.is_sky()) {
+                let (x0, _) = s.pos(s.born, false);
+                let travel = stream_travel_px(stream_px_per_s(g.cw as f32, 1000.0 / 12.0));
+                let mut x_end = x0;
+                for ms in (0..=(STREAM_END_MS as u64 + 200)).step_by(5) {
+                    let (x, y) = s.pos(s.born + Duration::from_millis(ms), false);
+                    assert_eq!(
+                        sky.probe().at_px(x, y, g),
+                        Some(false),
+                        "a star born at x {x0} is over ink or the unknown at ({x}, {y}) {ms} ms on"
+                    );
+                    assert!(
+                        px_col(x as f32, g) >= min_col,
+                        "a star born at x {x0} crossed to column {} at {ms} ms",
+                        px_col(x as f32, g)
+                    );
+                    assert!(
+                        x >= g.fx_left(),
+                        "a star born at x {x0} left the glass at x {x} ({ms} ms)"
+                    );
+                    x_end = x;
+                }
+                if x_end < x0 {
+                    streamed += 1;
+                }
+                // Would the unclamped travel have crossed the floor?
+                let floor = i32::from(g.origin_x) + min_col * g.cw as i32;
+                if (x0 as f32 - travel) < floor as f32 {
+                    clamped += 1;
+                    assert!(
+                        x_end >= floor,
+                        "a star born at x {x0} rests at {x_end}, past the floor {floor}"
+                    );
+                }
+            }
+            (streamed, clamped)
+        };
+        let (sky, _) = stream_sky(12.0, 8, 18, 18, &c, t0);
+        let (streamed, clamped) = sweep(&sky, 18);
+        eprintln!("ink at column 18: {streamed} stars streamed, {clamped} met the ink frontier");
+        assert!(
+            streamed > 0,
+            "no star streamed over the blank sky — nothing was clamped"
+        );
+        assert!(
+            clamped > 0,
+            "no star was born within its travel of the ink — the clamp was not exercised"
+        );
+        let (sky, _) = stream_sky(12.0, 8, 0, 0, &c, t0);
+        let (streamed, clamped) = sweep(&sky, 0);
+        eprintln!("the pane's first column: {streamed} stars streamed, {clamped} met the edge");
+        assert!(
+            streamed > 0,
+            "no star streamed from the pane's first columns"
+        );
+        assert!(
+            clamped > 0,
+            "no star was born within its travel of the pane's edge"
+        );
+    }
+
+    /// **1d — THE SKY IS AT REST ONE STAR-LIFE AFTER THE LAST KEY.** The
+    /// drift ends at [`STREAM_END_MS`], which is pinned here to the longest
+    /// sky class life (the strike m1's 460 ms, `H + 2.32·τ`). Twenty-four
+    /// keys at 12 cps, the spine hot; 100 ms after the last key the sky is
+    /// still streaming (some star moves between +100 and +200 ms), and from
+    /// one star-life on NO star's X moves again — read at +1 ms, +50, +200,
+    /// +1 s and +3 s past the rest — and no star offers a stream step to the
+    /// cadence fold. Fails before: nothing streams at +100 ms.
+    #[test]
+    fn the_sky_is_at_rest_one_star_life_after_the_last_key() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        // §5.6 publishes the m1's life as 460; `H + 2.32·τ` is 458.7.
+        let life_ms = StarClass::M1.life_s(StarLane::Strike) * 1000.0;
+        assert!(
+            (STREAM_END_MS - life_ms).abs() <= 1.5,
+            "the drift ends at {STREAM_END_MS} ms, not the longest sky life {life_ms:.1}"
+        );
+        let (sky, last) = stream_sky(12.0, 24, 30, 0, &c, t0);
+        let early = last + Duration::from_millis(100);
+        let later = last + Duration::from_millis(200);
+        let streaming = sky
+            .live_iter()
+            .filter(|s| s.pos(early, false).0 != s.pos(later, false).0)
+            .count();
+        assert!(
+            streaming > 0,
+            "nothing in the sky is streaming 100 ms after the last key"
+        );
+        let rest = last + Duration::from_secs_f32(STREAM_END_MS / 1000.0);
+        let mut travelled = Vec::new();
+        for s in sky.live_iter() {
+            let at_rest = s.pos(rest, false);
+            travelled.push(s.pos(s.born, false).0 - at_rest.0);
+            for ms in [1u64, 50, 200, 1_000, 3_000] {
+                let p = s.pos(rest + Duration::from_millis(ms), false);
+                assert_eq!(
+                    p.0, at_rest.0,
+                    "a star still moves {ms} ms after the sky should be at rest ({:?} → {:?})",
+                    at_rest, p
+                );
+            }
+            assert!(
+                s.next_stream_step_s(rest).is_none(),
+                "a star at rest still offers a stream step"
+            );
+        }
+        eprintln!(
+            "{streaming} stars streaming at +100 ms; at rest at +{STREAM_END_MS} ms, travelled {travelled:?} px"
+        );
+    }
+
+    /// **1d — THE STREAM STEP IS SOLVED, NOT POLLED** (§18's cadence law).
+    /// A star with a 14.8 px travel (12 cps on the owner's cell): from
+    /// every age on a 1 ms grid, the solved next step is where the integer
+    /// X actually changes — unchanged 1 ms before it, changed 1 ms after —
+    /// and every step is under the tail floor's reach of the previous one
+    /// or later, never a spin.
+    #[test]
+    fn the_stream_step_is_solved_not_polled() {
+        let t0 = Instant::now();
+        let mut s = star(StarClass::M2, StarLane::Strike, t0, TINT_WHITE_RGB);
+        s.stream = stream_travel_px(stream_px_per_s(15.0, 1000.0 / 12.0));
+        let mut steps = 0usize;
+        let mut age_ms = 0u64;
+        while age_ms < STREAM_END_MS as u64 + 100 {
+            let now = t0 + Duration::from_millis(age_ms);
+            let Some(dt) = s.next_stream_step_s(now) else {
+                break;
+            };
+            let at = now + Duration::from_secs_f32(dt);
+            let before = s.pos(at - Duration::from_millis(1), false).0;
+            let after = s.pos(at + Duration::from_millis(1), false).0;
+            assert!(
+                before != after,
+                "the solved step at +{dt:.4} s from {age_ms} ms moves nothing ({before} → {after})"
+            );
+            assert!(dt >= 0.0, "a negative step {dt} from {age_ms} ms");
+            steps += 1;
+            age_ms = (age_ms as f32 + dt * 1000.0).floor() as u64 + 2;
+        }
+        eprintln!("{steps} solved steps over a {:.1} px travel", s.stream);
+        assert!(
+            steps == s.stream.round() as usize,
+            "{steps} solved steps for a {:.1} px travel — one per pixel expected",
+            s.stream
+        );
+        let done = t0 + Duration::from_secs_f32(STREAM_END_MS / 1000.0);
+        assert!(
+            s.next_stream_step_s(done).is_none(),
+            "a step offered past the drift's end"
+        );
+        assert_eq!(
+            s.pos(done, false).0,
+            200 - s.stream.round() as i32,
+            "the star did not travel its whole priced distance"
+        );
+    }
+
+    /// `STREAM_SPENT` is the literal of `1 − e^(−STREAM_END_MS/STREAM_TAU_MS)`.
+    #[test]
+    fn the_stream_spent_share_is_the_exponential_s() {
+        let want = 1.0 - (-STREAM_END_MS / STREAM_TAU_MS).exp();
+        assert!(
+            (STREAM_SPENT - want).abs() < 1e-4,
+            "STREAM_SPENT {STREAM_SPENT} is not 1 − e^(−{STREAM_END_MS}/{STREAM_TAU_MS}) = {want:.5}"
+        );
+    }
+
+    // -- the mend's star (1e) ----------------------------------------------
+
+    /// One event on a HOT sky (`disp` 0.9 either way), with the frame the
+    /// engine's tick would emit on the same instant — so the cull is as
+    /// fresh here as it is there.
+    fn hot_event(
+        sky: &mut Stardust,
+        ribbon: &Ribbon,
+        world: (Geom, &Config),
+        ev: &Event,
+        at: Instant,
+        caret: (u16, u16),
+        mend: Option<Mend>,
+    ) {
+        let (g, c) = world;
+        let mut cx = ctx_in(g, at, c, caret);
+        cx.disp = 0.9;
+        cx.birth_disp = 0.9;
+        cx.mend = mend;
+        sky.budget.refill(at);
+        sky.on_event(ev, at, &cx, ribbon);
+        let mut sc = Scratch::default();
+        let mut f = sc.frame();
+        sky.emit(&cx, &mut f);
+    }
+
+    /// THE TYPO SCRIPT on the sky alone (§23's addendum "The mend"): eight
+    /// glyphs at 8 cps from column 4 of row 5 on the owner's cell, the sky
+    /// row probed blank, the spine held hot; `deletes` Backspaces one slot
+    /// after the last glyph and one slot apart; the fix `fix_after_ms` after
+    /// the last delete, carrying the mark the engine publishes on that tick
+    /// ([`Mend`]) when `mended` — else none, the tree before. Returns the
+    /// sky, the fix's instant, the erased cell, the sky star live over it
+    /// on the fix's own instant BEFORE the fix key — the light the
+    /// Backspace was retiring — as `(position, class)`, and the classes of
+    /// the sky stars live over the caret's cell then.
+    #[expect(clippy::type_complexity, reason = "a fixture's five readings")]
+    fn mend_sky(
+        typo: TypedClass,
+        deletes: u16,
+        fix_after_ms: u64,
+        mended: bool,
+        c: &Config,
+        t0: Instant,
+    ) -> (
+        Stardust,
+        Instant,
+        (u16, u16),
+        Option<((i32, i32), StarClass)>,
+        Vec<StarClass>,
+    ) {
+        const SLOT_MS: u64 = 125;
+        let g = geom_cell(15, 28);
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        let glyph = typed(TypedClass::Glyph);
+        let mut last = t0;
+        for k in 0..8u16 {
+            last = t0 + Duration::from_millis(SLOT_MS * u64::from(k));
+            let key = if k == 7 { typed(typo) } else { glyph };
+            hot_event(&mut sky, &ribbon, (g, c), &key, last, (5, 5 + k), None);
+        }
+        // Glyphs on columns 4..=11; the caret at 12.
+        let mut caret = 12u16;
+        for _ in 0..deletes {
+            last += Duration::from_millis(SLOT_MS);
+            caret -= 1;
+            hot_event(
+                &mut sky,
+                &ribbon,
+                (g, c),
+                &Event::Erase,
+                last,
+                (5, caret),
+                None,
+            );
+        }
+        let erased = (5u16, caret);
+        let fix = last + Duration::from_millis(fix_after_ms);
+        let retiring = sky
+            .live_iter()
+            .find(|s| s.lane.is_sky() && !s.dead(fix) && star_over_cell(s, erased, g))
+            .map(|s| (s.pos(fix, false), s.class));
+        let at_home = sky
+            .live_iter()
+            .filter(|s| s.lane.is_sky() && !s.dead(fix) && star_over_cell(s, (5, caret + 1), g))
+            .map(|s| s.class)
+            .collect();
+        let mend = mended.then_some(Mend {
+            at: last,
+            disp: 0.9,
+            row: erased.0,
+            col: erased.1,
+            deletes: u8::try_from(deletes).expect("a mend counts at most two"),
+        });
+        hot_event(&mut sky, &ribbon, (g, c), &glyph, fix, (5, caret + 1), mend);
+        (sky, fix, erased, retiring, at_home)
+    }
+
+    /// **1e — A MEND'S STAR IS BORN WHERE THE TYPO WAS AND DRAGGED TO THE
+    /// FIX** (§23's addendum "The mend"; [`MEND_PULL_MS`]).
+    ///
+    /// The typo script four ways — the fix one slot after one Backspace,
+    /// 500 ms after it, one slot after two, and one slot after a Backspace
+    /// over a CAPITAL typo, whose earned hero still lifts in the caret's
+    /// cell when the fix lands — on the owner's cell. On
+    /// the fix key's own instant one of its stars, an m2, stands where the
+    /// typo was — at the very pixel of the star the Backspace was retiring
+    /// where one is still live, else over the erased cell's sky — and 110
+    /// ms on it stands over
+    /// the CARET's cell: its own travel (the lane's position, the
+    /// slipstream's steps read back) never goes backward inside the window,
+    /// is exactly the pull from where it was born to its home, and does not
+    /// move again after the window; the retiring star is gone from the
+    /// erased cell (grabbed, not left beside a second) and the erased cell
+    /// bears no fresh star of the fix's (its light moved); the fix bears ONE
+    /// sky star over the caret's cell, and at +110 ms it is the ONLY sky
+    /// star there — the typo's hero evicted on the cap's own finish, gone
+    /// before the pull arrives; the sky is brisk inside the window
+    /// and not one millisecond after it; and the star's centre, composited
+    /// over the shipped ground at +0, +55 and +110 ms, is under the caret
+    /// law's ceiling. Fails before: the fix's strike is dealt at the
+    /// erased cell's free neighbour and lifts where it was born — "no star
+    /// of the fix's stands where the typo was … at +0 and over the caret's
+    /// (5, 12) at +110 ms".
+    #[test]
+    fn a_mend_s_star_is_born_where_the_typo_was_and_dragged_to_the_fix() {
+        let mut c = cfg(true);
+        c.theme_bg = SHIPPED_GROUND;
+        let g = geom_cell(15, 28);
+        let window_ms = MEND_PULL_MS as u64;
+        let ceil = STAR_LIGHT_CEIL * 255.0;
+        let over = |p: (i32, i32), cell: (u16, u16)| {
+            px_col(p.0 as f32, g) == i32::from(cell.1) && in_sky_of_row(p.1 as f32, cell.0, g)
+        };
+        for (label, typo, deletes, fix_after_ms) in [
+            ("one-slot fix", TypedClass::Glyph, 1u16, 125u64),
+            ("500 ms fix", TypedClass::Glyph, 1, 500),
+            ("two deletes", TypedClass::Glyph, 2, 125),
+            ("capital typo", TypedClass::Capital, 1, 125),
+        ] {
+            let t0 = Instant::now();
+            let (mut sky, fix, erased, retiring, home_before) =
+                mend_sky(typo, deletes, fix_after_ms, true, &c, t0);
+            let home = (erased.0, erased.1 + 1);
+            eprintln!(
+                "{label}: over the caret's cell {home:?} when the fix landed: {home_before:?}"
+            );
+            if typo == TypedClass::Capital {
+                assert!(
+                    home_before.contains(&StarClass::M1),
+                    "NON-VACUOUS: the capital typo's earned hero is not over the caret's cell"
+                );
+            }
+            let at = |ms: u64| fix + Duration::from_millis(ms);
+            let fix_born: Vec<Star> = sky
+                .live_iter()
+                .filter(|s| s.born == fix && s.lane.is_sky())
+                .copied()
+                .collect();
+            // Where the typo was: the retiring star's own pixel (a streamed
+            // grain may stand a few px into the cell before), else the
+            // erased cell's sky.
+            let typo_at = |p: (i32, i32)| retiring.is_some_and(|(r, _)| r == p) || over(p, erased);
+            let Some(star) = fix_born
+                .iter()
+                .find(|s| typo_at(s.pos(fix, false)) && over(s.pos(at(window_ms), false), home))
+            else {
+                panic!(
+                    "{label}: no star of the fix's stands where the typo was ({erased:?}, retiring {retiring:?}) at +0 and over the caret's {home:?} at +{window_ms} ms — the fix bore {:?}",
+                    fix_born
+                        .iter()
+                        .map(|s| (s.class, s.pos(fix, false), s.pos(at(window_ms), false)))
+                        .collect::<Vec<_>>()
+                );
+            };
+            assert_eq!(
+                star.class,
+                StarClass::M2,
+                "{label}: the mend's star is an m2"
+            );
+
+            // Its own travel: the lane's position with the slipstream's
+            // steps read back, ms by ms.
+            let own = |ms: u64| {
+                let p = star.pos(at(ms), false);
+                p.0 + star.stream_px(ms as f32)
+            };
+            let (x0, y0) = star.pos(fix, false);
+            let mut prev = own(0);
+            for ms in 1..=window_ms {
+                let now = own(ms);
+                assert!(
+                    now >= prev,
+                    "{label}: the pull went backward at +{ms} ms ({prev} → {now})"
+                );
+                prev = now;
+            }
+            let travelled = own(window_ms) - own(0);
+            eprintln!(
+                "{label}: born at {:?} over {erased:?}, home {:?} over {home:?}: pulled {travelled} px in {window_ms} ms (priced {:.0}), at +55 ms {} px in",
+                (x0, y0),
+                star.pos(at(window_ms), false),
+                star.pull,
+                own(55) - own(0)
+            );
+            assert_eq!(
+                travelled,
+                star.pull.round() as i32,
+                "{label}: pulled {travelled} px, priced {:.1}",
+                star.pull
+            );
+            assert!(
+                travelled >= g.cw as i32,
+                "{label}: pulled {travelled} px — less than the {} px cell",
+                g.cw
+            );
+            for ms in window_ms + 1..=400 {
+                assert_eq!(
+                    own(ms),
+                    own(window_ms),
+                    "{label}: the star moved at +{ms} ms, after its window"
+                );
+            }
+
+            // The grab: the light does not jump to be pulled.
+            match retiring {
+                Some((p, class)) => {
+                    assert_eq!(
+                        x0, p.0,
+                        "{label}: born at x {x0}, the retiring {class:?} stood at {}",
+                        p.0
+                    );
+                    assert!(
+                        (y0 - p.1).abs() <= 2,
+                        "{label}: born at y {y0}, the retiring {class:?} stood at {}",
+                        p.1
+                    );
+                    eprintln!("{label}: grabbed the retiring {class:?} at {p:?}");
+                }
+                None => eprintln!("{label}: nothing was retiring over {erased:?}"),
+            }
+            assert!(
+                !sky.live_iter()
+                    .any(|s| s.born < fix && s.lane.is_sky() && star_over_cell(s, erased, g)),
+                "{label}: a star born before the fix is still over the erased cell {erased:?}"
+            );
+            assert!(
+                !fix_born
+                    .iter()
+                    .any(|s| s.pull == 0.0 && over(s.pos(fix, false), erased)),
+                "{label}: the fix bore a fresh star over the erased cell {erased:?} beside the one it pulled away"
+            );
+            assert_eq!(
+                fix_born
+                    .iter()
+                    .filter(|s| over(s.pos(at(window_ms), false), home))
+                    .count(),
+                1,
+                "{label}: the fix bore more than one sky star over the caret's cell"
+            );
+            let at_home: Vec<(StarClass, StarLane, (i32, i32))> = {
+                let now = at(window_ms);
+                let mut cx = ctx_in(g, now, &c, home);
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                let mut sc = Scratch::default();
+                let mut f = sc.frame();
+                sky.emit(&cx, &mut f);
+                sky.live_iter()
+                    .filter(|s| s.lane.is_sky() && over(s.pos(now, false), home))
+                    .map(|s| (s.class, s.lane, s.pos(now, false)))
+                    .collect()
+            };
+            assert_eq!(
+                at_home.len(),
+                1,
+                "{label}: the caret's cell holds {at_home:?} at +{window_ms} ms — one star per cell"
+            );
+
+            // The cadence: one brisk window, then tails.
+            assert!(sky.brisk(at(55)), "{label}: not brisk mid-pull");
+            assert!(
+                !sky.brisk(at(window_ms + 1)),
+                "{label}: still brisk one millisecond after the pull"
+            );
+
+            // The caret stays brightest: the centre under the caret law.
+            for ms in [0u64, 55, window_ms] {
+                let now = at(ms);
+                let mut cx = ctx_in(g, now, &c, home);
+                cx.disp = 0.9;
+                cx.birth_disp = 0.9;
+                let mut sc = Scratch::default();
+                let mut f = sc.frame();
+                sky.emit(&cx, &mut f);
+                let (x, y) = star.pos(now, false);
+                let centre = composite_over(&sc, SHIPPED_GROUND, x, y, 1, 1)[0];
+                let lum = relative_luminance(centre) * 255.0;
+                assert!(
+                    lum <= ceil,
+                    "{label}: the mend's star centre at +{ms} ms reads Y {lum:.1} over the caret law's {ceil:.1}"
+                );
+            }
+        }
     }
 }

@@ -9,6 +9,74 @@
 
 use super::*;
 
+/// Pointer strokes are input-driven and rate limited. This bounded projection
+/// distinguishes absent contact, partial travel, and a completed slow stroke;
+/// geometry, speed, and elapsed-time thresholds are exercised by the detector's
+/// concrete regressions. `cooldown_due` is the independent obligation created
+/// by the most recent earned stroke, so resetting contact cannot erase it.
+///
+/// `Buggy = 1` admits stationary/partial/cooling samples as strokes, drops the
+/// cooldown on reset, and retains abandoned contact. Tier-1 in
+/// `aterm-effects/src/pet_stroke.rs` drives the real detector, reads its actual
+/// contact/travel/deadline fields, and binds each abstract transition.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn pet_stroke_detector_model() -> Model {
+    crate::ty_model! {
+        PetStrokeDetector {
+            const Buggy = 0;
+            var contact = 0;
+            var progress = 0;
+            var cooling = 0;
+            var cooldown_due = 0;
+            var emitted = 0;
+            // Input classes: seed, slow partial, still, completed stroke,
+            // cooling movement, contact reset, rejected movement, expiry.
+            var event = 0;
+
+            action Seed when (contact == 0) {
+                contact = 1; progress = 0; emitted = 0; event = 1;
+            }
+            action Partial when (contact == 1 && cooling == 0) {
+                progress = 1; emitted = if Buggy == 1 { 1 } else { 0 }; event = 2;
+            }
+            action Still when (contact == 1) {
+                emitted = if Buggy == 1 { 1 } else { 0 }; event = 3;
+            }
+            action Earn when (contact == 1 && progress == 1 && cooling == 0) {
+                progress = 0;
+                cooling = if Buggy == 1 { 0 } else { 1 };
+                cooldown_due = 1; emitted = 1; event = 4;
+            }
+            action CoolingMove when (contact == 1 && cooling == 1) {
+                progress = 0; emitted = if Buggy == 1 { 1 } else { 0 }; event = 5;
+            }
+            action Reset when (contact == 1) {
+                contact = if Buggy == 1 { contact } else { 0 };
+                progress = if Buggy == 1 { progress } else { 0 };
+                cooling = if Buggy == 1 { 0 } else { cooling };
+                emitted = 0; event = 6;
+            }
+            action Reject when (contact == 1) {
+                progress = 0; emitted = 0; event = 7;
+            }
+            action ExpireCooldown when (cooldown_due == 1) {
+                cooling = 0; cooldown_due = 0; emitted = 0; event = 8;
+            }
+
+            invariant OnlyCompleteStrokesEarn:
+                if event == 4 { emitted <= 1 } else { emitted == 0 };
+            invariant CooldownCannotBeBypassed:
+                if cooldown_due == 1 { cooling == 1 } else { cooling <= 1 };
+            invariant ResetForgetsContact:
+                if event == 6 { contact == 0 && progress == 0 } else { contact <= 1 };
+            invariant StrokeStateBounded:
+                contact <= 1 && progress <= 1 && cooling <= 1 && cooldown_due <= 1
+                    && emitted <= 1 && event <= 8;
+        }
+    }
+}
+
 /// SPARKLE-WORDS v2 identity/persistence episodes (docs/sparkle-words-v2-design.md
 /// §3.6/§9), authored via [`ty_model!`] exactly as the design prints it. One word
 /// identity's episode lifecycle over the GUI's grace-TTL persist map:

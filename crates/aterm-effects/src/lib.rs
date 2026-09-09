@@ -122,6 +122,7 @@ pub mod output_streak;
 /// The pet roster's bake path: one authored full-body pose → an exact-size
 /// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
 pub mod pet_baker;
+mod pet_stroke;
 /// `@generated` — the checked-in const drawlists for the PET roster (do not edit
 /// by hand). Produced by `cargo run -p aterm-effects --example gen_pet_glyphs`;
 /// kept honest by the `pet_glyphs_gen_matches_assets` drift test. `include!`d for
@@ -151,6 +152,7 @@ pub mod robi_baker;
 pub mod robi_glyphs_gen {
     include!("robi_glyphs_gen.rs");
 }
+pub mod cursor_momentum;
 pub mod spec;
 /// **THE ONE SPECTRUM** — `docs/design/RAINBOW-TRAIL-ONE-STORY.md` §2. The
 /// rainbow family's single colour law: a monotone C¹ hue curve through seven

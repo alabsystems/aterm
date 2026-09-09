@@ -21,8 +21,9 @@
 //!    identical bright bell, so most 3–5 letter words rendered
 //!    `accent, −8ve, −4th, accent, −8ve` — ≈ 6.7 octave-class leaps a second
 //!    at 10 cps, which the ear files as texture rather than as a tune. v2 has
-//!    NO ghost lane: a key inside the step gate is a SAME-PITCH re-strike at
-//!    falling level ([`Touch::ReStrike`]) — a music-box tremolo. Cured in
+//!    NO ghost lane: every key is its own derived note, and the only
+//!    same-pitch re-strike left is a doubled letter's ([`Touch::ReStrike`])
+//!    — a music-box tremolo the text asked for. Cured in
 //!    [`MelodyV2::on_typed`].
 //! 2. **The caret's column transposed the melody.** v1 added
 //!    `col_off = pan.round()` to the degree, so one verse note was three
@@ -34,10 +35,16 @@
 //!    mallet that is gone by 25 ms ([`MALLET_TAU_S`]) — the engine deltas that
 //!    make that possible are §16's rows 1–2.
 //! 4. **The bar was indexed by KEYSTROKE with no clock**, so the meter
-//!    followed finger jitter. v2's verse advances on a [`STEP_GATE_MS`] TIME
-//!    gate read off the host's input clock (`EventMeta::at_ms`): at ≤ 4.5 cps
-//!    every key sings, at 10 cps the verse steps every third key, and "a third
-//!    of typing speed" stops being a rule and becomes a property of the clock.
+//!    followed finger jitter. v2's first answer was a 220 ms TIME gate on the
+//!    playhead, and the owner ruled it the opposite of what he asked for
+//!    (2026-09-08): a key that does not step adds no note, so above ~4.5 cps
+//!    the melody stopped being something you were playing. **The gate is
+//!    gone.** ONE KEYSTROKE IS ONE MELODY STEP AT EVERY TYPING SPEED, and the
+//!    smoothing that the gate was buying now comes from note CHOICE —
+//!    [`MelodyV2::derive`]'s conjunct interval ladder, its gravity, its
+//!    reflection and its run guard — never from withholding a step. The
+//!    finger jitter the old rule feared IS the performance: it is what turns
+//!    an accelerating burst into a rising line ([`ACCEL_SHARE`]).
 //! 5. **Navigation spoke twice on two clocks with no flight sound.** v2's
 //!    meteor ([`TrailSynth::v2_meteor`]) is ONE gesture whose every time
 //!    constant is a multiple of `flight_ms(cells)` — the same number the
@@ -57,9 +64,10 @@
 //! bit for bit (A27).
 
 use super::{
-    ERASE_MIN_GAP, EventMeta, HELD_ERASE_RUN_WINDOW, PAN_LAW_SCALE, Palette, Partial, SONG_FORM,
-    SONG_THEME, SoundEvent, SoundGesture, SoundKind, TrailSynth, Voice, pan_gains, penta,
+    ERASE_MIN_GAP, EventMeta, HELD_ERASE_RUN_WINDOW, PAN_LAW_SCALE, Palette, Partial, SoundEvent,
+    SoundGesture, SoundKind, TrailSynth, Voice, pan_gains, penta,
 };
+use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::timing;
 
 // ===========================================================================
@@ -75,14 +83,18 @@ pub(super) const LANE_NONE: u8 = 0;
 /// The verse: steps, re-strikes, the nav tick, the meteor bell, the cadence's
 /// pickup and resolution. Cap 4 (§14).
 pub(super) const LANE_TUNE: u8 = 1;
-/// The capital echo and the `?`/`!` grafts. Cap 2.
-pub(super) const LANE_ECHO: u8 = 2;
+/// THE BLOOM (§3.3): the slow-attacking 3f/4f/6f voice that fades in behind
+/// a lit key's strike, the motif's answering voice, and the two air taps a
+/// line end or a rest leaves in the room. Cap 2 — the two slots the deleted
+/// capital echo vacated; formerly `LANE_ECHO`, whose only spawn site in this
+/// module was that echo.
+pub(super) const LANE_BLOOM: u8 = 2;
 /// The word downbeat's dyad, the meteor's thump, the cadence's tonic dyad.
 /// Cap 1 — the bass is monophonic by law (§9.3).
 pub(super) const LANE_BASS: u8 = 3;
 /// The space's breath. Cap 1.
 pub(super) const LANE_BREATH: u8 = 4;
-/// Stardust glints. Cap 3, and the only lane besides ECHO that drops an
+/// Stardust glints. Cap 3, and the only lane besides BLOOM that drops an
 /// incoming voice rather than cut a young one (§14's age guard).
 pub(super) const LANE_GLINT: u8 = 5;
 /// The meteor's tick, core and whoosh. Cap 3, exclusive: a new meteor damps
@@ -141,7 +153,7 @@ pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 /// under the onset census would fade-steal each brrrring note 12 ms after
 /// the next one opened — a staccato figure the pinned v1 brrrring never was.
 ///
-/// **The arithmetic, so nobody re-derives it wrong:** TUNE 4 + ECHO 2 + BASS
+/// **The arithmetic, so nobody re-derives it wrong:** TUNE 4 + BLOOM 2 + BASS
 /// 1 + BREATH 1 + GLINT 3 + METEOR 3 + RAIN 3 + CADENCE 1 + CASCADE 4 + SHIFT
 /// 1 = 23; + POOF 2 = **25**, which is §14's own total because CASCADE's
 /// three extra slots are exactly the three §14 books to the PEDAL lane that
@@ -152,7 +164,7 @@ pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 pub(super) fn lane_cap(lane: u8) -> usize {
     match lane {
         LANE_TUNE | LANE_CASCADE => 4,
-        LANE_ECHO => 2,
+        LANE_BLOOM => 2,
         LANE_GLINT | LANE_METEOR | LANE_RAIN => 3,
         // BASS, BREATH, CADENCE, SHIFT — and anything unnamed, which cannot
         // occur but must not silently become unbounded.
@@ -163,51 +175,146 @@ pub(super) fn lane_cap(lane: u8) -> usize {
 /// WHO LOSES when a full lane's oldest voice is younger than
 /// [`LANE_AGE_GUARD_S`]: `true` = drop the newcomer, `false` = steal anyway.
 ///
-/// §14 states it as a hierarchy of consequences. A missing GLINT or ECHO is a
-/// decoration that did not happen — inaudible as an absence. A missing TUNE
+/// §14 states it as a hierarchy of consequences. A missing GLINT or BLOOM is
+/// a decoration that did not happen — inaudible as an absence. A missing TUNE
 /// voice is **a key that made no sound**, which reads as a dropped keystroke;
 /// that is worse than a clipped tail, so the tune always speaks.
 pub(super) fn lane_drops_the_newcomer(lane: u8) -> bool {
-    matches!(lane, LANE_GLINT | LANE_ECHO)
+    matches!(lane, LANE_GLINT | LANE_BLOOM)
 }
 
 // ===========================================================================
 // §10.2 / §10.4 — the melody's clocks
 // ===========================================================================
 
-/// **THE STEP GATE**, milliseconds — the single number that turns v1's
-/// keystroke-indexed bar into a meter (§9.0 cause 4).
-///
-/// The playhead advances at most once per 220 ms, measured from the last
-/// STEP and not from the last key. Everything the owner asked for falls out of
-/// that one clock instead of needing three rules:
-/// - at ≤ 4.5 cps every key is a step (the "slow typing promotes every key"
-///   law, with no separate rule);
-/// - at 5 cps the verse steps every second key;
-/// - at 10 cps every third — v1's "a third of typing speed", now a property of
-///   the clock rather than of the finger.
-///
-/// 220 ms is ~2.3 notes/s at the low end and holds the verse near 4 notes/s
-/// under a fast hand: a music box's tempo, not a typist's.
-pub(super) const STEP_GATE_MS: u32 = 220;
+// ---------------------------------------------------------------------------
+// THE DERIVED LINE (§3.1). There is NO time gate here, in any form — not a
+// rate limiter, not a budget, not a token bucket. Every one of the constants
+// below shapes WHICH note a key gets; not one of them can decide that a key
+// gets no note. That is the owner's ruling of 2026-09-08 and it is the whole
+// reason this section replaced a single `STEP_GATE_MS`.
+// ---------------------------------------------------------------------------
 
-/// A typing gap this long ends the phrase and CADENCES it (§10.2).
+/// THE INTERVAL LADDER. Real melodies are 70-80 % conjunct, so the bands are
+/// cut for that and not for an even split of the fold: over the 13 folded
+/// values this is 0 repeats, 7 seconds, 4 thirds and 2 fifths — 54 / 31 /
+/// 15 % conjunct-to-leap. (The fold's zero is a second, not a repeat — see
+/// below; the only repeat is the text's own.)
+///
+/// **A REPEAT IS EARNED BY A REPEATED LETTER, NEVER BY THE FOLD.** The fold
+/// is modulo 13, so two letters exactly thirteen apart (`a`/`n`, `b`/`o`, …)
+/// land on 0 as surely as `tt` does — and they are 2 of the 26 offsets a
+/// random pair can take, which put the repeat rate of English prose near 15 %
+/// where the doubled-letter rate is nearer 4. That is an accident of the
+/// modulus and it is audible as a stutter, so [`MelodyV2::derive`] passes the
+/// RAW difference's zero-ness in alongside the folded value: a genuine repeat
+/// stays a repeat, and a folded-to-zero leap takes the smallest real move
+/// there is.
+const fn stride_mag(r: i32, repeated: bool) -> i32 {
+    if repeated {
+        return 0;
+    }
+    match r.abs() {
+        0 => 1,
+        1..=3 => 1,
+        4..=5 => 2,
+        _ => 3,
+    }
+}
+
+/// THE DEAD BAND. Human inter-key jitter is ±25 %, so a band narrower than
+/// this would let finger noise overwrite the alphabet's sign on most keys and
+/// the word motifs would stop being recognisable. Outside it the hand is
+/// genuinely accelerating or genuinely hesitating, and it takes the contour.
+///
+/// Measured against the SMOOTHED interval as it stood BEFORE this gap was
+/// folded in ([`IOI_EMA_ALPHA`]) — the running tempo the key is early or late
+/// against. Folding the gap in first would make every gap partly its own
+/// reference and shrink the band by half.
+const ACCEL_SHARE: f32 = 0.75;
+const DECEL_SHARE: f32 = 1.35;
+
+/// The register's middle, and how far the walk may wander before it is pulled
+/// back. Reflection at the bounds only acts at the edges; gravity acts
+/// everywhere, which is what turns a random walk's flat pitch distribution
+/// into a bell around a centre — the thing that makes a wander sound like it
+/// is IN a key rather than drifting through one.
+///
+/// **The pull is one-sided by construction, and that is the design.** With
+/// centre 3 and reach 3 the down-pull arms at degree 7 and the up-pull would
+/// arm below 0, which [`TUNE_DEG_LO`] makes unreachable: the lower half's
+/// restoring force is the REFLECTION at 0, which bounces a descending walk
+/// back up, and the upper half's is this gravity, which bends a climb over
+/// before it can reach the ceiling and start bouncing there. The two together
+/// settle the distribution around 3. The unreachable arm is kept as the law's
+/// other half so the rule stays true if the register ever moves.
+const MELODY_CENTRE_DEG: i32 = 3;
+const MELODY_GRAVITY_DEG: i32 = 3;
+
+/// Three identical strides running is a figure; four is a machine. The fourth
+/// inverts.
+///
+/// THE RUN IS COUNTED ON THE STRIDE THE EAR GETS, not on the one `derive`
+/// chose. Between the two sit the reflection at the register's bounds, the
+/// word-head snap onto a chord tone and the subject's answer, and each of
+/// them can turn a counted stride into a different sounded one: a `−1` off
+/// degree 0 SOUNDS as `+1`, and a subject latched as `+1 +1 +1` answered
+/// after a head that rose `+1` SOUNDS as four. Counted on `derive`'s stride,
+/// this guard let both through — `0 1 2 3 4` on the bench's digit run, a
+/// straight five-note scale at every answer of a rising subject — and the
+/// render's siren verdict caught it. So [`MelodyV2::note_run`] is fed
+/// `deg − from` after the snap, the guard is consulted by the answer as well
+/// as by the derivation, and a head whose snap would complete the fourth
+/// takes the nearest chord tone on the other side of the line instead.
+const MELODY_RUN_MAX: u8 = 3;
+
+/// HOW FAR A WORD HEAD MAY BE MOVED to land on a chord tone (§3.1 step 6).
+/// Two degrees reaches five consecutive pitch classes and every chord of
+/// [`CHORD_LOOP`] lights three of five, so the search always lands — the same
+/// totality argument the rest cadence's own search rests on.
+const WORD_HEAD_SNAP_DEG: i32 = 2;
+
+/// THE LINE'S OWN MOTIF. The first three intervals after an Enter (or after a
+/// phrase rest) are LATCHED as this line's subject — three, not four, because
+/// at ~4.5 letters per English word four fills the whole word and the line
+/// becomes the subject rather than answering it.
+const MOTIF_LEN: usize = 3;
+/// …and it is answered at every fourth word head, transposed onto the live
+/// chord tone the word head already snapped to. One word in four is about one
+/// key in eighteen: a recall, not a loop. Re-latched on every Enter, so a new
+/// line writes a new subject and nothing repeats across a session.
+const MOTIF_EVERY_WORDS: u8 = 4;
+
+/// MACHINE REGULARITY, NOT SPEED. Three consecutive gaps agreeing this
+/// closely — **on the same glyph** — is macOS key repeat; a genuinely fast
+/// human hand is jittery and is never caught by it, where a rate threshold
+/// would catch both.
+///
+/// **The same-glyph conjunct is this file's, not §3.1's, and it is load
+/// bearing.** A held key repeats ONE character by definition, so the rank
+/// costs nothing to require; without it a metronome — a script, a paste
+/// replay, the census's own clean column — is machine-regular by construction
+/// and every note of it would go unpitched. Regularity alone is not evidence
+/// of a machine; regularity on one glyph is.
+const AUTOREPEAT_JITTER_MS: u32 = 2;
+const AUTOREPEAT_RUN: u8 = 3;
+/// …and an absolute backstop at ~40 cps, past any hand. This one asks nothing
+/// of the glyph: nothing human puts two DIFFERENT keys 25 ms apart either.
+const AUTOREPEAT_FLOOR_MS: u32 = 25;
+
+/// A typing gap this long is a REST, and a rest RESOLVES the line (§3.1).
+///
+/// It resolves the walk onto the live chord where it stands, clears the
+/// contour bias and the run, and re-latches the motif so the phrase after the
+/// pause writes a new subject. **It never substitutes for a step and never
+/// withholds one:** the key that ends the pause resolves the line and then
+/// sings its own derived note, exactly as every other key does.
 ///
 /// **900, not v1's 600.** v1's 600 ms was tuned against a governor decay that
 /// §16 row 11 sets to exactly 1.0 for v2; at 600 ms every ordinary think-pause
-/// cadences, which skips a phrase of the form each time and means a session
-/// never plays the piece through. 900 ms is longer than a word-finding pause
-/// and shorter than a real stop.
+/// resolves, and a line that resolves every few words has no line left. 900 ms
+/// is longer than a word-finding pause and shorter than a real stop.
 pub(super) const PHRASE_PAUSE_MS: u32 = 900;
-
-/// Re-strikes closer together than this are COALESCED — the state still
-/// advances, but no second voice is spawned (§10.2).
-///
-/// 60 ms is chosen against the roughness band, not against taste: a 30 Hz
-/// auto-repeat becomes a ≤ 16.7 Hz roll, which is under the 15–60 Hz band
-/// where amplitude modulation is heard as buzz (§9.5 law 4). **Steps are never
-/// thinned** — only re-strikes are — so a held key can never silence the tune.
-pub(super) const RESTRIKE_COALESCE_MS: u32 = 60;
 
 /// A gap longer than this is not typing at all: the IOI estimator RESTARTS at
 /// [`IOI_DEFAULT_MS`] rather than dragging a stale 600 ms average into the
@@ -321,28 +428,54 @@ const MALLET_LVL: f32 = 0.45;
 const MALLET_TAU_S: f32 = 0.006;
 
 /// τ_v — the voice decay, adaptive to the inter-onset interval (§9.1):
-/// `clamp(110·(0.35 + 2.6·IOI_s), 55, 110)` ms.
+/// `clamp(110·(0.068 + 3.727·IOI_s), 28, 110)` ms.
 ///
 /// This is the masking law, not a taste dial. At 10 cps the keys are 100 ms
 /// apart; a 110 ms note would overlap its successor and the pitches would pile
-/// into a chord instead of a line. τ_v falls to 67 ms there and to the 55 ms
-/// floor above ~13 cps, so **fast typing thins the notes rather than the
-/// note count** — every key still speaks (A15).
+/// into a chord instead of a line. τ_v falls to 48 ms there, so **fast typing
+/// thins the notes rather than the note count** — every key speaks, always.
+///
+/// **THE LINE IS FITTED THROUGH THE TWO POINTS §3.1 STATES**, and the floor
+/// is 28 ms, not 55. With the step gate deleted, the roughness law that the
+/// deleted re-strike coalescer was defending — keep amplitude modulation out
+/// of the 15-60 Hz buzz band — is carried HERE, where this module's own
+/// header says it belongs: by note LENGTH, never by note COUNT. §3.1 states
+/// the law's two anchors: the 4 cps reference (250 ms) plays the full 110 ms
+/// note, and **a 20 cps run plays 28 ms notes** instead of 55 ms notes
+/// fighting each other. The design also wrote the curve as
+/// `110·(0.35 + 2.6·IOI)`, and that line does not pass through its own second
+/// anchor: at 50 ms it gives 52.8 ms, and with [`IOI_MIN_MS`] clamping the
+/// intake at 30 ms its global minimum is 47.1 ms — so a 28 ms floor under it
+/// could never bind, and the stated effect was never delivered (the step-3
+/// review measured exactly that). The intercept is the term that governs
+/// the fast end, so it is the intercept that moved: 0.068 / 3.727 is the
+/// unique line through (250 ms → 110 ms) and (50 ms → 28 ms). Below 20 cps
+/// the floor is the operating point — the intake clamp at 30 ms would read
+/// 25 ms, and [`TAU_V_MIN_S`] holds it at 28 — and the multipliers that ride
+/// outside the clamp ([`RESTRIKE_TAU_MUL`]) take their touches shorter still.
 const TAU_V_BASE_S: f32 = 0.110;
-const TAU_V_OFFSET: f32 = 0.35;
-const TAU_V_SLOPE: f32 = 2.6;
-const TAU_V_MIN_S: f32 = 0.055;
+const TAU_V_OFFSET: f32 = 0.068_181_8;
+const TAU_V_SLOPE: f32 = 3.727_272_7;
+const TAU_V_MIN_S: f32 = 0.028;
 const TAU_V_MAX_S: f32 = 0.110;
 
 /// THE ROOF — a one-pole lowpass, and §9.6's whole "brighter when fast, never
 /// louder" mechanism. Plain roof lerps 4200 → 5200 Hz over 4 → 12 cps; a
-/// chord-tone step opens it by [`ROOF_LIT_ADD`]; the glow's blaze adds up to
-/// [`ROOF_HEAT_HZ`] and **never a decibel**.
+/// chord-tone step opens it by [`ROOF_LIT_ADD_HZ`]; the glow's blaze adds up
+/// to [`ROOF_HEAT_HZ`]; the ribbon's hue adds up to [`ROOF_HUE_ADD_HZ`] — and
+/// **never a decibel**.
 const ROOF_PLAIN_LO_HZ: f32 = 4200.0;
 const ROOF_PLAIN_HI_HZ: f32 = 5200.0;
 const ROOF_LIT_ADD_HZ: f32 = 2300.0;
 const ROOF_MAX_HZ: f32 = 7500.0;
 const ROOF_HEAT_HZ: f32 = 600.0;
+/// THE NOTE'S OWN ROOF FOLLOWS THE ARC (§3.3 item 3). `ev.hue` is the live
+/// rainbow hue the caret is painting, and the roof opens by up to this much
+/// as the ribbon travels from the red end to the cyan end — added BEFORE the
+/// [`ROOF_MAX_HZ`] clamp, exactly like the blaze's term, so it buys
+/// brightness and never a decibel. Read through [`hue_arc`], so the wrap
+/// reflects and there is no click at the seam.
+const ROOF_HUE_ADD_HZ: f32 = 900.0;
 /// The cps span the plain roof opens across (4 → 12 cps).
 const ROOF_CPS_LO: f32 = 4.0;
 const ROOF_CPS_SPAN: f32 = 8.0;
@@ -371,31 +504,155 @@ const RESTRIKE_L0: f32 = 0.60;
 const RESTRIKE_FALL: f32 = 0.85;
 const RESTRIKE_FLOOR: f32 = 0.35;
 
-/// §9.2's echo touch — the capital's octave, 25 ms behind its own note.
-const ECHO_P2_LVL: f32 = 0.08;
-const ECHO_TAU_MUL: f32 = 0.55;
-const ECHO_DELAY_S: f32 = 0.025;
-/// −8 dB re the step (§11).
-const ECHO_LEVEL: f32 = 0.398_107_2;
-/// The echo's interval, as a ratio. `[2]` — the octave the owner's ruling asks
-/// for; §10.4's rotating `[2, 3, 4]` is an A/B, not the default.
-const ECHO_RATIO: [f32; 1] = [2.0];
-/// The echo is octave-folded down to sit inside the LIT lane (§9.4).
-const ECHO_FOLD_MAX_HZ: f32 = 3200.0;
+// ---------------------------------------------------------------------------
+// §3.3 — WHAT MAKES IT RAINBOW AND MAGICAL. Four additions, all inside the
+// existing `Voice` vocabulary: no reverb, no delay line, no dependency. The
+// tine itself is untouched — softening the strike would undo R1.
+// ---------------------------------------------------------------------------
+
+/// **THE BLOOM** — the single biggest lever, and the one that separates
+/// *struck* from *enchanted*. One extra voice per lit key, in the lane the
+/// deleted capital echo vacated ([`LANE_BLOOM`]): a twelfth, two octaves,
+/// and a twelfth above that — §3.3's 3f / 4f / 6f — each dying at its own
+/// rate.
+///
+/// **STATED AS LATTICE DEGREES, NOT AS RATIOS**, because this module has
+/// ONE LATTICE and the bloom is a pitched thing. On C, G and A the degrees
+/// ARE 3f / 4f / 6f exactly; on D and E the twelfth bends to the lattice's
+/// own sixth (10/3, 6.4) because the just pentatonic's D–A is a wolf: D×3 is
+/// 27/16 and the lattice's A is 5/3, a syntonic comma apart, and the first
+/// render with exact harmonics beat D5×6 against A5×4 at 43.6 Hz — inside
+/// the 15-60 Hz roughness band §9.5 law 4 forbids, with a 220-380 ms τ that
+/// no exemption covers. On the lattice every bloom partial either coincides
+/// exactly with a live harmonic or sits a lattice step from it, which is
+/// the same argument that admits the glints (§13).
+const BLOOM_DEGREES: [i32; 3] = [8, 10, 13];
+const BLOOM_LVL: [f32; 3] = [0.10, 0.06, 0.035];
+const BLOOM_TAU: [f32; 3] = [0.22, 0.30, 0.38];
+/// IT FADES IN BEHIND THE STRIKE. Everything else in this theme attacks in
+/// 4 ms and decays; this one blooms. A bell that arrives after its own mallet
+/// is the canonical enchantment cue, and it is why this reads as magic rather
+/// than as a brighter click.
+const BLOOM_ATTACK_S: f32 = 0.018;
+/// …12 ms behind the mallet, so the ear hears STRIKE then BLOOM and not one
+/// fatter transient.
+const BLOOM_DELAY_S: f32 = 0.012;
+/// 3-6× the tine's own tau ([`tau_v_s`], 28-110 ms). The tine speaks; the
+/// bloom hangs. Notes therefore overlap and answer each other in the
+/// HARMONICS, where consonance is structural, and never in the fundamentals.
+const BLOOM_DECAY_S: f32 = 0.340;
+/// The tail law's `3τ + 20 ms`, as the tine's own `dur` is built.
+const BLOOM_DUR_S: f32 = 3.0 * BLOOM_DECAY_S + TINE_DUR_TAIL_S;
+/// A slow twinkle on the hang — 5.5 Hz is well under the 15 Hz roughness
+/// band, so it reads as shimmer and never as buzz.
+const BLOOM_TW_RATE: f32 = 5.5;
+const BLOOM_TW_DEPTH: f32 = 0.22;
+/// The bloom's roof sits this far above the note's own: its partials live at
+/// 3f-6f and a roof fitted to the fundamental would take the top off them.
+const BLOOM_ROOF_ADD_HZ: f32 = 2400.0;
+/// The bloom's level re the step it blooms behind, BEFORE [`hue_air`].
+///
+/// **FITTED ON THE BENCH (2026-09-08), NOT TAKEN FROM §3.3.** §3.3's own
+/// figure of 0.30 put the bloom ≈ −25 dB under the fundamental (the partial
+/// levels above are already a fifth of the tine's P1) and moved the bench
+/// probe's centroid by three hertz — inaudible, and nothing like the lever
+/// the design describes. The prediction is the law, so the level was swept
+/// on the bench's own gesture probe (`keyboard_song_ab --probes`) and prose
+/// scene, seed `0x504f4f46`, vol 0.4, red end of the arc (`hue_air` 0.55):
+///
+/// ```text
+/// BLOOM_LEVEL   probe centroid  hi>2k   prose rms    prose centroid  burst ons/s
+/// plain (0)         905 Hz      0.009   (−36.9 est)      —              18.3
+/// 1.0               936         0.023   −36.69 dBFS   1132 Hz          18.3
+/// 1.5               975         0.039   −36.48        1248              17.1
+/// 2.0              1027         0.062   −36.20        1394              15.3
+/// 3.0              1163         0.122   −35.49        1725              11.4
+/// ```
+///
+/// The shipped take reads −36.25 dBFS on the same scene, so §8's +1.0 dB
+/// budget is met at every rung (the τ_v refit gave the room back). What
+/// decides it is the other two columns: at 3.0 the prose scene's centroid
+/// clears the **1600 Hz glass line** and the bloom's hang swallows a third
+/// of a 20 cps burst's onsets — the mud R1's shorter notes were bought to
+/// avoid; at 1.5 `hi>2k` lands exactly on §3.3's predicted 0.04. 2.0 sits
+/// between: the prose centroid inside §3.3's 1250-1400 window, `hi>2k` at
+/// 1.5× the prediction, the burst still articulate. The probe's own centroid
+/// reads 1027 Hz here against §3.3's 1250-1400 because that window was
+/// written against a 1085 Hz tine on the authored verse's probe note; the
+/// derived line lands the probe on a lower degree (905 Hz plain), and the
+/// RISE is what the prediction is about. Under budget pressure this is the
+/// constant that gives back first, never [`KEY_TINE_TRIM`] up; the ladder
+/// between 1.5 and 2.0 is the owner's by ear.
+const BLOOM_LEVEL: f32 = 2.0;
+/// THE BLOOM DRIFTS WITH THE COLOUR. The strike stays on the caret's column
+/// and the bloom's pan moves by up to this much with the hue, so the note
+/// OPENS in the field.
+const BLOOM_SPREAD: f32 = 0.28;
+
+/// **THE ANSWERING VOICE** (§3.3). On a motif-answering word head — the head
+/// that opens the line's reply to its own subject, one key in eighteen or so
+/// — one extra voice in [`LANE_BLOOM`], this far behind the head, pitched at
+/// the nearest lit chord tone ABOVE the head's degree. A call and its answer,
+/// in a droppable lane: counterpoint, not decoration.
+const ANSWER_DELAY_S: f32 = 0.19;
+/// −12 dB re the step.
+const ANSWER_LEVEL: f32 = 0.25;
+
+/// **THE AIR CLOUD** (§3.3 item 4) — the only literal room in the theme, and
+/// it is NOT per key. Two bloom taps behind a line's end (Enter) and behind
+/// the key that ends a phrase rest, at unequal spacings and opposite pans:
+/// two taps at unequal spacings read as a room; per key at 10 cps they would
+/// read as a smear. Levels are re the bloom they echo — −14 and −20 dB.
+const AIR_TAP_DELAY_S: [f32; 2] = [0.09, 0.17];
+const AIR_TAP_LEVEL: [f32; 2] = [0.199_526_2, 0.1];
+const AIR_TAP_PAN: f32 = 0.4;
+
+/// **A CAPITAL IS ONE ONSET** (§3.1 "Boundaries"): its own single step,
+/// lifted one lattice octave — five pentatonic degrees — and clamped to the
+/// register's ceiling, plus the open roof `ev.shifted` already buys. Where
+/// there used to be three sounds (the lift, the letter, an octave echo 25 ms
+/// later) there is now the letter, higher. Inside a word the lift is bounded
+/// by A2's in-word law ([`WORD_LEAP_MAX_DEG`]): a camelCase capital is an
+/// accent, not the octave-class leap this instrument exists to cure.
+const CAPITAL_LIFT_DEG: i32 = 5;
 
 /// A PASSING (non-chord-tone) step is 2 dB under a lit one (§9.2). The chord
 /// lights the verse; it never moves it (§10.3).
 const PASSING_LEVEL: f32 = 0.794_328_2;
 
-/// §9.6's loudness arc: `g_IOI = clamp(√(IOI_s / 0.15), 0.6, 1.0)`.
+/// §9.6's loudness arc: `g_IOI = clamp(√(IOI_s / 0.25), 0.45, 1.0)`.
 ///
 /// The arc REPLACES v1's flood governor (§16 row 11). v1 ducked every typed
 /// voice by `1/√(1 + 0.55·rate)` — −6.5 dB at 10 cps — while Jump/Sweep/Land
 /// bypassed it entirely, so the tune was the quietest layer in its own mix
 /// (§9.0 cause 5). The arc holds per-second energy flat to within +1 dB of the
 /// 4 cps reference (A14) *without* making the melody the thing that gives way.
-const G_IOI_REF_S: f32 = 0.15;
-const G_IOI_MIN: f32 = 0.6;
+///
+/// **The floor is 0.45, not 0.6, and the reference is 0.25 s, not 0.15
+/// (§3.1).** The arc is a √ law precisely so that per-second energy stays
+/// flat as the rate climbs: below the reference `rate · g² = 1/REF`, a
+/// constant, so every note the rate adds is paid for exactly. Two things
+/// broke that under R1 and both are fixed here.
+///
+/// **The reference.** `g` is capped at 1.0 (§9.6: the arc may buy brightness,
+/// never a decibel), so the flat law only holds for `IOI ≤ REF` and typing
+/// slower than `REF` simply gets quieter. At 0.15 s the cap bit at 6.7 cps,
+/// which held every rate between 4 and 6.7 cps BELOW the flat line while
+/// every rate above it sat ON it: A14's own 4 cps reference read 2.2 dB low,
+/// and with the gate deleted — which doubles the note count at 8 cps — the
+/// measured arc ran to **+3.2 dB re 4 cps**, straight through A14's +1 dB
+/// ceiling and §21.4's "cuteness must not buy loudness". 0.25 s is
+/// [`IOI_DEFAULT_MS`], which is 4 cps, which is the 0 dB reference §9.6
+/// writes the whole table against; putting the cap's knee ON the reference is
+/// what makes the arc flat from 4 cps up instead of from 6.7.
+///
+/// **The floor.** Under the gate the notes above ~17 cps were thinned anyway,
+/// so a floor cost nothing; with every key now speaking, a floor at 0.6 is
+/// the melody getting louder the faster you type. 0.45 is `√(0.050/0.25)` —
+/// reached at 20 cps, past any prose hand and inside the rate where
+/// [`AUTOREPEAT_FLOOR_MS`] has already taken the partials off the note.
+const G_IOI_REF_S: f32 = 0.25;
+const G_IOI_MIN: f32 = 0.45;
 
 /// Seeded velocity, in dB either side of nominal (§9.6). Per-session
 /// deterministic, never per-frame: the draw comes from the synth's own seeded
@@ -525,6 +782,90 @@ const CHORD_LOOP: [Chord; 8] = [
 /// is a minor colour on a fresh thought.
 const CHORD_AFTER_ENTER: u8 = 7;
 
+// ===========================================================================
+// THE RAINBOW SKY — the drifting bed (THE PRISM §3.2)
+// ===========================================================================
+
+/// C3 — two octaves under the tine and a full octave under the bass dyad's
+/// own band ([`BASS_BASE_HZ`] 261.63), so the word downbeat still reads as
+/// the downbeat and the pad reads as the floor under it. Every pad tone is
+/// `penta(BED_BASE_HZ, d)` for a lit degree `d`, so the top of the pad
+/// (degree 4, 218 Hz) stays clear of the bass register by construction
+/// (`the_sky_pad_is_the_live_chords_lit_degrees_under_the_bass`).
+pub(super) const BED_BASE_HZ: f32 = TINE_BASE_HZ * 0.25;
+/// The number of tournament chords the sky voices — [`CHORD_LOOP`]'s length,
+/// exported so the parent's lattice law can walk them.
+pub(super) const SKY_BED_CHORDS: usize = CHORD_LOOP.len();
+/// Voicing balance, lowest tone first: the root-most tone carries, the upper
+/// two colour. Static — the MOTION lives in pitch and in the hue.
+const BED_WEIGHT: [f32; 3] = [1.0, 0.80, 0.65];
+/// THE PAD NEVER STEPS. Portamento between chords, long enough that no
+/// crossing is a step and short enough that a fast run through the words is
+/// audibly moving. (`bed_chord_drift` uses 1.2 s against a 7.5 s bar; the sky
+/// moves once per WORD, so it needs longer.)
+const BED_GLIDE_TAU_S: f32 = 2.6;
+/// The pad's level. Air, not a drone: noticed when it stops, never when it
+/// starts. THE PRISM's number; on the audition harness (`bed_audition.rs`,
+/// vol 0.4, the 20 s script) it reads a bed RMS of about −44 dBFS, ≈ 8 dB
+/// under the melody, and clears the harness's −50 dBFS audibility line in
+/// most 50 ms windows while typing — the measured figures are in the step's
+/// report and in `target/bed-audition/c5-rainbow-sky.metrics.json`. The
+/// owner sets it from here by ear.
+const BED_LEVEL: f32 = 0.012_6;
+/// A 12 s breath on the whole pad. Weather, not tremolo.
+const BED_BREATH_HZ: f32 = 1.0 / 12.0;
+const BED_BREATH_DEPTH: f32 = 0.35;
+/// The hue's one-pole (τ, seconds) on the arc position the pad reads.
+const BED_HUE_TAU_S: f32 = 1.2;
+/// TILT — one one-pole over the pad sum (reusing `bed.lp1`). Red end of the
+/// arc warm and closed, cyan end open and glassy: the colour you can see is
+/// the colour you can hear.
+const BED_TILT_LO_HZ: f32 = 700.0;
+const BED_TILT_HI_HZ: f32 = 2600.0;
+/// WIDTH — the top tone's twin is detuned by this many cents, so the pad's
+/// own beat rate walks from ≈ 0.45 Hz (4 cents on G3, 196 Hz) to ≈ 1.4 Hz
+/// (11 cents on A3, 218 Hz) as the ribbon travels the arc. That slow,
+/// drifting beat IS the shimmer, and it costs one phase increment.
+const BED_DETUNE_CENTS_LO: f32 = 4.0;
+const BED_DETUNE_CENTS_HI: f32 = 11.0;
+/// THE PAD'S PARTIALS, harmonic numbers at `1/n`: octaves, fifths and the
+/// major third of each pad tone and nothing else — every partial is itself
+/// a lattice interval from its tone, so the pad's whole spectrum sits on the
+/// same consonances the melody does (the 7th harmonic, a flat seventh, is
+/// left out on purpose). A pure sine has nothing for a tilt to tilt; these
+/// are what the hue's filter acts on.
+const BED_PARTIALS: [u32; 7] = [1, 2, 3, 4, 5, 6, 8];
+/// `1 / sqrt(Σ 1/n²)` over [`BED_PARTIALS`], so a pad tone has the RMS of
+/// the sine it replaces and [`BED_LEVEL`] means what it says.
+const BED_PARTIAL_NORM: f32 = 0.815_1;
+
+/// THE SKY'S VOICING for one chord of [`CHORD_LOOP`]: the chord's three LIT
+/// verse degrees (`Chord::lit`, bits 0..5 = C D E G A), ascending, on the
+/// UNTRANSPOSED lattice. The pad is voiced from the lit set rather than
+/// stacked on `CHORD_ROOT_RATIO[root]` because a root triad built on G or A
+/// puts a B, a C♯ or an F♯ under a C-pentatonic melody — out of key — while
+/// the lit set is by definition the chord's tones that ARE on the lattice:
+/// C E G on I, C E A on vi and IV, D G A on V.
+pub(super) fn sky_bed_degrees(chord: usize) -> [i32; 3] {
+    let lit = CHORD_LOOP[chord % SKY_BED_CHORDS].lit;
+    let mut out = [0i32; 3];
+    let mut n = 0;
+    for d in 0..5 {
+        if lit & (1 << d) != 0 && n < 3 {
+            out[n] = d;
+            n += 1;
+        }
+    }
+    debug_assert_eq!(n, 3, "every chord lights exactly three degrees");
+    out
+}
+
+/// `a + (b - a) t`.
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 /// §9.3's bass tine. Centroid under 500 Hz — the darkest sound in the theme.
 const BASS_ROOT_LVL: f32 = 0.32;
 const BASS_FIFTH_LVL: f32 = 0.22;
@@ -577,17 +918,21 @@ const NAV_DECAY_S: f32 = 0.030;
 const NAV_DUR_S: f32 = TAIL_DUR_PER_TAU * NAV_DECAY_S;
 const NAV_LEVEL: f32 = 0.063_095_73;
 
-/// THE LIFT'S ROTATION (§10.4; owner 2026-08-31, "the tone should rotate").
-/// A bare Shift plays `walk + {1, 3, 5, 2, 4}` in turn — it never claims the
-/// beat and never moves the playhead, so how you reach for a capital cannot
-/// change the tune.
-const SHIFT_LIFT: [i32; 5] = [1, 3, 5, 2, 4];
+/// THE LIFT IS FELT, NOT PITCHED (§3.1 "Bare Shift", 2026-09-08). A bare
+/// Shift used to play a rotating pitched tine 30-100 ms before the letter it
+/// preceded — a note with no character behind it, and the first of the three
+/// onsets one capital used to cost. It is now the felt mallet alone, on the
+/// lift's own envelope: a modifier stays felt and can never be mistaken for
+/// a step. The rotation table (`SHIFT_LIFT`) and its cursor retired with the
+/// pitch; nothing about how you reach for a capital can touch the tune.
 const LIFT_ATTACK_S: f32 = 0.004;
 const LIFT_DECAY_S: f32 = 0.040;
 /// §11's 80 ms, raised to the tail law: [`TAIL_DUR_PER_TAU`] × 40.
 const LIFT_DUR_S: f32 = TAIL_DUR_PER_TAU * LIFT_DECAY_S;
-/// −9 dB re the step (§11) — a modifier is intent, not authorship.
+/// −9 dB re the step (§11) — a modifier is intent, not authorship…
 const LIFT_LEVEL: f32 = 0.354_813_4;
+/// …and the felt alone at 0.4 of that (−17 dB re the step): §3.1's figure.
+const LIFT_FELT_MUL: f32 = 0.4;
 /// The TUNE lane's degree span, `C5..G6` = 0..8 (§9.4). The lift folds into
 /// it so a rotation off a high verse note cannot climb out of the register.
 const TUNE_DEG_LO: i32 = 0;
@@ -783,20 +1128,27 @@ const CASCADE_RESTRIKE_LEVEL: f32 = 0.251_188_6;
 /// WHICH OF THE TINE'S THREE TOUCHES a key gets (§9.2).
 ///
 /// The whole of §9.0's first cure is that these are the ONLY three, and that
-/// two of them are the same pitch: a key inside the step gate does not get a
-/// different note, it gets the same note again, softer. v1's fourth "touch" —
-/// the ghost, an octave or a fourth or a third away on the identical bell — is
-/// not carried, and cannot be: nothing in this module can voice a degree the
-/// verse did not step to.
+/// two of them are the same pitch. v1's fourth "touch" — the ghost, an octave
+/// or a fourth or a third away on the identical bell — is not carried, and
+/// cannot be: nothing in this module can voice a degree the line did not
+/// derive.
+///
+/// **[`Touch::ReStrike`] now means what its own name says.** Under the
+/// deleted step gate it meant "you typed too fast", which is how a fast hand
+/// came to truncate its own notes; it is now reached only through
+/// [`stride_mag`]'s single zero, which is a DOUBLED LETTER — a real musical
+/// repeat, from a real repeat in the text. Every other way the derivation
+/// could arrive back on the sounding degree (a fold to zero, gravity
+/// cancelling a second, a reflection landing where it started) is closed in
+/// [`MelodyV2::derive`] on purpose. So the same-pitch damp is defending
+/// against a real comb filter instead of punishing a typist.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Touch {
-    /// The verse advanced. Full tine: body, octave, strike, mallet.
+    /// The line moved. Full tine: body, octave, strike, mallet.
     Step,
-    /// A key arrived inside the gate. The tine with the strike partial at
-    /// zero, at `L_n` — a music-box tremolo, never a leap.
+    /// The line derived the pitch it is already on. The tine with the strike
+    /// partial at zero, at `L_n` — a music-box tremolo, never a leap.
     ReStrike,
-    /// A capital's octave, 25 ms behind its own note.
-    Echo,
 }
 
 /// ONE FRAME OF MELODY STATE, saved before a keystroke mutates it so that a
@@ -809,16 +1161,24 @@ pub(super) enum Touch {
 /// notes you mistyped.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Undo {
-    theme_pos: u8,
-    phrase_idx: u8,
     walk: i8,
     restrike: u8,
     chord: u8,
     word_pos: u8,
-    /// The step clock rides the stack too: rewinding the playhead without
-    /// rewinding its gate would let the letter you retype be a re-strike of a
-    /// note that is no longer sounding.
-    last_step_ms: u32,
+    /// THE DERIVED LINE'S WHOLE STATE (§3.1). The melody is now a function of
+    /// the text, so un-writing a character has to un-write everything that
+    /// character decided: the rank the next interval is measured against, the
+    /// run the contour was building, and the subject the line had latched.
+    /// Anything left off this frame is a way for "type five, delete five,
+    /// type five again" to come back a different tune.
+    prev_rank: u8,
+    run_stride: i8,
+    run_len: u8,
+    motif: [i8; MOTIF_LEN],
+    motif_len: u8,
+    motif_play: u8,
+    motif_k: u8,
+    words_since_motif: u8,
 }
 
 /// **THE MELODY ENGINE** (§10) — `Copy`, alloc-free, deterministic, and driven
@@ -831,22 +1191,46 @@ struct Undo {
 /// produces the same notes (A27).
 #[derive(Clone, Copy, Debug)]
 pub struct MelodyV2 {
-    /// Playhead into [`SONG_THEME`], 0..28.
-    theme_pos: u8,
-    /// Which phrase of [`SONG_FORM`] the playhead sits in, 0..4.
-    phrase_idx: u8,
-    /// THE SOUNDING VERSE DEGREE, 0..8 (C5..G6). Every pitched thing in v2
-    /// that is not a bass root is stated relative to this.
+    /// THE SOUNDING DEGREE, 0..8 (C5..G6). Every pitched thing in v2 that is
+    /// not a bass root is stated relative to this, and [`MelodyV2::derive`]
+    /// is the only thing that moves it on a keystroke.
     walk: i8,
-    /// `at_ms` of the last verse STEP — the step gate's own clock.
-    last_step_ms: u32,
+    /// HOW MANY KEYSTROKES HAVE MOVED THE MELODY — one per typed key, with
+    /// no exception anywhere in this file (test / introspection hook, and
+    /// the census's `steps` column).
+    steps: u32,
     /// `at_ms` of the last admitted key (any touch) — the IOI's clock.
     last_key_ms: u32,
-    /// `at_ms` of the last TUNE onset that actually spawned a voice — the
-    /// coalescing clock ([`RESTRIKE_COALESCE_MS`]).
+    /// `at_ms` of the last typed key that actually SPAWNED a tune voice.
     last_onset_ms: u32,
-    /// Keys since the last step, 1-based inside [`RESTRIKE_L0`]'s ladder.
+    /// Keys since the line last moved, 1-based inside [`RESTRIKE_L0`]'s
+    /// ladder — a doubled letter's tremolo, not a fast hand's.
     restrike: u8,
+    /// THE PREVIOUS KEY'S ALPHABET RANK ([`EventMeta::rank`]), and the left
+    /// operand of the interval. `0` is "nothing to measure against yet", and
+    /// a cue that carries no rank never clobbers it: an echo-born cue must
+    /// not make the next real letter leap.
+    prev_rank: u8,
+    /// The stride the line is repeating, and how many times running —
+    /// [`MELODY_RUN_MAX`]'s whole state.
+    run_stride: i8,
+    run_len: u8,
+    /// THE LINE'S OWN SUBJECT: the first [`MOTIF_LEN`] intervals since the
+    /// last Enter or rest, and how many of them have been written.
+    motif: [i8; MOTIF_LEN],
+    motif_len: u8,
+    /// How many of the subject's intervals are still to be answered, and
+    /// where in it the answer has reached.
+    motif_play: u8,
+    motif_k: u8,
+    /// Word heads since the subject was last answered ([`MOTIF_EVERY_WORDS`]).
+    words_since_motif: u8,
+    /// THE AUTO-REPEAT DETECTOR'S STATE: the previous raw gap and how many
+    /// gaps of the live machine-regular run have agreed. Deliberately NOT on
+    /// the undo frame — it describes the hand on the key, not the text, and a
+    /// Backspace does not un-hold a key.
+    prev_gap: u32,
+    repeat_run: u8,
     /// Inter-onset interval, EMA'd, clamped 30..600 ms.
     ioi_ms: f32,
     /// Position in [`CHORD_LOOP`], advanced by Space run heads only.
@@ -856,10 +1240,10 @@ pub struct MelodyV2 {
     word_pos: u8,
     /// True while inside a whitespace RUN: only its head is a downbeat.
     space_run: bool,
-    /// Position in [`SHIFT_LIFT`].
-    shift_step: u8,
-    /// Position in [`ECHO_RATIO`].
-    echo_k: u8,
+    /// THE TIMBRE LADDER'S STOPS (§7 step 3) — which of §3.3's additions
+    /// this synth voices. All on in production; the bench pulls them one at a
+    /// time so the owner hears one variable per file.
+    stops: TimbreStops,
     /// Position in [`GLINT_DEGREES`].
     glint_k: u8,
     /// The last line feed of the live cascade RUN (D18) — see
@@ -911,19 +1295,27 @@ impl Default for MelodyV2 {
 }
 
 impl MelodyV2 {
-    /// A fresh melody: the theme at its first note, the loop on I, no history.
+    /// A fresh melody: home, the loop on I, no history and no subject.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            theme_pos: 0,
-            phrase_idx: 0,
-            // The hook's own tonic, so a session's first key opens on home
-            // even before the first step has run.
+            // The lattice tonic, so a session's first key opens on home even
+            // before anything has been derived.
             walk: 0,
-            last_step_ms: 0,
+            steps: 0,
             last_key_ms: 0,
             last_onset_ms: 0,
             restrike: 0,
+            prev_rank: 0,
+            run_stride: 0,
+            run_len: 0,
+            motif: [0; MOTIF_LEN],
+            motif_len: 0,
+            motif_play: 0,
+            motif_k: 0,
+            words_since_motif: 0,
+            prev_gap: 0,
+            repeat_run: 0,
             ioi_ms: IOI_DEFAULT_MS,
             // Parked where a keyed Enter parks it, so the session's FIRST
             // word boundary lands on I exactly as every later line's does
@@ -932,8 +1324,7 @@ impl MelodyV2 {
             chord: CHORD_AFTER_ENTER,
             word_pos: 0,
             space_run: false,
-            shift_step: 0,
-            echo_k: 0,
+            stops: TimbreStops::ALL,
             glint_k: 0,
             cascade_at: 0,
             seen_jump: false,
@@ -943,13 +1334,18 @@ impl MelodyV2 {
             seen_enter: false,
             seen_key: false,
             undo: [Undo {
-                theme_pos: 0,
-                phrase_idx: 0,
                 walk: 0,
                 restrike: 0,
                 chord: 0,
                 word_pos: 0,
-                last_step_ms: 0,
+                prev_rank: 0,
+                run_stride: 0,
+                run_len: 0,
+                motif: [0; MOTIF_LEN],
+                motif_len: 0,
+                motif_play: 0,
+                motif_k: 0,
+                words_since_motif: 0,
             }; UNDO_N],
             undo_len: 0,
             lead: None,
@@ -965,10 +1361,16 @@ impl MelodyV2 {
         self.walk
     }
 
-    /// THE PLAYHEAD (test / introspection hook).
+    /// HOW MANY KEYSTROKES HAVE MOVED THE MELODY (test / introspection hook).
+    ///
+    /// **This is R1's whole falsifiable content.** It is incremented once per
+    /// typed key, unconditionally, at the one place a key enters the melody —
+    /// so a census that pushes `n` typed keys and reads anything but `n` here
+    /// has caught a gate growing back. There is no branch it can miss,
+    /// because there is no branch.
     #[must_use]
-    pub fn theme_pos(&self) -> u8 {
-        self.theme_pos
+    pub fn steps(&self) -> u32 {
+        self.steps
     }
 
     /// The live chord's index into [`CHORD_LOOP`] (test / introspection hook).
@@ -983,41 +1385,70 @@ impl MelodyV2 {
         self.word_pos
     }
 
+    /// TRUE WHILE THE LINE IS ANSWERING ITS OWN SUBJECT — the next key will
+    /// replay one of [`MOTIF_LEN`] latched intervals rather than derive its
+    /// own (test / introspection hook).
+    ///
+    /// A census cannot otherwise tell an answered interval apart from a
+    /// derived one, and the difference decides how a repeated pitch is
+    /// CHARGED: a subject that latched a unison and is replaying it is the
+    /// line answering itself, which §3.1 asks for, where the same repeat
+    /// arriving from nowhere is the line stalling, which §3.1 forbids. The
+    /// bench's repeat ledger reads this hook to keep those two apart, and
+    /// §3.3's bloom will want the same notes named.
+    #[must_use]
+    pub fn motif_answering(&self) -> bool {
+        self.motif_play > 0
+    }
+
     /// The smoothed inter-onset interval in ms (test / introspection hook).
     #[must_use]
     pub fn ioi_ms(&self) -> f32 {
         self.ioi_ms
     }
 
-    fn phrase_start(&self) -> usize {
-        usize::from(SONG_FORM[usize::from(self.phrase_idx)])
+    /// WHEN A TYPED KEY LAST SPAWNED A TUNE VOICE, on the host input clock
+    /// (test / introspection hook).
+    ///
+    /// Written by [`TrailSynth::v2_typed`] AFTER the spawn returned a slot,
+    /// so it records what the mixer actually did rather than what the melody
+    /// intended. A key that leaves this where it was made no sound — which,
+    /// with the re-strike coalescer deleted, can now only mean the TUNE lane
+    /// refused the voice. The census's `silent` column is exactly this test,
+    /// and it is meant to read 0 for ever.
+    #[must_use]
+    pub fn last_onset_ms(&self) -> u32 {
+        self.last_onset_ms
     }
 
-    fn phrase_end(&self) -> usize {
-        usize::from(SONG_FORM[usize::from(self.phrase_idx) + 1])
-    }
-
-    fn at_phrase_start(&self) -> bool {
-        usize::from(self.theme_pos) == self.phrase_start()
-    }
-
-    /// Hand the playhead to the NEXT phrase of the form — never a rewind to
-    /// zero. That is the whole difference between a theme and a ringtone, and
-    /// it is v1's rule kept verbatim.
-    fn open_next_phrase(&mut self) {
-        self.phrase_idx = (self.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
-        self.theme_pos = SONG_FORM[usize::from(self.phrase_idx)];
+    /// TRUE AT A STRUCTURAL BOUNDARY of the line, at time `at`: a word head
+    /// (nothing typed since the last Space, Enter or line feed) or a rest
+    /// (nothing typed for [`PHRASE_PAUSE_MS`]).
+    ///
+    /// These are the two boundaries the derived line still has, and the
+    /// handback needs BOTH. A word head alone is the finer and the usual one,
+    /// but a stream with no spaces in it — a pasted base64 blob, a password
+    /// field — would never reach one, and the borrowed key would be held for
+    /// as long as that stream ran.
+    fn at_boundary(&self, at: u32) -> bool {
+        self.word_pos == 0
+            || (self.seen_key && at.saturating_sub(self.last_key_ms) >= PHRASE_PAUSE_MS)
     }
 
     fn push_undo(&mut self) {
         let frame = Undo {
-            theme_pos: self.theme_pos,
-            phrase_idx: self.phrase_idx,
             walk: self.walk,
             restrike: self.restrike,
             chord: self.chord,
             word_pos: self.word_pos,
-            last_step_ms: self.last_step_ms,
+            prev_rank: self.prev_rank,
+            run_stride: self.run_stride,
+            run_len: self.run_len,
+            motif: self.motif,
+            motif_len: self.motif_len,
+            motif_play: self.motif_play,
+            motif_k: self.motif_k,
+            words_since_motif: self.words_since_motif,
         };
         if usize::from(self.undo_len) == UNDO_N {
             // Drop the OLDEST frame: a correction can walk back a word, and a
@@ -1036,72 +1467,86 @@ impl MelodyV2 {
         };
         let f = self.undo[usize::from(n)];
         self.undo_len = n;
-        self.theme_pos = f.theme_pos;
-        self.phrase_idx = f.phrase_idx;
         self.walk = f.walk;
         self.restrike = f.restrike;
         self.chord = f.chord;
         self.word_pos = f.word_pos;
-        self.last_step_ms = f.last_step_ms;
+        self.prev_rank = f.prev_rank;
+        self.run_stride = f.run_stride;
+        self.run_len = f.run_len;
+        self.motif = f.motif;
+        self.motif_len = f.motif_len;
+        self.motif_play = f.motif_play;
+        self.motif_k = f.motif_k;
+        self.words_since_motif = f.words_since_motif;
     }
 
-    /// The verse STEPS: the playhead's note becomes the sounding degree and
-    /// the gate's clock restarts.
-    fn step(&mut self, at: u32) {
-        self.last_step_ms = at;
-        self.restrike = 0;
+    /// Is `deg` a chord tone of the live chord (§10.3)?
+    fn deg_is_lit(&self, deg: i32) -> bool {
+        let pc = deg.rem_euclid(5) as u8;
+        CHORD_LOOP[usize::from(self.chord)].lit & (1 << pc) != 0
     }
 
     /// Is the sounding degree a chord tone of the live chord (§10.3)?
     fn lit(&self) -> bool {
-        let pc = i32::from(self.walk).rem_euclid(5) as u8;
-        CHORD_LOOP[usize::from(self.chord)].lit & (1 << pc) != 0
+        self.deg_is_lit(i32::from(self.walk))
     }
 
-    /// THE REST CADENCE'S DEGREE (§10.2), made exact for A2's in-word law.
+    /// **THE SNAP** (§3.1 step 6, and the rest's own resolution): the degree
+    /// lit by the live chord NEAREST to `deg`, searched outward to
+    /// [`WORD_HEAD_SNAP_DEG`].
     ///
-    /// §10.2 closes a paused phrase onto its final degree — "the note the
-    /// theme was heading for". Between words that is the whole cadence and
-    /// it is kept verbatim. INSIDE a word it can be the one leap the
-    /// instrument otherwise cannot make: a pause after the hook's first note
-    /// (C5, `word_pos` 1) would close onto the hook's last (E6) — a tenth,
-    /// and exactly the octave-class jump §9.0's first cause is about, on the
-    /// one key where a listener is still inside the word. So a mid-word
-    /// cadence may reach at most [`WORD_LEAP_MAX_DEG`] degrees — a sixth —
-    /// from the sounding note: the final degree when it lies within that,
-    /// else the CHORD TONE nearest to it inside the sixth (the live chord's
-    /// own note, so the cadence is still a cadence). The playhead is
-    /// untouched either way: the next phrase opens where §10.2 says.
+    /// This is the bounded search the rest cadence used to carry privately,
+    /// lifted out so a word head and a resolution use ONE law. `from` is the
+    /// degree the line is coming from and it breaks ties: at equal distance
+    /// the snap takes the side that CONTINUES the derived contour, so a
+    /// rising word head that has to move still rises.
     ///
-    /// Total: a sixth is four consecutive pitch classes and every chord of
-    /// [`CHORD_LOOP`] lights three of five, so the search always lands; the
-    /// clamp below is the unreachable guard that keeps the function total on
-    /// the TUNE register.
-    fn cadence_degree(&self) -> i8 {
-        let target = i32::from(SONG_THEME[self.phrase_end() - 1]);
-        let from = i32::from(self.walk);
-        let leap = target - from;
-        if self.word_pos == 0 || leap.abs() <= WORD_LEAP_MAX_DEG {
-            return target as i8;
+    /// Total: five consecutive degrees carry all five pitch classes, every
+    /// chord of [`CHORD_LOOP`] lights three of them, and the register's own
+    /// bounds cut at most two candidates off one side — so a lit degree is
+    /// always inside ±2 and the `deg` fallback below is unreachable. It is
+    /// kept because a function that lights the chord differently must fail
+    /// loudly in a test rather than silently return an unlit note.
+    fn nearest_lit_within(&self, deg: i32, from: i32) -> i32 {
+        let deg = deg.clamp(TUNE_DEG_LO, TUNE_DEG_HI);
+        if self.deg_is_lit(deg) {
+            return deg;
         }
-        let dir = leap.signum();
-        let lit = CHORD_LOOP[usize::from(self.chord)].lit;
-        for k in (1..=WORD_LEAP_MAX_DEG).rev() {
-            let d = from + dir * k;
-            if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&d) && lit & (1 << d.rem_euclid(5)) != 0 {
-                return d as i8;
+        let dir = if deg >= from { 1 } else { -1 };
+        for k in 1..=WORD_HEAD_SNAP_DEG {
+            for cand in [deg + dir * k, deg - dir * k] {
+                if (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&cand) && self.deg_is_lit(cand) {
+                    return cand;
+                }
             }
         }
-        (from + dir * WORD_LEAP_MAX_DEG).clamp(TUNE_DEG_LO, TUNE_DEG_HI) as i8
+        deg
+    }
+
+    /// RE-LATCH THE SUBJECT (§3.1): the next [`MOTIF_LEN`] intervals will be
+    /// this line's new motif, and nothing of the old one is answered. Run by
+    /// an Enter and by a rest, which are the two places a line ends.
+    fn relatch_motif(&mut self) {
+        self.motif_len = 0;
+        self.motif_play = 0;
+        self.motif_k = 0;
+        self.words_since_motif = 0;
     }
 }
 
 /// THE WIDEST INTERVAL A WORD MAY CARRY, in lattice degrees: four — a major
 /// sixth (5/3). Five is the octave, and an octave-class leap between two
 /// keys of one word is the defect this instrument exists to cure (§9.0
-/// cause 1, A2). The theme's own steps never exceed three (a fifth); the only
-/// other in-word move the engine can make is the rest cadence, which
-/// [`MelodyV2::cadence_degree`] folds to this.
+/// cause 1, A2).
+///
+/// [`MelodyV2::derive`] CLAMPS its stride to this, which is what makes A2 a
+/// property of the arithmetic rather than of the table it used to read:
+/// [`stride_mag`] tops out at 3 (a fifth) and gravity may add one, so the
+/// clamp is the guard on that sum and the one place the law is written. The
+/// word-head snap can move a further two degrees, and may: a word head is
+/// the letter AFTER a space, so the interval it widens is a between-word
+/// interval, which A2 has never governed.
 const WORD_LEAP_MAX_DEG: i32 = 4;
 
 /// What one admitted `Typed` asks the synth to spawn — the melody's whole
@@ -1114,50 +1559,236 @@ struct TypedPlan {
     lit: bool,
     /// Level re the step, BEFORE the loudness arc's `g_IOI`.
     level: f32,
-    /// Whether a voice is spawned at all — a re-strike inside
-    /// [`RESTRIKE_COALESCE_MS`] advances the state and stays silent.
-    speaks: bool,
-    /// Under a live sing-along a re-strike drops to the mallet alone (§10.2),
-    /// so a held key cannot machine-gun under the 150 BPM riff.
+    /// THE FELT TOUCH: the tine's partials go to zero and the mallet alone
+    /// speaks. Two callers — a live sing-along's re-strike (§10.2, so a held
+    /// key cannot machine-gun under the 150 BPM riff) and macOS auto-repeat
+    /// ([`AUTOREPEAT_JITTER_MS`]).
+    ///
+    /// **It is not silence and never becomes silence.** A held key is still
+    /// the human playing; it is heard as *felt* rather than *pitched*, which
+    /// is what R1 costs to honour, honoured.
     mallet_only: bool,
+    /// THE SAME PITCH AGAIN, whatever the touch: a doubled letter's re-strike
+    /// or a word head's common tone. §9.5 law 5 damps the previous voice on
+    /// this, not on the touch — two independently phased sines at one
+    /// frequency comb whether the second is a tremolo or an accent.
+    repeat: bool,
+    /// This key is the first letter of a word.
+    word_head: bool,
+    /// This key ended a phrase rest ([`PHRASE_PAUSE_MS`]) and resolved the
+    /// line before sounding — the room answers it (§3.3's air cloud).
+    rest: bool,
+    /// This word head opened the line's answer to its own subject — the
+    /// answering voice sounds behind it (§3.3).
+    answer_head: bool,
+}
+
+/// WHICH OF §3.3's ADDITIONS THIS SYNTH VOICES — the timbre ladder's stops
+/// (§7 step 3: `plain` / `bloom` / `hue` / `room`, one variable per file).
+/// Production is [`TimbreStops::ALL`]; the bench renders the rungs. A stop
+/// that is out spawns nothing and reads no hue, so `plain` is the shipped
+/// tine byte for byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimbreStops {
+    /// The 3f/4f/6f bloom behind every lit key.
+    pub bloom: bool,
+    /// `hue_air` on the bloom's level and pan, `ROOF_HUE_ADD_HZ` on the note.
+    pub hue: bool,
+    /// The two-tap air cloud on Enter and phrase rests, and the answering
+    /// voice at motif word heads.
+    pub room: bool,
+}
+
+impl TimbreStops {
+    /// Everything: the instrument that ships.
+    pub const ALL: Self = Self {
+        bloom: true,
+        hue: true,
+        room: true,
+    };
+    /// Nothing: the derived line through the shipped tine — the ladder's
+    /// control.
+    pub const PLAIN: Self = Self {
+        bloom: false,
+        hue: false,
+        room: false,
+    };
+}
+
+impl Default for TimbreStops {
+    fn default() -> Self {
+        Self::ALL
+    }
 }
 
 impl MelodyV2 {
-    /// §10.2's `on Typed`, entire. Advances the state and returns what to
+    /// **ON TYPED**, entire (§3.1). Advances the state and returns what to
     /// play; it spawns nothing itself, so the whole melody law is testable
     /// without a synth.
-    fn on_typed(&mut self, at: u32, sing: bool) -> TypedPlan {
+    ///
+    /// **ONE KEYSTROKE IS ONE MELODY STEP.** There is no branch on this path
+    /// that leaves [`Self::walk`] underived or [`Self::steps`] unincremented,
+    /// at any typing rate, for any glyph, held key or not. Everything the
+    /// deleted 220 ms gate was buying — a line that stays conjunct, stays in
+    /// register, and does not run away under a fast hand — is bought here by
+    /// note CHOICE instead, in [`Self::derive`].
+    fn on_typed(&mut self, at: u32, rank: u8, sing: bool, shifted: bool) -> TypedPlan {
         let gap = at.saturating_sub(self.last_key_ms);
+        let first = !self.seen_key;
+        self.push_undo();
+
+        // MACHINE REGULARITY, read on the RAW gaps before the EMA smooths
+        // them away. It decides the TOUCH and never the step.
+        let held = self.detect_autorepeat(gap, rank, first);
+
+        // A REST RESOLVES THE LINE, and that is all it does. It resolves the
+        // walk onto the live chord where it stands, drops the contour bias
+        // and re-latches the subject — then this key derives its own note
+        // from the resolved position exactly as any other key would. Nothing
+        // here can consume the keystroke.
+        let rest = !first && gap >= PHRASE_PAUSE_MS;
+        if rest {
+            let here = i32::from(self.walk);
+            self.walk = self.nearest_lit_within(here, here) as i8;
+            self.run_stride = 0;
+            self.run_len = 0;
+            self.relatch_motif();
+        }
+
+        // THE WORD HEAD, decided BEFORE `word_pos` moves: this key is the
+        // first letter of a word iff nothing has been typed since the last
+        // Space, Enter or line feed.
+        let word_head = self.word_pos == 0;
+        let mut answer_head = false;
+        if word_head {
+            self.words_since_motif = self.words_since_motif.saturating_add(1);
+            // THE ANSWER (§3.1). A latched subject is answered at every
+            // MOTIF_EVERY_WORDS-th word head: this head snaps to a chord tone
+            // as every head does, and the keys after it replay the subject's
+            // intervals from wherever that landed — the transposition the
+            // design asks for, for free.
+            if usize::from(self.motif_len) == MOTIF_LEN
+                && self.words_since_motif >= MOTIF_EVERY_WORDS
+            {
+                self.motif_play = MOTIF_LEN as u8;
+                self.motif_k = 0;
+                self.words_since_motif = 0;
+                answer_head = true;
+            }
+        }
+
+        let from = i32::from(self.walk);
+        let mut deg = self.derive(rank, gap, first, word_head);
+        if word_head {
+            // WORD HEADS LAND LIT (§3.1 step 6). Interiors may pass, and a
+            // passing note sounds at PASSING_LEVEL — the brightness law
+            // already in place below.
+            deg = self.nearest_lit_within(deg, from);
+            // …BUT THE SNAP MAY NOT COMPLETE A MACHINE'S RUN. `derive` has
+            // already inverted a fourth identical stride; the snap can move
+            // the head two degrees and hand that stride straight back. When
+            // it would, the head takes the nearest chord tone on the OTHER
+            // side of the line: three of five classes are lit, so one is
+            // always inside three degrees unless the register's bound cuts
+            // it off — and then the snap stands, which is the rare case the
+            // render's siren verdict exists to notice.
+            let sounded = deg - from;
+            if sounded != 0
+                && self.run_len >= MELODY_RUN_MAX
+                && i32::from(self.run_stride) == sounded
+            {
+                let away = -sounded.signum();
+                if let Some(alt) = (1..=WORD_HEAD_SNAP_DEG + 1)
+                    .map(|k| from + away * k)
+                    .find(|c| (TUNE_DEG_LO..=TUNE_DEG_HI).contains(c) && self.deg_is_lit(*c))
+                {
+                    deg = alt;
+                }
+            }
+        }
+        // A CAPITAL IS THE SAME STEP, AN OCTAVE UP ([`CAPITAL_LIFT_DEG`]),
+        // clamped to the register's ceiling — applied BEFORE the run is
+        // booked and BEFORE the walk moves, so the line continues from the
+        // note the ear got and the siren verdict counts the stride it heard.
+        // Inside a word the lift is held to A2's in-word bound, measured from
+        // the note before: an accent, never an octave-class leap between two
+        // letters of one word.
+        // A doubled capital is still a doubled letter (the repeat stands),
+        // and a capital already at the ceiling is not lifted ONTO the note
+        // it came from: the lift may raise a step, never manufacture a
+        // repeat the text did not type.
+        if shifted && !first && deg != from {
+            let lifted = (deg + CAPITAL_LIFT_DEG).min(TUNE_DEG_HI);
+            let lifted = if word_head {
+                lifted
+            } else {
+                lifted.min(from + WORD_LEAP_MAX_DEG)
+            };
+            if lifted != from {
+                deg = lifted;
+            }
+        }
+        // THE RUN IS BOOKED ON WHAT WILL SOUND — after the reflection, after
+        // the snap, after the lift — because that is the stride the ear
+        // counts and the only one [`MELODY_RUN_MAX`] can be a guarantee about.
+        self.note_run(deg - from);
+        // THE LINE WRITES ITS OWN SUBJECT out of its first INTERVALS, and
+        // that word is load-bearing (§3.1: "the first three intervals after
+        // an Enter"). A key that is answering the subject does not also
+        // rewrite it — and neither does a key that made no interval to give.
+        //
+        // A SESSION'S VERY FIRST KEY IS EXACTLY THAT KEY. It has no note
+        // before it to be a distance FROM, so `derive` returns the degree it
+        // stood on and `deg - from` is a unison the text never typed. Latched
+        // as the subject's opening interval it became a repeated note at
+        // EVERY answering word head, for the whole session: 24 of them on the
+        // bench's 403-key prose, one per answer, all at `word_pos == 1`,
+        // every one of them the engine standing still while the hand moved.
+        // The subject now opens on the first real distance between two keys.
+        //
+        // THE SUBJECT IS A WITHIN-WORD FIGURE, and it is answered inside a
+        // word, so each latched interval is held to A2's in-word bound: a
+        // head's snap or a capital's lift may widen the line's first interval
+        // past a sixth, and an answer replaying that mid-word would be the
+        // octave-class leap A2 forbids.
+        if !first && usize::from(self.motif_len) < MOTIF_LEN && self.motif_play == 0 {
+            self.motif[usize::from(self.motif_len)] =
+                (deg - from).clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG) as i8;
+            self.motif_len += 1;
+        }
+        self.walk = deg as i8;
+        self.steps = self.steps.saturating_add(1);
+
+        // A RE-STRIKE IS A REPEATED PITCH INSIDE A WORD, and now only that: a
+        // doubled letter (§3.1 step 1's stride of zero). A session's FIRST
+        // key is a step whatever degree it lands on: there is no note before
+        // it for it to be a repeat of. And A WORD HEAD IS NEVER A RE-STRIKE:
+        // when the chord snap lands the head on the degree the previous word
+        // ended on, that is a common tone across a chord change — voice
+        // leading — and §3.1 step 6 exists to make the head PROMINENT. Under
+        // the ladder it sounded −4.4 dB below the interiors it is meant to
+        // lead (the step-3 review counted ~22 of 99 prose heads inverted that
+        // way). The repeated pitch still damps the previous voice (`repeat`,
+        // below); only the touch, and with it the level and the timbre, is
+        // the step's.
+        let repeat = deg == from && !first;
+        let touch = if repeat && !word_head {
+            self.restrike = self.restrike.saturating_add(1);
+            Touch::ReStrike
+        } else {
+            self.restrike = 0;
+            Touch::Step
+        };
+
+        // THE IOI, updated AFTER `derive` has read it: the contour asks
+        // whether this key was early or late against the tempo as it stood,
+        // and a tempo that had already absorbed half of this very gap
+        // ([`IOI_EMA_ALPHA`]) would answer a different question.
         self.ioi_ms = if self.seen_key && gap < IOI_RESET_MS {
             (1.0 - IOI_EMA_ALPHA) * self.ioi_ms
                 + IOI_EMA_ALPHA * (gap as f32).clamp(IOI_MIN_MS, IOI_MAX_MS)
         } else {
             IOI_DEFAULT_MS
-        };
-        self.push_undo();
-
-        // A REST CADENCES THE PHRASE. A think-pause closes the phrase you are
-        // in onto its own final degree — the note the theme was heading for —
-        // and the next key opens the phrase after it. Not applicable at a
-        // phrase's very first note: there is no phrase to close, and closing
-        // one would skip a phrase per pause.
-        let rest = self.seen_key && gap >= PHRASE_PAUSE_MS && !self.at_phrase_start();
-        let touch = if rest {
-            self.walk = self.cadence_degree();
-            self.open_next_phrase();
-            self.step(at);
-            Touch::Step
-        } else if !self.seen_key || at.saturating_sub(self.last_step_ms) >= STEP_GATE_MS {
-            self.walk = SONG_THEME[usize::from(self.theme_pos)];
-            self.theme_pos += 1;
-            if self.theme_pos == SONG_FORM[usize::from(self.phrase_idx) + 1] {
-                self.open_next_phrase();
-            }
-            self.step(at);
-            Touch::Step
-        } else {
-            self.restrike = self.restrike.saturating_add(1);
-            Touch::ReStrike
         };
 
         let lit = self.lit();
@@ -1174,13 +1805,22 @@ impl MelodyV2 {
                 * (RESTRIKE_L0 * RESTRIKE_FALL.powi(i32::from(self.restrike).saturating_sub(1)))
                     .max(RESTRIKE_FLOOR)
         };
-        // STEPS ARE NEVER THINNED (A15); only re-strikes coalesce.
-        let speaks =
-            touch == Touch::Step || at.saturating_sub(self.last_onset_ms) >= RESTRIKE_COALESCE_MS;
-        // A SING-ALONG ADMITS STEPS ONLY (§10.2, A31).
-        let mallet_only = sing && touch == Touch::ReStrike;
-        if speaks {
-            self.last_onset_ms = at;
+        // A SING-ALONG NEVER MUTES THE TYPIST'S OWN LINE (§10.2, A31, and
+        // R1's spirit). Under a live riff the melody is already ducked under
+        // the cat by the sing duck; the one thing the riff still takes off a
+        // key is a doubled letter's tremolo, which is §3.1's own spelling —
+        // `sing && touch == ReStrike`. An earlier rewrite sent every
+        // non-word-head key to the mallet while the riff was armed (a whole
+        // bar, τ 0.40 s handback), which left roughly one pitched note per
+        // word: R1 in letter and not in spirit. The machine gun A31 is named
+        // for was the deleted gate's re-strike ladder firing under the riff;
+        // with the gate gone a fast hand's notes are its own line, ducked,
+        // and a held key is caught by `held` at any rate.
+        let mallet_only = held || (sing && touch == Touch::ReStrike);
+        // A CUE WITH NO KEY BEHIND IT CARRIES NO RANK, and must not clobber
+        // the one the next real letter will be measured against.
+        if rank != 0 {
+            self.prev_rank = rank;
         }
         self.last_key_ms = at;
         self.seen_key = true;
@@ -1192,9 +1832,202 @@ impl MelodyV2 {
             deg: i32::from(self.walk),
             lit,
             level,
-            speaks,
             mallet_only,
+            repeat,
+            word_head,
+            rest,
+            answer_head,
         }
+    }
+
+    /// **THE DERIVATION** (§3.1): the degree this keystroke sounds, from what
+    /// was typed and how it was typed. Pure in everything but its own run and
+    /// motif bookkeeping — no clock, no RNG, no allocation — so the same text
+    /// typed with the same rhythm is the same line, every time (A27).
+    fn derive(&mut self, rank: u8, gap: u32, first: bool, word_head: bool) -> i32 {
+        let from = i32::from(self.walk);
+
+        // THE ANSWER: the line replaying its own subject. Not at the head
+        // itself — the head snaps to a chord tone and IS the transposition
+        // the subject is answered onto.
+        if !word_head && self.motif_play > 0 {
+            let iv = i32::from(self.motif[usize::from(self.motif_k)]);
+            self.motif_k = self.motif_k.saturating_add(1);
+            self.motif_play -= 1;
+            let mut deg = reflect_deg(from + iv);
+            // A reflected answer that lands where it left turns one degree
+            // further, exactly as a derived stride does below.
+            if iv != 0 && deg == from {
+                deg = reflect_deg(from + iv + iv.signum());
+            }
+            // THE ANSWER IS UNDER THE SAME GUARD AS THE LINE. A subject is
+            // latched from strides the guard already allowed, so it can be
+            // `+1 +1 +1` — and answered after a head that itself rose, that
+            // is four identical strides sounding, which is the machine
+            // [`MELODY_RUN_MAX`] exists to refuse. The fourth inverts here
+            // too: the subject comes back in inversion, which is what an
+            // answer has been allowed to do for three hundred years.
+            return self.break_run(from, deg);
+        }
+
+        // A session's very first key has nothing to be an interval FROM.
+        if first {
+            return from;
+        }
+
+        // *Step 1 — the text makes the interval.* Folded into −6..=6 so the
+        // alphabet's distance is a musical distance and not a register jump.
+        // With no pair of glyphs to measure — an echo-born cue with no rank,
+        // or the first letter of a new line — the RHYTHM is what there is,
+        // and the same fold reads the gap: still generative, still
+        // deterministic, and a stream that misses the key seam (ssh, a
+        // program echoing) still gets a moving line instead of one note.
+        let (raw, repeated) = if rank != 0 && self.prev_rank != 0 {
+            let d = i32::from(rank) - i32::from(self.prev_rank);
+            (d, d == 0)
+        } else {
+            // The gap is a magnitude, never a repeat: two keys at the same
+            // millisecond are the host's stamp failing, not a doubled letter.
+            (gap as i32, false)
+        };
+        let r = fold_signed13(raw);
+        let mag = stride_mag(r, repeated);
+        // THE DIRECTION OF A FOLDED-TO-ZERO LEAP is the raw difference's own,
+        // because the folded value has none left to give: `a` to `n` climbed
+        // thirteen letters and must not be handed a signless stride, which
+        // would silently become the repeat [`stride_mag`] just refused it.
+        let text_sign = if r != 0 { r.signum() } else { raw.signum() };
+
+        // *Step 2 — the hand makes the contour.* An accelerating burst
+        // climbs; a hesitating hand descends; ordinary jitter inside the dead
+        // band leaves the letter's own sign alone. This is the whole of "the
+        // melody is generated from the typing patterns": type the same
+        // sentence in a different rhythm and it is a different tune.
+        let tempo = self.ioi_ms;
+        let sign = if (gap as f32) < ACCEL_SHARE * tempo {
+            1
+        } else if (gap as f32) > DECEL_SHARE * tempo {
+            -1
+        } else {
+            text_sign
+        };
+        let mut stride = mag * sign;
+
+        // *Step 3 — gravity*, so the line has a tessitura and cannot walk to
+        // a bound. See [`MELODY_CENTRE_DEG`] for why the pull is one-sided.
+        //
+        // GRAVITY BENDS A MOVING LINE; IT NEVER STALLS ONE AND NEVER STARTS
+        // ONE. A rising second at the top of the register would come out of
+        // the addition as a stride of zero — a repeated note the text never
+        // asked for, and one the ear reads as a stutter rather than as a
+        // pull — so it becomes a falling second instead, the move the
+        // register wanted. And a DOUBLED LETTER is a stride of zero by §3.1
+        // step 1, "and therefore `Touch::ReStrike`": gravity applied to it
+        // would turn the text's own repeat into a step, which the step-3
+        // review caught in the outer register (one of the corpus's ten
+        // doubled pairs moved). The pull acts on a stride, not on a repeat.
+        if mag != 0 {
+            let pull = if from - MELODY_CENTRE_DEG > MELODY_GRAVITY_DEG {
+                -1
+            } else if from - MELODY_CENTRE_DEG < -MELODY_GRAVITY_DEG {
+                1
+            } else {
+                0
+            };
+            stride += pull;
+            if stride == 0 {
+                stride = pull;
+            }
+        }
+        // A2's in-word bound, as arithmetic: a sixth, never an octave class.
+        stride = stride.clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG);
+
+        // *Step 4 — reflect, never clamp.* A clamp pins against the ceiling
+        // and reads as a stuck siren; a reflection turns around and reads as
+        // a phrase.
+        let mut deg = reflect_deg(from + stride);
+        // A REFLECTION THAT LANDS BACK ON THE NOTE IT LEFT (`from + 2` off
+        // degree 7, say) is the same unearned repeat gravity could make: the
+        // line turned, and a turn is not a stall. It takes one further degree
+        // in the direction it turned, which is inside the register by the
+        // same bound that put it outside.
+        if stride != 0 && deg == from {
+            deg = reflect_deg(from + stride + stride.signum());
+        }
+
+        // *Step 5 — the anti-siren guard*, on the stride that will SOUND.
+        // §3.1 orders it after the reflection, and that order is the whole
+        // point: a `+3` off degree 6 sounds as `+1`, and a guard that had
+        // compared the `+3` against a run of `+1`s would have waved the
+        // fourth `+1` through — which is exactly what the render caught.
+        self.break_run(from, deg)
+    }
+
+    /// **THE FOURTH IDENTICAL STRIDE INVERTS** ([`MELODY_RUN_MAX`]), judged
+    /// on the stride the ear will get: `deg − from`, after the reflection.
+    /// Returns `deg` untouched unless it would complete the fourth; then the
+    /// first alternative that sounds a DIFFERENT non-zero stride inside the
+    /// in-word bound, tried in this order: the inversion; the inversion one
+    /// degree wider (when the plain inversion reflects back onto `from`, or
+    /// onto the same stride — at degree 0 a rising run cannot be inverted
+    /// at all); a wider step the same way; a narrower one. Something in the
+    /// list always exists: the register is nine degrees and the run stride
+    /// is one number, so at most one of the four candidates can equal it.
+    fn break_run(&self, from: i32, deg: i32) -> i32 {
+        let sounded = deg - from;
+        if sounded == 0 || self.run_len < MELODY_RUN_MAX || i32::from(self.run_stride) != sounded {
+            return deg;
+        }
+        let sgn = sounded.signum();
+        [
+            from - sounded,
+            from - sounded - sgn,
+            from + sounded + sgn,
+            from + sounded - sgn,
+        ]
+        .into_iter()
+        .map(reflect_deg)
+        .find(|c| {
+            let s = c - from;
+            s != 0 && s != sounded && s.abs() <= WORD_LEAP_MAX_DEG
+        })
+        .unwrap_or(deg)
+    }
+
+    /// [`MELODY_RUN_MAX`]'s bookkeeping: how long the line has been taking
+    /// the same stride. A repeat (stride 0) is not a run — it is the line
+    /// standing still — so it clears the count rather than extending it.
+    fn note_run(&mut self, stride: i32) {
+        if stride != 0 && i32::from(self.run_stride) == stride {
+            self.run_len = self.run_len.saturating_add(1);
+        } else {
+            self.run_stride = stride.clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG) as i8;
+            self.run_len = u8::from(stride != 0);
+        }
+    }
+
+    /// **THE AUTO-REPEAT DETECTORS** ([`AUTOREPEAT_JITTER_MS`]). Both leave
+    /// the melody advancing; all either can do is take the pitch off the
+    /// note.
+    fn detect_autorepeat(&mut self, gap: u32, rank: u8, first: bool) -> bool {
+        if first {
+            self.repeat_run = 1;
+            self.prev_gap = 0;
+            return false;
+        }
+        // Machine regularity, ON ONE GLYPH — see [`AUTOREPEAT_JITTER_MS`] for
+        // why the glyph is half the test.
+        let regular = rank != 0
+            && rank == self.prev_rank
+            && self.prev_gap != 0
+            && gap.abs_diff(self.prev_gap) <= AUTOREPEAT_JITTER_MS;
+        self.repeat_run = if regular {
+            self.repeat_run.saturating_add(1)
+        } else {
+            1
+        };
+        self.prev_gap = gap;
+        self.repeat_run >= AUTOREPEAT_RUN || gap <= AUTOREPEAT_FLOOR_MS
     }
 
     /// §10.4's `on Space`. **The playhead is untouched: a space is a rest.**
@@ -1217,22 +2050,33 @@ impl MelodyV2 {
         head
     }
 
-    /// §10.4's `on Enter`. Closes the phrase, parks the loop on
+    /// §10.4's `on Enter`. Ends the line home, parks the loop on
     /// [`CHORD_AFTER_ENTER`] and clears the undo stack — you cannot un-sing
     /// across a line break.
+    ///
+    /// **A LINE ENDS HOME AND THE NEXT LINE WRITES A NEW SUBJECT** (§3.1):
+    /// the walk resolves onto the register's centre, snapped to a tone of the
+    /// chord the next line will open against, the contour bias is dropped,
+    /// and the motif is re-latched — so recurrence exists inside a line and
+    /// nothing repeats across a session. `prev_rank` is cleared too: the
+    /// first letter of a new line has no letter before it, so it takes the
+    /// rhythm's interval rather than one measured against the last line's
+    /// final character.
     ///
     /// Returns whether the full cadence is earned (§11: ≥ 4 keys since the
     /// last Enter) or whether this Return is a bare tonic dyad.
     fn on_enter(&mut self, at: u32) -> bool {
-        if !self.at_phrase_start() {
-            self.walk = SONG_THEME[self.phrase_end() - 1];
-            self.open_next_phrase();
-        }
         let full = self.keys_since_enter >= ENTER_PICKUP_MIN_KEYS;
         self.chord = CHORD_AFTER_ENTER;
+        self.walk = self.nearest_lit_within(MELODY_CENTRE_DEG, MELODY_CENTRE_DEG) as i8;
+        self.relatch_motif();
+        self.run_stride = 0;
+        self.run_len = 0;
+        self.prev_rank = 0;
+        self.repeat_run = 1;
+        self.prev_gap = 0;
         self.word_pos = 0;
         self.restrike = 0;
-        self.last_step_ms = at;
         self.last_key_ms = at;
         self.last_enter_ms = at;
         self.seen_enter = true;
@@ -1265,17 +2109,16 @@ impl MelodyV2 {
     /// run is what the window measures, and the assertion is what settles the
     /// contradiction.
     fn on_jump(&mut self, at: u32) -> Option<bool> {
-        if self.at_phrase_start() {
-            self.walk = SONG_THEME[usize::from(self.theme_pos)];
-            self.theme_pos += 1;
-            if self.theme_pos == SONG_FORM[usize::from(self.phrase_idx) + 1] {
-                self.open_next_phrase();
-            }
-        } else {
-            self.walk = SONG_THEME[self.phrase_end() - 1];
-            self.open_next_phrase();
-        }
-        self.step(at);
+        // A LINE FEED IS NOT A KEYSTROKE: there is no glyph and no hand
+        // behind it, so there is nothing to derive from. It RESOLVES the line
+        // where it stands — the same act a rest performs — and the cascade is
+        // built on the resolved note. The contour bias goes with it: whatever
+        // the program printed is not a continuation of your typing.
+        let here = i32::from(self.walk);
+        self.walk = self.nearest_lit_within(here, here) as i8;
+        self.run_stride = 0;
+        self.run_len = 0;
+        self.restrike = 0;
         self.last_key_ms = at;
         self.seen_key = true;
         // A LINE FEED ENDS THE WORD, as a Space or a keyed Enter does: the
@@ -1319,18 +2162,6 @@ impl MelodyV2 {
         self.seen_key = true;
     }
 
-    /// §10.4's `on Shift`: the next lift degree, folded into the TUNE lane.
-    /// **Never claims the beat, never moves the playhead.**
-    fn on_shift(&mut self) -> i32 {
-        let deg = super::fold_register(
-            i32::from(self.walk) + SHIFT_LIFT[usize::from(self.shift_step)],
-            TUNE_DEG_LO,
-            TUNE_DEG_HI,
-        );
-        self.shift_step = (self.shift_step + 1) % SHIFT_LIFT.len() as u8;
-        deg
-    }
-
     /// The next glint's degree above the verse note (§13), rotating.
     fn next_glint_deg(&mut self) -> i32 {
         let deg = i32::from(self.walk) + GLINT_DEGREES[usize::from(self.glint_k)];
@@ -1338,11 +2169,15 @@ impl MelodyV2 {
         deg
     }
 
-    /// The next capital echo's ratio (§10.4), rotating.
-    fn next_echo_ratio(&mut self) -> f32 {
-        let r = ECHO_RATIO[usize::from(self.echo_k)];
-        self.echo_k = (self.echo_k + 1) % ECHO_RATIO.len() as u8;
-        r
+    /// THE ANSWER'S PITCH (§3.3): the nearest degree lit by the live chord
+    /// strictly ABOVE `deg`. Three of five classes are lit, so one is always
+    /// inside three degrees; the answer may sit above the TUNE register,
+    /// because it lives in [`LANE_BLOOM`] and the register is a lane's law.
+    fn answer_deg_above(&self, deg: i32) -> i32 {
+        (1..=5)
+            .map(|k| deg + k)
+            .find(|d| self.deg_is_lit(*d))
+            .unwrap_or(deg + CAPITAL_LIFT_DEG)
     }
 }
 
@@ -1350,21 +2185,54 @@ impl MelodyV2 {
 // The instrument's arithmetic — §9.1's curves, stated once
 // ===========================================================================
 
+/// FOLD a signed quantity into `−6..=6` by adding or subtracting 13 until it
+/// is in range — the interval fold of §3.1 step 1, stated once and used both
+/// for the alphabet's distance and for the millisecond gap that stands in for
+/// it when there is no pair of glyphs to measure.
+fn fold_signed13(d: i32) -> i32 {
+    (d + 6).rem_euclid(13) - 6
+}
+
+/// REFLECT a degree back inside the TUNE register (§3.1 step 4) — *never*
+/// clamp it. A clamp pins a climbing line against the ceiling and holds it
+/// there, which is what a siren is; a reflection turns the line around, which
+/// is what a phrase does.
+///
+/// The loop is the totality guard: a stride is bounded by
+/// [`WORD_LEAP_MAX_DEG`] and the register is eight degrees wide, so one
+/// reflection always suffices and the final clamp is unreachable.
+fn reflect_deg(deg: i32) -> i32 {
+    let mut d = deg;
+    for _ in 0..8 {
+        if d > TUNE_DEG_HI {
+            d = 2 * TUNE_DEG_HI - d;
+        } else if d < TUNE_DEG_LO {
+            d = 2 * TUNE_DEG_LO - d;
+        } else {
+            break;
+        }
+    }
+    d.clamp(TUNE_DEG_LO, TUNE_DEG_HI)
+}
+
 /// τ_v from the smoothed inter-onset interval (§9.1). See [`TAU_V_BASE_S`] for
 /// why this is the masking law and not a taste dial.
 fn tau_v_s(ioi_s: f32) -> f32 {
     (TAU_V_BASE_S * (TAU_V_OFFSET + TAU_V_SLOPE * ioi_s)).clamp(TAU_V_MIN_S, TAU_V_MAX_S)
 }
 
-/// §9.6's loudness arc, `g_IOI = clamp(√(IOI_s / 0.15), 0.6, 1.0)`.
+/// §9.6's loudness arc, `g_IOI = clamp(√(IOI_s / 0.25), 0.45, 1.0)`.
 fn g_ioi(ioi_s: f32) -> f32 {
     (ioi_s / G_IOI_REF_S).sqrt().clamp(G_IOI_MIN, 1.0)
 }
 
 /// §9.6's brightness law: the roof rises with rate, opens on a chord tone,
-/// takes up to [`ROOF_HEAT_HZ`] from the glow's blaze — and never, at any
-/// point, a decibel.
-fn roof_hz(cps: f32, lit: bool, heat: f32, touch: Touch) -> f32 {
+/// takes up to [`ROOF_HEAT_HZ`] from the glow's blaze and up to
+/// [`ROOF_HUE_ADD_HZ`] from the ribbon's hue (§3.3 item 3) — and never, at
+/// any point, a decibel. `hue` is the arc position already read through
+/// [`hue_arc`] (0 at the red end, 1 at the cyan end), so a caller with the
+/// hue stop out passes 0.0 and gets the pre-§3.3 roof exactly.
+fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
     let u = ((cps - ROOF_CPS_LO) / ROOF_CPS_SPAN).clamp(0.0, 1.0);
     let plain = ROOF_PLAIN_LO_HZ + (ROOF_PLAIN_HI_HZ - ROOF_PLAIN_LO_HZ) * u;
     let base = if lit {
@@ -1377,7 +2245,26 @@ fn roof_hz(cps: f32, lit: bool, heat: f32, touch: Touch) -> f32 {
     } else {
         base
     };
-    (base + ROOF_HEAT_HZ * heat.clamp(0.0, 1.0)).min(ROOF_MAX_HZ)
+    (base + ROOF_HEAT_HZ * heat.clamp(0.0, 1.0) + ROOF_HUE_ADD_HZ * hue.clamp(0.0, 1.0))
+        .min(ROOF_MAX_HZ)
+}
+
+/// THE HUE'S POSITION ON THE ARC, 0 at the red end and 1 at the cyan end,
+/// through [`tri`] so the wrap at hue 1 → 0 REFLECTS instead of jumping:
+/// `tri` has period two, so the hue is doubled and the arc is a mirror about
+/// its middle — the same shape [`hue_air`]'s cosine has, with no seam. One
+/// number drives the note's roof and the bloom's pan.
+fn hue_arc(hue: f32) -> f32 {
+    tri(2.0 * hue.clamp(0.0, 1.0))
+}
+
+/// THE HUE'S OWN AIR (§3.3 item 2). `ev.hue` reaches the synth on every event
+/// and was read nowhere in this module; this is that wire, connected: the
+/// bloom is dimmest at the red end of the arc and brightest at the cyan end,
+/// so the light you can see is the light you can hear. Smooth and periodic,
+/// so the wrap has no seam.
+fn hue_air(hue: f32) -> f32 {
+    0.55 + 0.45 * (0.5 - 0.5 * (core::f32::consts::TAU * hue).cos())
 }
 
 /// OCTAVE-FOLD `f` into `[lo, hi)`. Halving and doubling are exact in binary
@@ -1402,20 +2289,6 @@ fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
     f
 }
 
-/// OCTAVE-FOLD `f` down until it is at or below `max` — the capital echo's
-/// register guard (§10.4: "folded ≤ 3200 Hz").
-fn fold_below(f: f32, max: f32) -> f32 {
-    let mut f = f.clamp(1.0, 40_000.0);
-    for _ in 0..24 {
-        if f > max {
-            f *= 0.5;
-        } else {
-            break;
-        }
-    }
-    f
-}
-
 /// THE TINE, as a prototype voice (§9.1, §9.2). `f` is the fundamental, `tau`
 /// the already-scaled voice decay, `roof` the already-resolved lowpass.
 ///
@@ -1426,7 +2299,6 @@ fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool) -> Voice {
     let (p1, p2, p3, mallet) = match touch {
         Touch::Step => (P1_LVL, P2_LVL, P3_LVL, MALLET_LVL),
         Touch::ReStrike => (P1_LVL, RESTRIKE_P2_LVL, 0.0, RESTRIKE_MALLET_LVL),
-        Touch::Echo => (P1_LVL, ECHO_P2_LVL, 0.0, 0.0),
     };
     let (p1, p2, p3) = if mallet_only {
         (0.0, 0.0, 0.0)
@@ -1468,11 +2340,65 @@ fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool) -> Voice {
     }
 }
 
+/// THE BLOOM, as a prototype voice (§3.3 item 1): three partials at
+/// [`BLOOM_DEGREES`] above the note's lattice degree `deg`, each with its
+/// own decay, fading in over [`BLOOM_ATTACK_S`] from [`BLOOM_DELAY_S`] behind
+/// the strike, hanging for [`BLOOM_DECAY_S`], twinkling slowly, under a roof
+/// [`BLOOM_ROOF_ADD_HZ`] above the note's own. No mallet: the strike already
+/// happened.
+fn bloom(deg: i32, roof: f32) -> Voice {
+    Voice {
+        delay: BLOOM_DELAY_S,
+        dur: BLOOM_DUR_S,
+        attack: BLOOM_ATTACK_S,
+        decay: BLOOM_DECAY_S,
+        p: [
+            Partial {
+                lvl: BLOOM_LVL[0],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[0]),
+                decay: BLOOM_TAU[0],
+                ..Partial::default()
+            },
+            Partial {
+                lvl: BLOOM_LVL[1],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[1]),
+                decay: BLOOM_TAU[1],
+                ..Partial::default()
+            },
+            Partial {
+                lvl: BLOOM_LVL[2],
+                f0: penta(TINE_BASE_HZ, deg + BLOOM_DEGREES[2]),
+                decay: BLOOM_TAU[2],
+                ..Partial::default()
+            },
+        ],
+        tw_rate: BLOOM_TW_RATE,
+        tw_depth: BLOOM_TW_DEPTH,
+        lp_cut: roof + BLOOM_ROOF_ADD_HZ,
+        lane: LANE_BLOOM,
+        ..Voice::default()
+    }
+}
+
 // ===========================================================================
 // §16 row 9 — the v2 admission path on `TrailSynth`
 // ===========================================================================
 
 impl TrailSynth {
+    /// THE TIMBRE LADDER'S SEAM (§7 step 3; bench and test hook). Pull one
+    /// of §3.3's stops and the synth renders that rung — `plain` is the
+    /// derived line through the shipped tine, byte for byte. Production
+    /// never calls this: a fresh synth is [`TimbreStops::ALL`].
+    pub fn set_v2_timbre_stops(&mut self, stops: TimbreStops) {
+        self.v2.stops = stops;
+    }
+
+    /// The stops in force (test / introspection hook).
+    #[must_use]
+    pub fn v2_timbre_stops(&self) -> TimbreStops {
+        self.v2.stops
+    }
+
     /// THE MELODY'S CLOCK. The host's stamp where there is one; the synth's
     /// own block clock where there is not (§16 row 7's identity default).
     ///
@@ -1481,11 +2407,13 @@ impl TrailSynth {
     /// which truncates — reduces modulo 2³² — exactly as the host's own u32
     /// millisecond counter does. A saturating `f64 → u32` cast would pin
     /// every event after 49.7 days at `u32::MAX`: every gap zero, forever —
-    /// no steps, no rests, no IOI reset — with nothing to heal it. A wrap
-    /// costs what a wrapped host stamp costs and heals the same way: the
-    /// wrapping key reads a zero gap (a re-strike), the step gate stays shut
-    /// while `last_step_ms` sits on the far side of the wrap, and the next
-    /// rest cadence or Enter re-anchors it.
+    /// no rests, no IOI reset — with nothing to heal it. A wrap costs what a
+    /// wrapped host stamp costs and heals the same way: the wrapping key
+    /// reads a zero gap, so it derives its interval from a nonsense
+    /// millisecond count and the auto-repeat floor takes it to the mallet —
+    /// **and it still steps and still speaks**, because nothing on this path
+    /// may cost a key its note. The next gap is a real one and the line
+    /// carries on from wherever the wrapping key left it.
     fn v2_at_ms(&self, meta: EventMeta) -> u32 {
         if meta.at_ms != 0 {
             meta.at_ms
@@ -1511,13 +2439,19 @@ impl TrailSynth {
         pan + self.rnd_in(-PAN_JITTER, PAN_JITTER) / PAN_LAW_SCALE
     }
 
-    /// §10.2's KEY HANDBACK: when the sing-along has ended and the verse has
-    /// reached a phrase boundary, the borrowed `song_key` goes back to the
-    /// neutral lattice — here, BEFORE the phrase's first note is voiced, and
-    /// never mid-phrase (A31). Called at the top of every event that can
-    /// open a phrase.
-    fn v2_hand_back_key(&mut self) {
-        if self.v2_key_pending && self.v2.at_phrase_start() {
+    /// §10.2's KEY HANDBACK: when the sing-along has ended and the line has
+    /// reached a boundary, the borrowed `song_key` goes back to the neutral
+    /// lattice — here, BEFORE the next word's first note is voiced, and never
+    /// mid-word (A31). Called at the top of every event that can open a word.
+    ///
+    /// **The boundary is now the WORD or the REST, not the phrase.** With
+    /// the authored form deleted there is no phrase index to wait for; a word
+    /// head and a think-pause are the structure the line still has, and both
+    /// are finer than a phrase, so a held key is handed back sooner rather
+    /// than later. The law it serves — "never transpose an utterance
+    /// mid-way" — is unchanged. See [`MelodyV2::at_boundary`].
+    fn v2_hand_back_key(&mut self, at: u32) {
+        if self.v2_key_pending && self.v2.at_boundary(at) {
             self.song_key = 0;
             self.v2_key_pending = false;
         }
@@ -1590,7 +2524,8 @@ impl TrailSynth {
     ///
     /// It deliberately does NOT run: the flood governor (§16 row 11 sets that
     /// duck to exactly 1.0 — the IOI arc of §9.6 replaces it), `MIN_GAP`
-    /// thinning (the step gate and the per-lane caps are v2's rate law),
+    /// thinning (the per-lane caps and the IOI-shortened note are v2's rate
+    /// law — one key, one step, at every speed),
     /// `advance_song` (v2 has no bar of ghosts) or `design_trail`'s palette
     /// dispatch (v2 designs its own voices). What it DOES keep is every piece
     /// of v1 machinery v2 explicitly reuses byte-unchanged: the bed's style /
@@ -1603,6 +2538,21 @@ impl TrailSynth {
         let SoundGesture::Trail(kind) = ev.kind else {
             return;
         };
+        // THE SKY'S COLOUR (THE PRISM §3.2): the hue's arc position through
+        // a one-pole with τ = `BED_HUE_TAU_S`, stepped by the real time since
+        // the last event (read BEFORE the rate bookkeeping resets it). Seeded
+        // on the first v2 event so the pad enters in the ribbon's colour
+        // rather than gliding up from red. Unconditional — it is bookkeeping,
+        // not sound: with the bed knob off nothing reads it.
+        {
+            let arc = hue_arc(ev.hue);
+            if self.v2_latched {
+                let k = 1.0 - (-self.since_event / BED_HUE_TAU_S).exp();
+                self.bed.hue_s += (arc - self.bed.hue_s) * k;
+            } else {
+                self.bed.hue_s = arc;
+            }
+        }
         // THE FIRST v2 TRAIL EVENT LATCHES THE BUS (§9.7, §16 row 10): the
         // limiter is armed from here on, and the sing-along's key is handed
         // back at phrase boundaries rather than snapped (§10.2).
@@ -1612,6 +2562,16 @@ impl TrailSynth {
         self.bed_style = ev.style;
         self.bed_voice = ev.voice;
         self.tone = ev.tone;
+        // THE BED'S KICK (§3.2 "How it starts") — v1's own feed, the one
+        // table both engines call (`bed_kick`), behind the same `ev.bed`
+        // gate: with the `trail_sound_bed` setting off (the default) the
+        // bed's energy never leaves its exact-zero floor and the pad is
+        // silent by construction; on, it fades in behind the first two or
+        // three keys through `tick_bed`'s own 250 ms swell and exhales to
+        // exact zero after the last, so idle still parks the device.
+        if ev.bed {
+            self.kick_bed(kind, ev.gain);
+        }
         // The rate estimate is bookkeeping other sources (the bonk, the riff)
         // still read, so v2 pays into it even though its own loudness law is
         // the IOI arc.
@@ -1623,7 +2583,7 @@ impl TrailSynth {
             SoundKind::Typed => {
                 self.since_voice = 0.0;
                 self.damp_pending_shimmer();
-                self.v2_typed(&ev, at);
+                self.v2_typed(&ev, meta, at);
             }
             SoundKind::Space => {
                 self.since_voice = 0.0;
@@ -1714,43 +2674,43 @@ const ERASE_MUTE_S: f32 = 0.040;
 // ===========================================================================
 
 impl TrailSynth {
-    /// **TYPED** — the step or the re-strike, plus a capital's echo (§9.2,
-    /// §10.2, §11's first three rows).
-    fn v2_typed(&mut self, ev: &SoundEvent, at: u32) {
-        self.v2_hand_back_key();
+    /// **TYPED** — the step or the re-strike, the bloom behind it, and on
+    /// the keys that earn them the answering voice and the air cloud (§9.2,
+    /// §10.2, §11's first rows, §3.3).
+    fn v2_typed(&mut self, ev: &SoundEvent, meta: EventMeta, at: u32) {
+        self.v2_hand_back_key(at);
         let sing = self.sing > 0.0;
-        let plan = self.v2.on_typed(at, sing);
-        if !plan.speaks {
-            // Coalesced: the state advanced, the ear is spared. A 30 Hz
-            // auto-repeat becomes a ≤ 16.7 Hz roll, under the roughness band.
-            return;
-        }
+        // THE KEY IS THE NOTE. There is no early return on this path and
+        // there must never be one again: every keystroke that reaches here
+        // derives a degree and spawns a voice for it.
+        let plan = self.v2.on_typed(at, meta.rank, sing, ev.shifted);
+        let stops = self.v2.stops;
         let ioi_s = self.v2.ioi_ms * 0.001;
         let cps = 1.0 / ioi_s;
-        // A plan is a step or a re-strike; the echo is built below, off the
-        // same key, and is not a touch the melody can hand out.
         let tau_mul = if plan.touch == Touch::Step {
             1.0
         } else {
             RESTRIKE_TAU_MUL
         };
         let tau = tau_v_s(ioi_s) * tau_mul;
-        // A WORD-HEAD RE-STRIKE STILL GETS THE LIT ROOF (§10.2). The word
-        // boundary is heard in the harmony, not forced into the playhead —
-        // v1's word-head re-bar is not carried — but the first letter of a
-        // word may still open.
-        let word_head = self.v2.word_pos == 1;
-        // A CAPITAL OPENS THE ROOF (§10.4: "the verse note plays normally
-        // (lit roof)"). It is the one place spelling touches the sound at
-        // all, and it touches only brightness: the walk is never disturbed.
-        let lit_roof = ev.shifted || (plan.lit && (plan.touch == Touch::Step || word_head));
-        let roof = roof_hz(cps, lit_roof, ev.heat, plan.touch);
+        // A WORD HEAD STILL GETS THE LIT ROOF (§10.2). The word boundary is
+        // heard in the harmony, not forced into the playhead — v1's word-head
+        // re-bar is not carried — but the first letter of a word may open.
+        // A CAPITAL OPENS THE ROOF too (§10.4): the one other place spelling
+        // touches the sound, beside the lift `on_typed` gave the degree.
+        let lit_roof = ev.shifted || (plan.lit && (plan.touch == Touch::Step || plan.word_head));
+        // THE ARC (§3.3 item 3): the hue opens the roof, or does nothing at
+        // all with the stop out — `hue_arc(0) == 0`, so `plain` is exact.
+        let arc = if stops.hue { hue_arc(ev.hue) } else { 0.0 };
+        let roof = roof_hz(cps, lit_roof, ev.heat, arc, plan.touch);
         let deg = plan.deg + i32::from(self.song_key);
         let f = penta(TINE_BASE_HZ, deg);
-        if plan.touch == Touch::ReStrike {
-            // §9.5 law 5: a same-pitch re-strike damps the old voice first.
-            // Two independently phased voices at ONE frequency are a comb
-            // filter, which is the artefact the space damp exists to prevent.
+        if plan.repeat {
+            // §9.5 law 5: a same-pitch note damps the old voice first. Two
+            // independently phased voices at ONE frequency are a comb
+            // filter, which is the artefact the space damp exists to
+            // prevent — and a word head's common tone is as much the same
+            // pitch as a doubled letter's tremolo.
             self.v2_damp(self.v2.lead, LANE_FADE_STEAL_S);
         }
         let vel_db = if plan.touch == Touch::Step {
@@ -1760,32 +2720,81 @@ impl TrailSynth {
         };
         let vel = self.v2_velocity(vel_db);
         let pan = self.v2_pan(ev.pan);
-        let gain = ev.gain * KEY_TINE_TRIM * plan.level * g_ioi(ioi_s) * vel;
+        let g = g_ioi(ioi_s);
+        let gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel;
         let voice = tine(f, plan.touch, tau, roof, plan.mallet_only);
         self.v2.lead = self.v2_spawn(voice, gain, pan);
+        // THE ONSET CLOCK records what the MIXER did, not what the melody
+        // intended: a key that leaves this where it was is a key the TUNE
+        // lane refused, and the census's `silent` column is that test.
+        if self.v2.lead.is_some() {
+            self.v2.last_onset_ms = at;
+        }
 
-        // THE CAPITAL'S ECHO (§11): the note, then its octave 25 ms later at
-        // −8 dB in the LIT lane. It never touches `walk`, so how you spell a
-        // word cannot move the theme.
-        if ev.shifted {
-            let ratio = self.v2.next_echo_ratio();
-            let echo_f = fold_below(f * ratio, ECHO_FOLD_MAX_HZ);
-            let echo_roof = roof_hz(cps, true, ev.heat, Touch::Echo);
-            let mut voice = tine(
-                echo_f,
-                Touch::Echo,
-                tau_v_s(ioi_s) * ECHO_TAU_MUL,
-                echo_roof,
-                false,
-            );
-            voice.delay = ECHO_DELAY_S;
-            voice.lane = LANE_ECHO;
-            let vel = self.v2_velocity(VEL_DB_RESTRIKE);
-            let gain = ev.gain * KEY_TINE_TRIM * ECHO_LEVEL * g_ioi(ioi_s) * vel;
-            // §9.5 law 5: a second capital inside the gate echoes the SAME
-            // octave; the previous echo is damped first.
-            self.v2_damp_same_pitch(LANE_ECHO, echo_f);
-            self.v2_spawn(voice, gain, pan);
+        // THE BLOOM (§3.3 item 1) — behind every LIT step that has a pitch
+        // to bloom from. A passing note stays a plain strike, a doubled
+        // letter's tremolo stays a tremolo, and a felt key has nothing above
+        // it to bloom. Its level rides the hue's own air (item 2) and its pan
+        // drifts with the colour while the strike stays on the caret's
+        // column, so the note OPENS in the field. Both are two multiplies,
+        // and both are exactly the bloom rung's constants with the hue stop
+        // out.
+        let blooms = stops.bloom && plan.lit && plan.touch == Touch::Step && !plan.mallet_only;
+        // The bloom's own gain, kept for the air cloud, which is two taps of
+        // it.
+        let (air, spread) = if stops.hue {
+            (hue_air(ev.hue), BLOOM_SPREAD * (hue_arc(ev.hue) - 0.5))
+        } else {
+            (hue_air(0.25), 0.0)
+        };
+        let bloom_gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air;
+        if blooms {
+            self.v2_spawn(bloom(deg, roof), bloom_gain, pan + spread);
+        }
+
+        if stops.room {
+            // THE ANSWERING VOICE (§3.3): the head that opens the line's
+            // reply to its own subject is answered from above, a beat later,
+            // on the nearest lit tone — one key in eighteen or so, in the
+            // droppable lane.
+            if plan.answer_head && !plan.mallet_only {
+                let a_deg = self.v2.answer_deg_above(plan.deg) + i32::from(self.song_key);
+                let mut answer = tine(penta(TINE_BASE_HZ, a_deg), Touch::Step, tau, roof, false);
+                answer.n_lvl = 0.0;
+                answer.delay = ANSWER_DELAY_S;
+                answer.lane = LANE_BLOOM;
+                let vel = self.v2_velocity(VEL_DB_MOTION);
+                let pan = self.v2_pan(ev.pan);
+                self.v2_spawn(
+                    answer,
+                    ev.gain * KEY_TINE_TRIM * ANSWER_LEVEL * g * vel,
+                    pan,
+                );
+            }
+            // THE AIR CLOUD (§3.3 item 4): the key that ends a phrase rest
+            // resolves the line and then sings, and the room answers THAT
+            // note — never a key inside the phrase.
+            if plan.rest && !plan.mallet_only {
+                self.v2_air_cloud(deg, roof, bloom_gain, pan, 0.0);
+            }
+        }
+    }
+
+    /// THE TWO-TAP AIR CLOUD (§3.3 item 4): two bloom taps on degree `deg`,
+    /// `after` seconds past the key, at [`AIR_TAP_DELAY_S`] and
+    /// [`AIR_TAP_LEVEL`] re the bloom, panned to opposite sides of `pan`. Two
+    /// taps at unequal spacings read as a room; that is the whole of the
+    /// reverb this theme has, and it is spent only where a line ends.
+    fn v2_air_cloud(&mut self, deg: i32, roof: f32, bloom_gain: f32, pan: f32, after: f32) {
+        for k in 0..AIR_TAP_DELAY_S.len() {
+            let mut tap = bloom(deg, roof);
+            tap.delay = after + AIR_TAP_DELAY_S[k];
+            let side = if k % 2 == 0 {
+                -AIR_TAP_PAN
+            } else {
+                AIR_TAP_PAN
+            };
+            self.v2_spawn(tap, bloom_gain * AIR_TAP_LEVEL[k], pan + side);
         }
     }
 
@@ -1857,29 +2866,33 @@ impl TrailSynth {
         self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM * BREATH_LEVEL * g, pan);
     }
 
-    /// **SHIFT** — the bare modifier's lift (§10.4, §11). One sine, one
-    /// rotation step, no mallet, no beat claimed, no playhead moved.
+    /// **SHIFT** — the bare modifier's lift (§10.4, §11, §3.1): the felt
+    /// mallet alone, no pitch, no beat claimed, no playhead moved. A modifier
+    /// is intent, not authorship, and since 2026-09-08 it is not a note
+    /// either — it cannot be mistaken for a step, and one capital is no
+    /// longer three onsets.
     fn v2_shift(&mut self, ev: &SoundEvent) {
-        let deg = self.v2.on_shift() + i32::from(self.song_key);
         let voice = Voice {
             dur: LIFT_DUR_S,
             attack: LIFT_ATTACK_S,
             decay: LIFT_DECAY_S,
-            p: [
-                Partial {
-                    lvl: P1_LVL,
-                    f0: penta(TINE_BASE_HZ, deg),
-                    ..Partial::default()
-                },
-                Partial::default(),
-                Partial::default(),
-            ],
+            p: [Partial::default(), Partial::default(), Partial::default()],
+            n_lvl: MALLET_LVL,
+            n_f0: MALLET_HZ0,
+            n_f1: MALLET_HZ1,
+            n_glide: MALLET_GLIDE_S,
+            n_q: MALLET_Q,
+            n_decay: MALLET_TAU_S,
             lp_cut: ROOF_PLAIN_LO_HZ,
             lane: LANE_SHIFT,
             ..Voice::default()
         };
         let pan = self.v2_pan(ev.pan);
-        self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM * LIFT_LEVEL, pan);
+        self.v2_spawn(
+            voice,
+            ev.gain * KEY_TINE_TRIM * LIFT_LEVEL * LIFT_FELT_MUL,
+            pan,
+        );
     }
 
     /// **NAV TICK** — the mini-fan's voice (D17, §12.3's floor): the verse
@@ -1916,13 +2929,18 @@ impl TrailSynth {
     /// at 60 ms are therefore one cascade and at most eleven quiet
     /// re-strikes, instead of v1's ~60 pitched onsets a second.
     fn v2_cascade(&mut self, ev: &SoundEvent, at: u32) {
-        self.v2_hand_back_key();
+        self.v2_hand_back_key(at);
         let Some(head) = self.v2.on_jump(at) else {
             return;
         };
         let ioi_s = self.v2.ioi_ms * 0.001;
         let tau = tau_v_s(ioi_s);
         let cps = 1.0 / ioi_s;
+        let arc = if self.v2.stops.hue {
+            hue_arc(ev.hue)
+        } else {
+            0.0
+        };
         let base = i32::from(self.v2.walk) + i32::from(self.song_key);
         if head {
             for k in 0..CASCADE_DEGREES.len() {
@@ -1931,7 +2949,7 @@ impl TrailSynth {
                     f,
                     Touch::Step,
                     tau,
-                    roof_hz(cps, true, ev.heat, Touch::Step),
+                    roof_hz(cps, true, ev.heat, arc, Touch::Step),
                     false,
                 );
                 voice.delay = CASCADE_DELAYS_S[k];
@@ -1948,7 +2966,7 @@ impl TrailSynth {
                 f,
                 Touch::ReStrike,
                 tau * RESTRIKE_TAU_MUL,
-                roof_hz(cps, false, ev.heat, Touch::ReStrike),
+                roof_hz(cps, false, ev.heat, arc, Touch::ReStrike),
                 false,
             );
             voice.lane = LANE_CASCADE;
@@ -1965,7 +2983,7 @@ impl TrailSynth {
     /// at `t = 0`. A cadence on a constant while the pixels flew a
     /// distance-dependent arc is v1's coupling defect at Enter scale.
     fn v2_enter(&mut self, ev: &SoundEvent, at: u32, cells: u16) {
-        self.v2_hand_back_key();
+        self.v2_hand_back_key(at);
         let full = self.v2.on_enter(at);
         // §10.4 reads `walk` AFTER the phrase has been cadenced, so the
         // resolution answers the note the theme was heading for and not the
@@ -1974,8 +2992,34 @@ impl TrailSynth {
         let t = timing::flight_ms(f32::from(cells)) * 0.001;
         let ioi_s = self.v2.ioi_ms * 0.001;
         let tau = tau_v_s(ioi_s);
-        let roof = roof_hz(1.0 / ioi_s, true, ev.heat, Touch::Step);
+        let stops = self.v2.stops;
+        let arc = if stops.hue { hue_arc(ev.hue) } else { 0.0 };
+        let roof = roof_hz(1.0 / ioi_s, true, ev.heat, arc, Touch::Step);
         let key = i32::from(self.song_key);
+        // THE ROOM ANSWERS THE LINE'S END (§3.3 item 4): two bloom taps
+        // behind the note the cadence resolves onto — the resolution at
+        // `t` when the cadence is earned, home where it is a bare dyad —
+        // at the bloom's own level for this hue. A line ends, and the air
+        // it ends in is heard once.
+        let home = if full {
+            if walk <= CAD_RESOLUTION_SPLIT {
+                CAD_RESOLUTION_LOW_DEG
+            } else {
+                CAD_RESOLUTION_HIGH_DEG
+            }
+        } else {
+            i32::from(walk)
+        };
+        if stops.room {
+            let air = if stops.hue {
+                hue_air(ev.hue)
+            } else {
+                hue_air(0.25)
+            };
+            let g = g_ioi(ioi_s);
+            let bloom_gain = ev.gain * KEY_TINE_TRIM * g * BLOOM_LEVEL * air;
+            self.v2_air_cloud(home + key, roof, bloom_gain, ev.pan, t);
+        }
         if full {
             // THE PICKUP, at t = 0 — the one cadence voice that leads.
             let mut pickup = tine(
@@ -2397,11 +3441,16 @@ impl TrailSynth {
         // only carries it.
         let ioi_s = self.v2.ioi_ms * 0.001;
         let deg = i32::from(self.v2.walk) + i32::from(self.song_key);
+        let arc = if self.v2.stops.hue {
+            hue_arc(ev.hue)
+        } else {
+            0.0
+        };
         let mut bell = tine(
             penta(TINE_BASE_HZ, deg),
             Touch::Step,
             MET_BELL_TAU_S,
-            roof_hz(1.0 / ioi_s, true, ev.heat, Touch::Step),
+            roof_hz(1.0 / ioi_s, true, ev.heat, arc, Touch::Step),
             false,
         );
         bell.delay = t;
@@ -2493,32 +3542,98 @@ impl Palette for RainbowKittyV2Palette {
         _col_off: i32,
     ) {
         let ioi_s = s.v2.ioi_ms * 0.001;
+        let arc = if s.v2.stops.hue { hue_arc(ev.hue) } else { 0.0 };
         let voice = tine(
             penta(TINE_BASE_HZ, deg),
             Touch::Step,
             tau_v_s(ioi_s),
-            roof_hz(1.0 / ioi_s, false, ev.heat, Touch::Step),
+            roof_hz(1.0 / ioi_s, false, ev.heat, arc, Touch::Step),
             false,
         );
         s.spawn(voice, g * KEY_TINE_TRIM, ev.pan);
     }
 
-    /// §9.7: **no bed by default** — the silence between notes is the
-    /// instrument. The optional pedal haze is a knob, not a layer, and it is
-    /// not carried here.
-    fn bed_sample(
-        &self,
-        _s: &mut TrailSynth,
-        _dt: f32,
-        _lvl: f32,
-        _u1: f32,
-        _u2: f32,
-    ) -> (f32, f32) {
-        (0.0, 0.0)
+    /// THE RAINBOW SKY (THE PRISM §3.2) — the same body the tournament's
+    /// `BedVariant::RainbowSky` renders, so what the owner auditions as
+    /// `c5-rainbow-sky` is byte for byte what the knob turns on. §9.7's "no
+    /// bed by default" still holds where it is decided: the
+    /// `trail_sound_bed` setting ships OFF, so `push_v2` feeds this nothing
+    /// and it is never reached (`bed_sample`'s level floor); the ear decides
+    /// the default from the audition WAVs.
+    fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, _u1: f32, _u2: f32) -> (f32, f32) {
+        s.bed_rainbow_sky(dt, lvl)
     }
 
     fn anchor_hz(&self) -> f32 {
         TINE_BASE_HZ
+    }
+}
+
+// ===========================================================================
+// THE RAINBOW SKY — the body
+// ===========================================================================
+
+impl TrailSynth {
+    /// One stereo sample `(mid, side)` of the sky pad (THE PRISM §3.2), the
+    /// body behind both `BedVariant::RainbowSky` and the music box's palette
+    /// bed. The caller has floored `bed.level` and folded level × gain into
+    /// `lvl`; the result lands in the ducked mix sum like every other bed.
+    ///
+    /// Modelled on `bed_chord_drift`'s proven arithmetic — seed-at-target,
+    /// one-pole portamento on the oscillator frequencies, weighted sum — with
+    /// three differences that are the design: the bar is the LIVE chord
+    /// (`v2.chord`, which `on_space` advances once per word) instead of a
+    /// 30 s timer; each tone carries [`BED_PARTIALS`] so there is a spectrum
+    /// for the hue to tilt; and the hue's arc (`bed.hue_s`) drives the tilt
+    /// and the top tone's twin detune — and never a pitch, so no amount of
+    /// hue motion can take the pad out of key. Sample-driven throughout, no
+    /// rng: a candidate render is bit-replayable from (events, seed).
+    pub(super) fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
+        let degs = sky_bed_degrees(usize::from(self.v2.chord));
+        let mut tgt = [0.0f32; 3];
+        for (t, d) in tgt.iter_mut().zip(degs) {
+            *t = penta(BED_BASE_HZ, d);
+        }
+        let b = &mut self.bed;
+        let glide = 1.0 - (-dt / BED_GLIDE_TAU_S).exp();
+        let arc = b.hue_s.clamp(0.0, 1.0);
+        let detune = (2.0f32).powf(lerp(BED_DETUNE_CENTS_LO, BED_DETUNE_CENTS_HI, arc) / 1200.0);
+        let tone = |ph: f32| -> f32 {
+            let mut x = 0.0;
+            for n in BED_PARTIALS {
+                x += super::sin01((ph * n as f32).fract()) / n as f32;
+            }
+            x * BED_PARTIAL_NORM
+        };
+        let mut m = 0.0;
+        for i in 0..3 {
+            if b.var_f[i] <= 0.0 {
+                // First sample: seed at target so the pad enters ON the
+                // chord instead of sweeping up from 0 Hz.
+                b.var_f[i] = tgt[i];
+            }
+            b.var_f[i] += (tgt[i] - b.var_f[i]) * glide;
+            b.var_ph[i] = (b.var_ph[i] + b.var_f[i] * dt).fract();
+            let mut x = tone(b.var_ph[i]);
+            if i == 2 {
+                // THE WIDTH: the top tone's detuned twin, half and half, so
+                // the pair sums to the tone's weight when in phase and beats
+                // at `f · (detune − 1)` — the shimmer.
+                b.var_ph[3] = (b.var_ph[3] + b.var_f[2] * detune * dt).fract();
+                x = 0.5 * (x + tone(b.var_ph[3]));
+            }
+            m += x * BED_WEIGHT[i];
+        }
+        // THE TILT: one one-pole over the pad sum, its cutoff on the arc.
+        let cut = lerp(BED_TILT_LO_HZ, BED_TILT_HI_HZ, arc);
+        let k = (cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        b.lp1 += k * (m - b.lp1);
+        // THE BREATH: a raised cosine on the whole pad, on its own phase
+        // (`ph3`, which nothing else in the music box's bed uses), so the
+        // body is the same on the tournament clock and the palette path.
+        b.ph3 = (b.ph3 + BED_BREATH_HZ * dt).fract();
+        let breath = 1.0 - BED_BREATH_DEPTH * (0.5 - 0.5 * super::sin01((b.ph3 + 0.25).fract()));
+        (b.lp1 * breath * lvl * BED_LEVEL, 0.0)
     }
 }
 
@@ -2561,6 +3676,245 @@ mod tests {
             bed: false,
             shifted,
         }
+    }
+
+    /// A KEYSTROKE WITH A CHARACTER BEHIND IT — the shipping seam's own
+    /// stamp, through the engine's own rank producer, because the derived
+    /// melody's whole input is `(rank, at_ms)` and a fixture that leaves the
+    /// rank at 0 is testing the no-glyph fallback rather than the melody.
+    fn push_ch(s: &mut TrailSynth, kind: SoundKind, at: u32, ch: char) {
+        s.push_meta(
+            event(kind, 0.0, ch.is_uppercase()),
+            EventMeta {
+                at_ms: at,
+                rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
+                ..EventMeta::default()
+            },
+        );
+    }
+
+    // -- THE RAINBOW SKY (THE PRISM §3.2) -----------------------------------
+
+    /// THE PAD IS THE HARMONY THE MELODY IS SNAPPED TO: for every chord of the
+    /// loop the sky voices exactly that chord's three LIT verse degrees,
+    /// ascending, on the untransposed lattice — so nothing it plays can be out
+    /// of key against a derived step — and every pad tone sits under the bass
+    /// register ([`BASS_BASE_HZ`]), two octaves under the tine. The partial
+    /// set is octaves, fifths and the major third only, normalised to a
+    /// sine's RMS.
+    #[test]
+    fn the_sky_pad_is_the_live_chords_lit_degrees_under_the_bass() {
+        assert!((BED_BASE_HZ - TINE_BASE_HZ / 4.0).abs() < 1e-6);
+        for (chord, c) in CHORD_LOOP.iter().enumerate() {
+            let degs = sky_bed_degrees(chord);
+            let lit = c.lit;
+            assert!(
+                degs.windows(2).all(|w| w[1] > w[0]),
+                "chord {chord}: ascending, distinct ({degs:?})"
+            );
+            for d in degs {
+                assert!((0..5).contains(&d), "chord {chord}: a verse degree ({d})");
+                assert!(lit & (1 << d) != 0, "chord {chord}: degree {d} is lit");
+                let hz = penta(BED_BASE_HZ, d);
+                assert!(
+                    hz < BASS_BASE_HZ,
+                    "chord {chord}: pad tone {hz} Hz under the bass register"
+                );
+            }
+            assert_eq!(
+                lit.count_ones(),
+                3,
+                "chord {chord}: the loop lights exactly three degrees"
+            );
+        }
+        for n in BED_PARTIALS {
+            assert!(
+                matches!(n, 1 | 2 | 4 | 8 | 3 | 6 | 5),
+                "partial {n} is an octave, a fifth or a major third of its tone"
+            );
+        }
+        let rms: f32 = BED_PARTIALS
+            .iter()
+            .map(|&n| 1.0 / (n * n) as f32)
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (BED_PARTIAL_NORM - 1.0 / rms).abs() < 1e-3,
+            "the partial norm is 1/√Σ1/n² = {}",
+            1.0 / rms
+        );
+    }
+
+    /// THE HUE DRIVES THE TILT AND THE WIDTH, AND NEVER A PITCH: the same pad
+    /// rendered at the red end and the cyan end of the arc keeps its
+    /// oscillator frequencies bit for bit, and is brighter (more of its energy
+    /// in its first difference) at the cyan end. And the arc is slewed per v2
+    /// event through the one-pole — seeded on the first key, glided after.
+    #[test]
+    fn the_sky_follows_the_hue_in_tilt_and_width_and_never_in_pitch() {
+        let render = |arc: f32| -> (Vec<f32>, [f32; 4]) {
+            let mut s = synth();
+            s.bed.hue_s = arc;
+            let dt = 1.0 / SR;
+            let out: Vec<f32> = (0..48_000).map(|_| s.bed_rainbow_sky(dt, 0.4).0).collect();
+            (out, s.bed.var_f)
+        };
+        let (red, f_red) = render(0.0);
+        let (cyan, f_cyan) = render(1.0);
+        // Pitch: the three tones' frequencies are the chord's, whatever the hue.
+        assert!(
+            f_red
+                .iter()
+                .zip(&f_cyan)
+                .take(3)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the hue moved a pitch: {f_red:?} vs {f_cyan:?}"
+        );
+        // …and they are the chord the synth actually stands on (a fresh
+        // session parks on `CHORD_AFTER_ENTER`, not on I).
+        let chord = usize::from(synth().v2.chord());
+        for (i, d) in sky_bed_degrees(chord).into_iter().enumerate() {
+            assert!(
+                (f_red[i] - penta(BED_BASE_HZ, d)).abs() < 1e-3,
+                "tone {i}: {} vs degree {d} of chord {chord}",
+                f_red[i]
+            );
+        }
+        let brightness = |x: &[f32]| {
+            let e: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+            let d: f64 = x
+                .windows(2)
+                .map(|w| f64::from(w[1] - w[0]) * f64::from(w[1] - w[0]))
+                .sum();
+            d / e.max(1e-18)
+        };
+        let (b_red, b_cyan) = (brightness(&red), brightness(&cyan));
+        assert!(
+            b_cyan > b_red * 1.3,
+            "the cyan end is the open end: brightness red {b_red:.3e} vs cyan {b_cyan:.3e}"
+        );
+        assert!(
+            red.iter().any(|&v| v != 0.0) && cyan.iter().any(|&v| v != 0.0),
+            "the pad sounds at both ends"
+        );
+
+        // The slew: seeded on the first v2 key, then a one-pole in real time.
+        let mut s = synth();
+        let key = |hue: f32| SoundEvent {
+            hue,
+            ..event(SoundKind::Typed, 0.0, false)
+        };
+        s.push(key(0.25)); // arc = tri(0.5) = 0.5
+        assert!(
+            (s.bed.hue_s - 0.5).abs() < 1e-6,
+            "seeded at the first key's arc"
+        );
+        let mut buf = [0.0f32; 512];
+        while s.since_event < 1.0 {
+            s.render(&mut buf);
+        }
+        let gap = s.since_event;
+        s.push(key(0.0)); // arc 0
+        let want = 0.5 * (-gap / BED_HUE_TAU_S).exp();
+        assert!(
+            (s.bed.hue_s - want).abs() < 1e-4,
+            "one-pole toward the new arc over {gap:.3} s: {} vs {want}",
+            s.bed.hue_s
+        );
+    }
+
+    /// THE SKY IS FED BY THE MUSIC BOX'S OWN KEYS, BEHIND THE KNOB: with
+    /// `bed: false` (the shipping default) the bed's energy never leaves its
+    /// exact-zero floor and the pad contributes nothing; with `bed: true` a
+    /// keystroke kicks it by v1's own number, it sounds under the notes, and
+    /// after the typing stops it exhales to EXACT zero so the host's idle
+    /// pause still engages.
+    #[test]
+    fn the_sky_is_fed_by_the_music_boxs_keys_only_behind_the_knob() {
+        let mut off = synth();
+        let mut on = synth();
+        let mut buf = [0.0f32; 512];
+        for _ in 0..12 {
+            off.push(event(SoundKind::Typed, 0.0, false));
+            on.push(SoundEvent {
+                bed: true,
+                ..event(SoundKind::Typed, 0.0, false)
+            });
+            for _ in 0..8 {
+                off.render(&mut buf);
+                on.render(&mut buf);
+            }
+        }
+        assert_eq!(off.bed.energy, 0.0, "the knob off feeds nothing");
+        assert_eq!(off.bed.level, 0.0);
+        assert!(
+            on.bed.energy > 0.0 && on.bed.level > 0.1,
+            "the knob on: the pad is up"
+        );
+        // v1's table, shared: a key is 0.3, a jump 0.5, a nav tick 0.12.
+        let mut k = synth();
+        k.push(SoundEvent {
+            bed: true,
+            ..event(SoundKind::Typed, 0.0, false)
+        });
+        assert!(
+            (k.bed.energy - 0.3).abs() < 1e-6,
+            "a key kicks the bed by v1's 0.3"
+        );
+        // The pad is actually in the output while the notes are up (the
+        // palette path, not only the tournament's)…
+        let mut sounding = synth();
+        sounding.push(SoundEvent {
+            bed: true,
+            ..event(SoundKind::Typed, 0.0, false)
+        });
+        for _ in 0..30 {
+            sounding.render(&mut buf);
+        }
+        let (l, r) = sounding.bed_sample(1.0 / SR);
+        assert!(
+            l != 0.0 && (l - r).abs() < 1e-9,
+            "the pad is a mono floor under the notes"
+        );
+        // …and the bed exhales to exact zero within six seconds of the last key
+        // (`buf` is 256 stereo frames: 5.33 ms a render).
+        let renders_per_s = 48_000 / (buf.len() / crate::trail_sound::CHANNELS);
+        for _ in 0..(6 * renders_per_s) {
+            on.render(&mut buf);
+        }
+        assert_eq!(
+            on.bed.level, 0.0,
+            "the bed snaps to exact zero after the typing"
+        );
+        assert_eq!(on.bed.energy, 0.0);
+        assert!(on.is_quiet(), "idle parks the device");
+    }
+
+    /// Type `text` at a fixed period from `t0`, one cue per character, and
+    /// return the degree the line sounded on each TYPED key.
+    fn type_degrees(text: &str, t0: u32, period: u32) -> Vec<i8> {
+        type_degrees_rhythm(text, t0, &[period])
+    }
+
+    /// …and the same with a repeating rhythm, so two takes can differ in
+    /// nothing but the hand.
+    fn type_degrees_rhythm(text: &str, t0: u32, periods: &[u32]) -> Vec<i8> {
+        let mut s = synth();
+        let mut at = t0;
+        let mut out = Vec::new();
+        for (i, ch) in text.chars().enumerate() {
+            let kind = match ch {
+                ' ' => SoundKind::Space,
+                '\n' => SoundKind::Enter { cells: 30 },
+                _ => SoundKind::Typed,
+            };
+            push_ch(&mut s, kind, at, ch);
+            if matches!(kind, SoundKind::Typed) {
+                out.push(s.v2.walk());
+            }
+            at += periods[i % periods.len()];
+        }
+        out
     }
 
     fn push(s: &mut TrailSynth, kind: SoundKind, at: u32, pan: f32, shifted: bool) {
@@ -2688,89 +4042,473 @@ mod tests {
         );
     }
 
-    // -- A1 / A15: the clock, not the count ------------------------------
+    // -- R1: one keystroke, one melody step ------------------------------
 
-    /// **THE VERSE ADVANCES ON THE CLOCK, NOT ON THE COUNT** (§9.0 cause 4,
-    /// A1) — **and every key still speaks** (A15).
+    /// **ONE KEYSTROKE IS ONE MELODY STEP, AT EVERY TYPING SPEED** (R1,
+    /// ruled 2026-09-08) — and no keystroke is ever silent.
     ///
-    /// Two steps are never closer than [`STEP_GATE_MS`]; at 4 cps every key is
-    /// a step (the "slow typing promotes every key" law, which needs no rule
-    /// of its own); at 10 cps the verse steps about every third key; and a
-    /// 30 Hz auto-repeat advances the state 60 times while spawning at most
-    /// one TUNE voice per [`RESTRIKE_COALESCE_MS`], which keeps the roll under
-    /// the 15–60 Hz roughness band.
+    /// This test replaces `the_verse_advances_on_the_clock_and_every_key_
+    /// still_speaks`, which asserted the DELETED 220 ms gate: that two steps
+    /// were never closer than 220 ms and that at 10 cps the line stepped
+    /// every third key. The owner ruled that law "the OPPOSITE of what I
+    /// want", so the test that pinned it was asserting the defect.
+    ///
+    /// The sweep runs from 3 cps to 50 cps — past any hand, into auto-repeat
+    /// — and at every rate the melody must advance once per key AND spawn a
+    /// TUNE voice for every key. There is no rate at which either may fall
+    /// off, which is why the sweep goes well past the rate a person can
+    /// reach: a gate that grew back somewhere would show as a hole here
+    /// before it ever reached an ear.
     #[test]
-    fn the_verse_advances_on_the_clock_and_every_key_still_speaks() {
-        // 4 cps — every key is a step.
-        let mut s = synth();
-        let mut steps = 0;
-        for k in 0..40u32 {
-            let before = s.v2.theme_pos();
-            push(&mut s, SoundKind::Typed, 1_000 + k * 250, 0.0, false);
-            if s.v2.theme_pos() != before {
-                steps += 1;
+    fn every_key_is_a_step_at_every_rate_and_no_key_is_silent() {
+        // A pangram-ish key stream, so the ranks are spread and consecutive
+        // letters are rarely equal.
+        const KEYS: &str = "thequickbrownfoxjumpsoverthelazydogandthenwritesitdownagain";
+        for period in [333u32, 250, 222, 200, 167, 125, 100, 71, 50, 33, 20] {
+            let mut s = synth();
+            let mut spoke = 0;
+            let mut at = 1_000u32;
+            for ch in KEYS.chars() {
+                let mark = s.born_seq;
+                push_ch(&mut s, SoundKind::Typed, at, ch);
+                if !tune_voices(&since(&s, mark)).is_empty() {
+                    spoke += 1;
+                }
+                at += period;
             }
-        }
-        assert_eq!(steps, 40, "at 4 cps every key must sing the verse");
-
-        // 10 cps — the verse steps every third key, on the clock.
-        let mut s = synth();
-        let mut step_ms: Vec<u32> = Vec::new();
-        let mut spoke = 0;
-        for k in 0..100u32 {
-            let at = 1_000 + k * 100;
-            let mark = s.born_seq;
-            let before = s.v2.last_step_ms;
-            push(&mut s, SoundKind::Typed, at, 0.0, false);
-            if s.v2.last_step_ms != before {
-                step_ms.push(s.v2.last_step_ms);
-            }
-            if !since(&s, mark).is_empty() {
-                spoke += 1;
-            }
-        }
-        for w in step_ms.windows(2) {
-            assert!(
-                w[1] - w[0] >= STEP_GATE_MS,
-                "two steps {} ms apart, inside the {STEP_GATE_MS} ms gate",
-                w[1] - w[0]
+            let n = KEYS.chars().count() as u32;
+            assert_eq!(
+                s.v2.steps(),
+                n,
+                "at {:.1} cps the melody advanced {} times for {n} keys — a gate has grown back",
+                1_000.0 / f64::from(period),
+                s.v2.steps()
+            );
+            assert_eq!(
+                spoke,
+                n as usize,
+                "at {:.1} cps only {spoke} of {n} keys spawned a tune voice",
+                1_000.0 / f64::from(period)
             );
         }
-        // 10 s at 10 cps ⇒ one step per 300 ms (the gate rounded up to the
-        // key grid), ±1.
-        let expect = 10_000 / 300 + 1;
-        assert!(
-            (step_ms.len() as i64 - expect).abs() <= 1,
-            "10 cps produced {} steps, expected ~{expect}",
-            step_ms.len()
-        );
-        assert_eq!(spoke, 100, "at 10 cps every key still speaks");
+    }
 
-        // 30 Hz auto-repeat: the state advances 60x in 2 s, the ear hears at
-        // most one onset per 60 ms, and no STEP is ever thinned.
+    /// **A HELD KEY STILL STEPS AND STILL SPEAKS** — it is *felt* rather than
+    /// *pitched*, and never silent (§3.1's auto-repeat clause).
+    ///
+    /// macOS key repeat is one glyph on a machine-regular clock, which is
+    /// what [`AUTOREPEAT_JITTER_MS`] tests for. The old law coalesced those
+    /// onsets away; the new one takes the tine's partials to zero and leaves
+    /// the mallet, so the roll is felt under the fingers without becoming a
+    /// pitched machine gun — and the melody keeps moving underneath it.
+    #[test]
+    fn a_held_key_is_felt_not_silenced_and_the_line_keeps_moving() {
         let mut s = synth();
         let mut onsets = 0;
-        let mut steps = 0;
+        let mut pitched = 0;
         for k in 0..60u32 {
-            let at = 1_000 + k * 33;
             let mark = s.born_seq;
-            let before = s.v2.last_step_ms;
-            push(&mut s, SoundKind::Typed, at, 0.0, false);
-            let spawned = since(&s, mark);
-            if !spawned.is_empty() {
+            push_ch(&mut s, SoundKind::Typed, 1_000 + k * 33, 'a');
+            for v in tune_voices(&since(&s, mark)) {
                 onsets += 1;
-            }
-            if s.v2.last_step_ms != before {
-                steps += 1;
-                assert!(!spawned.is_empty(), "a STEP was thinned — never legal");
+                if v.p[0].lvl > 0.0 {
+                    pitched += 1;
+                }
             }
         }
+        assert_eq!(s.v2.steps(), 60, "the melody stalled under a held key");
+        assert_eq!(onsets, 60, "a held key went SILENT — never legal again");
         assert!(
-            onsets <= 34,
-            "a 30 Hz roll produced {onsets} onsets in 2 s — over the 16.7/s \
-             roughness ceiling"
+            pitched <= usize::from(AUTOREPEAT_RUN),
+            "{pitched} of 60 auto-repeat onsets were pitched; the detector \
+             should have taken all but its own run-in to the mallet alone"
         );
-        assert!(steps >= 8, "the verse stalled under auto-repeat ({steps})");
+
+        // A GENUINELY FAST HUMAN HAND IS NOT A MACHINE. The same rate with
+        // human jitter on it, and different letters, stays pitched.
+        let mut s = synth();
+        let mut pitched = 0;
+        let jitter = [30u32, 37, 33, 41, 28, 35, 39, 31];
+        let mut at = 1_000u32;
+        for (k, ch) in "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"
+            .chars()
+            .enumerate()
+        {
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, at, ch);
+            if tune_voices(&since(&s, mark))
+                .iter()
+                .any(|v| v.p[0].lvl > 0.0)
+            {
+                pitched += 1;
+            }
+            at += jitter[k % jitter.len()];
+        }
+        assert_eq!(
+            pitched,
+            60,
+            "a fast HUMAN hand was mistaken for a machine on {} of 60 keys",
+            60 - pitched
+        );
+    }
+
+    /// **THE SAME TEXT TYPED THE SAME WAY IS THE SAME LINE; TYPED
+    /// DIFFERENTLY IT IS A DIFFERENT ONE** (R2, and §3.1's determinism
+    /// clause).
+    ///
+    /// This is the whole content of "generated from the typing patterns", as
+    /// a falsifiable statement about the degree sequence: the text alone does
+    /// not fix the tune, the rhythm alone does not fix the tune, and the two
+    /// together fix it exactly.
+    #[test]
+    fn the_line_is_a_function_of_the_text_and_the_rhythm_and_of_nothing_else() {
+        const TEXT: &str = "the quick brown fox jumps over the lazy dog";
+        const OTHER: &str = "the quick brown fox jumps over the busy dog";
+        let steady = type_degrees(TEXT, 1_000, 200);
+
+        assert_eq!(
+            steady,
+            type_degrees(TEXT, 1_000, 200),
+            "the same text at the same rhythm played two different lines"
+        );
+        assert_eq!(
+            steady,
+            type_degrees(TEXT, 40_000, 200),
+            "the line moved when the take started later — an absolute clock leaked in"
+        );
+        assert!(
+            !steady.is_empty() && steady.len() == TEXT.chars().filter(|c| *c != ' ').count(),
+            "every typed key must have sounded a degree"
+        );
+
+        // A DIFFERENT RHYTHM, same text: the contour reads the hand, so the
+        // line must differ.
+        let hurried = type_degrees_rhythm(TEXT, 1_000, &[120, 340, 150, 300, 130]);
+        assert_ne!(
+            steady, hurried,
+            "the same text typed with a different rhythm played the SAME line — \
+             the hand is not reaching the melody"
+        );
+
+        // A DIFFERENT TEXT, same rhythm: the alphabet reads the glyphs, so
+        // the line must differ — and must differ from the word that changed
+        // onward, not before it.
+        let other = type_degrees(OTHER, 1_000, 200);
+        assert_ne!(
+            steady, other,
+            "two different sentences at one rhythm played the same line — \
+             the text is not reaching the melody"
+        );
+        let common = steady
+            .iter()
+            .zip(&other)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let before_change = TEXT
+            .chars()
+            .zip(OTHER.chars())
+            .take_while(|(a, b)| a == b)
+            .filter(|(a, _)| *a != ' ')
+            .count();
+        assert!(
+            common >= before_change,
+            "the line diverged at key {common}, BEFORE the text did at key \
+             {before_change} — something other than the text moved it"
+        );
+    }
+
+    /// **THE PATHOLOGICAL STREAM NEVER BECOMES A SIREN** (§3.1 step 5).
+    ///
+    /// The bench's own worst input — a held key, a digit run, `!!!!`, a
+    /// base64 blob and one word eight times — put through the melody, with
+    /// three closed guarantees checked on the degree sequence it produces:
+    /// every degree is inside the TUNE register (the reflection never lets it
+    /// out), no stride repeats more than [`MELODY_RUN_MAX`] times (the line
+    /// never climbs or falls without turning), and the line does not sit on
+    /// one degree.
+    #[test]
+    fn a_pathological_stream_never_becomes_a_siren() {
+        const PATHOLOGICAL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1234567890 !!!! \
+             aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgcHJvc2U ffff the the the the the the the the";
+        let degs = type_degrees_rhythm(PATHOLOGICAL, 1_000, &[83, 91, 83, 77, 83]);
+        assert!(
+            degs.len() > 100,
+            "fixture too short to say anything ({} keys)",
+            degs.len()
+        );
+        for d in &degs {
+            assert!(
+                (TUNE_DEG_LO..=TUNE_DEG_HI).contains(&i32::from(*d)),
+                "the line left the register at degree {d}"
+            );
+        }
+        let mut run = 1usize;
+        let mut worst = 1usize;
+        for w in degs.windows(3) {
+            if w[1] - w[0] == w[2] - w[1] && w[1] != w[0] {
+                run += 1;
+            } else {
+                run = 1;
+            }
+            worst = worst.max(run);
+        }
+        assert!(
+            worst <= usize::from(MELODY_RUN_MAX),
+            "{worst} identical strides ran without turning — that is a siren, \
+             and MELODY_RUN_MAX is meant to invert the fourth"
+        );
+        let mut hist = [0usize; (TUNE_DEG_HI + 1) as usize];
+        for d in &degs {
+            hist[*d as usize] += 1;
+        }
+        let top = hist.iter().max().copied().unwrap_or(0);
+        assert!(
+            top * 2 < degs.len(),
+            "{top} of {} keys landed on ONE degree — the line is stuck",
+            degs.len()
+        );
+        assert!(
+            hist.iter().filter(|n| **n > 0).count() >= 5,
+            "the line only ever visited {} of the register's nine degrees",
+            hist.iter().filter(|n| **n > 0).count()
+        );
+    }
+
+    /// **THE RUN GUARD HOLDS ON THE LINE THE EAR GETS**, not on the stride
+    /// `derive` counted — the bench's `scenario_pathological`, stream for
+    /// stream and pause for pause, plus the prose the answer leaks on.
+    ///
+    /// The render's siren verdict found `0 1 2 3 4` in this exact take: the
+    /// held `a`s park the line on degree 0, the 783 ms think before `0` reads
+    /// as a hesitation and turns the stride negative, the floor reflects it
+    /// to `+1` — and the run was booked as `−1`, so three more `+1`s passed
+    /// the guard. It also found every answer of a rising subject sounding as
+    /// a straight five-note scale in `prose` and `rotate`. Both are counted
+    /// here the way the bench counts them, on the sounded degrees.
+    #[test]
+    fn the_run_guard_holds_on_the_sounded_line_not_the_counted_one() {
+        // (text, period ms) scenes, each followed by the bench's 700 ms
+        // think — `Hand::steady(12.0)` is 83 ms, `Hand::steady(3.5)` 286.
+        const SCENES: [(&str, u32); 6] = [
+            ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 83),
+            ("0123456789 0123456789", 83),
+            ("!!!!", 83),
+            ("aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgcHJvc2U+Pz8/", 83),
+            ("the the the the the the the the ", 83),
+            ("!!!! 999 aaaa", 286),
+        ];
+        let mut takes: Vec<(&str, Vec<i8>)> = Vec::new();
+        let mut s = synth();
+        let mut at = 500u32;
+        let mut degs = Vec::new();
+        for (text, period) in SCENES {
+            for ch in text.chars() {
+                let kind = if ch == ' ' {
+                    SoundKind::Space
+                } else {
+                    SoundKind::Typed
+                };
+                push_ch(&mut s, kind, at, ch);
+                if kind == SoundKind::Typed {
+                    degs.push(s.v2.walk());
+                }
+                at += period;
+            }
+            at += 700;
+        }
+        takes.push(("pathological, as the bench types it", degs));
+        // THE PROSE AS THE BENCH'S HAND TYPES IT — `type_text`'s cadence,
+        // rest for rest: 100 ms a key at 10 cps, a 550 ms sentence rest
+        // after a full stop, a Jump and a 350 ms beat of thought at a line
+        // ending. The rests matter: a rest resolves the walk and re-latches
+        // the subject, and the third leak the render caught (a `+3` off
+        // degree 6 sounding as the fourth `+1` of a run, at key 295) only
+        // arises on the subject THIS cadence latches.
+        let mut s = synth();
+        let mut at = 500u32;
+        let mut degs = Vec::new();
+        for ch in BENCH_PROSE.chars() {
+            let kind = match ch {
+                ' ' => SoundKind::Space,
+                '\n' => SoundKind::Jump,
+                _ => SoundKind::Typed,
+            };
+            push_ch(&mut s, kind, at, ch);
+            if kind == SoundKind::Typed {
+                degs.push(s.v2.walk());
+            }
+            at += 100;
+            if ch == '\n' {
+                at += 350;
+            }
+            if ch == '.' {
+                at += 550;
+            }
+        }
+        takes.push(("prose, as the bench types it", degs));
+        // …and at three more hands, because which subject gets latched, and
+        // so where the answer can leak, depends on the rhythm.
+        for periods in [
+            &[100u32][..],
+            &[83, 91, 83, 77, 83],
+            &[140, 500, 130, 620, 150],
+        ] {
+            takes.push(("prose", type_degrees_rhythm(BENCH_PROSE, 1_000, periods)));
+        }
+        for (name, degs) in takes {
+            let mut run = 1usize;
+            let mut worst = (1usize, 0usize);
+            for (i, w) in degs.windows(3).enumerate() {
+                if w[1] - w[0] == w[2] - w[1] && w[1] != w[0] {
+                    run += 1;
+                } else {
+                    run = 1;
+                }
+                if run > worst.0 {
+                    worst = (run, i + 2);
+                }
+            }
+            assert!(
+                worst.0 <= usize::from(MELODY_RUN_MAX),
+                "{} identical strides SOUNDED without turning on {name}, ending at key {} \
+                 (…{:?}) — the guard counted a stride the ear did not get",
+                worst.0,
+                worst.1,
+                &degs[worst.1.saturating_sub(5)..=worst.1]
+            );
+        }
+    }
+
+    /// **EVERY REPEATED PITCH IS CHARGED TO A CAUSE THE DESIGN WROTE DOWN**
+    /// — §8 step 3's "the census reads 100 % distinct", in the only form that
+    /// is simultaneously true and worth having.
+    ///
+    /// §8 asks for 100 % distinct. §3.1 of the same document keeps
+    /// [`Touch::ReStrike`] for "a stride of zero — a genuinely repeated
+    /// pitch, from a doubled letter". Both cannot hold of one column: a
+    /// corpus that types `ll` has ASKED for the same note twice, and an
+    /// engine that refused would be overwriting the text instead of deriving
+    /// from it. So the claim is not a percentage — it is an ACCOUNT. Every
+    /// key that repeats the sounding degree is charged to one of the three
+    /// causes §3.1 names:
+    ///
+    /// * the text asked (this key's alphabet rank equals the last one's);
+    /// * a word head whose chord snap held a common tone across the change;
+    /// * the line answering its own subject on a latched unison.
+    ///
+    /// **The residual must be zero**, because a repeat with no cause is the
+    /// engine standing still while the hand moved — R1's defect in miniature,
+    /// and exactly what the deleted gate used to do wholesale.
+    ///
+    /// THIS TEST HAS ALREADY CAUGHT ONE. The subject used to latch its first
+    /// interval off the session's opening key, which has no note before it to
+    /// be a distance from, so the interval was a unison the text never typed
+    /// — and it came back as a repeated note at EVERY answering word head for
+    /// the rest of the session: 24 of them in the bench's 403-key prose, all
+    /// at `word_pos == 1`. Held against the whole sweep of rhythms below,
+    /// nothing like it can land again unnoticed.
+    #[test]
+    fn every_repeated_pitch_is_charged_to_a_cause_the_design_names() {
+        const PATHOLOGICAL: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1234567890 !!!! \
+             aGVsbG8gd29ybGQgdGhpcyBpcyBub3QgcHJvc2U ffff the the the the the the the the";
+        // A metronome, a hurried hand, a hesitating one, and a machine-fast
+        // run — the contour reads the gap, so each is a different line and
+        // each gets its own account.
+        const RHYTHMS: [&[u32]; 4] = [
+            &[200],
+            &[83, 91, 83, 77, 83],
+            &[140, 500, 130, 620, 150],
+            &[71],
+        ];
+        // `ordinary` says whether the corpus is text a person would write.
+        // The pathological one is 30 held `a`s, `!!!!`, `ffff` and one word
+        // eight times: a third of its keys ARE a doubled letter, so a bound
+        // on the TOTAL repeat share there would be a bound on the fixture
+        // rather than on the engine.
+        for (name, text, ordinary) in [
+            ("prose", BENCH_PROSE, true),
+            ("pathological", PATHOLOGICAL, false),
+        ] {
+            for periods in RHYTHMS {
+                let mut s = synth();
+                let mut at = 1_000u32;
+                let (mut keys, mut dbl, mut head, mut subj, mut stall) = (0, 0, 0, 0, 0);
+                let mut prev_rank = 0u8;
+                let mut prev_deg: Option<i8> = None;
+                for (i, ch) in text.chars().enumerate() {
+                    let kind = match ch {
+                        ' ' => SoundKind::Space,
+                        '\n' => SoundKind::Enter { cells: 30 },
+                        _ => SoundKind::Typed,
+                    };
+                    // Read BEFORE the push: both predicates move on it, and
+                    // both are the engine's own — `word_pos == 0` is the word
+                    // head branch, `!word_head && motif_play > 0` is the
+                    // replay branch, verbatim.
+                    let was_head = s.v2.word_pos() == 0;
+                    let was_answer = !was_head && s.v2.motif_answering();
+                    let rank = crate::trail_sound::typed_glyph_rank(Some(ch));
+                    push_ch(&mut s, kind, at, ch);
+                    if matches!(kind, SoundKind::Typed) {
+                        keys += 1;
+                        let deg = s.v2.walk();
+                        if prev_deg == Some(deg) {
+                            // Charged to the branch that PRODUCED the degree,
+                            // never to the first plausible story: an answered
+                            // interval never consulted the alphabet.
+                            if was_answer {
+                                subj += 1;
+                            } else if rank != 0 && rank == prev_rank {
+                                dbl += 1;
+                            } else if was_head {
+                                head += 1;
+                            } else {
+                                stall += 1;
+                            }
+                        }
+                        if rank != 0 {
+                            prev_rank = rank;
+                        }
+                        prev_deg = Some(deg);
+                    }
+                    at += periods[i % periods.len()];
+                }
+                assert!(
+                    keys > 100,
+                    "fixture too short to say anything ({keys} keys on {name})"
+                );
+                assert_eq!(
+                    stall, 0,
+                    "{stall} of {keys} keys on {name} at rhythm {periods:?} repeated \
+                     the sounding pitch with no cause §3.1 names — the line stood \
+                     still while the hand moved (dbl {dbl}, head {head}, subj {subj})"
+                );
+                // WHAT THE ENGINE ADDS TO THE TEXT'S OWN REPETITION is
+                // bounded on EVERY corpus. `dbl` is the text's doing and a
+                // corpus is entitled to as many doubled letters as it likes;
+                // `head` and `subj` are the instrument's, and an instrument
+                // that returns to the sounding note on a tenth of the keys of
+                // its own accord is decorating rather than deriving.
+                assert!(
+                    (head + subj) * 10 < keys,
+                    "the ENGINE repeated the sounding pitch on {} of {keys} keys on \
+                     {name} at rhythm {periods:?} (head {head}, subj {subj}) — \
+                     accounted for, but that is the instrument's repetition, not \
+                     the text's",
+                    head + subj
+                );
+                // …and on text a person would actually write, the total is
+                // bounded too: past a tenth the line is repeating more than
+                // it is deriving, whatever the account says.
+                assert!(
+                    !ordinary || (dbl + head + subj) * 10 < keys,
+                    "{} of {keys} keys on {name} at rhythm {periods:?} repeated the \
+                     last pitch (dbl {dbl}, head {head}, subj {subj}) — accounted \
+                     for, but that is no longer a derived line",
+                    dbl + head + subj
+                );
+            }
+        }
     }
 
     // -- A2: the anti-leap law, on the bench's own prose -------------------
@@ -2856,10 +4594,16 @@ for it up front.\n\
         deg: i8,
     }
 
-    /// Drive the bench's prose EXACTLY as `keyboard_song_ab` renders it —
-    /// the bench's seed, the music box reached by voice, unstamped `push` on
-    /// the synth's own 512-frame block clock — logging every spawn and the
-    /// melody's `word_pos` after every cue.
+    /// Drive the bench's prose corpus and cue script — the bench's seed, the
+    /// music box reached by voice, 512-frame blocks — logging every spawn and
+    /// the melody's `word_pos` after every cue.
+    ///
+    /// Deliberately still on UNSTAMPED `push`, i.e. the synth's own block
+    /// clock: `keyboard_song_ab` now stamps `EventMeta::at_ms` with the
+    /// scripted press time (2026-09-08), and A2's anti-leap law must hold on
+    /// BOTH clocks — the host stamp and the block-clock fallback a host with
+    /// nothing to stamp still lands on. This is the fallback's pin; the bench
+    /// is the stamped one.
     fn drive_bench_prose(cues: &[Cue]) -> (TrailSynth, Vec<Spawn>, Vec<u8>) {
         const BLOCK: usize = 512;
         let mut s = TrailSynth::new(SR, 0x504F_4F46);
@@ -2905,11 +4649,14 @@ for it up front.\n\
     /// 6.7 octave-class leaps a second at 10 cps. v2 has no ghost lane at all,
     /// so the law is stated positively and EXACTLY: inside a word — between
     /// two `Typed` cues with no Space, line feed or Enter between them — a
-    /// typed onset is a unison (a re-strike), the verse's own next note (at
-    /// most three degrees, the theme's widest step), or a mid-word rest
-    /// cadence folded to a sixth ([`WORD_LEAP_MAX_DEG`]). **One exemption,
-    /// §21.4's own:** the form wrap, A″'s peak G6 leaning back onto A's C5
-    /// (degree 8 → 0), which is the piece's shape and not a ghost.
+    /// typed onset is a unison (a doubled letter), or a derived stride — at
+    /// most [`WORD_LEAP_MAX_DEG`] degrees, which [`MelodyV2::derive`] clamps
+    /// by construction. **There is no longer any exemption.** The authored
+    /// form's wrap (A″'s peak G6 leaning back onto A's C5, degree 8 → 0) was
+    /// the one leap wider than a sixth this test used to allow; the derived
+    /// line has no form to wrap, and reflects at the register's bounds
+    /// instead of leaping across them, so the exemption is deleted rather
+    /// than widened.
     ///
     /// The capture-after analysis of 2026-09-05 reported four "in-word"
     /// leaps beyond the wrap; every one straddled a LINE FEED (the brrrring's
@@ -2932,7 +4679,7 @@ for it up front.\n\
             .filter(|e| e.lane == LANE_TUNE && matches!(cues[e.cue].1, SoundKind::Typed))
             .copied()
             .collect();
-        let (mut pairs, mut near, mut wraps) = (0usize, 0usize, 0usize);
+        let (mut pairs, mut near) = (0usize, 0usize);
         for w in typed.windows(2) {
             let (a, b) = (w[0], w[1]);
             if cues[a.cue + 1..b.cue]
@@ -2943,10 +4690,6 @@ for it up front.\n\
             }
             pairs += 1;
             let leap = i32::from(b.deg) - i32::from(a.deg);
-            if a.deg == TUNE_DEG_HI as i8 && b.deg == TUNE_DEG_LO as i8 {
-                wraps += 1;
-                continue;
-            }
             assert!(
                 leap.abs() <= WORD_LEAP_MAX_DEG,
                 "an in-word leap of {leap} degrees ({:.0} Hz -> {:.0} Hz) at cue {} — \
@@ -2963,10 +4706,19 @@ for it up front.\n\
             pairs >= 250,
             "only {pairs} in-word pairs — the take is not the bench's"
         );
-        assert!(wraps >= 3, "the take never wrapped the form ({wraps})");
-        // §21.4: ≥ 60 % unison-or-one-degree at 10 cps (the music-box
-        // tremolo is what replaces the ghosts).
+        // §21.4's CONJUNCT SHARE — ≥ 60 % unison-or-one-degree, KEPT, and now
+        // earned by the melody rather than by the gate.
+        //
+        // The old number was met because above 4.5 cps most keys were a muted
+        // repeat of the last note: the "conjunct" share was really the
+        // tremolo's. With the gate deleted it is the derived line's own, and
+        // it is higher — measured 76.5 % of 307 in-word pairs, against the
+        // 46 % that [`stride_mag`]'s bands alone would give over a uniform
+        // fold. Gravity's ±1 and [`MELODY_RUN_MAX`]'s inversion are what make
+        // up the difference, which puts the line inside the 70-80 % conjunct
+        // that the ladder's own doc says real melodies run at.
         let pct = 100.0 * near as f32 / pairs as f32;
+        println!("in-word conjunct share: {pct:.1} % of {pairs} pairs");
         assert!(
             pct >= 60.0,
             "only {pct:.0} % of {pairs} in-word pairs were a unison or one degree"
@@ -2976,7 +4728,7 @@ for it up front.\n\
         // straddles a line feed.
         let lead: Vec<Spawn> = log
             .iter()
-            .filter(|e| matches!(e.lane, LANE_TUNE | LANE_CASCADE | LANE_ECHO) && e.f0 > 0.0)
+            .filter(|e| matches!(e.lane, LANE_TUNE | LANE_CASCADE) && e.f0 > 0.0)
             .copied()
             .collect();
         let mut wide = 0usize;
@@ -3039,43 +4791,47 @@ for it up front.\n\
         let mut s = synth();
         push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
         push(&mut s, SoundKind::Typed, 1_100, 0.0, false);
-        assert_eq!(
-            (s.v2.walk(), s.v2.word_pos()),
-            (0, 2),
-            "fixture: C5, two letters in"
-        );
+        assert_eq!(s.v2.word_pos(), 2, "fixture: two letters into a word");
+        let before = s.v2.walk();
         let mark = s.born_seq;
         push(&mut s, SoundKind::Typed, 2_100, 0.0, false);
         let v = tune_voices(&since(&s, mark))[0];
-        assert_eq!(
-            s.v2.theme_pos(),
-            SONG_FORM[1],
-            "the pause must still cadence the phrase and open the next"
+        assert!(
+            !since(&s, mark).is_empty(),
+            "the key that ends a rest must still sing its own note"
         );
         let ratio = v.p[0].f0 / penta(TINE_BASE_HZ, 0);
         assert!(
             ratio <= 5.0 / 3.0 + 1e-4,
-            "the mid-word cadence leapt {ratio:.3}x from C5 — E6 is a tenth, the ghost \
-             defect on the one key still inside the word"
+            "the key after a mid-word rest leapt {ratio:.3}x from C5 — E6 is a tenth, \
+             the ghost defect on the one key still inside the word"
         );
-        assert_eq!(
-            s.v2.walk(),
-            4,
-            "the cadence takes the chord tone nearest the phrase's final degree inside a sixth"
+        assert!(
+            (i32::from(s.v2.walk()) - i32::from(before)).abs()
+                <= WORD_HEAD_SNAP_DEG + WORD_LEAP_MAX_DEG,
+            "the rest resolved by more than the resolution plus one derived stride"
         );
-        assert!(s.v2.lit(), "the folded cadence is a chord tone");
 
-        // Between words: §10.2 verbatim.
+        // THE RESOLUTION ITSELF is a chord tone, and it happens BEFORE the
+        // key derives its own note — so a rest lands the line on the harmony
+        // rather than wherever the last letter left it.
         let mut s = synth();
         push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
-        push(&mut s, SoundKind::Space, 1_100, 0.0, false);
-        push(&mut s, SoundKind::Typed, 2_100, 0.0, false);
-        assert_eq!(
-            s.v2.walk(),
-            SONG_THEME[usize::from(SONG_FORM[1]) - 1],
-            "between words the rest closes onto the phrase's own final degree"
+        push(&mut s, SoundKind::Typed, 1_100, 0.0, false);
+        push(&mut s, SoundKind::Typed, 1_200, 0.0, false);
+        let probe = s.v2;
+        let resolved = {
+            let here = i32::from(probe.walk());
+            probe.nearest_lit_within(here, here)
+        };
+        assert!(
+            probe.deg_is_lit(resolved),
+            "the rest's resolution is not a chord tone"
         );
-        assert_eq!(s.v2.theme_pos(), SONG_FORM[1]);
+        assert!(
+            (resolved - i32::from(probe.walk())).abs() <= WORD_HEAD_SNAP_DEG,
+            "the rest's resolution moved more than the snap's own bound"
+        );
     }
 
     // -- A4: nothing transposes the verse --------------------------------
@@ -3146,6 +4902,562 @@ for it up front.\n\
                 "{tone:?} scaled the tine's decay by {ratio}, not tone_feel's {feel}"
             );
         }
+    }
+
+    // -- §3.1 / §3.3 / §3.4: the onset repairs and the timbre ---------------
+
+    /// **A CAPITAL IS ONE ONSET, AN OCTAVE UP; A BARE SHIFT IS FELT, NOT
+    /// PITCHED** (§3.1 "Boundaries", §2.3 i-ii, §8 step 4).
+    ///
+    /// One capital used to be three sounds: the bare Shift's pitched lift,
+    /// the letter, and an octave echo 25 ms behind it at −8 dB. Now the
+    /// letter is its own single step lifted [`CAPITAL_LIFT_DEG`] degrees
+    /// (clamped to the ceiling) — the same derivation as its lowercase twin,
+    /// higher — and the modifier is the felt mallet alone.
+    #[test]
+    fn a_capital_is_one_lifted_onset_and_a_bare_shift_is_felt_not_pitched() {
+        let walk_after = |cap: bool| -> (i8, Vec<Voice>) {
+            let mut s = synth();
+            for (i, ch) in "hello ".chars().enumerate() {
+                push_ch(
+                    &mut s,
+                    if ch == ' ' {
+                        SoundKind::Space
+                    } else {
+                        SoundKind::Typed
+                    },
+                    1_000 + i as u32 * 150,
+                    ch,
+                );
+            }
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, 1_900, if cap { 'W' } else { 'w' });
+            (s.v2.walk(), since(&s, mark))
+        };
+        let (low, _) = walk_after(false);
+        let (high, spawned) = walk_after(true);
+        assert_eq!(
+            i32::from(high),
+            (i32::from(low) + CAPITAL_LIFT_DEG).min(TUNE_DEG_HI),
+            "the capital `W` sounded degree {high} where `w` sounded {low}: not one \
+             lattice octave up, clamped to the ceiling"
+        );
+        let tune: Vec<&Voice> = spawned.iter().filter(|v| v.lane == LANE_TUNE).collect();
+        assert_eq!(
+            tune.len(),
+            1,
+            "a capital spawned {} TUNE voices, not one",
+            tune.len()
+        );
+        assert!(
+            tune[0].p[0].lvl > 0.0 && tune[0].delay == 0.0,
+            "the capital's own note must be pitched and on the key"
+        );
+        // No second pitched sound of the capital's own: nothing at the
+        // retired echo's 25 ms, nothing at the note's octave.
+        let f = tune[0].p[0].f0;
+        for v in &spawned {
+            assert!(
+                v.lane != LANE_TUNE || core::ptr::eq(v, tune[0]),
+                "a second TUNE voice rode the capital"
+            );
+            assert!(
+                (v.delay - 0.025).abs() > 1e-6 && (v.p[0].f0 - 2.0 * f).abs() > SAME_PITCH_HZ,
+                "the capital's octave echo is back (delay {} s, f0 {} Hz)",
+                v.delay,
+                v.p[0].f0
+            );
+        }
+
+        // THE BARE MODIFIER: one voice in the SHIFT lane, every partial at
+        // zero, the mallet alone, at 0.4 of the lift's old level.
+        let mut s = synth();
+        push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+        let mark = s.born_seq;
+        push(&mut s, SoundKind::Shift, 1_300, 0.0, false);
+        let lift = since(&s, mark);
+        assert_eq!(lift.len(), 1, "a bare Shift spawned {} voices", lift.len());
+        let v = lift[0];
+        assert_eq!(v.lane, LANE_SHIFT);
+        assert!(
+            v.p.iter().all(|p| p.lvl == 0.0) && v.n_lvl > 0.0,
+            "a bare Shift must be felt (mallet only), never pitched"
+        );
+        let nominal = VOL * KEY_TINE_TRIM * LIFT_LEVEL * LIFT_FELT_MUL;
+        let got = (v.gl * v.gl + v.gr * v.gr).sqrt();
+        assert!(
+            (got / nominal - 1.0).abs() < 0.05,
+            "the felt lift is {got} against LIFT_LEVEL × 0.4 = {nominal}"
+        );
+    }
+
+    /// **A DOUBLED LETTER IS ALWAYS A RE-STRIKE** (§3.1 step 1), in the
+    /// outer register too: gravity acts on a stride, never on a repeat. Every
+    /// prefix of the pangram, every letter doubled after it.
+    #[test]
+    fn a_doubled_letter_is_a_re_strike_wherever_the_line_stands() {
+        const KEYS: &str = "thequickbrownfoxjumpsoverthelazydog";
+        let mut checked = 0usize;
+        let mut outer = 0usize;
+        for n in 1..=KEYS.chars().count() {
+            for ch in 'a'..='z' {
+                let mut s = synth();
+                let mut at = 1_000u32;
+                for c in KEYS.chars().take(n) {
+                    push_ch(&mut s, SoundKind::Typed, at, c);
+                    at += 90;
+                }
+                push_ch(&mut s, SoundKind::Typed, at, ch);
+                let before = s.v2.walk();
+                let mark = s.born_seq;
+                push_ch(&mut s, SoundKind::Typed, at + 90, ch);
+                checked += 1;
+                if (i32::from(before) - MELODY_CENTRE_DEG).abs() > MELODY_GRAVITY_DEG {
+                    outer += 1;
+                }
+                assert_eq!(
+                    s.v2.walk(),
+                    before,
+                    "`{ch}{ch}` after {:?} moved the line from {before} to {} — a doubled \
+                     letter is a repeat, and gravity may not turn it into a step",
+                    &KEYS[..n],
+                    s.v2.walk()
+                );
+                let lead = tune_voices(&since(&s, mark));
+                assert_eq!(lead.len(), 1);
+                assert_eq!(lead[0].p[2].lvl, 0.0, "a re-strike has no strike partial");
+                assert!(s.v2.restrike >= 1, "the re-strike ladder did not arm");
+            }
+        }
+        assert!(
+            outer > 0,
+            "fixture: {checked} doubles checked and none stood where gravity is armed"
+        );
+    }
+
+    /// **A WORD HEAD'S COMMON TONE IS AN ACCENT, NOT A TREMOLO** (§3.1 step
+    /// 6; step-3 review, finding 1). When the chord snap lands the head on
+    /// the degree the previous word ended on, the head keeps the STEP's
+    /// touch — full level, strike partial, roof — and the previous voice is
+    /// still damped, because two sines at one pitch comb whatever the touch.
+    #[test]
+    fn a_word_head_common_tone_keeps_the_steps_touch_and_still_damps_the_old_voice() {
+        let mut s = synth();
+        let mut at = 1_000u32;
+        let mut heads_repeated = 0usize;
+        let mut doubles = 0usize;
+        for line in BENCH_PROSE.lines() {
+            for word in line.split(' ') {
+                if word.is_empty() {
+                    continue;
+                }
+                let mut prev = '\0';
+                for (i, ch) in word.chars().enumerate() {
+                    let before = s.v2.walk();
+                    let old_lead = s.v2.lead;
+                    let mark = s.born_seq;
+                    push_ch(&mut s, SoundKind::Typed, at, ch);
+                    at += 100;
+                    let lead = tune_voices(&since(&s, mark))[0];
+                    if s.v2.walk() != before {
+                        prev = ch;
+                        continue;
+                    }
+                    // The old voice is damping — on a head and on a double.
+                    if let Some((slot, born)) = old_lead {
+                        let v = &s.voices[usize::from(slot)];
+                        assert!(
+                            v.born != born || !v.on || v.damp > 0.0,
+                            "a repeated pitch did not damp the voice before it"
+                        );
+                    }
+                    if i == 0 {
+                        heads_repeated += 1;
+                        assert_eq!(s.v2.restrike, 0, "a word head armed the re-strike ladder");
+                        assert!(
+                            lead.p[2].lvl > 0.0 && lead.n_lvl == MALLET_LVL,
+                            "a word head's common tone lost the step's strike"
+                        );
+                    } else {
+                        assert_eq!(prev, ch, "an in-word repeat that is not a doubled letter");
+                        doubles += 1;
+                        assert!(s.v2.restrike >= 1);
+                        assert_eq!(lead.p[2].lvl, 0.0);
+                    }
+                    prev = ch;
+                }
+                push(&mut s, SoundKind::Space, at, 0.0, false);
+                at += 100;
+            }
+            push(&mut s, SoundKind::Jump, at, 0.0, false);
+            at += 200;
+        }
+        assert!(doubles > 0, "fixture: the prose types no doubled letter");
+        assert!(
+            heads_repeated > 0,
+            "fixture: no word head landed on the previous word's last degree"
+        );
+    }
+
+    /// **τ_v PASSES THROUGH §3.1's TWO ANCHORS, AND THE FLOOR BINDS AT
+    /// 20 cps** (step-3 review, finding 8): 110 ms at the 4 cps reference,
+    /// 28 ms at 20 cps, and the floor — not the intake clamp — decides the
+    /// note from there down.
+    #[test]
+    fn tau_v_meets_both_anchors_and_the_floor_is_reachable() {
+        assert!((tau_v_s(0.25) - 0.110).abs() < 1e-4, "{}", tau_v_s(0.25));
+        assert!((tau_v_s(0.05) - 0.028).abs() < 1e-4, "{}", tau_v_s(0.05));
+        assert_eq!(
+            tau_v_s(IOI_MIN_MS * 0.001),
+            TAU_V_MIN_S,
+            "the floor does not bind"
+        );
+        // The curve must reach the floor, or the floor is not a law.
+        const { assert!(TAU_V_BASE_S * (TAU_V_OFFSET + TAU_V_SLOPE * IOI_MIN_MS * 0.001) < TAU_V_MIN_S) }
+        // …and through the engine: a 20 cps run's notes are 28 ms.
+        let mut s = synth();
+        let mut last = 0.0f32;
+        for (k, ch) in "abcdefghijklmnopqrstuvwxyz".chars().enumerate() {
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, 1_000 + k as u32 * 50, ch);
+            last = tune_voices(&since(&s, mark))[0].decay;
+        }
+        assert!(
+            (last - 0.028).abs() < 1e-3,
+            "a settled 20 cps run plays {last} s notes, not 28 ms"
+        );
+    }
+
+    /// **THE BLOOM FADES IN BEHIND EVERY LIT STEP, ON THE LATTICE, AND
+    /// FOLLOWS THE HUE** (§3.3 items 1-3).
+    ///
+    /// A lit step carries one voice in [`LANE_BLOOM`] at [`BLOOM_DELAY_S`]
+    /// with [`BLOOM_ATTACK_S`], its partials on [`BLOOM_DEGREES`] above the
+    /// note — 3f / 4f / 6f exactly on C — and nothing else does: not a
+    /// passing note, not a re-strike, not a felt key. Its level scales by
+    /// [`hue_air`] and its pan drifts by [`BLOOM_SPREAD`]; the note's roof
+    /// opens by [`ROOF_HUE_ADD_HZ`] and its gain does not move by a decibel.
+    /// With the stops out, none of it exists.
+    #[test]
+    fn the_bloom_rides_every_lit_step_on_the_lattice_and_follows_the_hue() {
+        // (a) The session's first key is C on I: a lit step. Its bloom.
+        let mut s = synth();
+        let mark = s.born_seq;
+        push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
+        let spawned = since(&s, mark);
+        let lead = tune_voices(&spawned)[0];
+        let blooms: Vec<&Voice> = spawned.iter().filter(|v| v.lane == LANE_BLOOM).collect();
+        assert_eq!(blooms.len(), 1, "a lit step carries exactly one bloom");
+        let b = blooms[0];
+        assert_eq!(b.delay, BLOOM_DELAY_S);
+        assert_eq!(b.attack, BLOOM_ATTACK_S);
+        assert_eq!(b.decay, BLOOM_DECAY_S);
+        assert_eq!(
+            b.n_lvl, 0.0,
+            "the bloom has no mallet: the strike already happened"
+        );
+        for (k, ratio) in [3.0f32, 4.0, 6.0].iter().enumerate() {
+            assert!(
+                (b.p[k].f0 - lead.p[0].f0 * ratio).abs() < 1e-2,
+                "on C the bloom's partial {k} is {} Hz, not {ratio}f",
+                b.p[k].f0
+            );
+            assert_eq!(b.p[k].decay, BLOOM_TAU[k]);
+        }
+        assert!(
+            (-b.dur / b.decay).exp() <= 0.07,
+            "the bloom's tail breaks A13"
+        );
+
+        // (b) Over a corpus: a bloom iff the key was a lit STEP with a pitch.
+        let mut s = synth();
+        let mut buf = [0.0f32; 960];
+        let (mut with, mut without) = (0usize, 0usize);
+        for (k, ch) in "the quick brown fox jumps over the lazy dogg"
+            .chars()
+            .enumerate()
+        {
+            let mark = s.born_seq;
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            push_ch(&mut s, kind, 1_000 + k as u32 * 110, ch);
+            // The audio clock keeps up with the hand, as on a host: a bench
+            // that never renders fills the pool and measures the pool.
+            for _ in 0..11 {
+                s.render(&mut buf);
+            }
+            if ch == ' ' {
+                continue;
+            }
+            let spawned = since(&s, mark);
+            let lead = tune_voices(&spawned)[0];
+            let step = lead.p[2].lvl > 0.0; // a Step's strike partial; 0 on a re-strike / felt key
+            // The answering voice shares the lane; a bloom is the voice
+            // with the bloom's own attack.
+            let bloomed = spawned
+                .iter()
+                .filter(|v| v.lane == LANE_BLOOM && v.attack == BLOOM_ATTACK_S)
+                .count();
+            let want = usize::from(s.v2.lit() && step);
+            assert_eq!(
+                bloomed,
+                want,
+                "key {k} `{ch}`: lit {} step {step}",
+                s.v2.lit()
+            );
+            if want == 1 { with += 1 } else { without += 1 }
+        }
+        assert!(
+            with > 10 && without > 0,
+            "fixture: with {with}, without {without}"
+        );
+
+        // (c) The hue: air on the bloom's level, spread on its pan, the arc
+        // on the note's roof — and not a decibel on the note.
+        let under_hue = |hue: f32, stops: TimbreStops| -> (Voice, Option<Voice>) {
+            let mut s = synth();
+            s.set_v2_timbre_stops(stops);
+            let mut ev = event(SoundKind::Typed, 0.0, false);
+            ev.hue = hue;
+            ev.heat = 0.0;
+            let mark = s.born_seq;
+            s.push_meta(
+                ev,
+                EventMeta {
+                    at_ms: 1_000,
+                    ..EventMeta::default()
+                },
+            );
+            let spawned = since(&s, mark);
+            (
+                tune_voices(&spawned)[0],
+                spawned.iter().find(|v| v.lane == LANE_BLOOM).copied(),
+            )
+        };
+        let (red, red_b) = under_hue(0.0, TimbreStops::ALL);
+        let (cyan, cyan_b) = under_hue(0.5, TimbreStops::ALL);
+        let (red_b, cyan_b) = (red_b.expect("bloom"), cyan_b.expect("bloom"));
+        assert_eq!(
+            red.gl + red.gr,
+            cyan.gl + cyan.gr,
+            "the hue bought a decibel on the note"
+        );
+        assert!(
+            (cyan.lp_cut - red.lp_cut - ROOF_HUE_ADD_HZ).abs() < 1e-2,
+            "the arc opened the roof by {} Hz, not {ROOF_HUE_ADD_HZ}",
+            cyan.lp_cut - red.lp_cut
+        );
+        let ratio = (cyan_b.gl.powi(2) + cyan_b.gr.powi(2)).sqrt()
+            / (red_b.gl.powi(2) + red_b.gr.powi(2)).sqrt();
+        let want = hue_air(0.5) / hue_air(0.0);
+        assert!(
+            (ratio - want).abs() < 1e-3,
+            "the bloom's level moved ×{ratio} from red to cyan, hue_air says ×{want}"
+        );
+        // Red sits BLOOM_SPREAD/2 to one side of the strike, cyan to the
+        // other: the pans differ, and by the spread. (Equal-power law: read
+        // the angle back off the gains.)
+        let angle = |v: &Voice| v.gr.atan2(v.gl);
+        assert!(
+            angle(&cyan_b) > angle(&red_b) + 1e-3 && angle(&red_b) < angle(&red) - 1e-3,
+            "the bloom's pan does not drift with the hue"
+        );
+        // Stops out: no bloom, no arc, the pre-§3.3 roof exactly.
+        let (plain_red, none_r) = under_hue(0.0, TimbreStops::PLAIN);
+        let (plain_cyan, none_c) = under_hue(0.5, TimbreStops::PLAIN);
+        assert!(none_r.is_none() && none_c.is_none(), "PLAIN still blooms");
+        assert_eq!(
+            plain_red.lp_cut, plain_cyan.lp_cut,
+            "PLAIN still reads the hue"
+        );
+        assert_eq!(
+            plain_red.lp_cut, red.lp_cut,
+            "the red end of the arc is not the shipped roof"
+        );
+    }
+
+    /// **THE ROOM ANSWERS A LINE'S END AND A REST, AND NOTHING INSIDE A
+    /// PHRASE; THE SUBJECT IS ANSWERED FROM ABOVE** (§3.3 item 4, the
+    /// answering voice).
+    #[test]
+    fn the_room_answers_line_ends_and_rests_and_the_subject_is_answered_from_above() {
+        let taps = |v: &[Voice]| -> Vec<Voice> {
+            v.iter()
+                .filter(|v| v.lane == LANE_BLOOM && v.delay > BLOOM_DELAY_S + 1e-6)
+                .copied()
+                .collect()
+        };
+        let mut s = synth();
+        let mut at = 1_000u32;
+        // Inside a phrase: blooms, but no taps and no answer.
+        for ch in "abcd".chars() {
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, at, ch);
+            assert!(
+                taps(&since(&s, mark)).is_empty(),
+                "the room spoke inside a phrase"
+            );
+            at += 200;
+        }
+        // A REST: the key after ≥ PHRASE_PAUSE_MS carries two taps, at the
+        // air cloud's spacings, on opposite sides.
+        at += PHRASE_PAUSE_MS;
+        let mark = s.born_seq;
+        push_ch(&mut s, SoundKind::Typed, at, 'e');
+        let after_rest = since(&s, mark);
+        let lead = tune_voices(&after_rest)[0];
+        let t = taps(&after_rest);
+        assert_eq!(
+            t.len(),
+            2,
+            "a rest leaves two taps in the room, got {}",
+            t.len()
+        );
+        for (tap, k) in t.iter().zip(AIR_TAP_DELAY_S) {
+            assert!((tap.delay - k).abs() < 1e-6, "tap at {} s", tap.delay);
+            assert!(
+                (tap.p[1].f0 - 4.0 * lead.p[0].f0).abs() < 1e-2,
+                "the tap is not the key's own bloom"
+            );
+        }
+        let side = |v: &Voice| v.gr.atan2(v.gl);
+        assert!(
+            (side(&t[0]) - side(&lead)) * (side(&t[1]) - side(&lead)) < 0.0,
+            "the two taps sit on the same side of the note"
+        );
+        assert!(
+            t[0].gl.hypot(t[0].gr) > t[1].gl.hypot(t[1].gr),
+            "the later tap must be the quieter one"
+        );
+
+        // THE ANSWER: a subject latched from the first three intervals of a
+        // line, answered at the fourth word head — one voice in the bloom
+        // lane, ANSWER_DELAY_S behind the head, no mallet, above the head on
+        // a lit tone.
+        let mut s = synth();
+        let mut at = 1_000u32;
+        let mut answers = 0usize;
+        for (i, ch) in "abcd efg hij klm nop qrs".chars().enumerate() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            let mark = s.born_seq;
+            push_ch(&mut s, kind, at, ch);
+            at += 120;
+            if ch == ' ' {
+                continue;
+            }
+            let spawned = since(&s, mark);
+            let lead = tune_voices(&spawned)[0];
+            let answer: Vec<&Voice> = spawned
+                .iter()
+                .filter(|v| v.lane == LANE_BLOOM && (v.delay - ANSWER_DELAY_S).abs() < 1e-6)
+                .collect();
+            if answer.is_empty() {
+                continue;
+            }
+            answers += 1;
+            assert_eq!(answer.len(), 1);
+            let a = answer[0];
+            assert!(
+                s.v2.motif_answering(),
+                "an answer with no subject at key {i}"
+            );
+            assert_eq!(a.n_lvl, 0.0, "the answer has no mallet");
+            assert!(
+                a.p[0].f0 > lead.p[0].f0 * 1.05,
+                "the answer ({} Hz) is not above the head ({} Hz)",
+                a.p[0].f0,
+                lead.p[0].f0
+            );
+        }
+        assert!(answers >= 1, "the subject was never answered");
+
+        // With the room stop out: no taps, no answer.
+        let mut s = synth();
+        s.set_v2_timbre_stops(TimbreStops {
+            bloom: true,
+            hue: true,
+            room: false,
+        });
+        let mut at = 1_000u32;
+        let mut extra = 0usize;
+        for ch in "abcd efg hij klm nop".chars() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            let mark = s.born_seq;
+            push_ch(&mut s, kind, at, ch);
+            extra += taps(&since(&s, mark)).len();
+            at += 1_000;
+        }
+        assert_eq!(extra, 0, "the room spoke with its stop out");
+    }
+
+    /// **THE BLOOMED STEP IS BRIGHTER THAN THE TINE AND UNDER THE GLASS
+    /// LINE** (§3.3's falsifiable prediction, §8 step 6). On §9.1's own
+    /// probe the bloom lifts the isolated step's centroid, and it stays under
+    /// 1600 Hz — past that the bloom has become the glass bell the v2 train
+    /// retired, and [`BLOOM_LEVEL`] must give back.
+    #[test]
+    fn the_bloomed_step_is_brighter_than_the_tine_and_under_the_glass_line() {
+        // `a` then `e`, 300 ms apart: a rising third inside the dead band,
+        // so the probed key lands on E — lit under the parked IV — and has
+        // a bloom to measure. (A rhythm-derived probe lands on D, a passing
+        // note, which blooms nothing: the fixture asserts the chord tone.)
+        let probe = |stops: TimbreStops, hue: f32| -> f32 {
+            let mut s = synth();
+            s.set_v2_timbre_stops(stops);
+            let key = |ch: char| EventMeta {
+                rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
+                ..EventMeta::default()
+            };
+            let mut ev = event(SoundKind::Typed, 0.0, false);
+            ev.hue = hue;
+            s.push_meta(
+                ev,
+                EventMeta {
+                    at_ms: 1_000,
+                    ..key('a')
+                },
+            );
+            let _ = render_mono(&mut s, 30);
+            s.push_meta(
+                ev,
+                EventMeta {
+                    at_ms: 1_300,
+                    ..key('e')
+                },
+            );
+            assert!(s.v2.lit(), "fixture: the probed key must be a chord tone");
+            probe_centroid_hz(&render_mono(&mut s, 50))
+        };
+        let plain = probe(TimbreStops::PLAIN, 0.0);
+        let red = probe(TimbreStops::ALL, 0.0);
+        let cyan = probe(TimbreStops::ALL, 0.5);
+        println!(
+            "§9.1 probe centroid: plain {plain:.0} Hz, bloomed red {red:.0} Hz, cyan {cyan:.0} Hz"
+        );
+        // Measured 679 -> 771 Hz at the red end, 952 at cyan (BLOOM_LEVEL 2.0).
+        assert!(
+            red > plain + 60.0,
+            "the bloom did not lift the centroid ({plain} -> {red})"
+        );
+        assert!(
+            cyan > red,
+            "the cyan end of the arc is not brighter than the red end"
+        );
+        assert!(
+            cyan < 1600.0,
+            "the bloomed step reads {cyan:.0} Hz at the cyan end — a glass bell"
+        );
     }
 
     // -- A27: determinism -------------------------------------------------
@@ -3296,7 +5608,11 @@ for it up front.\n\
         // 4096 samples = 85 ms: the whole of the strike and the octave, and
         // the first third of the body — the window in which a tine is either
         // small or hard.
+        // THE TINE ALONE: this probe compares the strike's own spectrum with
+        // v1's bell. §3.3's bloom is a second voice behind it and is pinned
+        // by its own test; with it in, this would be measuring the bloom.
         let mut s = synth();
+        s.set_v2_timbre_stops(TimbreStops::PLAIN);
         push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
         let v2 = render_mono(&mut s, 12);
         let v2_c = centroid_hz(&v2[..4096]);
@@ -3336,7 +5652,7 @@ for it up front.\n\
             .iter()
             .map(|v| v.p[0].f0)
             .collect();
-        let after = (s.v2.theme_pos(), s.v2.walk());
+        let after = s.v2.walk();
 
         let mark = s.born_seq;
         push(&mut s, SoundKind::Backspace, 1_800, 0.0, false);
@@ -3371,9 +5687,9 @@ for it up front.\n\
             "the retyped letter sang a different note — the melody did not rewind"
         );
         assert_eq!(
-            (s.v2.theme_pos(), s.v2.walk()),
+            s.v2.walk(),
             after,
-            "the playhead did not land where it had been"
+            "the line did not land where it had been"
         );
     }
 
@@ -3431,9 +5747,10 @@ for it up front.\n\
             }
             let mark = s.born_seq;
             push(&mut s, SoundKind::Enter { cells }, 2_400, 0.0, false);
-            let landed: Vec<Voice> = since(&s, mark)
-                .into_iter()
-                .filter(|v| v.delay > 0.0)
+            let spawned = since(&s, mark);
+            let landed: Vec<&Voice> = spawned
+                .iter()
+                .filter(|v| v.delay > 0.0 && v.lane != LANE_BLOOM)
                 .collect();
             assert_eq!(
                 landed.len(),
@@ -3446,6 +5763,26 @@ for it up front.\n\
                     want.to_bits(),
                     "cells {cells}: a cadence voice landed at {} s, not {want} s",
                     v.delay
+                );
+            }
+            // THE ROOM ANSWERS THE LINE'S END (§3.3 item 4): two bloom taps
+            // behind the resolution, on the same edge plus their own
+            // spacings — the room is heard after the note, never on it.
+            let taps: Vec<f32> = spawned
+                .iter()
+                .filter(|v| v.lane == LANE_BLOOM)
+                .map(|v| v.delay)
+                .collect();
+            assert_eq!(
+                taps.len(),
+                AIR_TAP_DELAY_S.len(),
+                "cells {cells}: a line end leaves exactly two taps in the room"
+            );
+            for (tap, k) in taps.iter().zip(AIR_TAP_DELAY_S) {
+                assert!(
+                    (tap - (want + k)).abs() < 1e-5,
+                    "cells {cells}: an air tap at {tap} s, not {} s",
+                    want + k
                 );
             }
         }
@@ -3567,7 +5904,7 @@ for it up front.\n\
         }
         let mark = s.born_seq;
         push(&mut s, SoundKind::Enter { cells: 30 }, 2_000, 0.0, false);
-        let after_enter = s.v2.theme_pos();
+        let after_enter = s.v2.walk();
         push(&mut s, SoundKind::Jump, 2_020, 0.0, false);
         let born = since(&s, mark);
         assert!(
@@ -3575,9 +5912,9 @@ for it up front.\n\
             "the keyed Return's own line-feed echo minted a cascade"
         );
         assert_eq!(
-            s.v2.theme_pos(),
+            s.v2.walk(),
             after_enter,
-            "the swallowed echo moved the playhead"
+            "the swallowed echo moved the line"
         );
         let mark = s.born_seq;
         push(&mut s, SoundKind::Jump, 2_400, 0.0, false);
@@ -3809,13 +6146,13 @@ for it up front.\n\
     /// §14 at one instant: every lane at or under its cap, counting SOUNDING
     /// voices only — the cap is a polyphony cap, and a pre-delayed voice is a
     /// schedule entry (§14's "5 scheduled, ≤ 3 live") — and no drop-newcomer
-    /// lane (glint, echo) has fade-stolen a SOUNDING voice under the 40 ms
+    /// lane (glint, bloom) has fade-stolen a SOUNDING voice under the 40 ms
     /// age guard. (A voice damped before its pre-delay ran out never
     /// sounded — "expires unheard" — and is not a steal.)
     fn assert_caps(s: &TrailSynth) {
         for lane in [
             LANE_TUNE,
-            LANE_ECHO,
+            LANE_BLOOM,
             LANE_BASS,
             LANE_BREATH,
             LANE_GLINT,
@@ -3905,14 +6242,10 @@ for it up front.\n\
             .iter()
             .map(|v| v.p[0].f0)
             .collect();
-        let first = (s.v2.theme_pos(), s.v2.walk());
+        let first = s.v2.walk();
         push(&mut s, SoundKind::Typed, 1_300, 0.0, false);
         push(&mut s, SoundKind::Typed, 1_600, 0.0, false);
-        assert_ne!(
-            (s.v2.theme_pos(), s.v2.walk()),
-            first,
-            "three steps must have moved the playhead"
-        );
+        assert_ne!(s.v2.walk(), first, "three steps must have moved the line");
         let mut buf = [0.0f32; 960];
         let mut poofs = 0;
         for k in 0..3u32 {
@@ -3930,20 +6263,34 @@ for it up front.\n\
             poofs, 1,
             "the erase gate thins the poof to one per 75 ms; it spoke {poofs} times"
         );
+        // THE STATE REWOUND ONE NOTE PER REPEAT — which is the claim, and it
+        // is asserted where it lives rather than through a pitch.
+        assert_eq!(
+            s.v2.walk(),
+            first,
+            "the line did not rewind one note per repeat"
+        );
         let mark = s.born_seq;
         push(&mut s, SoundKind::Typed, 2_300, 0.0, false);
         let retyped: Vec<f32> = tune_voices(&since(&s, mark))
             .iter()
             .map(|v| v.p[0].f0)
             .collect();
+        // …and the retyped letter still SINGS. Its pitch is derived from the
+        // rewound state AND from the hand, so a letter retyped after a
+        // different pause is entitled to a different note (R2): this retype
+        // is 334 ms after the last deletion where the original was 300 ms
+        // after its predecessor. What the undo stack owes is the STATE,
+        // asserted above; what R1 owes is a note, asserted here.
         assert_eq!(
-            retyped, first_f0,
-            "after three held deletions the retyped letter did not sing the first letter's note"
+            retyped.len(),
+            1,
+            "the retyped letter spawned {} tune voices, not one",
+            retyped.len()
         );
-        assert_eq!(
-            (s.v2.theme_pos(), s.v2.walk()),
-            first,
-            "the playhead did not rewind one note per repeat"
+        assert!(
+            retyped[0] > 0.0 && !first_f0.is_empty(),
+            "the retyped letter made no pitched sound"
         );
     }
 
@@ -4159,11 +6506,11 @@ for it up front.\n\
     /// after silence must account the pause through `resume_after`, or every
     /// think-pause reads as ≈ 0.9 s and the 900 ms rest cadence never fires.
     /// Three unstamped keys at 300 ms, a 5 s pause with no render, one more
-    /// key: accounted, it cadences the phrase and resets the IOI;
-    /// unaccounted, it is merely the fourth step.
+    /// key: accounted, it RESOLVES the line onto the chord and resets the
+    /// IOI; unaccounted, it is merely the fourth key of the same burst.
     #[test]
     fn a_pause_the_render_clock_never_saw_still_rests_the_phrase() {
-        let drive = |account: bool| -> (u8, i8, f32) {
+        let drive = |account: bool| -> (u32, i8, f32, bool) {
             let mut s = synth();
             let mut buf = [0.0f32; 960];
             for _ in 0..3 {
@@ -4176,25 +6523,21 @@ for it up front.\n\
                 s.resume_after(5.0);
             }
             s.push(event(SoundKind::Typed, 0.0, false));
-            (s.v2.theme_pos(), s.v2.walk(), s.v2.ioi_ms())
+            (s.v2.steps(), s.v2.walk(), s.v2.ioi_ms(), s.v2.lit())
         };
-        let phrase_1 = SONG_FORM[1];
-        let (pos, walk, ioi) = drive(true);
-        assert_eq!(
-            pos, phrase_1,
-            "an accounted 5 s pause did not cadence the phrase (theme_pos {pos})"
-        );
-        assert_eq!(
-            walk,
-            SONG_THEME[usize::from(phrase_1) - 1],
-            "the cadence did not close onto the phrase's final degree"
-        );
+        let (steps, rested_walk, ioi, _) = drive(true);
+        assert_eq!(steps, 4, "every key steps, pause or no pause");
         assert_eq!(ioi, IOI_DEFAULT_MS, "a ≥ 2 s gap must restart the IOI");
-        let (pos, walk, _) = drive(false);
-        assert_eq!(
-            (pos, walk),
-            (4, SONG_THEME[3]),
+        let (steps, walk, ioi, _) = drive(false);
+        assert_eq!(steps, 4, "every key steps, pause or no pause");
+        assert_ne!(
+            ioi, IOI_DEFAULT_MS,
             "the unaccounted pause must read as no pause at all — the control is broken"
+        );
+        assert_ne!(
+            walk, rested_walk,
+            "the accounted and unaccounted takes played the same note — the \
+             rest never reached the melody, so this test proves nothing"
         );
         // A clock never runs back, and never takes a NaN.
         let mut s = synth();
@@ -4215,8 +6558,9 @@ for it up front.\n\
     /// `u32::MAX` — every gap zero, no step ever again, nothing to heal it.
     /// Past the wrap two unstamped keys 300 ms apart must still be two
     /// steps; and the wrap itself costs exactly what a host wrap costs: the
-    /// wrapping key is a re-strike, the step gate is shut until a rest
-    /// re-anchors it, and then the verse walks on.
+    /// wrapping key reads a nonsense gap, so the contour may lose that one
+    /// interval — but the key still steps and still sounds, the IOI
+    /// estimator stays finite, and the line walks on.
     #[test]
     fn the_fallback_clock_wraps_like_a_host_stamp_instead_of_saturating() {
         fn key(s: &mut TrailSynth) {
@@ -4237,37 +6581,33 @@ for it up front.\n\
         render_ms(&mut s, 300);
         key(&mut s);
         assert_eq!(
-            s.v2.theme_pos(),
+            s.v2.steps(),
             2,
-            "past 49.7 days the second key must still be a step — the clock saturated (theme_pos {})",
-            s.v2.theme_pos()
+            "past 49.7 days the second key must still step — the clock saturated ({})",
+            s.v2.steps()
         );
 
         // ACROSS THE WRAP: the cost is a wrapped host stamp's, no more.
         let mut s = synth();
         s.clock_s = WRAP_S - 0.296;
         key(&mut s);
-        assert_eq!(s.v2.theme_pos(), 1, "the first key steps");
+        assert_eq!(s.v2.steps(), 1, "the first key steps");
         render_ms(&mut s, 300);
         key(&mut s);
         assert_eq!(
-            s.v2.theme_pos(),
-            1,
-            "the wrapping key reads a zero gap: a re-strike, as a wrapped host stamp is"
+            s.v2.steps(),
+            2,
+            "the wrapping key must STILL step — a wrapped clock may cost the \
+             contour its gap, and may never cost the key its note"
         );
         render_ms(&mut s, 1_000);
         key(&mut s);
-        assert_eq!(
-            s.v2.theme_pos(),
-            SONG_FORM[1],
-            "the rest after the wrap must cadence the phrase and re-anchor the gate"
-        );
         render_ms(&mut s, 300);
         key(&mut s);
-        assert_eq!(
-            s.v2.theme_pos(),
-            SONG_FORM[1] + 1,
-            "healed, the verse must walk on"
+        assert_eq!(s.v2.steps(), 4, "healed, the line must walk on");
+        assert!(
+            s.v2.ioi_ms() > 0.0 && s.v2.ioi_ms().is_finite(),
+            "the wrap left the IOI estimator in a state the arithmetic cannot use"
         );
     }
 
@@ -4473,14 +6813,25 @@ for it up front.\n\
 
     // -- A31: the sing-along ----------------------------------------------
 
-    /// **A SING-ALONG ADMITS STEPS ONLY, AND HANDS THE KEY BACK AT A PHRASE
-    /// BOUNDARY** (§10.2, A31).
+    /// **A SING-ALONG NEVER MUTES THE TYPIST'S LINE, AND HANDS THE KEY BACK
+    /// AT A PHRASE BOUNDARY** (§10.2, A31, R1).
     ///
-    /// Under a live riff a 30 Hz auto-repeat spawns ≤ 4.5 pitched TUNE
-    /// onsets a second (the steps) and the re-strikes drop to the mallet
-    /// alone; when the riff dies the borrowed `song_key` is NOT snapped — it
-    /// is held until the verse reaches a phrase boundary and handed back
-    /// there, once, before that phrase's first note.
+    /// Under a live riff every key still sounds ITS OWN PITCHED NOTE — the
+    /// sing duck is what makes room for the cat, not silence — and the one
+    /// thing the riff takes off a key is a doubled letter's tremolo (§3.1's
+    /// own spelling, `sing && touch == ReStrike`). When the riff dies the
+    /// borrowed `song_key` is NOT snapped — it is held until the line reaches
+    /// a word boundary and handed back there, once, before that word's first
+    /// note.
+    ///
+    /// **This replaces the word-head rule the step-3 tree carried**, under
+    /// which every non-word-head key went to the mallet for the whole bar a
+    /// riff is armed (τ 0.40 s handback on top) — roughly one pitched note
+    /// per word, which the owner's ruling calls the melody in letter and not
+    /// in spirit. The machine gun A31 is named for was the deleted gate's
+    /// re-strike ladder hammering under the riff; a fast hand's derived line
+    /// is the same line it plays without the riff, ducked, and a held key is
+    /// caught by the auto-repeat detector at any rate.
     #[test]
     fn a_sing_along_never_machine_guns_and_hands_the_key_back_at_a_phrase_boundary() {
         let mut s = synth();
@@ -4495,32 +6846,76 @@ for it up front.\n\
         );
 
         let mut buf = [0.0f32; 960];
-        let (mut pitched, mut mallets) = (0usize, 0usize);
-        for k in 0..60u32 {
+        let (mut pitched, mut mallets, mut heads, mut keys) = (0usize, 0usize, 0usize, 0usize);
+        // 60 keys of real words at 30 cps — a machine-gun burst with word
+        // boundaries in it, which is what the law is about.
+        const BURST: &str = "the cat sings so the hand keeps time under it and never over it x";
+        // FALSE, not true: a key was already typed above to arm the fixture,
+        // so the burst opens INSIDE a word.
+        let mut head_next = false;
+        for (k, ch) in BURST.chars().take(60).enumerate() {
             let mark = s.born_seq;
-            push(&mut s, SoundKind::Typed, 1_100 + k * 33, 0.0, false);
-            for v in tune_voices(&since(&s, mark)) {
-                if v.p[0].lvl > 0.0 {
-                    pitched += 1;
-                } else {
-                    mallets += 1;
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            push_ch(&mut s, kind, 1_100 + k as u32 * 33, ch);
+            if ch != ' ' {
+                keys += 1;
+                if head_next {
+                    heads += 1;
                 }
+                head_next = false;
+                for v in tune_voices(&since(&s, mark)) {
+                    if v.p[0].lvl > 0.0 {
+                        pitched += 1;
+                    } else {
+                        mallets += 1;
+                    }
+                }
+            } else {
+                head_next = true;
             }
             for _ in 0..3 {
                 s.render(&mut buf);
             }
         }
+        assert_eq!(
+            pitched + mallets,
+            keys,
+            "{keys} keys under the riff produced {} tune onsets — a key went \
+             silent, which the sing duck may never do",
+            pitched + mallets
+        );
         assert!(
             s.sing > 0.0,
             "the riff must outlive the burst for the law to be tested"
         );
         assert!(
-            (6..=9).contains(&pitched),
-            "{pitched} pitched TUNE onsets in 2 s under the riff — the steps alone are ≤ 4.5/s"
+            heads >= 8,
+            "fixture: the burst must contain words ({heads})"
         );
-        assert!(
-            mallets > 0,
-            "re-strikes under the riff drop to the mallet alone"
+        // The doubled letters the burst types inside a word — `keeps` — are
+        // the only keys the riff may take to the mallet.
+        let doubled = BURST
+            .chars()
+            .take(60)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|w| w[0] == w[1] && w[0] != ' ')
+            .count();
+        assert!(doubled > 0, "fixture: the burst must type a doubled letter");
+        assert_eq!(
+            mallets, doubled,
+            "{mallets} keys went to the mallet under the riff for {doubled} doubled \
+             letters — a riff may take the tremolo off a repeat and nothing else"
+        );
+        assert_eq!(
+            pitched,
+            keys - doubled,
+            "{pitched} pitched TUNE onsets under the riff for {keys} keys — the riff \
+             muted the typist's own line"
         );
         assert_eq!(
             s.song_key, key,
@@ -4540,13 +6935,29 @@ for it up front.\n\
         );
         assert!(s.v2_key_pending, "the handback must be pending");
 
-        // Typing on: the key changes exactly once, to neutral, and only on a
-        // key that opens a phrase.
+        // Typing on — WORDS, because the handback waits for a boundary and a
+        // word head is the boundary the derived line has. The key changes
+        // exactly once, to neutral, and only on a key that opens a word.
+        // The keys continue the burst's own clock. `at_ms` is the melody's
+        // only time source, so the seconds of rendering that killed the riff
+        // do not open a gap in it — and a ≥ 900 ms gap would be a REST, which
+        // is a boundary in its own right and would hand the key back before
+        // the word head this half of the test is about.
         let mut changes = Vec::new();
-        for k in 0..40u32 {
-            let pos = s.v2.theme_pos();
+        let mut at = 3_200u32;
+        for (k, ch) in "in the middle of a word the key is held and never snapped away"
+            .chars()
+            .enumerate()
+        {
+            let pos = s.v2.word_pos();
             let before = s.song_key;
-            push(&mut s, SoundKind::Typed, 12_000 + k * 250, 0.0, false);
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            push_ch(&mut s, kind, at, ch);
+            at += 250 + (k as u32 % 3) * 7;
             if s.song_key != before {
                 changes.push((pos, s.song_key));
             }
@@ -4559,9 +6970,9 @@ for it up front.\n\
         );
         let (pos, to) = changes[0];
         assert_eq!(to, 0, "the handback goes to the neutral lattice");
-        assert!(
-            SONG_FORM.contains(&pos),
-            "the key was handed back MID-PHRASE, at theme_pos {pos}"
+        assert_eq!(
+            pos, 0,
+            "the key was handed back MID-WORD, at word_pos {pos}"
         );
         assert!(!s.v2_key_pending, "the handback must clear itself");
     }
@@ -4569,7 +6980,7 @@ for it up front.\n\
     /// **A v1 VOICE AFTER THE MUSIC BOX SNAPS A PENDING KEY; IT DOES NOT HOLD
     /// IT FOR EVER** (§10.2, §16 row 9 — the v1 chain keeps v1's law).
     ///
-    /// The v2 latch is sticky and the phrase-boundary handback is detected on
+    /// The v2 latch is sticky and the word-boundary handback is detected on
     /// the v2 path alone, but the roster is read per event: audition "music
     /// box", go back to "marimba", let a riff die, and the borrowed
     /// `song_key` would otherwise stay pinned for the session — no v1 event
@@ -4745,7 +7156,7 @@ for it up front.\n\
         seen.dedup();
         for lane in [
             LANE_TUNE,
-            LANE_ECHO,
+            LANE_BLOOM,
             LANE_BASS,
             LANE_BREATH,
             LANE_GLINT,
@@ -4821,7 +7232,9 @@ for it up front.\n\
     /// octave against v1; this one reads the whole body.)
     #[test]
     fn the_isolated_step_centroid_is_the_one_the_partial_table_builds() {
+        // The tine's table, so the tine alone (see the bloom's own pin).
         let mut s = synth();
+        s.set_v2_timbre_stops(TimbreStops::PLAIN);
         // One settling key, ~340 ms, then the probe — the family probe's
         // own stance.
         push(&mut s, SoundKind::Typed, 1_000, 0.0, false);
@@ -4842,21 +7255,26 @@ for it up front.\n\
     /// **FASTER IS BRIGHTER, NEVER LOUDER** (§9.6, A14).
     ///
     /// Per-second TUNE energy — Σ(gl+gr)² over the pitched spawns of steady
-    /// typing — sits inside A14's +1 / −3 dB of the 4 cps reference at 10, 15
-    /// and 20 cps (measured ≈ −0.4, −1.2, −2.9 on the 0.60 ladder; §9.6's
-    /// table, written on the 0.70 ladder, says +0.1, −0.6, −0.8 — its 20 cps
-    /// row predates §10.2's 60 ms coalescing, which silences every other
-    /// re-strike at a 50 ms key spacing, and the law's −3 dB floor is what
-    /// still holds: 20 cps is one step, L₂ and L₄ per 250 ms, `0.36 × 4 ×
-    /// (1 + 0.26 + 0.136)` = 2.01 re 4.0 = −2.99 dB exactly). **8 cps is
-    /// pinned to the table, not to the cap:** the table's own arithmetic puts
-    /// it at +0.54 (g² 0.833 × (4 + 4·0.36) re 4.0; +0.94 on the 0.70 ladder,
-    /// which the ±1 / ±1.5 dB seeded velocity — mean bias +0.02 dB, ±0.07 dB
-    /// over this 20 s window — pushed over the cap on any finite sample) —
-    /// measured +0.64. The roof, meanwhile, is a non-decreasing
-    /// function of the rate for every touch and lighting, and heat moves the
-    /// roof and never the gain: the arc buys brightness with speed, never a
-    /// decibel.
+    /// typing — sits inside A14's +1 / −3 dB of the 4 cps reference at 8, 10,
+    /// 15 and 20 cps.
+    ///
+    /// **Every rate is now on one band, and that is the point.** The old
+    /// version pinned 8 cps separately, to +0.54 dB, because §9.6's table was
+    /// arithmetic over the re-strike ladder: under the 220 ms gate an 8 cps
+    /// take was one step and one muted re-strike per 250 ms, so the energy
+    /// depended on which keys the gate let through. With every key a full
+    /// step (R1), `rate · g²` is flat by construction below the arc's
+    /// reference and the whole sweep collapses onto ~0 dB — measured
+    /// +0.98 / +0.90 / −0.01 / +0.09 at 8 / 10 / 15 / 20 cps, where the
+    /// residual is the take's own lit-versus-passing mix (a passing note is
+    /// 2 dB down) and the ±1 dB seeded velocity, not the arc. It is the
+    /// reference at [`G_IOI_REF_S`], moved from 0.15 s to 0.25 s, that buys
+    /// this; on the old reference the same sweep read +3.2 dB at 8 cps and
+    /// broke the law outright.
+    ///
+    /// The roof, meanwhile, is a non-decreasing function of the rate for
+    /// every touch and lighting, and heat moves the roof and never the gain:
+    /// the arc buys brightness with speed, never a decibel.
     #[test]
     fn faster_is_brighter_never_louder() {
         let energy_per_s = |cps: u32| -> f32 {
@@ -4889,25 +7307,16 @@ for it up front.\n\
             .collect();
         println!("A14 arc re 4 cps: {arc:?}");
         for (cps, db) in &arc {
-            if *cps == 8 {
-                // Pinned to the table's own arithmetic on the 0.60 ladder
-                // (+0.54 exact) — see the doc above.
-                assert!(
-                    (db - 0.54).abs() <= 0.35,
-                    "8 cps: per-second TUNE energy is {db:+.2} dB re 4 cps; §9.6's table on the 0.60 ladder says +0.54; arc {arc:?}"
-                );
-            } else {
-                assert!(
-                    (-3.0..=1.0).contains(db),
-                    "{cps} cps: per-second TUNE energy is {db:+.2} dB re 4 cps, outside +1/−3; arc {arc:?}"
-                );
-            }
+            assert!(
+                (-3.0..=1.0).contains(db),
+                "{cps} cps: per-second TUNE energy is {db:+.2} dB re 4 cps, outside +1/−3; arc {arc:?}"
+            );
         }
         for lit in [false, true] {
             for touch in [Touch::Step, Touch::ReStrike] {
                 let mut last = 0.0f32;
                 for cps in [2.0f32, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0] {
-                    let roof = roof_hz(cps, lit, 0.5, touch);
+                    let roof = roof_hz(cps, lit, 0.5, 0.0, touch);
                     assert!(
                         roof >= last,
                         "lit {lit} / {touch:?}: the roof fell from {last} to {roof} Hz at {cps} cps"

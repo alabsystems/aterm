@@ -20447,6 +20447,10 @@ mod tests {
             momentum_display: 0.44,
             glow_active: true,
             pet_active: true,
+            pet_action: "purr",
+            pet_content: 0.42,
+            pet_pending: 1,
+            pet_body: Some((12, 68, 30, 64)),
             cat_active: false,
             // A body PRESENT, so the fields that only a claimed caret fills are
             // in the row being compared rather than silently absent.

@@ -3438,6 +3438,9 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_FONT_THICKEN => cfg!(target_os = "macos").then_some(Effect::RendererTypography),
         prefs::EDIT_CURSOR_STYLE
         | prefs::EDIT_CURSOR_BLINK
+        // Read per frame by the cursor-body tick (`cursor_momentum_glow_or_default`),
+        // so the switch lands on the next present like blink does.
+        | prefs::EDIT_CURSOR_MOMENTUM_GLOW
         | prefs::EDIT_MOTION
         | prefs::EDIT_STREAM_FADE
         // The effect-INTENSITY dial (2026-07-24 UX audit). It already scales
@@ -3999,6 +4002,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "bold_is_bright" => config.bold_is_bright,
         "font_thicken" => config.font_thicken,
         "cursor_blink" => config.cursor_blink,
+        "cursor_momentum_glow" => config.cursor_momentum_glow,
         "cursor_trail" => config.cursor_trail,
         "cursor_trail_ring" => config.cursor_trail_ring,
         "cursor_trail_bloom" => config.cursor_trail_bloom,
@@ -34159,14 +34163,23 @@ enabled = true
         // nothing else. Its live consumer is pinned by
         // `the_rainbow_wake_row_lands_on_the_kitty_page_and_reaches_the_glow`,
         // and its trail-master disclosure by the `TRAIL_TUNING_KEYS` sweep.
+        // THE TYPING-MOMENTUM GLOW (2026-09-08): +1 on every platform. The
+        // owner asked for it by name ("the blinking cursor is annoying, I want
+        // some momentum glow for typing faster that cools down"), it ships
+        // DEFAULT ON, and `cursor_momentum_glow` is read at its consumer every
+        // frame — `app_render`'s cursor-body tick reads
+        // `cursor_momentum_glow_or_default()` — so the switch is a real one,
+        // not a Manual-only expert key. It sits in the Cursor box beside
+        // `cursor_blink`, the row it partly replaces (a warm cursor does not
+        // blink), and is searchable as "blink".
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                55
+                56
             } else if cfg!(windows) {
-                52
+                53
             } else {
-                50
+                51
             },
             // +1 on every platform (2026-08-21): allow_osc52_query became an
             // ordinary Advanced switch when the GUI's clipboard callback

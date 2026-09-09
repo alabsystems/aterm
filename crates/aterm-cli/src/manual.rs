@@ -104,11 +104,14 @@ GOTCHAS
     (TCC), not a broken tool — and it can arrive with NO dialog at all. `aterm doctor` has a
     `privacy:` row, `aterm ctl privacy` has the whole posture, and `aterm help permissions`
     says what to do about it. Only a human can grant it; aterm cannot.
-  * Inside a session the upstream toolchain names are REROUTED: a bare `cargo build` is
-    refused (exit 2) naming `targo trust` / `targo --unverified` with your arguments,
-    `rustc` likewise names `trustc`, and `clippy`/`rustfmt`/`rustdoc`/`lean` run the
-    branded tool after one stderr line. `aterm help reroute` has the table and the exit
-    codes; ATERM_NO_REROUTE=1 (or `aterm --no-reroute`) restores every upstream tool.
+  * Rust here means the TRUST toolchain: `targo` (cargo), `trustc` (rustc), `tippy`
+    (clippy), `trustfmt`, `trustdoc`. Inside a session the upstream names are REROUTED:
+    a bare `cargo build` prints `targo trust build` / `targo --unverified build` with
+    your arguments and then runs upstream (announce, never prevent — an owner ruling);
+    `rustc` likewise names `trustc`; `clippy`/`rustfmt`/`rustdoc`/`lean` run the
+    branded tool after one stderr line. `aterm help rust` MEASURES which toolchain a
+    directory gets; `aterm help reroute` has the table and the flags
+    (ATERM_REROUTE_QUIET=1 silences the signpost, ATERM_NO_REROUTE=1 restores upstream).
   * `-h`/`--help` prints the terse CLI usage; `aterm help` (this manual) is the full guide."#,
         ),
     },
@@ -116,6 +119,11 @@ GOTCHAS
         name: "introspection",
         tagline: "read & drive any terminal via the control protocol (aterm ctl)",
         body: None, // generated — see `introspection_page()`
+    },
+    Topic {
+        name: "rust",
+        tagline: "which Rust toolchain THIS directory gets — measured, not guessed (default: Trust)",
+        body: None, // generated — see `rust_page()`
     },
     Topic {
         name: "conn",
@@ -1203,6 +1211,290 @@ NOT IN THE GROUP
 
 /// The `introspection` topic — GENERATED from the live control-verb catalog so it
 /// never drifts from the real protocol, plus the how-to an AI needs to use it.
+/// `aterm help rust` / `aterm help cargo` — the page that MEASURES which Rust
+/// toolchain the current directory gets, instead of restating a table that will
+/// be stale inside a year (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md
+/// §7). It calls the real discovery code, `aterm_verify::toolchain::Toolchain::
+/// discover`, which is what `aterm verify` and the GUI already use, so there is
+/// no second copy of "which toolchain wins" to drift from the first.
+///
+/// The owner's instruction of 2026-09-08, verbatim: *"USE TRUST TOOLCHAIN NOT
+/// RUST! this needs to be very strongly encouraged by the aterm system itself."*
+/// So the page leads with the default and says plainly when this directory is
+/// NOT on it — but it never prevents anything: two owner rulings (2026-09-07,
+/// 2026-09-08) say warn, not refuse, and `atpkg::reroute` is where that is kept.
+///
+/// Everything printed is measured at the moment of the call: every subprocess
+/// is bounded (2 s), every file read is optional, and a probe that fails says so
+/// rather than filling in a plausible answer.
+fn rust_page() -> String {
+    use aterm_verify::toolchain::{Toolchain, atpkg_prefix, pinned_channel};
+    use std::path::PathBuf;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let cwd = std::env::current_dir().ok();
+    let pinned = cwd.as_deref().and_then(pinned_channel);
+    let explicit = std::env::var_os("TRUST_STAGE2_BIN").map(PathBuf::from);
+    let tools = Toolchain::discover(explicit.as_deref(), &home, &path_env, pinned.as_deref());
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let prefix = atpkg_prefix(&home, xdg.as_deref());
+    let store_bin = prefix.join("bin");
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "rust — which Rust toolchain THIS directory gets, measured now\n\
+         \n\
+         THE DEFAULT HERE IS THE TRUST TOOLCHAIN. `targo` is cargo, `trustc` is rustc, `tippy` is\n\
+         clippy, `trustfmt` is rustfmt, `trustdoc` is rustdoc; `ty`, `ay`, `clean` are the verifiers.\n\
+         Stock `cargo`/`rustc` is never blocked — but it is the exception, and inside a session a bare\n\
+         `cargo …` prints the `targo` spelling of your command before running (`aterm help reroute`).\n\
+         Name the lane; `targo` will not pick one for you:\n\
+         \n\
+         \x20 targo trust <cmd> …         VERIFIED   fail-closed; --allow-l0-gaps = advisory survey;\n\
+         \x20                                        authenticated per-unit proof report (--report-dir)\n\
+         \x20 targo --unverified <cmd> …  UNVERIFIED proof pipeline off; one notice; NO proof claim\n\
+         \n\
+         A bare `targo build` is REFUSED on purpose. That refusal is the rule above, not a broken tool.\n\
+         `aterm help trust` explains both lanes and why an empty report is not a proof.\n\
+         \n\
+         MEASURED (this call, this directory, this PATH):"
+    );
+
+    // Where we are, and what the project itself says.
+    match &cwd {
+        Some(d) => {
+            let _ = writeln!(out, "  directory        {}", d.display());
+        }
+        None => {
+            let _ = writeln!(out, "  directory        (unreadable)");
+        }
+    }
+    match pinned.as_deref() {
+        Some(ch) if ch.starts_with("trust") => {
+            let _ = writeln!(
+                out,
+                "  rust-toolchain   channel = \"{ch}\"  — this project PINS the Trust channel: even a stock-\n\
+                 \x20                  spelled `cargo` here drives trustc (cargo-in-disguise: no per-unit lane,\n\
+                 \x20                  no --unverified). Use `targo` so the lane is explicit."
+            );
+        }
+        Some(ch) => {
+            let _ = writeln!(
+                out,
+                "  rust-toolchain   channel = \"{ch}\"  — this project pins a NON-Trust channel. The project\n\
+                 \x20                  wins over this page; say so in your reply when you build it."
+            );
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "  rust-toolchain   no channel pinned — nothing selects stock Rust here; use `targo`."
+            );
+        }
+    }
+    let cargo_cfg = cwd.as_ref().map(|d| d.join(".cargo/config.toml"));
+    match cargo_cfg
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+    {
+        Some(cfg) => {
+            let live: Vec<&str> = cfg
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with('#') && !l.is_empty())
+                .collect();
+            let off = live.iter().any(|l| l.contains("-Ztrust-verify=off"));
+            let stock_scoping = live.iter().any(|l| {
+                l.starts_with("[host]")
+                    || (l.starts_with("[profile.") && l.contains("package.\"*\""))
+                    || l.starts_with("target-applies-to-host")
+            });
+            let policy = live.iter().find_map(|l| {
+                l.find("-Ztrust-policy=").map(|i| {
+                    l[i + "-Ztrust-policy=".len()..]
+                        .trim_matches(|c: char| c == '"' || c == ']' || c == ',')
+                        .to_string()
+                })
+            });
+            let _ = writeln!(
+                out,
+                "  .cargo/config    present; verification off-switch {}; policy {}{}",
+                if off {
+                    "PRESENT (-Ztrust-verify=off)"
+                } else {
+                    "absent"
+                },
+                policy.as_deref().unwrap_or("(compiler default: strict)"),
+                if stock_scoping {
+                    "\n                   carries the stock-cargo scoping posture ([host] / [profile.*.package.\"*\"]):\n\
+                     \x20                  `targo trust` REFUSES that in a config file (it scopes per unit itself) —\n\
+                     \x20                  keep it on a measurement command line via --config, not in the file"
+                } else {
+                    ""
+                }
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  .cargo/config    none in this directory");
+        }
+    }
+
+    // What discovery chose, and what it refused.
+    if tools.targo.is_file() {
+        let _ = writeln!(
+            out,
+            "  toolchain        {}  (wins)",
+            tools.stage2_dir.display()
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  toolchain        NO Trust toolchain satisfies the pin on this machine\n\
+             \x20                  (looked for a sealed promote target, the rustup `trust` link, the atpkg\n\
+             \x20                  store, a from-source stage2, then PATH) — `aterm pkg doctor`, then\n\
+             \x20                  `aterm pkg install trust`"
+        );
+    }
+    if let Some(r) = &tools.refused {
+        let _ = writeln!(
+            out,
+            "  refused          {}  (carried a targo but is NOT the pinned toolchain)",
+            r.display()
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  atpkg store      {}  {}",
+        store_bin.display(),
+        if store_bin.is_dir() {
+            "present"
+        } else {
+            "absent — `aterm pkg install --default-set`"
+        }
+    );
+    let managed: Vec<String> = std::fs::read_dir(&store_bin)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            matches!(
+                n.as_str(),
+                "targo" | "trustc" | "tippy" | "trustfmt" | "trustdoc" | "ty" | "ay" | "clean"
+            )
+        })
+        .collect();
+    if !managed.is_empty() {
+        let mut m = managed;
+        m.sort();
+        let _ = writeln!(out, "  managed tools    {}", m.join(" "));
+    }
+
+    // What the names on THIS PATH actually answer. Bounded: a wedged toolchain
+    // must not wedge the manual.
+    let probe = |cmd: &str, args: &[&str]| -> String {
+        bounded_first_line(cmd, args, std::time::Duration::from_secs(2))
+            .unwrap_or_else(|| "(no answer within 2 s, or not on PATH)".to_string())
+    };
+    let _ = writeln!(out, "  rustc --version  {}", probe("rustc", &["--version"]));
+    let _ = writeln!(
+        out,
+        "  rustc sysroot    {}",
+        probe("rustc", &["--print", "sysroot"])
+    );
+    let targo_ver = probe("targo", &["--unverified", "--version"]);
+    let _ = writeln!(
+        out,
+        "  targo            {}{}",
+        targo_ver,
+        if targo_ver.starts_with("targo ") {
+            ""
+        } else {
+            "  — a real targo answers `--unverified --version`; anything else is not the Trust cargo"
+        }
+    );
+    let rustup_trust = probe("rustup", &["which", "cargo", "--toolchain", "trust"]);
+    let _ = writeln!(
+        out,
+        "  rustup `trust`   {}",
+        if rustup_trust.contains("not installed") || rustup_trust.starts_with("(no answer") {
+            "NOT LINKED — `cargo +trust` will fail here; `targo` in the store still works.\n\
+             \x20                  (`'rustc' is not installed for the custom toolchain 'trust'` is THIS, not a\n\
+             \x20                  blocked machine: `aterm pkg doctor`, then `aterm pkg repair`.)"
+                .to_string()
+        } else {
+            rustup_trust
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "\n\
+         RULES OF THE ROAD\n\
+         \x20 * Ask the compiler, never a document: `trustc -Vv`, `targo --unverified --version`.\n\
+         \x20 * Never assign RUSTFLAGS in a Trust-pinned repo (it replaces the repo's policy wholesale);\n\
+         \x20   never pass an explicit --target (it strips config from host units).\n\
+         \x20 * Never point CARGO_TARGET_DIR or --out-dir under /tmp: Trust voids a verified run whose\n\
+         \x20   directory is world-writable, and what surfaces after that reads like a transport bug.\n\
+         \x20 * Never build in a checkout another session is working in — `git worktree add` your own.\n\
+         \x20 * Never rebuild a toolchain from source to answer a rustup error; run `aterm pkg doctor`.\n\
+         \n\
+         FLAGS   ATERM_REROUTE_QUIET=1 silences the signpost · ATERM_REROUTE_STRICT=1 refuses instead of\n\
+         \x20       running · ATERM_NO_REROUTE=1 (or `aterm --no-reroute`) restores every upstream name.\n\
+         SEE     `aterm help trust` (the lanes and the report gates) · `aterm help reroute` (the table) ·\n\
+         \x20       `aterm help atpkg` (the store)."
+    );
+    out
+}
+
+/// First stdout line of `cmd args…`, or `None` when it does not exit within
+/// `limit` (the child is killed) or cannot be spawned. The manual must never
+/// wedge on a wedged toolchain; a probe that cannot answer says so.
+fn bounded_first_line(cmd: &str, args: &[&str], limit: std::time::Duration) -> Option<String> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut text = String::new();
+    if let Some(mut o) = child.stdout.take() {
+        let _ = o.read_to_string(&mut text);
+    }
+    if text.trim().is_empty()
+        && let Some(mut e) = child.stderr.take()
+    {
+        let _ = e.read_to_string(&mut text);
+    }
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
 fn introspection_page() -> String {
     let mut s = String::new();
     s.push_str(
@@ -1411,6 +1703,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     // Pinned by `every_front_door_verb_resolves`.
     let topic = topic.map(|t| match t {
         "ctl" => "introspection",
+        "cargo" | "targo" | "rustc" | "trustc" | "toolchain" => "rust",
         "trust-mc" | "trust-ir" | "trust-cg" | "trust-vc" => "trust-backends",
         "pkg" => "atpkg",
         "new-tab" | "new-window" | "split-pane" => "windowing",
@@ -1427,6 +1720,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         }
         Some("agent") | Some("instructions") => (agent_page(session), 0),
         Some("introspection") => (introspection_page(), 0),
+        Some("rust") => (rust_page(), 0),
         Some("config") => (CONFIG_PAGE.to_string(), 0),
         Some("ship") => (SHIP_PAGE.to_string(), 0),
         Some("update") => (UPDATE_PAGE.to_string(), 0),
@@ -1437,11 +1731,11 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("trust-backends") => (TRUST_BACKENDS_PAGE.to_string(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
-                // Only `introspection` has a generated body; it is handled above, so
-                // every remaining TOPICS entry carries an authored body.
+                // `introspection` and `rust` have generated bodies; both are handled
+                // above, so every remaining TOPICS entry carries an authored body.
                 let body = t
                     .body
-                    .unwrap_or_else(|| unreachable!("only introspection is generated"));
+                    .unwrap_or_else(|| unreachable!("only introspection and rust are generated"));
                 (format!("{body}\n"), 0)
             }
             None => {
@@ -1607,6 +1901,58 @@ mod tests {
                 "topic {name} is dispatchable but missing from the command map"
             );
         }
+    }
+
+    /// `rust` is a generated page: it must render, lead with the Trust default,
+    /// state both lanes verbatim, and be reachable under the names a reader
+    /// actually types (`cargo`, `targo`, `rustc`, `trustc`, `toolchain`).
+    #[test]
+    fn rust_topic_measures_and_leads_with_the_trust_default() {
+        let (page, code) = render(Some("rust"), None);
+        assert_eq!(code, 0);
+        for needle in [
+            "THE DEFAULT HERE IS THE TRUST TOOLCHAIN",
+            "targo trust <cmd>",
+            "targo --unverified <cmd>",
+            "MEASURED (this call, this directory, this PATH)",
+            "rustc --version",
+            "rustc sysroot",
+            "aterm help reroute",
+            "aterm pkg doctor",
+            "ATERM_REROUTE_QUIET=1",
+        ] {
+            assert!(page.contains(needle), "rust page lost: {needle}");
+        }
+        // Never prevented: the page may call stock the exception, not forbidden.
+        assert!(!page.contains("forbidden"));
+        for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
+            let (aliased, code) = render(Some(alias), None);
+            assert_eq!(code, 0, "alias {alias}");
+            assert!(
+                aliased.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"),
+                "`aterm help {alias}` must land on the rust page"
+            );
+        }
+    }
+
+    /// The probe helper is BOUNDED: a command that never exits cannot wedge the
+    /// manual. `sleep 5` against a 200 ms limit must come back `None` quickly.
+    #[test]
+    fn bounded_first_line_kills_a_wedged_probe() {
+        let t0 = std::time::Instant::now();
+        let got = bounded_first_line("sleep", &["5"], std::time::Duration::from_millis(200));
+        assert!(
+            got.is_none(),
+            "a wedged probe must answer None, got {got:?}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(3),
+            "the bound did not hold"
+        );
+        assert_eq!(
+            bounded_first_line("echo", &["hello"], std::time::Duration::from_secs(2)).as_deref(),
+            Some("hello")
+        );
     }
 
     #[test]

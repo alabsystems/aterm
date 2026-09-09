@@ -50,10 +50,20 @@ const SAMPLE_RATE: f64 = 48_000.0;
 const BUFFER_FRAMES: usize = 512;
 const BUFFER_COUNT: usize = 3;
 
-/// Consecutive silent buffers before the queue pauses: ~48 buffers ≈ 0.5 s
+/// Consecutive silent buffers before the queue pauses: 140 buffers ≈ 1.5 s
 /// of exact digital silence (the synth's beds have already snapped to zero
 /// by then, so this can never clip a tail).
-const PAUSE_AFTER_SILENT: u32 = 48;
+///
+/// 140, NOT THE 48 (≈ 0.5 s) IT WAS (THE PRISM §2.4 item 5, §3.4 d). A
+/// stopped queue makes the next cue pay an `AudioQueueStart`, and the first
+/// key after every think-pause therefore carried a DIFFERENT offset from its
+/// successors — the one part of latency an ear hears as slop rather than as
+/// a constant. Half a second is shorter than an ordinary pause between
+/// words; a second and a half is longer than nearly all of them and still
+/// parks the device hard when the typing has really stopped. It trades a
+/// little idle power for alignment and ships behind its own measurement
+/// (§7 step 6): revert if the idle census shows a wake cost.
+const PAUSE_AFTER_SILENT: u32 = 140;
 
 /// Event-loop housekeeping cadence while the AudioQueue is running. The queue
 /// callback already does the sample work; this low-rate one-shot only observes
@@ -97,6 +107,26 @@ mod mac {
     use aterm_effects::trail_sound::{CHANNELS, EventMeta, SoundEvent, TrailSynth};
 
     use super::{BUFFER_COUNT, BUFFER_FRAMES, PAUSE_AFTER_SILENT, SAMPLE_RATE};
+
+    /// One queue block in seconds — 512 frames at 48 kHz = 10.667 ms — the
+    /// ceiling on a cue's pre-roll ([`EventMeta::block_lead_s`]).
+    pub(super) const BLOCK_S: f32 = BUFFER_FRAMES as f32 / SAMPLE_RATE as f32;
+
+    /// THE PRE-ROLL LAW (THE PRISM §3.4 c): how far into the in-flight block
+    /// a cue arrived, from the block's admission stamp and the cue's own
+    /// instant. `0` while the queue is not running (the first cue after idle
+    /// primes fresh buffers that render at once) and before any block has
+    /// been stamped; otherwise `now - start`, clamped to one block so a late
+    /// callback can never become a late note. Pure, so the callback-free
+    /// fake can drive it against a fake clock and pin the one scenario the
+    /// real device hides: the cues that arrive in the first block after a
+    /// resume prime.
+    pub(super) fn block_lead_s(running: bool, block_start_us: u64, now_us: u64) -> f32 {
+        if !running || block_start_us == 0 {
+            return 0.0;
+        }
+        (now_us.saturating_sub(block_start_us) as f32 * 1e-6).min(BLOCK_S)
+    }
 
     /// Opaque AudioToolbox handles (never dereferenced in Rust).
     type AudioQueueRef = *mut c_void;
@@ -203,6 +233,22 @@ mod mac {
         /// worker's disable transition. Without this gate, stop could begin in
         /// the few instructions between an atomic check and the FFI enqueue.
         recycle_gate: Mutex<()>,
+        /// THE INSTANT THE CALLBACK BEGAN RENDERING THE IN-FLIGHT BLOCK, in
+        /// [`crate::metrics::now_us`] µs — one relaxed store per block, taken
+        /// under the synth lock immediately before `render` (the cue
+        /// admission boundary: a cue pushed before this instant is in that
+        /// block, one pushed after it waits for the next). [`MacOut::push_meta`]
+        /// reads it to hand the synth the cue's PRE-ROLL
+        /// ([`EventMeta::block_lead_s`]), which is what turns the render
+        /// grid's 0–10.7 ms of onset jitter into a constant. ALSO stamped by
+        /// every prime ([`QueueCycle::stamp_block_start`], first thing in
+        /// [`prime_and_start`]): the primed buffers are the in-flight blocks
+        /// until the first callback, and without that stamp every cue in the
+        /// ~10.7 ms after a resume would measure against a start seconds old
+        /// and clamp to a full block — the one-per-restart asymmetry this
+        /// stamp exists to remove, moved from the first key to the second.
+        /// `0` until the first prime.
+        block_start_us: AtomicU64,
     }
 
     fn set_callback_recycling(shared: &Shared, enabled: bool) {
@@ -227,6 +273,12 @@ mod mac {
     /// owns scheduling access until `stop_immediate` returns synchronously.
     pub(super) trait QueueCycle {
         fn buffer_count(&self) -> usize;
+        /// Stamp the block admission boundary for the buffers about to be
+        /// primed — the same stamp the render callback takes before each
+        /// block, taken once here because the prime renders every buffer in
+        /// one breath. Called by [`prime_and_start`] BEFORE its first
+        /// `render_post_cue`, on every prime, cold and resume alike.
+        fn stamp_block_start(&mut self);
         fn render_post_cue(&mut self, index: usize) -> bool;
         fn enqueue_buffer(&mut self, index: usize) -> bool;
         fn set_callback_recycling(&mut self, enabled: bool);
@@ -241,12 +293,15 @@ mod mac {
         pub(super) first_audible_buffer: Option<usize>,
     }
 
-    /// Fill every AVAILABLE buffer from the post-cue synth state, enqueue it
-    /// exactly once, then enable callback recycling and start. This ordering is
-    /// the latency contract: no pre-cue buffer can sit ahead of buffer one.
+    /// Stamp the block start, fill every AVAILABLE buffer from the post-cue
+    /// synth state, enqueue it exactly once, then enable callback recycling
+    /// and start. This ordering is the latency contract: no pre-cue buffer
+    /// can sit ahead of buffer one, and no cue admitted after this prime can
+    /// measure its pre-roll against a block from before the park.
     pub(super) fn prime_and_start<Q: QueueCycle>(queue: &mut Q) -> Option<PrimeReport> {
         let count = queue.buffer_count();
         debug_assert!(count > 0);
+        queue.stamp_block_start();
         let mut first_audible_buffer = None;
         for index in 0..count {
             if queue.render_post_cue(index) && first_audible_buffer.is_none() {
@@ -317,6 +372,12 @@ mod mac {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
+                // The block's admission boundary, stamped under the lock so
+                // a push can never read a start that is about to move under
+                // it. One relaxed store: no allocation, no lock, RT-safe.
+                shared
+                    .block_start_us
+                    .store(crate::metrics::now_us(), Ordering::Relaxed);
                 synth.render(out);
                 synth.is_quiet()
             };
@@ -381,6 +442,7 @@ mod mac {
                 faulted: AtomicBool::new(false),
                 recycle_epoch: AtomicU64::new(0),
                 recycle_gate: Mutex::new(()),
+                block_start_us: AtomicU64::new(0),
             });
             let fmt = AudioStreamBasicDescription {
                 m_sample_rate: SAMPLE_RATE,
@@ -493,7 +555,28 @@ mod mac {
                     Ok(g) => g,
                     Err(p) => p.into_inner(),
                 };
-                synth.push_meta(ev, meta);
+                // THE PRE-ROLL (THE PRISM §3.4 c, [`block_lead_s`]): how far
+                // into the in-flight block this cue arrived. Measured under
+                // the same lock the callback stamps under, so the two cannot
+                // interleave: if the callback is rendering, we wait and then
+                // measure against the block it just started. Only while the
+                // queue is RUNNING — the first cue after idle primes fresh
+                // buffers that render at once, so its lead is exactly 0 —
+                // and the prime itself re-stamps, so the cues in the first
+                // block after a resume measure against the prime, not the
+                // block before the park.
+                let block_lead_s = block_lead_s(
+                    self.shared.running.load(Ordering::Relaxed),
+                    self.shared.block_start_us.load(Ordering::Relaxed),
+                    crate::metrics::now_us(),
+                );
+                synth.push_meta(
+                    ev,
+                    EventMeta {
+                        block_lead_s,
+                        ..meta
+                    },
+                );
                 self.shared.silent.store(0, Ordering::Release);
             }
             if !self.shared.running.load(Ordering::Relaxed) {
@@ -572,6 +655,15 @@ mod mac {
     impl QueueCycle for MacQueueCycle<'_> {
         fn buffer_count(&self) -> usize {
             self.buffers.len()
+        }
+
+        fn stamp_block_start(&mut self) {
+            // The worker is the only pusher and it is the thread priming, so
+            // no lock is needed for the stamp to be ordered before the
+            // renders below; the callback cannot run (recycling is off).
+            self.shared
+                .block_start_us
+                .store(crate::metrics::now_us(), Ordering::Relaxed);
         }
 
         fn render_post_cue(&mut self, index: usize) -> bool {
@@ -1016,6 +1108,16 @@ impl TrailAudio {
             let worker = std::thread::Builder::new()
                 .name("aterm-trail-audio".into())
                 .spawn(move || {
+                    // THE ROLE, DECLARED FIRST (THE PRISM §3.4 d). This
+                    // worker holds the synth mutex the AudioQueue callback
+                    // takes on the one thread that must never miss; left at
+                    // the inherited default it was the priority inversion
+                    // `qos.rs` warns of — a descheduled lock holder with the
+                    // RT callback queued behind it under load. `Responsive`,
+                    // not `Interactive`: `qos.rs` names Responsive as the
+                    // floor for a lock holder the UI thread contends, and a
+                    // class at or above the UI thread can cost a frame.
+                    crate::qos::set_self(crate::qos::Role::Responsive);
                     worker_main(
                         rx,
                         WorkerFlags {
@@ -1409,7 +1511,7 @@ mod tests {
         WordGesture,
     };
 
-    use super::mac::{QueueCycle, prime_and_start, stop_and_reclaim};
+    use super::mac::{BLOCK_S, QueueCycle, block_lead_s, prime_and_start, stop_and_reclaim};
     use super::{
         AudioWorkerOutput, COMMAND_CAPACITY, Cue, DETACH_DEADLINE, STATE_DORMANT, STATE_FAILED,
         STATE_PAUSED, STATE_RUNNING, STATE_STOPPED, TrailAudio, WEDGE_REVIVES, WorkerFlags,
@@ -1581,6 +1683,16 @@ mod tests {
         stale_enqueues: usize,
         enqueue_in_flight: bool,
         stop_overlaps: usize,
+        /// The fake's µs clock, advanced by the test; what a stamp records.
+        clock_us: u64,
+        /// The block admission stamp — the fake's `Shared::block_start_us`.
+        block_start_us: u64,
+        /// Stamps taken by `prime_and_start` (one per prime is the law).
+        block_stamps: usize,
+        /// Set by a stamp, cleared by a stop: a `render_post_cue` that runs
+        /// while it is clear is a prime rendering against a stale stamp.
+        stamped_since_stop: bool,
+        renders_before_stamp: usize,
     }
 
     impl CallbackFreeQueue {
@@ -1597,7 +1709,24 @@ mod tests {
                 stale_enqueues: 0,
                 enqueue_in_flight: false,
                 stop_overlaps: 0,
+                clock_us: 1_000_000,
+                block_start_us: 0,
+                block_stamps: 0,
+                stamped_since_stop: false,
+                renders_before_stamp: 0,
             }
+        }
+
+        /// The render callback's half of the stamp: a block begins now.
+        fn callback_renders_block(&mut self) {
+            assert!(self.running && self.recycling);
+            self.block_start_us = self.clock_us;
+        }
+
+        /// What `MacOut::push_meta` would hand the synth for a cue at the
+        /// fake's current instant.
+        fn lead_now_s(&self) -> f32 {
+            block_lead_s(self.running, self.block_start_us, self.clock_us)
         }
 
         fn apply_audible_cue(&mut self) {
@@ -1641,6 +1770,7 @@ mod tests {
             // identity, so an old callback could alias the later run.
             self.recycling = false;
             self.enqueue_in_flight = false;
+            self.stamped_since_stop = false;
         }
 
         fn old_callback_returns(&mut self) {
@@ -1655,8 +1785,18 @@ mod tests {
             self.buffers.len()
         }
 
+        fn stamp_block_start(&mut self) {
+            self.operations += 1;
+            self.block_start_us = self.clock_us;
+            self.block_stamps += 1;
+            self.stamped_since_stop = true;
+        }
+
         fn render_post_cue(&mut self, index: usize) -> bool {
             self.operations += 1;
+            if !self.stamped_since_stop {
+                self.renders_before_stamp += 1;
+            }
             if self.buffers[index] != FakeBuffer::Available {
                 self.unsafe_writes += 1;
                 return false;
@@ -1703,6 +1843,7 @@ mod tests {
             self.buffers.fill(FakeBuffer::Available);
             self.running = false;
             self.cue_audible = false;
+            self.stamped_since_stop = false;
             true
         }
     }
@@ -1743,6 +1884,11 @@ mod tests {
         assert_eq!(state, project(1, 0, &queue));
         let cold = prime_and_start(&mut queue).expect("cold prime/start");
         assert_eq!(cold.first_audible_buffer, Some(1));
+        assert_eq!(queue.block_stamps, 1, "a cold prime stamps the block start");
+        assert_eq!(
+            queue.renders_before_stamp, 0,
+            "and stamps it BEFORE it renders"
+        );
         assert!(model.fire("PrimeCold", &mut state));
         assert!(model.fire("StartCold", &mut state));
         assert_eq!(state, project(3, 1, &queue));
@@ -1768,6 +1914,14 @@ mod tests {
         assert_eq!(state, project(5, 0, &queue));
         let resumed = prime_and_start(&mut queue).expect("resume prime/start");
         assert_eq!(resumed.first_audible_buffer, Some(1));
+        assert_eq!(
+            queue.block_stamps, 2,
+            "a resume prime stamps the block start again"
+        );
+        assert_eq!(
+            queue.renders_before_stamp, 0,
+            "and never renders against the parked stamp"
+        );
         assert!(model.fire("PrimeResume", &mut state));
         assert!(model.fire("StartResume", &mut state));
         assert_eq!(state, project(7, 1, &queue));
@@ -1830,6 +1984,110 @@ mod tests {
         assert_eq!(retained.stale_enqueues, 1);
         assert!(buggy.fire("OldCallbackReturns", &mut bad));
         assert!(!buggy.check_invariant("StaleCallbackCannotReenqueue", &bad));
+    }
+
+    /// THE PRE-ROLL ACROSS A PARK (THE PRISM §3.4 c, §2.4 item 5): the cues
+    /// that arrive in the first block after a resume prime measure their
+    /// pre-roll against the PRIME, not against the last block the callback
+    /// rendered before the park. Driven through the exact generic helpers
+    /// `MacOut` uses, on the callback-free fake with a fake clock, and the
+    /// lead read through the same pure law `MacOut::push_meta` applies.
+    /// The negative control is the retired code: a prime that did not stamp
+    /// left the parked block's start in place, and a cue 3 ms after the
+    /// resume read `now - <a stamp seconds old>`, clamped to the full block
+    /// — a once-per-restart onset error of (10.667 - d) ms on the second key
+    /// of every burst that began after a think-pause.
+    #[test]
+    fn a_resume_prime_restamps_the_block_so_the_next_cues_pre_roll_is_its_true_offset() {
+        const MS: u64 = 1_000;
+        let mut queue = CallbackFreeQueue::new();
+
+        // Before any prime nothing is stamped and nothing is running: 0.
+        assert_eq!(queue.lead_now_s(), 0.0);
+
+        // Cold start at t = 1 s. The first cue is pushed while the queue is
+        // not running (lead 0 by law), then primed.
+        queue.apply_audible_cue();
+        assert_eq!(
+            queue.lead_now_s(),
+            0.0,
+            "the cue that wakes the queue has no pre-roll"
+        );
+        prime_and_start(&mut queue).expect("cold prime/start");
+        assert_eq!(
+            queue.block_start_us,
+            1_000 * MS,
+            "the cold prime stamped its own instant"
+        );
+        queue.clock_us += 4 * MS;
+        assert!(
+            (queue.lead_now_s() - 0.004).abs() < 1e-6,
+            "4 ms into the primed block"
+        );
+
+        // Steady state: the callback stamps each block as it begins.
+        queue.clock_us += 500 * MS;
+        queue.callback_renders_block();
+        let last_callback_us = queue.clock_us;
+        queue.clock_us += 7 * MS;
+        assert!((queue.lead_now_s() - 0.007).abs() < 1e-6);
+        queue.clock_us += 20 * MS;
+        assert_eq!(
+            queue.lead_now_s(),
+            BLOCK_S,
+            "a late callback clamps to one block"
+        );
+
+        // Silence: the queue parks for five seconds. Parked, the law reads 0
+        // whatever the stamp says.
+        assert!(stop_and_reclaim(&mut queue));
+        queue.clock_us += 5_000 * MS;
+        assert_eq!(
+            queue.lead_now_s(),
+            0.0,
+            "a parked queue hands out no pre-roll"
+        );
+        assert_eq!(
+            queue.block_start_us, last_callback_us,
+            "the parked stamp is seconds old"
+        );
+
+        // The think-pause ends with a burst. Key 1 wakes the queue (lead 0),
+        // the prime runs, and key 2 arrives 3 ms later, inside the first
+        // block after the resume.
+        queue.apply_audible_cue();
+        let resume_us = queue.clock_us;
+        prime_and_start(&mut queue).expect("resume prime/start");
+        assert_eq!(
+            queue.block_start_us, resume_us,
+            "the resume prime re-stamped"
+        );
+        queue.clock_us += 3 * MS;
+        let key2 = queue.lead_now_s();
+        assert!(
+            (key2 - 0.003).abs() < 1e-6,
+            "key 2 measures 3 ms from the prime, got {key2}"
+        );
+
+        // The retired code, for the record: no stamp at the prime, so the
+        // same key 2 measured against the block before the park and clamped
+        // to the whole block — an error of BLOCK_S - 3 ms on that one key.
+        let retired = block_lead_s(true, last_callback_us, queue.clock_us);
+        assert_eq!(
+            retired, BLOCK_S,
+            "the retired prime clamped key 2 to a full block"
+        );
+        assert!(
+            retired - key2 > 0.007,
+            "the asymmetry this pin keeps out: {retired} vs {key2}"
+        );
+
+        // And once the first callback lands, prime and callback stamps are
+        // one continuous clock.
+        queue.clock_us += 8 * MS;
+        queue.callback_renders_block();
+        queue.clock_us += 2 * MS;
+        assert!((queue.lead_now_s() - 0.002).abs() < 1e-6);
     }
 
     #[derive(Default)]
@@ -2361,7 +2619,9 @@ mod tests {
             EventMeta {
                 at_ms: 4242,
                 glyph_class: 2,
+                rank: 20,
                 pan_from: -0.5,
+                block_lead_s: 0.0,
             },
         );
         let captured = audio.take_captured_with_meta_for_test();
@@ -2369,6 +2629,7 @@ mod tests {
         assert_eq!(captured[0].1, EventMeta::default(), "push stamps nothing");
         assert_eq!(captured[1].1.at_ms, 4242);
         assert_eq!(captured[1].1.glyph_class, 2);
+        assert_eq!(captured[1].1.rank, 20);
         assert_eq!(captured[1].1.pan_from, -0.5);
         assert_eq!(
             Cue::from(cue()).meta,
@@ -2389,7 +2650,9 @@ mod tests {
             meta: EventMeta {
                 at_ms: 31_337,
                 glyph_class: 1,
+                rank: 40,
                 pan_from: 0.0,
+                block_lead_s: 0.0,
             },
         })
         .unwrap();

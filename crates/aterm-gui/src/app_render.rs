@@ -2077,6 +2077,144 @@ struct BlockFillSplice {
     comet: Option<u32>,
     droplet: Option<u32>,
     beamrod: Option<u32>,
+    /// The typing-momentum tint — LAST, so a style body always wins the caret.
+    momentum: Option<u32>,
+}
+
+/// THE ONE BLINK LAW, composed by who owns the caret (2026-09-08; the owner,
+/// to two sessions: *"I don't like the blinking cursor"* — twice — and *"the
+/// blinking cursor is annoying, I want some momentum glow for typing faster
+/// that cools down"*). Precedence, first wins:
+///
+/// 1. the bolt (the `laser` body's own shape);
+/// 2. **the rainbow owns the caret** (`twinkle_cursor`: the `rainbow kitty`
+///    block body resolved a fill on a BLINKING block) — pinned
+///    `SteadyBlock`, UNCONDITIONALLY, whatever the momentum engine says: the
+///    rainbow caret never blinks, hot or cold, and its halo/rim/spin already
+///    encode momentum;
+/// 3. **the momentum glow is HOT** on any other style — the Blinking* style
+///    is pinned to its Steady* twin while warm (`momentum_steady`), and
+///    `None` once cool, so the terminal's own blink returns exactly as
+///    configured.
+///
+/// Composed by ORDERING and nothing else: the rainbow's ownership is
+/// evaluated before the momentum override is consulted, so there is no
+/// third mechanism to keep in step with the two. ONE function for every
+/// site that spells the caret's shape — the single-pane
+/// `redraw_window_with_layout` path (the one a focused window's
+/// `RedrawRequested` renders through), the two composed-pane splices, and
+/// the introspection mirror (`app_introspect.rs`, the frame `ctl image` and
+/// a paced `ctl video` read) — so a capture can never contradict the glass
+/// and no path can spell the caret alone. Pure, so the law is pinned in
+/// `caret_blink_law_tests`.
+pub(crate) fn compose_caret_style_override(
+    bolt: bool,
+    rainbow_owns_caret: bool,
+    momentum_steady: Option<CursorStyle>,
+) -> Option<CursorStyle> {
+    if bolt {
+        Some(CursorStyle::Bolt)
+    } else if rainbow_owns_caret {
+        Some(CursorStyle::SteadyBlock)
+    } else {
+        // A hot cursor does not blink (owner, 2026-09-08); a cool one is
+        // exactly the configured cursor.
+        momentum_steady
+    }
+}
+
+/// Whether the typing-momentum glow engine RUNS this frame: the user's
+/// switch (default ON) ANDed with the host's gates (serious mode, focus,
+/// the live viewport — folded by the caller into `host_allows`), and NOT
+/// while the rainbow owns the caret. Under the rainbow the caret already
+/// encodes momentum in its own rim and halo; a second engine painting an
+/// amber halo and a warm body over the same cell would be two encodings of
+/// one quantity, so the momentum engine yields the cell — it is handed
+/// `enabled: false`, paints nothing, and reports `hot: false`. Pure; pinned
+/// beside the blink law.
+fn momentum_glow_allowed(user_on: bool, host_allows: bool, rainbow_owns_caret: bool) -> bool {
+    user_on && host_allows && !rainbow_owns_caret
+}
+
+#[cfg(test)]
+mod caret_blink_law_tests {
+    use super::{CursorStyle, compose_caret_style_override, momentum_glow_allowed};
+
+    /// LAW 1, the rainbow half: under the rainbow, Blink is never the
+    /// caret's — regardless of momentum temperature. Cold (`None`) and hot
+    /// (`Some(SteadyBlock)`, and even a hot BAR twin) all compose to the
+    /// pinned steady block.
+    #[test]
+    fn under_the_rainbow_the_caret_never_blinks_at_any_momentum() {
+        for momentum in [
+            None,
+            Some(CursorStyle::SteadyBlock),
+            Some(CursorStyle::SteadyBar),
+            Some(CursorStyle::SteadyUnderline),
+        ] {
+            assert_eq!(
+                compose_caret_style_override(false, true, momentum),
+                Some(CursorStyle::SteadyBlock),
+                "rainbow owns the caret, momentum {momentum:?}: the block is pinned steady"
+            );
+        }
+    }
+
+    /// LAW 1, the other half: under a classic style the peer's law stands
+    /// unchanged — Blink is the caret's when cool (`None`: the terminal's
+    /// Blinking* style is rendered as configured) and pinned to the Steady*
+    /// twin while warm.
+    #[test]
+    fn under_a_classic_style_blink_returns_when_cool_and_is_pinned_while_warm() {
+        assert_eq!(
+            compose_caret_style_override(false, false, None),
+            None,
+            "cool: no override, the configured blink stands"
+        );
+        for steady in [
+            CursorStyle::SteadyBlock,
+            CursorStyle::SteadyBar,
+            CursorStyle::SteadyUnderline,
+        ] {
+            assert_eq!(
+                compose_caret_style_override(false, false, Some(steady)),
+                Some(steady),
+                "warm: the Blinking* style is pinned to its Steady* twin"
+            );
+        }
+    }
+
+    /// The bolt outranks both — the `laser` body's own shape, as before.
+    #[test]
+    fn the_bolt_outranks_the_rainbow_and_the_momentum_glow() {
+        assert_eq!(
+            compose_caret_style_override(true, true, Some(CursorStyle::SteadyBlock)),
+            Some(CursorStyle::Bolt)
+        );
+        assert_eq!(
+            compose_caret_style_override(true, false, None),
+            Some(CursorStyle::Bolt)
+        );
+    }
+
+    /// The momentum ENGINE yields the caret cell to the rainbow: with the
+    /// rainbow owning the caret it is not run at all (no amber halo, no warm
+    /// body tint, `hot: false`), whatever the user's switch and the host's
+    /// gates say; without the rainbow it is exactly the user's switch ANDed
+    /// with the host's gates — default ON.
+    #[test]
+    fn the_momentum_engine_yields_the_caret_cell_to_the_rainbow() {
+        assert!(!momentum_glow_allowed(true, true, true));
+        assert!(momentum_glow_allowed(true, true, false));
+        assert!(
+            !momentum_glow_allowed(false, true, false),
+            "the user's switch is honoured"
+        );
+        assert!(
+            !momentum_glow_allowed(true, false, false),
+            "and so are the host's gates"
+        );
+    }
 }
 
 /// WHO owns the block cursor's body this frame, and the colour they built it
@@ -2135,6 +2273,7 @@ fn resolve_block_fill(
         .or_else(|| owned(BlockFillOwner::Comet, fills.comet))
         .or_else(|| owned(BlockFillOwner::Droplet, fills.droplet))
         .or_else(|| owned(BlockFillOwner::BeamRod, fills.beamrod))
+        .or_else(|| owned(BlockFillOwner::Momentum, fills.momentum))
 }
 
 /// Project the one resolved effect-owned cursor body through adaptive shedding.
@@ -6811,6 +6950,9 @@ pub(crate) fn companion_pet_sense(
         phase: 0.0,
         caret: host.caret.unwrap_or((0, 0)),
         caret_t: 0.0,
+        // The companion router reads no birth price, so the tick's mend mark
+        // (the typo-fix birth, `RAINBOW-KITTY-V2.md` §23) is nothing to it.
+        mend: None,
     };
     aterm_effects::rainbow_kitty::companion::sense(&ctx, host)
 }
@@ -21339,11 +21481,16 @@ pub(crate) struct CursorFxTick {
     /// focused, visible block cursor): the caller applies the
     /// `CursorStyle::Bolt` style override — the cursor IS the lightning.
     pub bolt_cursor: bool,
-    /// 🌟 Whether the rainbow BLINK-TWINKLE is live (the `rainbow kitty` style on a focused,
-    /// visible BLINKING block): the caller pins the rendered shape to
-    /// `CursorStyle::SteadyBlock` so the block never vanishes on the off phase —
-    /// the blink flips become the rainbow cursor's star flares instead.
+    /// 🌟 Whether the rainbow OWNS a BLINKING block (the `rainbow kitty` style
+    /// on a focused, visible blinking block, fill resolved): the caller pins the
+    /// rendered shape to `CursorStyle::SteadyBlock` so the block never vanishes
+    /// on an off phase — typing or idle (R4) — and the momentum-rung twinkle
+    /// stands in for the blink the terminal asked for.
     pub twinkle_cursor: bool,
+    /// ✨ The typing-momentum glow is HOT: pin this Blinking* style to its
+    /// Steady* twin so a warm cursor never blinks (`None` when cold, or when
+    /// the style does not blink in the first place).
+    pub momentum_steady: Option<CursorStyle>,
 }
 
 /// Clock ownership for one composed cursor-effect projection.
@@ -22828,6 +22975,11 @@ impl App {
             crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, win_focused);
         let shed = self.effective_shed_envelope(mode, now);
         let glow_cfg = self.glow_config();
+        let pet_action = if ws.pet_hit_rect.is_some() {
+            format!("{:?}", ws.cursor_pet.action()).to_ascii_lowercase()
+        } else {
+            "none".to_string()
+        };
         Ok(crate::cursor_glow::TrailStatus {
             style_raw: self.config.cursor_trail_style_raw(),
             style: glow_cfg.style,
@@ -22876,6 +23028,10 @@ impl App {
             momentum_display: ws.cursor_glow.momentum_display(),
             glow_active: ws.cursor_glow.is_active(),
             pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
+            pet_action: &pet_action,
+            pet_content: ws.cursor_pet.content(),
+            pet_pending: ws.cursor_pet.pending_pets(),
+            pet_body: ws.pet_hit_rect,
             cat_active: ws.cursor_cat.is_active(),
             // WHO OWNS THE CARET — the gate none of the three above reports.
             // Recorded by the tick that resolved it (`tick_cursor_fx`, and the
@@ -23185,15 +23341,28 @@ impl App {
                 .effective(self.config.tone_melody_or_default());
             // THE STAMP (`RAINBOW-KITTY-V2.md` §16 row 7): the host input
             // clock in ms, on BOTH delivery paths — the keyed seam stamps its
-            // click at the key, this drain stamps every echo-born cue at the
-            // frame — so the music box's verse gate measures one clock. An
-            // echo-born cue has no key behind it, so its glyph class is
-            // `0` exactly as its `shifted` is `false` (row 8).
-            let meta = aterm_effects::trail_sound::EventMeta {
-                at_ms: input_clock_ms(),
-                glyph_class: 0,
-                pan_from: 0.0,
-            };
+            // click at the key, this drain stamps every echo-born cue — so
+            // the melody measures one clock. An echo-born cue has no key
+            // behind it, so its glyph class is `0` exactly as its `shifted`
+            // is `false` (row 8).
+            //
+            // EACH CUE AT ITS OWN INSTANT, AND NO TWO ALIKE. The side-car is
+            // built INSIDE the emit closure, once per cue, not once per
+            // frame: a single frame-level stamp gave every cue drained in one
+            // frame — a ten-key burst echoing back over a 50 ms ssh round
+            // trip, a paste, a fast `ls` — one `at_ms`, so their gaps read 0
+            // and the whole frame's worth of keys went to the unpitched
+            // mallet as one machine event. The clock is millisecond-grained
+            // and a drain runs in microseconds, so successive cues are also
+            // TIE-BROKEN forward by one ms: the stamps a frame hands over are
+            // strictly increasing, which is the ORDER the ms clock cannot see
+            // on its own. That is bounded by the backlog (at most
+            // `MAX_SOUND_CUES` ms ahead of the clock, inside one frame) and
+            // the melody's gaps are saturating, so a keyed stamp that lands
+            // on or under the last echo stamp reads as a gap of 0 exactly as
+            // it did before. `the_drain_stamps_each_echo_cue_at_its_own_instant`
+            // pins it.
+            let mut last_at_ms = 0u32;
             drain_trail_sound_cues(
                 &mut ws.cursor_glow,
                 glow_cfg.style,
@@ -23204,7 +23373,21 @@ impl App {
                     tone,
                     bed: self.config.trail_sound_bed_or_default(),
                 },
-                |event| self.trail_audio.push_meta(event, meta),
+                |event| {
+                    let at_ms = input_clock_ms().max(last_at_ms.wrapping_add(1));
+                    last_at_ms = at_ms;
+                    self.trail_audio.push_meta(
+                        event,
+                        aterm_effects::trail_sound::EventMeta {
+                            at_ms,
+                            glyph_class: 0,
+                            rank: 0,
+                            pan_from: 0.0,
+                            // Stamped by the audio worker (`MacOut::push_meta`).
+                            block_lead_s: 0.0,
+                        },
+                    );
+                },
             );
         }
         // The FORGE cursor fill (fire style): the block cursor heats along
@@ -23419,14 +23602,34 @@ impl App {
             &mut ws.glow_scratch,
         );
         let rainbow_fill = rainbow_frame.fill;
-        // 🌟 The rainbow kitty BLINK-TWINKLE: with the rainbow live on a BLINKING block,
-        // the rendered shape is pinned steady (the caller applies the override —
-        // this fn holds the window borrow, like the bolt) so the block never
-        // vanishes black-and-white; the blink flips fed to the tick above fire
-        // little star flares instead. Reduced motion / load-shed leaves `fill`
-        // None, so the plain on/off blink is provably restored.
-        let twinkle_cursor =
-            rainbow_frame.fill.is_some() && rainbow_cfg.blinking && ws.cursor_rainbow.is_active();
+        // 🌟 THE RAINBOW OWNS THE CARET (R4, 2026-09-08: *"I don't like the
+        // blinking cursor"* — said twice). With the rainbow live on a BLINKING
+        // block, the rendered shape is pinned steady UNCONDITIONALLY (the
+        // caller applies the override — this fn holds the window borrow, like
+        // the bolt) so the block never vanishes black-and-white, typing or
+        // idle. This used to carry `&& ws.cursor_rainbow.is_active()`, and
+        // `is_active`'s own fingerprint law releases the moment the u8 fill
+        // settles — so the caret was steady while you typed and blinking
+        // again 530 ms after you stopped, which is exactly the complaint. The
+        // deadline fold in `lib.rs` never arms `DeadlineOwner::Blink` for a
+        // window under this pair either. Reduced motion / load-shed leaves
+        // `fill` None, so the plain on/off blink is provably restored.
+        let twinkle_cursor = rainbow_frame.fill.is_some() && rainbow_cfg.blinking;
+        // ONE BLINK LAW, composed by WHO OWNS THE CARET (2026-09-08, the
+        // merge of the rainbow caret work and the typing-momentum glow — two
+        // sessions, one owner ruling). The rainbow's ownership is evaluated
+        // FIRST: when its block body resolved a fill this frame, the caret
+        // is the rainbow's — it never blinks (R4, above) and its halo, rim
+        // and spin already read momentum from the ribbon's spine (`paint`,
+        // `cursor_rainbow.rs`). Only when the rainbow does NOT own the caret
+        // is the momentum engine below consulted at all: it is disabled for
+        // the frame, so it paints no body tint and no halo and reports
+        // `hot: false`. Two encodings of one quantity on one cell — a
+        // rainbow rim AND an amber halo both saying "you are typing fast" —
+        // is the thing this ordering prevents. Bars and underlines take no
+        // rainbow body (`fill` None), so under the rainbow theme they keep
+        // the momentum law like every other style.
+        let rainbow_owns_caret = rainbow_frame.fill.is_some();
         // Fold the rainbow-cursor fingerprint into the aurora key so an evolving
         // cursor forces a present and a settled one early-outs to idle.
         let glow_fp = glow_fp ^ rainbow_frame.fp.rotate_left(23);
@@ -23455,6 +23658,55 @@ impl App {
         );
         let droplet_fill = droplet_frame.fill;
         let glow_fp = glow_fp ^ droplet_frame.fp.rotate_left(47);
+        // ✨ TYPING-MOMENTUM GLOW (owner, 2026-09-08: "the blinking cursor is
+        // annoying, I want some momentum glow for typing faster that cools
+        // down"): a warm additive halo that brightens with key RATE and cools
+        // in silence, on ANY style and ANY shape; a hot cursor does not blink
+        // (the Blinking* style is pinned to its Steady* twin below, the same
+        // precedence the rainbow twinkle uses). It joins the same aurora
+        // scratch as its siblings, so it obeys the effects master, serious
+        // mode, focus and the live-viewport gate through `cursor_body_allowed`.
+        let momentum_cfg = aterm_effects::cursor_momentum::MomentumGlowConfig {
+            enabled: momentum_glow_allowed(
+                self.config.cursor_momentum_glow_or_default(),
+                cursor_body_allowed && win_focused,
+                rainbow_owns_caret,
+            ),
+            intensity: cursor_motion.amplitude(crate::motion::MotionEffect::CursorGlow) * shed_env,
+            tau_s: aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
+            radius_cells: aterm_effects::cursor_momentum::MOMENTUM_GLOW_RADIUS_CELLS,
+            base: aterm_render::rgb_to_u32(live_cursor_rgb),
+            dark_theme: glow_cfg.dark_theme,
+            block: matches!(
+                cursor_style,
+                aterm_core::terminal::CursorStyle::BlinkingBlock
+                    | aterm_core::terminal::CursorStyle::SteadyBlock
+            ),
+        };
+        let momentum_frame = ws.momentum_glow.tick(
+            cur,
+            frame_started,
+            glow_geom,
+            &momentum_cfg,
+            &mut ws.glow_scratch,
+        );
+        let momentum_fill = momentum_frame.fill;
+        let momentum_steady = momentum_frame
+            .hot
+            .then_some(match cursor_style {
+                aterm_core::terminal::CursorStyle::BlinkingBlock => {
+                    aterm_core::terminal::CursorStyle::SteadyBlock
+                }
+                aterm_core::terminal::CursorStyle::BlinkingUnderline => {
+                    aterm_core::terminal::CursorStyle::SteadyUnderline
+                }
+                aterm_core::terminal::CursorStyle::BlinkingBar => {
+                    aterm_core::terminal::CursorStyle::SteadyBar
+                }
+                other => other,
+            })
+            .filter(|s| *s != cursor_style);
+        let glow_fp = glow_fp ^ momentum_frame.fp.rotate_left(53);
         // ☄ COMET NUCLEUS CURSOR (the `comet` block-cursor body): the block
         // fill frosts to ice and an additive round COMA with twinkling rim
         // glints wraps the cell, riding the aurora's BLAZE (read AFTER
@@ -23657,6 +23909,7 @@ impl App {
                     bolt: bolt_fill,
                     comet: comet_fill,
                     droplet: droplet_fill,
+                    momentum: momentum_fill,
                     beamrod: beamrod_fill,
                 },
                 terminal_cursor_color,
@@ -23687,6 +23940,7 @@ impl App {
             block_fill,
             bolt_cursor,
             twinkle_cursor,
+            momentum_steady,
         })
     }
 
@@ -24119,13 +24373,8 @@ impl App {
         };
         let block_fill = fx.block_fill;
         let active_fill = block_fill.map(|owned| owned.fill);
-        let body_style_override = if fx.bolt_cursor {
-            Some(CursorStyle::Bolt)
-        } else if fx.twinkle_cursor {
-            Some(CursorStyle::SteadyBlock)
-        } else {
-            None
-        };
+        let body_style_override =
+            compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let Some(window) = self.windows.get_mut(&wid) else {
             return false;
         };
@@ -27131,15 +27380,19 @@ impl App {
                 block_fill,
                 bolt_cursor,
                 twinkle_cursor,
+                momentum_steady,
                 ..
             } = fx;
-            let cursor_effect_style_override = if bolt_cursor {
-                Some(CursorStyle::Bolt)
-            } else if twinkle_cursor {
-                Some(CursorStyle::SteadyBlock)
-            } else {
-                None
-            };
+            // The ONE blink law (`compose_caret_style_override`), on the path
+            // every focused single-pane `RedrawRequested` renders through.
+            // This site used to spell bolt/twinkle alone and DROP
+            // `momentum_steady` in the destructure above, so a warm classic
+            // caret kept blinking on glass (capture: 6–8 blink jumps in 3 s
+            // while `block_fill=momentum`) although the composed-pane
+            // splices and the introspection mirror held it steady — the
+            // fourth override site, and the one the eye actually sees.
+            let cursor_effect_style_override =
+                compose_caret_style_override(bolt_cursor, twinkle_cursor, momentum_steady);
             // The same window-space geometry the ticks used (shared derivation, so
             // this site can never disagree with `tick_cursor_fx`).
             let (origin_x, origin_y, win_w, win_h, fx_head) =
@@ -27594,7 +27847,17 @@ impl App {
                     },
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
-                    pointer: pet_pointer,
+                    // The caret may prewarm an invisible resident behind the
+                    // singer. Pointer contact requires its last drawn body
+                    // and the current frame's pixel custody instead.
+                    pointer: if ws.pet_hit_rect.is_some()
+                        && pet_companion_admitted(pet_visible, cat_frame.sing)
+                        && shed_companion_alpha(255, shed_envelope) > 0
+                    {
+                        pet_pointer
+                    } else {
+                        None
+                    },
                 },
             ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
@@ -32901,13 +33164,8 @@ impl App {
         let trail_fp = fx.trail_fp;
         let block_fill = fx.block_fill;
         let active_cursor_fill = block_fill.map(|owned| owned.fill);
-        let body_style_override = if fx.bolt_cursor {
-            Some(CursorStyle::Bolt)
-        } else if fx.twinkle_cursor {
-            Some(CursorStyle::SteadyBlock)
-        } else {
-            None
-        };
+        let body_style_override =
+            compose_caret_style_override(fx.bolt_cursor, fx.twinkle_cursor, fx.momentum_steady);
         let focused = fx.win_focused;
         let policy = fx.motion;
         let cursor_motion = fx.cursor_motion;
@@ -33193,7 +33451,16 @@ impl App {
                     },
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
-                    pointer: pet_pointer,
+                    // The focused split pane obeys the same touch custody as
+                    // the single-pane resident, including a dark shed.
+                    pointer: if ws.pet_hit_rect.is_some()
+                        && pet_companion_admitted(pet_visible, cat_frame.sing)
+                        && shed_companion_alpha(255, shed_envelope) > 0
+                    {
+                        pet_pointer
+                    } else {
+                        None
+                    },
                 },
             ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
@@ -42223,6 +42490,72 @@ mod key_time_click_tests {
                 .any(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed))),
             "the capital the lift announced must still click",
         );
+    }
+
+    /// EACH ECHO-BORN CUE IS STAMPED AT ITS OWN INSTANT (THE PRISM §3.4 b,
+    /// build step 2). Three cues drained in ONE frame reach the host with
+    /// three DISTINCT, strictly increasing, non-zero `at_ms` — never the one
+    /// frame-level side-car that made a whole frame's worth of keys share a
+    /// stamp, read as gaps of 0, and go to the mallet as one machine event.
+    ///
+    /// The cues are queued on the engine's backlog between two frames, as an
+    /// echo stream lands them, and none is taken at the key: this is the
+    /// frame drain's stamp under test, not the keyed seam's.
+    #[test]
+    fn the_drain_stamps_each_echo_cue_at_its_own_instant() {
+        use aterm_effects::trail_sound::{SoundGesture, SoundKind};
+        use std::time::{Duration, Instant};
+
+        let mut app = crate::App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.trail_sounds = Some(true);
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        let wid = crate::WindowId(0);
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        let t0 = Instant::now();
+        // One drawing tick arms the engine's silence law (`sound_live`).
+        app.tick_cursor_fx(wid, super::CursorFxInputs::sample_for_test(t0))
+            .expect("the fixture window ticks");
+        let _ = app.trail_audio.take_captured_with_meta_for_test();
+
+        {
+            let glow = &mut app.windows.get_mut(&wid).expect("window").cursor_glow;
+            for i in 0..3u64 {
+                assert!(
+                    glow.cue_keystroke(t0 + Duration::from_millis(1 + i)),
+                    "the backlog takes cue {i}"
+                );
+            }
+        }
+        app.tick_cursor_fx(
+            wid,
+            super::CursorFxInputs::sample_for_test(t0 + Duration::from_millis(16)),
+        )
+        .expect("the fixture window ticks");
+
+        let spoken = app.trail_audio.take_captured_with_meta_for_test();
+        let stamps: Vec<u32> = spoken
+            .iter()
+            .filter(|(ev, _)| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed)))
+            .map(|(_, meta)| meta.at_ms)
+            .collect();
+        assert_eq!(
+            stamps.len(),
+            3,
+            "three cues drained in one frame: {stamps:?}"
+        );
+        assert!(
+            stamps.iter().all(|&at| at != 0),
+            "an echo-born cue is stamped, never left to the block clock: {stamps:?}"
+        );
+        assert!(
+            stamps.windows(2).all(|w| w[1] > w[0]),
+            "three cues in one frame carry three distinct, increasing stamps: {stamps:?}"
+        );
+        // And an echo-born cue still carries no glyph: class 0, rank 0.
+        for (_, meta) in &spoken {
+            assert_eq!((meta.glyph_class, meta.rank), (0, 0));
+        }
     }
 
     /// THE INSTRUMENT CANNOT DRIFT. The key seam reads [`crate::App::glow_style`]

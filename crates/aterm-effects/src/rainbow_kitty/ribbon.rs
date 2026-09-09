@@ -17,25 +17,33 @@
 //! [`WALK_FAST_CELLS`] cells, then [`WALK_LAY_RATE`] per cell), one
 //! `aterm_render::ribbon_beam` call over `RibbonVertex`s with the C¹
 //! `ribbon_profile` (core share 0.5) and its Bayer dither, the flat body
-//! (head floor 1.0, crest gain 0.0), the 0.75-cycle wave at `0.055 ch · disp`,
-//! the 18 ms `edge-in` and the exact-zero expiry melt, the four-letter
+//! (head floor 1.0, crest gain 0.0), the 0.75-cycle wave (at
+//! `0.110 ch · disp` since 2026-09-08 — twice v1's `0.055`, the owner's
+//! "bigger"; [`WAVE_AMP_CELLS`]), the 18 ms `edge-in` and the exact-zero
+//! expiry melt, the four-letter
 //! guarantee and its chain law, the staggered backspace retract, the wrap
 //! fold, the exit swoosh (`0.75 grace + 3 × 0.05 reach + 0.40 retract +
 //! 0.24 fade`), and the source-over twin on light themes.
 //!
 //! ## What is genuinely new, and why
 //!
-//! 1. **The hot edge** (§4.1) — a 1-px `#FFFFFF` additive hairline along the
-//!    ribbon's TOP edge, from the head cell back [`HOT_EDGE_CELLS`] cells,
-//!    drawn as a `comet_beam` hairline sampled at the same `spine − up` the
-//!    body used (the top edge carries the wave, so three axis-aligned rects
-//!    cannot follow it). Dark themes only, into `out`, SPATIAL rather than
-//!    temporal so it can never lag the head; its gain is priced at the head
-//!    cell's birth and scaled by the head cell's envelope
-//!    ([`Ribbon::env_of`]), so it goes out WITH the body — ember, melt and
-//!    swoosh — and never holds over a spent one. It is the first item on the
-//!    owner A/B sheet (§22), so it lives behind one gate —
-//!    [`Ribbon::hot_edge_gain`] — that is one line to flip off.
+//! 1. **The hot edge** (§4.1) — a 1-px additive hairline IN THE SPECTRUM
+//!    along the ribbon's TOP edge, from the head cell back [`HOT_EDGE_CELLS`]
+//!    cells: each vertex carries the stop under it, lifted toward white to
+//!    [`HOT_EDGE_LUMA_FLOOR`] ([`hot_edge_ink`]) so it out-shines any bed it
+//!    can ride, at [`HOT_EDGE_COV_MAX`] 118 — the transient cap. It was a
+//!    `#FFFFFF` hairline at 38 — "a third white idiom" — until 2026-09-08,
+//!    when the owner struck the
+//!    restraint ("I feel like you are diminishing the specialness and
+//!    emphasis of this theme? why?"). Drawn as a `comet_beam` hairline
+//!    sampled at the same `spine − up` the body used (the top edge carries
+//!    the wave, so three axis-aligned rects cannot follow it). Dark themes
+//!    only, into `out`, SPATIAL rather than temporal so it can never lag the
+//!    head; its gain is priced at the head cell's birth and scaled by the
+//!    head cell's envelope ([`Ribbon::env_of`]), so it goes out WITH the
+//!    body — ember, melt and swoosh — and never holds over a spent one. It is
+//!    the first item on the owner A/B sheet (§22), so it lives behind one
+//!    gate — [`Ribbon::hot_edge_gain`] — that is one line to flip off.
 //! 2. **The field index** (§18) — a per-row `col → t` lane built ONCE per tick
 //!    by [`Ribbon::plan`] and answering [`Ribbon::field_at`] in O(1). v1's
 //!    `rainbow_field_at` was a LINEAR SCAN of every spark, called per station
@@ -51,9 +59,11 @@
 //!   olive and navy mids, and only the bottom 2–3 px bright. Three parts, and
 //!   this module answers TWO of them; it does not claim the third. The NAVY
 //!   mids were v1's dark stops (blue, indigo, violet) composited as smudges
-//!   below the ground's own reach; [`bed_ink`] walks them toward white until
-//!   they sit on the same composited luminance as every other stop, so the
-//!   arc is EVEN — indigo weighs what red weighs — and the 33-entry
+//!   below the ground's own reach; [`bed_ink`] lifts them until they sit on
+//!   the same composited luminance as every other stop — through their own
+//!   hue at full value first, and toward white only for the light a hue
+//!   cannot carry ([`onto_luma`], 2026-09-09; below) — so the arc is EVEN —
+//!   indigo weighs what red weighs — and the 33-entry
 //!   per-position coverage table v1 priced that against is not carried
 //!   (§19.1: *"two ceilings for one bed"*). The bottom-only brightness was
 //!   the baseline strip out-shining a body that had been capped below it; the
@@ -62,16 +72,61 @@
 //!   it, so it is a crisp accent on a bright body rather than the only lit
 //!   thing in the mark. The OLIVE mids are NOT fixed here. The "one
 //!   composited luminance" is L3's 5.25:1 bar against the theme's foreground
-//!   — `Y ≈ 0.080` on the default theme — and a warm stop at that luminance
-//!   IS an olive: a full-coverage yellow composites at `(78, 78, 2)`, max
-//!   channel 78, at or below the ≈ 84 v1's table produced. The warm mids sit
-//!   at the bar's ceiling BY CONSTRUCTION. Whether the bar is relaxed for the
-//!   bed over BLANK cells (e.g. 3:1, with the ledger still holding 5.25:1
-//!   over probed glyph cells per §3.4) is an **owner ruling, OPEN** — it
-//!   needs a §22 A/B row and has none — not a recipe this module may choose.
-//!   The number is pinned either way by
-//!   `the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_78_under_the_bar`,
-//!   so "dim" has a figure to move when the ruling lands.
+//!   — `Y ≈ 0.083` on the default theme — and a warm stop at that luminance
+//!   IS an olive: a full-coverage yellow composites at `(80, 80, 3)`, max
+//!   channel 80, at or below the ≈ 84 v1's table produced. The warm mids sit
+//!   at the bar's ceiling BY CONSTRUCTION — and since 2026-09-08 AT the bar
+//!   rather than a guard under it: the owner kept the bar as the one
+//!   restraint ("text under the bed stays legible") and struck every other
+//!   one ("I feel like you are diminishing the specialness and emphasis of
+//!   this theme? why?"), so the 0.15 guard became the 0.05 the composite's
+//!   rounding actually needs ([`BODY_CONTRAST_GUARD`]), the solver answers
+//!   from under its target ([`solve_for_luma`]), and the luminance clamp
+//!   became the bar's own answer at a white foreground ([`BED_LUMA_MAX`]
+//!   0.150, from 0.100 — which had bound on every foreground brighter than
+//!   ≈ `#D8D8D8`). On the default theme that is one level (79 → 80); on a
+//!   white foreground it is sixteen (87 → 103). Relaxing the bar for the bed
+//!   over BLANK cells stays REJECTED (below). The number is pinned by
+//!   `the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_80_under_the_bar`,
+//!   so "dim" has a figure to move when a ruling lands.
+//! * **"There are GAPS, BLACK GAPS in the rainbow a few characters back
+//!   from the cursor"** (the owner, 2026-09-08, on Nord). Diagnosed twice
+//!   on glass — the shipped v0.76.0 and m15's main — with the same
+//!   instruments (`blackgaps/`, `blackgaps-main/`): NOT holes. Every "gap"
+//!   cell held the SAME relative luminance as the vivid cells beside it
+//!   (`Y 0.062–0.083`, ≈ 1.9 × the ground); what read as black was CHROMA.
+//!   Two stops lost it two different ways. Indigo `#4B0082` was walked
+//!   TOWARD WHITE onto the bar and arrived as `(82, 60, 136)` composited —
+//!   `S 0.61`, a grey lavender next to a blue at 210–230 — and the
+//!   green→blue crossing carried the arc's authored `S 0.53`
+//!   ([`crate::spectrum::SPECTRUM_CROSSING_ROOF`], sized for the cyan
+//!   census the owner retired on 2026-09-01) and composited as
+//!   `(45, 92, 93)`, the greyest cell on the line. The owner's standing
+//!   rulings cover the class — "bright not dim", and "the anti-cyan laws
+//!   were what greyed the arc" — so the recipe now spends CHROMA before it
+//!   spends white: [`onto_luma`] takes a dark stop up through its own hue to
+//!   full value and only then toward white (indigo on Nord: `(127, 0, 219)`,
+//!   `S 0.98`, the same `Y 0.097`, the same 5.3:1 under the text), and
+//!   [`BED_SAT_FLOOR`] gives the crossing its neighbours' chroma back at the
+//!   bed's own read (`(3, 95, 95)`). The luminance budget itself is still
+//!   the bar's alone: a floor against the GROUND was tried here and taken
+//!   out again, because wherever it exceeds the bar it lifts the bed over
+//!   the luminance the text can bear (One Dark's `#ABB2BF` over `#282C34`
+//!   went 5.29:1 → 4.69:1), and that trade is the owner's, not this
+//!   module's — `the_warm_stops_frontier_table` prints what each theme's
+//!   bed reads at over its own ground beside what a lift would cost. What
+//!   this does NOT do: brighten yellow, green or the crossing's green half.
+//!   At a fixed
+//!   `Y` the sRGB transfer caps their peak channel (yellow `(90, 90, 0)`,
+//!   green `(0, 102, 0)`, cyan `(0, 98, 97)` at Nord's `0.097`), and they
+//!   are already at full chroma — the only lever left is the bar itself,
+//!   and that is the owner's ruling, not this module's;
+//!   `the_warm_stops_frontier_table` prints what each step up would cost.
+//!   Pinned by `the_bed_s_dark_stops_arrive_at_full_chroma_not_walked_grey`,
+//!   `the_crossing_composites_no_greyer_than_its_flanks`,
+//!   `the_ground_never_lifts_the_bed_over_the_bar` and
+//!   `the_visibility_floor_costs_the_bar_nothing_on_nord`.
+//!
 //! * **"It keeps BRIGHTENING for ~660 ms after the last key"** — light with no
 //!   keystroke behind it, which is the anti-stray law's own complaint. The
 //!   cause is a body whose coverage re-read the LIVE spine every frame while
@@ -89,6 +144,34 @@
 //!   "goes out with its body" half is pinned on the swoosh by
 //!   `the_exit_swoosh_retracts_toward_the_caret_and_reaches_exactly_zero`
 //!   and on the ember by `the_hot_edge_embers_out_with_its_body_on_focus_loss`.
+//!
+//! * **"The ribbon under a line I am still typing is BROKEN INTO PIECES"**
+//!   (the owner's screenshot, 2026-09-08 — "rainbow" lit, "theme" dark,
+//!   "truly" half lit, "magical" lit, "and" dark, "specai" lit at the caret).
+//!   Traced on the shipped binary under real Claude Code and under the paint
+//!   probe's fake-claude shape (771 and 624 planned ticks): every echo was
+//!   licensed, no cell was re-laid or retired by the TUI's redraw, and the
+//!   engine's cell set was contiguous on every tick — the darkness was the
+//!   EXPIRY. A cell's life was priced once at birth from the spine
+//!   ([`Ribbon::cell_life`]: 1.70 s for the first five keys of a take,
+//!   4.55 s once the spine was hot) and ran on the cell's own clock, so the
+//!   oldest cells died under a hand that had not lifted (the take's "wha"
+//!   went dark 1.9 s into a line still being typed), and a word typed at a
+//!   dip — after a thinking pause, or slowly — was born with a SHORTER life
+//!   than the hotter word before it (`birth_disp` 0.8·peak after a 700 ms
+//!   pause: 3.1 s against 4.4 s at peak 0.75) and died first, a dark word
+//!   inside the live span. v2's law now: **cells of a cohort share the
+//!   cohort's clock** — a cell's expiry is measured from
+//!   `max(cell.born, cohort.alive_at)` ([`live_since`]), and every typing
+//!   key refreshes `alive_at` on every un-abandoned cohort, so a mark only
+//!   ages once the hand stops, and then the exit swoosh retracts it from the
+//!   tail exactly as before (off-glass [`SWOOSH_TOTAL_S`] after the last
+//!   key, idle → zero unchanged). This REVERSES the 2026-09-06 ruling that
+//!   v1's "while the rhythm lives the whole mark lives" was not a v2 gap
+//!   (`RAINBOW-KITTY-V2.md` §23's addendum). Pinned by
+//!   `a_line_still_being_typed_keeps_every_cell_from_its_first_key_to_the_caret`
+//!   here and `a_line_still_being_typed_has_no_dark_cell_inside_its_live_span`
+//!   at the seam.
 //!
 //! ## The ledger, and the one ceiling this producer applies
 //!
@@ -111,7 +194,7 @@
 //! coverage ceiling has to carry the bar in its ink. [`bed_ink`] composites
 //! yellow at the same luminance v1's table did (`Y ≈ 0.080` vs `≈ 0.086`)
 //! with more chroma — which is to say it equalizes the arc AT L3's ceiling
-//! and leaves the warm mids where v1 left them, ≈ 78 max channel composited.
+//! and leaves the warm mids where v1 left them, ≈ 80 max channel composited.
 //! v1's ink at a flat 236 would composite yellow at `(243, 243, 33)` —
 //! ≈ 1.25:1 — and a "max channel ≥ 120 at yellow" floor is arithmetically
 //! incompatible with 5.25:1 (`(120, 120, ·)` is 3.1:1). Any brighter warm
@@ -127,10 +210,15 @@
 //! the opposite of the "light on the frame the caret lands" law. The measured
 //! dim-and-muddy complaint was closed on the other axis — the cold key's
 //! share of the ceiling (`BODY_COLD_SHARE` 0.88) and the hot edge from the
-//! second key (`HOT_EDGE_DISP_MIN` 0.15), both under the same bar (§23). The
-//! max-channel pin beside
-//! `letters_stay_legible_under_the_ribbon_on_the_default_dark_theme` holds
-//! the number so a future change to the bar has something to move.
+//! second key (`HOT_EDGE_DISP_MIN` 0.15), both under the same bar (§23) —
+//! and on 2026-09-08 the bar was taken to its edge (the guard, the clamp,
+//! the solver) and everything ABOVE the text was made louder: the hot edge
+//! in the spectrum at the transient cap, the wave at twice its swing. The
+//! max-channel pin
+//! beside `letters_stay_legible_under_the_ribbon_on_the_default_dark_theme`
+//! holds the number so a future change to the bar has something to move,
+//! and `the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme`
+//! holds the other side: light left under the bar is diminished light.
 //!
 //! ## Contract notes (stage 2)
 //!
@@ -163,7 +251,7 @@ use aterm_render::{BeamVertex, GlowBlend, RibbonVertex, comet_beam, ribbon_beam}
 
 use crate::cursor_glow::InkRole;
 use crate::effect_util::lerp_rgb;
-use crate::spectrum::spectrum;
+use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
 use super::meteor::tri;
 use super::spine::{DISP_RELEASE_TAU, PHASE_RATE};
@@ -186,12 +274,48 @@ pub const RIBBON_QUAD_BUDGET: usize = 10_240;
 /// Cells the hot edge reaches back from the head (§4.1).
 pub const HOT_EDGE_CELLS: f32 = 3.0;
 
-/// Peak alpha of the hot edge at the head cell: `alpha(d) = 0.38·(1 − d/3)²`.
+/// The hot edge's falloff shape, normalised at the head cell:
+/// `alpha(d) = 0.38·(1 − d/3)²`, so the request is
+/// `HOT_EDGE_COV_MAX · (1 − d/3)²` with `d` in cells behind the head.
 pub const HOT_EDGE_ALPHA: f32 = 0.38;
 
-/// The hot edge's coverage request ceiling — inside the transient cap (§4.1),
-/// which is what keeps a third white idiom legibility-safe.
-pub const HOT_EDGE_COV_MAX: f32 = 38.0;
+/// The hot edge's coverage request ceiling — THE TRANSIENT CAP itself (§3.2,
+/// `RAINBOW_TRANSIENT_COV_CAP` 118: the meteor's shoulder, the pin's
+/// nucleus, every transient at the hand), which is what keeps a 1-px additive
+/// hairline legibility-safe: the ledger holds it to the ink lift over the
+/// row above's probed glyph cells (L2), and it never touches the row it
+/// underlines.
+///
+/// **118, from 38 (2026-09-08, the owner: "I feel like you are diminishing
+/// the specialness and emphasis of this theme? why?" — "everything above
+/// and around the text may be as loud as you like").** At 38 the white
+/// hairline over the ground composited at max 76 / spread 12 — a grey
+/// lightening no scanner could call colour (the paint scanner's rule: max
+/// ≥ 60 AND spread ≥ 40) — and over its own bed it was 1.7× (blue) to 2.3×
+/// (yellow) the bed's luminance. At the cap the lifted stop is colour on
+/// every one of the seven (over the ground: red 144 / 74, orange 144 / 106,
+/// yellow 145 / 107, green 145 / 119, blue 156 / 68, indigo 129 / 40,
+/// violet 145 / 64) and over its bed the head's request is 2.3× (blue) to
+/// 7.0× (yellow) the bed's luminance — before the hairline's 1-px
+/// anti-aliasing, which lands 30-70 % of a request on its brightest row.
+/// Measured on the default theme in
+/// `the_hot_edge_is_the_stop_under_it_lifted_hot_and_brighter_than_the_bed`.
+pub const HOT_EDGE_COV_MAX: f32 = 118.0;
+
+/// The relative luminance the hot edge's ink is LIFTED to when its stop is
+/// darker — twice [`BED_LUMA_MAX`], so the hairline's ink is at least twice
+/// as luminous as any bed it can ride, on every theme and every stop, by
+/// construction. A stop already brighter than this (orange, yellow, green)
+/// is carried pure; red, blue, indigo and violet are lifted to it
+/// ([`hot_edge_ink`] through [`onto_luma`]) — through their own hue at full
+/// value first, then toward white: the hue stays, the heat is white.
+///
+/// It is a floor on the INK, not on the composite: the hairline is additive
+/// and priced by [`HOT_EDGE_COV_MAX`], so what lands is `ink · cov / 255` on
+/// top of the bed — the blue stop's `(135, 135, 255)` at 118 puts
+/// `(62, 62, 118)` on a bed whose blue is already saturated, which is the
+/// one way a blue hairline can be brighter than a blue bed.
+pub const HOT_EDGE_LUMA_FLOOR: f32 = 2.0 * BED_LUMA_MAX;
 
 /// The spine value below which there is no hot edge at all (§4.1): it is the
 /// "still wet at the hand" mark, and a cold hand is not wet.
@@ -212,8 +336,8 @@ pub const HOT_EDGE_DISP_SPAN: f32 = 0.30;
 ///
 /// It is a CONSEQUENCE, not a knob: the hairline rides `spine − up`, which
 /// under the tall spelling is `0.10 ch` above the caret cell's top and under
-/// the underline spelling is `0.305 ch` below it. `0.55` bounds both with room
-/// for the wave, and the pin
+/// the underline spelling is `0.36 ch` below it. `0.55` bounds both with room
+/// for the wave (`0.11 ch` at full momentum), and the pin
 /// (`the_hot_edge_lives_only_at_the_head_on_a_dark_ground`) is what stops a
 /// later geometry change from quietly moving a white line onto another row.
 pub const HOT_EDGE_CARET_REACH_CH: f32 = 0.55;
@@ -267,8 +391,8 @@ pub const DN_TOP_CH: f32 = DN_FLOOR_CH + WAVE_AMP_CELLS;
 
 /// The UNDERLINE spelling's reach above the spine, in `ch`: the rest of the
 /// cell once [`DN_TOP_CH`] is spent below it, so the mark's top edge lands
-/// exactly `0.305 ch` under the cell top. An underline however the shoulder is
-/// spelled.
+/// exactly `0.36 ch` under the cell top (`0.305` until the wave doubled on
+/// 2026-09-08). An underline however the shoulder is spelled.
 pub const UNDERLINE_UP_CH: f32 = 1.0 - DN_TOP_CH;
 
 /// The leading's own half-thickness in `ch` (v1's `RAINBOW_RIBBON_LEAD`,
@@ -293,9 +417,20 @@ pub const SHOULDER_TALL: f32 = 1.0;
 /// only difference between the two spellings is [`BodyProfile`].
 pub const SHOULDER_UNDERLINE: f32 = 0.55;
 
-/// The 0.75-cycle wave's amplitude in cells, at full spine (v1's
-/// `RAINBOW_WAVE_AMP_CELLS`).
-pub const WAVE_AMP_CELLS: f32 = 0.055;
+/// The 0.75-cycle wave's amplitude in cells, at full spine.
+///
+/// **0.110, from v1's `RAINBOW_WAVE_AMP_CELLS` 0.055 (2026-09-08, the owner:
+/// "make this rainbow theme truly magical and special and dynamic and
+/// beautiful").** At 0.055 the live-momentum wave was ≤ 1 px at `ch 18` and
+/// 1.5 px at retina — a settle the eye could not read as motion. Doubled,
+/// the mark breathes ±2 px (3 px at retina) with speed, still inside the
+/// rows the body owns: the head is pinned ([`WAVE_HEAD_PIN`]), the top edge
+/// never rises above [`TALL_UP_CH`] and the bottom never falls past
+/// [`DN_TOP_CH`], which grows with this number by construction (the wedge's
+/// full travel is `0.36 ch` now, was `0.305`). Pinned by
+/// `the_wave_breathes_a_tenth_of_a_cell_at_full_momentum_inside_the_body_s_own_rows`
+/// (0.99 px at `ch 18` before, 1.98 after).
+pub const WAVE_AMP_CELLS: f32 = 0.110;
 
 /// Cycles of the wave across the WHOLE mark, whatever its length (v1's
 /// `RAINBOW_WAVE_CYCLES`): three quarters, so the mark undulates once and does
@@ -348,7 +483,7 @@ pub const UNDER_COV_CAP: f32 = 236.0;
 
 /// The coverage at which a planned boundary counts as ON THE GLASS for
 /// `trail status` ([`Ribbon::lit_segments`]): half the cap. Derivation: the
-/// bed's dimmest stop composites at a brightest channel of ≈ 78 at full
+/// bed's dimmest stop composites at a brightest channel of ≈ 80 at full
 /// coverage (the pin below), and the paint scanner's colour floor is 60 on
 /// that channel over a ground near 20 — so the dimmest stop reads as ink from
 /// about half coverage up, and a claim made under that would be a claim the
@@ -371,27 +506,92 @@ pub const BODY_FRAME_TOP: f32 = 251.0;
 pub const BODY_CONTRAST_BAR: f32 = 5.25;
 
 /// The margin under [`BODY_CONTRAST_BAR`] the emitter's own rounding may not
-/// be able to cross. Quantization, the Bayer offset and the LUT's own
-/// interpolation each cost a fraction of a level; 0.15 of a ratio point is
-/// ~4 levels of composited luma at the bar, which is more than all three can
-/// spend together.
-pub const BODY_CONTRAST_GUARD: f32 = 0.15;
+/// be able to cross — and NO MORE than that, because light left under the
+/// bar is diminished light (the owner, 2026-09-08).
+///
+/// **0.05, from 0.15.** The 0.15 was sized as "~4 levels of composited luma
+/// at the bar, more than all three [rounding costs] can spend together";
+/// measured, two of the three spend nothing: [`solve_for_luma`] answers from
+/// UNDER its target, so the ink's own byte rounding cannot cross the bar,
+/// and the LUT's lerp of two on-bar colours is under the bar (the EOTF is
+/// convex). What is left is the partial composite's one level of rounding
+/// (`premul_rgb` + `over_premul`), and one Bayer level over the ledger's
+/// frame top — worth 0.05 of a ratio point at the dimmest theme above the
+/// floor (fg `#A0A0A0`, budget 0.026: 5.2019:1 at a guard of 0), less
+/// everywhere brighter. Sized by
+/// `letters_stay_legible_under_the_ribbon_on_every_dark_theme_above_the_floor`,
+/// which is the first step of a `0 / 0.005 / 0.01 / 0.015 / 0.02 / 0.03 /
+/// 0.05` sweep that holds the bar on all 67 of its themes.
+pub const BODY_CONTRAST_GUARD: f32 = 0.05;
 
 /// Floor on the bed's composited luminance budget. A theme whose foreground is
 /// almost black would solve to a bed nobody can see; below this the ribbon
 /// stops obeying the bar and simply takes the dimmest light that still reads.
 pub const BED_LUMA_MIN: f32 = 0.020;
 
-/// …and the ceiling. L5: the caret is the brightest PERSISTENT thing on glass,
-/// and the ribbon is a persistent thing. A white-on-white theme would solve to
-/// an unbounded budget; the ribbon takes this and no more.
+/// …and the ceiling: the bar's own answer at a WHITE foreground
+/// (`(1.0 + 0.05) / 5.25 − 0.05`), which no foreground can exceed — so under
+/// the bar this clamp binds nowhere, and the bed on every theme is exactly
+/// as bright as its text allows.
 ///
-/// L3's "field luminance ceiling 72" is this budget read in v1's unit: on the
-/// default theme [`bed_luma_budget`] solves to `Y ≈ 0.080`, and a warm stop
-/// composited at full coverage on that budget carries a Rec.709 gamma-luma of
-/// ≈ 72/255 (`(78, 78, 2)` at yellow). The two numbers are one ceiling in two
-/// coordinates; this module states it in the one the 5.25:1 bar is written in.
-pub const BED_LUMA_MAX: f32 = 0.100;
+/// **0.150, from 0.100 (2026-09-08).** The 0.100 was written against L5
+/// (the caret is the brightest PERSISTENT thing on glass), but it bound on
+/// every foreground brighter than ≈ `#D8D8D8` — the offline renderer's
+/// `#E8E8F0` solved to 0.114 and took 0.100, a white foreground to 0.150 and
+/// took 0.100: a third of the bar's light, withheld on the brightest themes
+/// for no law the text could name. The owner's ruling is that the bar is the
+/// one restraint ("text under the bed stays legible") and the bed is not to
+/// sit under it. L5 is untouched: the caret block is an opaque authored stop
+/// and out-shines a bed at `Y 0.15` on every stop of the arc.
+///
+/// L3's "field luminance ceiling 72" is this budget read in v1's unit on the
+/// default theme, where [`bed_luma_budget`] solves to `Y ≈ 0.083` (the bar
+/// solves it, not this clamp) and a warm stop composited at full coverage
+/// carries a Rec.709 gamma-luma of ≈ 74/255 (`(80, 80, 3)` at yellow). The
+/// two numbers are one ceiling in two coordinates; this module states it in
+/// the one the 5.25:1 bar is written in. Pinned by
+/// `a_bright_foreground_s_bed_takes_the_bar_s_whole_budget_not_a_tenth`.
+pub const BED_LUMA_MAX: f32 = 0.150;
+
+/// **THE BED'S CHROMA FLOOR** — the least HSV saturation a stop of the arc
+/// may carry into [`bed_ink`] and [`hot_edge_ink`], applied before the
+/// luminance solve ([`crate::spectrum::spectrum_with_min_saturation`]).
+///
+/// THE OWNER, 2026-09-08: *"there are gaps black gaps in the rainbow a few
+/// characters back from the cursor."* Diagnosed twice on glass (v0.76.0 and
+/// m15's main): not holes — every "gap" cell held the SAME relative
+/// luminance as the vivid cells beside it; what read as black was chroma.
+/// This floor is the crossing's half of that. The green→blue crossing is
+/// authored at `S 0.53` ([`crate::spectrum::SPECTRUM_CROSSING_ROOF`],
+/// tapering in from `0.65` / `0.72` knots) for the cyan true-peak bound of
+/// the census the owner retired on 2026-09-01, and once the bed scales it
+/// onto the bar it composites as `(45, 92, 93)` — `S 0.52`, the greyest cell
+/// on the line, a teal-grey notch between an `S 0.97` green and an `S 0.81`
+/// blue. **`1.0`**: the seven anchors all carry `S 1.0` (each has a zero
+/// channel) and every table entry outside the crossing's flanks sits at
+/// `S ≥ 0.98`, so the floor asks nothing of any stop but the crossing, and
+/// there it asks for exactly what its neighbours have. Hue and value are
+/// untouched, so the crossing's hue PACING — the thing the roof still owns
+/// — is exactly as authored. Measured: the crossing composites `(3, 95, 95)`
+/// at the same `Y`. Pinned by
+/// `the_crossing_composites_no_greyer_than_its_flanks`.
+pub const BED_SAT_FLOOR: f32 = 1.0;
+
+// There is deliberately NO floor for the bed against the GROUND. One was
+// tried (2026-09-09, `BED_GROUND_CONTRAST_MIN` 1.4:1, `bar.max(ground)`): it
+// reads as harmless on the shipped defaults, whose bars answer far above it
+// (Nord `0.097` against `0.068`), but on any theme whose foreground solves
+// the bar under `1.4 ×` its ground it OVERRIDES the bar — One Dark's
+// `#ABB2BF` over `#282C34` went from 5.29:1 to 4.69:1 under the text, and 54
+// (fg, ground) pairs of the 67-theme sweep were bar-violating by
+// construction. A floor that must never exceed the bar collapses to the bar,
+// so it cannot exist as a law beside it; how dark a bed a dark-foreground
+// theme is handed is a ruling for the owner, and
+// `the_warm_stops_frontier_table` prints it (Solarized Dark's bed sits 1.00:1
+// over its page at the `BED_LUMA_MIN` clamp, its text at 4.70:1 — the
+// documented exception; lifting it to 1.4:1 would cost that text 3.39:1, and
+// One Dark's 5.29:1 → 4.69:1). Pinned by
+// `the_ground_never_lifts_the_bed_over_the_bar`.
 
 /// Entries in the bed-ink lookup table. The recipe below is a bisection over
 /// the sRGB EOTF — far too expensive per slab — but it is a pure function of
@@ -456,6 +656,64 @@ pub const CHAIN_MARGIN: f32 = 0.10;
 /// …capped just above `CHAIN_KEYS × CHAIN_GAP_MAX` so the slowest chained
 /// rhythm still earns its full four-letter span.
 pub const CHAIN_LIFE_MAX: f32 = 23.0;
+
+// ===========================================================================
+// The wake — what a jump leaves behind (R5, 2026-09-08)
+// ===========================================================================
+
+/// **A JUMP LAYS ITS CORRIDOR** (the owner, 2026-09-08: "I want more of a
+/// trailing cursor rainbow effect", "I like the streak effect, but leave more
+/// a rainbow after effect"). Measured on 379ab6159, before this law, on
+/// glass against a trail-OFF control: behind a Ctrl-E into unlit ground the
+/// corridor held colour for under 100 ms — the train crosses 25 cells in
+/// ~60 ms and its root then sucks INTO the landing (T5), so nothing of it
+/// lingers where it flew — and a band live under the hand was gone 707 ms
+/// after a Ctrl-A (the abandon's 0.40 + 0.24 s retract, sliding toward the
+/// new caret). Nothing trailed. The wake is the ribbon the jump itself lays
+/// behind the caret, newest at the landing, on the walk the band already
+/// had (C2: `t` is a function of position, so the corridor continues the
+/// live cohort's spectrum instead of re-anchoring at red).
+///
+/// A phrase, not a line: a Ctrl-A across 200 columns must not paint the
+/// whole row. Counted back from the LANDING, so the rainbow lies beside the
+/// caret, where the eye is. Cells beyond the cap that the live band already
+/// lights are TAKEN OVER, never cut — light that was on the glass stays on
+/// it and goes out on the wake's clock. A band ALREADY LEAVING (its cohort
+/// retracting, or abandoned by an earlier jump) is not taken over and has
+/// nothing laid under it while it is lit: it finishes on its own clock, and
+/// the wake lights only the cells its drain has already emptied — a half-
+/// drained cell handed to a fresh cohort would freeze at the level it had,
+/// and that frozen ramp between two bright runs is the owner's "black gaps a
+/// few characters back from the cursor" (R6), reproduced on a Ctrl-A at
+/// 1.0–1.4 s idle before this clause.
+pub const WAKE_MAX_CELLS: u16 = 32;
+
+/// Long enough to read as an after-effect and short enough that a Ctrl-A /
+/// Ctrl-E ping-pong cannot accumulate. FIXED, not [`Ribbon::cell_life`] — a
+/// jump must not inherit the four-letter chain law, nor its 1.70 s swoosh
+/// floor ([`SWOOSH_LIFE_S`]). The wake's cohort is never held by a later
+/// jump (each jump abandons what came before it), so the pool holds at most
+/// `WAKE_LIFE_S / jump period` wakes, and the pinned ping-pong empties
+/// within one wake life of its last key.
+pub const WAKE_LIFE_S: f32 = 1.10;
+
+/// A NEW wake cell is born this far past the landing, so it fades up UNDER a
+/// train that is still bright: the eye sees ONE gesture leaving light
+/// behind, not two marks racing. Until it is born the cell is DARK
+/// ([`Ribbon::env_of`]'s first line) — the attack starts at `born`, never
+/// before it. A cell taken over from the live band keeps its own birth: a
+/// hand-off has no attack, and no dip.
+pub const WAKE_BORN_LAG_S: f32 = 0.10;
+
+/// A same-row hop under [`JUMP_MIN_CELLS`] — an arrow key — lays its wake at
+/// this share of [`WAKE_LIFE_S`]: holding an arrow paints rainbow behind the
+/// caret, a single tap leaves a short one, and a cell a live cell already
+/// owns is left exactly as it is (the hop does not abandon). The hop's new
+/// cells go into a cohort of their own ([`Cohort::wake`]) on the row's own
+/// walk, never into a typed word's: an arrow beside the word you just typed
+/// does not restart the word's grace, move its bounds, or change when it
+/// swooshes — a hop lifts no other mark's finger.
+pub const WAKE_HOP_LIFE_SHARE: f32 = 0.5;
 
 /// Cells the four-letter guarantee reaches for.
 pub const FOUR_LETTER_CELLS: u16 = 4;
@@ -529,6 +787,24 @@ pub const RUN_TAIL_EASE: f32 = 0.10;
 // The atoms
 // ===========================================================================
 
+/// **THE COHORT'S CLOCK** (2026-09-08): the instant a cell's expiry is
+/// measured from — its own birth or its cohort's last live typing key,
+/// whichever is later. Every key in a live run refreshes the whole run, so a
+/// cell born with 1.70 s of life keeps 1.70 s of life AFTER THE LAST KEY of
+/// its run rather than after its own; a mark only ages once the hand stops.
+/// A cell whose cohort is gone (never on the frame path — `retire` drops the
+/// cells with the cohort) falls back to its birth.
+///
+/// Zero-alloc and O(cohorts) per call; a row has one cohort per typing burst,
+/// so this is a handful of compares.
+#[must_use]
+pub fn live_since(cohorts: &[Cohort], cell: &Cell) -> Instant {
+    cohorts
+        .iter()
+        .find(|c| c.id == cell.cohort)
+        .map_or(cell.born, |c| cell.born.max(c.alive_at))
+}
+
 /// One LAID RIBBON CELL — the atom of the field (v1's `spark`, ported).
 ///
 /// `Copy` and flat: the cell pool is a resident `Vec` reused every frame
@@ -546,10 +822,14 @@ pub struct Cell {
     /// C2 — the caret, the ribbon head and a star's halo on this cell are the
     /// same colour on the same frame because they all read THIS number.
     pub t: f32,
-    /// When the cell was laid (the echo frame). Drives the 18 ms `edge-in` and
-    /// the expiry melt.
+    /// When the cell was laid (the echo frame). Drives the 18 ms `edge-in`;
+    /// the expiry melt runs from [`live_since`] — this, or the cohort's last
+    /// live key, whichever is later.
     pub born: Instant,
-    /// Total life in seconds, priced at birth from `Spine::birth_disp`.
+    /// Total life in seconds, priced at birth from `Spine::birth_disp` — and
+    /// measured from the COHORT'S clock, not this cell's (2026-09-08): the
+    /// life a cell was born with is the life it has left after the LAST key
+    /// of its run, so no cell can run out under a hand that is still typing.
     pub life_s: f32,
     /// **THE CELL'S LIGHT, PRICED ONCE.** The share of [`UNDER_COV_CAP`] this
     /// cell's body may take at its peak, `0..1`, resolved at BIRTH from
@@ -614,12 +894,31 @@ pub struct Cohort {
     /// mark: its earlier rows stay lit while the hand is still on the last
     /// one and slurp back into the caret together when it lifts. Only an
     /// [`Cohort::abandoned`] cohort keeps a clock of its own.
+    ///
+    /// It is also the clock every cell's EXPIRY runs from ([`live_since`],
+    /// 2026-09-08): a key refreshes the whole run's life, not only the cell
+    /// it lays. Monotone — a sweep laid at an older key's stamp never
+    /// rewinds it.
     pub alive_at: Instant,
     /// Set by a real jump ([`Ribbon::abandon`]): this cohort is leaving on its
     /// own rewound clock, and a typing key elsewhere no longer refreshes it —
     /// the band under the hand's OLD position must go out while the new one
     /// is being laid, not wait for the next finger-lift.
     pub abandoned: bool,
+    /// Minted by a wake ([`Ribbon::wake`]) and never typed into. A HOP's
+    /// new cells join only such a cohort, or mint one — so an arrow beside a
+    /// live word touches neither the word's clock nor its bounds (its cells
+    /// it leaves exactly as they are) — and a typed key laid into a wake
+    /// cohort clears the flag: the hand is on it now.
+    pub wake: bool,
+    /// The caret column the retract pulls this cohort toward, captured the
+    /// frame it entered its retract ([`Ribbon::advance_swoosh`]) and held
+    /// until a key brings the cohort back to laying. T5 says a leaving mark
+    /// moves TOWARD THE CARET, and it does — toward the hand that let go of
+    /// it: a mark read against the LIVE caret lurched across the row the
+    /// frame a Ctrl-A landed while it was half-way into its old spot (13
+    /// cells at 1.25 s idle), which is the step "smooth transitions" forbids.
+    pub retract_col: Option<u16>,
     /// Where the cohort is in the exit choreography.
     pub phase: Phase,
 }
@@ -888,6 +1187,27 @@ impl FieldIndex {
         self.spare.clear();
     }
 
+    /// Move every lane with a scroll of `rows` (seam point 12): a lane whose
+    /// row leaves the grid retires into the spare pool, cleared over its own
+    /// `touched` list — the O(marks) reset, and no lane is minted again on
+    /// the next plan; the rest keep their columns and take the new row, so
+    /// [`FieldIndex::at`] answers for the MOVED cell between the scroll and
+    /// the next plan, exactly as a newest-first scan of the translated pool
+    /// would.
+    fn translate(&mut self, rows: u16) {
+        let mut i = 0;
+        while i < self.lanes.len() {
+            if let Some(row) = self.lanes[i].row.checked_sub(rows) {
+                self.lanes[i].row = row;
+                i += 1;
+            } else {
+                let mut dark = self.lanes.swap_remove(i);
+                dark.clear();
+                self.spare.push(dark);
+            }
+        }
+    }
+
     /// Write one cell's field. **FIRST WRITER WINS**, and the plan feeds this
     /// NEWEST-FIRST — which is the index's whole contract, stated in exactly
     /// the terms v1's reverse scan of `sparks` answered it in: the newest cell
@@ -937,11 +1257,22 @@ pub fn relative_luminance(rgb: u32) -> f32 {
 /// one bed, solved by two different emitters, and they disagreed. There is one
 /// bar here, it is stated in the coordinate the bar is actually written in,
 /// and [`bed_ink`] is what spends it.
+///
+/// **A FUNCTION OF THE FOREGROUND ALONE.** [`BED_LUMA_MIN`] is the one
+/// documented exception under it ("below this the ribbon stops obeying the
+/// bar and simply takes the dimmest light that still reads") and
+/// [`BED_LUMA_MAX`] the bar's own answer at a white foreground. The theme's
+/// GROUND is not an input: a floor against it was tried and removed (see the
+/// note above `BED_LUMA_MIN`'s neighbours) because wherever it exceeded the
+/// bar it put the bed over the luminance the text can bear.
 #[must_use]
 pub fn bed_luma_budget(theme_fg: u32) -> f32 {
-    let y = relative_luminance(theme_fg);
-    ((y + 0.05) / (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) - 0.05)
-        .clamp(BED_LUMA_MIN, BED_LUMA_MAX)
+    let bar =
+        (relative_luminance(theme_fg) + 0.05) / (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) - 0.05;
+    // `clamp` is total here: both bounds are finite constants with
+    // `BED_LUMA_MIN < BED_LUMA_MAX`, and `relative_luminance` of a byte
+    // triple is finite.
+    bar.clamp(BED_LUMA_MIN, BED_LUMA_MAX)
 }
 
 /// Every channel scaled by `k` — a uniform gamma-space scale, which is the one
@@ -956,6 +1287,10 @@ fn scale_rgb(rgb: u32, k: f32) -> u32 {
 /// survives unscaled, so the hue direction is untouched and only the
 /// saturation falls — the same move v1's bed glass floor made, for the same
 /// reason: a dark arc colour over a dark ground is a navy smudge, not a stop.
+/// Since 2026-09-09 it is the LAST resort of [`onto_luma`], taken only from a
+/// stop already at full value: white is the one currency that buys light at
+/// the price of chroma, and the owner's "black gaps" were that price paid
+/// where it did not have to be.
 fn toward_white(rgb: u32, w: f32) -> u32 {
     let ch = |sh: u32| {
         let c = ((rgb >> sh) & 0xff) as f32;
@@ -964,9 +1299,16 @@ fn toward_white(rgb: u32, w: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
-/// Bisect a monotone one-parameter colour family for the parameter whose
-/// relative luminance is `target`. 24 halvings resolve the parameter to under
-/// 1e-7, which is finer than the byte quantization it feeds.
+/// Bisect a monotone one-parameter colour family for the brightest member
+/// UNDER `target` relative luminance. 24 halvings resolve the parameter to
+/// under 1e-7, which is finer than the byte quantization it feeds — and the
+/// answer is `family(lo)`, the last parameter whose bytes measured under the
+/// target, never the midpoint: the family is a step function of bytes, so
+/// the midpoint's bytes can land a level OVER the target, which is exactly
+/// the rounding the old 0.15 [`BODY_CONTRAST_GUARD`] was paying for. The
+/// invariant `Y(family(lo)) < target` holds from `lo = 0` (black for a scale,
+/// the colour itself for a walk toward white from under the target) and is
+/// kept by every halving.
 fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..24 {
@@ -977,39 +1319,102 @@ fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
             hi = mid;
         }
     }
-    family(0.5 * (lo + hi))
+    family(lo)
+}
+
+/// **A STOP PUT ON ONE RELATIVE LUMINANCE AT THE MOST CHROMA THAT LUMINANCE
+/// ALLOWS** — the one family the bed and the hot edge both solve over.
+///
+/// One monotone family, bisected by [`solve_for_luma`]: from black, the stop
+/// scaled UP through itself to its own hue at FULL VALUE (`k = 255 / max`,
+/// the brightest colour with exactly this hue and this saturation), and only
+/// past that point — only for a target the hue cannot reach at full value —
+/// a walk toward white. The recipe this replaces (2026-09-09) walked toward
+/// white from the stop ITSELF, so a dark stop paid in chroma for light it
+/// could have had in value: indigo `#4B0082` at the bar's `Y 0.097` came out
+/// `(118, 60, 160)`, `S 0.61`, a grey lavender — the owner's "black gap".
+/// Through this family it is `(127, 0, 219)`, `S 0.98`: the same hue, the
+/// same luminance, the same contrast under any text, and every bit of the
+/// chroma the hue owns. The fg-over-ribbon bar is a function of `Y` alone,
+/// so this costs it nothing, on any theme.
+///
+/// Blue `#0000FF` is the one anchor whose full value is still under the bar
+/// (`Y 0.072`), so it alone still takes some white — `(45, 45, 255)`,
+/// `S 0.82`, exactly what it took before, because it was already at full
+/// value. A stop BRIGHTER than the target scales DOWN, byte for byte as
+/// before (its `k` lands under `1`): red, orange, yellow, green and every
+/// warm mid are untouched by this change, and the bar-side pins beside them
+/// (`the_dimmest_stop_…`, `a_bright_foreground_s_bed_…`) read the same
+/// numbers. A black (no hue to spend) walks toward white as it always did;
+/// the arc has none.
+fn onto_luma(rgb: u32, target: f32) -> u32 {
+    let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
+    if mx == 0 {
+        return solve_for_luma(|w| toward_white(rgb, w), target);
+    }
+    let k_full = 255.0 / mx as f32;
+    let full = scale_rgb(rgb, k_full);
+    if relative_luminance(full) >= target {
+        solve_for_luma(|k| scale_rgb(rgb, k * k_full), target)
+    } else {
+        solve_for_luma(|w| toward_white(full, w), target)
+    }
 }
 
 /// **THE BED'S ON-GLASS INK** — an arc colour put on ONE composited luminance,
-/// `budget` (see [`bed_luma_budget`]).
+/// `budget` (see [`bed_luma_budget`]), at the most chroma that luminance
+/// allows.
 ///
-/// Two arms, one bar:
+/// Two moves, one bar:
 ///
-/// * A colour BRIGHTER than the budget (red, yellow, green) is scaled down
-///   uniformly, so its hue is bit-exact and only its value moves.
-/// * A colour DARKER than it (blue, indigo, violet) is walked toward white
-///   until it reaches the budget, so it arrives as a vivid stop instead of the
-///   navy smudge the measured defect reports.
+/// * [`BED_SAT_FLOOR`] first — the crossing's authored chroma dip is given
+///   back at the bed's own read, hue and value untouched;
+/// * then [`onto_luma`] — a colour BRIGHTER than the budget (red, yellow,
+///   green) is scaled down uniformly, so its hue is bit-exact and only its
+///   value moves; a colour DARKER than it (blue, indigo, violet) is lifted
+///   through its own hue to full value and only then toward white, so it
+///   arrives as a vivid stop instead of the navy smudge (v1) or the grey
+///   lavender (v2 before 2026-09-09) the two measured defects report.
 ///
 /// The consequence is that **every stop of the arc composites at the same
 /// weight**, and one coverage ceiling is legal for the whole arc — which is
 /// why the 33-entry table §19.1 deletes is not needed and is not carried. That
 /// is the NAVY half of the measured "dim and muddy" defect (a dark stop as a
 /// smudge) and not the OLIVE half: the weight is the bar's own, and on the
-/// default theme a warm stop at that weight is `(78, 78, 2)` composited — the
+/// default theme a warm stop at that weight is `(80, 80, 3)` composited — the
 /// luminance v1's table produced, with more chroma. A brighter warm mid is a
-/// ruling on the bar (module doc; OPEN on the §22 sheet), not on this recipe.
+/// ruling on the bar (module doc: the bar STANDS, and the bed sits AT it
+/// since 2026-09-08), not on this recipe.
 ///
 /// It also makes the per-hue "equal-ledge" core law v1 needed unnecessary: the
 /// per-row melt step is proportional to the position's peak premultiplied
 /// level, and after this recipe every position has the same one.
 #[must_use]
 pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
-    let y = relative_luminance(rgb);
-    if y > budget {
-        solve_for_luma(|k| scale_rgb(rgb, k), budget)
+    onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
+}
+
+/// **THE HOT EDGE'S INK** — the stop, lifted until it is at least
+/// [`HOT_EDGE_LUMA_FLOOR`] luminous ([`onto_luma`]: through its own hue at
+/// full value, then toward white); a stop already brighter is carried pure.
+/// The bed's recipe equalizes the arc DOWN onto one legibility budget; this
+/// one equalizes it UP onto one heat, and for the same reason in the other
+/// direction — a blue hairline at blue's own `Y 0.072` over a blue bed whose
+/// blue channel is already saturated adds nothing the eye can see, and
+/// "brighter than the bed" has to be true of every stop or the edge reads as
+/// speed only on the warm half of the arc. It takes [`BED_SAT_FLOOR`] too, so
+/// the hairline over the seam is a teal line over a teal bed, not a grey one.
+///
+/// Additive light, so it is not under the bed's bar: the hairline is 1 px on
+/// the ribbon's top edge, priced by [`HOT_EDGE_COV_MAX`] inside the
+/// transient cap, and ledger-held over the row above's descenders (§4.1).
+#[must_use]
+pub fn hot_edge_ink(rgb: u32) -> u32 {
+    let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
+    if relative_luminance(rgb) >= HOT_EDGE_LUMA_FLOOR {
+        rgb
     } else {
-        solve_for_luma(|w| toward_white(rgb, w), budget)
+        onto_luma(rgb, HOT_EDGE_LUMA_FLOOR)
     }
 }
 
@@ -1044,6 +1449,9 @@ pub struct BedInkLut {
     key: Option<(u32, u32, bool, bool)>,
     /// [`BED_INK_LUT_LEN`] entries over the folded arc `[0, 1]`.
     lut: Vec<u32>,
+    /// The hot edge's twin table ([`hot_edge_ink`]), same positions — solved
+    /// beside the bed's so the hairline costs one lerp per vertex too.
+    hot: Vec<u32>,
 }
 
 impl BedInkLut {
@@ -1057,6 +1465,8 @@ impl BedInkLut {
         let role = light_role(cfg);
         self.lut.clear();
         self.lut.reserve(BED_INK_LUT_LEN);
+        self.hot.clear();
+        self.hot.reserve(BED_INK_LUT_LEN);
         for i in 0..BED_INK_LUT_LEN {
             let x = i as f32 / (BED_INK_LUT_LEN - 1) as f32;
             let arc = spectrum(x);
@@ -1065,6 +1475,7 @@ impl BedInkLut {
             } else {
                 role.ink(arc)
             });
+            self.hot.push(hot_edge_ink(arc));
         }
         self.key = Some(key);
     }
@@ -1075,13 +1486,26 @@ impl BedInkLut {
     /// by construction rather than by coincidence.
     #[must_use]
     pub fn at(&self, t: f32) -> u32 {
-        if self.lut.is_empty() {
+        Self::sample(&self.lut, t)
+    }
+
+    /// The hot edge's ink at walk position `t` — the same fold, the hot
+    /// table ([`hot_edge_ink`]).
+    #[must_use]
+    pub fn hot_at(&self, t: f32) -> u32 {
+        Self::sample(&self.hot, t)
+    }
+
+    /// One lerp on `table` at the folded position of `t`; `0` on an unsynced
+    /// table.
+    fn sample(table: &[u32], t: f32) -> u32 {
+        if table.is_empty() {
             return 0;
         }
         let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
         let i = (x as usize).min(BED_INK_LUT_LEN - 1);
         let j = (i + 1).min(BED_INK_LUT_LEN - 1);
-        lerp_rgb(self.lut[i], self.lut[j], x - i as f32)
+        lerp_rgb(table[i], table[j], x - i as f32)
     }
 }
 
@@ -1281,6 +1705,12 @@ impl Ribbon {
         &self.cohorts
     }
 
+    /// The instant `cell`'s expiry is measured from — see [`live_since`].
+    #[must_use]
+    pub fn live_since(&self, cell: &Cell) -> Instant {
+        live_since(&self.cohorts, cell)
+    }
+
     /// This frame's planned boundary samples, valid after [`Ribbon::plan`].
     /// Read-only.
     #[must_use]
@@ -1344,12 +1774,19 @@ impl Ribbon {
     /// Line scope is the synth's, §8.2 — the drain is one law);
     /// [`Event::Move`] moves [`Ribbon::caret`] and, on a REAL jump under a
     /// non-typed licence (a row change, or [`JUMP_MIN_CELLS`] or more on the
-    /// row), ABANDONS the live band straight into its retract (see
-    /// [`RETRACT_START_S`]) — a one-cell arrow or a click inside the word is an
-    /// edit, and the swoosh's own grace handles it; [`Event::Focus`] takes the
-    /// 300 ms ember and, on regain inside it, the `edge-in` rearm;
-    /// [`Event::ReducedMotion`] and [`Event::Return`] lay nothing — a jump lays
-    /// nothing, which is T1.
+    /// row), lays the WAKE of a same-row navigation or synthetic jump
+    /// ([`Ribbon::wake`], R5 — the corridor it crossed, newest at the
+    /// landing, taking over what the live band already lit) and then
+    /// ABANDONS every other cohort straight into its retract (see
+    /// [`RETRACT_START_S`]); a same-row hop under the jump floor with a
+    /// navigation witness (an arrow) lays a shorter wake in a cohort of its
+    /// own and abandons nothing — a click inside the word is an edit, and
+    /// the swoosh's own grace handles it; a band already leaving is left on
+    /// its own clock by either arm; a PTY-driven or return-licensed jump still only abandons
+    /// (no credit, no wake); [`Event::Focus`] takes the 300 ms ember and, on
+    /// regain inside it, the `edge-in` rearm; [`Event::ReducedMotion`] and
+    /// [`Event::Return`] lay nothing. T1 holds: the wake is born only on an
+    /// observed, licensed move whose witness was a key.
     ///
     /// Every event is applied against `ctx.caret`, the caret as the host
     /// observed it for THIS tick; a host that buffers two typed echoes into
@@ -1367,9 +1804,38 @@ impl Ribbon {
                 from, to, licence, ..
             } => {
                 self.caret = Some(to);
-                let jump = to.0 != from.0 || to.1.abs_diff(from.1) >= JUMP_MIN_CELLS;
-                if licence != Licence::Typed && jump {
-                    self.abandon(at);
+                // A typed echo's own motion is inert here: the key laid its
+                // cell, and the caret mirror is all that moves.
+                if licence != Licence::Typed {
+                    let same_row = to.0 == from.0;
+                    let jump = !same_row || to.1.abs_diff(from.1) >= JUMP_MIN_CELLS;
+                    if jump {
+                        // THE WAKE, then the abandon that spares it. A row
+                        // change has no corridor on one row (an Up-arrow
+                        // recall must not paint the line it lands on), and a
+                        // PTY cascade or a Return earns no credit — they keep
+                        // the old law: abandon, lay nothing.
+                        let wakes =
+                            same_row && matches!(licence, Licence::Nav | Licence::Synthetic);
+                        let keep = if wakes {
+                            self.wake(to.0, from.1, to.1, at, ctx, WAKE_LIFE_S, true)
+                        } else {
+                            None
+                        };
+                        self.abandon(at, keep);
+                    } else if same_row && licence == Licence::Nav && from.1 != to.1 {
+                        // AN ARROW'S HOP: a short wake behind the caret, no
+                        // abandon — the band under the hand keeps its light.
+                        self.wake(
+                            to.0,
+                            from.1,
+                            to.1,
+                            at,
+                            ctx,
+                            WAKE_LIFE_S * WAKE_HOP_LIFE_SHARE,
+                            false,
+                        );
+                    }
                 }
             }
             Event::Focus(on) => {
@@ -1406,7 +1872,10 @@ impl Ribbon {
                 c.row == row
                     && c.col == col
                     && c.retract_at.is_none()
-                    && at.saturating_duration_since(c.born).as_secs_f32() < c.life_s
+                    && at
+                        .saturating_duration_since(live_since(&self.cohorts, c))
+                        .as_secs_f32()
+                        < c.life_s
             });
             if !owned {
                 self.lay_cell(row, col, at, ctx, true);
@@ -1469,11 +1938,31 @@ impl Ribbon {
         }
     }
 
-    /// The life one cell earns, priced at BIRTH (§4's chain law, verbatim).
+    /// **THE SPINE A BIRTH IS PRICED AT** on this tick: [`Ctx::birth_disp`]
+    /// (the resume-floored spine), floored again by a live mend
+    /// ([`Ctx::mend`] — §23's addendum "The mend", 2026-09-08). A typed key
+    /// that fixes a typo within a breath is born at `max(birth_disp,
+    /// mend.disp)`, the momentum its Backspace interrupted, so the fixed
+    /// cell's `cov0`, life and hot-edge price match the run it re-joins and
+    /// the bed shows no dip where the fix went in. A v2-local birth price,
+    /// like `METRIC_GAIN`: the spine's metric and follower are untouched, and
+    /// every live-spine consumer (the wave, the wedge, the caret, the stars'
+    /// envelope) keeps reading the honest [`Ctx::disp`].
+    #[inline]
+    fn birth_price(ctx: &Ctx<'_>) -> f32 {
+        clamp01(
+            ctx.mend
+                .map_or(ctx.birth_disp, |m| ctx.birth_disp.max(m.disp)),
+        )
+    }
+
+    /// The life one cell earns, priced at BIRTH (§4's chain law, verbatim)
+    /// — and spent from the cohort's clock ([`live_since`]): it is how long
+    /// the cell outlives the LAST key of its run.
     fn cell_life(&self, at: Instant, ctx: &Ctx<'_>) -> f32 {
         let full = ctx.cfg.duration.as_secs_f32().max(0.001);
         let base = (full * LIFE_DURATION_GAIN).clamp(LIFE_BASE_MIN, LIFE_BASE_MAX);
-        let d = clamp01(ctx.birth_disp);
+        let d = Self::birth_price(ctx);
         let life = base * (1.0 + LIFE_SPINE_LINEAR * d + LIFE_SPINE_SQUARE * d * d);
         // THE FOUR-LETTER GUARANTEE. The observed inter-key gap is the newest
         // cohort's own idle time; the FIRST key of a burst has no gap and so
@@ -1496,7 +1985,7 @@ impl Ribbon {
     /// Lay ONE cell, joining or minting its cohort.
     fn lay_cell(&mut self, row: u16, col: u16, at: Instant, ctx: &Ctx<'_>, typing: bool) {
         let life_s = self.cell_life(at, ctx);
-        let birth_disp = clamp01(ctx.birth_disp);
+        let birth_disp = Self::birth_price(ctx);
         let cov0 = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let idx = self.join_cohort(row, col, at);
         let cohort = self.cohorts[idx];
@@ -1517,13 +2006,21 @@ impl Ribbon {
             retract_at: None,
             birth_disp,
         };
+        self.place(idx, cell, at);
+    }
+
+    /// Put ONE built cell into the pool under the cohort at `idx`, laid at
+    /// `at`: one owner per `(row, col, cohort)`, the cohort's bounds grown
+    /// over it, and the cohort clocks that the lay refreshes.
+    fn place(&mut self, idx: usize, cell: Cell, at: Instant) {
+        let (row, col, typing) = (cell.row, cell.col, cell.typing);
         // ONE OWNER PER CELL. A retype replaces the light on that cell rather
         // than stacking a second body under it — the shadowed cell could never
         // be seen, and leaving it in the pool is how v1's field scan grew.
         if let Some(slot) = self
             .cells
             .iter()
-            .position(|c| c.row == row && c.col == col && c.cohort == cohort.id)
+            .position(|c| c.row == row && c.col == col && c.cohort == cell.cohort)
         {
             self.cells.remove(slot);
         }
@@ -1532,17 +2029,251 @@ impl Ribbon {
         coh.col0 = coh.col0.min(col);
         coh.col1 = coh.col1.max(col + 1);
         if typing {
+            // The hand is on this cohort now, whatever minted it.
+            coh.wake = false;
             // ONE FINGER: a live key holds EVERY cohort that has not been
             // abandoned in its laying phase, so the mark's earlier rows do
             // not start their exit swoosh while the hand is still typing on
             // the current one (see `Cohort::alive_at`).
             for held in &mut self.cohorts {
                 if !held.abandoned {
-                    held.alive_at = at;
+                    held.alive_at = held.alive_at.max(at);
                     held.phase = Phase::Laying;
+                    held.retract_col = None;
                 }
             }
+        } else {
+            // A WAKE CELL holds only its OWN cohort — and that is always a
+            // wake cohort ([`Cohort::wake`]: a jump mints one, a hop joins
+            // or mints one, never a typed word's): an arrow held down keeps
+            // the wake it is laying out of the swoosh until the arrow stops,
+            // and nothing else — a jump builds no momentum and lifts no other
+            // mark's finger (`typing` is what the one-finger law reads).
+            coh.alive_at = coh.alive_at.max(at);
+            coh.phase = Phase::Laying;
+            coh.retract_col = None;
         }
+    }
+
+    /// **THE WAKE** (R5) — lay the corridor a same-row move just crossed on
+    /// `row`, from column `from` to the landing `to`, newest at the landing.
+    /// The landing cell is included, so the caret block's fill, the train's
+    /// phase-lock (`field_at(landing)`, §6.4) and the bed under the caret read
+    /// ONE walk; the origin cell is the far end. New cells are born
+    /// [`WAKE_BORN_LAG_S`] past the move and live `life_s`; at most
+    /// [`WAKE_MAX_CELLS`] of them, counted back from the landing.
+    ///
+    /// The wake's cohort takes THE BAND'S OWN WALK ORIGIN
+    /// ([`Ribbon::wake_origin`]: the row's freshest cohort's `anchor_col`
+    /// and `t0`, not its `t` read at the landing) — `walk_t` is `d/16` for
+    /// sixteen cells and `1/36` a cell after, so only a cohort anchored where
+    /// the band is anchored gives `t_at(col)` the band's number at EVERY
+    /// column (C2); a wake anchored at the landing agreed with the band on a
+    /// Ctrl-A to its origin and repainted stops past the kink on a Ctrl-E
+    /// across it.
+    ///
+    /// `takeover` is the JUMP's arm: the corridor is minted as a cohort of
+    /// its own and every cell the live band already lights is HANDED OVER,
+    /// not re-lit: same stop, the old cell's own birth (no second attack),
+    /// priced at exactly the light it has now, and the old cell leaves the
+    /// pool. The abandon that follows then finds nothing under the corridor
+    /// to retract, and the eye sees no step — the band simply outlives the
+    /// jump on the wake's clock. Lit cells beyond the cap are taken over too:
+    /// the cap bounds NEW light, never light already on the glass.
+    ///
+    /// A band ALREADY LEAVING is not an owner to take over: a cell whose
+    /// cohort is retracting or abandoned stays on that clock, and while it is
+    /// still lit nothing is laid under it — the wake lights only the cells
+    /// the drain has emptied (and, past the drain's end, all of them). Taking
+    /// a half-drained cell over froze it at its instantaneous level for a
+    /// whole wake life beside cells re-lit at full: the frozen partial ramp
+    /// the reviewer reproduced at 1.0 / 1.25 / 1.4 s idle. So a Ctrl-A a
+    /// second after the last key shows the band finishing its exit and a
+    /// fresh wake rising under the cells it has already left, the two never
+    /// sharing a cell; the wake's width grows with the idle from nothing at
+    /// 1.0 s to the full cap once the band is gone.
+    ///
+    /// Without `takeover` (a hop) a cell a live cell owns is left as it is,
+    /// and the new cells join the row's adjacent WAKE cohort or mint one on
+    /// the same origin ([`Ribbon::join_wake_cohort`]) — never a typed
+    /// word's, whose clock and bounds a hop must not touch.
+    ///
+    /// Every wake cell is `typing: false` — load-bearing: the one-finger hold
+    /// in [`Ribbon::place`] and the momentum spine read that flag, and
+    /// `mod.rs`'s "a jump builds no momentum" depends on it (pinned by
+    /// `a_wake_is_never_typing_and_holds_no_other_cohort`).
+    ///
+    /// Returns the minted cohort's id (the takeover arm) so the abandon can
+    /// spare it.
+    #[allow(clippy::too_many_arguments)]
+    fn wake(
+        &mut self,
+        row: u16,
+        from: u16,
+        to: u16,
+        at: Instant,
+        ctx: &Ctx<'_>,
+        life_s: f32,
+        takeover: bool,
+    ) -> Option<u32> {
+        let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
+        if cols == 0 || from == to || to >= cols {
+            return None;
+        }
+        let leftward = to < from;
+        let far = from.min(cols - 1);
+        let span = far.abs_diff(to);
+        let born_new = at
+            .checked_add(std::time::Duration::from_secs_f32(WAKE_BORN_LAG_S))
+            .unwrap_or(at);
+        let birth_disp = clamp01(ctx.birth_disp);
+        let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
+        let (anchor_col, t0) = self.wake_origin(row, to, at);
+        let minted = takeover.then(|| self.mint_cohort(row, to, anchor_col, t0, at, true));
+        // Far end first, landing LAST: the landing is the newest cell, so it
+        // is the run's head (`head_col`) and the hot edge sits by the caret.
+        for k in (0..=span).rev() {
+            let col = if leftward { to + k } else { to - k };
+            // The cell that owns this column now: its newest un-retracting
+            // cell (the pool is append-ordered; `build` reads the same one).
+            let owner = self
+                .cells
+                .iter()
+                .rposition(|c| c.row == row && c.col == col && c.retract_at.is_none());
+            let (born, cov0) = match owner {
+                Some(i) => {
+                    let cell = self.cells[i];
+                    let env = self.env_of(ctx, &cell);
+                    let leaving = self
+                        .cohorts
+                        .iter()
+                        .find(|c| c.id == cell.cohort)
+                        .is_none_or(|c| c.abandoned || c.phase.is_retracting());
+                    if env <= 0.0 {
+                        // Melted to nothing since the last plan, or drained
+                        // by its cohort's retract: a hole, not an owner.
+                        if k >= WAKE_MAX_CELLS {
+                            continue;
+                        }
+                        (born_new, cov0_new)
+                    } else if leaving || !takeover {
+                        // On its own clock (a band already leaving), or
+                        // under a hop (a live cell is left as it is): lay
+                        // nothing here.
+                        continue;
+                    } else {
+                        let old = self.cells.remove(i);
+                        (old.born, old.cov0 * env)
+                    }
+                }
+                None if k >= WAKE_MAX_CELLS => continue,
+                None => (born_new, cov0_new),
+            };
+            let idx = match minted {
+                Some(idx) => idx,
+                None => self.join_wake_cohort(row, col, anchor_col, t0, at),
+            };
+            let cohort = self.cohorts[idx];
+            let cell = Cell {
+                row,
+                col,
+                cohort: cohort.id,
+                t: cohort.t_at(col),
+                born,
+                life_s,
+                cov0,
+                typing: false,
+                retract_at: None,
+                birth_disp,
+            };
+            self.place(idx, cell, at);
+        }
+        minted.map(|idx| self.cohorts[idx].id)
+    }
+
+    /// The walk origin a wake takes on `row`, as `(anchor_col, t0)`: the
+    /// row's freshest cohort inside the chain window — abandoned, retracting
+    /// or not: the band it continues may be leaving — shares its origin
+    /// outright, so `t_at(col)` is the very number the band has at every
+    /// column and continues past both its ends on the same walk. With no
+    /// cohort on the row, the freshest anywhere is continued from one past
+    /// its rightmost column, anchored at `landing`, as
+    /// [`Ribbon::join_cohort`] does; red at the landing when nothing is laid.
+    fn wake_origin(&self, row: u16, landing: u16, at: Instant) -> (u16, f32) {
+        let fresh =
+            |c: &&Cohort| at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX;
+        if let Some(c) = self
+            .cohorts
+            .iter()
+            .filter(fresh)
+            .filter(|c| c.row == row)
+            .max_by_key(|c| c.alive_at)
+        {
+            return (c.anchor_col, c.t0);
+        }
+        let t0 = self
+            .cohorts
+            .iter()
+            .filter(fresh)
+            .max_by_key(|c| c.alive_at)
+            .map_or(0.0, |c| c.t_at(c.col1));
+        (landing, t0)
+    }
+
+    /// The cohort a HOP's new cell at `col` joins: a WAKE cohort on the same
+    /// row, not abandoned, inside the chain window, adjacent to or containing
+    /// `col` — a held arrow's own trail, or a jump's wake it runs into.
+    /// Otherwise a new wake cohort on the row's origin `(anchor_col, t0)`.
+    /// Never a typed cohort: the hop leaves the word's clock and bounds alone.
+    fn join_wake_cohort(
+        &mut self,
+        row: u16,
+        col: u16,
+        anchor_col: u16,
+        t0: f32,
+        at: Instant,
+    ) -> usize {
+        if let Some(i) = self.cohorts.iter().position(|c| {
+            c.row == row
+                && c.wake
+                && !c.abandoned
+                && at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX
+                && col + 1 >= c.col0
+                && col <= c.col1
+        }) {
+            return i;
+        }
+        self.mint_cohort(row, col, anchor_col, t0, at, true)
+    }
+
+    /// Push a new cohort covering `col` on `row` with the walk origin
+    /// `(anchor_col, t0)`, born and alive at `at`; returns its index.
+    fn mint_cohort(
+        &mut self,
+        row: u16,
+        col: u16,
+        anchor_col: u16,
+        t0: f32,
+        at: Instant,
+        wake: bool,
+    ) -> usize {
+        let id = self.next_cohort;
+        self.next_cohort = self.next_cohort.wrapping_add(1);
+        self.cohorts.push(Cohort {
+            id,
+            row,
+            col0: col,
+            col1: col + 1,
+            anchor_col,
+            t0,
+            born: at,
+            alive_at: at,
+            abandoned: false,
+            wake,
+            retract_col: None,
+            phase: Phase::Laying,
+        });
+        self.cohorts.len() - 1
     }
 
     /// The cohort this cell joins: one on the same row, adjacent to or
@@ -1566,21 +2297,7 @@ impl Ribbon {
             .filter(|c| at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX)
             .max_by_key(|c| c.alive_at)
             .map_or(0.0, |c| c.t_at(c.col1));
-        let id = self.next_cohort;
-        self.next_cohort = self.next_cohort.wrapping_add(1);
-        self.cohorts.push(Cohort {
-            id,
-            row,
-            col0: col,
-            col1: col + 1,
-            anchor_col: col,
-            t0,
-            born: at,
-            alive_at: at,
-            abandoned: false,
-            phase: Phase::Laying,
-        });
-        self.cohorts.len() - 1
+        self.mint_cohort(row, col, col, t0, at, false)
     }
 
     /// Retract the SUFFIX of `row` from `col` on — every live cell at or right
@@ -1613,18 +2330,25 @@ impl Ribbon {
         }
     }
 
-    /// A real jump ABANDONS the band: nothing lays here, and every cohort
-    /// still in its grace or reach is sent straight into its retract by
-    /// rewinding `alive_at` to [`RETRACT_START_S`] ago. The light leaves
-    /// CONTINUOUSLY from the level it has (the retract's `spend` starts at
-    /// exactly `1.0`), where v1's life clamp stepped the melt on the jump
-    /// frame; and a cohort already retracting is left on its own clock.
-    fn abandon(&mut self, at: Instant) {
+    /// A real jump ABANDONS the band: every cohort still in its grace or
+    /// reach — except the jump's own wake, `keep` — is sent straight into
+    /// its retract by rewinding `alive_at` to [`RETRACT_START_S`] ago. The
+    /// light leaves CONTINUOUSLY from the level it has (the retract's `spend`
+    /// starts at exactly `1.0`), where v1's life clamp stepped the melt on
+    /// the jump frame; and a cohort already retracting is left on its own
+    /// clock. Under the corridor the wake has already taken the band's cells
+    /// over ([`Ribbon::wake`]), so what retracts here is only the light the
+    /// jump left behind beyond it — and a band that was already leaving
+    /// when the jump came, which the wake did not touch.
+    fn abandon(&mut self, at: Instant, keep: Option<u32>) {
         let Some(rewound) = at.checked_sub(std::time::Duration::from_secs_f32(RETRACT_START_S))
         else {
             return;
         };
         for coh in &mut self.cohorts {
+            if keep == Some(coh.id) {
+                continue;
+            }
             coh.abandoned = true;
             if coh.alive_at > rewound {
                 coh.alive_at = rewound;
@@ -1671,6 +2395,13 @@ impl Ribbon {
                 continue;
             };
             self.cohorts[i].phase = phase;
+            // THE RETRACT'S TARGET is the caret's column the frame the
+            // retract begins, and it stays: the mark is drawn back into the
+            // hand that let go of it, not toward wherever the caret goes
+            // next (see `Cohort::retract_col`).
+            if phase.is_retracting() && self.cohorts[i].retract_col.is_none() {
+                self.cohorts[i].retract_col = self.caret.map(|(_, col)| col);
+            }
             // Under reduced motion the mark is STATIC (§6.11): no reach.
             if phase != Phase::Reaching || ctx.cfg.reduced_motion {
                 continue;
@@ -1753,7 +2484,11 @@ impl Ribbon {
         }
         let cohorts = &self.cohorts;
         self.cells.retain(|cell| {
-            if now.saturating_duration_since(cell.born).as_secs_f32() >= cell.life_s {
+            if now
+                .saturating_duration_since(live_since(cohorts, cell))
+                .as_secs_f32()
+                >= cell.life_s
+            {
                 return false;
             }
             if let Some(at) = cell.retract_at
@@ -1865,9 +2600,10 @@ impl Ribbon {
         let prof = Self::body_profile(ctx.cfg);
         let reduced = ctx.cfg.reduced_motion;
         // THE WAVE rides the LIVE spine, and only ever settles: its amplitude
-        // is `0.055 ch · disp`, so when the hand lifts the mark flattens. The
-        // head is pinned (`WAVE_HEAD_PIN`) so the cell under the hand never
-        // moves. Under reduced motion there is no wave at all (§6.11).
+        // is `WAVE_AMP_CELLS · ch · disp` (0.110 ch — twice v1's, 2026-09-08),
+        // so when the hand lifts the mark flattens. The head is pinned
+        // (`WAVE_HEAD_PIN`) so the cell under the hand never moves. Under
+        // reduced motion there is no wave at all (§6.11).
         let room = (DN_TOP_CH - DN_FLOOR_CH) * chf;
         let amp = if reduced {
             0.0
@@ -1919,9 +2655,20 @@ impl Ribbon {
     /// hold for the hairline by construction.
     fn env_of(&self, ctx: &Ctx<'_>, cell: &Cell) -> f32 {
         let now = ctx.now;
+        // A wake cell laid AHEAD of its birth (`WAKE_BORN_LAG_S`) is dark
+        // until it is born: the attack starts at `born`, never before it.
+        if now < cell.born {
+            return 0.0;
+        }
         let reduced = ctx.cfg.reduced_motion;
+        let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
+        // The attack runs from the cell's own birth; the expiry runs from the
+        // COHORT's clock (`live_since`): a key refreshes the whole run.
         let age = now.saturating_duration_since(cell.born).as_secs_f32();
-        let u = (age / cell.life_s.max(1e-3)).clamp(0.0, 1.0);
+        let spent = now
+            .saturating_duration_since(coh.map_or(cell.born, |c| cell.born.max(c.alive_at)))
+            .as_secs_f32();
+        let u = (spent / cell.life_s.max(1e-3)).clamp(0.0, 1.0);
         // UNDER REDUCED MOTION every mark is static and takes the theme's ONE
         // linear fade over the last `REDUCED_MOTION_FADE_MS` of whatever ends
         // it (§6.11) — the natural life, the retract stamp, the ember and the
@@ -1929,7 +2676,7 @@ impl Ribbon {
         // stays, because it is the one sanctioned attack and not a motion.
         let mut env = (BIRTH_EDGE_FLOOR + (1.0 - BIRTH_EDGE_FLOOR) * edge_in(age))
             * if reduced {
-                reduced_fade(cell.life_s - age)
+                reduced_fade(cell.life_s - spent)
             } else {
                 expiry_melt(u)
             };
@@ -1955,7 +2702,7 @@ impl Ribbon {
             let r = now.saturating_duration_since(at).as_secs_f32();
             env *= level + (1.0 - level) * edge_in(r);
         }
-        if let Some(coh) = self.cohorts.iter().find(|c| c.id == cell.cohort)
+        if let Some(coh) = coh
             && coh.phase.is_retracting()
         {
             let idle = now.saturating_duration_since(coh.alive_at).as_secs_f32();
@@ -1997,9 +2744,12 @@ impl Ribbon {
     /// toward the caret on `suck-in`, so the mark shortens INTO the hand (T5)
     /// rather than fading in place, and at `u = 1` every boundary is the
     /// caret's own x — a run of exactly zero length, which draws exactly
-    /// nothing. Per COHORT, never per row: a cohort still being typed beside
-    /// one that is swooshing keeps every boundary where its letters are.
-    /// Under reduced motion nothing moves (§6.11).
+    /// nothing. The caret it pulls toward is the one the retract BEGAN
+    /// under ([`Cohort::retract_col`]), so a jump landing mid-retract does
+    /// not lurch the leaving mark across the row. Per COHORT, never per row:
+    /// a cohort still being typed beside one that is swooshing keeps every
+    /// boundary where its letters are. Under reduced motion nothing moves
+    /// (§6.11).
     fn retract_x(&self, ctx: &Ctx<'_>, cohort: u32, x: f32) -> f32 {
         if ctx.cfg.reduced_motion {
             return x;
@@ -2016,7 +2766,8 @@ impl Ribbon {
             .saturating_duration_since(coh.alive_at)
             .as_secs_f32();
         let u = clamp01((idle - RETRACT_START_S) / (RETRACT_DUR_S + RETRACT_FADE_S));
-        let caret_x = self.caret.map_or(x, |(_, col)| {
+        let target = coh.retract_col.or_else(|| self.caret.map(|(_, col)| col));
+        let caret_x = target.map_or(x, |col| {
             f32::from(ctx.geom.origin_x) + (f32::from(col) + 0.5) * ctx.geom.cw as f32
         });
         caret_x + (x - caret_x) * (1.0 - suck_in(u))
@@ -2279,13 +3030,18 @@ impl Ribbon {
         smoothstep01((clamp01(disp) - HOT_EDGE_DISP_MIN) / HOT_EDGE_DISP_SPAN)
     }
 
-    /// **REFINEMENT A** (§4.1) — a 1-px `#FFFFFF` additive hairline along the
-    /// ribbon's TOP edge, from the head cell back [`HOT_EDGE_CELLS`] cells.
+    /// **REFINEMENT A** (§4.1) — a 1-px additive hairline IN THE SPECTRUM
+    /// along the ribbon's TOP edge, from the head cell back
+    /// [`HOT_EDGE_CELLS`] cells: every vertex carries the stop under it,
+    /// lifted to [`HOT_EDGE_LUMA_FLOOR`] ([`BedInkLut::hot_at`]), so at the
+    /// hand it IS the head's stop, hot — brighter than the bed on every stop
+    /// of the arc. (`#FFFFFF` at 38 until 2026-09-08; the owner: "I want the
+    /// meteor to have rainbow! be a bigger more special rainbow impact!".)
     ///
     /// It is drawn as a 2-vertex-per-cell `comet_beam` hairline (one vertex
     /// per cell BOUNDARY) sampled at the same `spine − up` the body used,
-    /// because the top edge carries the 0.75-cycle wave (≈ 1 px at `ch 18`,
-    /// 2 px at retina) and three axis-aligned rects cannot follow it. It is
+    /// because the top edge carries the 0.75-cycle wave (≈ 2 px at `ch 18`,
+    /// 3 px at retina) and three axis-aligned rects cannot follow it. It is
     /// SPATIAL rather than temporal — a property of where the head IS, with no
     /// clock of its own — so it can never lag the head: it ends at the head
     /// boundary [`Run::head`] resolves and reaches back only toward the tail.
@@ -2322,8 +3078,8 @@ impl Ribbon {
         // BIRTH-PRICED so it can never rise; ENVELOPE-SCALED so it goes out
         // with its body. The head cell's envelope is the mark's own clock at
         // the hand — the ember, the expiry melt, the swoosh's drain — and a
-        // hairline that ignored it rode the retract at full 38 over a body
-        // that had spent to zero, then snapped off with the cells.
+        // hairline that ignored it rode the retract at full coverage over a
+        // body that had spent to zero, then snapped off with the cells.
         let gain = Self::hot_edge_gain(ctx.cfg, head_cell.birth_disp) * self.env_of(ctx, head_cell);
         if gain <= 0.0 {
             return;
@@ -2348,7 +3104,7 @@ impl Ribbon {
             frame.beams.push(BeamVertex {
                 x: seg.x,
                 y: seg.spine - seg.up,
-                color: 0x00FF_FFFF,
+                color: self.ink.hot_at(seg.t),
                 cov: cov as u8,
             });
         }
@@ -2552,7 +3308,9 @@ impl Ribbon {
         let dur = std::time::Duration::from_secs_f32;
         let reduced_fade_s = REDUCED_MOTION_FADE_MS / 1000.0;
         for cell in &self.cells {
-            let age = since(cell.born);
+            // The expiry clock is the cohort's (`live_since`), as `env_of`
+            // and `retire` read it.
+            let age = since(live_since(&self.cohorts, cell));
             let life = cell.life_s.max(1e-3);
             cad.tail(cell.life_s - age);
             let coh = self.cohorts.iter().find(|c| c.id == cell.cohort);
@@ -2634,14 +3392,38 @@ impl Ribbon {
         cad.take()
     }
 
-    /// Translate every laid cell by a scroll of `rows` rows (seam point 12).
-    /// Cells that leave the grid are dropped rather than clamped: a ribbon
-    /// pinned to row 0 by a clamp is light on a line nobody typed.
+    /// **A SCROLL CARRIES THE RIBBON WITH ITS TEXT** (seam point 12): move
+    /// every laid cell by a scroll of `rows` rows, with everything that is
+    /// addressed by a cell's row — the cohorts, the field index the other
+    /// producers read, and the caret the field is resolved against. What
+    /// leaves the grid is dropped rather than clamped: a ribbon pinned to row
+    /// 0 by a clamp is light on a line nobody typed.
     ///
-    /// `_cell_h` is accepted and unused because every piece of ribbon state is
-    /// GRID-anchored — the pixel geometry lives in [`Ribbon::plan`], which the
-    /// next tick rebuilds from scratch.
-    pub fn translate_scroll(&mut self, rows: u16, _cell_h: u16) {
+    /// **There is no pixel to move, so no cell height is taken.** Every piece
+    /// of ribbon STATE is addressed by grid row and clock: a cell is `(row,
+    /// col)` plus its instants and its prices, a cohort is a row and a column
+    /// span, the retract clocks and the focus ember are instants, and the
+    /// wave's phase is the spine's ([`Ctx::phase`]), not the mark's. The pixel
+    /// geometry — [`Ribbon::plan`], the runs, the hot edge's hairline, the
+    /// bands stardust reads — is this frame's scratch, rebuilt from the cells
+    /// by the next tick's [`Ribbon::plan`] before any producer reads it, so it
+    /// is dropped here. The seam's `cell_h` belongs to the meteor's and the
+    /// sky's halves, whose marks are window-absolute px; a parameter this
+    /// half accepted and ignored read as a pixel path that did not exist.
+    ///
+    /// The index and the caret are TRANSLATED, not dropped. Between this call
+    /// and the next plan the ribbon is still asked — the engine seeds the
+    /// tick's `caret_t` from [`Ribbon::field_at_caret`] BEFORE it plans, and
+    /// [`Ribbon::field_at`], [`Ribbon::head_rgb`] and [`Ribbon::caret`] are
+    /// public reads the host may make between its `note_scroll` and its tick
+    /// — and the honest answer is the MOVED cell's, which a reset index and a
+    /// caret left on the pre-scroll row could not give (the index answered
+    /// `None` for the moved cell, and the caret fell through to the newest
+    /// key's stop). On glass the old spelling never showed: the same tick's
+    /// plan rebuilt both before anything drew. The caret is a position, not
+    /// a mark, so it saturates at row 0 as the engine's does; the next plan
+    /// re-observes it.
+    pub fn translate_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
         }
@@ -2664,9 +3446,10 @@ impl Ribbon {
             .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
         self.cells
             .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
+        self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
+        self.index.translate(rows);
         self.plan.clear();
         self.runs.clear();
-        self.index.reset();
     }
 
     /// Drop everything — style switch, layout change, `Engine::reset`.
@@ -2697,6 +3480,10 @@ mod tests {
     /// solved against.
     const DEFAULT_BG: u32 = 0x001A_1B26;
     const DEFAULT_FG: u32 = 0x00C8_D3F5;
+    /// The owner's theme (`theme = "Nord"`): the pair the black-gaps report
+    /// was made on and re-measured against.
+    const NORD_BG: u32 = 0x002E_3440;
+    const NORD_FG: u32 = 0x00D8_DEE9;
 
     /// The 1× fixture: `cw 9`, `ch 18`, 120 × 40 cells.
     fn geom() -> Geom {
@@ -2750,6 +3537,7 @@ mod tests {
             phase: 0.0,
             caret,
             caret_t: 0.0,
+            mend: None,
         }
     }
 
@@ -2802,6 +3590,16 @@ mod tests {
             from,
             to,
             licence: Licence::Nav,
+            dir: Dir::Right,
+        }
+    }
+
+    /// A program-driven move (no credit): abandons, lays no wake.
+    fn pty(from: (u16, u16), to: (u16, u16)) -> Event {
+        Event::Move {
+            from,
+            to,
+            licence: Licence::Pty,
             dir: Dir::Right,
         }
     }
@@ -2917,21 +3715,30 @@ mod tests {
     }
 
     #[test]
-    fn the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_78_under_the_bar() {
+    fn the_dimmest_stop_of_the_bed_composites_at_a_max_channel_of_about_80_under_the_bar() {
         // "Dim and muddy" gets a NUMBER. Under L3's 5.25:1 bar every stop is
         // put on `bed_luma_budget(fg)`, and a warm stop at that luminance IS
         // an olive: on the default theme a full-coverage yellow composites at
-        // `(78, 78, 2)`, at or below the ≈ 84 v1's coverage table produced.
+        // `(80, 80, 3)`, at or below the ≈ 84 v1's coverage table produced.
         // The module does not fix that half of the measured defect, and this
         // pin is what keeps the module doc from claiming it does.
         //
-        // TWO-SIDED on purpose. An owner ruling that relaxes the bar for the
-        // bed over blank cells (§22, OPEN) lands the warm mids above 84 and
-        // must re-pin this line; a change that dims the bed further trips the
-        // floor. Either way the number moves HERE first, not in a screenshot.
+        // RE-PINNED 2026-09-08, 78 → 80 (measured 79 → 80): the owner struck
+        // the restraint under the bar ("I feel like you are diminishing the
+        // specialness and emphasis of this theme? why?") and kept the bar —
+        // the 0.15 guard is the 0.05 the rounding needs, the solver answers
+        // from under its target, and the clamp is the bar's own answer at a
+        // white foreground. On the default theme that is one level; the
+        // bright-foreground gain is pinned beside this in
+        // `a_bright_foreground_s_bed_takes_the_bar_s_whole_budget_not_a_tenth`.
+        //
+        // TWO-SIDED on purpose. A ruling that relaxes the bar for the bed
+        // over blank cells (REJECTED 2026-09-06, module doc) would land the
+        // warm mids above 84 and must re-pin this line; a change that dims the
+        // bed trips the floor. Either way the number moves HERE first, not in
+        // a screenshot.
         let budget = bed_luma_budget(DEFAULT_FG);
         let cov = UNDER_COV_CAP as u8;
-        let max_channel = |c: u32| ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff);
         let dimmest = (0..=32u32)
             .map(|i| {
                 let t = i as f32 / 32.0;
@@ -2947,8 +3754,180 @@ mod tests {
         let (max, i, lit) = dimmest;
         let t = i as f32 / 32.0;
         assert!(
-            (72..=84).contains(&max),
-            "the dimmest stop (t = {t:.3}, composited #{lit:06X}) peaks at max channel {max}; the bar puts it at ≈ 78 and v1's table at ≈ 84 — a brighter warm mid is the OPEN §22 ruling, not a drift"
+            (79..=81).contains(&max),
+            "the dimmest stop (t = {t:.3}, composited #{lit:06X}) peaks at max channel {max}; the bar puts it at ≈ 80 and v1's table at ≈ 84 — a brighter warm mid is a ruling on the bar, a dimmer one is light left under it"
+        );
+    }
+
+    /// The worst contrast the bed can composite against `fg` over `bg` —
+    /// every position of the arc, every level the emitter can reach (the
+    /// body's request and the strip's accent, to the ledger's frame top).
+    fn worst_bed_contrast(fg: u32, bg: u32) -> f32 {
+        worst_bed_contrast_at(fg, bg, bed_luma_budget(fg))
+    }
+
+    /// The same, with the bed put on a stated luminance instead of the
+    /// theme's own budget — what a different budget WOULD read at.
+    fn worst_bed_contrast_at(fg: u32, bg: u32, budget: f32) -> f32 {
+        let mut worst = f32::INFINITY;
+        for i in 0..=512u32 {
+            let ink = bed_ink(spectrum(i as f32 / 512.0), budget);
+            for cov in 1..=(BODY_FRAME_TOP as u32) {
+                let cov = cov as u8;
+                worst = worst.min(contrast(fg, over_premul(bg, premul_rgb(ink, cov), cov)));
+            }
+        }
+        worst
+    }
+
+    fn max_channel(c: u32) -> u32 {
+        ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff)
+    }
+
+    fn min_channel(c: u32) -> u32 {
+        ((c >> 16) & 0xff).min((c >> 8) & 0xff).min(c & 0xff)
+    }
+
+    #[test]
+    fn the_bed_sits_at_the_bar_not_under_it_on_the_default_dark_theme() {
+        // THE OWNER, 2026-09-08: "I feel like you are diminishing the
+        // specialness and emphasis of this theme? why?" — and the one
+        // restraint that stays is the bar itself, not a margin under it. The
+        // bed carried a 0.15 guard ("more than all three [rounding costs]
+        // can spend together") and composited at 5.3729:1 at its worst.
+        // Measured: `solve_for_luma` answering from UNDER its target makes
+        // the ink's own rounding cost nothing, and the composite's one level
+        // of rounding costs 0.05 of a ratio point at the dimmest theme above
+        // the floor (`letters_stay_legible_under_the_ribbon_on_every_dark_theme_above_the_floor`)
+        // — so that is the guard, and the bed sits within a tenth of the bar.
+        let worst = worst_bed_contrast(DEFAULT_FG, DEFAULT_BG);
+        assert!(
+            worst >= BODY_CONTRAST_BAR,
+            "the bed composited to {worst:.4}:1; the bar is {BODY_CONTRAST_BAR}:1"
+        );
+        assert!(
+            worst - BODY_CONTRAST_BAR <= 0.10,
+            "the bed's worst stop composites at {worst:.4}:1 against a {BODY_CONTRAST_BAR}:1 bar — light left under the bar is diminished light; the guard under it is one level of rounding, not {:.4} of a ratio point",
+            worst - BODY_CONTRAST_BAR
+        );
+    }
+
+    #[test]
+    fn letters_stay_legible_under_the_ribbon_on_every_dark_theme_above_the_floor() {
+        // THE NET UNDER THE GUARD. 67 foregrounds — the greys `#909090` to
+        // `#FFFFFF` in steps of three, 27 tints from `{A0, D0, FF}³`, the
+        // shipped defaults — over four grounds, each only where the ground
+        // sits under the bed's own ceiling (a ground brighter than the bed is
+        // the theme's contrast, not the bed's), through the ledger's frame
+        // top plus one Bayer level. Foregrounds the floor catches
+        // (`bed_luma_budget` clamped up to `BED_LUMA_MIN`, fg ≤ ≈ `#999999`)
+        // are the documented exception — "below this the ribbon stops obeying
+        // the bar" — and are skipped. This sweep is what sized
+        // `BODY_CONTRAST_GUARD`: at 0 the worst was 5.2019:1 (fg `#A0A0A0`,
+        // one level of composite rounding at a 0.026 budget); 0.05 is the
+        // first step of the sweep that holds — and it is a law the 0.15 guard
+        // did NOT hold, because its solver could answer a level over its
+        // target (5.2039:1 at fg `#999999` before).
+        let mut fgs: Vec<u32> = (0x90u32..=0xFF)
+            .step_by(3)
+            .map(|g| (g << 16) | (g << 8) | g)
+            .collect();
+        for r in [0xA0u32, 0xD0, 0xFF] {
+            for g in [0xA0u32, 0xD0, 0xFF] {
+                for b in [0xA0u32, 0xD0, 0xFF] {
+                    fgs.push((r << 16) | (g << 8) | b);
+                }
+            }
+        }
+        fgs.extend([
+            DEFAULT_FG,
+            0x00E8_E8F0,
+            0x00F8_F8F2,
+            0x00AB_B2BF,
+            0x00CD_D6F4,
+        ]);
+        // Nord's pair — the owner's own theme — rides in the sweep too.
+        fgs.push(NORD_FG);
+        let grounds = [0x0000_0000u32, DEFAULT_BG, 0x0028_2C34, NORD_BG];
+        let mut worst = f32::INFINITY;
+        let mut at = String::new();
+        let mut themes = 0;
+        for fg in fgs {
+            // Floor-clamped (`BED_LUMA_MIN`) is the documented exception:
+            // those foregrounds are skipped whole. This and the
+            // ground-brighter-than-the-bed skip below are the ONLY two skips
+            // — a third was added on 2026-09-09 to hide the pairs a ground
+            // floor lifted over the bar, and it was taken out with the floor.
+            let budget = bed_luma_budget(fg);
+            if budget <= BED_LUMA_MIN {
+                continue;
+            }
+            themes += 1;
+            for bg in grounds {
+                if relative_luminance(bg) >= budget {
+                    continue;
+                }
+                for i in 0..=128u32 {
+                    let ink = bed_ink(spectrum(i as f32 / 128.0), budget);
+                    for cov in 1..=(BODY_FRAME_TOP as u32 + 1) {
+                        let cov = cov as u8;
+                        let lit = over_premul(bg, premul_rgb(ink, cov), cov);
+                        let c = contrast(fg, lit);
+                        if c < worst {
+                            worst = c;
+                            at = format!(
+                                "fg #{fg:06X} over #{bg:06X}, t {:.3}, cov {cov}, #{lit:06X}",
+                                i as f32 / 128.0
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            themes >= 60,
+            "the sweep must cover the themes it claims ({themes})"
+        );
+        assert!(
+            worst >= BODY_CONTRAST_BAR,
+            "the bed composited to {worst:.4}:1 at {at}; the bar is {BODY_CONTRAST_BAR}:1 on every dark theme above the floor"
+        );
+    }
+
+    #[test]
+    fn a_bright_foreground_s_bed_takes_the_bar_s_whole_budget_not_a_tenth() {
+        // MORE COLOUR where the bar allows it (the owner, 2026-09-08: "make
+        // this rainbow theme truly magical and special and dynamic and
+        // beautiful"). `BED_LUMA_MAX` was 0.100 — a clamp that bound on every
+        // foreground brighter than ≈ `#D8D8D8`: the offline renderer's
+        // `#E8E8F0` and a white foreground both solved to the clamp, under
+        // the bar's own answers (0.114 and 0.150). The ceiling is now the
+        // bar's answer at a white foreground, so under the bar the clamp
+        // binds nowhere.
+        let white = bed_luma_budget(0x00FF_FFFF);
+        assert!(
+            white > 0.14,
+            "a white foreground's bed budget is {white:.4}; the bar itself allows ≈ 0.148 and the bed took 0.100"
+        );
+        let cov = UNDER_COV_CAP as u8;
+        let yellow_at = |fg: u32, bg: u32| {
+            max_channel(over_premul(
+                bg,
+                premul_rgb(bed_ink(0x00FF_FF00, bed_luma_budget(fg)), cov),
+                cov,
+            ))
+        };
+        let (white_bed, renderer_bed) = (
+            yellow_at(0x00FF_FFFF, 0),
+            yellow_at(0x00E8_E8F0, 0x0011_1318),
+        );
+        assert!(
+            (102..=104).contains(&white_bed),
+            "yellow at the bed's ceiling under a white foreground composites at max channel {white_bed}; the bar puts it at ≈ 103 (it was 87 under the 0.100 clamp)"
+        );
+        assert!(
+            (91..=93).contains(&renderer_bed),
+            "yellow at the bed's ceiling under the renderer's `#E8E8F0` composites at max channel {renderer_bed}; the bar puts it at ≈ 92 (it was 88 under the 0.100 clamp)"
         );
     }
 
@@ -2970,6 +3949,451 @@ mod tests {
             hi - lo <= 0.004,
             "the arc's composited weight spans {lo:.4}..{hi:.4}; the bed is supposed to be even"
         );
+    }
+
+    /// HSV saturation of a composited pixel, `0..=1`.
+    fn sat(c: u32) -> f32 {
+        let (mx, mn) = (max_channel(c), min_channel(c));
+        if mx == 0 {
+            0.0
+        } else {
+            (mx - mn) as f32 / mx as f32
+        }
+    }
+
+    /// The bed's composite at the body's own cap on a theme.
+    fn bed_at_cap(t: f32, fg: u32, bg: u32) -> u32 {
+        let cov = UNDER_COV_CAP as u8;
+        over_premul(
+            bg,
+            premul_rgb(bed_ink(spectrum(t), bed_luma_budget(fg)), cov),
+            cov,
+        )
+    }
+
+    // -- the black gaps (2026-09-08): chroma, not luminance ------------------
+
+    #[test]
+    fn the_bed_s_dark_stops_arrive_at_full_chroma_not_walked_grey() {
+        // THE OWNER, 2026-09-08: "there are gaps black gaps in the rainbow a
+        // few characters back from the cursor" — measured on Nord as indigo
+        // composited `(82, 60, 136)`, S 0.61, next to a blue at 210–230. At
+        // the bar's own luminance indigo's hue owns `(127, 0, 219)`; the old
+        // walk toward white spent that chroma for nothing the bar wanted.
+        for (name, fg, bg) in [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+        ] {
+            let budget = bed_luma_budget(fg);
+            let indigo = bed_ink(0x004B_0082, budget);
+            assert!(
+                sat(indigo) >= 0.95 && max_channel(indigo) >= 195,
+                "{name}: indigo's bed ink is #{indigo:06X} (S {:.2}, peak {}) — a grey lavender, not a violet",
+                sat(indigo),
+                max_channel(indigo)
+            );
+            // …at the bar's weight, not over it.
+            assert!(
+                relative_luminance(indigo) < budget && budget - relative_luminance(indigo) < 0.002,
+                "{name}: indigo sits at Y {:.4} against a budget of {budget:.4}",
+                relative_luminance(indigo)
+            );
+            // The whole arc, composited at the cap: no stop is walked greyer
+            // than blue's own unavoidable share of white (blue's full value
+            // is under the bar, so it alone takes white: S 0.81 on Nord).
+            let (mut lo, mut lo_t) = (f32::INFINITY, 0.0f32);
+            for i in 0..=512u32 {
+                let t = i as f32 / 512.0;
+                let s = sat(bed_at_cap(t, fg, bg));
+                if s < lo {
+                    lo = s;
+                    lo_t = t;
+                }
+            }
+            assert!(
+                lo >= 0.78,
+                "{name}: the bed's least saturated composite is S {lo:.3} at t {lo_t:.3} — the walk toward white is back"
+            );
+        }
+        // The controls: the stops the bar itself prices are byte-identical to
+        // the recipe this replaced (scale-down is scale-down).
+        let budget = bed_luma_budget(DEFAULT_FG);
+        for (stop, name) in [
+            (0x00FF_FF00, "yellow"),
+            (0x0000_FF00, "green"),
+            (0x00FF_0000, "red"),
+        ] {
+            let old = solve_for_luma(|k| scale_rgb(stop, k), budget);
+            assert_eq!(
+                bed_ink(stop, budget),
+                old,
+                "{name} is priced by the bar alone and must not move"
+            );
+        }
+        // Blue's full value is already blue: its white share is what it was.
+        let old_blue = solve_for_luma(|w| toward_white(0x0000_00FF, w), budget);
+        assert_eq!(
+            bed_ink(0x0000_00FF, budget),
+            old_blue,
+            "blue was already at full value"
+        );
+    }
+
+    #[test]
+    fn the_crossing_composites_no_greyer_than_its_flanks() {
+        // The other "gap": the green→blue crossing carried the arc's authored
+        // S 0.53 (`SPECTRUM_CROSSING_ROOF`, the retired cyan census's bound)
+        // and composited `(45, 92, 93)` on Nord — the greyest cell on a typed
+        // line. `BED_SAT_FLOOR` gives the seam its neighbours' chroma back at
+        // the bed's own read; the arc's hue pacing is untouched.
+        use crate::spectrum::{spectrum_crossing_position, spectrum_crossing_width};
+        let mid = spectrum_crossing_position();
+        let half = spectrum_crossing_width();
+        for (name, fg, bg) in [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+        ] {
+            let green = sat(bed_at_cap(mid - 2.0 * half, fg, bg));
+            let blue = sat(bed_at_cap(mid + 2.0 * half, fg, bg));
+            let mut worst = f32::INFINITY;
+            let mut at = 0.0f32;
+            let mut px = 0u32;
+            for i in 0..=64u32 {
+                let t = mid - half + 2.0 * half * i as f32 / 64.0;
+                let c = bed_at_cap(t, fg, bg);
+                if sat(c) < worst {
+                    worst = sat(c);
+                    at = t;
+                    px = c;
+                }
+            }
+            assert!(
+                worst >= green.min(blue) - 0.02,
+                "{name}: the crossing composites #{px:06X} (S {worst:.3}) at t {at:.3}, greyer than its flanks (green S {green:.3}, blue S {blue:.3})"
+            );
+            assert!(
+                worst >= 0.90,
+                "{name}: the crossing's least saturated composite is S {worst:.3} (#{px:06X}) — the roof's S 0.53 is showing through the bed"
+            );
+            // And the arc's hue through the seam is the table's own: the
+            // floor moves S, never H.
+            for i in 0..=16u32 {
+                let t = mid - half + 2.0 * half * i as f32 / 16.0;
+                let (h_arc, _, _) = crate::spectrum::spectrum_hsv(spectrum(t));
+                let (h_ink, _, _) =
+                    crate::spectrum::spectrum_hsv(bed_ink(spectrum(t), bed_luma_budget(fg)));
+                assert!(
+                    (h_arc - h_ink).abs() <= 2.5,
+                    "{name}: at t {t:.3} the bed's hue is {h_ink:.1}° against the arc's {h_arc:.1}°"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ground_never_lifts_the_bed_over_the_bar() {
+        // A floor against the ground (`BED_GROUND_CONTRAST_MIN` 1.4:1,
+        // 2026-09-09) was taken out: wherever it exceeded the bar it lifted
+        // the bed over the luminance the text can bear. The budget is the
+        // bar's answer alone, clamped to [`BED_LUMA_MIN`, `BED_LUMA_MAX`] —
+        // on the themes the floor would have moved as much as on the ones it
+        // would not.
+        let bar = |fg: u32| {
+            (relative_luminance(fg) + 0.05) / (BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD) - 0.05
+        };
+        let one_dark = (0x00AB_B2BFu32, 0x0028_2C34u32);
+        let solarized = (0x0083_9496u32, 0x0000_2B36u32);
+        for (name, fg, bg) in [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+            ("One Dark", one_dark.0, one_dark.1),
+            ("One Dark on its alt ground", one_dark.0, 0x0032_3844),
+            ("Solarized Dark", solarized.0, solarized.1),
+            (
+                "a #999999 foreground on Nord's ground",
+                0x0099_9999,
+                NORD_BG,
+            ),
+        ] {
+            let budget = bed_luma_budget(fg);
+            assert!(
+                (budget - bar(fg).clamp(BED_LUMA_MIN, BED_LUMA_MAX)).abs() < 1e-6,
+                "{name}: the budget {budget:.4} is not the bar's own answer {:.4}",
+                bar(fg)
+            );
+            // The floor that was removed would have bound here: prove the
+            // control — on One Dark and Solarized it would have lifted the
+            // bed over the bar, and the text over it under 5.25:1.
+            let floor = (relative_luminance(bg) + 0.05) * 1.4 - 0.05;
+            if floor > budget {
+                assert!(
+                    worst_bed_contrast_at(fg, bg, floor) < BODY_CONTRAST_BAR,
+                    "{name}: the control — a 1.4:1 ground floor ({floor:.4}) would not have broken the bar here"
+                );
+            }
+            // …and the bar's own budget holds the bar wherever the bar is
+            // obeyed at all: a foreground clamped up to `BED_LUMA_MIN`
+            // (Solarized Dark's `#839496` solves to 0.012) is the documented
+            // exception, and is under 5.25:1 by design.
+            if budget > BED_LUMA_MIN {
+                assert!(
+                    worst_bed_contrast_at(fg, bg, budget) >= BODY_CONTRAST_BAR,
+                    "{name}: the bar's own budget composites under the bar"
+                );
+            }
+        }
+        // One Dark's pair is the one the floor cost the most: 5.29:1 → 4.69:1
+        // (4.74:1 on the sweep pin's own coarser grid).
+        let (fg, bg) = one_dark;
+        let floor = (relative_luminance(bg) + 0.05) * 1.4 - 0.05;
+        assert!(
+            worst_bed_contrast_at(fg, bg, floor) < 4.8,
+            "the control: One Dark under the removed floor read {:.3}:1",
+            worst_bed_contrast_at(fg, bg, floor)
+        );
+    }
+
+    #[test]
+    fn the_visibility_floor_costs_the_bar_nothing_on_nord() {
+        // The chroma-first recipe changes what indigo, violet, the blue mids
+        // and the crossing LOOK like; it must not change what the text over
+        // them reads at — the bar is a function of Y alone and the solver
+        // still answers from under it. Nord, every position, every level.
+        let worst = worst_bed_contrast(NORD_FG, NORD_BG);
+        assert!(
+            worst >= BODY_CONTRAST_BAR,
+            "Nord: the bed composited to {worst:.4}:1; the bar is {BODY_CONTRAST_BAR}:1"
+        );
+        assert!(
+            worst - BODY_CONTRAST_BAR <= 0.10,
+            "Nord: the bed's worst stop composites at {worst:.4}:1 — light left under the bar"
+        );
+        // …and the scanner's own colour floor (paint-conformance `SAT_MIN`
+        // 60 / `SAT_SPREAD` 40) is cleared by every stop at the cap and at
+        // the cold key's share of it.
+        for cov in [UNDER_COV_CAP as u8, (UNDER_COV_CAP * BODY_COLD_SHARE) as u8] {
+            for i in 0..=512u32 {
+                let t = i as f32 / 512.0;
+                let ink = bed_ink(spectrum(t), bed_luma_budget(NORD_FG));
+                let lit = over_premul(NORD_BG, premul_rgb(ink, cov), cov);
+                assert!(
+                    max_channel(lit) >= 60 && max_channel(lit) - min_channel(lit) >= 40,
+                    "Nord at cov {cov}, t {t:.3}: #{lit:06X} is under the scanner's colour floor"
+                );
+            }
+        }
+    }
+
+    /// **THE INK TABLE** — not a pin: every anchor and the crossing's roof,
+    /// the bed's ink before (the walk toward white from the stop itself) and
+    /// after (`onto_luma` + `BED_SAT_FLOOR`) on Nord and the default theme,
+    /// and the hot edge's ink the same way — the numbers the module doc and
+    /// `RAINBOW-KITTY-V2.md` quote, printed from the code that makes them.
+    ///
+    /// `targo --unverified test -p aterm-effects --lib -- --ignored --nocapture the_bed_and_hot_edge_ink_table`
+    #[test]
+    #[ignore = "a table for the record, not a pin"]
+    fn the_bed_and_hot_edge_ink_table() {
+        use crate::spectrum::{SPECTRUM_ANCHORS, SPECTRUM_CROSSING_ROOF};
+        let old_bed = |rgb: u32, budget: f32| {
+            if relative_luminance(rgb) > budget {
+                solve_for_luma(|k| scale_rgb(rgb, k), budget)
+            } else {
+                solve_for_luma(|w| toward_white(rgb, w), budget)
+            }
+        };
+        let old_hot = |rgb: u32| {
+            if relative_luminance(rgb) >= HOT_EDGE_LUMA_FLOOR {
+                rgb
+            } else {
+                solve_for_luma(|w| toward_white(rgb, w), HOT_EDGE_LUMA_FLOOR)
+            }
+        };
+        let rgb = |c: u32| {
+            format!(
+                "({:3},{:3},{:3})",
+                (c >> 16) & 0xff,
+                (c >> 8) & 0xff,
+                c & 0xff
+            )
+        };
+        let names = [
+            "red", "orange", "yellow", "green", "blue", "indigo", "violet",
+        ];
+        let mut stops: Vec<(String, u32)> = names
+            .iter()
+            .zip(SPECTRUM_ANCHORS)
+            .map(|(n, c)| ((*n).to_string(), c))
+            .collect();
+        for (i, &c) in SPECTRUM_CROSSING_ROOF.iter().enumerate() {
+            stops.push((format!("roof[{i}]"), c));
+        }
+        println!();
+        for (theme, fg, bg) in [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+        ] {
+            let budget = bed_luma_budget(fg);
+            let cov = UNDER_COV_CAP as u8;
+            println!("bed on {theme} (budget Y {budget:.4}):");
+            println!(
+                "  stop      arc                 old ink          S     @236 (peak)          new ink          S     @236 (peak)          Y new  fg/bed@236"
+            );
+            for (name, c) in &stops {
+                let (o, n) = (old_bed(*c, budget), bed_ink(*c, budget));
+                let (oc, nc) = (
+                    over_premul(bg, premul_rgb(o, cov), cov),
+                    over_premul(bg, premul_rgb(n, cov), cov),
+                );
+                println!(
+                    "  {name:9} {} #{c:06X}  {} {:.2}  {} ({:3})  {} {:.2}  {} ({:3})  {:.4} {:.3}",
+                    rgb(*c),
+                    rgb(o),
+                    sat(o),
+                    rgb(oc),
+                    max_channel(oc),
+                    rgb(n),
+                    sat(n),
+                    rgb(nc),
+                    max_channel(nc),
+                    relative_luminance(n),
+                    contrast(fg, nc)
+                );
+            }
+        }
+        println!("hot edge (floor Y {HOT_EDGE_LUMA_FLOOR:.2}):");
+        println!("  stop      old ink   S     new ink   S");
+        for (name, c) in &stops {
+            let (o, n) = (old_hot(*c), hot_edge_ink(*c));
+            println!(
+                "  {name:9} #{o:06X}   {:.2}  #{n:06X}   {:.2}",
+                sat(o),
+                sat(n)
+            );
+        }
+    }
+
+    /// **THE WARM STOPS' FRONTIER** — not a pin: a table for the owner.
+    ///
+    /// Yellow, green and the crossing's cyan are at full chroma already; at
+    /// the bar's luminance the sRGB transfer sets their peak channel (Nord:
+    /// 90 / 102 / 98 ink, 87 / 98 / 95 composited). The only lever left is
+    /// the bar, and that is a ruling. This prints, per stop and per step of
+    /// the peak channel, what the foreground reads at over the composited
+    /// bed at the body's cap and at the ledger's frame top, on Nord and the
+    /// default theme, and names the pins each step would move.
+    ///
+    /// `targo --unverified test -p aterm-effects --lib -- --ignored --nocapture the_warm_stops_frontier_table`
+    #[test]
+    #[ignore = "a table for the owner's ruling, not a pin"]
+    fn the_warm_stops_frontier_table() {
+        type InkOf = fn(u32) -> u32;
+        let stops: [(&str, InkOf); 3] = [
+            ("yellow", |p| (p << 16) | (p << 8)),
+            ("green", |p| p << 8),
+            ("cyan", |p| (p << 8) | p),
+        ];
+        let themes = [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+        ];
+        println!();
+        println!(
+            "bar {BODY_CONTRAST_BAR}:1 (+{BODY_CONTRAST_GUARD} guard); fg over the composited bed, at cov {} (the body's cap) and {} (the frame top)",
+            UNDER_COV_CAP as u32, BODY_FRAME_TOP as u32
+        );
+        for (name, ink_of) in stops {
+            for (theme, fg, bg) in themes {
+                let budget = bed_luma_budget(fg);
+                let at_bar = match name {
+                    "yellow" => bed_ink(0x00FF_FF00, budget),
+                    "green" => bed_ink(0x0000_FF00, budget),
+                    _ => bed_ink(0x0000_FFFF, budget),
+                };
+                let p0 = max_channel(at_bar);
+                println!();
+                println!(
+                    "{name} on {theme}: the bar's own ink is #{at_bar:06X} (peak {p0}); one level per row for the first six, then five"
+                );
+                println!(
+                    "  ink peak | composited@236 (peak) | fg/bed @236 | fg/bed @251 | Y ink  | pins that move"
+                );
+                let mut p = p0;
+                while p <= p0 + 45 && p <= 255 {
+                    let ink = ink_of(p);
+                    let cap = UNDER_COV_CAP as u8;
+                    let top = BODY_FRAME_TOP as u8;
+                    let c236 = over_premul(bg, premul_rgb(ink, cap), cap);
+                    let c251 = over_premul(bg, premul_rgb(ink, top), top);
+                    let (r236, r251) = (contrast(fg, c236), contrast(fg, c251));
+                    let mut moves = Vec::new();
+                    if r251 < BODY_CONTRAST_BAR {
+                        moves.push("letters_stay_legible_* (5.25:1 at the frame top)");
+                    }
+                    if r236 < BODY_CONTRAST_BAR {
+                        moves.push("…and at the body's cap");
+                    }
+                    if theme == "default"
+                        && name == "yellow"
+                        && !(79..=81).contains(&max_channel(c236))
+                    {
+                        moves.push("the_dimmest_stop_… (79..=81)");
+                    }
+                    if relative_luminance(ink) - budget > 0.004 {
+                        moves.push("every_stop_of_the_arc_composites_at_one_weight (±0.004 Y)");
+                    }
+                    println!(
+                        "  {p:8} | #{c236:06X} ({:3})        | {r236:8.3}    | {r251:8.3}    | {:.4} | {}",
+                        max_channel(c236),
+                        relative_luminance(ink),
+                        if moves.is_empty() {
+                            "none".to_string()
+                        } else {
+                            moves.join("; ")
+                        }
+                    );
+                    p += if p < p0 + 6 { 1 } else { 5 };
+                }
+            }
+        }
+        // THE GROUND. The bed's budget is the bar's answer against the
+        // foreground; how far it sits over the theme's own page is not a
+        // law (a 1.4:1 floor was tried on 2026-09-09 and removed — it
+        // overrode the bar wherever it exceeded it). Per theme: the bar's
+        // bed over the ground, and what lifting the bed to 1.4:1 over the
+        // ground would cost the text over it.
+        println!();
+        println!(
+            "the bed over its ground (no law — a ruling): bar's bed / ground, and the cost of a 1.4:1 lift"
+        );
+        println!(
+            "  theme                     fg      bg      budget  bed/ground  fg/bed worst | lifted to  fg/bed worst"
+        );
+        let one_dark = (0x00AB_B2BFu32, 0x0028_2C34u32);
+        for (theme, fg, bg) in [
+            ("Nord", NORD_FG, NORD_BG),
+            ("default", DEFAULT_FG, DEFAULT_BG),
+            ("One Dark", one_dark.0, one_dark.1),
+            ("One Dark (alt ground)", one_dark.0, 0x0032_3844),
+            ("Solarized Dark", 0x0083_9496, 0x0000_2B36),
+            ("Gruvbox Dark", 0x00EB_DBB2, 0x0028_2828),
+            ("Dracula", 0x00F8_F8F2, 0x0028_2A36),
+            ("Tokyo Night", 0x00C0_CAF5, 0x001A_1B26),
+        ] {
+            let budget = bed_luma_budget(fg);
+            let over = (budget + 0.05) / (relative_luminance(bg) + 0.05);
+            let lifted = ((relative_luminance(bg) + 0.05) * 1.4 - 0.05).max(budget);
+            println!(
+                "  {theme:24} #{fg:06X} #{bg:06X} {budget:.4}  {over:6.3}:1  {:8.3}:1 | {lifted:.4}     {:8.3}:1{}",
+                worst_bed_contrast_at(fg, bg, budget),
+                worst_bed_contrast_at(fg, bg, lifted),
+                if lifted > budget + 1e-6 {
+                    "  (lift would bind)"
+                } else {
+                    "  (bar already above 1.4:1)"
+                }
+            );
+        }
     }
 
     // -- §18: the field index ---------------------------------------------
@@ -3175,6 +4599,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_wave_breathes_a_tenth_of_a_cell_at_full_momentum_inside_the_body_s_own_rows() {
+        // THE OWNER, 2026-09-08: "make this rainbow theme truly magical and
+        // special and dynamic and beautiful" — the live-momentum wave was
+        // v1's `0.055 ch · disp`, at most 1.5 px at retina; it is doubled so
+        // the ribbon visibly breathes with speed, still inside the rows the
+        // body already owns: the top edge never rises above `TALL_UP_CH` and
+        // the bottom never falls past `DN_TOP_CH`, at any phase.
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 24, &c, 1.0);
+        let g = geom();
+        let ch = g.ch as f32;
+        let rest = f32::from(g.origin_y) + 3.0 * ch;
+        let mut deepest = 0.0f32;
+        for k in 0..16u32 {
+            let mut cx = ctx(at(t0, 23 * 60 + 8), &c, (2, 34), 1.0);
+            cx.phase = k as f32 / 16.0;
+            rib.plan(&cx);
+            for col in 10..34u16 {
+                let band = rib.band(2, col).expect("a laid cell has a band");
+                deepest = deepest.max((band.spine - rest).abs());
+                assert!(
+                    band.top >= rest - TALL_UP_CH * ch - 0.5,
+                    "the wave lifted the body's top past its own reach at col {col}, phase {k}/16 ({})",
+                    band.top
+                );
+                assert!(
+                    band.bottom <= rest + DN_TOP_CH * ch + 0.5,
+                    "the wave dropped the body's bottom past its own reach at col {col}, phase {k}/16 ({})",
+                    band.bottom
+                );
+            }
+        }
+        assert!(
+            deepest >= 0.10 * ch,
+            "the wave's deepest swing at full momentum is {deepest:.2} px ({:.3} ch); the owner asked for a ribbon that visibly breathes with speed — `WAVE_AMP_CELLS` 0.110",
+            deepest / ch
+        );
+    }
+
     // -- §4.1: the hot edge ------------------------------------------------
 
     #[test]
@@ -3210,8 +4676,9 @@ mod tests {
                     "{label}: the hot edge left the caret's own row band (y = {y})"
                 );
             }
-            // The peak request is 38; the beam's transverse AA can only lower
-            // it, and premultiplied white carries the coverage in every channel.
+            // The peak request is `HOT_EDGE_COV_MAX`; the beam's transverse AA
+            // can only lower it, and the lifted stop's brightest channel is
+            // 255, so its premultiplied peak is the coverage itself.
             assert!(
                 peak_channel(out) as f32 <= HOT_EDGE_COV_MAX + 1.0,
                 "{label}: hot-edge coverage is over the {HOT_EDGE_COV_MAX} request ceiling"
@@ -3274,6 +4741,81 @@ mod tests {
         assert!(
             Ribbon::hot_edge_gain(&light, 1.0) <= 0.0,
             "additive white on a paper ground is exactly what L6 forbids"
+        );
+    }
+
+    #[test]
+    fn the_hot_edge_is_the_stop_under_it_lifted_hot_and_brighter_than_the_bed() {
+        // THE OWNER, 2026-09-08: "I want the meteor to have rainbow! be a
+        // bigger more special rainbow impact!" — "make this rainbow theme
+        // truly magical and special and dynamic and beautiful". The hairline
+        // at the hand was `#FFFFFF`, "a third white idiom". It is now the
+        // spectrum: the stop under each vertex, lifted toward white to
+        // `HOT_EDGE_LUMA_FLOOR` (`hot_edge_ink`) so it out-shines any bed it
+        // can sit on, at `HOT_EDGE_COV_MAX` 118 — the transient cap (was 38).
+        use aterm_render::add_sat;
+        let dark = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 8, &dark, 0.9);
+        let cx = ctx(at(t0, 8 * 60), &dark, (2, 18), 0.9);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        {
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+        }
+        let head = sink
+            .out
+            .iter()
+            .max_by_key(|q| max_channel(q.color))
+            .expect("a hot hand leaves a hot edge");
+        assert!(
+            max_channel(head.color) - min_channel(head.color) >= 8,
+            "the hot edge is white (#{:06X}) — the owner asked for the rainbow at the hand",
+            head.color
+        );
+        let dominant = |c: u32| {
+            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            if r >= g && r >= b {
+                'r'
+            } else if g >= b {
+                'g'
+            } else {
+                'b'
+            }
+        };
+        let t = rib.field_at(2, 17).expect("the head cell is laid");
+        let stop = spectrum(clamp01(tri(t)));
+        assert_eq!(
+            dominant(head.color),
+            dominant(stop),
+            "the hairline's hue (#{:06X}) is not the head's stop (#{stop:06X})",
+            head.color
+        );
+        // BRIGHTER THAN THE BED it rides: the head's stop at the bed's
+        // ceiling, plus the hairline's premultiplied light on top.
+        let cov = UNDER_COV_CAP as u8;
+        let bed = over_premul(
+            DEFAULT_BG,
+            premul_rgb(bed_ink(stop, bed_luma_budget(DEFAULT_FG)), cov),
+            cov,
+        );
+        let lit = add_sat(bed, head.color);
+        assert!(
+            relative_luminance(lit) >= 1.5 * relative_luminance(bed),
+            "the hot edge over its bed (#{lit:06X}, Y {:.3}) is not brighter than the bed (#{bed:06X}, Y {:.3})",
+            relative_luminance(lit),
+            relative_luminance(bed)
+        );
+        // …and priced for EMPHASIS: past the 38 the white hairline was held
+        // to. The hairline's 1-px anti-aliasing puts two thirds of a request
+        // on its brighter row at this fixture (25 of 38 before), so the pin
+        // is on the emitted peak, past the old ceiling.
+        let peak = peak_channel(&sink.out);
+        assert!(
+            peak > 39,
+            "the hairline's brightest emitted level is {peak}; it was capped at 38 until 2026-09-08 and the owner asked for more"
         );
     }
 
@@ -3448,10 +4990,13 @@ mod tests {
         let mut rib = Ribbon::new();
         // A: cols 10..17. A real jump on the same row abandons it into its
         // retract (§4); the hand then lays B beside it while A is moving.
+        // A PTY-licensed jump (no credit): it abandons and lays no wake, so
+        // A is a retracting row-mate and B a cohort of its own — a Nav jump
+        // would take A over into its wake and B would join that (R5).
         type_run(&mut rib, t0, 10, 8, &c, 0.8);
         let now = at(t0, 1000);
         let cx = ctx(now, &c, (2, 40), 0.8);
-        rib.on_event(&nav((2, 18), (2, 40)), now, &cx);
+        rib.on_event(&pty((2, 18), (2, 40)), now, &cx);
         rib.plan(&cx);
         let keys = Keys {
             g: geom(),
@@ -3554,7 +5099,9 @@ mod tests {
         );
         let now = at(last, 16);
         let cx = ctx(now, &c, (2, 80), 0.9);
-        rib.on_event(&nav((2, 42), (2, 80)), now, &cx);
+        // A PTY-licensed jump: the abandon alone (no credit, no wake — R5's
+        // wake is pinned on its own below).
+        rib.on_event(&pty((2, 42), (2, 80)), now, &cx);
         rib.plan(&cx);
         let after = plan_sum(&rib);
         assert!(
@@ -3576,6 +5123,662 @@ mod tests {
             rib.at_rest(),
             "the abandoned band must be out {RETRACT_DUR_S} + {RETRACT_FADE_S} s after the jump"
         );
+    }
+
+    // -- R5: the wake ------------------------------------------------------
+
+    /// Cells on `row` as `(col, typing, life_s, born)`, column-sorted.
+    fn row_cells(rib: &Ribbon, row: u16) -> Vec<(u16, bool, f32, Instant)> {
+        let mut v: Vec<_> = rib
+            .cells()
+            .iter()
+            .filter(|c| c.row == row)
+            .map(|c| (c.col, c.typing, c.life_s, c.born))
+            .collect();
+        v.sort_by_key(|c| c.0);
+        v
+    }
+
+    #[test]
+    fn a_jump_lays_its_wake_counted_back_from_the_landing_and_never_the_whole_row() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // A cold Ctrl-A across 108 columns: WAKE_MAX_CELLS beside the caret,
+        // the landing included, every one born WAKE_BORN_LAG_S later, with
+        // the fixed life — never the four-letter chain law's.
+        let cx = ctx(t0, &c, (2, 2), 0.0);
+        rib.on_event(&nav((2, 110), (2, 2)), t0, &cx);
+        let cells = row_cells(&rib, 2);
+        let cols: Vec<u16> = cells.iter().map(|c| c.0).collect();
+        assert_eq!(
+            cols,
+            (2..2 + WAKE_MAX_CELLS).collect::<Vec<_>>(),
+            "a leftward jump's wake runs from the landing rightward, capped"
+        );
+        let lag = t0 + Duration::from_secs_f32(WAKE_BORN_LAG_S);
+        for &(col, typing, life, born) in &cells {
+            assert!(!typing, "col {col}: a wake cell is never typing");
+            assert!(
+                (life - WAKE_LIFE_S).abs() < 1e-6,
+                "col {col}: fixed life, got {life}"
+            );
+            assert_eq!(born, lag, "col {col}: born one lag past the landing");
+        }
+        assert_eq!(rib.cohorts().len(), 1, "one cohort, the wake's own");
+        // A cold Ctrl-E the other way, once the first wake is long gone: the
+        // wake runs from the landing LEFTWARD, and the origin cell at col 2
+        // is beyond the cap, so it is not painted.
+        let t1 = at(t0, 3000);
+        let cx = ctx(t1, &c, (2, 110), 0.0);
+        rib.plan(&cx);
+        assert!(rib.at_rest(), "the first wake is out by +3 s");
+        rib.on_event(&nav((2, 2), (2, 110)), t1, &cx);
+        let cols: Vec<u16> = row_cells(&rib, 2).iter().map(|c| c.0).collect();
+        assert_eq!(
+            cols,
+            (111 - WAKE_MAX_CELLS..111).collect::<Vec<_>>(),
+            "a rightward jump's wake ends AT the landing, capped"
+        );
+        // The landing is the run's HEAD (newest cell): the hot edge sits by
+        // the caret, not at the far end.
+        let newest = rib
+            .cells()
+            .iter()
+            .max_by_key(|c| (c.born, c.col))
+            .map(|c| c.col);
+        assert_eq!(newest, Some(110));
+    }
+
+    #[test]
+    fn a_wake_cell_is_dark_until_it_is_born_then_takes_the_one_attack() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let cx = ctx(t0, &c, (2, 2), 0.0);
+        rib.on_event(&nav((2, 60), (2, 2)), t0, &cx);
+        let lag_ms = (WAKE_BORN_LAG_S * 1000.0) as u64;
+        let edge_ms = (EDGE_IN_S * 1000.0) as u64;
+        for ms in [0u64, lag_ms / 2, lag_ms - 1] {
+            let cx = ctx(at(t0, ms), &c, (2, 2), 0.0);
+            rib.plan(&cx);
+            assert_eq!(
+                plan_peak(&rib),
+                0,
+                "+{ms} ms: a wake cell is dark before its birth"
+            );
+            assert!(
+                !rib.at_rest(),
+                "+{ms} ms: …but it is laid, so the host keeps ticking"
+            );
+        }
+        let cx = ctx(at(t0, lag_ms + edge_ms + 2), &c, (2, 2), 0.0);
+        rib.plan(&cx);
+        assert!(
+            plan_peak(&rib) >= (UNDER_COV_CAP * BODY_COLD_SHARE) as u8 - 2,
+            "one attack past its birth the wake is at its cold ceiling ({})",
+            plan_peak(&rib)
+        );
+        // …and it is out one life after that birth, through its own melt.
+        let cx = ctx(
+            at(t0, lag_ms + (WAKE_LIFE_S * 1000.0) as u64 + 20),
+            &c,
+            (2, 2),
+            0.0,
+        );
+        rib.plan(&cx);
+        assert!(
+            rib.at_rest(),
+            "the wake is gone one WAKE_LIFE_S after its birth"
+        );
+    }
+
+    #[test]
+    fn a_jump_hands_the_live_band_to_its_wake_with_the_stops_it_had_and_no_step() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // Forty cells over 2.4 s, then a Ctrl-A: the band under the hand IS
+        // the corridor. It keeps every stop it had (C2), loses no light on
+        // the jump frame, has ONE owner per cell, and then outlives the jump
+        // on the wake's clock instead of the abandon's 0.64 s retract. (A
+        // jump AWAY from the band — Alt-F past its end — leaves the band
+        // behind its origin, outside the corridor: that light still goes out
+        // through the abandon, pinned above under the PTY licence.)
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let last = at(t0, 39 * 60);
+        let cx = ctx(at(last, 8), &c, (2, 42), 0.9);
+        rib.plan(&cx);
+        let before = plan_sum(&rib);
+        let segs = rib.plan_segments().len() as u32;
+        let stops: Vec<Option<f32>> = (2..42u16).map(|col| rib.field_at(2, col)).collect();
+        assert!(
+            stops.iter().all(Option::is_some),
+            "the band is laid under cols 2..42"
+        );
+        let now = at(last, 16);
+        let cx = ctx(now, &c, (2, 2), 0.9);
+        rib.on_event(&nav((2, 42), (2, 2)), now, &cx);
+        rib.plan(&cx);
+        for (col, want) in (2..42u16).zip(&stops) {
+            let got = rib.field_at(2, col);
+            assert!(
+                matches!((got, want), (Some(g), Some(w)) if (g - w).abs() < 1e-5),
+                "col {col}: the wake repainted a stop the eye had read ({want:?} → {got:?})"
+            );
+        }
+        let wake = rib
+            .cohorts()
+            .iter()
+            .map(|c| c.id)
+            .max()
+            .expect("the wake cohort");
+        for col in 2..42u16 {
+            let owners: Vec<&Cell> = rib
+                .cells()
+                .iter()
+                .filter(|c| c.row == 2 && c.col == col)
+                .collect();
+            assert_eq!(owners.len(), 1, "col {col}: one owner, the wake's cell");
+            assert_eq!(owners[0].cohort, wake, "col {col}: …in the wake cohort");
+            assert!(
+                !owners[0].typing,
+                "col {col}: a taken-over cell is a wake cell"
+            );
+        }
+        // The origin cell (42) is unlit and beyond the cap counted back from
+        // the landing, so it stays dark: the cap bounds NEW light only, and
+        // the band's 40 cells were all taken over — nothing else was laid.
+        assert!(rib.field_at(2, 42).is_none());
+        assert_eq!(rib.cells().len(), 40, "the band's cells, and no more");
+        let after = plan_sum(&rib);
+        assert!(
+            after + 2 * segs >= before,
+            "the hand-off stepped the band down ({before} → {after} over {segs} boundaries)"
+        );
+        // Where the abandon's retract would have drained it to nothing, the
+        // wake still holds the band (the design's ~1.1 s after-effect)…
+        let cx = ctx(at(last, 16 + 660), &c, (2, 80), 0.9);
+        rib.plan(&cx);
+        let held = plan_sum(&rib);
+        assert!(
+            held * 2 > before,
+            "0.66 s after the jump the wake must still hold the band ({before} → {held})"
+        );
+        // …and it is out one wake life (plus the new cells' lag) later.
+        let cx = ctx(at(last, 16 + 1250), &c, (2, 80), 0.9);
+        rib.plan(&cx);
+        assert!(rib.at_rest(), "the wake is out by +1.25 s");
+    }
+
+    #[test]
+    fn a_wake_is_never_typing_and_holds_no_other_cohort() {
+        // THE FLAG PIN. `typing: false` is what keeps "a jump builds no
+        // momentum" (mod.rs) true and keeps a wake from lifting another
+        // mark's finger: a later flip to `true` would break both silently.
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // A band on row 3, then a hop on row 2 (no abandon): row 3's clock is
+        // untouched, and every row-2 cell is a non-typing wake cell.
+        let keys = Keys {
+            g: geom(),
+            row: 3,
+            col0: 10,
+            n: 6,
+            period_ms: 60,
+            disp: 0.8,
+        };
+        type_keys(&mut rib, t0, keys, &c);
+        let row3_alive = rib
+            .cohorts()
+            .iter()
+            .find(|c| c.row == 3)
+            .map(|c| c.alive_at);
+        let now = at(t0, 400);
+        let cx = ctx(now, &c, (2, 21), 0.8);
+        rib.on_event(&nav((2, 20), (2, 21)), now, &cx);
+        assert!(rib.cells().iter().filter(|c| c.row == 2).all(|c| !c.typing));
+        assert_eq!(
+            rib.cohorts()
+                .iter()
+                .find(|c| c.row == 3)
+                .map(|c| c.alive_at),
+            row3_alive,
+            "a hop's wake holds only its own cohort"
+        );
+        // A jump's wake: not typing either, and `field_at_caret`'s fallback
+        // still reads REAL TYPING — the jump wrote no hand colour.
+        let now = at(t0, 800);
+        let cx = ctx(now, &c, (2, 2), 0.8);
+        rib.on_event(&nav((2, 60), (2, 2)), now, &cx);
+        assert!(rib.cells().iter().filter(|c| c.row == 2).all(|c| !c.typing));
+        assert!(rib.cells().iter().any(|c| c.row == 3 && c.typing));
+    }
+
+    #[test]
+    fn a_ping_pong_at_speed_does_not_accumulate_and_empties_one_wake_life_after_its_last_key() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // Ctrl-A / Ctrl-E across 58 cells every 200 ms for 3 s, planned at
+        // 120 Hz. Each jump abandons the last wake and lays its own, so the
+        // pool plateaus (bounded by WAKE_LIFE_S / period wakes plus the
+        // abandoned ones' 0.64 s drains) instead of growing with the count.
+        let mut caret = (2u16, 2u16);
+        let mut peak_by_cycle = Vec::new();
+        let mut peak = 0usize;
+        for ms in (0..=3000u64).step_by(8) {
+            let now = at(t0, ms);
+            if ms % 200 == 0 {
+                let to = if caret.1 == 2 { (2, 60) } else { (2, 2) };
+                let cx = ctx(now, &c, to, 0.0);
+                rib.on_event(&nav(caret, to), now, &cx);
+                caret = to;
+                if ms > 0 {
+                    peak_by_cycle.push(peak);
+                    peak = 0;
+                }
+            }
+            let cx = ctx(now, &c, caret, 0.0);
+            rib.plan(&cx);
+            peak = peak.max(rib.cells().len());
+        }
+        let bound = usize::from(WAKE_MAX_CELLS + 1) * (WAKE_LIFE_S / 0.2).ceil() as usize
+            + 59 * (RETRACT_START_S / 0.2).ceil() as usize;
+        let worst = *peak_by_cycle.iter().max().expect("cycles");
+        assert!(
+            worst <= bound,
+            "the pool grew past its bound: {worst} > {bound} ({peak_by_cycle:?})"
+        );
+        let (early, late) = peak_by_cycle.split_at(peak_by_cycle.len() / 2);
+        assert!(
+            late.iter().max() <= early.iter().max(),
+            "the second half of the ping-pong holds more than the first: {peak_by_cycle:?}"
+        );
+        let cx = ctx(at(t0, 3000 + 1250), &c, caret, 0.0);
+        rib.plan(&cx);
+        assert!(
+            rib.at_rest(),
+            "everything is out one wake life after the last jump"
+        );
+    }
+
+    #[test]
+    fn a_row_change_a_pty_jump_and_a_typed_move_lay_no_wake() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let cx = ctx(t0, &c, (3, 5), 0.0);
+        rib.on_event(&nav((2, 5), (3, 5)), t0, &cx);
+        assert!(rib.at_rest(), "an Up-arrow recall paints no line");
+        let cx = ctx(t0, &c, (2, 2), 0.0);
+        rib.on_event(&pty((2, 60), (2, 2)), t0, &cx);
+        assert!(rib.at_rest(), "a PTY cascade earns no wake");
+        rib.on_event(
+            &Event::Move {
+                from: (2, 60),
+                to: (2, 2),
+                licence: Licence::Typed,
+                dir: Dir::Right,
+            },
+            t0,
+            &cx,
+        );
+        assert!(rib.at_rest(), "a typed echo's own motion lays nothing");
+        rib.on_event(
+            &Event::Move {
+                from: (2, 60),
+                to: (2, 2),
+                licence: Licence::Return,
+                dir: Dir::Right,
+            },
+            t0,
+            &cx,
+        );
+        assert!(rib.at_rest(), "a return-licensed move lays nothing");
+    }
+
+    #[test]
+    fn an_arrow_hop_lays_a_short_wake_behind_the_caret_and_leaves_live_cells_alone() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // A word at cols 10..17; Left from 18 to 17 crosses its own live
+        // cell (left alone) and the caret's empty cell 18 (laid, in a WAKE
+        // cohort of its own on the word's walk — never in the word's cohort,
+        // whose clock, phase and bounds the arrow must not touch: an arrow
+        // beside the word you just typed does not restart its grace).
+        type_run(&mut rib, t0, 10, 8, &c, 0.8);
+        let word = rib.cohorts()[0];
+        assert!(!word.wake);
+        let now = at(t0, 600);
+        let cx = ctx(now, &c, (2, 17), 0.8);
+        let t17 = rib.field_at(2, 17);
+        rib.on_event(&nav((2, 18), (2, 17)), now, &cx);
+        rib.plan(&cx);
+        assert_eq!(
+            rib.field_at(2, 17),
+            t17,
+            "the live cell under the hop is untouched"
+        );
+        let laid: Vec<&Cell> = rib
+            .cells()
+            .iter()
+            .filter(|c| c.row == 2 && c.col == 18)
+            .collect();
+        assert_eq!(laid.len(), 1);
+        assert_ne!(
+            laid[0].cohort, word.id,
+            "the hop's cell is in a cohort of its own, not the word's"
+        );
+        let hop = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == laid[0].cohort)
+            .expect("the hop's cohort");
+        assert!(hop.wake, "…a wake cohort");
+        assert!(
+            (laid[0].t - word.t_at(18)).abs() < 1e-6,
+            "…on the word's own walk ({} vs {})",
+            laid[0].t,
+            word.t_at(18)
+        );
+        assert!(!laid[0].typing);
+        assert!((laid[0].life_s - WAKE_LIFE_S * WAKE_HOP_LIFE_SHARE).abs() < 1e-6);
+        assert!(
+            rib.cells()
+                .iter()
+                .filter(|c| c.row == 2 && c.col == 17)
+                .count()
+                == 1
+        );
+        let word_now = rib
+            .cohorts()
+            .iter()
+            .find(|k| k.id == word.id)
+            .expect("the word");
+        assert_eq!(
+            (word_now.alive_at, word_now.col0, word_now.col1),
+            (word.alive_at, word.col0, word.col1),
+            "the hop touched the word's clock or bounds"
+        );
+        assert_eq!(
+            word_now.phase,
+            Phase::Grace,
+            "180 ms after its last key the word is in its grace — a hop that refreshed it would read Laying"
+        );
+        // …so the word swooshes exactly when it would have without the arrow:
+        // SWOOSH_TOTAL_S after ITS last key (t0 + 420 ms), not after the hop.
+        let cx = ctx(
+            at(t0, 420 + (SWOOSH_TOTAL_S * 1000.0) as u64 + 20),
+            &c,
+            (2, 17),
+            0.0,
+        );
+        rib.plan(&cx);
+        assert!(
+            rib.cells().iter().all(|c| c.cohort != word.id),
+            "the word must be out {SWOOSH_TOTAL_S} s after its own last key; the arrow lifted its finger"
+        );
+        // Right held down over cold ground: a trail behind the caret, one
+        // cohort, gone WAKE_LIFE_S / 2 after the last step.
+        let mut rib = Ribbon::new();
+        for (k, col) in (40u16..46).enumerate() {
+            let now = at(t0, 40 * k as u64);
+            let cx = ctx(now, &c, (2, col + 1), 0.0);
+            rib.on_event(&nav((2, col), (2, col + 1)), now, &cx);
+            rib.plan(&cx);
+        }
+        let cols: Vec<u16> = row_cells(&rib, 2).iter().map(|c| c.0).collect();
+        assert_eq!(
+            cols,
+            (40..=46).collect::<Vec<_>>(),
+            "the arrow painted behind itself"
+        );
+        assert_eq!(rib.cohorts().len(), 1, "one walk under the held arrow");
+        let cx = ctx(at(t0, 200 + 100 + 560), &c, (2, 46), 0.0);
+        rib.plan(&cx);
+        assert!(
+            rib.at_rest(),
+            "the arrow's trail is out half a wake life after its last step"
+        );
+    }
+
+    #[test]
+    fn a_jump_into_a_band_already_leaving_lays_nothing_under_it_and_lights_only_what_has_gone_out()
+    {
+        // The reviewer's reproduction (2026-09-09): forty cells, a plan at
+        // `now` — the host plans every tick, so the cohort's phase is current
+        // when the Move arrives — then a Ctrl-A at 1.0 / 1.25 / 1.4 s idle,
+        // inside the swoosh window (retract from 0.90 s, over at 1.54 s), and
+        // at 1.6 s as the cold endpoint. Before this clause the takeover
+        // handed every half-drained cell to a fresh Laying cohort at its
+        // instantaneous level and re-lit the emptied ones at full: a ramp
+        // frozen between two bright runs for a whole wake life — R6's gaps.
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let cw = geom().cw as f32;
+        let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * 0.9;
+        let vis = |rib: &Ribbon| -> String {
+            let mut cells: Vec<(i32, u8)> = Vec::new();
+            for s in rib.plan_segments() {
+                let col = (s.x / cw).floor() as i32;
+                match cells.iter_mut().find(|e| e.0 == col) {
+                    Some(e) => e.1 = e.1.max(s.cov),
+                    None => cells.push((col, s.cov)),
+                }
+            }
+            cells.sort_unstable();
+            cells
+                .iter()
+                .map(|(c0, v)| format!("{c0}:{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let mut laid = Vec::new();
+        for idle_ms in [1000u64, 1250, 1400, 1600] {
+            let mut rib = Ribbon::new();
+            type_run(&mut rib, t0, 2, 40, &c, 0.9);
+            let last = at(t0, 39 * 60);
+            let now = at(last, idle_ms);
+            let cx = ctx(now, &c, (2, 42), 0.9);
+            rib.plan(&cx);
+            let band = rib.cohorts().first().copied();
+            let before: Vec<Cell> = rib.cells().to_vec();
+            let lit: Vec<u16> = before
+                .iter()
+                .filter(|l| rib.env_of(&cx, l) > 0.0)
+                .map(|l| l.col)
+                .collect();
+            let mut empty: Vec<u16> = (2..42u16).filter(|col| !lit.contains(col)).collect();
+            empty.sort_unstable();
+            println!("idle {idle_ms} before  {}", vis(&rib));
+            let lit_xs = |rib: &Ribbon| -> Vec<(i32, u8)> {
+                rib.plan_segments()
+                    .iter()
+                    .filter(|s| s.cov > 0)
+                    .map(|s| ((s.x * 16.0).round() as i32, s.cov))
+                    .collect()
+            };
+            let xs_before = lit_xs(&rib);
+            let cx = ctx(now, &c, (2, 2), 0.9);
+            rib.on_event(&nav((2, 42), (2, 2)), now, &cx);
+            rib.plan(&cx);
+            println!("idle {idle_ms} +0 ms   {}", vis(&rib));
+            // NO LURCH: every boundary the leaving band had is exactly where
+            // it was on the jump frame — its retract keeps pulling toward
+            // the caret it began under, not toward the landing.
+            let xs_after = lit_xs(&rib);
+            assert_eq!(
+                xs_before, xs_after,
+                "idle {idle_ms}: the leaving band moved on the jump frame"
+            );
+            let band_id = band.map(|b| b.id);
+            // Every cell the band still lights is still the band's: same
+            // cohort, same birth, same price, ONE owner — nothing was taken
+            // over and nothing was laid under it.
+            for col in &lit {
+                let owners: Vec<&Cell> = rib
+                    .cells()
+                    .iter()
+                    .filter(|l| l.row == 2 && l.col == *col)
+                    .collect();
+                assert_eq!(owners.len(), 1, "idle {idle_ms}: col {col} keeps one owner");
+                let b = before
+                    .iter()
+                    .find(|l| l.col == *col)
+                    .expect("was in the pool");
+                let o = owners[0];
+                assert!(
+                    Some(o.cohort) == band_id && o.born == b.born && o.cov0 == b.cov0,
+                    "idle {idle_ms}: the lit band cell at col {col} was taken over"
+                );
+            }
+            // …the leaving band's clock is not touched (it is already past
+            // the abandon's rewind point)…
+            if let Some(b) = band {
+                let b_now = rib
+                    .cohorts()
+                    .iter()
+                    .find(|k| k.id == b.id)
+                    .expect("the band stays in the pool");
+                assert_eq!(
+                    b_now.alive_at, b.alive_at,
+                    "idle {idle_ms}: the leaving band keeps its clock"
+                );
+                assert!(b_now.phase.is_retracting() || idle_ms < 900);
+            }
+            // …and the wake's NEW cells sit exactly where the drain had
+            // already emptied a cell (within the cap counted back from the
+            // landing: cols 2..34), one cohort, born a lag late, cold-priced.
+            let wake: Vec<&Cell> = rib
+                .cells()
+                .iter()
+                .filter(|l| Some(l.cohort) != band_id)
+                .collect();
+            let mut wake_cols: Vec<u16> = wake.iter().map(|l| l.col).collect();
+            wake_cols.sort_unstable();
+            let want: Vec<u16> = empty
+                .iter()
+                .copied()
+                .filter(|col| col - 2 < WAKE_MAX_CELLS)
+                .collect();
+            assert_eq!(
+                wake_cols, want,
+                "idle {idle_ms}: the wake lights the emptied cells and only them"
+            );
+            let wake_id = wake.first().map(|l| l.cohort);
+            for w in &wake {
+                assert!(Some(w.cohort) == wake_id, "idle {idle_ms}: one wake cohort");
+                let lag_ok = w.born >= at(now, 99) && w.born <= at(now, 101);
+                assert!(
+                    !w.typing && (w.cov0 - cov0_new).abs() < 1e-6 && lag_ok,
+                    "idle {idle_ms}: col {} is a new wake cell (cold-priced, born WAKE_BORN_LAG_S late)",
+                    w.col
+                );
+            }
+            laid.push(wake.len());
+            // Through the wake's life the pool holds only the two kinds — the
+            // band's cells draining on their own clock and the wake's — and
+            // no band cell remains once its swoosh is over (1.54 s idle).
+            for dt in [50u64, 150, 400, 800] {
+                let cx = ctx(at(now, dt), &c, (2, 2), 0.9);
+                rib.plan(&cx);
+                println!("idle {idle_ms} +{dt:>3} ms {}", vis(&rib));
+                for l in rib.cells() {
+                    assert!(
+                        Some(l.cohort) == band_id || Some(l.cohort) == wake_id,
+                        "idle {idle_ms} +{dt}: a cell of a third cohort at col {}",
+                        l.col
+                    );
+                }
+                if idle_ms + dt > (SWOOSH_TOTAL_S * 1000.0) as u64 {
+                    assert!(
+                        rib.cells().iter().all(|l| Some(l.cohort) != band_id),
+                        "idle {idle_ms} +{dt}: the band must be out {SWOOSH_TOTAL_S} s after its last key"
+                    );
+                }
+            }
+            let cx = ctx(at(now, 1300), &c, (2, 2), 0.9);
+            rib.plan(&cx);
+            assert!(
+                rib.at_rest(),
+                "idle {idle_ms}: everything is out 1.3 s after the jump"
+            );
+        }
+        // The wake's width grows with the idle, continuously from nothing
+        // while the band is still whole to the full cap once it is gone.
+        assert_eq!(
+            laid[0], 0,
+            "at 1.0 s idle every band cell is still lit: no wake"
+        );
+        assert!(
+            laid.windows(2).all(|w| w[0] < w[1]),
+            "monotone in idle: {laid:?}"
+        );
+        assert_eq!(
+            laid[3],
+            usize::from(WAKE_MAX_CELLS),
+            "past the swoosh the cold Ctrl-A lays the cap"
+        );
+    }
+
+    #[test]
+    fn a_wake_continues_the_band_s_own_walk_across_the_kink_whichever_way_it_jumps() {
+        // `walk_t` is `d/16` for sixteen cells and `1/36` a cell after, so a
+        // wake anchored at the LANDING reproduces the band's `t_at` only when
+        // the landing is the band's origin (a Ctrl-A) and repaints every stop
+        // past the kink on a jump into the band's middle or a Ctrl-E across
+        // it. The wake shares the band's origin instead (`wake_origin`).
+        assert!(
+            (walk_t(39.0) - walk_t(18.0) - walk_t(21.0)).abs() > 0.1,
+            "the kink this pin is about"
+        );
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let last = at(t0, 39 * 60);
+        let now = at(last, 16);
+        // (a) Into the band's middle, 42 → 20: cells 20..42 are taken over on
+        // the stops they had; cells 2..20 stay the band's, on theirs.
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let cx = ctx(at(last, 8), &c, (2, 42), 0.9);
+        rib.plan(&cx);
+        let stops: Vec<f32> = (2..42u16)
+            .map(|col| rib.field_at(2, col).expect("laid"))
+            .collect();
+        let cx = ctx(now, &c, (2, 20), 0.9);
+        rib.on_event(&nav((2, 42), (2, 20)), now, &cx);
+        rib.plan(&cx);
+        for (col, want) in (2..42u16).zip(&stops) {
+            let got = rib.field_at(2, col).expect("still lit at +0");
+            assert!(
+                (got - want).abs() < 1e-5,
+                "col {col}: the wake repainted {want} → {got}"
+            );
+        }
+        let wake = rib.cohorts().iter().max_by_key(|k| k.id).expect("the wake");
+        assert_eq!(
+            (wake.anchor_col, wake.t0),
+            (rib.cohorts()[0].anchor_col, rib.cohorts()[0].t0),
+            "the wake shares the band's origin"
+        );
+        // (b) Past its end, 42 → 60: the new cells continue the band's walk
+        // at the lay rate — no seam at 41/42, and none where a landing-
+        // anchored walk would have re-entered the fast sixteen.
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let band = rib.cohorts()[0];
+        let cx = ctx(now, &c, (2, 60), 0.9);
+        rib.on_event(&nav((2, 42), (2, 60)), now, &cx);
+        let cx = ctx(at(now, 150), &c, (2, 60), 0.9);
+        rib.plan(&cx);
+        for col in 42..=60u16 {
+            let got = rib.field_at(2, col).expect("the corridor is laid");
+            let want = band.t_at(col);
+            assert!((got - want).abs() < 1e-5, "col {col}: {want} → {got}");
+        }
     }
 
     #[test]
@@ -4044,10 +6247,163 @@ mod tests {
         let mut rib = Ribbon::new();
         type_run(&mut rib, t0, 10, 4, &c, 0.5);
         assert!(rib.live_cells() > 0);
-        rib.translate_scroll(1, 18);
+        rib.translate_scroll(1);
         assert!(rib.cells().iter().all(|l| l.row == 1));
-        rib.translate_scroll(4, 18);
+        rib.translate_scroll(4);
         assert!(rib.at_rest(), "light on a line nobody typed is not kept");
+    }
+
+    /// **A SCROLL CARRIES THE RIBBON WITH ITS TEXT** (seam point 12 — the
+    /// PTY's one-row scroll on every Enter at the foot of the screen): the
+    /// hand types four cells and backspaces the last, so the caret stands ON
+    /// a retracting cell whose stop is not the newest key's; then the screen
+    /// scrolls one row. BETWEEN the scroll and the next plan the ribbon must
+    /// already answer for the moved text — the caret one row up, the field
+    /// at the caret the SAME cell's stop, nothing left on the old row (the
+    /// engine reads these for a jump that shares the tick with the scroll) —
+    /// and the NEXT FRAME, planned at the same instant with the host's
+    /// translated caret, must be the pre-scroll frame moved up exactly one
+    /// cell height: every body quad and every hot-edge quad the same colour
+    /// and width, one `ch` higher, and every cell's clocks and prices
+    /// untouched. A scroll past the text drops it.
+    ///
+    /// The frame clause is stated at the 2× fixture (`ch 36`) on purpose:
+    /// `ribbon_beam` phases its 4×4 Bayer dither on ABSOLUTE device y, so a
+    /// translated frame is byte-identical only when the cell height is a
+    /// multiple of four — true of the 2× fixture and of the owner's retina
+    /// cell (`ch 28`), false of the 1× fixture's `ch 18`, where the same
+    /// move re-phases the dither by two rows and every quad's byte shifts
+    /// one level (the rasterizer's dither, not the ribbon's light).
+    ///
+    /// FAILED before the fix on the first clause after the scroll: the
+    /// caret stayed on row 2 and the index was dropped, so `field_at(1, 13)`
+    /// was `None` until the next plan and `field_at_caret` fell through to
+    /// the newest typing cell's stop (col 12's, not col 13's).
+    #[test]
+    fn a_scroll_carries_the_ribbon_with_its_text() {
+        let c = cfg(true, true);
+        let g = geom2x();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        // Row 2, cols 10..14, the caret at (2, 14); then a Backspace puts
+        // col 13 on its retract clock and the caret on it.
+        type_run(&mut rib, t0, 10, 4, &c, 0.5);
+        let now = at(t0, 4 * 60);
+        erase_at(&mut rib, now, (2, 13), &c);
+        let t13 = rib
+            .field_at(2, 13)
+            .expect("the retracting cell keeps its stop");
+        let t12 = rib.field_at(2, 12).expect("col 12 is lit");
+        assert_ne!(
+            t13, t12,
+            "the fixture needs a caret stop the newest key does not share"
+        );
+        assert_eq!(rib.caret(), Some((2, 13)));
+        assert_eq!(rib.field_at_caret(), t13);
+        assert!(
+            rib.cells().iter().any(|l| l.retract_at.is_some()),
+            "the fixture needs a cell on its retract clock"
+        );
+        let cx = ctx_in(now, &c, (2, 13), 0.7, g);
+        rib.plan(&cx);
+        let mut before = Sink::default();
+        {
+            let mut f = before.frame();
+            rib.emit(&cx, &mut f);
+        }
+        assert!(
+            !before.under.is_empty(),
+            "the frame must draw for the law to bite"
+        );
+        assert!(
+            !before.out.is_empty(),
+            "the hot edge must draw for the law to bite"
+        );
+        let cells_before: Vec<Cell> = rib.cells().to_vec();
+
+        rib.translate_scroll(1);
+
+        // Between the scroll and the next plan: the ribbon answers for the
+        // moved text already.
+        assert_eq!(rib.caret(), Some((1, 13)), "the caret rides the scroll");
+        assert_eq!(
+            rib.field_at(1, 13),
+            Some(t13),
+            "the field moved with its cell"
+        );
+        assert_eq!(rib.field_at(2, 13), None, "nothing is left on the old row");
+        assert_eq!(
+            rib.field_at_caret(),
+            t13,
+            "the caret's stop is its own cell's, not the newest key's"
+        );
+        // Only the row moved: every clock and every price is untouched.
+        let cells_after = rib.cells();
+        assert_eq!(
+            cells_after.len(),
+            cells_before.len(),
+            "a scroll drops nothing on the grid"
+        );
+        for (a, b) in cells_before.iter().zip(cells_after) {
+            assert_eq!(b.row + 1, a.row);
+            assert_eq!(
+                (b.col, b.cohort, b.born, b.retract_at, b.typing),
+                (a.col, a.cohort, a.born, a.retract_at, a.typing)
+            );
+            assert_eq!(
+                (b.t, b.life_s, b.cov0, b.birth_disp),
+                (a.t, a.life_s, a.cov0, a.birth_disp)
+            );
+        }
+        // The next frame, planned at the same instant with the host's
+        // translated caret, is the pre-scroll frame one cell height higher.
+        let cx1 = ctx_in(now, &c, (1, 13), 0.7, g);
+        rib.plan(&cx1);
+        let mut after = Sink::default();
+        {
+            let mut f = after.frame();
+            rib.emit(&cx1, &mut f);
+        }
+        let ch = u16::try_from(g.ch).expect("ch");
+        assert_eq!(
+            after.under.len(),
+            before.under.len(),
+            "the body kept every quad"
+        );
+        for (a, b) in before.under.iter().zip(&after.under) {
+            assert_eq!(
+                (b.x, b.w, b.h, b.color, b.alpha),
+                (a.x, a.w, a.h, a.color, a.alpha)
+            );
+            assert_eq!(
+                b.y + ch,
+                a.y,
+                "a body quad moved by {} px, not one cell height ({ch})",
+                i32::from(a.y) - i32::from(b.y)
+            );
+            assert_eq!(b.row + 1, a.row, "the damage hint rides with the quad");
+        }
+        assert_eq!(
+            after.out.len(),
+            before.out.len(),
+            "the hot edge kept every quad"
+        );
+        for (a, b) in before.out.iter().zip(&after.out) {
+            assert_eq!(
+                (b.x, b.w, b.h, b.color, b.alpha),
+                (a.x, a.w, a.h, a.color, a.alpha)
+            );
+            assert_eq!(
+                b.y + ch,
+                a.y,
+                "a hot-edge quad moved by {} px, not one cell height ({ch})",
+                i32::from(a.y) - i32::from(b.y)
+            );
+        }
+        // A scroll past the text drops it: light on a line nobody typed.
+        rib.translate_scroll(2);
+        assert!(rib.at_rest());
+        assert_eq!(rib.field_at(0, 13), None);
     }
 
     // -- §18 cadence: a fade's next level is solved, not polled -------------
@@ -4105,5 +6461,97 @@ mod tests {
             }
         }
         assert!(checked >= 20, "only {checked} steps checked");
+    }
+
+    // -- the cohort's clock (2026-09-08, the owner's screenshot) -------------
+
+    /// **A LINE STILL BEING TYPED KEEPS EVERY CELL FROM ITS FIRST KEY TO THE
+    /// CARET.** The owner's screenshot ("rainbow" lit, "theme" DARK, "truly"
+    /// half lit, "magical" lit, "and" DARK, "specai" lit at the caret):
+    /// "rainbow" at 9 cps on a hot spine (`birth_disp` 0.9, `cell_life`
+    /// 5.88 s), a 700 ms thinking pause, "theme" slowly at 4 cps on the
+    /// dipped spine (0.45, 2.11 s), then " truly magical" at 8 cps hot again.
+    /// Planned every 16 ms until the last key, every glyph cell from the
+    /// first key to the caret's neighbour is in the pool. FAILED before the
+    /// cohort's clock (measured): at +4.192 s "theme"'s `h` — born at
+    /// +2.08 s with 2.11 s of life (its `t`, the first key after the pause,
+    /// took the chain floor `4.5 × 0.95 s + 0.1 = 4.38 s`) — ran out on its
+    /// own clock while "rainbow" (5.88 s) on its left and " truly" on its
+    /// right stood lit: a dark cell inside the live span, under a hand that
+    /// was still typing (key 23 of 27). Also pinned here, UNCHANGED: after the last key
+    /// nothing is dropped through the 0.75 s grace, and the mark is off the
+    /// glass — pool empty, at rest — [`SWOOSH_TOTAL_S`] after it.
+    #[test]
+    fn a_line_still_being_typed_keeps_every_cell_from_its_first_key_to_the_caret() {
+        let c = cfg(true, true);
+        let g = geom();
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let row = 4u16;
+        let col0 = 2u16;
+        // `(word, ms per key, pause before, birth_disp)`.
+        let words: [(&str, u64, u64, f32); 4] = [
+            ("rainbow ", 110, 0, 0.9),
+            ("theme", 250, 700, 0.45),
+            (" truly ", 125, 0, 0.9),
+            ("magical", 125, 0, 0.9),
+        ];
+        let mut key_ms = 0u64;
+        let mut caret = col0;
+        let mut now_ms = 0u64;
+        let mut dark: Vec<String> = Vec::new();
+        let mut keys = 0;
+        for (word, per_key, pause, disp) in words {
+            key_ms += pause;
+            for _ in word.chars() {
+                key_ms += per_key;
+                while now_ms + 16 <= key_ms {
+                    now_ms += 16;
+                    let cx = ctx_in(at(t0, now_ms), &c, (row, caret), disp, g);
+                    rib.plan(&cx);
+                    let missing: Vec<u16> = (col0..caret)
+                        .filter(|&col| rib.field_at(row, col).is_none())
+                        .collect();
+                    if !missing.is_empty() && dark.len() < 6 {
+                        dark.push(format!(
+                            "+{:.3}s keys={keys} caret={caret} dark={missing:?}",
+                            now_ms as f32 / 1000.0
+                        ));
+                    }
+                }
+                caret += 1;
+                keys += 1;
+                let cx = ctx_in(at(t0, key_ms), &c, (row, caret), disp, g);
+                rib.on_event(&typed(), at(t0, key_ms), &cx);
+                rib.plan(&cx);
+            }
+        }
+        assert_eq!(keys, 27);
+        assert!(
+            dark.is_empty(),
+            "a cell went dark under a hand still typing:\n{}",
+            dark.join("\n")
+        );
+        // UNCHANGED: the swoosh is still the ending. Through the grace every
+        // cell stands; SWOOSH_TOTAL_S after the last key the mark is gone.
+        let last = key_ms;
+        let cx = ctx_in(at(t0, last + 700), &c, (row, caret), 0.9, g);
+        rib.plan(&cx);
+        assert_eq!(
+            (col0..caret)
+                .filter(|&col| rib.field_at(row, col).is_some())
+                .count(),
+            usize::from(caret - col0),
+            "every cell stands through the 0.75 s grace"
+        );
+        let gone = last + (SWOOSH_TOTAL_S * 1000.0) as u64 + 20;
+        let cx = ctx_in(at(t0, gone), &c, (row, caret), 0.9, g);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        assert!(
+            rib.at_rest() && sink.under.is_empty() && sink.out.is_empty(),
+            "off the glass {SWOOSH_TOTAL_S} s after the last key"
+        );
     }
 }

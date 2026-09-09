@@ -950,7 +950,10 @@ const _: () = assert!(RAINBOW_FIELD_LEVEL > 144.0 && RAINBOW_FIELD_LEVEL < 146.0
 /// The number is not a taste: with the fold switched off ENTIRELY, every gate
 /// that exists because of it stays green — `the_jump_streak_is_never_cyan_on_glass`
 /// (`lit=1,678,001 unruled=24,224 cyan=0`), `no_visible_cyan_on_the_cold_streak_at_any_latch_phase`,
-/// `the_band_is_never_cyan_on_glass`, `the_caret_rim_is_never_cyan_where_its_own_layers_meet` —
+/// `the_band_is_never_cyan_on_glass`, and the caret's rim gate of the day
+/// (`the_caret_rim_is_never_cyan_where_its_own_layers_meet`, since replaced by
+/// `the_rim_light_is_hue_invariant_and_monotone_in_paint` when the caret's
+/// private cyan law was retired on 2026-09-08) —
 /// and `the_zoom_streak_resolves_its_colour_on_the_arc` returns `0.000` loss on a
 /// population that is `S = 1.000` pure. The seven-anchor palette retired the
 /// cyan hazard this fold was insurance against (the emit site says so in as many
@@ -2187,6 +2190,51 @@ struct Ring {
     cy: f32, // grid-interior pixel center
     born: Instant,
     life: f32,
+    /// The jump's impact magnitude (`rainbow_kitty::timing::impact`, `1.0..=3.5`):
+    /// every expansion radius below is scaled by [`classic_ring_radius_factor`]
+    /// of it, and `life` was already graded by [`classic_ring_life`] at spawn.
+    scale: f32,
+}
+
+// ---- THE CLASSIC LANDING RING's GRADE -------------------------------------
+//
+// Owner, 2026-09-08: "a bigger impact splash that scales more with the distance
+// traveled". Rainbow Kitty's landing took the grade first (`timing::impact`,
+// `meteor::ring_ms`); this is the SAME magnitude applied to every other style's
+// ring — fire flash, water ripple, the light-theme veil and the dark square
+// outline all expand `classic_ring_radius_factor` wider and last
+// `classic_ring_life` longer. An 8-cell hop (impact 1.0) is byte-for-byte what
+// it was; a full-line Ctrl-A (impact 3.5) rings TWICE as wide for 300 ms —
+// the same numbers the kitty's ring reaches, so the two arts agree on how big
+// a jump felt.
+
+/// Radius growth per unit of impact above 1: ×2.0 at the 3.5 cap
+/// (`1 + 0.4 · 2.5`). Rainbow Kitty's `RING_R_PER_IMPACT_CH` doubles its ring
+/// over the same range.
+const CLASSIC_RING_RADIUS_PER_IMPACT: f32 = 0.4;
+/// Life growth per unit of impact above 1: the built-in 180 ms reaches 300 ms
+/// at the cap (`0.18 · (1 + 0.267 · 2.5)`), Rainbow Kitty's `RING_MS_MAX`.
+const CLASSIC_RING_LIFE_PER_IMPACT: f32 = 0.267;
+
+/// How much wider a ring of impact `scale` expands: `1.0` at impact 1 (and for
+/// anything non-finite or below), `2.0` at the 3.5 cap.
+fn classic_ring_radius_factor(scale: f32) -> f32 {
+    if !scale.is_finite() {
+        return 1.0;
+    }
+    let impact = scale.clamp(1.0, crate::rainbow_kitty::timing::IMPACT_MAX);
+    1.0 + CLASSIC_RING_RADIUS_PER_IMPACT * (impact - 1.0)
+}
+
+/// A ring's life in seconds: `base` graded by impact `scale` — `base` itself at
+/// impact 1, `base · 1.667` at the cap (0.18 s → 0.30 s for the built-ins; a
+/// Trail Pack's own `ring.life_ms` grades the same way from its own base).
+fn classic_ring_life(base: f32, scale: f32) -> f32 {
+    if !scale.is_finite() {
+        return base;
+    }
+    let impact = scale.clamp(1.0, crate::rainbow_kitty::timing::IMPACT_MAX);
+    base * (1.0 + CLASSIC_RING_LIFE_PER_IMPACT * (impact - 1.0))
 }
 
 // `GlideStar` STOOD HERE and is deleted (step 13). It was a whole transient
@@ -3252,7 +3300,7 @@ pub struct CursorGlow {
     /// The `&[bool]` view of the host's row probe for v2's glyph gate (§5.4,
     /// seam point 13): resident, cleared and refilled from the SAME `cols`
     /// the v1 probe copies — never a second grid scan.
-    v2_probe_scratch: Vec<bool>,
+    v2_probe_scratch: Vec<rk::stardust::CellInk>,
     /// The caret seam v2 handed back on the last engaged tick (§7.1); the
     /// host reads it through [`Self::caret_flare_at`] / [`Self::caret_paint`]
     /// when it builds the caret's `RainbowConfig`.
@@ -3530,6 +3578,10 @@ pub enum BlockFillOwner {
     /// [`crate::cursor_beam`] — the emitter block the styles with no bespoke
     /// body wear (`beam`, `lumen`, `sparkle`, trail packs).
     BeamRod,
+    /// The typing-momentum glow's warm tint (`crate::cursor_momentum`) —
+    /// LOWEST precedence: every style body above it owns the caret when it
+    /// is lit; the tint paints only a caret nobody else is painting.
+    Momentum,
 }
 
 impl BlockFillOwner {
@@ -3544,6 +3596,7 @@ impl BlockFillOwner {
             Self::Comet => "comet",
             Self::Droplet => "droplet",
             Self::BeamRod => "beamrod",
+            Self::Momentum => "momentum",
         }
     }
 
@@ -3555,7 +3608,9 @@ impl BlockFillOwner {
             // Both take the host's resolved cursor colour as the base their
             // spectrum/beam hue tints. Both had to be TAUGHT to (the two
             // fixes this sensor exists because of).
-            Self::Rainbow | Self::Phaser => BlockFillBase::CursorColor,
+            // The momentum tint is the cursor's own colour, warmed: at rest
+            // the caret IS the user's / OSC-12 colour.
+            Self::Rainbow | Self::Phaser | Self::Momentum => BlockFillBase::CursorColor,
             // Built from the resolved TRAIL colour, which itself follows the
             // cursor colour unless the user pinned `cursor_trail_color` — or,
             // for the laser, at all: lightning is electric yellow ON PURPOSE
@@ -3732,6 +3787,14 @@ pub struct TrailStatus<'a> {
     pub glow_active: bool,
     /// Whether the full-body pet companion is drawn and animating.
     pub pet_active: bool,
+    /// The resident brain's current action, lowercase; `none` without a drawn body.
+    pub pet_action: &'a str,
+    /// Earned affection/contentment, independent of visibility, in 0..=1.
+    pub pet_content: f32,
+    /// Queued clicks/strokes waiting for the brain's existing consumption gate.
+    pub pet_pending: u8,
+    /// Last drawn resident body `(x0, x1, y0, y1)` in frame pixels, exclusive ends.
+    pub pet_body: Option<(i32, i32, i32, i32)>,
     /// Whether the flying cursor cat is animating.
     pub cat_active: bool,
     /// WHO OWNS THE BLOCK CURSOR right now, the colour they painted it, and the
@@ -3786,7 +3849,8 @@ impl TrailStatus<'_> {
              field={:.3} sparks={} \
              momentum={:.2} momentum_display={:.2} \
              glow_active={} pet_active={} cat_active={} \
-             block_fill={} block_fill_rgb={} block_fill_base={} block_fill_base_from={}",
+             block_fill={} block_fill_rgb={} block_fill_base={} block_fill_base_from={} \
+             pet_action={} pet_content={:.3} pet_pending={} pet_body={}",
             self.style_raw,
             self.style.label(),
             self.config_enabled,
@@ -3827,6 +3891,13 @@ impl TrailStatus<'_> {
             // owner's declaration: a `CursorColor` owner handed no base built
             // from white, and the row must say so ([`BlockFill::base_from`]).
             self.block_fill.map_or("none", |b| b.base_from().label()),
+            self.pet_action,
+            self.pet_content,
+            self.pet_pending,
+            self.pet_body.map_or_else(
+                || "none".to_string(),
+                |(x0, x1, y0, y1)| format!("{x0},{x1},{y0},{y1}"),
+            ),
         )
     }
 
@@ -5754,15 +5825,21 @@ impl CursorGlow {
     }
 
     /// The host's row probe → v2's glyph probe (§5.4's `probed_cell_glyph
-    /// == Some(false)` gate): `occupied[col]` is "not a blank", so a wide
-    /// glyph's `'\0'` continuation counts as ink exactly as the v1 fill
-    /// counts it. The bool view is a resident scratch refilled from the
-    /// chars v1 just copied — no second grid scan, no allocation past the
-    /// first row.
+    /// == Some(false)` gate): every char reduces to its
+    /// [`rk::stardust::CellInk`] — a blank, a glyph (a wide glyph's `'\0'`
+    /// continuation counts as ink exactly as the v1 fill counts it), or a
+    /// LIGHT horizontal rule, the one glyph whose ink the sky band can never
+    /// touch and which a bordered TUI prompt (Claude Code's input box) puts
+    /// in every column of the row above the line being typed. The class view
+    /// is a resident scratch refilled from the chars v1 just copied — no
+    /// second grid scan, no allocation past the first row.
     fn v2_probe_row(&mut self, row: i32, cols: &[char]) {
         self.v2_probe_scratch.clear();
-        self.v2_probe_scratch.extend(cols.iter().map(|&c| c != ' '));
-        self.v2.probe_mut().probe_row(row, &self.v2_probe_scratch);
+        self.v2_probe_scratch
+            .extend(cols.iter().map(|&c| rk::stardust::cell_ink(c)));
+        self.v2
+            .probe_mut()
+            .probe_row_ink(row, &self.v2_probe_scratch);
     }
 
     /// STAR-LANDING NEIGHBOR PROBE: hand the engine the content of the two
@@ -6923,11 +7000,16 @@ impl CursorGlow {
         if let Some(m) = struck {
             self.flare = 1.0;
             if cfg.ring {
+                // Graded by the flight the head just finished, in cells.
+                let scale = crate::rainbow_kitty::timing::impact(
+                    (m.x1 - m.x0).abs() / geom.cw.max(1) as f32,
+                );
                 self.ring = Some(Ring {
                     cx: m.x1,
                     cy: m.y1,
                     born: now,
-                    life: 0.18,
+                    life: classic_ring_life(0.18, scale),
+                    scale,
                 });
             }
             if matches!(cfg.style, GlowStyle::Fire) {
@@ -9053,11 +9135,13 @@ impl CursorGlow {
         });
         if ring_on && dist >= 2.0 && !fire_meteor && !navigation {
             let (cx, cy) = geom.cell_center(cr, cc);
+            let scale = crate::rainbow_kitty::timing::impact(dist);
             self.ring = Some(Ring {
                 cx,
                 cy,
                 born: now,
-                life: ring_life,
+                life: classic_ring_life(ring_life, scale),
+                scale,
             });
         }
     }
@@ -12518,6 +12602,8 @@ impl CursorGlow {
         if cov == 0 {
             return;
         }
+        // The jump's grade: every radius below is this much wider (1.0 for a hop).
+        let rf = classic_ring_radius_factor(ring.scale);
         let color = match cfg.style {
             GlowStyle::Laser => cfg.color,
             // The landing SHOCKWAVE glows white-hot at birth and cools as it
@@ -12531,7 +12617,7 @@ impl CursorGlow {
         // dimmer aftershock swelling behind it. (The square outline below serves
         // the non-fire styles only.)
         if matches!(cfg.style, GlowStyle::Fire) {
-            let grow = (0.55 + 1.25 * t) * geom.ch as f32;
+            let grow = (0.55 + 1.25 * t) * geom.ch as f32 * rf;
             push_halo(
                 halos,
                 geom,
@@ -12545,7 +12631,7 @@ impl CursorGlow {
                 let t2 = (t - 0.30) / 0.70;
                 let cov2 = (150.0 * (1.0 - t2) * cfg.intensity) as u8;
                 if cov2 > 0 {
-                    let g2 = (0.55 + 1.25 * t2) * geom.ch as f32;
+                    let g2 = (0.55 + 1.25 * t2) * geom.ch as f32 * rf;
                     push_halo(
                         halos,
                         geom,
@@ -12572,7 +12658,7 @@ impl CursorGlow {
                     return;
                 }
                 let premul = premul_rgb(color, cov);
-                let rx = (0.7 + 1.5 * tt) * geom.ch as f32;
+                let rx = (0.7 + 1.5 * tt) * geom.ch as f32 * rf;
                 let ry = (rx * 0.38).max(2.0);
                 let thick = 2.0f32;
                 let rslab = ((ry * 0.5) as i32).max(2);
@@ -12620,7 +12706,7 @@ impl CursorGlow {
         // burying text. Applies to every square-outline style (all were
         // additive-only); fire/water/laser returned above with their own art.
         if !cfg.dark_theme {
-            let grow = (0.7 + 1.0 * t) * geom.ch as f32;
+            let grow = (0.7 + 1.0 * t) * geom.ch as f32 * rf;
             let veil = lerp_rgb(color, 0x0000_0000, 0.28);
             let cap = ((cov as u32) / 2).clamp(1, 120);
             let veil_capped = (veil & 0x00FF_FFFF) | (cap << 24);
@@ -12640,7 +12726,7 @@ impl CursorGlow {
         // Expanding square outline: half-size grows from ~0.6 to ~1.6 cells; emit as
         // top/bottom horizontal bars + left/right vertical bars (push_rect splits the
         // verticals into per-row slabs). Thickness ~2px.
-        let s = ((0.6 + 1.0 * t) * geom.ch as f32) as i32;
+        let s = ((0.6 + 1.0 * t) * geom.ch as f32 * rf) as i32;
         let th = 2i32;
         let cx = ring.cx as i32;
         let cy = ring.cy as i32;
@@ -23634,6 +23720,7 @@ mod tests {
             cy: 40.0,
             born,
             life: 0.30,
+            scale: 1.0,
         };
 
         // DARK: additive square outline, never a source-over veil.
@@ -23686,6 +23773,90 @@ mod tests {
     /// rainbow-comb ownership bug's sibling, 2026-09-01 audit). The outline
     /// must also stay CLOSED: every edge of the square keeps its light.
     #[test]
+    fn classic_ring_grade_is_floored_and_capped_like_the_kittys() {
+        // Impact 1 (an 8-cell hop or less) is exactly what it was.
+        assert_eq!(classic_ring_radius_factor(1.0), 1.0);
+        assert_eq!(classic_ring_life(0.18, 1.0), 0.18);
+        // Below the floor and non-finite never SHRINK or explode a ring.
+        assert_eq!(classic_ring_radius_factor(0.2), 1.0);
+        assert_eq!(classic_ring_radius_factor(f32::NAN), 1.0);
+        assert_eq!(classic_ring_life(0.18, f32::INFINITY), 0.18);
+        // The cap: twice as wide, 300 ms — Rainbow Kitty's own numbers.
+        assert!((classic_ring_radius_factor(3.5) - 2.0).abs() < 1e-5);
+        assert!((classic_ring_life(0.18, 3.5) - 0.30).abs() < 1e-3);
+        assert_eq!(
+            classic_ring_radius_factor(9.0),
+            classic_ring_radius_factor(3.5),
+            "past the cap is the cap"
+        );
+        // Monotone across the graded range.
+        let mut last = 0.0f32;
+        for i in 0..=25 {
+            let f = classic_ring_radius_factor(1.0 + i as f32 * 0.1);
+            assert!(
+                f >= last,
+                "radius factor dips at impact {}",
+                1.0 + i as f32 * 0.1
+            );
+            last = f;
+        }
+    }
+
+    /// The same ring at the same age: a full-line jump's outline reaches
+    /// further from the landing cell than a hop's, on every square-outline
+    /// theme arm and for the fire flash — the grade is not a no-op.
+    #[test]
+    fn classic_landing_ring_expands_wider_with_the_jump() {
+        let g = geom();
+        let born = Instant::now();
+        let extent = |style: GlowStyle, dark: bool, scale: f32| -> i32 {
+            let c = cfg(style, dark);
+            let glow = CursorGlow {
+                ring: Some(Ring {
+                    cx: 100.0,
+                    cy: 40.0,
+                    born,
+                    life: 0.30,
+                    scale,
+                }),
+                ..Default::default()
+            };
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_ring(
+                born + Duration::from_millis(120),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
+            let quads = out
+                .iter()
+                .map(|q| ((q.x as i32 + q.w as i32 - 1) - 100).max(100 - q.x as i32))
+                .max()
+                .unwrap_or(0);
+            let halos = halos
+                .iter()
+                .map(|h| ((h.x as i32 + h.w as i32 - 1) - 100).max(100 - h.x as i32))
+                .max()
+                .unwrap_or(0);
+            quads.max(halos)
+        };
+        for (style, dark) in [
+            (GlowStyle::Phaser, true),
+            (GlowStyle::Phaser, false),
+            (GlowStyle::Fire, true),
+        ] {
+            let hop = extent(style, dark, 1.0);
+            let leap = extent(style, dark, 3.5);
+            assert!(hop > 0, "{style:?} dark={dark}: the hop ring draws");
+            assert!(
+                leap as f32 >= hop as f32 * 1.8,
+                "{style:?} dark={dark}: a capped-impact ring reaches {leap} px, a hop {hop} px"
+            );
+        }
+    }
+
+    #[test]
     fn landing_ring_bars_partition_the_square_outline() {
         let g = geom();
         let born = Instant::now();
@@ -23697,6 +23868,7 @@ mod tests {
                 cy: 40.0,
                 born,
                 life: 0.30,
+                scale: 1.0,
             };
             let glow = CursorGlow {
                 ring: Some(ring),
@@ -24046,16 +24218,32 @@ mod tests {
         // own art — and the zero-momentum RainbowKitty held, which is the
         // control: the byte change is the ring's and nothing else's
         // (`landing_ring_bars_partition_the_square_outline` pins the geometry).
+        // RECAPTURED for THE CLASSIC LANDING RING'S GRADE (2026-09-08, the
+        // owner's "a bigger impact splash that scales more with the distance
+        // traveled" — `classic_ring_radius_factor` / `classic_ring_life`,
+        // `Ring.scale`): this script's screen-crossing jump is well past the
+        // 8-cell floor, so every style that rings on it took a wider, longer
+        // ring. Exactly the SEVEN ringing rows moved — the six square-outline
+        // styles (Lumen, Phaser, Sparkle, Laser, Beam, Comet) and Water's
+        // ripple train; Fire's flash held here (its strike goes through the
+        // meteor arm, whose ring this script does not reach), the
+        // zero-momentum RainbowKitty held, and the Classic salvage held —
+        // which is the control: the byte change is the graded ring's and
+        // nothing else's. VERIFIED by zeroing the two grade constants on the
+        // merged tree, under which all ten rows fold to the previous numbers.
+        // (The grade's own commit re-minted only the DELETION_GOLDENS kitty
+        // rows; its suite run was filtered to ring/impact/momentum, so this
+        // pin was first read on the merge.)
         const GOLDEN: [u64; 10] = [
-            7_311_572_356_106_409_050,
-            15_992_340_453_230_736_825,
+            10_825_902_740_968_678_692,
+            7_284_969_456_844_567_239,
             0,
-            4_860_916_537_009_075_818,
+            8_478_652_148_696_807_272,
             2_367_067_016_366_301_709,
-            7_722_362_062_232_441_407,
-            4_985_842_062_844_328_140,
-            12_989_637_048_037_794_453,
-            14_542_522_712_162_096_404,
+            8_472_466_222_191_431_873,
+            11_179_281_213_543_892_930,
+            18_232_718_546_775_126_099,
+            8_446_969_558_599_158_774,
             // CLASSIC — captured from this script against the salvaged engine,
             // whose output was verified byte-identical to the real v0.28 build
             // (tag v0.28, `8e7fe4f6f`) over a typing run, a decay and a
@@ -24622,6 +24810,10 @@ halo = "add"
             momentum_display: 0.44,
             glow_active: true,
             pet_active: true,
+            pet_action: "purr",
+            pet_content: 0.42,
+            pet_pending: 1,
+            pet_body: Some((12, 68, 30, 64)),
             cat_active: false,
             block_fill: Some(BlockFill {
                 owner: BlockFillOwner::Rainbow,
@@ -24653,6 +24845,10 @@ halo = "add"
             " momentum_display=0.44",
             " glow_active=true",
             " pet_active=true",
+            " pet_action=purr",
+            " pet_content=0.420",
+            " pet_pending=1",
+            " pet_body=12,68,30,64",
             " cat_active=false",
             " block_fill=rainbow",
             " block_fill_rgb=f02218",
@@ -24733,6 +24929,10 @@ halo = "add"
             // EVERY gate the row used to print, quiet…
             glow_active: false,
             pet_active: false,
+            pet_action: "none",
+            pet_content: 0.0,
+            pet_pending: 0,
+            pet_body: None,
             cat_active: false,
             block_fill: None,
         };
@@ -25079,19 +25279,164 @@ halo = "add"
     /// engage v2, so their rows are the pre-seam engine's bytes, and the
     /// rainbow rows are the seam-era v2's). Row order: the nine built-ins
     /// dark, then rainbow kitty light, underline, reduced-motion.
+    ///
+    /// The four RainbowKitty rows were RE-BAKED 2026-09-08 for the owner's
+    /// "more colour, more emphasis" pass ("I want the meteor to have
+    /// rainbow! be a bigger more special rainbow impact!"): `ribbon.rs` —
+    /// the bed at the bar's edge (`BODY_CONTRAST_GUARD` 0.05,
+    /// `BED_LUMA_MAX` 0.150, the under-target solver), the hot edge in the
+    /// spectrum at the transient cap 118, the wave at `0.110 ch`, every
+    /// live cell on its cohort's clock (`live_since`); `stardust.rs` — the
+    /// coloured sky (halos to the core's level, tinted m2/m3 bodies, the
+    /// aurora veil, the hot field deal); `meteor.rs`/`timing.rs` — the
+    /// rainbow train, corona, shockwave, splash and sparks, off glass at
+    /// T+600. Folded on the MERGED tree of the three (the gate run of that
+    /// day); the nine other rows are the deletion's own and did not move.
+    ///
+    /// RE-BAKED AGAIN the same day, after the gate's two fixes on that
+    /// merged tree: `stardust.rs` holds every star under the caret law's
+    /// ceiling (`STAR_LIGHT_CEIL` — priced on the composited bytes over the
+    /// ground it sits on, the closer dimming the whole star by one factor),
+    /// which moved the drawn bytes; `meteor.rs` splits the fold's cadence
+    /// into the attack (every frame) and the release (the host's train, the
+    /// fold at the floor), which moved `needs_frame_cadence` /
+    /// `next_change_deadline` at the script's fixed steps.
+    ///
+    /// RE-BAKED A FOURTH TIME 2026-09-09: the slipstream (stars born at speed
+    /// drift backwards at the hand's own cadence) and the mend (a typo fixed
+    /// within a breath is born at the momentum it interrupted) move v2's dark,
+    /// light and underline bytes; the reduced row is unmoved (a still sky).
+    /// RE-BAKED A THIRD TIME 2026-09-08, the round after the bold one
+    /// ("make this rainbow theme truly magical and special and dynamic and
+    /// beautiful"): `meteor.rs` — the arrival's white-hot flash dying into
+    /// the spectrum, the shockwave's stroke at 2.5× the bold round's, the
+    /// splash as two sky bands that never enter a glyph row, and haloed
+    /// star sparks at twice the count; `stardust.rs` — the grain's px sizes
+    /// ruled at the 1× cell (`CELL_1X_CH`) and scaled by `ch/14`, the m1/m2
+    /// halo radius off the arm clock, one sky star per cell (the field deal
+    /// adopts, the strike moves or drops) and brightest-first drawing;
+    /// `ribbon.rs` — a scroll translates the field index and the caret
+    /// instead of resetting them (bytes unmoved by it: the script never
+    /// scrolls). Folded on the merged tree of the three; the nine other
+    /// rows did not move.
+    ///
+    /// RE-BAKED A FOURTH TIME 2026-09-08, on the MERGE of that third round
+    /// with the distance-graded landing (the owner's "a bigger impact splash
+    /// that scales more with the distance traveled"): `timing::impact` now
+    /// grades m15's second-round impact — the shockwave's radius (3 → 6 `ch`
+    /// at the cap) and life (480 → 600 ms), the fan's count (19 → 28) and
+    /// reach (2.8 → 6.8 `ch`) — and this script's kill (14 cells) and
+    /// Ctrl-A (20 cells) land above the 8-cell floor. The four RainbowKitty
+    /// rows moved for that. FIRE DARK moved too, for the OTHER half of the
+    /// same ruling: the classic landing ring takes the same grade
+    /// (`classic_ring_radius_factor`, `classic_ring_life`), and Fire's flash
+    /// and aftershock expand on it. The other seven rows held — the control.
+    /// (The grade's own commit re-minted the kitty rows for its 1.3 `ch`
+    /// ring, not m15's 3 `ch` one, and did not read Fire's.)
+    ///
+    /// RE-BAKED A FIFTH TIME 2026-09-09 — THE FAN GRADE'S EXPRESSION FIXED.
+    /// The fourth bake's four kitty numbers (dark 5_181_681_818_849_286_277,
+    /// light 15_060_307_760_572_643_170, underline 3_208_445_556_075_229_922,
+    /// reduced 13_984_872_238_427_905_104) encoded a mis-fit: `mint_landing`
+    /// wrote `FAN_N_BASE + FAN_N_PER_IMPACT * impact` (and the reach the
+    /// same way) under constants re-fitted to the `(impact − 1)` form the
+    /// ring, the classic ring and every const assert use — 23 stars over
+    /// 4.4 `ch` at the 8-cell floor instead of m15's 19 over 2.8, saturated
+    /// by ≈ 30 cells. `meteor::fan_count` / `fan_reach_ch` carry the law
+    /// now, pinned at floor and cap; the kill (14 cells) and Ctrl-A (20
+    /// cells) here land a smaller, correctly graded fan. Exactly the FOUR
+    /// RainbowKitty rows moved; the eight others held — the control.
+    ///
+    /// RE-BAKED A SIXTH TIME 2026-09-09 — THE BED'S DIM STOPS (the owner:
+    /// "there are gaps black gaps in the rainbow a few characters back from
+    /// the cursor"). `ribbon::bed_ink` now spends chroma before white
+    /// (`onto_luma`: a dark stop is taken up through its own hue to full
+    /// value and only then toward white — indigo on the default theme
+    /// `(112, 52, 155)` → `(118, 0, 205)`), the crossing's authored `S 0.53`
+    /// is given back at the bed's read (`BED_SAT_FLOOR`), and the hot edge
+    /// takes the same lift (`hot_edge_ink`). EXACTLY THREE rows moved —
+    /// dark `6_963_335_580_286_069_896` → `4_513_269_044_794_059_716`,
+    /// underline `7_863_611_541_446_512_099` → `5_561_586_697_592_017_299`,
+    /// reduced `9_161_098_340_088_343_982` → `10_372_081_128_516_681_772` —
+    /// and the LIGHT row held (`6_228_993_948_126_662_541`), which is the
+    /// control: the light theme's bed is `InkRole::ink`, not `bed_ink`, and
+    /// has no hot edge (L6), so a change confined to the dark bed's ink and
+    /// the hairline can move exactly these three and nothing else. The eight
+    /// non-kitty rows held too. Every bar-side pin (`letters_stay_legible_*`,
+    /// `the_dimmest_stop_*`, `the_bed_sits_at_the_bar_*`,
+    /// `every_stop_of_the_arc_composites_at_one_weight`) read the same
+    /// numbers before and after: the recipe moved chroma, not luminance.
+    ///
+    /// RE-BAKED A SEVENTH TIME 2026-09-09 — THE WAKE (R5; the owner: "I like
+    /// the streak effect, but leave more a rainbow after effect", "I want
+    /// more of a trailing cursor rainbow effect"). A same-row navigation
+    /// jump now LAYS the corridor it crossed (`ribbon::wake`, newest at the
+    /// landing, `WAKE_MAX_CELLS` back from it, taking over the live band's
+    /// cells on the walk they had) and a navigation hop lays a short one;
+    /// the script's `note_motion` jumps at 1000 ms (14 → 34), 1700 ms
+    /// (20 → 0) and its hop at 2300 ms (4 → 9) are exactly those gestures.
+    /// EXACTLY THE FOUR RainbowKitty rows moved — dark
+    /// `4_513_269_044_794_059_716` → `1_559_379_337_883_191_330`, light
+    /// `6_228_993_948_126_662_541` → `11_168_686_335_249_599_596`, underline
+    /// `5_561_586_697_592_017_299` → `4_181_101_903_882_768_273`, reduced
+    /// `10_372_081_128_516_681_772` → `16_452_127_564_566_527_183` — the light
+    /// row with them this time because the wake is laid geometry, not dark
+    /// ink, and the light bed draws it too. The eight non-kitty rows held.
+    /// DECOMPOSED: with the wake's two arms switched off in place (the
+    /// `wakes` predicate and the hop arm forced false, everything else of
+    /// the commit — `place`, `abandon(_, keep)`, the pre-birth guard in
+    /// `env_of` — left in) all four rows read their previous values again.
+    ///
+    /// RE-BAKED AN EIGHTH TIME 2026-09-09 — THE WAKE'S REPAIR (review of
+    /// the wake: a hop's cells joined the typed word's cohort and refreshed
+    /// its clock; the wake's walk was anchored at the landing and repainted
+    /// stops past `walk_t`'s kink; a band already retracting was taken over
+    /// and frozen). Now a hop's new cells go into a WAKE cohort of their
+    /// own (`Cohort::wake`, `join_wake_cohort`) and the word's clock, phase
+    /// and bounds are untouched; the wake shares the band's own
+    /// `(anchor_col, t0)` (`wake_origin`); and a retracting or abandoned
+    /// cohort's cells are never taken over nor laid under. The same four
+    /// RainbowKitty rows moved — dark `1_559_379_337_883_191_330` →
+    /// `9_309_284_957_880_150_073`, light `11_168_686_335_249_599_596` →
+    /// `14_288_785_307_851_792_380`, underline `4_181_101_903_882_768_273` →
+    /// `2_407_247_862_092_338_810`, reduced `16_452_127_564_566_527_183` →
+    /// `4_582_082_343_011_259_820` — the eight non-kitty rows held.
+    /// DECOMPOSED, each clause toggled back in place: all three old → the
+    /// four previous values exactly; the leaving-band clause alone old →
+    /// those values exactly (no jump in this script lands in a retracting
+    /// band, so it contributes nothing here); the old landing anchor alone
+    /// → `6_970_898_741_549_892_352 / 14_693_874_922_185_261_812 /
+    /// 17_088_784_654_736_242_535 / 2_991_102_607_294_635_813` (the 1000 ms
+    /// jump 14 → 34 crosses the kink from the word's origin at 4); the old
+    /// hop join alone → `3_293_823_338_448_505_247 /
+    /// 2_407_082_770_710_709_828 / 12_036_005_192_191_222_172 /
+    /// 3_609_780_069_397_637_626` (the 2300 ms hop no longer restarts the
+    /// row-3 word's grace, so it swooshes 180 ms earlier). Then the
+    /// RETRACT'S TARGET was frozen at the caret column the retract began
+    /// under (`Cohort::retract_col`) — a leaving mark no longer follows the
+    /// caret across the row — and three rows moved once more: dark
+    /// `9_309_284_957_880_150_073` → `9_430_650_487_507_223_919`, light
+    /// `14_288_785_307_851_792_380` → `5_660_464_995_143_636_586`, underline
+    /// `2_407_247_862_092_338_810` → `15_155_705_891_344_270_438`; the
+    /// reduced row HELD (`retract_x` is inert under reduced motion, §6.11),
+    /// which is the decomposition's control; and with the target toggled
+    /// back to the live caret the three read their previous values again
+    /// (the row-2 cohorts abandoned at 1000 and 1700 ms retract while the
+    /// caret goes on to 35–37 and then to row 3 — under the old law they
+    /// followed it).
     const DELETION_GOLDENS: [(&str, u64); 12] = [
         ("Lumen dark", 1_264_411_311_373_267_895),
         ("Phaser dark", 2_726_566_909_586_900_035),
-        ("RainbowKitty dark", 7_119_714_764_508_997_887),
+        ("RainbowKitty dark", 952_090_913_515_946_647),
         ("Sparkle dark", 14_969_905_489_495_276_903),
-        ("Fire dark", 4_372_954_880_431_801_087),
+        ("Fire dark", 12_618_090_056_209_866_428),
         ("Laser dark", 1_955_324_598_530_313_952),
         ("Beam dark", 15_086_158_732_367_022_435),
         ("Water dark", 482_165_703_607_766_578),
         ("Comet dark", 14_523_124_226_784_523_753),
-        ("RainbowKitty light", 4_619_354_103_071_899_091),
-        ("RainbowKitty underline", 439_699_524_830_923_601),
-        ("RainbowKitty reduced", 8_993_227_030_587_030_911),
+        ("RainbowKitty light", 654_842_353_775_665_666),
+        ("RainbowKitty underline", 10_675_176_284_471_571_526),
+        ("RainbowKitty reduced", 4_582_082_343_011_259_820),
     ];
 
     /// THE ONE HARD LAW OF THE DELETION (§17.3 phase 7): with v2
@@ -25124,14 +25469,24 @@ halo = "add"
     fn rainbow_kitty_is_byte_identical_to_the_seam_era_v2() {
         let rows = deletion_goldens();
         let mut checked = 0;
+        // Every kitty row is read before any is judged, so one re-bake shows
+        // all four moved numbers at once instead of one per run.
+        let mut moved = Vec::new();
         for ((name, got), (want_name, want)) in rows.iter().zip(DELETION_GOLDENS) {
             assert_eq!(name, want_name);
             if !name.starts_with("RainbowKitty") {
                 continue;
             }
             checked += 1;
-            assert_eq!(*got, want, "{name}: the deletion moved a v2 byte");
+            if *got != want {
+                moved.push(format!("{name}: got {got} want {want}"));
+            }
         }
+        assert!(
+            moved.is_empty(),
+            "the deletion moved a v2 byte:\n{}",
+            moved.join("\n")
+        );
         assert_eq!(checked, 4);
     }
 
@@ -25318,6 +25673,98 @@ halo = "add"
             on_echo > 0 && on_echo * 4 >= on_next,
             "the frame that echoes the key shows its ribbon cell: echo tick light {on_echo} \
              vs next tick {on_next} — the glyph presents without its colour"
+        );
+    }
+
+    /// **A LINE STILL BEING TYPED HAS NO DARK CELL INSIDE ITS LIVE SPAN**
+    /// (the owner's screenshot, 2026-09-08: "rainbow" lit, "theme" DARK,
+    /// "truly" half lit, "magical" lit, "and" DARK, "specai" lit at the
+    /// caret — "fix the black rainbow cursor trail gap"). The owner's
+    /// sentence, 60 keys at a HUMAN 7 cps — fast words, a thinking pause
+    /// before some of them, one slow word — each echo observed on the tick
+    /// after its key, ticks at 60 Hz. On EVERY tick while the hand is still
+    /// typing, every glyph cell from the first key to the caret's neighbour
+    /// is a live ribbon cell: no hole inside the span, and no tail dropped
+    /// while the hand has not stopped. FAILED before the cohort-shared life:
+    /// a cell's life was priced once at birth from the spine, so a word typed
+    /// at a dip (after a pause, or slowly) died BEFORE the hotter, older
+    /// word beside it — a dark word inside the live span — and the oldest
+    /// cells died on their own 1.7 s clock under a hand that had not lifted.
+    #[test]
+    fn a_line_still_being_typed_has_no_dark_cell_inside_its_live_span() {
+        let g = Geom {
+            cols: 120,
+            win_w: 960,
+            ..geom()
+        };
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let row = 2u16;
+        let col0 = 2u16;
+        glow.tick(Some((row, col0)), t0, &c, g, &mut out);
+        // `(word, ms per key, thinking pause before the word)` — 60 keys,
+        // 8.6 s: 7 cps on average.
+        let words: [(&str, u64, u64); 12] = [
+            ("what ", 125, 0),
+            ("more ", 125, 0),
+            ("can ", 125, 0),
+            ("we ", 125, 0),
+            ("do ", 125, 0),
+            ("to ", 125, 0),
+            ("make ", 125, 0),
+            ("this ", 125, 0),
+            ("rainbow ", 110, 0),
+            ("theme ", 250, 700),
+            ("truly ", 125, 0),
+            ("magical", 110, 500),
+        ];
+        let tick = Duration::from_micros(16_667);
+        let mut caret = col0;
+        let mut now = t0;
+        let mut key_at = t0;
+        let mut keys = 0u16;
+        let mut holes: Vec<String> = Vec::new();
+        let mut echo_pending: Option<(Instant, u16)> = None;
+        for (word, per_key_ms, pause_ms) in words {
+            key_at += Duration::from_millis(pause_ms);
+            for ch in word.chars() {
+                key_at += Duration::from_millis(per_key_ms);
+                keys += 1;
+                while now + tick <= key_at {
+                    now += tick;
+                    if let Some((at, to)) = echo_pending
+                        && now >= at
+                    {
+                        caret = to;
+                        echo_pending = None;
+                    }
+                    glow.tick(Some((row, caret)), now, &c, g, &mut out);
+                    let cols = v2_cols(&glow, row);
+                    let dark: Vec<u16> = (col0..caret).filter(|c| !cols.contains(c)).collect();
+                    if !dark.is_empty() && holes.len() < 8 {
+                        holes.push(format!(
+                            "+{:.3}s keys={keys} caret={caret} dark={dark:?}",
+                            now.saturating_duration_since(t0).as_secs_f32()
+                        ));
+                    }
+                }
+                let class = if ch == ' ' {
+                    rk::TypedClass::Space
+                } else {
+                    rk::TypedClass::Glyph
+                };
+                glow.supersede_typed_press(key_at);
+                glow.note_typed_glyph(key_at, 1, false, class);
+                echo_pending = Some((key_at + Duration::from_millis(9), caret + 1));
+            }
+        }
+        assert_eq!(keys, 60);
+        assert!(
+            holes.is_empty(),
+            "a line still being typed has a dark cell inside its live span:\n{}",
+            holes.join("\n")
         );
     }
 

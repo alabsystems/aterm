@@ -7961,8 +7961,10 @@ struct WindowState {
     /// by the renderers for the `Blinking*` DECSCUSR styles.
     blink_phase: bool,
     /// The next blink toggle deadline. Armed ONLY while blinking is active
-    /// (focused window + Blinking* style + cursor visible); `None` keeps the
-    /// event loop in pure `Wait` so an idle steady/unfocused session burns 0%.
+    /// (focused window + Blinking* style + cursor visible — and NOT a blinking
+    /// block the `rainbow kitty` body owns, which is pinned steady on glass
+    /// and never blinks; R4, 2026-09-08); `None` keeps the event loop in pure
+    /// `Wait` so an idle steady/unfocused/rainbow session burns 0%.
     next_blink: Option<Instant>,
     /// M2 quit-safety: armed (a ~2 s deadline) when a close/quit request is REFUSED
     /// because a foreground job is running. While armed the titlebar shows
@@ -8021,6 +8023,10 @@ struct WindowState {
     /// riding the aurora's surge (typing heat / jump splash). Settles to still
     /// water on the blink cadence.
     cursor_droplet: crate::cursor_droplet::CursorDroplet,
+    /// The typing-momentum glow (`aterm_effects::cursor_momentum`): glows with
+    /// key rate, cools down, suppresses blink while warm. Fed at the printable
+    /// key, ticked beside the other cursor bodies.
+    momentum_glow: aterm_effects::cursor_momentum::MomentumGlow,
     /// LIGHT-ROD-CURSOR state (the `beam` cursor body): the bar becomes a vertical
     /// rod of light / the block a charged emitter, riding the aurora's blaze so the
     /// cursor and the tube it lays read as one beam. Settles on the blink cadence.
@@ -9417,6 +9423,7 @@ impl WindowState {
             || self.word_decos.is_active(now)
             || self.cursor_rainbow.is_active()
             || self.cursor_droplet.is_active()
+            || self.momentum_glow.is_active()
             || self.cursor_beamrod.is_active()
             || self.cursor_fireball.is_active()
             || self.cursor_comet.is_active()
@@ -9892,6 +9899,7 @@ impl WindowState {
         self.cursor_glow.reset();
         self.cursor_rainbow = crate::cursor_rainbow::CursorRainbow::default();
         self.cursor_droplet = crate::cursor_droplet::CursorDroplet::default();
+        self.momentum_glow.reset();
         self.cursor_beamrod = crate::cursor_beam::CursorBeamRod::default();
         self.cursor_fireball = crate::cursor_fireball::CursorFireball::default();
         self.cursor_comet = crate::cursor_comet::CursorComet::default();
@@ -10329,6 +10337,7 @@ impl WindowState {
             cursor_glow: crate::cursor_glow::CursorGlow::default(),
             cursor_rainbow: crate::cursor_rainbow::CursorRainbow::default(),
             cursor_droplet: crate::cursor_droplet::CursorDroplet::default(),
+            momentum_glow: aterm_effects::cursor_momentum::MomentumGlow::default(),
             cursor_beamrod: crate::cursor_beam::CursorBeamRod::default(),
             cursor_fireball: crate::cursor_fireball::CursorFireball::default(),
             cursor_comet: crate::cursor_comet::CursorComet::default(),
@@ -12284,15 +12293,16 @@ struct App {
     /// points at us (the child repointed it at ITS bind — the guard keeps it).
     sock_plan: Option<control_auth::SocketPlan>,
     sock_bound: Arc<std::sync::atomic::AtomicBool>,
-    /// Set for the duration of a DELIBERATE, non-interactive close (the control
-    /// socket's `tab close` verb, driven on the main loop by [`Wake::TabCmd`]).
-    /// [`App::confirm_destructive_close`] reads it to SKIP the blocking native
-    /// confirm dialog for such closes: a scripted close is an explicit instruction,
-    /// not a stray user gesture, so it must proceed immediately rather than wedge the
-    /// UI thread (and the client's blocking reply) on a human clicking a modal. User
-    /// gestures (Cmd-Q, the red close button, Cmd-W, the tab-strip / native `✕`) leave
-    /// it `false` and still confirm.
-    close_confirm_suppressed: bool,
+    /// The confirm policy of the close IN PROGRESS ([`app_window::CloseConfirm`]):
+    /// `Interactive` at rest, set by every control-socket close arm for the
+    /// duration of its action — `Programmatic` for `tab close` (proceed, no
+    /// dialog) and the operator's Stop row, `WireRefuseBusy` for the `close` verb
+    /// (no dialog; refuse a running job). [`App::confirm_destructive_close`] reads
+    /// it so a scripted close never wedges the UI thread (and the client's
+    /// blocking reply) on a human clicking a modal. User gestures (Cmd-Q, the red
+    /// close button, Cmd-W, the tab-strip / native `✕`) run at rest and still
+    /// confirm.
+    close_confirm: app_window::CloseConfirm,
     /// Soft frame-cap interval for bulk PTY output — the actual display refresh
     /// period, resolved from the primary monitor in `resumed()` (e.g. 16.7ms for
     /// 60Hz, 8.3ms for 120Hz ProMotion). Defaults to [`MIN_FRAME_INTERVAL`] until
@@ -15314,7 +15324,7 @@ impl App {
             headless: true,
             sock_plan: None,
             sock_bound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            close_confirm_suppressed: false,
+            close_confirm: app_window::CloseConfirm::Interactive,
             frame_interval: MIN_FRAME_INTERVAL,
             bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
             trail_audio: trail_audio::TrailAudio::new(false),
@@ -17783,6 +17793,61 @@ impl App {
     }
 }
 
+/// Whether the 1.887 Hz blink clock (`DeadlineOwner::Blink`) is armed for a
+/// focused window's front terminal: the cursor is visible, its style is a
+/// Blinking* one, and the caret is NOT a blinking block the `rainbow kitty`
+/// body owns (`rainbow_caret_policy`: the app-level half of R4's pair — the
+/// style is `RainbowKitty`, enabled, with amplitude, and the serious policy
+/// allows a cursor body). Under the rainbow the block is pinned steady on
+/// glass and never blinks, so its clock is never armed — whatever the
+/// typing-momentum glow's temperature, which is not an input. Pure, so the
+/// law is pinned in `blink_clock_law_tests`.
+fn blink_clock_armed(cursor_visible: bool, style: CursorStyle, rainbow_caret_policy: bool) -> bool {
+    let rainbow_owns_caret = rainbow_caret_policy && matches!(style, CursorStyle::BlinkingBlock);
+    cursor_visible
+        && matches!(
+            style,
+            CursorStyle::BlinkingBlock | CursorStyle::BlinkingUnderline | CursorStyle::BlinkingBar
+        )
+        && !rainbow_owns_caret
+}
+
+#[cfg(test)]
+mod blink_clock_law_tests {
+    use super::{CursorStyle, blink_clock_armed};
+
+    /// LAW 1, the rainbow half at the clock: with the rainbow owning the
+    /// caret, `DeadlineOwner::Blink` is never armed for a blinking block —
+    /// and the predicate takes no momentum input, so "regardless of
+    /// momentum temperature" holds by construction.
+    #[test]
+    fn under_the_rainbow_the_blink_clock_is_never_armed() {
+        assert!(!blink_clock_armed(true, CursorStyle::BlinkingBlock, true));
+        // Bars and underlines take no rainbow body: they blink as configured.
+        assert!(blink_clock_armed(true, CursorStyle::BlinkingBar, true));
+        assert!(blink_clock_armed(
+            true,
+            CursorStyle::BlinkingUnderline,
+            true
+        ));
+    }
+
+    /// The other half: under a classic style the clock is armed exactly when
+    /// the terminal asked for a visible blinking cursor. (While the momentum
+    /// glow is warm the RENDERED shape is pinned steady by the composed
+    /// override in `app_render.rs`; the clock underneath is untouched.)
+    #[test]
+    fn under_a_classic_style_the_blink_clock_follows_the_terminal() {
+        assert!(blink_clock_armed(true, CursorStyle::BlinkingBlock, false));
+        assert!(blink_clock_armed(true, CursorStyle::BlinkingBar, false));
+        assert!(!blink_clock_armed(true, CursorStyle::SteadyBlock, false));
+        assert!(
+            !blink_clock_armed(false, CursorStyle::BlinkingBlock, false),
+            "hidden: no clock"
+        );
+    }
+}
+
 impl ApplicationHandler<Wake> for App {
     fn new_events(&mut self, _el: &ActiveEventLoop, cause: StartCause) {
         crate::metrics::note_event_wake(match cause {
@@ -18488,6 +18553,32 @@ impl ApplicationHandler<Wake> for App {
             .map(|c| Duration::from_millis(1000 / u64::from(c.fps)));
         let output_streak_idle_secs = self.config.output_streak_idle_secs_or_default();
         let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
+        // R4 (owner, 2026-09-08, twice): *"I don't like the blinking cursor"*.
+        // THE RAINBOW OWNS THE CARET: whenever the `rainbow kitty` block body
+        // may run at all — the same app-level half of the pair the render
+        // path's `rainbow_block` resolves (`app_render.rs`, the
+        // `RainbowConfig { enabled, .. }` build) — a focused BLINKING BLOCK is
+        // pinned steady on glass and must therefore never arm
+        // `DeadlineOwner::Blink`: the `Some(false)` arm below clears
+        // `next_blink`, forces `blink_phase = true` and asks for one redraw, so
+        // the block lands SOLID and the 1.887 Hz wake is retired for that
+        // window, forever. Removing the blink removes a timer; it adds none.
+        // Read before borrowing windows, like every other policy input here.
+        // The per-window half (focused, visible, BlinkingBlock) is folded at the
+        // predicate. Reduce Motion and load shed zero the amplitude, the render
+        // path then leaves `fill` None, and the plain blink is provably
+        // restored on the next fold — the documented escape hatch.
+        let rainbow_caret_policy = {
+            let glow = self.glow_config();
+            glow.enabled
+                && glow.intensity > 0.0
+                && matches!(glow.style, crate::cursor_glow::GlowStyle::RainbowKitty)
+                && serious_policy.allows(crate::motion::SeriousEffect::CursorBody)
+                && self
+                    .motion_policy(true)
+                    .amplitude(crate::motion::MotionEffect::CursorGlow)
+                    > 0.0
+        };
         for (id, ws) in self.windows.iter_mut() {
             // Input hinting is shared with normal mode and may have charged a cursor
             // animator since the transition. Serious mode drains those hints before
@@ -18520,13 +18611,22 @@ impl ApplicationHandler<Wake> for App {
             } else if !headless && ws.os_window.is_some() && ws.focused {
                 match ws.front_terminal() {
                     Some(terminal) => terminal.term.try_lock().ok().map(|term| {
-                        term.cursor_visible()
-                            && matches!(
-                                term.cursor_style(),
-                                CursorStyle::BlinkingBlock
-                                    | CursorStyle::BlinkingUnderline
-                                    | CursorStyle::BlinkingBar
-                            )
+                        // The window half of R4's pair: a blinking BLOCK the
+                        // rainbow body owns is pinned steady on glass, so its
+                        // blink is never armed. Bars and underlines take no
+                        // block body and blink as they always did. The
+                        // typing-momentum glow is NOT an input here on
+                        // purpose (the one blink law, `app_render.rs`
+                        // `compose_caret_style_override`): under every other
+                        // style it pins the RENDERED shape steady while warm
+                        // and hands the blink back when cool — the clock
+                        // keeps running underneath, so nothing has to be
+                        // re-armed on the cool-down edge.
+                        blink_clock_armed(
+                            term.cursor_visible(),
+                            term.cursor_style(),
+                            rainbow_caret_policy,
+                        )
                     }),
                     None => Some(false),
                 }
@@ -20251,13 +20351,13 @@ impl ApplicationHandler<Wake> for App {
                 // client's blocking reply on a human click). Suppress the confirm for
                 // the duration of this programmatic action; a stray user gesture
                 // (Cmd-W, the strip/native `✕`) is a different path that still confirms.
-                self.close_confirm_suppressed = true;
+                self.close_confirm = app_window::CloseConfirm::Programmatic;
                 let state = self.apply_tab_cmd(action);
                 // A `tab close` of the front window's LAST tab flags `pending_close`;
                 // escalate it (we have `el` here) so the window actually tears down —
                 // mirrors the keyboard/menu/strip close paths.
                 self.escalate_pending_close(el);
-                self.close_confirm_suppressed = false;
+                self.close_confirm = app_window::CloseConfirm::Interactive;
                 let _ = reply.send(state);
             }
             Wake::TabCmdAimed {
@@ -20813,8 +20913,19 @@ impl ApplicationHandler<Wake> for App {
                 // `subscribe` stream. That ordering is the `close` verb entry's
                 // promise that this reply is the instance's last word; it holds
                 // only while the reply is sent from inside this same turn.
+                // THE WIRE POLICY, for the whole of this arm: `close` is the one
+                // control-socket close that used to run with the confirm ARMED,
+                // so an idle last-tab close of a windowed instance reached the
+                // native "quit aterm?" dialog — `NSAlert runModal` on this very
+                // thread — and the reply above could only come after a human
+                // clicked. `WireRefuseBusy` is the catalog entry's contract: no
+                // dialog ever; an idle close proceeds (ending the process when
+                // the tab was the last window's), a running job is REFUSED with
+                // `ERR close refused (a running job armed the last-tab confirm)`.
+                self.close_confirm = app_window::CloseConfirm::WireRefuseBusy;
                 let progress = self.close_session_by_id(session);
                 self.escalate_pending_close(el);
+                self.close_confirm = app_window::CloseConfirm::Interactive;
                 let _ = reply.send(
                     progress.and_then(|progress| self.close_session_verdict(session, progress)),
                 );
@@ -25157,7 +25268,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         headless,
         sock_plan: sock_plan.clone(),
         sock_bound: sock_bound.clone(),
-        close_confirm_suppressed: false,
+        close_confirm: app_window::CloseConfirm::Interactive,
         frame_interval: MIN_FRAME_INTERVAL,
         bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
         // A flood measurement that wants zero audio threads sets `serious_mode`
@@ -37416,7 +37527,7 @@ mod spec_xref_gate {
              below would have absorbed it"
         );
         assert_eq!(
-            total, 148,
+            total, 149,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -37450,7 +37561,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 147-machine DesignOnly report shape must classify honestly"
+            "the live DesignOnly report shape must classify honestly"
         );
     }
 

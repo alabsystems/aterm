@@ -25,6 +25,11 @@ aterm-containment = { workspace = true }
 # diagnostic subcommand that prints and exits before any PTY spawn.
 aterm-render = { workspace = true }
 aterm-types = { workspace = true }
+# `aterm help rust` calls the REAL toolchain discovery (`Toolchain::discover`)
+# rather than restating it: a second copy of "which toolchain wins" would
+# disagree with the first inside a year. aterm-verify has zero dependencies by
+# charter, so this costs the one binary nothing at link time.
+aterm-verify = { workspace = true }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
 # `--containment` hands its selection to the init funnel through the env var that
 # funnel reads, and every mutation in the workspace routes through that helper

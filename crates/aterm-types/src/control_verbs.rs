@@ -1085,7 +1085,8 @@ pub const VERBS: &[VerbSpec] = &[
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
          momentum_display= glow_active= pet_active= cat_active= \
-         block_fill= block_fill_rgb= block_fill_base= block_fill_base_from=` (every gate \
+         block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
+         pet_action= pet_content= pet_pending= pet_body=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
@@ -1099,8 +1100,16 @@ pub const VERBS: &[VerbSpec] = &[
          FROM and which source supplied it (`cursor_color`/`trail_color`/`style_identity`, \
          or `white` — a CursorColor-based owner handed no pinned cursor colour builds from \
          the theme-polar white, and the shipped-default rainbow style takes that path) — \
-         so a caret that ignored OSC 12 is separable from one that honoured it. Read-only; \
-         typed text is never reported",
+         so a caret that ignored OSC 12 is separable from one that honoured it. In a \
+         `--headless` instance the engine ticks only while a capture drives its clock (`image` \
+         after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
+         head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
+         - judge stars from row 1 or lower. Read-only; typed text is never reported. \
+         `pet_action` names the resident brain's current action \
+         in lowercase (`none` without a drawn body), `pet_content` is earned contentment \
+         in 0..1, and `pet_pending` counts queued clicks/strokes. `pet_body` is the last \
+         drawn body as `x0,x1,y0,y1` in frame pixels, right/bottom exclusive, or `none`; \
+         these are observations, and reading them never advances the pet",
     ),
     // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven
     // custody-moving events last fired. Several of them leave identical state behind
@@ -1167,7 +1176,10 @@ pub const VERBS: &[VerbSpec] = &[
          unresolvable sid, or one no window holds, is `ERR no such session`. `ERR close refused \
          (a running job armed the last-tab confirm)` = the destructive-close confirm did not let \
          a LAST-tab close through and the tab is still there (a `--headless` instance never \
-         confirms, so it never answers this). Closing a window's LAST tab DEFERS the window \
+         confirms, so it never answers this). That refusal is the verb's WHOLE confirm: a wire \
+         close never shows a dialog - an idle last tab closes at once, and only a running \
+         foreground job refuses it - so a driver is never left waiting on a human click it \
+         cannot give. Closing a window's LAST tab DEFERS the window \
          teardown that retires the session (that teardown needs the event loop), so the verb \
          waits for the escalation before answering; if the session is still registered after it, the \
          reply names WHICH deferral it is looking at: `ERR close deferred (the window teardown \

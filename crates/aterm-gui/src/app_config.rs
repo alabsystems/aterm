@@ -140,6 +140,14 @@ pub(crate) struct Config {
     /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
     /// exactly idle at rest; set `cursor_trail = false` to opt out.
     pub(crate) cursor_trail: Option<bool>,
+    /// TYPING-MOMENTUM GLOW — the cursor glows with how fast you type and
+    /// cools down when you stop; while warm it does not blink. DEFAULT ON
+    /// (owner, 2026-09-08: "the blinking cursor is annoying, I want some
+    /// momentum glow for typing faster that cools down"); set
+    /// `cursor_momentum_glow = false` to opt out. Any style, any shape; it
+    /// rides the cursor-effects lane, so `cursor_trail = false` (the effects
+    /// master) turns it off with everything else.
+    pub(crate) cursor_momentum_glow: Option<bool>,
     /// Trail STYLE: `rainbow kitty pet` (DEFAULT — the smooth momentum-driven
     /// rainbow ribbon with the full-body cat that walks, runs and pounces along
     /// the line), `rainbow kitty` (THE SAME THING: since 2026-08-26 every
@@ -3267,6 +3275,11 @@ impl Config {
         self.cursor_trail.unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
+    /// The typing-momentum glow (default ON; `cursor_momentum_glow = false`).
+    pub(crate) fn cursor_momentum_glow_or_default(&self) -> bool {
+        self.cursor_momentum_glow.unwrap_or(true)
+    }
+
     /// Whether a config APPLY should warm the demand-driven effect pipelines
     /// (`aterm_gpu::EffectPipeline`) off the frame path.
     ///
@@ -3322,7 +3335,10 @@ impl Config {
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
     /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
-        self.trail_sound_bed.unwrap_or(false)
+        // ON by default — the owner, 2026-09-09: "i don't know what rainbow sky
+        // bed is but turn it on and let me see it". The pad is voiced from the
+        // live chord, so the derived line always lands in key over it.
+        self.trail_sound_bed.unwrap_or(true)
     }
 
     /// Sing-along RIFF on/off (`trail_sound_riff`, default ON — a shipped
@@ -12303,7 +12319,10 @@ mod cfg_engine_tests {
     /// round-trips, and `true` re-enables the bed at the drain seams.
     #[test]
     fn trail_sound_bed_defaults_off_and_round_trips() {
-        assert!(!Config::default().trail_sound_bed_or_default());
+        assert!(
+            Config::default().trail_sound_bed_or_default(),
+            "the owner turned the bed ON by default (2026-09-09)"
+        );
         assert!(cfg("trail_sound_bed = true").trail_sound_bed_or_default());
         assert!(!cfg("trail_sound_bed = false").trail_sound_bed_or_default());
     }

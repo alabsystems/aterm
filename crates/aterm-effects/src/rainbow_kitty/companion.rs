@@ -1639,6 +1639,7 @@ mod tests {
             phase: 12.0,
             caret: (7, 33),
             caret_t: 0.5,
+            mend: None,
         };
         let s = sense(
             &ctx,
@@ -1744,6 +1745,7 @@ mod tests {
                 // Frozen on purpose: the last landing the licence gate passed.
                 caret: (3, 5),
                 caret_t: 0.25,
+                mend: None,
             };
             let b = v2.tick(sense(
                 &ctx,

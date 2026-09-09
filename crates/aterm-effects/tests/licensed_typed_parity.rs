@@ -698,8 +698,26 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // 0.30..0.72 s. SEVEN of the nine entries move because the jump streak's
         // life is shared by every style that draws one; Fire and Water are
         // byte-identical because they do not.
-        8_384_014_991_348_537_604,
-        16_554_105_343_338_789_366,
+        // RE-BASELINED 2026-09-08 — THE DISTANCE-GRADED LANDING (owner: "a
+        // bigger impact splash that scales more with the distance traveled").
+        // Two laws, one magnitude (`rainbow_kitty::timing::impact`), and the
+        // fold was DECOMPOSED between them on the merged tree by zeroing the
+        // classic grade's two constants (`CLASSIC_RING_RADIUS_PER_IMPACT`,
+        // `CLASSIC_RING_LIFE_PER_IMPACT`): under that, EXACTLY ONE entry still
+        // moves — 2 (RainbowKitty), whose meteor landing is m15's second-round
+        // shockwave/fan graded by the jump (`meteor::ring_full_radius`,
+        // `ring_ms`, `FAN_N_PER_IMPACT`, `FAN_REACH_PER_IMPACT_CH`); with the
+        // constants restored the other SEVEN move too — every style whose
+        // landing ring goes through `cursor_glow::emit_ring` (the six
+        // square-outline styles and Water's ripple), widened and lengthened
+        // by `classic_ring_radius_factor` / `classic_ring_life` on this
+        // script's screen-crossing jump. Fire (4) is the control: its strike
+        // ring is the meteor arm's, which this script does not reach, and its
+        // entry is byte-identical. (The classic grade's own commit re-minted
+        // no golden here; its suite run was filtered to ring/impact/momentum,
+        // so these numbers were first read on the merge.)
+        11_108_773_950_677_089_257,
+        13_440_444_393_441_563_092,
         // RE-BASELINED 2026-09-06 — v1 DELETED (RAINBOW-KITTY-V2.md §17.3
         // phase 7): `rainbow kitty` is its v2 engine unconditionally, so this
         // entry is v2's fold of the same script (and the fold's light channel
@@ -711,13 +729,27 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // withholding every key hint still moves this entry — v2 admits its
         // moves through the same style-agnostic licence gate v1 did (seam
         // point 1 sits AFTER it), so a cold script reaches it with nothing.
-        9_913_598_197_427_658_676,
-        6_783_487_424_150_533_517,
+        // …and re-baselined again 2026-09-08 for the graded landing (above):
+        // 9_913_598_197_427_658_676 → 14_978_377_130_234_467_942, the one
+        // entry the kitty's own grade moves.
+        // RE-CAPTURED 2026-09-09 — THE FAN GRADE'S EXPRESSION FIXED. The
+        // 14_978… number encoded a mis-fit: `mint_landing` wrote
+        // `FAN_N_BASE + FAN_N_PER_IMPACT * impact` (and the same for the
+        // reach) under constants re-fitted to the `(impact − 1)` form the
+        // ring and the classic ring use, so the 8-cell floor threw 23 stars
+        // over 4.4 ch instead of m15's 19 over 2.8 and saturated by ≈ 30
+        // cells. `meteor::fan_count` / `fan_reach_ch` now carry the law
+        // (pinned at floor and cap by `fan_count_and_reach_are_the_graded_
+        // law_at_floor_and_cap`), and this script's jump lands a different
+        // fan. Captured with `ATERM_CAPTURE_TYPED_PARITY=1`: the other EIGHT
+        // came back byte-identical — the fix touches the kitty's fan alone.
+        11_326_000_515_217_637_852,
+        12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
-        14_938_859_424_317_138_785,
-        896_993_405_195_581_747,
-        3_816_899_345_458_622_939,
-        8_233_860_657_484_358_547,
+        13_741_658_660_564_044_123,
+        8_682_652_025_797_884_188,
+        1_945_409_555_229_807_496,
+        13_099_582_226_493_843_556,
     ];
     let styles = ALL_STYLES;
     let mut actual = [0u64; 9];

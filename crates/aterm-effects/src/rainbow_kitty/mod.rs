@@ -488,6 +488,37 @@ pub struct Frame<'a> {
     pub fp: u64,
 }
 
+/// **THE MEND MARK, published for this tick** (§23's addendum "The mend",
+/// 2026-09-08): the typed key this frame carries is a TYPO FIX — it came
+/// within [`spine::MEND_WINDOW_S`] of a Backspace run of at most
+/// [`spine::MEND_MAX_DELETES`] deletes ([`spine::Spine::mend`]) — and this is
+/// the mark it mends. `Some` on exactly the tick that births the fix; `None`
+/// on every other tick, including the erase's own (the erase is the sky's
+/// [`Event::Erase`] as before).
+///
+/// Consumers: the ribbon prices the fix's births at `max(birth_disp, disp)`
+/// ([`Ctx::birth_disp`] floored by [`Mend::disp`]); stardust MAY birth the
+/// fix's m2 from the erased cell's sky position (`row`, `col`) and inherit
+/// the momentum it carried — left to the sky's own law. The meteor and the
+/// caret read nothing here: a mend is a birth price, not a gesture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mend {
+    /// The LAST delete's edge ([`spine::EraseMark::at`]).
+    pub at: Instant,
+    /// The birth spine the deleting interrupted ([`spine::EraseMark::disp`])
+    /// — what the fix is born at when the live `birth_disp` is lower.
+    pub disp: f32,
+    /// The erased cell's row: the caret's row as observed on the last
+    /// delete's tick.
+    pub row: u16,
+    /// The erased cell's column — the cell the last Backspace emptied, which
+    /// is the cell the fix key re-lights. With `deletes` 2 the run emptied
+    /// `col..col + 2`.
+    pub col: u16,
+    /// How many deletes the run counted (1 or 2 — a mend never carries more).
+    pub deletes: u8,
+}
+
 /// The per-tick read-only context handed to every producer.
 ///
 /// One struct rather than eight arguments, so a producer's signature does not
@@ -518,6 +549,8 @@ pub struct Ctx<'a> {
     /// The caret's own field `t` — §6.4's `t_land`, the meteor's phase lock,
     /// and C2's shared colour.
     pub caret_t: f32,
+    /// The mend mark, on the one tick that births a typo fix (see [`Mend`]).
+    pub mend: Option<Mend>,
 }
 
 /// `trail status`'s v2 rows (seam point 12).
@@ -702,6 +735,14 @@ pub struct Engine {
     caret_seam: CaretSeam,
     /// The caret cell as last observed.
     caret: (u16, u16),
+    /// The cell the last Backspace emptied — the caret as of that erase's
+    /// tick (the ribbon's and the sky's own reading of it) — published as
+    /// [`Mend::row`] / [`Mend::col`] when a fix key mends the run.
+    erased: (u16, u16),
+    /// The erase mark a typed key just spent ([`spine::Spine::mend`] read on
+    /// its edge), waiting for the tick that births the key to publish it as
+    /// [`Ctx::mend`]. Taken by that tick.
+    mend: Option<spine::EraseMark>,
     /// The focused pane's `(first column, width)` in grid cells, when the
     /// host has told us (`CursorGlow::note_pane_columns`); a typed fold
     /// wraps at ITS edges, never the grid's. Survives `reset` — it is the
@@ -766,6 +807,8 @@ impl Engine {
             meteor: Meteors::default(),
             caret_seam: CaretSeam::default(),
             caret: (0, 0),
+            erased: (0, 0),
+            mend: None,
             pane: None,
             events: Vec::new(),
             earned: Vec::new(),
@@ -827,12 +870,26 @@ impl Engine {
     /// included, is minted in [`Engine::tick`] after the one `Spine::update`.
     /// The only thing minted on the edge is the kitty's Wince on an erase or a
     /// kill (§8.2's "oops" column): a pose, priced by nothing.
+    ///
+    /// **The mend is read on the edge too** (§23's addendum "The mend"): a
+    /// typed key asks the spine whether it is a typo fix
+    /// ([`spine::Spine::mend`]) BEFORE it advances the metric (the advance
+    /// closes the erase run), and a `Some` is held for the tick that births
+    /// the key, which publishes it as [`Ctx::mend`]. A value, not a timer:
+    /// nothing is armed on a pending mark, and a stale one is simply not a
+    /// mend when the next key reads it.
     pub fn on_event(&mut self, ev: Event, now: Instant) {
         if !self.engaged {
             return;
         }
         match ev {
-            Event::Typed { .. } => self.spine.advance(now),
+            Event::Typed { .. } => {
+                let mend = self.spine.mend(now);
+                self.spine.advance(now);
+                if mend.is_some() {
+                    self.mend = mend;
+                }
+            }
             Event::Erase => {
                 self.spine.drain_delete(now);
                 self.offer(CompanionImpulse::Wince);
@@ -951,6 +1008,7 @@ impl Engine {
         if !self.engaged {
             self.events.clear();
             self.earned.clear();
+            self.mend = None;
             self.fp = 0;
             self.brisk = false;
             return;
@@ -979,6 +1037,20 @@ impl Engine {
             reduced_motion: cfg.reduced_motion || self.reduced_motion,
             ..*cfg
         };
+        // The cell a Backspace emptied is the caret as of ITS tick — the same
+        // reading the ribbon retracts from and the sky throws from — so it is
+        // resolved here, whichever order the host reported the erase and its
+        // retreat in.
+        if self.events.iter().any(|(ev, _)| matches!(ev, Event::Erase)) {
+            self.erased = self.caret;
+        }
+        let mend = self.mend.take().map(|m| Mend {
+            at: m.at,
+            disp: m.disp,
+            row: self.erased.0,
+            col: self.erased.1,
+            deletes: m.count,
+        });
         let mut ctx = Ctx {
             now,
             geom,
@@ -990,6 +1062,7 @@ impl Engine {
             // Last frame's answer: the ribbon ingests against it and nothing
             // else reads it before it is re-sampled below.
             caret_t: self.ribbon.field_at_caret(),
+            mend,
         };
 
         // Pass 1 — the ribbon INGESTS, then PLANS. The field index exists
@@ -1383,6 +1456,8 @@ impl Engine {
         // The caret is learned from the next observed move; a key before it
         // lays nowhere rather than at a cell the reset forgot the meaning of.
         self.caret = (0, 0);
+        self.erased = (0, 0);
+        self.mend = None;
         self.events.clear();
         self.earned.clear();
         self.pending_cues.clear();
@@ -1410,7 +1485,7 @@ impl Engine {
         if !self.engaged || rows == 0 {
             return;
         }
-        self.ribbon.translate_scroll(rows, cell_h);
+        self.ribbon.translate_scroll(rows);
         self.meteor.translate_scroll(rows, cell_h);
         self.stardust.translate_scroll(rows, cell_h);
         // The caret is a POSITION, not a mark: it cannot be dropped, and the
@@ -1924,6 +1999,300 @@ mod tests {
             eng.take_companion_impulse(),
             Some(CompanionImpulse::Meteor { .. })
         ));
+    }
+
+    /// One 120 Hz tick — the design's reference cadence (§18).
+    const TICK: Duration = Duration::from_micros(8_333);
+
+    /// Drive `eng` through the tick indices `ticks` at 120 Hz on `t0`'s
+    /// clock, reporting the events scheduled on a tick BEFORE that tick, as
+    /// the host's seam does (T2: an event and its frame share a `now`).
+    fn drive_ticks(
+        eng: &mut Engine,
+        sc: &mut Scratch,
+        t0: Instant,
+        ticks: std::ops::RangeInclusive<u64>,
+        sched: &[(u64, Event)],
+    ) {
+        let cfg = config();
+        for i in ticks {
+            let now = t0 + TICK * u32::try_from(i).expect("a short script");
+            for (_, ev) in sched.iter().filter(|(at, _)| *at == i) {
+                eng.on_event(*ev, now);
+            }
+            let mut fr = sc.frame();
+            eng.tick(now, geom(), &cfg, &mut fr);
+        }
+    }
+
+    /// The live (not retracting) ribbon cell at `(row, col)`.
+    fn live_cell(eng: &Engine, row: u16, col: u16) -> Option<ribbon::Cell> {
+        eng.ribbon
+            .cells()
+            .iter()
+            .find(|c| c.row == row && c.col == col && c.retract_at.is_none())
+            .copied()
+    }
+
+    /// THE TYPO SCRIPT (§23's addendum "The mend"): eight keys at 8 cps from
+    /// column 4 of row 3 — every 15th tick — then a Backspace one key-slot
+    /// later, then the fix key one slot after that. Returns the schedule and
+    /// the ticks of the erase and the fix.
+    fn typo_script(
+        erase_after: u64,
+        deletes: u16,
+        fix_after: u64,
+    ) -> (Vec<(u64, Event)>, u64, u64) {
+        let mut out = Vec::new();
+        let mut col = 4u16;
+        for k in 0..8u64 {
+            out.push((15 * k, mv((3, col), (3, col + 1), Licence::Typed)));
+            out.push((15 * k, typed(1)));
+            col += 1;
+        }
+        let erase = 15 * 7 + erase_after;
+        let mut last_erase = erase;
+        for d in 0..deletes {
+            last_erase = erase + 15 * u64::from(d);
+            out.push((last_erase, Event::Erase));
+            out.push((last_erase, mv((3, col), (3, col - 1), Licence::Typed)));
+            col -= 1;
+        }
+        let fix = last_erase + fix_after;
+        out.push((fix, mv((3, col), (3, col + 1), Licence::Typed)));
+        out.push((fix, typed(1)));
+        (out, last_erase, fix)
+    }
+
+    /// **THE MEND** (§23's addendum "The mend"): the typo is the commonest
+    /// momentum-killer, and the owner's law says momentum resumes, it does
+    /// not start over. Eight keys at 8 cps, a Backspace, the fix key — one
+    /// slot later, 500 ms later, and after a 250 ms pause with two deletes:
+    /// the fix cell is born at the momentum the deleting INTERRUPTED (the
+    /// birth spine as it stood on the frame before the first Backspace), so
+    /// its `cov0` and life match the run it re-joins and the bed shows no
+    /// dip where the fix went in — never below its left neighbour, never
+    /// below the momentum it interrupted. Meanwhile the erased cell's own
+    /// retract starts on the erase edge exactly as before (T5), the fix key
+    /// owns its light on its own frame (frame-0), and the mark is spent by
+    /// the fix (the next key is priced live).
+    ///
+    /// Fails on the tree before the mend, where the fix was priced at the
+    /// live `birth_disp` the delete had drained: "one-slot fix: born at
+    /// 0.7083, the delete interrupted 0.7335 — a 0.0252 dip of the birth
+    /// spine (3.4 %)"; the 500 ms fix reads 0.6444 vs 0.7335 (12.1 %) and
+    /// the two-delete case 0.6618 vs 0.7286 (9.2 %).
+    #[test]
+    fn a_typo_fixed_within_a_breath_is_born_at_the_momentum_it_interrupted() {
+        for (label, erase_after, deletes, fix_after) in [
+            ("one-slot fix", 15u64, 1u16, 15u64),
+            ("500 ms fix", 15, 1, 60),
+            ("250 ms pause, two deletes", 30, 2, 15),
+        ] {
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            let mut sc = Scratch::default();
+            let (sched, erase, fix) = typo_script(erase_after, deletes, fix_after);
+            let first_erase = erase - 15 * (u64::from(deletes) - 1);
+            drive_ticks(&mut eng, &mut sc, t0, 0..=first_erase - 1, &sched);
+            let interrupted = eng.spine().birth_disp();
+            drive_ticks(&mut eng, &mut sc, t0, first_erase..=erase, &sched);
+            let fix_col = 12 - deletes;
+            assert!(
+                live_cell(&eng, 3, fix_col).is_none(),
+                "{label}: the erased cell is retracting on the erase frame (T5)"
+            );
+            let retracting = eng
+                .ribbon
+                .cells()
+                .iter()
+                .find(|c| c.row == 3 && c.col == fix_col)
+                .copied()
+                .expect("the erased cell is still on glass, retracting");
+            assert_eq!(
+                retracting.retract_at,
+                Some(t0 + TICK * u32::try_from(erase).expect("short")),
+                "{label}: the erased cell's retract starts on the erase edge, as before"
+            );
+            assert_eq!(
+                eng.erased,
+                (3, fix_col),
+                "{label}: the erased cell is known"
+            );
+
+            drive_ticks(&mut eng, &mut sc, t0, erase + 1..=fix, &sched);
+            let fixed =
+                live_cell(&eng, 3, fix_col).expect("the fix key owns its light on its own frame");
+            let left = live_cell(&eng, 3, fix_col - 1).expect("the neighbour is still laid");
+            assert_eq!(
+                fixed.born,
+                t0 + TICK * u32::try_from(fix).expect("short"),
+                "{label}: frame-0 — the fix cell is born on the fix key's frame"
+            );
+            assert!(
+                fixed.birth_disp >= interrupted - 1e-4,
+                "{label}: born at {:.4}, the delete interrupted {interrupted:.4} — a {:.4} dip of the birth spine ({:.1} %); live birth_disp {:.4}",
+                fixed.birth_disp,
+                interrupted - fixed.birth_disp,
+                (interrupted - fixed.birth_disp) / interrupted * 100.0,
+                eng.spine().birth_disp()
+            );
+            assert!(
+                fixed.cov0 >= left.cov0 && fixed.life_s >= left.life_s,
+                "{label}: the fix ({:.4}, {:.3} s) is not below its left neighbour ({:.4}, {:.3} s)",
+                fixed.cov0,
+                fixed.life_s,
+                left.cov0,
+                left.life_s
+            );
+            assert!(
+                eng.mend.is_none() && eng.spine().erase_mark().is_none(),
+                "{label}: the fix spends the mark"
+            );
+        }
+    }
+
+    /// The mend's two edges: a typed key 2 s after the Backspace, or after
+    /// THREE deletes, is not a fix — it is priced at the live `birth_disp`,
+    /// below the momentum the deleting interrupted, and the mark (still
+    /// there as a value, with its count) is not a mend when the key reads it.
+    /// Both halves hold on the tree before as a matter of arithmetic (there
+    /// was no mend); what they pin is the boundary the mend does not cross.
+    #[test]
+    fn a_slow_correction_is_not_a_mend() {
+        for (label, deletes, fix_after) in [("2 s later", 1u16, 240u64), ("three deletes", 3, 15)] {
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            let mut sc = Scratch::default();
+            let (sched, erase, fix) = typo_script(15, deletes, fix_after);
+            let first_erase = erase - 15 * (u64::from(deletes) - 1);
+            drive_ticks(&mut eng, &mut sc, t0, 0..=first_erase - 1, &sched);
+            let interrupted = eng.spine().birth_disp();
+            drive_ticks(&mut eng, &mut sc, t0, first_erase..=fix - 1, &sched);
+            let t_fix = t0 + TICK * u32::try_from(fix).expect("short");
+            let mark = eng
+                .spine()
+                .erase_mark()
+                .expect("the mark is a value, still there");
+            assert_eq!(mark.count, u8::try_from(deletes).expect("small"));
+            assert_eq!(
+                eng.spine().mend(t_fix),
+                None,
+                "{label}: the key that comes now is not a fix"
+            );
+            drive_ticks(&mut eng, &mut sc, t0, fix..=fix, &sched);
+            let fix_col = 12 - deletes;
+            let fixed = live_cell(&eng, 3, fix_col).expect("the key still lays its cell");
+            let live = eng.spine().birth_disp();
+            assert!(
+                (fixed.birth_disp - live).abs() < 1e-6,
+                "{label}: priced live — born at {:.4}, live birth_disp {live:.4}",
+                fixed.birth_disp
+            );
+            assert!(
+                fixed.birth_disp < interrupted,
+                "{label}: and the live price ({:.4}) is below the momentum interrupted ({interrupted:.4}) — the honest re-earn",
+                fixed.birth_disp
+            );
+            assert!(
+                eng.spine().erase_mark().is_none(),
+                "{label}: the key closes the run"
+            );
+        }
+    }
+
+    /// **A VALUE, NOT A TIMER** (T6 at the mark): one key, one Backspace,
+    /// and the glass goes dark well inside the mend window — and while the
+    /// mend is still LIVE the engine asks for no cadence, names no deadline
+    /// and fingerprints zero; when the window closes nothing wakes (no tick
+    /// after the dark one ever names a deadline), the mark is still there as
+    /// a value, and it is simply not a mend any more. And a key typed over
+    /// the dark glass inside the window IS mended: born at the mark, above
+    /// the live price. Does not compile on the tree before (no mark).
+    #[test]
+    fn the_mend_mark_is_a_value_not_a_timer() {
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let sched = [
+            (0, mv((3, 4), (3, 5), Licence::Typed)),
+            (0, typed(1)),
+            (15, Event::Erase),
+            (15, mv((3, 5), (3, 4), Licence::Typed)),
+        ];
+        let t_erase = t0 + TICK * 15;
+        let window = Duration::from_secs_f32(spine::MEND_WINDOW_S);
+        drive_ticks(&mut eng, &mut sc, t0, 0..=15, &sched);
+        let mark = eng
+            .spine()
+            .erase_mark()
+            .expect("the Backspace leaves its mark");
+
+        // Tick on until the glass is dark.
+        let mut i = 15u64;
+        let dark = loop {
+            i += 1;
+            let now = t0 + TICK * u32::try_from(i).expect("short");
+            drive_ticks(&mut eng, &mut sc, t0, i..=i, &sched);
+            if eng.fingerprint() == 0 && eng.next_change_deadline(now).is_none() {
+                break i;
+            }
+            assert!(
+                now < t_erase + window,
+                "the precondition: a lone erased key must go dark inside the mend window"
+            );
+        };
+        let t_dark = t0 + TICK * u32::try_from(dark).expect("short");
+        assert_eq!(
+            eng.spine().mend(t_dark),
+            Some(mark),
+            "the mend is still live over the dark glass"
+        );
+        assert!(!eng.needs_frame_cadence(), "…and asks for no cadence");
+        assert_eq!(
+            eng.next_change_deadline(t_dark),
+            None,
+            "…and names no deadline"
+        );
+
+        // A key over the dark glass, inside the window, is mended.
+        let mut mended = eng.clone();
+        let mut sc2 = Scratch::default();
+        let fix = dark + 1;
+        let fix_sched = [(fix, mv((3, 4), (3, 5), Licence::Typed)), (fix, typed(1))];
+        drive_ticks(&mut mended, &mut sc2, t0, fix..=fix, &fix_sched);
+        let cell = live_cell(&mended, 3, 4).expect("the key lays its cell");
+        let live = mended
+            .spine()
+            .disp()
+            .max(spine::DISP_PEAK_FLOOR_SHARE * mended.spine().disp_peak());
+        assert!(
+            (cell.birth_disp - mark.disp).abs() < 1e-6 && mark.disp > live + 0.01,
+            "born at {:.4}: the mark {:.4}, over a live price of {live:.4}",
+            cell.birth_disp,
+            mark.disp
+        );
+
+        // No key: the window closes and nothing wakes.
+        let past = 15 + (window.as_micros() as u64 + 100_000).div_ceil(TICK.as_micros() as u64);
+        for j in dark + 1..=past {
+            let now = t0 + TICK * u32::try_from(j).expect("short");
+            drive_ticks(&mut eng, &mut sc, t0, j..=j, &sched);
+            assert_eq!(eng.fingerprint(), 0, "idle → zero, mark or no mark");
+            assert!(!eng.needs_frame_cadence());
+            assert_eq!(
+                eng.next_change_deadline(now),
+                None,
+                "a pending mark names no deadline (tick {j})"
+            );
+        }
+        let t_past = t0 + TICK * u32::try_from(past).expect("short");
+        assert_eq!(
+            eng.spine().erase_mark(),
+            Some(mark),
+            "the mark is a value: still there, unchanged, after the window"
+        );
+        assert_eq!(eng.spine().mend(t_past), None, "…and not a mend any more");
     }
 
     /// §6.11 / §7.1: under reduced motion a credited spawn is a LANDING with

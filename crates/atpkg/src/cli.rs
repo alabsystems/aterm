@@ -578,6 +578,33 @@ fn cmd_reroute(rest: &[String]) -> ExitCode {
     crate::reroute::run(&layout, upstream, args)
 }
 
+/// Re-assert the rustup SEAM: the managed `trust` toolchain linked into rustup as
+/// channel `trust`, so `cargo +trust`, `targo` resolved through rustup, and every
+/// repo pinning `channel = "trust"` all work on THIS machine.
+///
+/// `seam.rs` has carried attach/detach/reassert since the seam was designed, and
+/// its header CLAIMS re-assertion "after every successful activation of `trust`,
+/// after a rollback of `trust`, and at the end of the unattended `update` pass".
+/// MEASURED 2026-09-08: nothing called it. The managed toolchain was invisible
+/// to rustup on every fresh machine, and the first thing a Rust project pinning
+/// the channel saw was `'rustc' is not installed for the custom toolchain
+/// 'trust'` — the message that reads as a blocked machine. Owner, the same day:
+/// the Trust toolchain is to be "very strongly encouraged by the aterm system
+/// itself"; a store rustup cannot see is the opposite of that.
+///
+/// Fail-soft by construction: no rustup home ⇒ nothing to do; `reassert` only
+/// ever creates a name nothing else owns, adopts a link already pointing into
+/// the store, and REFUSES (with the fix printed) anything foreign under
+/// `~/.rustup` — it never follows or replaces an entry aterm did not lay.
+fn reassert_rustup_seam(layout: &crate::store::Layout) {
+    let Some(home) = crate::seam::rustup_home() else {
+        return;
+    };
+    for line in crate::seam::reassert(layout, &home) {
+        println!("atpkg: rustup seam: {line}");
+    }
+}
+
 /// Lay (or refresh) the reroute stubs beside the pending-stub reconcile — at seed,
 /// after each install pass, and on `repair` — and never let a failure fail the pass:
 /// the stubs are a session convenience the spawn seam re-lays anyway, while the pass
@@ -2078,6 +2105,7 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
     // The reroute stubs are the other store-less half: they embed this atpkg's path,
     // so a relocated or self-updated binary is exactly what repair re-lays for.
     lay_reroute_stubs(&layout);
+    reassert_rustup_seam(&layout);
 
     let installed = crate::list_installed(&layout);
     if installed.is_empty() {
@@ -4623,6 +4651,9 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
                 "atpkg: rolled back {program} from build {} to {}; `aterm pkg pin {program}` to hold it there",
                 r.from_build, r.to_build
             );
+            if program == crate::seam::SEAM_PROGRAM {
+                reassert_rustup_seam(&layout);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -5567,6 +5598,7 @@ fn install_default_set_inner(
     // The reroute stubs ride the same reconcile: the embedded atpkg path is refreshed
     // and a row that left the table is swept (philosophy §4).
     lay_reroute_stubs(layout);
+    reassert_rustup_seam(layout);
     // ALIAS reconcile over what is live NOW: every ALab program's `alab-<tool>` names
     // stand beside its shims (an install a pre-alias client made gets them here), and a
     // program the signed index no longer calls ALab's own loses them.
@@ -6123,6 +6155,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // REROUTE STUBS beside them (philosophy §4): the upstream Rust names answer inside a
     // session from the first seed on, not only once the spawn seam has laid them.
     lay_reroute_stubs(&layout);
+    reassert_rustup_seam(&layout);
     let Some(seed_dir) = crate::bundled_seed_dir() else {
         // DO NOT PROMISE WHAT THE INDEX CANNOT DELIVER. This used to assert the
         // toolset would be "kept current and complete from here on" without asking

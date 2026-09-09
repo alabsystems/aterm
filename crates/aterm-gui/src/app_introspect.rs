@@ -4194,13 +4194,19 @@ impl App {
         // Shape and the canonical resolved fill, mirroring `redraw_window`.
         // `tick_cursor_fx` already applied precedence and presentation opacity;
         // rebuilding the seven raw candidates here would bypass the shed fade.
-        ws.input_scratch.cursor_effect_style_override = if fx.bolt_cursor {
-            Some(aterm_core::terminal::CursorStyle::Bolt)
-        } else if fx.twinkle_cursor {
-            Some(aterm_core::terminal::CursorStyle::SteadyBlock)
-        } else {
-            None
-        };
+        // ONE blink law, the same function the two `redraw_window` sites call
+        // (`app_render::compose_caret_style_override`): this mirror used to
+        // spell only the bolt and the rainbow arms, so a `ctl image` / paced
+        // `ctl video` frame showed a warm classic caret BLINKING while the
+        // presented frame had it pinned steady — the capture contradicting the
+        // glass. Measured 2026-09-08 on the merge, windowed, trail off, after a
+        // 10-key burst: 232 → 51 → 234 on the caret cell every ~530 ms.
+        ws.input_scratch.cursor_effect_style_override =
+            crate::app_render::compose_caret_style_override(
+                fx.bolt_cursor,
+                fx.twinkle_cursor,
+                fx.momentum_steady,
+            );
         ws.input_scratch.cursor_fill_override = fx.block_fill.map(|owned| owned.fill);
         ws.input_scratch.cursor_trail.clone_from(&ws.trail_scratch);
         ws.input_scratch.cursor_trail_color = fx.trail_color;

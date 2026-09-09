@@ -43,6 +43,7 @@ pub enum StageId {
     Formatting,
     GrepGuards,
     InstallChannel,
+    AtpkgTooling,
     TrustGateVerdict,
     TrustContractProbe,
     StartCompare,
@@ -137,6 +138,11 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::InstallChannel,
         "bootstrap update-channel arbitration/identity",
+        Lane::Pure,
+    ));
+    v.push(spec(
+        StageId::AtpkgTooling,
+        "atpkg publish tooling (author-vendor/index/publish rows + the vendor lane; stubbed)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -430,6 +436,7 @@ mod tests {
                 StageId::Formatting,
                 StageId::GrepGuards,
                 StageId::InstallChannel,
+                StageId::AtpkgTooling,
                 StageId::TrustGateVerdict,
                 StageId::TrustContractProbe,
                 StageId::StartCompare,
@@ -609,6 +616,7 @@ mod tests {
                 StageId::LibcOracle => Lane::LibcOracleTarget,
                 StageId::GrepGuards
                 | StageId::InstallChannel
+                | StageId::AtpkgTooling
                 | StageId::TrustGateVerdict
                 | StageId::TrustContractProbe
                 | StageId::StartCompare
@@ -626,6 +634,7 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 30);
+        // 31 since 2026-09-08: the atpkg publish-tooling suites joined the ladder.
+        assert_eq!(plan(&nothing_installed).len(), 31);
     }
 }

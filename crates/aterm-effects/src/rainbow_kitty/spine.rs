@@ -41,6 +41,17 @@
 //!   while the owner is already typing at speed.
 //! * **ERASE WEIGHT IS A COUNTER, not a sixth integrator** (§19.1). The drains
 //!   below move the one metric; nothing accumulates a private erase level.
+//! * **THE MEND IS A MARK, not a level** (§23's addendum "The mend",
+//!   2026-09-08). A Backspace records [`EraseMark`] — the birth spine at the
+//!   instant of the delete and how many deletes the run has counted — and
+//!   the next typed key, if it comes within [`MEND_WINDOW_S`] after at most
+//!   [`MEND_MAX_DELETES`] deletes, is a TYPO FIX: the engine prices its
+//!   birth at `max(birth_disp, mark.disp)` (a v2-local birth price, exactly
+//!   like [`METRIC_GAIN`]), so the fixed cell is born at the momentum the
+//!   delete interrupted — the owner's law is that momentum resumes, it does
+//!   not start over. The metric is not touched by the mark, the mark arms
+//!   no timer (it is a value read at the next key and stale by then or not),
+//!   and [`Spine::at_rest`] ignores it.
 //!
 //! ## Determinism
 //!
@@ -161,6 +172,37 @@ pub const PHASE_RATE: f32 = 0.85;
 /// `phase` and `phase + PHASE_RING` are exactly equivalent to every consumer.
 pub const PHASE_RING: f32 = 1024.0;
 
+/// **THE MEND WINDOW**, seconds: a typed key this soon after the last delete
+/// of a run is a typo FIX, born at the momentum the delete interrupted
+/// ([`Spine::mend`]). Sized to a breath — the notice-and-retype of a slip
+/// (the fix lands 100–600 ms after the Backspace); a correction that took
+/// longer was a thought, and re-earns its price honestly.
+pub const MEND_WINDOW_S: f32 = 1.2;
+
+/// The most deletes a run may hold and still be a typo: one or two. Three
+/// deletes is an edit — a word going — and the key after it is priced live.
+pub const MEND_MAX_DELETES: u8 = 2;
+
+/// **THE ERASE MARK** — what a Backspace leaves behind for the next typed
+/// key (§23's addendum "The mend"): the momentum the delete interrupted and
+/// how many deletes the run has counted since the last typed key.
+///
+/// A VALUE, not a timer: nothing wakes when the window closes; the key that
+/// reads it finds it live or stale ([`Spine::mend`]), and the next typed key
+/// clears it whichever it was. `Copy`, so it rides in the spine's snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EraseMark {
+    /// The LAST delete's edge — the window is measured from here.
+    pub at: Instant,
+    /// The birth spine ([`Spine::birth_disp`]) at the FIRST delete of the run
+    /// — the momentum the deleting interrupted — kept across the run: a
+    /// second delete 125 ms later has already drained the follower a little,
+    /// and that drain is the dip the mend exists to close.
+    pub disp: f32,
+    /// Deletes in the run since the last typed key (saturating).
+    pub count: u8,
+}
+
 /// The ONE momentum integrator and its display follower (see the module doc).
 ///
 /// `Copy` for the same reason [`TypingMomentum`] is: the style-crossfade ghost
@@ -193,6 +235,10 @@ pub struct Spine {
     /// panel the attack constant on different frames, and two different
     /// `disp` values at one wall time — T7 broken by the follower itself.
     slamming: bool,
+    /// The pending [`EraseMark`], if the last edge was a Backspace (see the
+    /// module doc, "the mend is a mark"). Cleared by the next typed advance,
+    /// by a kill, and by [`Spine::reset`].
+    mark: Option<EraseMark>,
 }
 
 impl Spine {
@@ -208,22 +254,44 @@ impl Spine {
     /// a coalesced multi-glyph echo. The ONLY thing that builds momentum
     /// (§2.1 T1: a jump, a scroll, program output and a nav hop all build
     /// nothing).
+    ///
+    /// A typed key also CLOSES the erase run: the [`EraseMark`] is cleared
+    /// (its count is "deletes since the last typed key"). Read
+    /// [`Spine::mend`] BEFORE calling this on the key that may be a fix.
     pub fn advance(&mut self, now: Instant) {
         self.momentum.advance(now);
+        self.mark = None;
     }
 
     /// One Backspace. Deletes never build; this drains
     /// `TYPING_MOMENTUM_DELETE_DRAIN` and spends the pending gap credit, so a
     /// correction dents an earned run without erasing it and a held delete
     /// walks it to zero.
+    ///
+    /// And it leaves the [`EraseMark`]: the birth spine as it stands at this
+    /// edge (the follower has not yet seen the drain — that is the momentum
+    /// the delete interrupts), the run's count one higher, the window
+    /// restarted at `now`. A delete more than [`MEND_WINDOW_S`] after the
+    /// previous one starts a fresh run rather than carrying a stale price.
     pub fn drain_delete(&mut self, now: Instant) {
         self.momentum.delete(now);
+        let prior = self
+            .mark
+            .filter(|m| now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S);
+        let here = self.birth_disp();
+        self.mark = Some(EraseMark {
+            at: now,
+            disp: prior.map_or(here, |m| m.disp.max(here)),
+            count: prior.map_or(1, |m| m.count.saturating_add(1)),
+        });
     }
 
     /// One kill chord (`^W` / `^U` / `^K`, Alt-D, word-backspace): a span
-    /// erased un-earns like ~two deletes.
+    /// erased un-earns like ~two deletes — and it is an EDIT, not a typo, so
+    /// it drops any [`EraseMark`]: the key after a kill is priced live.
     pub fn drain_kill(&mut self, now: Instant) {
         self.momentum.kill(now);
+        self.mark = None;
     }
 
     /// THE CELEBRATION BYPASS, kept from v1 and deliberately narrow: pin the
@@ -352,6 +420,31 @@ impl Spine {
     #[must_use]
     pub fn birth_disp(&self) -> f32 {
         self.disp.max(DISP_PEAK_FLOOR_SHARE * self.disp_peak)
+    }
+
+    /// The pending [`EraseMark`], live or stale — the raw value. Diagnostic
+    /// (and the proof that the mark is a value: it is still here over a dark
+    /// glass, and nothing is armed on it).
+    #[inline]
+    #[must_use]
+    pub fn erase_mark(&self) -> Option<EraseMark> {
+        self.mark
+    }
+
+    /// **THE MEND** — the [`EraseMark`] if a typed key at `now` is a typo
+    /// FIX: the mark is within [`MEND_WINDOW_S`] of its last delete and the
+    /// run counted at most [`MEND_MAX_DELETES`]. `None` for a slow
+    /// correction, a longer run, a kill, or no delete at all — and then the
+    /// key is priced at [`Spine::birth_disp`] alone. A pure read: the engine
+    /// takes the answer, prices the key's births at
+    /// `max(birth_disp, mark.disp)`, and publishes the mark in `Ctx::mend`
+    /// for the sky; the metric and the follower are untouched.
+    #[must_use]
+    pub fn mend(&self, now: Instant) -> Option<EraseMark> {
+        self.mark.filter(|m| {
+            m.count <= MEND_MAX_DELETES
+                && now.saturating_duration_since(m.at).as_secs_f32() <= MEND_WINDOW_S
+        })
     }
 
     /// The lay/flow clock in dimensionless sweeps, modulo [`PHASE_RING`] — the
@@ -817,6 +910,112 @@ mod tests {
                 s.momentum(t)
             );
         }
+    }
+
+    /// **THE ERASE MARK'S ARITHMETIC** (§23's addendum "The mend"): a
+    /// Backspace on a warm spine leaves a mark carrying the birth spine AS
+    /// IT STOOD at the delete (the follower has not seen the drain yet), a
+    /// second delete inside the window keeps that first price and counts
+    /// two, a third counts three and is no longer a mend, a typed key
+    /// clears the run, a kill drops it, and a delete after a stale run
+    /// starts afresh at one. The mark never moves the metric or the
+    /// follower: `momentum()` and `disp()` read the same with and without
+    /// it. Does not compile on the tree before (no `EraseMark`).
+    #[test]
+    fn a_backspace_leaves_a_mark_that_counts_the_run_and_a_typed_key_closes_it() {
+        let t0 = Instant::now();
+        let mut s = Spine::new();
+        s.update(t0);
+        let mut t = t0;
+        for _ in 0..16 {
+            t += ms(125);
+            s.advance(t);
+            s.update(t);
+        }
+        assert_eq!(s.erase_mark(), None, "typing leaves no mark");
+        let interrupted = s.birth_disp();
+        let metric_before = s.momentum(t + ms(125));
+
+        let mut twin = s;
+        t += ms(125);
+        s.drain_delete(t);
+        twin.drain_delete(t);
+        let mark = s.erase_mark().expect("a delete leaves the mark");
+        assert_eq!(mark.at, t);
+        assert_eq!(mark.count, 1);
+        assert!(
+            (mark.disp - interrupted).abs() < 1e-6,
+            "the mark carries the birth spine the delete interrupted: {} vs {interrupted}",
+            mark.disp
+        );
+        assert!(
+            s.momentum(t) < metric_before,
+            "the delete still drains the metric"
+        );
+        assert_eq!(s.mend(t + ms(125)), Some(mark), "one delete is a mend");
+        assert_eq!(
+            s.mend(t + Duration::from_secs_f32(MEND_WINDOW_S + 0.01)),
+            None,
+            "…until the window closes"
+        );
+
+        // A second delete: the FIRST price is kept, the count is two.
+        s.update(t + ms(125));
+        t += ms(125);
+        s.drain_delete(t);
+        let second = s.erase_mark().expect("still marked");
+        assert_eq!((second.count, second.at), (2, t));
+        assert!(
+            (second.disp - interrupted).abs() < 1e-6,
+            "the run keeps the momentum its first delete interrupted"
+        );
+        assert!(s.mend(t + ms(125)).is_some(), "two deletes are a mend");
+
+        // A third: counted, and no longer a mend.
+        t += ms(125);
+        s.drain_delete(t);
+        assert_eq!(s.erase_mark().map(|m| m.count), Some(3));
+        assert_eq!(s.mend(t), None, "three deletes are an edit");
+
+        // A typed key closes the run.
+        t += ms(125);
+        s.advance(t);
+        assert_eq!(s.erase_mark(), None, "a typed key clears the mark");
+
+        // A kill drops a run outright.
+        t += ms(125);
+        twin.drain_kill(t);
+        assert_eq!(twin.erase_mark(), None, "a kill is an edit, not a typo");
+
+        // A delete after a stale run starts over at one.
+        let mut stale = Spine::new();
+        stale.update(t0);
+        stale.drain_delete(t0);
+        stale.update(t0 + ms(2000));
+        stale.drain_delete(t0 + ms(2000));
+        assert_eq!(stale.erase_mark().map(|m| m.count), Some(1));
+
+        // The follower is not touched by the mark: the same edges with the
+        // mark read and without it are the same number.
+        let mut a = Spine::new();
+        let mut b = Spine::new();
+        a.update(t0);
+        b.update(t0);
+        for i in 1..=8u32 {
+            let at = t0 + ms(125) * i;
+            a.advance(at);
+            b.advance(at);
+            a.update(at);
+            b.update(at);
+        }
+        let at = t0 + ms(125 * 9);
+        a.drain_delete(at);
+        b.drain_delete(at);
+        let _ = a.mend(at);
+        a.update(at + ms(125));
+        b.update(at + ms(125));
+        assert_eq!(a.disp(), b.disp());
+        assert_eq!(a.momentum(at + ms(125)), b.momentum(at + ms(125)));
     }
 
     /// The lay/flow clock advances only while the spine is lit, and wraps on

@@ -80,9 +80,17 @@ const MARK_PREFIX: &str = "<!-- aterm primer";
 /// sentence — on macOS an `Operation not permitted` can arrive with NO dialog,
 /// and an agent that reads it as a broken tool retries in a loop, reaches for
 /// `sudo`, or quietly rewrites the path, all three of which are wrong and none
-/// of which anything else in an agent's context file tells it.
+/// of which anything else in an agent's context file tells it. v6 (2026-09-08):
+/// the Rust paragraph — `RUST_NOTE`. Measured that day on the owner's own box: an
+/// agent working INSIDE this repo's ecosystem built and tested a first-party
+/// solver crate with stock `cargo +1.97.1`, then ran `cargo +trust` in a tree a
+/// peer's release gate was judging. Nothing in its context said "Rust here means
+/// the Trust toolchain; the driver is `targo`". The owner's instruction, verbatim:
+/// *"USE TRUST TOOLCHAIN NOT RUST! this needs to be very strongly encouraged by
+/// the aterm system itself."* A v5 block is silent on the one thing every Rust
+/// build on this machine must know.
 const MARK_BEGIN: &str =
-    "<!-- aterm primer v5 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
+    "<!-- aterm primer v6 — managed by `aterm agents`; `aterm agents remove` uninstalls -->";
 
 /// The end marker closing the managed block.
 const MARK_END: &str = "<!-- /aterm primer -->";
@@ -109,6 +117,37 @@ why. On macOS, `Operation not permitted` on a file is usually privacy consent, n
 tool, and it can arrive with NO dialog: run `aterm ctl privacy` before retrying — never in a
 loop, never `sudo`, never by rewriting the path; `aterm help permissions` says what to do.
 If neither variable is set, you are not inside aterm; ignore this section.";
+
+/// The Rust paragraph (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md §4
+/// Block C, made STRONG by the owner's 2026-09-08 instruction). It is NOT part of
+/// [`PRIMER_BODY`] — that body is at its line cap and its budget test exists to
+/// make the next author argue — and it carries its OWN gate sentence, keyed on
+/// `$ATPKG_BIN`, because the toolchain is on PATH in every shell, not only
+/// aterm's, so `PRIMER_BODY`'s "not inside aterm; ignore" gate is the wrong one.
+///
+/// What it says, and why each sentence is there: the DEFAULT is Trust (the
+/// owner's instruction is "strongly encouraged", not "both are fine"); the exact
+/// branded names, because an agent that knows only `cargo` cannot guess `targo`;
+/// the two-lane rule, because a bare `targo build` is refused on purpose and an
+/// agent that reads that refusal as a broken tool falls straight back to stock
+/// cargo; `aterm help rust`, which MEASURES the answer instead of trusting this
+/// prose; and the one incident sentence — a stale rustup link reads as a blocked
+/// machine and is not one. Stock cargo is never prevented (two owner rulings);
+/// it is named as the exception that must be said out loud.
+const RUST_NOTE: &str = "\
+## Rust on this machine: the DEFAULT is the Trust toolchain (true in ANY terminal)
+aterm installs the ALab VERIFIED Rust toolchain beside stock Rust and atpkg's rc block puts
+it on PATH in every shell. USE IT: `targo` is cargo, `trustc` is rustc, `tippy` is clippy,
+`trustfmt` is rustfmt; `ty`, `ay`, `clean` are the verifiers. Stock `cargo`/`rustc` is the
+EXCEPTION here, never the default — a session-scoped reroute prints the `targo` spelling
+whenever you type one; if you must run stock anyway, say why in your reply. Name the lane:
+`targo trust <cmd>` (verified, fail-closed, proof report) or `targo --unverified <cmd>`
+(no proof claim); a bare `targo build` is refused on purpose, so that refusal is not a
+broken tool. Run `aterm help rust` in the project BEFORE the first build: it MEASURES which
+compiler this directory gets. `'rustc' is not installed for the custom toolchain 'trust'`
+is a stale rustup link, not a blocked machine: `targo` still works; run `aterm pkg doctor`
+then `aterm pkg repair`; never rebuild a toolchain from source to answer it.
+If `$ATPKG_BIN` is unset and that directory is absent, this toolchain is not installed here.";
 
 /// Codex CLI's addendum (docs/AGENT-EXPERIENCE-2026-08-26.md §3 S8). Measured on
 /// 2026-08-26: Codex's default macOS sandbox refuses AF_UNIX `connect()` outside
@@ -159,9 +198,14 @@ pub fn primer_block(agent: Option<&str>) -> String {
 /// Assemble a block from its parts. The addendum is its own paragraph (blank-line
 /// separated) so a Markdown renderer keeps it distinct from the generic brief.
 fn block_with(addendum: Option<&str>) -> String {
+    // `RUST_NOTE` is its own paragraph after the generic brief and before the
+    // per-agent addendum: a Markdown renderer keeps the three distinct, and the
+    // Rust paragraph's own gate sentence stays adjacent to the text it gates.
     match addendum {
-        Some(extra) => format!("{MARK_BEGIN}\n{PRIMER_BODY}\n\n{extra}\n{MARK_END}\n"),
-        None => format!("{MARK_BEGIN}\n{PRIMER_BODY}\n{MARK_END}\n"),
+        Some(extra) => {
+            format!("{MARK_BEGIN}\n{PRIMER_BODY}\n\n{RUST_NOTE}\n\n{extra}\n{MARK_END}\n")
+        }
+        None => format!("{MARK_BEGIN}\n{PRIMER_BODY}\n\n{RUST_NOTE}\n{MARK_END}\n"),
     }
 }
 
@@ -193,6 +237,12 @@ const DRIVE_SKILL_BODY: &str = include_str!("../assets/drive-aterm-skill.md");
 /// repo asset, same single-source-of-truth rule as the drive skill.
 const SUPERVISE_SKILL_BODY: &str = include_str!("../assets/supervise-agent-skill.md");
 
+/// The Rust-in-aterm skill (docs/DESIGN-agent-toolchain-guidance-2026-09-08.md
+/// layer 2). A skill costs zero context until its description matches, which is
+/// the right shape for DEPTH: the primer paragraph says "Rust here means Trust";
+/// this says how, and what every refusal and error on that road actually means.
+const RUST_SKILL_BODY: &str = include_str!("../assets/rust-in-aterm-skill.md");
+
 /// One managed skill file: `path` is the agent-relative location under `$HOME`,
 /// `body` the compiled-in content.
 struct SkillFile {
@@ -215,6 +265,10 @@ fn skills_for(agent: &str) -> &'static [SkillFile] {
             SkillFile {
                 path: ".claude/skills/supervise-agent/SKILL.md",
                 body: SUPERVISE_SKILL_BODY,
+            },
+            SkillFile {
+                path: ".claude/skills/rust-in-aterm/SKILL.md",
+                body: RUST_SKILL_BODY,
             },
         ],
         _ => &[],
@@ -1111,8 +1165,13 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         // Marked + versioned, so installs are idempotent and updatable.
         assert!(block.starts_with(MARK_BEGIN) && block.trim_end().ends_with(MARK_END));
         assert!(
-            MARK_BEGIN.contains(" v5 "),
-            "the macOS privacy sentence bumped the version"
+            MARK_BEGIN.contains(" v6 "),
+            "the Rust paragraph bumped the version"
+        );
+        // v6: the Rust paragraph rides in the block, after the body.
+        assert!(
+            block.contains(RUST_NOTE),
+            "v6 block carries the Rust paragraph"
         );
     }
 
@@ -1129,6 +1188,54 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
     /// lives behind `aterm help permissions`; what is here is the pointer plus
     /// the three refusals, which are useless if the agent has to already suspect
     /// a permissions wall to go looking for them.
+    #[test]
+    fn rust_note_has_its_own_budget_and_says_the_default_is_trust() {
+        // Its own budget — it must not be smuggled into PRIMER_BODY's 1_150/13,
+        // and it must not grow into a manual either: depth is `aterm help rust`.
+        assert!(
+            RUST_NOTE.len() <= 1_250,
+            "rust note is {} bytes",
+            RUST_NOTE.len()
+        );
+        assert!(
+            RUST_NOTE.lines().count() <= 14,
+            "{}",
+            RUST_NOTE.lines().count()
+        );
+        // The owner's instruction is "strongly encouraged", so the paragraph
+        // must say DEFAULT, name every branded tool, state the two-lane rule,
+        // point at the measuring command, and carry its own gate sentence.
+        for needle in [
+            "DEFAULT is the Trust toolchain",
+            "`targo` is cargo",
+            "`trustc` is rustc",
+            "`tippy` is clippy",
+            "targo trust <cmd>",
+            "targo --unverified <cmd>",
+            "aterm help rust",
+            "aterm pkg doctor",
+            "aterm pkg repair",
+            "`$ATPKG_BIN` is unset",
+        ] {
+            assert!(RUST_NOTE.contains(needle), "rust note lost: {needle}");
+        }
+        // Never prevented — two owner rulings. The text may call stock cargo the
+        // exception; it may not call it forbidden.
+        for anti in ["forbidden", "refuse to run", "must not use cargo"] {
+            assert!(!RUST_NOTE.contains(anti), "rust note overreaches: {anti}");
+        }
+        // And it is IN the block, after the body, before any addendum.
+        let block = block_with(Some("ADDENDUM"));
+        let body_at = block.find(PRIMER_BODY).expect("body");
+        let note_at = block.find(RUST_NOTE).expect("note in block");
+        let add_at = block.find("ADDENDUM").expect("addendum");
+        assert!(
+            body_at < note_at && note_at < add_at,
+            "order: body, rust note, addendum"
+        );
+        assert!(block_with(None).contains(RUST_NOTE));
+    }
+
     #[test]
     fn primer_body_stays_within_its_byte_budget() {
         assert!(
@@ -1299,7 +1406,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
         let old = format!("before\n\n{V1_BLOCK}\nafter\n");
         assert_eq!(block_state(&old, &block).unwrap(), BlockState::Stale);
         let updated = upsert_block(&old, &block).unwrap().unwrap();
-        assert!(updated.starts_with("before\n\n<!-- aterm primer v5"));
+        assert!(updated.starts_with("before\n\n<!-- aterm primer v6"));
         assert!(updated.ends_with("<!-- /aterm primer -->\n\nafter\n"));
         assert_eq!(
             updated.matches(MARK_PREFIX).count(),
@@ -1331,7 +1438,7 @@ explains why. If neither variable is set, you are not inside aterm; ignore this 
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v5"),
+                updated.starts_with("mine\n\n<!-- aterm primer v6"),
                 "{}",
                 a.name
             );
@@ -1391,7 +1498,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v5"),
+                updated.starts_with("mine\n\n<!-- aterm primer v6"),
                 "{}",
                 a.name
             );
@@ -1415,6 +1522,53 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     /// predecessors, so v4 → v5 is tested against what is really on disk rather
     /// than against today's constants (which would make the test vacuous the
     /// moment the body changes again).
+    /// A v5 block — everything up to the macOS privacy sentence — is exactly
+    /// today's body under yesterday's marker. It must read STALE and be rewritten
+    /// in place, gaining the Rust paragraph, for every agent, with every byte
+    /// around it preserved. The v6 delta IS that paragraph.
+    #[test]
+    fn v5_block_is_stale_and_gains_the_rust_paragraph() {
+        let v5_block = format!(
+            "<!-- aterm primer v5 — managed by `aterm agents`; `aterm agents remove` uninstalls -->\n{PRIMER_BODY}\n{MARK_END}\n"
+        );
+        assert!(
+            !v5_block.contains("Trust toolchain"),
+            "a v5 block is silent on Rust"
+        );
+        for a in AGENT_FILES {
+            let block = primer_block(Some(a.name));
+            let old = format!("mine\n\n{v5_block}\ntheirs\n");
+            assert_eq!(
+                block_state(&old, &block).unwrap(),
+                BlockState::Stale,
+                "{}: a v5 block must read stale",
+                a.name
+            );
+            let updated = upsert_block(&old, &block).unwrap().unwrap();
+            assert!(
+                updated.starts_with("mine\n\n<!-- aterm primer v6"),
+                "{}",
+                a.name
+            );
+            assert!(
+                updated.ends_with("<!-- /aterm primer -->\n\ntheirs\n"),
+                "{}",
+                a.name
+            );
+            assert!(
+                updated.contains(RUST_NOTE),
+                "{}: v6 gains the Rust paragraph",
+                a.name
+            );
+            assert!(
+                updated.contains("DEFAULT is the Trust toolchain"),
+                "{}: the paragraph says the default",
+                a.name
+            );
+            assert_eq!(updated.matches(MARK_PREFIX).count(), 1, "{}", a.name);
+        }
+    }
+
     const V4_BLOCK: &str = r"<!-- aterm primer v4 — managed by `aterm agents`; `aterm agents remove` uninstalls -->
 ## aterm
 If the environment has `TERM_PROGRAM=aterm` or `ATERM_CHILD=1`, this terminal is aterm — an
@@ -1450,7 +1604,7 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
             );
             let updated = upsert_block(&old, &block).unwrap().unwrap();
             assert!(
-                updated.starts_with("mine\n\n<!-- aterm primer v5"),
+                updated.starts_with("mine\n\n<!-- aterm primer v6"),
                 "{}",
                 a.name
             );
@@ -2060,8 +2214,15 @@ why. If neither variable is set, you are not inside aterm; ignore this section.
     /// such concept.
     #[test]
     fn skills_are_registered_only_for_agents_that_have_them() {
-        // Claude Code ships two bundled skills today: drive-aterm + supervise-agent.
-        assert_eq!(skills_for("claude").len(), 2);
+        // Claude Code ships three bundled skills: drive-aterm, supervise-agent,
+        // and rust-in-aterm (the 2026-09-08 "Rust here means Trust" depth layer).
+        assert_eq!(skills_for("claude").len(), 3);
+        assert!(
+            skills_for("claude")
+                .iter()
+                .any(|s| s.path.ends_with("rust-in-aterm/SKILL.md")),
+            "the rust-in-aterm skill must be registered for Claude"
+        );
         assert!(
             skills_for("claude")
                 .iter()

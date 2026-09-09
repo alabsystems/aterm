@@ -335,7 +335,9 @@ every session aterm opens installs the primer for each detected agent
 The default cursor is the **rainbow kitty pet**: a full-body cat that walks,
 runs, and pounces along your line, trailing a banded rainbow ribbon (with a
 glass-bell typing sound on macOS). It cheers a green build, sulks at a failed
-one, and chases your mouse. A new kitty is generated every time aterm starts, and
+one, and chases your mouse. Slowly stroke across its body to earn a chin lift,
+slow blink and purr, or click it for affection. Keep petting and its tail and
+body join in. A new kitty is generated every time aterm starts, and
 any program that holds the foreground for more than a few seconds earns its own
 cat — Claude Code, Codex, and everything else you run gets a look of its own.
 View ▸ Favourite This Kitty pins the one you like.

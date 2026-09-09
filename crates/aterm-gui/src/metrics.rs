@@ -1942,6 +1942,27 @@ pub fn clear_key_arrival() {
     LAT_KEY_NS.store(0, Ordering::Relaxed);
 }
 
+/// The current key's TRUE hardware arrival in ms — the same backdated stamp
+/// [`note_key_arrival_queued`] wrote — as a PEEK; [`note_pty_write`] owns the
+/// consuming swap. `None` when unarmed (a bare modifier, an IME run, a control
+/// verb's `send`, or a key whose write already ran).
+///
+/// This is the MELODY'S clock (the rainbow-kitty keyed seam stamps its cue
+/// with it): two keys must be heard the interval apart that the fingers
+/// struck them, not the interval their PTY writes happened to return in. It
+/// exists because the write's `swap(0)` runs BEFORE the audio push on the key
+/// path, so the push cannot read the arrival itself — the peek is taken at
+/// the cue's mint, while the stamp is still armed. Same epoch and unit as
+/// `app_render::input_clock_ms` (the metrics clock in ms, never `0`), so the
+/// two seams keep measuring one clock. One relaxed load per key.
+#[must_use]
+pub fn key_arrival_ms() -> Option<u32> {
+    match LAT_KEY_NS.load(Ordering::Relaxed) {
+        0 => None,
+        ns => Some(((ns / 1_000_000) as u32).max(1)),
+    }
+}
+
 /// The PTY write just RETURNED (after the — on Windows blocking — `WriteFile` and
 /// the press-path `term_lock`s). Record the key→write COMPONENT already contained
 /// by the end-to-end `input_present` clock. Always recorded (cheap atomics) so the

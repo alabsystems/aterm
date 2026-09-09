@@ -115,6 +115,46 @@ pub fn flight(cells: f32) -> Duration {
     Duration::from_secs_f32(flight_ms(cells) / 1000.0)
 }
 
+/// Exponent of the landing's IMPACT curve — concave, so the middle band of
+/// jumps (16-40 cells) gets most of the new headroom and a wide-terminal
+/// Ctrl-A does not climb forever.
+pub const IMPACT_EXP: f32 = 0.7;
+
+/// Where [`impact`] saturates: reached at ≈ 48 cells — a full line — so an
+/// 80- or 200-cell jump lands on the cap instead of past it.
+pub const IMPACT_MAX: f32 = 3.5;
+
+/// How HARD a jump lands — ONE shared magnitude read by every distance-graded
+/// landing law (fan count, fan reach, ring radius, ring life), so they cannot
+/// come apart.
+///
+/// `impact(cells) = clamp((cells / 8)^0.7, 1, 3.5)`: exactly `1.0` at the
+/// 8-cell meteor floor ([`JUMP_MIN_CELLS`]), so the floor landing is
+/// byte-identical to what it was before distance bought anything — 1.62 at
+/// 16 cells, 2.16 at 24, 3.09 at 40, and the cap from ≈ 48 on.
+///
+/// The owner's ask (2026-09-08): "a bigger impact splash that scales more
+/// with the distance traveled." Before this, count saturated at ~16 cells
+/// and reach at ~34; from 40 to 200 cells nothing grew at all.
+///
+/// Guards mirror [`flight_ms`]: a NaN, infinite or non-positive distance is
+/// the floor, never a panic and never a runaway.
+#[inline]
+#[must_use]
+pub fn impact(cells: f32) -> f32 {
+    if !cells.is_finite() || cells <= 0.0 {
+        return 1.0;
+    }
+    (cells / f32::from(JUMP_MIN_CELLS))
+        .powf(IMPACT_EXP)
+        .clamp(1.0, IMPACT_MAX)
+}
+
+const _: () = assert!(
+    IMPACT_MAX >= 1.0,
+    "the impact cap cannot be under the floor"
+);
+
 /// Head position on the path at `t = 0` — the frame the caret is first
 /// observed at its landing (D20: `p₀ = 0.28`, *everywhere*, in both halves).
 ///
@@ -129,9 +169,16 @@ pub const FLIGHT_P0: f32 = 0.28;
 pub const FLIGHT_ENTER_EXP: f32 = 2.2;
 
 /// Milliseconds AFTER the arrival edge by which every meteor pixel is off the
-/// glass (§6.2): train, pin and ring are gone at `T + 320`, the fan's hero
-/// winks at `T + 315`. "Any meteor light after `T + 350` ms is a bug."
-pub const FLIGHT_OFF_GLASS_MS: f32 = 320.0;
+/// glass. §6.2 wrote 320 ("any meteor light after `T + 350` ms is a bug");
+/// **600 since 2026-09-08**, the owner's ruling: "I want the meteor to have
+/// rainbow! be a bigger more special rainbow impact!" — the 320 was restraint,
+/// and the impact now carries a 420 ms shockwave, a 260 ms splash and a
+/// shower of sparks whose longest lives 560 ms. The FLIGHT is untouched
+/// ([`flight_ms`]): responsiveness is the attack, and the attack did not
+/// move — only the release grew. Read by `meteor.rs` alone; the pool's
+/// `end()` is `arrival + this`, and every impact mark is asserted inside it
+/// at compile time there.
+pub const FLIGHT_OFF_GLASS_MS: f32 = 600.0;
 
 /// The retire-previous finish (§6.9): a new meteor whose corridor comes within
 /// 1 `ch` of a live one jumps that one to its post-arrival fade with this `R`.
@@ -196,9 +243,14 @@ pub fn shed_n(cells: f32) -> u16 {
 /// constant exists to make impossible.
 pub const FAN_HERO_N: usize = 5;
 
-/// Fan stars in total, ceiling included: `n = min(5 + cells/1.8, 14) + party·4`
-/// never exceeds this (§6.5 layer 11).
-pub const FAN_MAX_N: usize = 18;
+/// Fan stars in total, ceiling included:
+/// `n = min(19 + 3.6·(impact − 1), 28) + party·8` never exceeds this (§6.5
+/// layer 11 wrote `min(5 + cells/1.8, 14) + party·4` under 18; **doubled
+/// 2026-09-08** — "a fan of coloured stars twice today's count" — and
+/// distance-graded the same day through [`impact`], which moves the count
+/// from the floor's 19 to the ceiling's 28 at the cap instead of saturating
+/// at 16 cells). Shared with the sky, which sizes its throw from it.
+pub const FAN_MAX_N: usize = 36;
 
 /// Rain-glint spacing floor in ms (D19).
 pub const RAIN_SPACING_MIN_MS: f32 = 18.0;
@@ -515,6 +567,53 @@ mod tests {
     /// two clamps, and monotonicity across the whole open range. This is the
     /// number the synth resolves through the SAME function, so an off-by-one
     /// here desynchronises the bell from the pin.
+    /// `impact` is the ONE magnitude every distance-graded landing law reads,
+    /// so its shape is pinned here once: floor exactly 1 at the 8-cell meteor
+    /// floor (the floor landing must not change), non-decreasing over the whole
+    /// range, saturating at the cap, and total on garbage.
+    #[test]
+    fn impact_is_monotone_floored_and_capped() {
+        assert!(
+            (impact(8.0) - 1.0).abs() < 1e-6,
+            "8 cells is the floor: exactly 1"
+        );
+        for c in [
+            0.0,
+            1.0,
+            4.0,
+            7.9,
+            -3.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert!(
+                (impact(c) - 1.0).abs() < 1e-6,
+                "{c}: below the floor (or garbage) is 1"
+            );
+        }
+        let mut last = 0.0f32;
+        for c in 1..=400 {
+            let v = impact(c as f32);
+            assert!(
+                v.is_finite() && v >= last,
+                "impact must be monotone: {c} → {v} < {last}"
+            );
+            assert!(v <= IMPACT_MAX);
+            last = v;
+        }
+        assert!((impact(16.0) - 1.62).abs() < 0.01, "{}", impact(16.0));
+        assert!((impact(40.0) - 3.09).abs() < 0.01, "{}", impact(40.0));
+        assert!(
+            (impact(48.0) - IMPACT_MAX).abs() < 1e-3,
+            "a full line is the cap"
+        );
+        assert!(
+            (impact(400.0) - IMPACT_MAX).abs() < 1e-6,
+            "and it stays there"
+        );
+    }
+
     #[test]
     fn flight_ms_is_shared_and_clamped() {
         assert!((flight_ms(8.0) - 60.0).abs() < 1e-4, "8 cells → 60 ms");

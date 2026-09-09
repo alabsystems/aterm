@@ -37,6 +37,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
         StageId::InstallChannel => install_channel(ctx, &mut r),
+        StageId::AtpkgTooling => atpkg_tooling(ctx, &mut r),
         StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
         StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
         StageId::StartCompare => start_compare(ctx, &mut r),
@@ -1255,6 +1256,31 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
             "test-install-channel.sh missing or not executable ({})",
             t.display()
         ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3.52) ATPKG PUBLISH TOOLING — the two deterministic shell suites over the
+//    producer scripts (tools/atpkg-author-vendor.sh, atpkg-index.sh,
+//    atpkg-publish.sh, atpkg-mirror-public.sh and the vendor lane
+//    tools/atpkg-auto-vendor.sh). Every vendor, key and gh call is stubbed
+//    (their headers say so): no network, no token, no repo mutation. Until
+//    2026-09-08 neither suite ran under any gate, so a change to the scripts
+//    that sign the toolchain index could land unmeasured (the audit finding).
+//    Same posture as install_channel: a missing suite is a cannot-run, never a
+//    skip.
+// ---------------------------------------------------------------------------
+fn atpkg_tooling(ctx: &Ctx, r: &mut Report) {
+    for name in ["test-atpkg-vendor-tooling.sh", "test-atpkg-auto-vendor.sh"] {
+        let t = ctx.tools_dir().join(name);
+        if is_executable_file(&t) {
+            run_labeled(ctx, r, name, &Cmd::new(&t));
+        } else {
+            r.cannot_run(format!(
+                "{name} missing or not executable ({})",
+                t.display()
+            ));
+        }
     }
 }
 

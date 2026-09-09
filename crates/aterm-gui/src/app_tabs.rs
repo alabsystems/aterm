@@ -2787,11 +2787,11 @@ impl App {
                 // is protected by the ordinary dialog.
                 let suppress = self.operator_typed;
                 if suppress {
-                    self.close_confirm_suppressed = true;
+                    self.close_confirm = crate::app_window::CloseConfirm::Programmatic;
                 }
                 let result = self.close_session_by_id(session);
                 if suppress {
-                    self.close_confirm_suppressed = false;
+                    self.close_confirm = crate::app_window::CloseConfirm::Interactive;
                 }
                 if result.is_ok() {
                     self.escalate_pending_close(el);
@@ -8020,6 +8020,7 @@ mod connected_spawn_tests {
 mod exit_attribution_tests {
     use super::*;
     use crate::CloseOutcome;
+    use crate::app_window::CloseConfirm;
     use crate::session_store::{ExitReason, RosterChange};
 
     /// The reason + actor (`by=`) of the sole `Exited` journal row — a fresh
@@ -8100,6 +8101,64 @@ mod exit_attribution_tests {
             Ok(()),
             "the session is gone: the verb answers OK closed"
         );
+        let (reason, _by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::CtlClose);
+    }
+
+    /// **THE WIRE `close` NEVER REACHES THE DIALOG.** Measured 2026-09-08 on a
+    /// windowed instance opened in the background: `@<sid> close` of an idle
+    /// last tab answered `ERR main-thread reply did not arrive within 30s`, and a
+    /// sample of the main thread showed `close_session_by_id → close_tab_at →
+    /// window_exit_close_allowed → confirm_destructive_close → NSAlert runModal`
+    /// — the native "quit aterm?" dialog, waiting for a click nobody could give,
+    /// with the shell's own `exit` queued behind it. `tab close` had carried a
+    /// programmatic bracket since M2; `close` was the one wire path without
+    /// one. The `Wake::CloseSession` arm now runs under
+    /// [`CloseConfirm::WireRefuseBusy`]: the confirm answers from the policy
+    /// before any dialog, an idle close proceeds, a busy one is refused — the
+    /// catalog entry's `ERR close refused (a running job armed the last-tab
+    /// confirm)`. Pinned WINDOWED (`headless = false`), because the headless
+    /// short-circuit is what kept every earlier test green over this hang.
+    #[test]
+    fn a_wire_close_never_reaches_the_dialog_and_refuses_only_a_busy_job() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+
+        // The `close` verb's policy: never a dialog, busy is a refusal.
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        assert!(
+            app.confirm_destructive_close(wid, true, false),
+            "an idle wire close proceeds without a dialog"
+        );
+        assert!(
+            !app.confirm_destructive_close(wid, true, true),
+            "a busy wire close is refused, not asked"
+        );
+        // `tab close` and the operator's Stop row: an explicit instruction, busy
+        // or not.
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(app.confirm_destructive_close(wid, true, true));
+        assert!(app.confirm_destructive_close(wid, false, true));
+
+        // The whole verb, windowed and idle: the close DEFERS (it is not refused,
+        // and it consults no dialog on the way), exactly as the headless twin
+        // above — then the escalation retires it.
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        let session = 0;
+        let progress = {
+            let _closing = session_store::CloseAttribution::enter(
+                session_store::ExitReason::CtlClose,
+                session_store::ExitActor::Unknown,
+            );
+            app.close_session_by_id(session)
+                .expect("an idle windowed last-tab close proceeds without a dialog")
+        };
+        app.close_confirm = CloseConfirm::Interactive;
+        assert_eq!(progress, CloseProgress::Deferred(wid));
+        assert!(app.windows[&wid].pending_close);
+        assert_eq!(app.close_window_logical(wid), CloseOutcome::Exit);
+        assert_eq!(app.close_session_verdict(session, progress), Ok(()));
         let (reason, _by) = sole_exit(&app);
         assert_eq!(reason, ExitReason::CtlClose);
     }

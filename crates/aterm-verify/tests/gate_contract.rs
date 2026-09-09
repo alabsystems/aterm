@@ -49,6 +49,8 @@ impl FakeRepo {
         me.script("tools/grep_guard.sh", "echo 'GUARD: PASS'; exit 0");
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
         me.script("tools/test-install-channel.sh", "exit 0");
+        me.script("tools/test-atpkg-vendor-tooling.sh", "exit 0");
+        me.script("tools/test-atpkg-auto-vendor.sh", "exit 0");
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
@@ -344,8 +346,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        30,
-        "27 gate stages plus the three --full tiers"
+        31,
+        "28 gate stages plus the three --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -1132,6 +1134,11 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             ("skip", "gate lint --fmt-only (selftest: not executed)"),
             ("skip", "grep_guard.sh (selftest)"),
             ("skip", "test-install-channel.sh (selftest: not executed)"),
+            (
+                "skip",
+                "test-atpkg-vendor-tooling.sh (selftest: not executed)"
+            ),
+            ("skip", "test-atpkg-auto-vendor.sh (selftest: not executed)"),
             (
                 "skip",
                 "test-trust-gate-verdict.sh (selftest: not executed)"

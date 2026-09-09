@@ -85,7 +85,7 @@
 
 mod rainbow_kitty_v2;
 
-pub use rainbow_kitty_v2::{MelodyV2, RainbowKittyV2Palette};
+pub use rainbow_kitty_v2::{MelodyV2, RainbowKittyV2Palette, TimbreStops};
 
 use rainbow_kitty_v2::{
     LANE_AGE_GUARD_S, LANE_FADE_STEAL_S, LANE_NONE, lane_cap, lane_drops_the_newcomer,
@@ -688,12 +688,14 @@ pub struct EventMeta {
     /// ONE time source, stamped on both delivery paths (the keyed seam and the
     /// observed-echo seam).
     ///
-    /// v1 indexed the bar by KEYSTROKE with no quantisation at all (§9.0 cause
-    /// 4): the meter followed finger jitter, so the "song" sped up and slowed
-    /// down with the hand and never sounded like a meter. v2's verse advances
-    /// on a 220 ms gate measured on THIS number, which is why "the verse steps
-    /// at a third of typing speed" stops being a rule and becomes a property
-    /// of the clock.
+    /// The melody's ONE clock. It is no longer a gate: the 220 ms step gate
+    /// this number used to feed was deleted on the owner's ruling of
+    /// 2026-09-08 (one keystroke is one melody step, at every typing speed).
+    /// What the stamp now decides is the SHAPE of the note rather than
+    /// whether there is one — the inter-key gap is what tells the derivation
+    /// that the hand is accelerating or hesitating, so an accurate `at_ms` is
+    /// the difference between a line that follows your hand and one that
+    /// follows the audio thread's block grid.
     ///
     /// Taken from the INPUT clock rather than audio-thread arrival because two
     /// cues delivered in one buffer must not be able to reorder a phrase
@@ -706,6 +708,24 @@ pub struct EventMeta {
     /// and the `!` hero request. An echo-born cue has no key behind it and
     /// must carry `0`, exactly as it must carry `shifted: false`.
     pub glyph_class: u8,
+    /// THE TYPED GLYPH'S ALPHABET RANK (§3.1's R2), filled at the keyed seam
+    /// only — the one input the DERIVED melody has about *what* you wrote.
+    ///
+    /// ORDERED, so a signed difference between consecutive keys is musically
+    /// meaningful; LOSSY, so nothing here reconstructs the user's text:
+    /// `0` = no key behind this cue (every echo-born cue, exactly as its
+    /// `glyph_class` is 0 and its `shifted` is false), `1..=26` = a letter
+    /// with its case folded away, `27..=36` = a digit, `37..=44` =
+    /// punctuation in eight buckets, `45` = anything else printable.
+    ///
+    /// The case folding and the punctuation bucketing are not incidental.
+    /// The melody needs the ORDER and nothing else, and shipping less than
+    /// the character is the right call for something that reaches a new
+    /// consumer: an eight-bucket punctuation class cannot carry a password,
+    /// and a rank stream cannot be read back as prose.
+    ///
+    /// [`typed_glyph_rank`] is the one producer.
+    pub rank: u8,
     /// THE PAN THIS GESTURE STARTS AT, −1..1 — the meteor's ORIGIN column,
     /// where [`SoundEvent::pan`] is its destination.
     ///
@@ -713,6 +733,65 @@ pub struct EventMeta {
     /// `pan_from == pan` simply does not travel, which is the right sound for
     /// a gesture that did not travel.
     pub pan_from: f32,
+    /// HOW FAR INTO THE CURRENT AUDIO BLOCK THIS CUE ARRIVED, in seconds
+    /// (THE PRISM §2.4 item 3, §3.4 c) — the host's pre-roll for the block
+    /// quantisation the render grid would otherwise impose.
+    ///
+    /// `render` fills each block from frame 0 and a voice starts at `t = 0`,
+    /// so a cue that lands mid-block used to start at the NEXT block
+    /// boundary: a uniform 0–10.7 ms of onset jitter (512 frames at 48 kHz)
+    /// uncorrelated with anything the fingers did. The host stamps the
+    /// instant the callback began rendering the in-flight block and hands
+    /// over `now − block_start` here; [`TrailSynth::spawn_seeded`] delays
+    /// every voice of this cue by exactly that much (J1), so the voice
+    /// sounds one whole block after its own arrival — a CONSTANT offset in
+    /// place of white noise on the rhythm. Clamped by the host to one block.
+    ///
+    /// `0.0` is the identity: every caller that does not stamp it, and every
+    /// archived render, is byte-identical.
+    pub block_lead_s: f32,
+}
+
+/// The engine's own ceiling on [`EventMeta::block_lead_s`]: 50 ms, five of
+/// the host's 10.667 ms blocks. The host clamps to ONE block; this bound only
+/// keeps a mis-stamped side-car from scheduling a note into the far future.
+const BLOCK_LEAD_MAX_S: f32 = 0.050;
+
+/// [`EventMeta::rank`] for a typed character — the ONE producer of the melody's
+/// alphabet order, so the host seam, the offline bench and this crate's own
+/// tests can never disagree about what a glyph is worth.
+///
+/// `None` (an IME run, a bare modifier, an echo-born cue) is `0`: no key.
+///
+/// The punctuation buckets are the keyboard's own groups rather than Unicode
+/// categories — the quantity is a keyboard distance, and the eight buckets are
+/// what keeps the class lossy enough to be safe to ship (see the field's own
+/// doc). Anything printable that is none of the above is `45`, one rank above
+/// the last bucket, so "some other glyph" is a real interval from punctuation
+/// and not a collision with it.
+#[must_use]
+pub fn typed_glyph_rank(typed: Option<char>) -> u8 {
+    let Some(c) = typed else { return 0 };
+    if c.is_ascii_alphabetic() {
+        // Case folded away: `A` and `a` are one letter, because the melody
+        // reads the alphabet's order and the capital already has its own
+        // voice in `SoundEvent::shifted`.
+        return 1 + (c.to_ascii_lowercase() as u8 - b'a');
+    }
+    if c.is_ascii_digit() {
+        return 27 + (c as u8 - b'0');
+    }
+    match c {
+        '.' | ',' => 37,
+        ';' | ':' => 38,
+        '\'' | '"' => 39,
+        '!' | '?' => 40,
+        '-' | '_' | '+' | '=' => 41,
+        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' => 42,
+        '/' | '\\' | '|' => 43,
+        c if c.is_ascii_punctuation() => 44,
+        _ => 45,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2535,6 +2614,15 @@ struct Bed {
     var_ph: [f32; 4],
     var_f: [f32; 4],
     var_t: f32,
+    /// THE SKY'S COLOUR (THE PRISM §3.2): the rainbow hue's ARC position
+    /// (`rainbow_kitty_v2::hue_arc`, 0 at the red end, 1 at the cyan end)
+    /// through a one-pole with τ = `BED_HUE_TAU_S`, slewed per v2 event. The
+    /// arc rather than the raw hue, because a one-pole on a circular
+    /// quantity takes the long way round at the wrap — the arc is continuous
+    /// through it. Drives the sky pad's tilt and its detune, and never a
+    /// pitch. Read by the music box's bed only; the other palettes never
+    /// touch it.
+    hue_s: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2588,18 +2676,28 @@ pub enum BedVariant {
     /// Contributes literally zero samples
     /// (`silence_candidate_contributes_exact_zero_bed_samples`).
     Silence,
+    /// C5 — THE RAINBOW SKY (THE PRISM §3.2): the music box's own pad. Three
+    /// lattice tones two octaves under the tine, voiced from the LIVE
+    /// chord's lit degrees (so the pad IS the harmony the derived melody is
+    /// snapped to, and nothing it plays can be out of key against it),
+    /// gliding once per WORD rather than on a timer; a 12 s breath; and the
+    /// rainbow's hue on its TILT and its WIDTH — never on a pitch. Body in
+    /// `rainbow_kitty_v2::TrailSynth::bed_rainbow_sky`, which the music box's
+    /// palette bed shares.
+    RainbowSky,
 }
 
 impl BedVariant {
-    /// Every tournament entrant, C0..C4 — the audition harness and the
+    /// Every tournament entrant, C0..C5 — the audition harness and the
     /// variant proofs iterate this so a new candidate is automatically
     /// rendered and law-checked.
-    pub const ALL: [BedVariant; 5] = [
+    pub const ALL: [BedVariant; 6] = [
         BedVariant::Current,
         BedVariant::ChordDrift,
         BedVariant::Breathing,
         BedVariant::Shimmer,
         BedVariant::Silence,
+        BedVariant::RainbowSky,
     ];
 }
 
@@ -2650,6 +2748,40 @@ const SHIMMER_DEGREES: [i32; 4] = [10, 12, 14, 15];
 /// glitters instead of pulsing.
 const SHIMMER_RATES: [f32; 4] = [0.13, 0.19, 0.29, 0.23];
 
+/// THE BED'S ENERGY KICK per admitted trail gesture — the table v1's trail
+/// arm has always used, hoisted so the music box's `push_v2` feeds the bed
+/// from the SAME numbers (THE PRISM §3.2 "How it starts") and the two paths
+/// cannot drift. Values are v1's, unchanged.
+fn bed_kick(kind: SoundKind) -> f32 {
+    match kind {
+        SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
+        // A word kill is per-command like the line kill, at word scale.
+        SoundKind::KillWord => 0.4,
+        // A space is typing cadence exactly like a letter.
+        SoundKind::Typed | SoundKind::Backspace | SoundKind::Space => 0.3,
+        // Cursor scrubbing feeds the bed at a whisper — presence, not a
+        // swell. The shift lift joins it: a modifier is presence too, never
+        // a swell of its own.
+        // THE CLOUD'S PUFF feeds it NOTHING: it is the accompaniment of a
+        // Backspace that already kicked the bed on this very gesture, and
+        // counting it again would let a delete swell the weather twice as
+        // hard as a keystroke.
+        SoundKind::Navigation
+        | SoundKind::Glide { .. }
+        | SoundKind::Sweep { .. }
+        | SoundKind::Shift => 0.12,
+        // The music box's own gestures feed nothing of their own: the
+        // meteor's arm and bell, the glint and the Enter cadence ride a
+        // keystroke or a jump that already kicked the bed on the same
+        // gesture (and under v1 these kinds never arrive at all).
+        SoundKind::Poof
+        | SoundKind::MeteorArm { .. }
+        | SoundKind::Meteor { .. }
+        | SoundKind::Enter { .. }
+        | SoundKind::Stardust { .. } => 0.0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The synth
 // ---------------------------------------------------------------------------
@@ -2679,6 +2811,13 @@ pub struct TrailSynth {
     since_voice: f32,
     /// Seconds since the last event of any kind (rate decay bookkeeping).
     since_event: f32,
+    /// THE BLOCK PRE-ROLL LATCHED FOR THE PUSH IN FLIGHT
+    /// ([`EventMeta::block_lead_s`]): set by [`Self::push_meta`] for the
+    /// duration of one push and cleared on its way out, so every voice that
+    /// push spawns is pre-delayed by the cue's own arrival offset and nothing
+    /// spawned at render time (a grain, a cascade re-strike) ever is. Exactly
+    /// `0.0` between pushes.
+    block_lead_s: f32,
     /// Seconds since the last ADMITTED deletion — the erase gate's own clock
     /// ([`ERASE_MIN_GAP`]). Separate from [`Self::since_voice`] on purpose:
     /// a poof must survive a correction typed inside the keystroke gap, and a
@@ -2846,15 +2985,15 @@ pub struct TrailSynth {
     /// [`Self::render`] (the branch is untaken — bit-exact pre-limiter
     /// arithmetic — until the first v2 event, so every pinned path renders
     /// as it always did) and it turns the sing-along's `song_key` snap into
-    /// §10.2's phrase-boundary handback. Never cleared.
+    /// §10.2's word-boundary handback. Never cleared.
     v2_latched: bool,
     /// THE KEY HANDBACK IS PENDING (§10.2, A31): the sing-along has ended
-    /// but the verse is mid-phrase, so `song_key` is held until the next
-    /// phrase boundary rather than snapped — the phrase finishes in the
-    /// cat's key. Only ever set while [`Self::v2_latched`]; cleared by the
-    /// handback itself, by the next riff bar's latch, or by the first v1
-    /// TRAIL event — a v1 voice has no phrase boundary to wait for, so it
-    /// takes v1's snap (see [`Self::push_meta`]).
+    /// but the line is mid-word, so `song_key` is held until the next word
+    /// boundary rather than snapped — the word finishes in the cat's key.
+    /// Only ever set while [`Self::v2_latched`]; cleared by the handback
+    /// itself, by the next riff bar's latch, or by the first v1 TRAIL event —
+    /// a v1 voice has no word boundary to wait for, so it takes v1's snap
+    /// (see [`Self::push_meta`]).
     v2_key_pending: bool,
     /// §9.7's BUS PEAK LIMITER — two state floats per channel: the peak
     /// follower (`lim_env_*`, instant attack, [`LIMIT_RELEASE_S`] release)
@@ -3048,6 +3187,7 @@ impl TrailSynth {
             rate: 0.0,
             since_voice: 1.0,
             since_event: 1.0,
+            block_lead_s: 0.0,
             since_erase: 1.0,
             erase_run: 0,
             space_run: false,
@@ -3146,6 +3286,19 @@ impl TrailSynth {
         self.steals
     }
 
+    /// RAINBOW KITTY's MELODY STATE, read-only (test / bench introspection).
+    ///
+    /// The census in `keyboard_song_ab` reads the melody's own account of
+    /// every key off [`MelodyV2::steps`] and [`MelodyV2::last_onset_ms`]
+    /// rather than re-deriving it, so the bench cannot drift from the law it
+    /// is measuring (one keystroke, one step, one onset):
+    /// the only way to disagree with the engine is to change the engine. Read
+    /// only — nothing outside the synth may advance the verse.
+    #[must_use]
+    pub fn melody_v2(&self) -> &MelodyV2 {
+        &self.v2
+    }
+
     /// Diagnostic: (bed energy, bed level) — demo/tuning hook.
     pub fn debug_bed(&self) -> (f32, f32) {
         (self.bed.energy, self.bed.level)
@@ -3198,9 +3351,9 @@ impl TrailSynth {
     }
 
     /// RELEASE THE SONG'S KEY — v1's snap, or, once the music box has
-    /// spoken, §10.2's HANDBACK: "`song_key` is handed back at the next
-    /// phrase boundary rather than snapped", so a verse that is mid-phrase
-    /// when the cat stops singing finishes the phrase in the cat's key. The
+    /// spoken, §10.2's HANDBACK: `song_key` is handed back at the next word
+    /// boundary rather than snapped, so a line that is mid-word when the cat
+    /// stops singing finishes the word in the cat's key. The
     /// boundary itself is detected on the v2 path
     /// (`rainbow_kitty_v2`'s `v2_hand_back_key`); a v1 trail event arriving
     /// first — the roster is per event — snaps instead ([`Self::push_meta`]),
@@ -3262,13 +3415,29 @@ impl TrailSynth {
         {
             return;
         }
-        if !meta.pan_from.is_finite() {
+        if !meta.pan_from.is_finite() || !meta.block_lead_s.is_finite() {
             return;
         }
         let meta = EventMeta {
             pan_from: meta.pan_from.clamp(-1.0, 1.0),
+            // A pre-roll is at most one block by the host's own clamp; the
+            // engine's bound is generous enough for any real block size and
+            // tight enough that a mis-stamped host cannot schedule a note
+            // into next week.
+            block_lead_s: meta.block_lead_s.clamp(0.0, BLOCK_LEAD_MAX_S),
             ..meta
         };
+        // THE PRE-ROLL IS LATCHED FOR THIS PUSH ONLY (J1, §3.4 c): every
+        // voice the push spawns reads it in `spawn_seeded`; it is cleared on
+        // every way out so render-time spawns never inherit it.
+        self.block_lead_s = meta.block_lead_s;
+        self.push_meta_latched(ev, meta);
+        self.block_lead_s = 0.0;
+    }
+
+    /// The body of [`Self::push_meta`] after the boundary filter, with the
+    /// block pre-roll already latched on `self`.
+    fn push_meta_latched(&mut self, ev: SoundEvent, meta: EventMeta) {
         let ev = SoundEvent {
             pan: ev.pan.clamp(-1.0, 1.0),
             heat: ev.heat.clamp(0.0, 1.0),
@@ -3288,7 +3457,7 @@ impl TrailSynth {
         // that is the whole point. v2's loudness law is the IOI arc of §9.6,
         // which REPLACES the flood duck (§16 row 11 sets that duck to exactly
         // 1.0 for a v2 event); its melody is `MelodyV2`, not `SONG_PULSE`; its
-        // admission is the 220 ms step gate and the per-lane caps, not
+        // admission is the derivation and the per-lane caps, not
         // `MIN_GAP`. Routing a v2 event through any of that would mean editing
         // shared arithmetic to make room for it — and shared arithmetic is
         // exactly what the eight v1 palettes are pinned on.
@@ -3296,12 +3465,12 @@ impl TrailSynth {
             return self.push_v2(ev, meta);
         }
         // A v1 TRAIL EVENT RESOLVES A PENDING HANDBACK BY SNAPPING. §10.2's
-        // phrase-boundary handback is detected on the v2 path alone
+        // word-boundary handback is detected on the v2 path alone
         // (`v2_hand_back_key`) and the latch that arms it is sticky, while
         // the voice roster is read PER EVENT: audition "music box", go back
         // to "marimba", let a riff die, and `song_key` would otherwise stay
         // pinned for the rest of the session — v1's typed register held
-        // transposed with no phrase boundary ever coming to release it, the
+        // transposed with no word boundary ever coming to release it, the
         // exact defect the sing-duck release below closed. v1's law is the
         // snap ("exactly as live as the song is"), so the first v1 trail event
         // takes it here, BEFORE its note is designed. TRAIL ONLY: a bonk or an
@@ -3376,35 +3545,7 @@ impl TrailSynth {
             // setting OFF mid-breath simply starves the feed: the live bed
             // exhales through its normal ~1 s decay and snaps to exact zero.
             if ev.bed {
-                let kick = match kind {
-                    SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
-                    // A word kill is per-command like the line kill, at word
-                    // scale.
-                    SoundKind::KillWord => 0.4,
-                    // A space is typing cadence exactly like a letter.
-                    SoundKind::Typed | SoundKind::Backspace | SoundKind::Space => 0.3,
-                    // Cursor scrubbing feeds the bed at a whisper — presence,
-                    // not a swell. The shift lift joins it: a modifier is
-                    // presence too, never a swell of its own.
-                    // THE CLOUD'S PUFF feeds it NOTHING: it is the accompaniment
-                    // of a Backspace that already kicked the bed on this very
-                    // gesture, and counting it again would let a delete swell the
-                    // weather twice as hard as a keystroke.
-                    SoundKind::Navigation
-                    | SoundKind::Glide { .. }
-                    | SoundKind::Sweep { .. }
-                    | SoundKind::Shift => 0.12,
-                    // §9.7: the music box has NO BED by default — the
-                    // silence between notes is the instrument — and its
-                    // events cannot reach here anyway (`push_v2` forks first).
-                    SoundKind::Poof
-                    | SoundKind::MeteorArm { .. }
-                    | SoundKind::Meteor { .. }
-                    | SoundKind::Enter { .. }
-                    | SoundKind::Stardust { .. } => 0.0,
-                };
-                self.bed.energy = (self.bed.energy + kick).min(1.0);
-                self.bed.gain += (ev.gain - self.bed.gain) * 0.3;
+                self.kick_bed(kind, ev.gain);
             }
         }
 
@@ -3736,14 +3877,24 @@ impl TrailSynth {
     /// live)". Running the census here would make the meteor's thump evict
     /// the word's downbeat `T` before the thump itself spoke.
     fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
-        if lane == LANE_NONE || deferred {
+        if lane == LANE_NONE {
             return Some(self.claim());
         }
-        if self.lane_make_room(lane, MAX_VOICES) {
-            Some(self.claim())
-        } else {
-            None
+        if !deferred && !self.lane_make_room(lane, MAX_VOICES) {
+            return None;
         }
+        // A DECORATION NEVER STEALS FROM A FULL POOL. §14's hierarchy is
+        // "a missing GLINT or BLOOM is a decoration that did not happen; a
+        // missing TUNE voice is a key that made no sound" — and `claim`'s
+        // pool-level steal takes the QUIETEST voice, which under a burst
+        // that outruns the renderer is the lead a bloom was spawned to
+        // decorate, at `t = 0` with its attack not yet delivered. So a lane
+        // that drops its newcomers under the age guard drops them under
+        // pool exhaustion too, and the tune still speaks (R1).
+        if lane_drops_the_newcomer(lane) && self.voices.iter().all(|v| v.on) {
+            return None;
+        }
+        Some(self.claim())
     }
 
     /// THE LANE CENSUS AND ITS VERDICT (§14). Counts the SOUNDING voices of
@@ -3878,7 +4029,16 @@ impl TrailSynth {
             }
         }
         v.on = true;
-        v.t = -v.delay; // delay is modelled as negative onset time
+        // Delay is modelled as negative onset time — plus the cue's block
+        // pre-roll (J1, [`EventMeta::block_lead_s`]): the voice sounds
+        // exactly one block after its own arrival instead of at the block
+        // boundary, so the onset jitter the render grid imposed goes to zero
+        // and the total offset becomes a constant. On `t`, NOT on `delay`:
+        // `delay > 0` is the lane census's "pre-delayed" mark (`claim_lane`
+        // above, `lane_onset_steal` in `render`), and a lead must not turn a
+        // voice censused at spawn into one censused twice. `0.0` between
+        // pushes, so every archived render is byte-identical.
+        v.t = -(v.delay + self.block_lead_s);
         (v.gl, v.gr) = pan_gains(gain, pan);
         // SPAWN ORDINAL — monotone, never recycled, so "oldest in lane" and
         // "is that still MY bell" are both exact questions. Saturating: a
@@ -5538,6 +5698,16 @@ impl TrailSynth {
         }
     }
 
+    /// FEED THE BED for one admitted trail gesture: [`bed_kick`]'s energy for
+    /// the kind, and the smoothed gain the bed honours the user volume with.
+    /// The ONE feed both engines call (v1's trail arm and `push_v2`), so the
+    /// two paths cannot drift: the setting's gate (`ev.bed`) stays at each
+    /// call site, exactly as it always was.
+    pub(super) fn kick_bed(&mut self, kind: SoundKind, gain: f32) {
+        self.bed.energy = (self.bed.energy + bed_kick(kind)).min(1.0);
+        self.bed.gain += (gain - self.bed.gain) * 0.3;
+    }
+
     /// Block-rate bed upkeep: energy decay, level slew, stochastic grains
     /// (grain design is per-palette — [`Palette::bed_grain`]).
     fn tick_bed(&mut self, dt: f32) {
@@ -5645,6 +5815,9 @@ impl TrailSynth {
             // incumbent rendered through the identical harness so its
             // artifacts are comparable.
             BedVariant::Silence => (0.0, 0.0),
+            // C5: the music box's own sky, on its own register (it ignores
+            // the palette anchor — its base is derived from the tine's).
+            BedVariant::RainbowSky => self.bed_rainbow_sky(dt, lvl),
         };
         (m + side, m - side)
     }
@@ -8203,6 +8376,59 @@ fn soft_clip(x: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// **THE GLYPH RANK IS ORDERED, TOTAL AND LOSSY** ([`EventMeta::rank`],
+    /// §3.1's R2) — the three properties the derived melody and the privacy
+    /// argument each rest on, and the only three this table promises.
+    ///
+    /// ORDERED, because the melody's whole use of it is the signed difference
+    /// between consecutive keys: the letters must run 1..=26 in alphabet
+    /// order and the digits 27..=36 in numeric order, or "two letters apart"
+    /// stops meaning a musical distance. TOTAL, because it is called on
+    /// whatever the host hands it. LOSSY, because it reaches a new consumer:
+    /// case is folded away and punctuation collapses into eight buckets, so
+    /// a rank stream cannot be read back as text.
+    #[test]
+    fn the_glyph_rank_is_ordered_total_and_lossy() {
+        assert_eq!(typed_glyph_rank(None), 0, "no key behind the cue");
+        // ORDERED — the letters.
+        for (k, c) in ('a'..='z').enumerate() {
+            assert_eq!(typed_glyph_rank(Some(c)), 1 + k as u8, "{c:?}");
+            assert_eq!(
+                typed_glyph_rank(Some(c.to_ascii_uppercase())),
+                typed_glyph_rank(Some(c)),
+                "{c:?}: case must fold"
+            );
+        }
+        // ORDERED — the digits, above every letter.
+        for (k, c) in ('0'..='9').enumerate() {
+            assert_eq!(typed_glyph_rank(Some(c)), 27 + k as u8, "{c:?}");
+        }
+        // LOSSY — eight punctuation buckets, and every printable that is
+        // none of the above shares one rank above them.
+        let buckets: std::collections::BTreeSet<u8> = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+            .chars()
+            .map(|c| typed_glyph_rank(Some(c)))
+            .collect();
+        assert!(
+            (2..=8).contains(&buckets.len()),
+            "ASCII punctuation collapsed into {} ranks; the table says eight",
+            buckets.len()
+        );
+        assert!(
+            buckets.iter().all(|r| (37..=44).contains(r)),
+            "a punctuation rank landed outside 37..=44: {buckets:?}"
+        );
+        for c in ['漢', '£', 'é', '٣', ' ', '\t'] {
+            assert_eq!(typed_glyph_rank(Some(c)), 45, "{c:?}");
+        }
+        // TOTAL — no input panics, and nothing exceeds the documented top.
+        for u in 0u32..0x3000 {
+            if let Some(c) = char::from_u32(u) {
+                assert!(typed_glyph_rank(Some(c)) <= 45, "{c:?} ranked out of range");
+            }
+        }
+    }
+
     /// AN EXPLICIT INSTRUMENT AUDITIONS ITSELF UNDER THE MUSIC BOX: under the
     /// rainbow kitty look (the music box's own), a `marimba`-voiced trail
     /// event walks the marimba, not the music box; only a "follow the look"
@@ -8319,6 +8545,109 @@ mod tests {
         let s = TrailSynth::new(48_000.0, 0x5EED_0B0C);
         assert!(!s.v2_engaged(&ev(GlowStyle::Lumen, SoundKind::Typed)));
         assert!(s.v2_engaged(&ev(GlowStyle::RainbowKitty, SoundKind::Typed)));
+    }
+
+    /// THE BLOCK PRE-ROLL (THE PRISM §3.4 c, J1): a cue stamped
+    /// `block_lead_s` sounds exactly that much later than the same cue
+    /// unstamped — every voice of the push, and NOTHING after it (the latch is
+    /// exactly zero between pushes) — and an unstamped cue is byte-identical to
+    /// the pre-field render, on a v1 palette and on the music box alike.
+    #[test]
+    fn the_block_pre_roll_delays_every_voice_of_the_push_and_nothing_after() {
+        const LEAD_S: f32 = 0.005;
+        // Bed OFF: the first non-zero sample must be the VOICE's onset, not
+        // the bed swelling in under it.
+        let ev = |style: GlowStyle, kind: SoundKind| SoundEvent {
+            bed: false,
+            ..ev(style, kind)
+        };
+        let first_onset = |style: GlowStyle, lead: f32| -> (usize, Vec<f32>) {
+            let mut s = TrailSynth::new(48_000.0, 0xB10C_1EAD);
+            s.push_meta(
+                ev(style, SoundKind::Typed),
+                EventMeta {
+                    at_ms: 1_000,
+                    block_lead_s: lead,
+                    ..EventMeta::default()
+                },
+            );
+            assert_eq!(s.block_lead_s, 0.0, "the latch is cleared on the way out");
+            let mut out = vec![0.0f32; 4 * 512 * CHANNELS];
+            for block in out.chunks_mut(512 * CHANNELS) {
+                s.render(block);
+            }
+            let onset = out
+                .iter()
+                .position(|&x| x != 0.0)
+                .expect("a typed key sounds");
+            (onset / CHANNELS, out)
+        };
+        for style in [GlowStyle::Lumen, GlowStyle::RainbowKitty] {
+            let (t0, plain) = first_onset(style, 0.0);
+            let (t1, _) = first_onset(style, LEAD_S);
+            let want = (LEAD_S * 48_000.0).round() as usize;
+            assert!(
+                t1 >= t0 + want - 1 && t1 <= t0 + want + 1,
+                "{style:?}: onset moved {} frames for a {want}-frame lead",
+                t1 as i64 - t0 as i64
+            );
+            // The identity: an unstamped side-car renders the pre-field bytes.
+            let mut s = TrailSynth::new(48_000.0, 0xB10C_1EAD);
+            s.push(ev(style, SoundKind::Typed));
+            let mut out = vec![0.0f32; 4 * 512 * CHANNELS];
+            for block in out.chunks_mut(512 * CHANNELS) {
+                s.render(block);
+            }
+            let mut s2 = TrailSynth::new(48_000.0, 0xB10C_1EAD);
+            s2.push_meta(ev(style, SoundKind::Typed), EventMeta::default());
+            let mut out2 = vec![0.0f32; 4 * 512 * CHANNELS];
+            for block in out2.chunks_mut(512 * CHANNELS) {
+                s2.render(block);
+            }
+            assert!(
+                out.iter()
+                    .zip(&out2)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{style:?}: `push` and an unstamped `push_meta` differ"
+            );
+            // A lead of 0.0 is the identity too (v.t = -(delay + 0.0)).
+            let (_, lead0) = first_onset(style, 0.0);
+            assert!(
+                plain
+                    .iter()
+                    .zip(&lead0)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{style:?}: the zero pre-roll is not the identity"
+            );
+        }
+        // Non-finite and out-of-range leads: refused, or clamped to the
+        // engine's ceiling — never scheduled into next week.
+        let mut s = TrailSynth::new(48_000.0, 1);
+        s.push_meta(
+            ev(GlowStyle::Lumen, SoundKind::Typed),
+            EventMeta {
+                block_lead_s: f32::NAN,
+                ..EventMeta::default()
+            },
+        );
+        assert!(s.voices.iter().all(|v| !v.on), "a NaN pre-roll is refused");
+        s.push_meta(
+            ev(GlowStyle::Lumen, SoundKind::Typed),
+            EventMeta {
+                block_lead_s: 9.0,
+                ..EventMeta::default()
+            },
+        );
+        let pending = s
+            .voices
+            .iter()
+            .filter(|v| v.on)
+            .map(|v| -v.t)
+            .fold(0.0f32, f32::max);
+        assert!(
+            pending <= BLOCK_LEAD_MAX_S + 1e-6,
+            "a wild pre-roll is clamped to the ceiling, got {pending}"
+        );
     }
 
     fn ev(style: GlowStyle, kind: SoundKind) -> SoundEvent {
@@ -9343,6 +9672,19 @@ mod tests {
     ///
     /// (The bypass kinds — Jump/Sweep/Land/Bonk/riff — are the deliberate
     /// exception and are asserted separately; a keystroke is not one of them.)
+    ///
+    /// **THE MUSIC BOX IS ON THE OTHER LAW, and is asserted on it here.** v2
+    /// does not route through [`MIN_GAP`] at all ([`TrailSynth::push_meta`]
+    /// forks to `push_v2` first), and since 2026-09-08 it may not thin a
+    /// keystroke by any means: one keystroke is one melody step and one note,
+    /// at every rate, which is exactly R1. So for the rainbow kitty look the
+    /// batch DOES spawn a voice per cue — that is the ruling, not a
+    /// regression — and what stands between a deep backlog and a click is
+    /// §14's per-lane cap plus the bus limiter. That is the claim this test
+    /// makes there, and it is the stronger one: it bounds the OUTPUT rather
+    /// than the voice count. (A batch sharing one instant is itself the host
+    /// defect §2.3(iii) names — one `EventMeta` built outside the frame's
+    /// drain loop — and it is repaired at the seam, not by silencing keys.)
     #[test]
     fn a_drained_cue_batch_speaks_once_however_deep_the_backlog() {
         for style in LOOKS {
@@ -9358,6 +9700,39 @@ mod tests {
                 let mut s = TrailSynth::new(48_000.0, 11);
                 for _ in 0..depth {
                     s.push(ev(style, SoundKind::Typed));
+                }
+                if style == GlowStyle::RainbowKitty {
+                    // R1: every cue speaks. The bound is the lane cap and
+                    // the limiter, measured on the output below.
+                    let mut buf = [0.0f32; 960];
+                    let mut peak = 0.0f32;
+                    for _ in 0..4 {
+                        s.render(&mut buf);
+                        for &x in &buf {
+                            peak = peak.max(x.abs());
+                        }
+                    }
+                    let mut lone = TrailSynth::new(48_000.0, 11);
+                    lone.push(ev(style, SoundKind::Typed));
+                    let mut single = 0.0f32;
+                    for _ in 0..4 {
+                        lone.render(&mut buf);
+                        for &x in &buf {
+                            single = single.max(x.abs());
+                        }
+                    }
+                    assert!(
+                        peak <= single * 2.5 + MASTER * (0.05 / 0.9),
+                        "{style:?}: {depth} keystroke cues drained together peaked \
+                         at {peak} against one key's {single} — the lane cap and \
+                         the limiter are what must hold this, since the melody \
+                         may no longer thin a key"
+                    );
+                    assert!(
+                        peak < 0.5,
+                        "{style:?}: {depth}-deep batch absolute peak too hot: {peak}"
+                    );
+                    continue;
                 }
                 assert_eq!(
                     s.live_voices(),
@@ -9496,7 +9871,7 @@ mod tests {
     #[test]
     fn bed_variant_pitches_stay_on_the_active_lattice_for_every_tone() {
         // Union of every candidate's lattice degrees (C1 chords, C2 pad,
-        // C3 wash — C0/C4 have no candidate pitches).
+        // C3 wash, C5 sky — C0/C4 have no candidate pitches).
         let mut bed_degrees: Vec<i32> = Vec::new();
         for root in CHORD_DRIFT_ROOTS {
             for off in CHORD_DRIFT_STACK {
@@ -9505,6 +9880,10 @@ mod tests {
         }
         bed_degrees.extend(BREATH_DEGREES);
         bed_degrees.extend(SHIMMER_DEGREES);
+        // C5 voices the live chord's lit degrees, chord by chord.
+        for chord in 0..rainbow_kitty_v2::SKY_BED_CHORDS {
+            bed_degrees.extend(rainbow_kitty_v2::sky_bed_degrees(chord));
+        }
         // Melody notes the beds must sit under: the walk's clamped range
         // (0..=8 across all tones) plus the ±2 column offset.
         let melody_degrees: Vec<i32> = (-2..=10).collect();
@@ -9616,7 +9995,7 @@ mod tests {
         }
     }
 
-    /// The tournament is non-vacuous: the five candidates are pairwise
+    /// The tournament is non-vacuous: the candidates are pairwise
     /// distinct textures under an identical melody script (bit-hash over
     /// the mixed render — the only degree of freedom is the bed design).
     #[test]
@@ -11126,13 +11505,28 @@ mod tests {
     /// which matters more than the level half. At 10 cps the keystrokes are
     /// 100 ms apart and a glass-bell note is ~135 ms, so every note used to
     /// overlap its neighbour.
+    ///
+    /// **On [`GlowStyle::Lumen`], as its sibling
+    /// `punctuation_and_the_note_after_a_pause_always_sing` already is.** The
+    /// accent/ghost split is v1's melody machinery (`song_notes`, `song_pulse`,
+    /// `walk`), and this test used to drive it through `RainbowKitty` — which
+    /// has been the music box since §17.3 phase 7 and does not route through
+    /// `design_trail` at all. Its melody assertions were therefore reading v1
+    /// fields the music box never writes, and only the level assertion still
+    /// bit: the 220 ms step gate happened to make the second key of a batch a
+    /// re-strike at 0.60, which looked like a ghost. With that gate deleted
+    /// (build step 3, 2026-09-08) the second key is a note in its own right,
+    /// so the coincidence is gone and the test is pointed at the palette
+    /// whose law it states. **v2 has no ghost lane** — §9.0 cause 1 deleted
+    /// it — and what bounds a batch there is the lane cap, asserted in
+    /// `a_drained_cue_batch_speaks_once_however_deep_the_backlog`.
     #[test]
     fn a_ghost_is_quieter_and_shorter_than_the_accent_it_follows() {
         let mut s = TrailSynth::new(48_000.0, 0x6805_7000);
         let mut buf = [0.0f32; 9600];
         let key = |s: &mut TrailSynth, buf: &mut [f32]| -> (f32, f32, i32, u32) {
             let before: [bool; MAX_VOICES] = core::array::from_fn(|i| s.voices[i].on);
-            s.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            s.push(ev(GlowStyle::Lumen, SoundKind::Typed));
             let v = s
                 .voices
                 .iter()
@@ -15242,11 +15636,62 @@ mod tests {
         /// (five spaced kinds, a 50-key 25 cps flood, a 3 s exhale), seed
         /// `0xA5A5_1234`.
         pub const ORACLE_SCRIPT_SAMPLES: usize = 264_000;
-        pub const ORACLE_SCRIPT_FOLD: u64 = 0xf5dd_2a34_2aac_b88f;
+        /// **RE-BAKED 2026-09-08, from a run, for the reason the design
+        /// names.** Build step 3 of the rainbow-feel design deletes the
+        /// 220 ms step gate and DERIVES the melody from the typed glyphs and
+        /// the hand (`rainbow_kitty_v2::MelodyV2::derive`), on the owner's
+        /// ruling that one keystroke must be one melody step at every typing
+        /// speed. This script's 50-key 25 cps flood used to sound one step
+        /// and four muted re-strikes per 220 ms; it now sounds fifty derived
+        /// notes. The fold is the melody, so the fold had to move — and it
+        /// moved for the music box alone: the eight v1 palettes are still
+        /// within `V056_TOLERANCE` of the v0.56 oracle on this same script,
+        /// which is what says the change stayed inside v2.
+        ///
+        /// **RE-BAKED AGAIN 2026-09-08 (build steps 4 and 6), from a run.**
+        /// Step 6 spawns §3.3's bloom voice behind every lit step and step
+        /// 3's τ_v line was re-fitted through the design's two anchors
+        /// (28 ms at 20 cps), so this script's 25 cps flood is fifty shorter
+        /// notes each with a hanging 3f/4f/6f bloom behind it — a different
+        /// waveform on every key by construction, not a drift. The eight v1
+        /// palettes are still within `V056_TOLERANCE` of the v0.56 oracle on
+        /// the same run, and `BRRRRING_FOLD` below did NOT move: the cascade
+        /// blooms nothing and its τ at the 250 ms default is the 110 ms both
+        /// fits share.
+        ///
+        /// **RE-BAKED AGAIN 2026-09-08 (build step 7), from a run.** The
+        /// music box's palette bed was a `(0.0, 0.0)` stub; it now renders
+        /// THE PRISM §3.2's sky (`bed_rainbow_sky`), and this script's
+        /// events carry `bed: true` ("the v0.56 reference has no bed gate"),
+        /// so a pad now sounds under the fifty keys and their exhale — a
+        /// whole-render hash cannot stay fixed under a new layer, by
+        /// construction. The eight v1 palettes are still within
+        /// `V056_TOLERANCE` of the v0.56 oracle on the same run (the kick
+        /// table they use was hoisted, not changed). The engine's own
+        /// entrant commit (`BedVariant::RainbowSky`, the kick) left both
+        /// folds where they were; ONLY the palette body moved them, which
+        /// is why that body and this re-bake share one commit: revert it
+        /// and the tree is the tournament entrant alone, green, on the old
+        /// folds. Previous: `0xd12d_77a1_3fe1_f68a`.
+        pub const ORACLE_SCRIPT_FOLD: u64 = 0x13cf_37ca_06db_6ad4;
         /// `brrrring_of_rapid_line_feeds_is_pinned`'s script (six Jumps at
         /// 30 ms, a 1 s ring-out), seed `0x5EED_50FD`.
         pub const BRRRRING_SAMPLES: usize = 113_280;
-        pub const BRRRRING_FOLD: u64 = 0x546e_544d_1dbe_b644;
+        /// **RE-BAKED 2026-09-08, from a run, same cause.** The cascade's
+        /// four notes are `walk + CASCADE_DEGREES`, and `walk` is where the
+        /// derived line stands rather than where the authored theme's
+        /// playhead stood — so the brrrring is the same FIGURE at a different
+        /// pitch. `BRRRRING_ONSETS` is unchanged at 6, which is the part of
+        /// this pin that is about D18's cap rather than about the melody: the
+        /// burst still speaks in one four-note cascade plus two floored
+        /// re-strikes.
+        ///
+        /// **RE-BAKED AGAIN 2026-09-08 (build step 7), from a run, same
+        /// cause as `ORACLE_SCRIPT_FOLD` above:** six `bed: true` Jumps
+        /// kick the bed by v1's 0.5 each, and the music box's bed now sounds.
+        /// `BRRRRING_ONSETS` is unchanged at 6 — the cascade itself is
+        /// untouched. Previous: `0x67e4_959d_a518_30a9`.
+        pub const BRRRRING_FOLD: u64 = 0x8f4c_7088_3ba4_04fb;
         /// Pitched onsets the six-jump burst spawns under the music box (D18:
         /// one four-note cascade, then at most one quiet top-note re-strike per
         /// 60 ms).

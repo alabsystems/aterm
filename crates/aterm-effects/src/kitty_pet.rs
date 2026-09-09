@@ -237,6 +237,7 @@ use aterm_time::Instant;
 
 use crate::cat_baker::CatColorKey;
 use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
+use crate::pet_stroke::StrokeDetector;
 use crate::rainbow_kitty::ARM_MIN;
 
 // ── the chase ───────────────────────────────────────────────────────────────
@@ -2607,6 +2608,9 @@ pub struct PetBrain {
     /// Seconds remaining in the petting hold — the purr-flavored beat a
     /// consumed pet buys regardless of the contentment ledger.
     pet_hold_t: f32,
+    /// Genuine pointer travel across a resting body earns the same bounded
+    /// affection as a click. This sensor never requests a wake or a frame.
+    stroke: StrokeDetector,
     /// PERK-AND-WATCH (wave 2): the stream-attention accumulator — rises
     /// [`WATCH_RISE`]/s while [`PetSense::output_burst`] holds, decays
     /// [`WATCH_FALL`]/s otherwise, clamped to `[0, 1]`. Heat, not a latch:
@@ -2966,6 +2970,7 @@ impl Default for PetBrain {
             pending_pet: 0,
             pet_at: None,
             pet_hold_t: 0.0,
+            stroke: StrokeDetector::default(),
             watch_heat: 0.0,
             watch_t: 0.0,
             watch_spent: false,
@@ -3234,6 +3239,12 @@ impl PetBrain {
         let mote_mark = self.mote_mark;
         let last_frolic = self.last_frolic;
         let bored_cool = self.bored_cool;
+        let mut stroke = std::mem::take(&mut self.stroke);
+        if let Some(now) = self.last_now {
+            // Contact belongs to the old surface; the rate limit belongs
+            // to the same pet, so switching panes cannot bypass it.
+            stroke.sample(now, None, 0.0);
+        }
         let mut ink_spans = std::mem::take(&mut self.ink_spans);
         ink_spans.clear();
 
@@ -3256,6 +3267,7 @@ impl PetBrain {
             mote_mark,
             last_frolic,
             bored_cool,
+            stroke,
             ink_spans,
             ..Self::default()
         };
@@ -3673,7 +3685,7 @@ impl PetBrain {
         }
     }
 
-    /// The user clicked the cat. Pets queue up to [`PET_LATCH_MAX`] (extras
+    /// The user clicked or gently stroked the cat. Pets queue up to [`PET_LATCH_MAX`] (extras
     /// are absorbed silently) and stay actionable for [`PET_LATCH_TTL`]
     /// from the LAST click, so a pet mid-flight waits for the ground.
     pub fn note_petted(&mut self, now: Instant) {
@@ -3806,6 +3818,10 @@ impl PetBrain {
             self.col_at_tick = self.col;
         }
         self.evicting = false;
+        if self.last_cell_h != sense.cell_h || self.last_cell_w != sense.cell_w {
+            // Pixel-to-cell coordinates changed: a resize is not a stroke.
+            self.stroke.sample(sense.now, None, 0.0);
+        }
         self.last_cell_h = sense.cell_h;
         self.last_cell_w = sense.cell_w;
         self.last_reduced = sense.reduced_motion;
@@ -3823,6 +3839,7 @@ impl PetBrain {
         // lifted a true first sighting off zero.
         let was_invisible = self.alpha <= 0.0;
         let Some((cr, cc)) = sense.caret else {
+            self.stroke.sample(sense.now, None, width);
             // Retire the OLD presentation's arc immediately, but do not move
             // a still-visible fading body to its far destination. If the fade
             // completes, landing there is invisible and gives the next cold
@@ -4209,6 +4226,7 @@ impl PetBrain {
         }
 
         if sense.reduced_motion {
+            self.stroke.sample(sense.now, None, width);
             // No fade, chase, gait, or arc: the pet simply IS at its station.
             // Reduced motion owns no frame-cadence lane in the host, so leaving
             // the ordinary first-sighting fade at alpha 0 here strands the
@@ -4427,6 +4445,21 @@ impl PetBrain {
             self.twitch_up = self.mote_serial.is_multiple_of(2);
             self.mote_serial = self.mote_serial.wrapping_add(1);
         }
+        // A hand moving over the resting body is affection. Use absolute
+        // pointer coordinates: the follower passing beneath a parked mouse
+        // cannot manufacture travel. The inset keeps this touch zone inside
+        // the rendered body even during the small idle squash and swell.
+        let stroke_point = if !was_invisible && prev.is_some() {
+            self.stroke_point(&sense, width)
+        } else {
+            None
+        };
+        if self.stroke.sample(sense.now, stroke_point, width) {
+            self.note_petted(sense.now);
+        }
+        // Touching the body still earns gaze, but the play-entry gates below
+        // stand down: a contented cat must not enter its hunting crouch
+        // halfway through the slow stroke that is about to earn affection.
         // POINTER PLAY (wave 2): the pet's own pointer sensor — velocity EMA
         // over DASH_WINDOW, attention heat, the dash clock, and (when a dash
         // matures near a happy cat) the pounce LATCH. Bookkeeping only;
@@ -4466,6 +4499,7 @@ impl PetBrain {
                 };
                 let range = (px - (self.col + width * 0.5)).abs();
                 if self.pointer_armed
+                    && stroke_point.is_none()
                     && self.dash_t >= DASH_MIN_T
                     && self.content >= PLAY_CONTENT
                     && range <= POUNCE_RANGE
@@ -4492,6 +4526,7 @@ impl PetBrain {
                 match self.pursuit_t {
                     None => {
                         if self.pursuit_cool <= 0.0
+                            && stroke_point.is_none()
                             && self.pointer_heat >= PURSUIT_HEAT
                             && (PURSUIT_MIN_SPEED..DASH_SPEED).contains(&speed)
                             && dist <= PURSUIT_RANGE
@@ -6063,6 +6098,7 @@ impl PetBrain {
             // threshold (~6.7 cells/s), and a creep never gets there — that
             // is exactly what makes it a creep.
             if !self.stakeout
+                && stroke_point.is_none()
                 && self.pursuit_t.is_none()
                 && self.pursuit_cool <= 0.0
                 && self.quiet >= PURSUIT_QUIET
@@ -7846,6 +7882,43 @@ impl PetBrain {
         self.hiding = false;
     }
 
+    /// A conservative middle band of the natural body, in absolute grid
+    /// cells. The same top/bottom containment as `PetFrame::body_px` keeps
+    /// a cat on row zero touchable without admitting the terminal chrome.
+    fn stroke_point(&self, sense: &PetSense, width: f32) -> Option<(f32, f32)> {
+        if !self.action.settled()
+            || self.action == PetAction::Perk
+            || self.quiet < PURSUIT_QUIET
+            || sense.output_burst
+            || self.stream
+            || self.watch_heat >= WATCH_GATE
+            || self.flight.is_some()
+            || self.retired_flight_lift.is_some()
+            || self.land_t > 0.0
+            || self.speed.abs() > 0.01
+            || self.pending_pounce
+            || self.pending_big_jump
+            || self.pending_wall_transit
+            || self.hiding
+            || sense.cell_w == 0
+            || sense.cell_h == 0
+            || sense.rows == 0
+            || sense.cols == 0
+        {
+            return None;
+        }
+        let (x, y) = sense.pointer?;
+        let top =
+            (self.row + 1.0 - ART_ROWS).clamp(0.0, (f32::from(sense.rows) - ART_ROWS).max(0.0));
+        (x.is_finite()
+            && y.is_finite()
+            && x >= self.col + width * 0.15
+            && x < self.col + width * 0.85
+            && y >= top + ART_ROWS * 0.20
+            && y < top + ART_ROWS * 0.85)
+            .then_some((x, y))
+    }
+
     fn clear_play(&mut self) {
         self.last_pointer = None;
         self.pointer_vx = 0.0;
@@ -8502,6 +8575,28 @@ impl PetBrain {
                     PetGlyphId::PetLoafOpen
                 } else {
                     PetGlyphId::PetLoaf
+                }
+            }
+            PetAction::Purr if self.pet_hold_t > 0.0 => {
+                // Affection has an immediate, readable body answer, even
+                // before the ledger earns a sustained purr. All beats ride
+                // the existing finite hold; no new idle clock or position
+                // change. Repeated affection warms the ledger and adds a
+                // tail flick and a second lean to the same seated gesture.
+                let u = (1.0 - self.pet_hold_t / PET_HOLD).clamp(0.0, 1.0);
+                let warm = self.content >= PURR_GATE;
+                let waves = if warm { 2.0 } else { 1.0 };
+                let lean = (core::f32::consts::PI * waves * u).sin().powi(2);
+                scale_y += 0.07 * lean;
+                scale_x -= 0.04 * lean;
+                if u < 0.20 {
+                    PetGlyphId::PetSitLookup
+                } else if warm && (0.35..0.55).contains(&u) {
+                    PetGlyphId::PetSitFlick
+                } else if !warm && (0.62..0.76).contains(&u) {
+                    PetGlyphId::PetSitBlink
+                } else {
+                    PetGlyphId::PetPurr
                 }
             }
             PetAction::Purr => {
@@ -14522,6 +14617,197 @@ mod tests {
         );
         assert!(pet.content() > c0, "and warmth");
         assert!(pet.pet_hold_t > 0.0, "held, not earned — yet");
+    }
+
+    #[test]
+    fn a_gentle_body_stroke_earns_a_visible_finite_affection_beat() {
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, Instant::now(), 4, 10);
+        let (mut t, initial) = idle(&mut pet, t, (4, 12), 1.0);
+        let width = art_cols(10, 20);
+        let mut frames = Vec::new();
+        let mut held_locations = Vec::new();
+        for step in 0..=16 {
+            t += Duration::from_millis(50);
+            frames.push(ptick(
+                &mut pet,
+                t,
+                (4, 12),
+                Some((
+                    initial.col + width * (0.20 + 0.60 * step as f32 / 16.0),
+                    4.1,
+                )),
+            ));
+            if pet.pet_hold_t > 0.0 {
+                let f = frames.last().unwrap();
+                held_locations.push((f.col, f.row, f.lift));
+            }
+        }
+        for _ in 0..70 {
+            t += Duration::from_millis(16);
+            frames.push(pet.tick(sense(t, Some((4, 12)))));
+            if pet.pet_hold_t > 0.0 {
+                let f = frames.last().unwrap();
+                held_locations.push((f.col, f.row, f.lift));
+            }
+        }
+        assert!(frames.iter().any(|f| f.action == PetAction::Purr));
+        assert!(
+            frames.iter().any(|f| {
+                f.motes
+                    .iter()
+                    .flatten()
+                    .any(|m| m.kind == PetMoteKind::Heart)
+            }),
+            "a stroke gives the same heart as a click"
+        );
+        for pose in [
+            PetGlyphId::PetSitLookup,
+            PetGlyphId::PetPurr,
+            PetGlyphId::PetSitBlink,
+        ] {
+            assert!(
+                frames
+                    .iter()
+                    .any(|f| f.action == PetAction::Purr && f.pose == pose),
+                "affection must actually show {pose:?}"
+            );
+        }
+        assert!(
+            frames.iter().any(|f| f.scale_y > 1.05),
+            "the body leans into the hand"
+        );
+        assert!(
+            held_locations
+                .iter()
+                .all(|p| *p == held_locations[0] && p.2 == 0.0),
+            "affection changes expression, never the pet's location"
+        );
+        assert_eq!(
+            pet.pet_hold_t, 0.0,
+            "one stroke buys only the existing finite hold"
+        );
+        let (_, f) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+        assert_eq!(f.action, PetAction::Sleep);
+        assert!(!pet.needs_frames());
+        assert!(
+            pet.next_change_deadline(t + Duration::from_secs(60))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn repeat_affection_adds_a_tail_flick_without_extending_each_hold() {
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, Instant::now(), 4, 10);
+        pet.note_petted(t);
+        t += Duration::from_millis(16);
+        pet.tick(sense(t, Some((4, 12))));
+        for _ in 0..3 {
+            pet.note_petted(t);
+        }
+        let mut flicked = false;
+        for _ in 0..160 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            flicked |= f.action == PetAction::Purr && f.pose == PetGlyphId::PetSitFlick;
+        }
+        assert!(flicked, "warm affection varies the seated beat");
+        assert_eq!(pet.pending_pets(), 0);
+        assert_eq!(pet.pet_hold_t, 0.0);
+    }
+
+    #[test]
+    fn a_parked_pointer_over_the_body_never_farms_affection_or_frames() {
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, Instant::now(), 4, 10);
+        let pointer = Some((pet.col + art_cols(10, 20) * 0.5, 4.1));
+        for _ in 0..360 {
+            t += Duration::from_millis(100);
+            let f = ptick(&mut pet, t, (4, 12), pointer);
+            assert_eq!(pet.pending_pets(), 0);
+            assert_eq!(pet.pet_hold_t, 0.0);
+            assert!(
+                !f.motes
+                    .iter()
+                    .flatten()
+                    .any(|m| m.kind == PetMoteKind::Heart)
+            );
+        }
+        assert!(!pet.needs_frames());
+        assert!(
+            pet.next_change_deadline(t).is_none(),
+            "quiet={} action={:?} offer={:?}",
+            pet.quiet,
+            pet.action,
+            pet.next_change_secs()
+        );
+    }
+
+    #[test]
+    fn stroke_progress_cannot_cross_hidden_reduced_or_work_frames() {
+        for interrupt in 0..4 {
+            let mut pet = PetBrain::default();
+            let t = awake(&mut pet, Instant::now(), 4, 10);
+            let (mut t, initial) = idle(&mut pet, t, (4, 12), 1.0);
+            let width = art_cols(10, 20);
+            for step in 0..=16 {
+                t += Duration::from_millis(50);
+                let mut s = sense(t, Some((4, 12)));
+                s.pointer = Some((
+                    initial.col + width * (0.20 + 0.60 * step as f32 / 16.0),
+                    4.1,
+                ));
+                if step == 8 {
+                    match interrupt {
+                        0 => s.caret = None,
+                        1 => s.reduced_motion = true,
+                        2 => s.caret = Some((4, 13)),
+                        _ => s.output_burst = true,
+                    }
+                }
+                pet.tick(s);
+                assert_eq!(pet.pending_pets(), 0, "interrupt={interrupt}, step={step}");
+                assert_eq!(pet.pet_hold_t, 0.0, "interrupt={interrupt}, step={step}");
+            }
+        }
+    }
+
+    #[test]
+    fn gentle_strokes_can_wake_a_sleeper_but_not_a_reduced_motion_pet() {
+        for reduced in [false, true] {
+            let mut pet = PetBrain::default();
+            let start = Instant::now();
+            let (mut t, initial) =
+                idle(&mut pet, start, (4, 12), SLEEP_AFTER + BREATH_WINDOW + 2.0);
+            assert_eq!(initial.action, PetAction::Sleep);
+            let width = art_cols(10, 20);
+            let mut woke = false;
+            for step in 0..=16 {
+                t += Duration::from_millis(50);
+                let mut s = sense(t, Some((4, 12)));
+                s.reduced_motion = reduced;
+                s.pointer = Some((
+                    initial.col + width * (0.20 + 0.60 * step as f32 / 16.0),
+                    4.1,
+                ));
+                let f = pet.tick(s);
+                woke |= f.action == PetAction::Waking;
+            }
+            assert_eq!(woke, !reduced);
+            if reduced {
+                assert_eq!(pet.content(), 0.0, "hover is not a reduced-motion click");
+                assert_eq!(pet.pending_pets(), 0);
+                assert!(!pet.needs_frames());
+            } else {
+                let mut answered = false;
+                for _ in 0..150 {
+                    t += Duration::from_millis(16);
+                    answered |= pet.tick(sense(t, Some((4, 12)))).action == PetAction::Purr;
+                }
+                assert!(answered, "the existing wake stretch hands into affection");
+            }
+        }
     }
 
     #[test]

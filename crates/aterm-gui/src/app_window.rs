@@ -302,6 +302,30 @@ fn present_target_install_outcome(
     (true, Some(milestones))
 }
 
+/// How [`App::confirm_destructive_close`] answers a close that would exit a window
+/// (or the app) — the one seam between a human gesture and a wire instruction.
+///
+/// The native confirm dialog is `NSAlert runModal`: it parks the main thread until
+/// a human clicks. A control-socket verb waits for that same main thread's reply,
+/// so a wire close that reached the dialog wedged the instance — nobody clicks a
+/// modal in a window an agent opened in the background. Every wire path therefore
+/// sets a non-interactive policy for the duration of its close, and the dialog is
+/// reserved for Cmd-W / Cmd-Q / the red light / the strip's ✕.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum CloseConfirm {
+    /// A human gesture: the native dialog, or the titlebar-warning fallback where
+    /// there is none.
+    #[default]
+    Interactive,
+    /// A programmatic close (`tab close`, the operator's Stop row): proceed with no
+    /// dialog, busy or not — a scripted close is an explicit instruction.
+    Programmatic,
+    /// The `close` verb: no dialog; an idle close proceeds, a busy one is refused so
+    /// the verb answers `ERR close refused (a running job armed the last-tab
+    /// confirm)` exactly as its catalog entry promises.
+    WireRefuseBusy,
+}
+
 impl App {
     /// Coalesce a destructive request behind the one live overlap handoff and
     /// nonblockingly ask its worker to abort.  Returning `true` is a hard
@@ -2545,15 +2569,30 @@ impl App {
     /// titlebar-warning confirm: the gesture is refused once (arming the warning) and
     /// proceeds on a repeat within the window.
     ///
-    /// NON-INTERACTIVE closes always PROCEED without a dialog: `headless` (no window to
-    /// confirm against) and a control-socket-driven close (`close_confirm_suppressed`,
-    /// e.g. the `tab close` verb) are DELIBERATE programmatic instructions, not stray
-    /// user gestures — blocking them on a human click would wedge the UI thread and the
-    /// client's reply. This means the M2 busy-job guard is intentionally not enforced
-    /// for programmatic/headless closes; it exists to catch accidental UI gestures.
-    fn confirm_destructive_close(&mut self, wid: WindowId, exits_app: bool, busy: bool) -> bool {
-        if self.headless || self.close_confirm_suppressed {
+    /// NON-INTERACTIVE closes never reach a dialog: `headless` (no window to confirm
+    /// against) always proceeds, and a control-socket-driven close answers by its
+    /// [`CloseConfirm`] policy — a `tab close` is a DELIBERATE programmatic
+    /// instruction and proceeds busy or not; a `close` proceeds when idle and is
+    /// REFUSED (never asked) when a job runs, which is the `ERR close refused (a
+    /// running job armed the last-tab confirm)` its catalog entry promises. Either
+    /// way no wire close blocks on a human click: that wedged the UI thread inside
+    /// `runModal` and the client's reply behind it — measured 2026-09-08, a `close`
+    /// of an idle last tab in a background window hung the instance until it was
+    /// killed. The M2 busy-job guard is therefore a refusal on the `close` verb, not
+    /// enforced at all on `tab close` or headless, and a dialog only for UI gestures.
+    pub(crate) fn confirm_destructive_close(
+        &mut self,
+        wid: WindowId,
+        exits_app: bool,
+        busy: bool,
+    ) -> bool {
+        if self.headless {
             return true;
+        }
+        match self.close_confirm {
+            CloseConfirm::Programmatic => return true,
+            CloseConfirm::WireRefuseBusy => return !busy,
+            CloseConfirm::Interactive => {}
         }
         // Windows follows Windows Terminal's convention, not macOS's: prompt when
         // the gesture closes MULTIPLE tabs or a running job, never for a single

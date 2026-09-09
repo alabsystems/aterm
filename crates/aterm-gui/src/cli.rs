@@ -286,7 +286,8 @@ const HELP_TAIL: &str = concat!(
     "              tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
     "              tab_status_badge, tab_connection_badge.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
-    "              cursor_style, cursor_blink, cursor_trail, cursor_trail_style\n",
+    "              cursor_style, cursor_blink, cursor_momentum_glow (typing-speed glow),\n",
+    "              cursor_trail, cursor_trail_style\n",
     "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
     "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
     // Sound is its own help block because it is its own Settings box now (the
@@ -383,6 +384,7 @@ const STARTER_CONFIG: &str = "\
 # background = \"#1A1B26\"
 # cursor_style = \"block\"          # block | bar
 # cursor_blink = true
+# cursor_momentum_glow = true     # the cursor glows with how fast you type and cools when you stop; warm = no blink (default ON)
 # selection_color = \"#33415E\"
 # selection_foreground = \"#FFFFFF\" # selected-text ink; unset = auto contrast floor
 # selection_inactive = false       # dim the selection band while the window is unfocused

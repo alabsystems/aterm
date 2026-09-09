@@ -1163,6 +1163,7 @@ pub fn model_registry() -> Vec<Model> {
         scrollback_maintenance_lane_model(),
         top_anchored_scroll_history_model(),
         kitty_sing_detector_model(),
+        pet_stroke_detector_model(),
         cursor_cat_earn_floor_model(),
         cursor_cat_curse_wince_model(),
         reduced_motion_companion_handoff_model(),
