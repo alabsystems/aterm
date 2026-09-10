@@ -1207,7 +1207,13 @@ impl StatusBars {
 
     /// THE NEW BUILD TOOK OVER (or a cold-lane boot found it already running):
     /// the good news, held [`HOLD_OK`] and then folded into the ledger.
-    pub(crate) fn update_landed(&mut self, version: &str, build: u64, now: Instant) {
+    pub(crate) fn update_landed(
+        &mut self,
+        version: &str,
+        build: u64,
+        kept_shells: bool,
+        now: Instant,
+    ) {
         self.staged_behind_outcome = None;
         let v = sanitize_for_tty(version, 32);
         let title = if v.is_empty() {
@@ -1219,7 +1225,15 @@ impl StatusBars {
             text: BarText {
                 glyph: '\u{2726}',
                 title,
-                detail: "your shells kept running".to_string(),
+                // ONLY WHERE IT IS TRUE. The seamless lane carried the running
+                // shells across and this is the whole promise; the cold lane
+                // carried none, and saying it there is a plain falsehood next to
+                // brand-new shells.
+                detail: if kept_shells {
+                    "your shells kept running".to_string()
+                } else {
+                    "the new build is running".to_string()
+                },
                 stats: String::new(),
                 tone: Tone::Success,
             },
@@ -1641,6 +1655,14 @@ fn truncate(s: &str, max: usize) -> String {
 /// find bar and the config notices already use, so the window's in-grid chrome
 /// reads as one surface). The LAST bar row carries the hairline that closes the
 /// chrome against the terminal content beneath it.
+/// One EMPTY band row, in the same colours a painted bar uses. The compose pads
+/// with this when the geometry has committed more rows than the cache holds, so
+/// a reserved row is never a hole the terminal's own top row shows through.
+pub(crate) fn blank_band_row(cols: usize, theme: Theme) -> Vec<RenderCell> {
+    let c = chrome_band::band_colors(theme);
+    blank_row(cols, c.label, c.bar_bg, false)
+}
+
 pub(crate) fn paint_rows(bars: &StatusBars, cols: usize, theme: Theme) -> Vec<Vec<RenderCell>> {
     let c = chrome_band::band_colors(theme);
     let n = bars.rows() as usize;
@@ -2419,12 +2441,12 @@ mod tests {
         assert_eq!(bar.text.title, "Finishing aterm v0.76.0");
         assert!(bar.text.detail.contains("queued"));
         assert_eq!(bar.stale_at, Some(now + HANDOFF_STALE));
-        bars.update_landed("0.76.0", 7, now);
+        bars.update_landed("0.76.0", 7, true, now);
         let bar = bars.bars().next().unwrap().1;
         assert_eq!(bar.text.title, "Updated \u{2014} now on v0.76.0");
         assert_eq!(bar.text.tone, Tone::Success);
         assert_eq!(bar.fold_at, Some(now + HOLD_OK));
-        bars.update_landed("", 7, now);
+        bars.update_landed("", 7, true, now);
         assert_eq!(
             bars.bars().next().unwrap().1.text.title,
             "Updated \u{2014} now on build 7"
@@ -2997,6 +3019,26 @@ mod tests {
         assert!(!text.contains(CLICK_TO_APPLY), "{text}");
     }
 
+    /// THE LANDING LINE ONLY CLAIMS WHAT THE LANE DID (2026-09-09): the
+    /// seamless lane carried the running shells, the cold lane carried none.
+    #[test]
+    fn the_landing_row_claims_the_shells_only_where_they_were_kept() {
+        let now = Instant::now();
+        let mut kept = StatusBars::default();
+        kept.update_landed("0.79.0", 7, true, now);
+        let bar = kept.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "Updated \u{2014} now on v0.79.0");
+        assert_eq!(bar.text.detail, "your shells kept running");
+        let mut cold = StatusBars::default();
+        cold.update_landed("0.79.0", 7, false, now);
+        let bar = cold.bars().next().unwrap().1;
+        assert_eq!(bar.text.detail, "the new build is running");
+        assert!(
+            !bar.text.detail.contains("shells"),
+            "no promise about shells this lane never had"
+        );
+    }
+
     /// A HANDOFF FREEZE SUSPENDS THE HOLDS, NOT THE CAPS (2026-09-08): the row
     /// count is frozen for Commit, so a hold that elapses mid-freeze must not
     /// leave the committed row a hole — but a successor whose Commit never
@@ -3409,7 +3451,7 @@ mod tests {
                 .map(|(_, b)| format!("{} — {}", b.text.title, b.text.detail))
                 .unwrap_or_default(),
         ));
-        lane.update_landed("9.9.9", 7, now);
+        lane.update_landed("9.9.9", 7, true, now);
         surfaces.push((
             "update row (landed)",
             lane.bars()

@@ -1830,17 +1830,34 @@ impl App {
                         )
                     {
                         // A NEWLY STAGED BUILD IS ANNOUNCED BY THE STATUS BAR
-                        // (2026-09-07): the updater's own `Staged` report already
-                        // painted the update lane's row — "aterm vX is ready … click
-                        // to apply now" — held for as long as the apply is armed.
-                        // The floating "Update ready" card and the stage-time border
-                        // glow are retired: the glow is the UPGRADE's, and fires
-                        // when the apply actually runs.
+                        // (2026-09-07): "aterm vX is ready … click to apply now",
+                        // held for as long as the apply is armed. The floating
+                        // "Update ready" card and the stage-time border glow are
+                        // retired: the glow is the UPGRADE's, and fires when the
+                        // apply actually runs.
+                        //
+                        // ANNOUNCED FROM HERE, NOT FROM THE DOWNLOADER (2026-09-09).
+                        // The updater's own `Progress::Staged` report is gated on
+                        // this process having actually DOWNLOADED the artifact
+                        // (`take_download_began`), so a build staged by a previous
+                        // launch — or by a sibling aterm that won the download race
+                        // — reported no progress at all and the row was never
+                        // opened. That is the ordinary way a ready build is met: it
+                        // is already on disk when the app starts. The reducer knows
+                        // the stage is newly announced and knows its posture, so the
+                        // row is posted here, where the announcement actually is.
+                        // `note_update_progress` is idempotent for a build whose row
+                        // is already up: it repaints the same words.
                         aterm_log::info!(
                             "update staged: build {} (v{}) announced on the status bar",
                             stage.build,
                             stage.version
                         );
+                        self.note_update_progress(&aterm_update::Progress::Staged {
+                            version: stage.version.clone(),
+                            build: stage.build,
+                        });
+                        self.restate_staged_bar_posture(stage.build);
                         self.request_redraw_all_windows();
                     }
 

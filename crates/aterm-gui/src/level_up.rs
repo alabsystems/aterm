@@ -162,6 +162,17 @@ impl LevelUp {
         }
     }
 
+    /// Whether this surge still paints while an in-app overlay covers the
+    /// window. The LANDING is a celebration over content the user has chosen to
+    /// cover: it yields. The CHARGING rim does not — it is the only thing on
+    /// screen saying why the terminal stopped echoing, and an automatic apply
+    /// fires precisely when the user's hands are off the keys, which is exactly
+    /// when the palette or Settings may be open over the window. A frozen
+    /// terminal behind an overlay is still a frozen terminal.
+    pub(crate) const fn paints_over_overlay(&self) -> bool {
+        matches!(self.phase, Phase::Charging)
+    }
+
     pub(crate) const fn phase(&self) -> Phase {
         self.phase
     }

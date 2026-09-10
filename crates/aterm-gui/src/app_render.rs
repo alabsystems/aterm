@@ -26110,7 +26110,7 @@ impl App {
         } else {
             self.level_up
                 .as_ref()
-                .filter(|_| !overlay_open)
+                .filter(|l| !overlay_open || l.paints_over_overlay())
                 .map(|level| OverlayGlow {
                     accent: level.accent(self.theme.cursor, now),
                     wash_a: level.wash_alpha(now),
@@ -29184,7 +29184,8 @@ impl App {
                 .level_up
                 .as_ref()
                 .filter(|l| {
-                    !ws.overlay_open() && (!ws.drag_hover || l.arrow_alpha(frame_started) > 0.0)
+                    (!ws.overlay_open() || l.paints_over_overlay())
+                        && (!ws.drag_hover || l.arrow_alpha(frame_started) > 0.0)
                 })
                 .map_or(0, |l| l.fingerprint(frame_started));
             // The status bars: 0 when none is up — the key stays byte-identical
@@ -29896,7 +29897,7 @@ impl App {
         } else {
             self.level_up
                 .as_ref()
-                .filter(|_| !overlay_open)
+                .filter(|l| !overlay_open || l.paints_over_overlay())
                 .map(|l| OverlayGlow {
                     accent: l.accent(self.theme.cursor, frame_started),
                     wash_a: l.wash_alpha(frame_started),
@@ -33978,7 +33979,10 @@ impl App {
         let level_up_fp = self
             .level_up
             .as_ref()
-            .filter(|l| !overlay_covers && (!drag_covers || l.arrow_alpha(now) > 0.0))
+            .filter(|l| {
+                (!overlay_covers || l.paints_over_overlay())
+                    && (!drag_covers || l.arrow_alpha(now) > 0.0)
+            })
             .map_or(0, |l| l.fingerprint(now));
         // The status bars — same term as the single-pane key: they are WINDOW
         // chrome rows over the finished composite; 0 when none is up (FL-1).
@@ -35142,8 +35146,27 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // SYMMETRIC (2026-09-09): over-supply is trimmed, and UNDER-supply is
+        // padded. The window was SIZED for `committed` rows; composing fewer
+        // makes every later row land one short, so the terminal's own top row is
+        // drawn under the band. That state is reachable whenever the bars empty
+        // while the count is frozen — a handoff that never commits is the case
+        // that made it permanent — and the padded row is the honest picture:
+        // the row the geometry owns, with nothing in it.
+        let padded: Vec<Vec<RenderCell>>;
         let rows: &[Vec<RenderCell>] = if ws.cached_bar_rows.len() > committed {
             &ws.cached_bar_rows[..committed]
+        } else if ws.cached_bar_rows.len() < committed {
+            padded = ws
+                .cached_bar_rows
+                .iter()
+                .cloned()
+                .chain(std::iter::repeat_with(|| {
+                    crate::status_bars::blank_band_row(cols, theme)
+                }))
+                .take(committed)
+                .collect();
+            &padded
         } else {
             &ws.cached_bar_rows
         };

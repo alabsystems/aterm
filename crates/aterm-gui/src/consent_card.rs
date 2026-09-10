@@ -122,7 +122,17 @@ pub(crate) const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 /// How long after its FIRST raise a displaced card may be raised again — the
 /// card's own hold (`notice::ADMIN_STEP_TTL`). Past it the card has had its
 /// turn for this process; the next launch asks again.
-pub(crate) const RERAISE_WITHIN: Duration = crate::notice::ADMIN_STEP_TTL;
+pub(crate) const RERAISE_WITHIN: Duration = crate::notice::ADMIN_STEP_TTL.saturating_mul(2);
+
+/// How long the launch one-shot waits for its worker's verdict before asking
+/// again. A verdict CAN be lost: an uncommitted incoming handoff drops every
+/// wake but Commit, and the tick that starts the one-shot has no way to know a
+/// wake it posted was dropped.
+const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many verdicts the one-shot will wait for before giving up for the life
+/// of the process.
+pub(crate) const DECIDE_ATTEMPTS: u8 = 3;
 
 /// The pill that replaces the card once the probe observes the grant. It
 /// names the fact and stops: which services the grant covers and how far it
@@ -318,8 +328,10 @@ pub(crate) fn decide(facts: &CardFacts, marker: Option<Marker>) -> Verdict {
 pub(crate) enum CardPhase {
     /// Nothing asked yet — the launch-time one-shot has not run.
     Idle,
-    /// The worker is warming the identity and reading the marker.
-    Deciding,
+    /// The worker is warming the identity and reading the marker, since
+    /// `since` — stamped so a verdict that never arrives ([`DECIDE_TIMEOUT`])
+    /// is asked for again instead of waiting for a wake that cannot come.
+    Deciding { since: Instant },
     /// Due; waiting for the shared notice slot to be free.
     Due,
     /// On screen since `since` (or displaced and waiting to return); the
@@ -344,12 +356,16 @@ pub(crate) struct CardState {
     /// The owner pressed something on the card (Open Settings, or the body).
     /// A card the owner acted on is never re-raised in this process.
     owner_acted: bool,
+    /// How many times the launch one-shot has asked its worker for a verdict
+    /// ([`DECIDE_ATTEMPTS`]).
+    decide_attempts: u8,
 }
 
 impl CardState {
     pub(crate) const fn new() -> Self {
         Self {
             phase: CardPhase::Idle,
+            decide_attempts: 0,
             first_raised: None,
             owner_acted: false,
         }
@@ -360,11 +376,32 @@ impl CardState {
     }
 
     /// The one-shot fired: a worker is deciding. Only from [`CardPhase::Idle`].
-    pub(crate) fn begin_deciding(&mut self) -> bool {
+    pub(crate) fn begin_deciding(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Idle {
             return false;
         }
-        self.phase = CardPhase::Deciding;
+        self.phase = CardPhase::Deciding { since: now };
+        self.decide_attempts = self.decide_attempts.saturating_add(1);
+        true
+    }
+
+    /// The worker's verdict has not arrived within [`DECIDE_TIMEOUT`].
+    pub(crate) fn deciding_lapsed(&self, now: Instant) -> bool {
+        matches!(self.phase, CardPhase::Deciding { since }
+            if now.duration_since(since) >= DECIDE_TIMEOUT)
+    }
+
+    /// A lapsed decision: ask again from `Idle`, or settle for good once
+    /// [`DECIDE_ATTEMPTS`] have been spent. `true` when another attempt will be
+    /// made. DECIDING IS NOT A TERMINAL STATE — a dropped wake (the incoming
+    /// handoff swallows every non-Commit wake until it commits) must not make
+    /// the card silently dead for the life of the process.
+    pub(crate) fn reopen_deciding(&mut self) -> bool {
+        if self.decide_attempts >= DECIDE_ATTEMPTS {
+            self.phase = CardPhase::Settled;
+            return false;
+        }
+        self.phase = CardPhase::Idle;
         true
     }
 
@@ -373,7 +410,7 @@ impl CardState {
     /// and is ignored. `Confirm` waits for the slot like `Offer` does: the
     /// confirmation is a one-time pill the caller raises when it can.
     pub(crate) fn on_decided(&mut self, verdict: &Verdict, now: Instant) -> bool {
-        if self.phase != CardPhase::Deciding {
+        if !matches!(self.phase, CardPhase::Deciding { .. }) {
             return false;
         }
         self.phase = match verdict {
@@ -414,7 +451,7 @@ impl CardState {
     pub(crate) fn on_grant_awaiting_slot(&mut self, now: Instant) {
         if matches!(
             self.phase,
-            CardPhase::Due | CardPhase::Watching { .. } | CardPhase::Deciding
+            CardPhase::Due | CardPhase::Watching { .. } | CardPhase::Deciding { .. }
         ) {
             self.phase = CardPhase::Confirming { since: now };
         }
@@ -505,9 +542,9 @@ impl Default for CardState {
 #[cfg(test)]
 mod tests {
     use super::{
-        CardFacts, CardPhase, CardState, GRANTED_CAPTION, MARKER, MAX_MARKER_BYTES, Marker, NotDue,
-        RERAISE_WITHIN, Verdict, WATCH_FOR, clear_opened, decide, marker_path,
-        opened_settings_caption, read_marker, record_marker,
+        CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT, GRANTED_CAPTION, MARKER,
+        MAX_MARKER_BYTES, Marker, NotDue, RERAISE_WITHIN, Verdict, WATCH_FOR, clear_opened, decide,
+        marker_path, opened_settings_caption, read_marker, record_marker,
     };
     use aterm_containment::consent::{DrClass, FdaState};
     use std::time::{Duration, Instant};
@@ -727,6 +764,62 @@ mod tests {
     /// The lifecycle: one decision per process, a stale verdict is ignored,
     /// the watch is bounded, a displaced card returns within its own hold
     /// unless the owner pressed it, and every terminal press settles it.
+    /// A VERDICT THAT NEVER ARRIVES DOES NOT KILL THE CARD (2026-09-09). An
+    /// uncommitted incoming handoff drops every wake but Commit, so the card's
+    /// own verdict can be swallowed. Deciding therefore lapses, asks again, and
+    /// gives up only after [`DECIDE_ATTEMPTS`] — never silently forever.
+    #[test]
+    fn a_swallowed_verdict_is_asked_for_again_and_then_given_up_on() {
+        let t0 = Instant::now();
+        let mut s = CardState::new();
+        for attempt in 1..=DECIDE_ATTEMPTS {
+            assert!(s.begin_deciding(t0), "attempt {attempt} starts");
+            assert!(!s.deciding_lapsed(t0), "not lapsed on the same instant");
+            assert!(!s.deciding_lapsed(t0 + DECIDE_TIMEOUT - Duration::from_millis(1)));
+            assert!(s.deciding_lapsed(t0 + DECIDE_TIMEOUT));
+            let again = s.reopen_deciding();
+            assert_eq!(
+                again,
+                attempt < DECIDE_ATTEMPTS,
+                "attempt {attempt} of {DECIDE_ATTEMPTS}"
+            );
+        }
+        assert_eq!(s.phase(), CardPhase::Settled, "the attempts are spent");
+        assert!(!s.begin_deciding(t0), "and it does not start again");
+        // A verdict that DOES arrive still ends the deciding phase.
+        let mut ok = CardState::new();
+        assert!(ok.begin_deciding(t0));
+        assert!(ok.on_decided(&Verdict::Offer, t0));
+        assert_eq!(ok.phase(), CardPhase::Due);
+    }
+
+    /// THE RE-RAISE BUDGET MUST OUTLAST WHAT DISPLACES IT (2026-09-09): the
+    /// admin card holds the slot for `ADMIN_STEP_TTL`, and the design promises
+    /// the access card comes back when the slot frees. With the two equal the
+    /// budget always closed first, so the return was unreachable in exactly the
+    /// case the module names.
+    #[test]
+    fn a_displaced_card_can_still_return_after_the_card_that_displaced_it() {
+        assert!(
+            RERAISE_WITHIN > crate::notice::ADMIN_STEP_TTL,
+            "the longest hold that can displace it must fit inside the budget"
+        );
+        let t0 = Instant::now();
+        let mut s = CardState::new();
+        assert!(s.begin_deciding(t0));
+        assert!(s.on_decided(&Verdict::Offer, t0));
+        assert!(s.raise_allowed(t0));
+        s.on_raised(t0);
+        // The admin card lands a moment later and takes the slot for its whole hold.
+        let displaced_at = t0 + Duration::from_millis(500);
+        assert!(s.on_displaced(displaced_at));
+        let slot_frees = displaced_at + crate::notice::ADMIN_STEP_TTL;
+        assert!(
+            s.raise_allowed(slot_frees),
+            "the slot frees inside the budget, so the card returns"
+        );
+    }
+
     #[test]
     fn the_lifecycle_decides_once_watches_for_a_while_and_settles() {
         let t0 = Instant::now();
@@ -734,11 +827,14 @@ mod tests {
         assert_eq!(s.phase(), CardPhase::Idle);
         assert!(!s.wants_probe(t0), "idle: nothing to watch");
         assert!(!s.on_displaced(t0));
-        assert!(s.begin_deciding());
-        assert!(!s.begin_deciding(), "the one-shot fires once");
-        assert_eq!(s.phase(), CardPhase::Deciding);
+        assert!(s.begin_deciding(Instant::now()));
+        assert!(!s.begin_deciding(Instant::now()), "the one-shot fires once");
+        assert!(matches!(s.phase(), CardPhase::Deciding { .. }));
         s.on_raised(t0);
-        assert_eq!(s.phase(), CardPhase::Deciding, "nothing to raise yet");
+        assert!(
+            matches!(s.phase(), CardPhase::Deciding { .. }),
+            "nothing to raise yet"
+        );
 
         assert!(s.on_decided(&Verdict::Offer, t0));
         assert_eq!(s.phase(), CardPhase::Due);
@@ -769,7 +865,7 @@ mod tests {
         // A card displaced LATE in its hold goes to Due but may not come back
         // past the window: the raise is refused and the card settles.
         let mut d = CardState::new();
-        assert!(d.begin_deciding());
+        assert!(d.begin_deciding(Instant::now()));
         assert!(d.on_decided(&Verdict::Offer, t0));
         d.on_raised(t0);
         assert!(d.on_displaced(t0 + RERAISE_WITHIN - Duration::from_secs(1)));
@@ -780,7 +876,7 @@ mod tests {
         // THE GRANT SEEN WHILE ANOTHER CARD HOLDS THE SLOT: the confirmation
         // waits like the card does, and gives up only after its patience.
         let mut g = CardState::new();
-        assert!(g.begin_deciding());
+        assert!(g.begin_deciding(Instant::now()));
         assert!(g.on_decided(&Verdict::Offer, t0));
         g.on_raised(t0);
         g.on_grant_awaiting_slot(t1);
@@ -792,7 +888,7 @@ mod tests {
         assert!(g.confirmation_expired(t1 + WATCH_FOR));
         assert_eq!(g.phase(), CardPhase::Settled);
         let mut c = CardState::new();
-        assert!(c.begin_deciding());
+        assert!(c.begin_deciding(Instant::now()));
         assert!(c.on_decided(&Verdict::Confirm, t0));
         assert_eq!(c.phase(), CardPhase::Confirming { since: t0 });
 
@@ -800,7 +896,7 @@ mod tests {
         // no re-raise after that, however soon it is displaced.
         let t2 = t0 + Duration::from_secs(20);
         let mut o = CardState::new();
-        assert!(o.begin_deciding());
+        assert!(o.begin_deciding(Instant::now()));
         assert!(o.on_decided(&Verdict::Offer, t0));
         o.on_raised(t0);
         o.on_opened_settings(t2);
@@ -815,7 +911,7 @@ mod tests {
 
         // A body press: dismissed for now, watch continues, never re-raised.
         let mut b = CardState::new();
-        assert!(b.begin_deciding());
+        assert!(b.begin_deciding(Instant::now()));
         assert!(b.on_decided(&Verdict::Offer, t0));
         b.on_raised(t0);
         b.on_owner_acted();
@@ -824,13 +920,13 @@ mod tests {
 
         // A decision that says no settles without ever raising.
         let mut n = CardState::new();
-        assert!(n.begin_deciding());
+        assert!(n.begin_deciding(Instant::now()));
         assert!(n.on_decided(&Verdict::Quiet(NotDue::Granted), t0));
         assert_eq!(n.phase(), CardPhase::Settled);
 
         // Not now / the grant observed: settle from watching.
         let mut w = CardState::new();
-        assert!(w.begin_deciding());
+        assert!(w.begin_deciding(Instant::now()));
         assert!(w.on_decided(&Verdict::Offer, t0));
         w.on_raised(t0);
         w.settle();

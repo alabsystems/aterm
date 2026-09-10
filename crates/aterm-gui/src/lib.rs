@@ -13289,6 +13289,17 @@ impl App {
         }
         match self.consent_card.phase() {
             consent_card::CardPhase::Idle => {
+                // NOT WHILE AN INCOMING HANDOFF IS UNCOMMITTED. Until Commit,
+                // `user_event` drops every wake but `ActivateCommittedHandoff`
+                // — including the verdict this one-shot is about to ask for —
+                // so starting here would spend the launch's single attempt on a
+                // wake that cannot be delivered, and the card would be silently
+                // dead for the life of the process. Since aterm normally
+                // ARRIVES by updating itself, that is the common case, not a
+                // corner. Ask at the first park after Commit instead.
+                if self.incoming_handoff_pending {
+                    return;
+                }
                 if !(self.config.privacy_enabled() && self.config.privacy_notice()) {
                     self.consent_card.settle();
                     return;
@@ -13298,7 +13309,7 @@ impl App {
                     return;
                 };
                 let config = self.consent_card_config.clone();
-                if self.consent_card.begin_deciding()
+                if self.consent_card.begin_deciding(now)
                     && !post_macos_access_card_facts(proxy, config)
                 {
                     aterm_log::warn!(
@@ -13307,7 +13318,18 @@ impl App {
                     self.consent_card.settle();
                 }
             }
-            consent_card::CardPhase::Deciding | consent_card::CardPhase::Settled => {}
+            consent_card::CardPhase::Settled => {}
+            // A VERDICT THAT NEVER CAME. Deciding is not terminal: ask again,
+            // and say so once when the attempts are spent.
+            consent_card::CardPhase::Deciding { .. } => {
+                if self.consent_card.deciding_lapsed(now) && !self.consent_card.reopen_deciding() {
+                    aterm_log::warn!(
+                        "macOS access card: no verdict arrived after {} attempts; \
+                         not offered this launch",
+                        consent_card::DECIDE_ATTEMPTS
+                    );
+                }
+            }
             // The grant was observed while another card held the slot: the ✓
             // waits for the slot exactly as the card does, and gives up only
             // after its patience — leaving the `opened` marker for the next
@@ -18329,12 +18351,43 @@ impl ApplicationHandler<Wake> for App {
         if self.first_present_done
             && let Some(build) = self.landed_row_pending.take()
         {
+            // The COLD lane: this process adopted no shells, so the row must not
+            // say any kept running.
             self.status_bars.update_landed(
                 crate::build_info::version_display(),
                 build,
+                false,
                 Instant::now(),
             );
             self.sync_status_bars();
+        }
+        // …AND SO DO THE FOLDS. `new_events` retires expired bars only on a
+        // `ResumeTimeReached` wake, which a shell streaming output can starve
+        // indefinitely: the "Updated" row would sit past its hold for as long as
+        // the flood lasts. Retiring here costs two instant comparisons.
+        {
+            let now = Instant::now();
+            if self.settle_status_bars(now) {
+                self.request_redraw_all_windows();
+            }
+            if self.level_up.as_ref().is_some_and(|l| l.is_expired(now)) {
+                self.level_up = None;
+                self.request_redraw_all_windows();
+            }
+        }
+        // HEADLESS STILL RECORDS THE UPDATE. The landing is noted in `resumed`,
+        // which a windowless process never reaches — so an operator driving
+        // `aterm ctl appstatus` saw no evidence the app had updated itself at
+        // all. The flourish belongs to a window; the RECORD does not.
+        if self.headless && !self.level_up_done && JUST_UPDATED.get().copied().unwrap_or(false) {
+            self.level_up_done = true;
+            let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
+            self.status_bars.update_landed(
+                crate::build_info::version_display(),
+                build,
+                !self.seamless_adopt.is_empty(),
+                Instant::now(),
+            );
         }
         // THE ROW COUNT CONVERGES ON THE WAY TO EVERY WAIT. A refused apply
         // retires the row it added without a sync of its own
@@ -20588,6 +20641,7 @@ impl ApplicationHandler<Wake> for App {
                     self.status_bars.update_landed(
                         crate::build_info::version_display(),
                         build,
+                        true,
                         Instant::now(),
                     );
                     self.sync_status_bars();
@@ -26939,7 +26993,7 @@ mod overlap_handoff_tests {
         assert_eq!(decide(&facts, None), Verdict::Quiet(NotDue::Headless));
         // The only headless path that reaches the decision code: a verdict
         // in `Deciding` settles, and raises nothing.
-        assert!(app.consent_card.begin_deciding());
+        assert!(app.consent_card.begin_deciding(Instant::now()));
         app.decide_macos_access_card(None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert!(app.notice.is_none());
@@ -26967,7 +27021,7 @@ mod overlap_handoff_tests {
             app
         };
         let raised = |app: &mut App, now: Instant| {
-            assert!(app.consent_card.begin_deciding());
+            assert!(app.consent_card.begin_deciding(Instant::now()));
             assert!(app.consent_card.on_decided(&Verdict::Offer, now));
             app.tick_macos_access_card(now);
             assert!(
@@ -27001,7 +27055,7 @@ mod overlap_handoff_tests {
         // A verdict in DECIDING against the inert arm: the probe is
         // `unknown`, which is not a denial — quiet, nothing raised.
         let mut app = windowed();
-        assert!(app.consent_card.begin_deciding());
+        assert!(app.consent_card.begin_deciding(Instant::now()));
         app.decide_macos_access_card(None);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert!(app.notice.is_none());
@@ -27009,7 +27063,7 @@ mod overlap_handoff_tests {
         // DUE: the admin card holds the slot → the card waits and the admin
         // card is untouched; a decoration yields → the card is raised.
         let mut app = windowed();
-        assert!(app.consent_card.begin_deciding());
+        assert!(app.consent_card.begin_deciding(Instant::now()));
         assert!(app.consent_card.on_decided(&Verdict::Offer, t0));
         app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
         app.tick_macos_access_card(t0);

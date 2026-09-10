@@ -609,10 +609,24 @@ impl App {
             }
             crate::native_app::UpdateOutcome::Deferred { reason } => {
                 aterm_log::info!("update apply ({source}) deferred: {reason}");
-                self.retire_charging_surge();
+                // THE SCREEN FROZE AND THEN CAME BACK. On the automatic lane a
+                // deferral lands AFTER the readers parked (the user touched the
+                // keyboard, and the lane stood down for them), so the terminal
+                // stopped echoing, the rim charged, and both then stopped. With a
+                // staged row up the restored words explain it; with no row up —
+                // the ordinary case, since the ready row may have folded long
+                // before — the freeze would be explained by nothing at all.
+                self.retire_update_installing();
                 if open_details {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
+                } else if !self.status_bars.update_bar_is_staged() {
+                    self.note_update_outcome(
+                        '\u{21bb}',
+                        "Update postponed",
+                        "you were using the terminal \u{b7} it retries on its own",
+                        crate::status_bars::Tone::Info,
+                    );
                 }
             }
             crate::native_app::UpdateOutcome::Blocked { reasons } => {
@@ -758,19 +772,46 @@ impl App {
         }
     }
 
-    /// The UPGRADE SURGE (`crate::level_up`): spawn `phase` for `build`, gated
-    /// like every decorative effect on serious mode, and spawned under the
-    /// reduced-motion amplitude the policy resolves for a focused window.
-    pub(crate) fn spawn_upgrade_surge(&mut self, phase: crate::level_up::Phase, build: u64) {
-        if !self
+    /// The surge's motion amplitude for `phase`, or `None` when this phase must
+    /// not be spawned at all.
+    ///
+    /// SERIOUS MODE SPLITS THE TWO PHASES, because they are not the same kind of
+    /// thing (2026-09-09). `LANDING` is a celebration: serious mode removes it,
+    /// like every other decorative effect. `CHARGING` is not decorative — it is
+    /// the ONLY thing on screen that says why the terminal stopped echoing, and
+    /// on the automatic lane with no update row up (its ready row folded, or it
+    /// never had one) it is the only explanation the user gets at all. Removing
+    /// it hands someone in serious mode a terminal that freezes for seconds with
+    /// no reason given. `motion.rs`'s own charter draws this line: serious mode
+    /// "removes decorative output, but must not demote functional motion … and
+    /// it must not affect cursor blink, visual bell, or window attention". A
+    /// freeze explanation belongs with the visual bell, not with the confetti.
+    ///
+    /// So serious mode keeps the charging rim and takes its MOVEMENT instead —
+    /// amplitude `0`, the same still rim Reduce Motion resolves (information
+    /// kept, movement removed). No pulse, no hue travel, no thickening: a
+    /// steady inset rim that says "working" and nothing more.
+    fn upgrade_surge_motion(&self, phase: crate::level_up::Phase) -> Option<f32> {
+        let serious = !self
             .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::LevelUp)
-        {
-            return;
+            .allows(crate::motion::SeriousEffect::LevelUp);
+        match (phase, serious) {
+            (crate::level_up::Phase::Landing, true) => None,
+            (_, true) => Some(0.0),
+            (_, false) => Some(
+                self.motion_policy(true)
+                    .amplitude(crate::motion::MotionEffect::UpgradeSurge),
+            ),
         }
-        let motion = self
-            .motion_policy(true)
-            .amplitude(crate::motion::MotionEffect::UpgradeSurge);
+    }
+
+    /// The UPGRADE SURGE (`crate::level_up`): spawn `phase` for `build` under
+    /// the amplitude [`Self::upgrade_surge_motion`] resolves — which is where
+    /// serious mode and Reduce Motion are applied.
+    pub(crate) fn spawn_upgrade_surge(&mut self, phase: crate::level_up::Phase, build: u64) {
+        let Some(motion) = self.upgrade_surge_motion(phase) else {
+            return;
+        };
         let now = std::time::Instant::now();
         self.level_up = Some(match phase {
             crate::level_up::Phase::Charging => {
@@ -788,15 +829,9 @@ impl App {
     /// — no ramp-in dip, no rebuild — and the swap reads as one continuous rim.
     /// Gated exactly like [`Self::spawn_upgrade_surge`].
     pub(crate) fn spawn_upgrade_surge_continued(&mut self, build: u64) {
-        if !self
-            .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::LevelUp)
-        {
+        let Some(motion) = self.upgrade_surge_motion(crate::level_up::Phase::Charging) else {
             return;
-        }
-        let motion = self
-            .motion_policy(true)
-            .amplitude(crate::motion::MotionEffect::UpgradeSurge);
+        };
         self.level_up = Some(crate::level_up::LevelUp::charging_continued(
             build,
             std::time::Instant::now(),

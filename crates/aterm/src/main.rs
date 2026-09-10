@@ -75,7 +75,10 @@ fn main() -> ExitCode {
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
-        AliasRoute::AliasWindowVerb => return window_verb(&first, &rest[1..]),
+        // `get(1..)` not `rest[1..]`: this arm is only reached with a first
+        // token in hand, but that is an argument the verifier cannot follow
+        // from here, and it refuted the index (measured 2026-09-09).
+        AliasRoute::AliasWindowVerb => return window_verb(&first, rest.get(1..).unwrap_or(&[])),
         AliasRoute::AliasWindow => return gui_alias_entry(rest),
         // `aterm`, the old `aterm-cli` symlink target, and anything else
         // (a renamed copy) are all the front door.
@@ -94,7 +97,8 @@ fn main() -> ExitCode {
     // selects the SESSION, whose parser knew no `ship` and rejected it as an unknown
     // option; the verb worked only when stdin happened to be a pipe.
     if let Some(verb) = aterm_cli::Verb::from_operand(&first) {
-        let forwarded = rest[1..].to_vec();
+        // `get(1..)` for the reason recorded on the `AliasWindowVerb` arm.
+        let forwarded = rest.get(1..).unwrap_or(&[]).to_vec();
         return match verb {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry(forwarded),
             // Session connections (SESSION_CONNECTIONS.md §6.1): the human
@@ -112,7 +116,22 @@ fn main() -> ExitCode {
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
-                std::process::exit(aterm_gui::run_ship(&args));
+                // RETURN the tool's status rather than `std::process::exit`-ing
+                // it. A `-> !` call leaves rustc no successor block, so the
+                // enclosing body's scope teardown lands on an `unreachable` — and
+                // the verifier, which has no body for an out-of-bundle callee,
+                // cannot see that the call diverges and REFUTED that unreachable
+                // inside `main` (measured 2026-09-09, `targo trust build
+                // --allow-l0-gaps -p aterm`). A return has no such path to
+                // discharge, so the obligation disappears instead of needing a
+                // proof, and this arm becomes what every other arm already is: a
+                // route that hands `main` an `ExitCode`. `run_ship` narrows to
+                // 0..=255 itself (`ExitStatus::code()` on a normal exit, 1 for a
+                // signal or a failed spawn), so the status a publishing machine
+                // sees is unchanged; a value outside that range — which
+                // `status.code()` does not produce where `ship` runs — becomes the
+                // refusal code 2 rather than being truncated into a lie.
+                ExitCode::from(u8::try_from(aterm_gui::run_ship(&args)).unwrap_or(2))
             }
             // The HEADLESS update lane (round-11 audit): `aterm ctl update status`
             // needs a WINDOW process serving the control socket — a terminal-only
@@ -190,10 +209,19 @@ fn main() -> ExitCode {
         // are never parsed by `pkg run` (its parser strips exactly one
         // leading `--`) — the binary-era contract; a user's literal `--`
         // survives verbatim.
-        let mut run_args: Vec<OsString> = vec![OsString::from("run"), rest[0].clone()];
-        run_args.push(OsString::from("--"));
-        run_args.extend(rest[1..].iter().cloned());
-        return atpkg::cli::main_entry(run_args);
+        // `split_first` rather than `rest[0]` / `rest[1..]`: `first` above is
+        // `rest.first().…unwrap_or_default()`, so an empty `rest` reaches here as
+        // the empty string and the two indexes are unreachable — but only by a
+        // chain the verifier cannot follow, and it refuted both bounds checks
+        // (measured 2026-09-09, `targo trust build --allow-l0-gaps -p aterm`).
+        // Destructuring carries the non-emptiness in the type instead of in an
+        // argument nobody can see from here.
+        if let Some((tool, tool_args)) = rest.split_first() {
+            let mut run_args: Vec<OsString> = vec![OsString::from("run"), tool.clone()];
+            run_args.push(OsString::from("--"));
+            run_args.extend(tool_args.iter().cloned());
+            return atpkg::cli::main_entry(run_args);
+        }
     }
 
     // PENDING-PROGRAM arm (R6): a default-set tool whose real shim has not landed
@@ -202,7 +230,13 @@ fn main() -> ExitCode {
     // front of the queue), never fall through to "unknown option". Same in-process
     // dispatch as the arm above; `atpkg __pending` prints the message and exits 127.
     if aterm_cli::is_tool_candidate(Some(first.as_str())) && pending_stub_resolves(&first) {
-        return atpkg::cli::main_entry(vec![OsString::from("__pending"), rest[0].clone()]);
+        // `first()` for the reason recorded on the `split_first` arm below:
+        // the index is unreachable with an empty `rest`, but not by a chain
+        // the verifier can follow.
+        let Some(tool) = rest.first() else {
+            return ExitCode::from(2);
+        };
+        return atpkg::cli::main_entry(vec![OsString::from("__pending"), tool.clone()]);
     }
 
     // Mode fork. Explicit flags first — `--session` and `--window` force a
@@ -217,7 +251,14 @@ fn main() -> ExitCode {
     // contract) and passes through VERBATIM. The `aterm-cli` argv0 alias
     // keeps its binary-era contract: the session regardless of TTY (old
     // installs pipe it in scripts).
-    let scan = &rest[..payload_boundary(&rest)];
+    // `get(..b).unwrap_or(rest)` rather than `rest[..b]`: `payload_boundary`
+    // returns `position(..).unwrap_or(rest.len())`, always in range, but that is
+    // a property of `position` the verifier does not have — and it refuted both
+    // the bare index AND a `.min(rest.len())` clamp (measured 2026-09-09;
+    // comparison is opaque to it here). `get` has no panic path to discharge,
+    // so the obligation disappears instead of needing a proof. The fallback is
+    // unreachable and returns the whole slice, which is what the clamp meant.
+    let scan = rest.get(..payload_boundary(&rest)).unwrap_or(&rest);
     let force_session =
         argv0 == "aterm-cli" || scan.iter().any(|a| a.to_string_lossy() == "--session");
     let windowish = !force_session
@@ -329,7 +370,31 @@ fn main() -> ExitCode {
         );
     }
 
-    aterm_cli::session_main(quiet);
+    session_lane(quiet)
+}
+
+/// The SESSION route as a function that RETURNS an `ExitCode`, like every other
+/// route `main` dispatches to.
+///
+/// It exists for one reason, and it is the same one as the `ship` arm's return
+/// above. `aterm_cli::session_main` is `-> !` — it owns the process from here to
+/// `exit` — and rustc lowers a call to a diverging callee with NO successor
+/// block, which leaves the enclosing body's scope teardown sitting on an
+/// `unreachable`. The verifier has no body for an out-of-bundle callee, so it
+/// cannot see that the call diverges, and it REFUTED that unreachable inside
+/// `main` (measured 2026-09-09, `targo trust build --allow-l0-gaps -p aterm`;
+/// dropping the semicolon and writing an explicit tail were both refuted too —
+/// what `main` has and this function does not is droppable locals still live at
+/// the call). Here there is nothing left to tear down, so no `unreachable` is
+/// emitted at all and the obligation disappears rather than needing a proof. The
+/// call itself is then reported as unmodelled MIR (`Call … targets []`), which is
+/// the honest verdict for a callee whose body is not in the bundle.
+///
+/// `#[inline(never)]` pins the property the fix rests on: inlined back into
+/// `main`, `main`'s teardown returns and so does the refutation.
+#[inline(never)]
+fn session_lane(quiet: bool) -> ExitCode {
+    aterm_cli::session_main(quiet)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +533,10 @@ const NO_REROUTE_FLAG: &str = "--no-reroute";
 /// routing policy (which reads the unstripped `rest`): a tab forwarded to another
 /// instance would not carry the environment the flag asked for, so it opens here.
 fn take_no_reroute(rest: &[OsString]) -> Vec<OsString> {
-    if rest[..payload_boundary(rest)]
+    // Same form, same reason as the `scan` slice above.
+    if rest
+        .get(..payload_boundary(rest))
+        .unwrap_or(rest)
         .iter()
         .any(|a| a.to_string_lossy() == NO_REROUTE_FLAG)
     {

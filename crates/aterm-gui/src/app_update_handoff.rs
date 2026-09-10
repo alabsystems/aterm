@@ -2933,6 +2933,37 @@ fn run_handoff_decision(
 #[cfg(unix)]
 const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The wall-clock window the park + capture of a seamless handoff must fit in, measured
+/// from the instant the readers park — the freeze the user actually feels.
+///
+/// 20 ms is the imperceptible default and stays the FIRST automatic attempt's budget.
+/// It is not a correctness bound, and treating it as one made an update refuse forever
+/// on a machine that was merely busy: measured 2026-09-10 on m22 with two `trustc`
+/// processes pinning the cores (load average 12.8), the automatic attempt missed the
+/// park deadline and the owner's manual attempt three minutes later missed the capture
+/// deadline — same 20 ms, same five sessions, and nothing about either would ever
+/// change while the compiler ran. The module's own rule for the scrollback carry is
+/// "the failure mode is less scrollback, never the update did not apply"; this is that
+/// rule applied to time. A retry after a physical failure widens the window (80 ms,
+/// then a quarter second — one such freeze, once per update), and an EXPLICIT apply
+/// gets the widest window at once: the user asked for the update, not for a
+/// sub-frame swap.
+pub(crate) fn handoff_freeze_budget(
+    mode: crate::native_updater_service::ApplyMode,
+    prior_physical_failures: u8,
+) -> std::time::Duration {
+    use crate::native_updater_service::ApplyMode;
+    let ms = match mode {
+        ApplyMode::Immediate | ApplyMode::CleanQuit => 250,
+        ApplyMode::Automatic | ApplyMode::AutomaticPastGrace => match prior_physical_failures {
+            0 => 20,
+            1 => 80,
+            _ => 250,
+        },
+    };
+    std::time::Duration::from_millis(ms)
+}
+
 /// Whether one session may spend `optional` on a budget, on top of the
 /// `own_mandatory` it must spend regardless.
 ///
@@ -3794,23 +3825,36 @@ impl App {
             ));
         }
         // How much of the capture window must remain before a session is willing to
-        // serialize scrollback as well as its visible screen. Half the budget: the
+        // serialize scrollback as well as its visible screen. Half the freeze budget: the
         // visible screen is mandatory and cheap, history is optional and priced per
         // line, so once the window is half gone every remaining session drops to
         // visible-only rather than risking the deadline for a bonus. This is what
         // makes carrying history safe to enable by default — the failure mode is
         // "less scrollback", never "the update did not apply".
-        const HANDOFF_HISTORY_COMFORT: std::time::Duration = std::time::Duration::from_millis(10);
+        // The budget this attempt gets: 20 ms on a first automatic attempt, wider after
+        // a physical failure of these same bytes, widest for an explicit apply — see
+        // `handoff_freeze_budget`. Everything below that used to spell "20 ms" now
+        // spells the budget it actually had.
+        let prior_physical_failures = self
+            .auto_apply_physical_retry
+            .filter(|retry| retry.build == build)
+            .map_or(0, |retry| retry.cycles);
+        let freeze_budget = handoff_freeze_budget(mode, prior_physical_failures);
+        let freeze_ms = freeze_budget.as_millis();
+        let handoff_history_comfort = freeze_budget / 2;
+        aterm_log::info!(
+            "update apply: freeze budget {freeze_ms} ms ({mode:?}, {prior_physical_failures} prior physical failure(s) of build {build})"
+        );
         // THE INSTANT THE TERMINAL STOPS ECHOING — the start of the freeze the
         // user experiences, and the zero point of the two numbers reported at
-        // Commit. The 20 ms capture deadline hangs off the same stamp.
+        // Commit. The capture deadline hangs off the same stamp.
         let park_at = std::time::Instant::now();
-        let deadline = park_at + std::time::Duration::from_millis(20);
+        let deadline = park_at + freeze_budget;
         if !self.park_all_readers(deadline) {
             self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "a PTY reader missed the 20 ms handoff park deadline",
-            ));
+            return Err(crate::UpdateHandoffStartError::failed(format!(
+                "a PTY reader missed the {freeze_ms} ms handoff park deadline"
+            )));
         }
         // SEAMLESS: the post-park re-check tolerates activity that used to
         // revoke here. A final burst consumed by a reader during the bounded
@@ -3883,7 +3927,9 @@ impl App {
         }
         for session in self.pool.iter() {
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
+                capture_failed = Some(format!(
+                    "bounded visible-screen capture exceeded {freeze_ms} ms"
+                ));
                 break;
             }
             let terminal = match session.term.try_lock() {
@@ -3939,7 +3985,7 @@ impl App {
                 bytes_reserve,
                 MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
             );
-            let mut history = if remaining >= HANDOFF_HISTORY_COMFORT
+            let mut history = if remaining >= handoff_history_comfort
                 && !history_latched_off
                 && history_fits_cells
                 && history_fits_bytes
@@ -4101,12 +4147,16 @@ impl App {
             }
             screens.push((session.id, checkpoint));
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
+                capture_failed = Some(format!(
+                    "bounded visible-screen capture exceeded {freeze_ms} ms"
+                ));
                 break;
             }
         }
         if capture_failed.is_none() && std::time::Instant::now() >= deadline {
-            capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
+            capture_failed = Some(format!(
+                "bounded visible-screen capture exceeded {freeze_ms} ms"
+            ));
         }
         if let Some(reason) = capture_failed {
             self.rollback_overlap(None, &live);
@@ -5126,6 +5176,57 @@ fn wait_handoff_ready(
             // (a failed validation) or died/malformed mid-proof.
             0 => return crate::UpdateHandoffOutcome::ChildDied,
             _ => continue, // EINTR/EAGAIN — re-loop
+        }
+    }
+}
+
+#[cfg(test)]
+mod freeze_budget_tests {
+    use super::handoff_freeze_budget;
+    use crate::native_updater_service::ApplyMode;
+    use std::time::Duration;
+
+    /// The first automatic attempt keeps the imperceptible 20 ms; a physical failure of
+    /// the same bytes buys a wider window, then the widest; an explicit apply gets the
+    /// widest at once. A monotone ladder: more failures never buy LESS time.
+    #[test]
+    fn freeze_budget_widens_on_retries_and_for_an_explicit_apply() {
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Automatic, 0),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 0),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Automatic, 1),
+            Duration::from_millis(80)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Automatic, 2),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::AutomaticPastGrace, 7),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::Immediate, 0),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            handoff_freeze_budget(ApplyMode::CleanQuit, 0),
+            Duration::from_millis(250)
+        );
+        let mut last = Duration::ZERO;
+        for prior in 0..=u8::MAX {
+            let now = handoff_freeze_budget(ApplyMode::Automatic, prior);
+            assert!(
+                now >= last,
+                "the ladder must be monotone: {prior} prior failures gave {now:?} after {last:?}"
+            );
+            last = now;
         }
     }
 }
