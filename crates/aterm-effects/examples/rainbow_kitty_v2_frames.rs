@@ -348,6 +348,8 @@ struct TickStats {
     /// The widest achromatic halo — the meteor nucleus while one flies:
     /// `(cx, cy, rx)`.
     nucleus: Option<(u16, u16, u16)>,
+    /// The flow state: heat, combo, high-water mark.
+    flow: (f32, u32, u32),
     /// A meteor spawned this tick: its `T`, its landing column, its `cells`.
     spawn: Option<(Duration, u16, u16)>,
     /// On a spawn tick, seven `under` colours sampled left → right across
@@ -550,6 +552,7 @@ impl Sim {
                 seen.iter().filter(|&&s| s).count()
             },
             nucleus: self.nucleus(),
+            flow: (st.flow.heat, st.flow.combo, st.flow.best),
             spawn,
             arc: if spawn.is_some() {
                 self.arc()
@@ -814,7 +817,7 @@ impl Sinks {
             stats: String::from(
                 "scenario,tick,frame,t_ms,abs_ms,event,under,out,halos,stars,meteors,fp,cues,\
                  paint,flare,point_over_ink,under_hues,lum_sum,lum_max,field_t,thin_over_ink,\
-                 halos_over_ink,nucleus_cx,nucleus_cy,nucleus_rx\n",
+                 halos_over_ink,nucleus_cx,nucleus_cy,nucleus_rx,flow,combo,best\n",
             ),
         }
     }
@@ -928,7 +931,7 @@ fn run(sim: &mut Sim, sc: &Scenario, keep: &[usize], sinks: &mut Sinks) -> RunOu
         });
         let _ = writeln!(
             sinks.stats,
-            "{},{tick},{frame_col},{:.3},{:.3},{event},{},{},{},{},{},{:016x},{},{:.3},{},{},{},{},{},{:.4},{},{},{ncx},{ncy},{nrx}",
+            "{},{tick},{frame_col},{:.3},{:.3},{event},{},{},{},{},{},{:016x},{},{:.3},{},{},{},{},{},{:.4},{},{},{ncx},{ncy},{nrx},{:.3},{},{}",
             sc.name,
             Sim::ms(tick) - Sim::ms(start),
             Sim::ms(tick),
@@ -948,6 +951,9 @@ fn run(sim: &mut Sim, sc: &Scenario, keep: &[usize], sinks: &mut Sinks) -> RunOu
             st.field_t,
             st.thin_over_ink,
             st.halos_over_ink,
+            st.flow.0,
+            st.flow.1,
+            st.flow.2,
         );
         out.ticks.push((tick, st));
     }
@@ -1000,7 +1006,7 @@ fn scenarios() -> [Scenario; 4] {
     let keys: Vec<(u64, Action)> = TEXT
         .chars()
         .enumerate()
-        .map(|(i, c)| (Sim::tick_of((i as u64 + 1) * KEY_MS), Action::Key(c)))
+        .map(|(i, c)| (Sim::tick_of((i as u64 + 1) * key_ms()), Action::Key(c)))
         .collect();
     let last_key = keys.last().map_or(0, |&(t, _)| t);
     let a_end = last_key + Sim::tick_of(1_500);
@@ -1050,6 +1056,17 @@ fn scenarios() -> [Scenario; 4] {
             end: c_end,
         },
     ]
+}
+
+/// `RK_FRAMES_KEY_MS=<n>`: scenario A's key cadence, ms per key — [`KEY_MS`]
+/// (70 ms, 14.3 cps) unless the environment names another. 83 ms is the
+/// 12 cps hand the flow-state captures are read at.
+fn key_ms() -> u64 {
+    std::env::var("RK_FRAMES_KEY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(KEY_MS)
 }
 
 /// `RK_FRAMES_CTRL_A_ONLY=1`: scenario B is the lone Ctrl-A, run out to

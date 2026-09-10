@@ -3313,6 +3313,15 @@ pub struct CursorGlow {
     /// landing pop [`Self::rainbow_head_rgb`] documents. `None` until the
     /// first engaged tick, and cleared whenever v2 lets go of the frame.
     v2_stop: Option<(f32, Option<(u16, u16)>)>,
+    /// **THE FLOW ENTRY EDGE** — whether the last [`Self::take_flow_entry`]
+    /// drain found the theme OPEN ([`rk::Flow::open`]).
+    ///
+    /// One `bool` of memo, and the seam's whole state: the RUN itself is the
+    /// engine's ([`rk::spine::Spine::flow`] — one counter, per the flow law),
+    /// and this only remembers which side of the open bar the last drain saw
+    /// it on, so the pet can be told ONCE per entry and nothing at all on an
+    /// exit.
+    flow_open: bool,
     /// v2's cue sink ([`rk::Frame::cues`]): resident, drained into
     /// [`Self::sound_cues`] under v1's own `MAX_SOUND_CUES` refusal after every
     /// engaged tick, so the backlog a non-draining host accumulates is bounded
@@ -3816,6 +3825,21 @@ pub struct TrailStatus<'a> {
     /// frame actually applied — not a parallel re-derivation, for the same
     /// reason [`Self::focused`] is the frame path's own fold.
     pub block_fill: Option<BlockFill>,
+    /// **FLOW** — `flow=` / `combo=` / `combo_best=`, the engine's own
+    /// counter as [`CursorGlow::flow_status`] reads it.
+    ///
+    /// The one field on this row that is about the PERSON rather than the
+    /// pixels: `combo=` is keys typed at [`rk::spine::FLOW_KEY_DISP`] with no
+    /// delete, `flow=` is the open ramp over the last
+    /// [`rk::spine::FLOW_OPEN_EASE_KEYS`] before
+    /// [`rk::spine::FLOW_ENTRY_KEYS`], and `combo_best=` is the window's
+    /// high-water mark. An agent reading the socket sees `flow=1.00` and
+    /// knows the human is mid-flow — the reason the counter is on the wire at
+    /// all.
+    ///
+    /// Zero on every style but Rainbow Kitty v2 (the spine that prices it is
+    /// v2's), and zero the instant the run breaks.
+    pub flow: rk::Flow,
 }
 
 impl TrailStatus<'_> {
@@ -3848,6 +3872,7 @@ impl TrailStatus<'_> {
              ribbon_active={} ribbon_look={} ribbon_segments={} ribbon_hue_bands={} \
              field={:.3} sparks={} \
              momentum={:.2} momentum_display={:.2} \
+             flow={:.2} combo={} combo_best={} \
              glow_active={} pet_active={} cat_active={} \
              block_fill={} block_fill_rgb={} block_fill_base={} block_fill_base_from={} \
              pet_action={} pet_content={:.3} pet_pending={} pet_body={}",
@@ -3872,6 +3897,13 @@ impl TrailStatus<'_> {
             self.sparks,
             self.momentum,
             self.momentum_display,
+            // THE HAND'S OWN ROW: the climb, the run, and the best the
+            // window has held. Beside the two momentum numbers because they
+            // are the same story — what the spine is doing, and what the
+            // person did to it.
+            self.flow.heat,
+            self.flow.combo,
+            self.flow.best,
             self.glow_active,
             self.pet_active,
             self.cat_active,
@@ -5289,6 +5321,44 @@ impl CursorGlow {
         }
     }
 
+    /// **THE RESIDENT PET'S OFFER** (`rk::companion` panel #10, D13) — the
+    /// perk edge, the star within reach and the ribbon's colour under the
+    /// cat, as ONE value, for the host to hand to
+    /// [`crate::kitty_pet::PetBrain::note_v2_offer`].
+    ///
+    /// A PURE READ that arms nothing: every field is state a producer already
+    /// owns this frame, so an idle engine offers `PetOffer::default()` and no
+    /// clock, mark or cadence moves. Call it BEFORE
+    /// [`Self::take_companion_impulse`] drains the frame's impulse — the perk
+    /// edge lives in that slot, and a drained slot offers none.
+    /// `PetOffer::default()` whenever v2 is not engaged, so a host that wires
+    /// this beside the pet's own tick pays one bool on every other style.
+    #[must_use]
+    pub fn pet_offer(
+        &self,
+        geom: Geom,
+        pet: Option<rk::companion::PetOnGlass>,
+    ) -> rk::companion::PetOffer {
+        if self.v2.engaged() {
+            self.v2.pet_offer(geom, pet)
+        } else {
+            rk::companion::PetOffer::default()
+        }
+    }
+
+    /// **THE CAT CAUGHT THE STAR** (panel #10(b)) — spend the offered star's
+    /// remaining life on the sky's own 40 ms finish. `star` is exactly the
+    /// value [`crate::kitty_pet::PetBrain::note_v2_offer`] handed back and
+    /// `at` is the PAW'S LANDING instant. Returns whether the star was still
+    /// there to catch; inert, and `false`, unless v2 is engaged.
+    ///
+    /// Nothing is drawn: the whole of the catch is one star ending sooner,
+    /// which is the only way the resident's own motion may touch the sky
+    /// without becoming light itself (T1).
+    pub fn catch_star(&mut self, star: rk::companion::StarCatch, at: Instant) -> bool {
+        self.v2.engaged() && self.v2.catch_star(star, at)
+    }
+
     /// **THE KITTY'S DELIGHT EDGE** (§5.8, §7.2): the host reports the
     /// companion's Delight at the caret's `(row, col)`; v2 earns the heroes
     /// [`rk::companion::heroes_earned`] says it earns and mints the
@@ -5297,6 +5367,19 @@ impl CursorGlow {
     pub fn note_kitty_delight(&mut self, now: Instant, row: u16, col: u16) {
         if self.v2.engaged() {
             self.v2.earn_hero(now, row, col);
+        }
+    }
+
+    /// **THE VERDICT'S HOT RESUME** (THE VERDICT, sense 3): the host reports
+    /// that a shell command came back GREEN after a long run, on the OSC
+    /// 133/633 `D` it already dedupes. Not a cursor event, so — like
+    /// [`Self::note_kitty_delight`] — it is not an [`rk::Event`]; inert
+    /// unless v2 is engaged, and inert on glass even when it is. It mints no
+    /// light: it only prices the first key you type next
+    /// ([`rk::spine::Spine::note_verdict`]).
+    pub fn note_command_verdict(&mut self, now: Instant) {
+        if self.v2.engaged() {
+            self.v2.note_verdict(now);
         }
     }
 
@@ -5333,6 +5416,42 @@ impl CursorGlow {
     #[must_use]
     pub fn v2_status(&self) -> Option<rk::Status> {
         self.v2.engaged().then(|| self.v2.status())
+    }
+
+    /// **SEAM POINT 12's SIBLING — THE FLOW SEAM.** `trail status`'s
+    /// `flow=` / `combo=` / `combo_best=` ([`rk::Flow`]), and the number an
+    /// agent holding its turn reads off the control socket.
+    ///
+    /// The engine's OWN counter, read out — never a second one kept here
+    /// (the flow law is one counter, exactly as the momentum law is one
+    /// metric). Pure and free: three fields off the spine, no clock, no
+    /// engine walk, so it costs nothing unasked like every other reading on
+    /// that row. `Flow::default()` — `flow=0.00 combo=0 combo_best=0` — for
+    /// every style but Rainbow Kitty v2, whose spine is the one that prices
+    /// it.
+    #[must_use]
+    pub fn flow_status(&self) -> rk::Flow {
+        if self.v2.engaged() {
+            self.v2.spine().flow()
+        } else {
+            rk::Flow::default()
+        }
+    }
+
+    /// **THE PET'S ONE-SHOT** — `true` exactly once per flow ENTRY (the drain
+    /// on which [`rk::Flow::open`] first reads true), and never on an exit.
+    ///
+    /// The host drains it once per frame into
+    /// [`crate::kitty_pet::PetBrain::note_flow`]. An EDGE over the engine's
+    /// counter, not a counter of its own: one `bool` of memo, so a run that
+    /// opens, breaks and opens again is two entries and a run that merely
+    /// continues is none. A latch, not a light — it asks for no frame, spawns
+    /// nothing, and a drain nobody forwards costs one compare.
+    pub fn take_flow_entry(&mut self) -> bool {
+        let open = self.flow_status().open();
+        let entered = open && !self.flow_open;
+        self.flow_open = open;
+        entered
     }
 
     /// SING-ALONG drive (`crate::kitty_sing`): pin the canonical
@@ -24820,6 +24939,11 @@ halo = "add"
                 fill: 0x00F0_2218,
                 base: Some(0x00FF_0000),
             }),
+            flow: rk::Flow {
+                heat: 0.5,
+                combo: 12,
+                best: 31,
+            },
         };
         let line = base.line();
         for key in [
@@ -24843,6 +24967,9 @@ halo = "add"
             " sparks=4",
             " momentum=0.50",
             " momentum_display=0.44",
+            " flow=0.50",
+            " combo=12",
+            " combo_best=31",
             " glow_active=true",
             " pet_active=true",
             " pet_action=purr",
@@ -24897,6 +25024,185 @@ halo = "add"
         );
     }
 
+    /// A minimal `trail status` row carrying one [`rk::Flow`] — the flow
+    /// laws assert the BYTES the socket prints, not the accessor alone, and
+    /// every other field on the row is beside the point for them.
+    fn row_for(flow: rk::Flow) -> TrailStatus<'static> {
+        TrailStatus {
+            style_raw: "rainbow kitty pet",
+            style: GlowStyle::RainbowKitty,
+            config_enabled: true,
+            effective: true,
+            focused: true,
+            motion_stage: "full",
+            motion_mode: "auto",
+            shed: 1.0,
+            intensity: 0.7,
+            tally: AdmissionTally::default(),
+            spawns: 0,
+            ribbon_look: "underline",
+            ribbon_segments: 0,
+            ribbon_hue_bands: 0,
+            field: 0.0,
+            sparks: 0,
+            momentum: 0.0,
+            momentum_display: 0.0,
+            glow_active: false,
+            pet_active: false,
+            // The resident's own four columns (another round's, landed in the
+            // same merge): a flow row says nothing about the cat.
+            pet_action: "none",
+            pet_content: 0.0,
+            pet_pending: 0,
+            pet_body: None,
+            cat_active: false,
+            block_fill: None,
+            flow,
+        }
+    }
+
+    /// **THE ROW REPORTS THE FLOW THE ENGINE IS IN.**
+    ///
+    /// The whole point of the feature on the wire: an agent reading
+    /// `trail status` can tell that the human is mid-flow — typing at speed,
+    /// uninterrupted — and hold its turn. So a run of fast keys must MOVE
+    /// `flow=` and `combo=` on the row the socket prints, and one Backspace
+    /// must zero them, all the way through the real engine and the real row.
+    ///
+    /// Nothing here asserts light: flow draws nothing of its own, and this is
+    /// the sensor's law, not the theme's.
+    #[test]
+    fn the_trail_row_reports_the_flow_the_engine_is_in() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 1)), t0, &c, g, &mut out);
+        assert!(glow.v2.engaged(), "flow is priced by v2's spine");
+
+        // COLD: no keys, no flow. The row says so in its own words.
+        let cold = glow.flow_status();
+        assert_eq!(
+            (cold.heat, cold.combo, cold.best),
+            (0.0, 0, 0),
+            "a hand that has not typed is not in flow"
+        );
+
+        // A RUN AT SPEED — 12 cps, one key per tick, the caret walking its
+        // row. The spine needs ~a dozen keys to climb past `FLOW_KEY_DISP`,
+        // and the combo counts only the keys after that.
+        let mut now = t0;
+        let mut entries = 0u32;
+        for k in 0..48u32 {
+            now += Duration::from_millis(83);
+            glow.note_typed(now);
+            let col = 2 + (k % 30) as u16;
+            glow.tick(Some((2, col)), now, &c, g, &mut out);
+            if glow.take_flow_entry() {
+                entries += 1;
+            }
+        }
+        let hot = glow.flow_status();
+        assert!(
+            hot.combo >= rk::spine::FLOW_ENTRY_KEYS,
+            "48 keys at 12 cps must open the theme; combo={}",
+            hot.combo
+        );
+        assert_eq!(hot.heat, 1.0, "an open theme reads `flow=1.00`");
+        assert_eq!(hot.best, hot.combo, "the run IS the best so far");
+        assert_eq!(entries, 1, "one ENTRY latch for one crossing, ever");
+
+        // The ROW, in the bytes the socket prints.
+        let row = row_for(hot).line();
+        assert!(
+            row.contains(" flow=1.00")
+                && row.contains(&format!(" combo={}", hot.combo))
+                && row.contains(&format!(" combo_best={}", hot.best)),
+            "the row must carry the run it is in: {row}"
+        );
+
+        // A DELETE ENDS IT — exit no. 1, on the key's own edge, and the row
+        // says so on the very next reading.
+        glow.note_backspace(now + Duration::from_millis(83));
+        let broken = glow.flow_status();
+        assert_eq!(
+            (broken.heat, broken.combo),
+            (0.0, 0),
+            "one Backspace ends the run"
+        );
+        assert_eq!(
+            broken.best, hot.best,
+            "…and never un-earns the run already held"
+        );
+        let row = row_for(broken).line();
+        assert!(
+            row.contains(" flow=0.00")
+                && row.contains(" combo=0")
+                && row.contains(&format!(" combo_best={}", hot.best)),
+            "a broken run reads as broken: {row}"
+        );
+        assert!(
+            !glow.take_flow_entry(),
+            "an EXIT latches nothing — the pet hears only entries"
+        );
+
+        // A KILL ends it too (exit no. 2), and a key under the floor is the
+        // third: a cold hand's first key can never open the theme.
+        let mut cold = CursorGlow::default();
+        cold.tick(Some((2, 1)), t0, &c, g, &mut out);
+        cold.note_typed(t0 + Duration::from_millis(83));
+        assert_eq!(
+            cold.flow_status().combo,
+            0,
+            "a key under the spine floor is not flow"
+        );
+    }
+
+    /// **AUTO-REPEAT CANNOT FARM THE COMBO.** A held key at repeat cadence IS
+    /// maximal momentum by definition — that is the documented bypass
+    /// [`CursorGlow::celebrate`] takes — so the ladder must FREEZE under it,
+    /// or leaning on one key would buy the state the feature exists to make
+    /// you earn.
+    #[test]
+    fn a_celebration_freezes_the_combo_so_a_held_key_cannot_farm_it() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 1)), t0, &c, g, &mut out);
+        let mut now = t0;
+        for k in 0..20u32 {
+            now += Duration::from_millis(83);
+            glow.note_typed(now);
+            glow.tick(Some((2, 2 + (k % 30) as u16)), now, &c, g, &mut out);
+        }
+        let earned = glow.flow_status().combo;
+        assert!(earned > 0, "the run is live before the celebration");
+        // The celebration drives once per frame, as the host drives it.
+        for _ in 0..20u32 {
+            now += Duration::from_millis(83);
+            glow.celebrate(now, 1.0);
+            glow.note_typed(now);
+            glow.tick(Some((2, 5)), now, &c, g, &mut out);
+        }
+        assert_eq!(
+            glow.flow_status().combo,
+            earned,
+            "a frozen combo neither climbs nor breaks"
+        );
+        // …and it thaws: after the grace, real keys count again.
+        now += Duration::from_secs_f32(rk::spine::FLOW_FREEZE_S) + Duration::from_millis(83);
+        glow.note_typed(now);
+        glow.tick(Some((2, 6)), now, &c, g, &mut out);
+        assert_eq!(
+            glow.flow_status().combo,
+            earned + 1,
+            "the freeze lifts after the last drive"
+        );
+    }
+
     /// THE FIELD THAT WOULD HAVE NAMED THE BUG.
     ///
     /// `glow_active` / `pet_active` / `cat_active` all read false while the
@@ -24935,6 +25241,7 @@ halo = "add"
             pet_body: None,
             cat_active: false,
             block_fill: None,
+            flow: rk::Flow::default(),
         };
         let line = quiet.line();
         assert!(
@@ -25424,10 +25731,24 @@ halo = "add"
     /// (the row-2 cohorts abandoned at 1000 and 1700 ms retract while the
     /// caret goes on to 35–37 and then to row 3 — under the old law they
     /// followed it).
+    /// RE-BAKED A NINTH TIME 2026-09-09 — FLOW STATE AND THE SURGE. A run
+    /// of fast clean keys now opens the theme (`spine::Flow`), and the one
+    /// clause of it that moves a byte on this script is the SURGE: a change
+    /// of speed stretches the ribbon's hot edge past its base 3 cells
+    /// (`HOT_EDGE_CELLS_MAX` 5.0, `ribbon::edge_cells`). TWO rows moved —
+    /// dark `9_430_650_487_507_223_919` → `4_700_607_042_552_021_299` and
+    /// underline `15_155_705_891_344_270_438` →
+    /// `4_306_855_813_314_184_046`; light and reduced HELD (no hot edge is
+    /// drawn on either), which is this re-bake's control, and the eight
+    /// non-kitty rows held. DECOMPOSED: with `edge_cells` neutered back to
+    /// the flat `HOT_EDGE_CELLS` and everything else of flow left in, all
+    /// four rows read their previous values exactly — the flow field
+    /// share, the combo ladder and the caret flare are exact identities on
+    /// this script (it never reaches combo 16 at speed).
     const DELETION_GOLDENS: [(&str, u64); 12] = [
         ("Lumen dark", 1_264_411_311_373_267_895),
         ("Phaser dark", 2_726_566_909_586_900_035),
-        ("RainbowKitty dark", 952_090_913_515_946_647),
+        ("RainbowKitty dark", 4_700_607_042_552_021_299),
         ("Sparkle dark", 14_969_905_489_495_276_903),
         ("Fire dark", 12_618_090_056_209_866_428),
         ("Laser dark", 1_955_324_598_530_313_952),
@@ -25435,7 +25756,7 @@ halo = "add"
         ("Water dark", 482_165_703_607_766_578),
         ("Comet dark", 14_523_124_226_784_523_753),
         ("RainbowKitty light", 654_842_353_775_665_666),
-        ("RainbowKitty underline", 10_675_176_284_471_571_526),
+        ("RainbowKitty underline", 4_306_855_813_314_184_046),
         ("RainbowKitty reduced", 4_582_082_343_011_259_820),
     ];
 

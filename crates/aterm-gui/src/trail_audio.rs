@@ -2622,6 +2622,7 @@ mod tests {
                 rank: 20,
                 pan_from: -0.5,
                 block_lead_s: 0.0,
+                flow: 0.0,
             },
         );
         let captured = audio.take_captured_with_meta_for_test();
@@ -2653,6 +2654,7 @@ mod tests {
                 rank: 40,
                 pan_from: 0.0,
                 block_lead_s: 0.0,
+                flow: 0.0,
             },
         })
         .unwrap();

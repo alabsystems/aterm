@@ -20459,6 +20459,13 @@ mod tests {
                 fill: 0x0000_F022,
                 base: Some(0x0000_FF00),
             }),
+            // A run in progress, so `flow=`/`combo=`/`combo_best=` are in the
+            // row being compared rather than silently absent.
+            flow: aterm_effects::rainbow_kitty::Flow {
+                heat: 1.0,
+                combo: 24,
+                best: 24,
+            },
         }
         .line();
         let emitted = row

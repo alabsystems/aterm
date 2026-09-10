@@ -826,3 +826,192 @@ fn ribbon_beam_v_train_is_byte_exact_cpu_vs_gpu() {
         eprintln!("SKIP damaged-path byte-exact ribbon_beam_v gate: downlevel sRGB offscreen");
     }
 }
+
+/// THE BED IS NEVER BOOSTED OR BLOOMED (design §L5, "white is hot").
+///
+/// The EDR crown prices `out` fragments by their white part and the bloom
+/// splits white from chroma — both of which run over the `out` stream ALONE.
+/// The `under` bed (the ribbon under text, `RAINBOW_UNDER_COV_CAP` 236) is
+/// composited into the offscreen between the cell fill and the glyph ink and is
+/// handed to NEITHER pass, which is what keeps the 5.25:1 body-contrast law a
+/// property of the SDR frame the ledger already priced. Measured with a bed so
+/// pale that it would triple if the crown ever saw it:
+///
+///   * the crowned present differs from the pass-less present ONLY inside the
+///     `out` quad — every bed pixel is bit-identical;
+///   * a bed-only frame is bit-identical with the bloom on and off (the bed is
+///     not a bloom SOURCE — the halo pass does not even run for it);
+///   * with an `out` core present the bloom does paint (non-vacuity), and still
+///     no bed pixel moves.
+///
+/// The boost is proven LIVE in the same frame by measuring it: the core's
+/// emission must equal `lin x (1 + 2*smoothstep(0.35, 0.60, white))`, not the
+/// flat reference emission — so this is a law about a pass that is running, not
+/// about one that is absent.
+#[test]
+fn the_bed_is_never_boosted_or_bloomed() {
+    let theme = Theme::default();
+    let Some((_cpu, mut gpu)) = backends(18.0, theme) else {
+        return;
+    };
+    // The EDR crown drives the wgpu present stand-in (the WGPU ORACLE arm).
+    #[cfg(target_os = "macos")]
+    gpu.disarm_metal_for_oracle();
+    gpu.set_hdr_glow(true);
+    gpu.set_shimmer(false);
+    gpu.set_bloom(false);
+    let mut win = aterm_gpu::WindowGpu::new();
+    // A 4.0x panel: headroom 3.0, the whole boost curve observable.
+    win.set_edr_max(4.0);
+    let headroom = aterm_render::hdr::additive_headroom(4.0);
+
+    let (rows, cols) = (8usize, 24usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    term.process("\x1b[?25l".as_bytes());
+    for r in 1..4usize {
+        term.process(format!("\x1b[{};1H{}", r + 1, "MMMMMMMMMMMMMMMM").as_bytes());
+    }
+    let (cw, ch) = gpu.cell_size();
+    let grid_w = cols * cw;
+
+    // THE BED: three full rows of near-white ribbon under the text. Its white
+    // part is 0.78 — factor 3.0, the cap — so a bed that reached the crown
+    // could not hide.
+    let bed: Vec<GlowQuad> = (1..4usize)
+        .filter_map(|r| emit_under(r, 0, grid_w as i64, ch, grid_w, 0x00C8_C8C8))
+        .collect();
+    assert_eq!(bed.len(), 3, "three bed rows");
+
+    // THE CORE: one white `out` quad, the field m1 core's composited peak.
+    let core = GlowQuad {
+        row: 6,
+        x: (4 * cw) as u16,
+        y: (6 * ch) as u16,
+        w: cw as u16,
+        h: ch as u16,
+        color: aterm_render::premul_rgb(0x00FF_FFFF, 143),
+        // ADDITIVE light (see `GlowQuad::alpha`).
+        alpha: 0,
+    };
+    let core_rect = (
+        core.x as usize,
+        core.y as usize,
+        core.x as usize + core.w as usize,
+        core.y as usize + core.h as usize,
+    );
+
+    let mut bed_only = term.cell_frame(rows, cols);
+    bed_only.cursor_visible = false;
+    bed_only.glow_under = bed.clone();
+    let mut both = bed_only.clone();
+    both.cursor_glow_add = vec![core];
+
+    // (a) THE CROWN. Only the `out` quad may move between the pass-less and
+    // the crowned present.
+    let (plain, w, h) = gpu.present_hdr_for_test(&mut win, &both, false);
+    let (lit, _, _) = gpu.present_hdr_for_test(&mut win, &both, true);
+    let mut moved_outside = 0usize;
+    let mut moved_inside = 0usize;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let b = (y * w as usize + x) * 4;
+            let same = lit[b..b + 4] == plain[b..b + 4];
+            let inside = x >= core_rect.0 && x < core_rect.2 && y >= core_rect.1 && y < core_rect.3;
+            if inside {
+                moved_inside += usize::from(!same);
+            } else if !same {
+                moved_outside += 1;
+                assert!(
+                    moved_outside == 0,
+                    "the crown moved a pixel OUTSIDE the out quad at ({x},{y}): \
+                     {:?} != {:?} — the bed (or the text under it) was boosted",
+                    &lit[b..b + 4],
+                    &plain[b..b + 4]
+                );
+            }
+        }
+    }
+    assert_eq!(
+        moved_inside,
+        cw * ch,
+        "NON-VACUITY: the crown must light every pixel of the out quad"
+    );
+    // ...and the light it added is the WHITENED one, in this very frame.
+    let cb = ((core_rect.1 + ch / 2) * w as usize + core_rect.0 + cw / 2) * 4;
+    let c = 143.0 / 255.0;
+    let lin = aterm_render::hdr::srgb_channel_to_linear(c);
+    let t = ((c - 0.35) / 0.25).clamp(0.0, 1.0);
+    let hot = 1.0 + 2.0 * (t * t * (3.0 - 2.0 * t));
+    let want = (lin * aterm_render::hdr::HDR_GLOW_BOOST * hot).min(headroom);
+    let got = lit[cb] - plain[cb];
+    eprintln!(
+        "bed white 0.784 (would be factor 3.0) boosted 0 px; core white {c:.3} \
+         factor {hot:.3} add {got:.4} (want {want:.4})"
+    );
+    assert!(
+        (got - want).abs() <= 8e-3,
+        "the core's own emission must be the §L5 whitened one ({got} vs {want})"
+    );
+
+    // (b) THE BLOOM. A bed-only frame is bit-identical with the halo on and
+    // off: the bed is not a bloom source, and with an empty `out` stream the
+    // pass does not run at all.
+    let bed_dark = gpu.render_input(&mut win, &bed_only, None);
+    gpu.set_bloom(true);
+    let bed_bloomed = gpu.render_input(&mut win, &bed_only, None);
+    assert_eq!(
+        bed_dark.pixels, bed_bloomed.pixels,
+        "the bed alone must never bloom — the halo pass has no `under` source"
+    );
+
+    // (c) With an `out` core the bloom DOES paint (non-vacuity) — and still not
+    // one bed pixel moves. The halo's reach is the composite scissor: the glow
+    // bbox dilated by (2*radius + 1) * DOWNSCALE px, 12 px at the shipped 2.2.
+    gpu.set_bloom(false);
+    let both_dark = gpu.render_input(&mut win, &both, None);
+    gpu.set_bloom(true);
+    let both_bloomed = gpu.render_input(&mut win, &both, None);
+    assert_ne!(
+        both_dark.pixels, both_bloomed.pixels,
+        "NON-VACUITY: the bloom must paint something for an `out` core"
+    );
+    let reach = 12usize + 1;
+    let (fw, fh) = (both_dark.width, both_dark.height);
+    let pad_x = (fw - grid_w) / 2;
+    let pad_y = (fh - rows * ch) / 2;
+    let halo = (
+        core_rect.0.saturating_sub(reach),
+        core_rect.1.saturating_sub(reach),
+        core_rect.2 + reach,
+        core_rect.3 + reach,
+    );
+    // The bed rows must lie clear of the halo's reach for this to mean anything.
+    assert!(
+        pad_y + 4 * ch < halo.1,
+        "the bed rows must sit outside the halo's reach (bed ends at {}, halo starts at {})",
+        pad_y + 4 * ch,
+        halo.1
+    );
+    let mut bed_px = 0usize;
+    for y in 0..fh {
+        for x in 0..fw {
+            let inside = x >= halo.0 && x < halo.2 && y >= halo.1 && y < halo.3;
+            if inside {
+                continue;
+            }
+            let i = y * fw + x;
+            assert_eq!(
+                both_dark.pixels[i], both_bloomed.pixels[i],
+                "the bloom painted outside its scissor at ({x},{y})"
+            );
+            if y >= pad_y + ch && y < pad_y + 4 * ch && x >= pad_x && x < pad_x + grid_w {
+                bed_px += 1;
+            }
+        }
+    }
+    assert_eq!(
+        bed_px,
+        3 * ch * grid_w,
+        "NON-VACUITY: every bed pixel must have been compared"
+    );
+}

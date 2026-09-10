@@ -1818,6 +1818,8 @@ impl Minted {
             caret: self.caret,
             caret_t: self.caret_t,
             mend: None,
+            surge: 0.0,
+            flow: Default::default(),
         }
     }
 }
@@ -4246,6 +4248,8 @@ mod tests {
             caret,
             caret_t,
             mend: None,
+            surge: 0.0,
+            flow: Default::default(),
         }
     }
 

@@ -4199,6 +4199,12 @@ impl App {
                             // stamp (`MacOut::push_meta`): only it knows
                             // where the in-flight block stands.
                             block_lead_s: 0.0,
+                            // FLOW HEAT, from the one counter
+                            // (`CursorGlow::flow_status`) — the same number
+                            // `trail status` prints as `flow=`, so what the
+                            // music box opens on and what an agent reads off
+                            // the socket can never disagree.
+                            flow: ws.cursor_glow.flow_status().heat,
                         },
                     );
                 }

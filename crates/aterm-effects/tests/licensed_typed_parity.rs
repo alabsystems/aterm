@@ -743,7 +743,18 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // law_at_floor_and_cap`), and this script's jump lands a different
         // fan. Captured with `ATERM_CAPTURE_TYPED_PARITY=1`: the other EIGHT
         // came back byte-identical — the fix touches the kitty's fan alone.
-        11_326_000_515_217_637_852,
+        // RE-CAPTURED 2026-09-09 — THE SPARKLE'S ARRIVAL. The music box's
+        // per-key glint was spawned at delay zero, inside the tine's own 4 ms
+        // attack, so a phase-random sine sat on every strike's crest and
+        // §9.6's "brightness, never a decibel" stopped holding under §22's
+        // flow (`the_box_opens_with_the_hand_and_never_gets_louder`). It now
+        // arrives at `KEY_GLINT_DELAY_S`, with the bloom. This script's fold
+        // takes the SOUND CUES, and `GlowStyle::RainbowKitty` is the one
+        // style whose cues reach the v2 music box, so entry 2 alone moves:
+        // captured with `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came
+        // back byte-identical. Nothing visual moved at all — this commit
+        // touches no paint.
+        10_546_526_808_721_960_741,
         12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
         13_741_658_660_564_044_123,

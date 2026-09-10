@@ -124,7 +124,7 @@ use aterm_time::Instant;
 
 use crate::companion::CompanionDuty;
 use crate::cursor_glow::Geom;
-use crate::kitty_pet::PetSense;
+use crate::kitty_pet::{PetFrame, PetSense};
 use crate::kitty_registry::KittyLook;
 use crate::word_decorations::CatFootprint;
 
@@ -854,6 +854,196 @@ pub fn sense(ctx: &Ctx<'_>, host: HostSense) -> PetSense {
         reduced_motion: ctx.cfg.reduced_motion,
         output_burst: host.output_burst,
         pointer: host.pointer,
+    }
+}
+
+// ===========================================================================
+// 5b. THE PET AND THE SKY (panel #10) — the resident's whole receiving end
+// ===========================================================================
+//
+// D13 left the pet ONE coupling — the offered perk edge — and no mailbox for
+// it (WIRING STATUS). Panel #10 keeps the coupling one-way and makes it
+// three offers instead of one, all riding the SAME per-frame value:
+//
+//   (a) the perk        — `t₀ + T`, the landing pin's own instant (D13);
+//   (b) the catch       — a gold m1 born within reach of a settled, contented
+//                         cat, offered to it; the paw's landing shortens that
+//                         one star's life to `stardust::CATCH_FINISH_MS`;
+//   (c) the purr's hue  — the ribbon's field under the cat, so the ♪/♥ of a
+//                         contented resident wear the rainbow at its own
+//                         position (C2, extended to the pet).
+//
+// **Every one is an OFFER, and none of them is light.** v2 mints nothing for
+// the pet, moves nothing of the pet, and holds no frame open for it: a
+// [`PetOffer`] is a pure read of state three other producers already own
+// (the impulse slot, the sky's pool, the ribbon's field index), so the whole
+// of #10 costs the frame one scan of a ≤ 48-slot pool and no wake at all
+// (T6). D13's ruling stands untouched: the pet is offered, never driven, and
+// it is never relocated.
+//
+// **T1 stands too.** The catch spends a star a KEYSTROKE made — the sky's own
+// 1-in-12 m1 deal crossed with §5.3's 15 % gold, which is the ~1-key-in-80
+// the panel names — and the cat's reaching for it draws nothing. If the pet
+// never looks, the star lives its own life out; if it does, the only thing
+// that changes is when that life ends.
+
+/// **THE CATCH'S REACH: TEN COLUMNS** (panel #10(b)) — how far along its own
+/// line a settled cat is offered a star, measured from the NEAREST EDGE of
+/// its body ([`PetOnGlass::span`]), not from a point: a six-cell cat whose
+/// nose is one column from a star is one column from it.
+///
+/// The vertical half of the reach is not a number but a law — the star must
+/// be in the sky of the pet's own row ([`super::stardust::Star::in_sky_of`])
+/// — because that band IS the strip of glass directly over the cat, whichever
+/// ribbon spelling the host runs (§5.4, D16). A paw reaches sideways and up
+/// one line; it does not reach three lines up.
+pub const CATCH_REACH_CELLS: f32 = 10.0;
+
+/// **THE PET, AS THE SKY SEES IT** — the five facts an offer is resolved
+/// against, and nothing else.
+///
+/// Filled from the pet's own last [`PetFrame`] ([`PetOnGlass::of`]), which
+/// means the sky reads the cat ONE frame stale. That is deliberate and it is
+/// the whole reason #10 needs no new plumbing: the pet's brain ticks where it
+/// ticks today, publishes the frame it always published, and v2 reads that
+/// value the next time it is asked. Nothing here can retime a pounce, because
+/// nothing here is upstream of one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PetOnGlass {
+    /// The body's LEFT edge in fractional grid columns ([`PetFrame::col`],
+    /// after the emitter's own clamps).
+    pub col: f32,
+    /// The body's width in fractional grid columns.
+    pub width: f32,
+    /// The grid row the pet's feet are on.
+    pub row: u16,
+    /// [`crate::kitty_pet::PetAction::settled`] — at rest on the ground.
+    /// A cat mid-pounce is not offered a star: it is already busy, and an
+    /// offer it could not take would be an offer that lies.
+    pub settled: bool,
+    /// [`PetFrame::purr`] — the purr's own intensity, which the pet publishes
+    /// as `content` while its TELL is up and `0.0` otherwise
+    /// (`kitty_pet.rs:8436`). CONTENTMENT IS THE PET'S WORD, not v2's: this
+    /// file invents no second threshold beside the pet's `PURR_GATE`, it just
+    /// asks whether the cat says it is purring.
+    pub purr: f32,
+}
+
+impl PetOnGlass {
+    /// Read the five facts off the pet's own published frame. `None` when the
+    /// pet is not on glass at all (`alpha == 0`) or the cell metrics are
+    /// degenerate — the same frames its emitter draws nothing for, and the
+    /// frames on which the sky must offer nothing.
+    ///
+    /// The body span is taken from [`PetFrame::body_px`], which is the dest
+    /// rect the emitter actually draws (squash, lift and all four clamps
+    /// folded in), so the reach is measured against the cat that is on the
+    /// glass rather than a model of it.
+    #[must_use]
+    pub fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
+        let cell_w = u16::try_from(geom.cw).ok()?;
+        let cell_h = u16::try_from(geom.ch).ok()?;
+        let cols = u16::try_from(geom.cols).ok()?;
+        let rows = u16::try_from(geom.rows).ok()?;
+        let (x0, x1, _, _) = frame.body_px(cell_w, cell_h, cols, rows)?;
+        let cw = f32::from(cell_w);
+        if cw <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            col: x0 as f32 / cw,
+            width: (x1 - x0) as f32 / cw,
+            row: u16::try_from(frame.row.round().max(0.0) as u32).unwrap_or(u16::MAX),
+            settled: frame.action.settled(),
+            purr: frame.purr,
+        })
+    }
+
+    /// The body's column span, `[left, right]`, in fractional grid columns.
+    #[must_use]
+    pub fn span(&self) -> (f32, f32) {
+        (self.col, self.col + self.width.max(0.0))
+    }
+
+    /// **THE OFFER GATE** — a cat is offered a star only while it is SETTLED
+    /// and CONTENTED (§7.2(b)'s posture, and the pet's own purr tell). Both
+    /// halves are the pet's own verdicts, restated; v2 adds no third.
+    #[must_use]
+    pub fn contented(&self) -> bool {
+        self.settled && self.purr > 0.0
+    }
+
+    /// Distance in COLUMNS from the body's nearest edge to grid column `col`
+    /// — `0` for a column the body is standing on.
+    #[must_use]
+    pub fn columns_to(&self, col: i32) -> f32 {
+        let (lo, hi) = self.span();
+        let c = col as f32;
+        (lo - c).max(c - hi).max(0.0)
+    }
+}
+
+/// **ONE STAR, OFFERED** (panel #10(b)) — the gold m1 within reach of a
+/// contented cat, named by the triple that identifies it in the sky's pool.
+///
+/// The receiver hands this VALUE BACK on the paw's landing frame
+/// (`Engine::catch_star`), which is what makes the catch impossible to
+/// mis-address: v2 never publishes an index into a pool that reorders, and
+/// the pet never has to know what a star is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StarCatch {
+    /// The star's home pixel, window-absolute — pinned at birth (§5.4).
+    pub x: f32,
+    /// The star's home pixel, window-absolute.
+    pub y: f32,
+    /// The birth edge, so a stale offer can never spend a new star's life.
+    pub born: Instant,
+    /// The grid column the star is over — what the pet aims the paw at.
+    pub col: i32,
+}
+
+/// **WHAT V2 OFFERS THE RESIDENT PET THIS FRAME** — the whole of panel #10,
+/// in one value, minted by `Engine::pet_offer`.
+///
+/// Every field is `Option`, and `PetOffer::default()` (all `None`) is exactly
+/// what a frame with no meteor, no star and no ribbon under the cat produces
+/// — so a receiver that reads it every frame does nothing on almost all of
+/// them, and a host that never calls it changes nothing at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PetOffer {
+    /// **(a) THE PERK EDGE** — `t₀ + T`, D13's offer, and the same `Instant`
+    /// the landing pin, the arrival flash, the caret flare and the audio bell
+    /// read (§6.7, §8.1 no. 3). A settled pet should perk exactly THERE, with
+    /// no relocation: this is the arrival, not the launch.
+    ///
+    /// It is [`BodyImpulse::Perk`]'s `at`, routed through [`impulse_for`]
+    /// with [`Body::Pet`] — the router is not bypassed, it is finally read.
+    /// `None` under reduced motion (the impulse is a [`CompanionImpulse::Land`]
+    /// there, and a landing is a pose, not an edge to wait for) and on every
+    /// frame with no live meteor impulse.
+    pub perk_at: Option<Instant>,
+    /// **(b) THE STAR** — a gold m1 within [`CATCH_REACH_CELLS`] of a
+    /// contented cat. `None` unless the cat is settled and purring.
+    pub catch: Option<StarCatch>,
+    /// **(c) THE PURR'S HUE** — the ribbon's field `t` at the cell under the
+    /// pet, or `None` where no ribbon light is laid there. C2 says the caret,
+    /// the ribbon head and a star's halo on a cell are the same colour on the
+    /// same frame; #10(c) adds the cat's own ♪/♥ to that list.
+    pub mote_t: Option<f32>,
+    /// [`Self::mote_t`] resolved to an RGB, so the receiver needs no colour
+    /// law of its own. A mote is a POINT MARK, so C1 snaps it to one of the
+    /// seven stops (`spectrum_snap`) exactly as a star's tint and a pin's
+    /// arms are snapped — a mote sampling the bed's continuous walk would be
+    /// the one un-snapped point mark in the theme.
+    pub mote_rgb: Option<u32>,
+}
+
+impl PetOffer {
+    /// True when this frame offers the pet nothing — the common case, and the
+    /// one-branch early-out a receiver keys on.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.perk_at.is_none() && self.catch.is_none() && self.mote_t.is_none()
     }
 }
 
@@ -1640,6 +1830,8 @@ mod tests {
             caret: (7, 33),
             caret_t: 0.5,
             mend: None,
+            surge: 0.0,
+            flow: Default::default(),
         };
         let s = sense(
             &ctx,
@@ -1746,6 +1938,8 @@ mod tests {
                 caret: (3, 5),
                 caret_t: 0.25,
                 mend: None,
+                surge: 0.0,
+                flow: Default::default(),
             };
             let b = v2.tick(sense(
                 &ctx,

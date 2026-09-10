@@ -388,6 +388,26 @@ pub enum OutputGesture {
     /// The episode's closing exhale — the same voice, one partial, quieter
     /// still. Sound as information (the output stopped), not repetition.
     Settle,
+    /// **THE VERDICT** — a command's exit code, sounded once, on the OSC
+    /// 133/633 `D` that carries it. It is in THIS vocabulary and not in a new
+    /// one because it REPLACES [`Self::Settle`] whenever both would speak:
+    /// the exhale says "the output stopped" and the verdict says "the command
+    /// finished, and here is how", which is the same gesture told twice. The
+    /// host hushes the exhale for the episode the verdict spoke for
+    /// (`app_render.rs`, the PRISM WAKE voice's own gate).
+    ///
+    /// **THE MUSIC BOX'S ALONE.** Rainbow Kitty v2 voices it as a cadence in
+    /// its own lattice ([`TrailSynth::v2_verdict`]); every other instrument
+    /// is SILENT for it, by the early return in
+    /// [`TrailSynth::design_output_pip`] — which is why the nine other voices
+    /// and both audio goldens are byte-identical with this variant in the
+    /// enum. A cat and a music box, or nothing.
+    Verdict {
+        /// The exit status was non-zero.
+        failed: bool,
+        /// It ran long enough for the faraway ice bell (`CAD_BELL_*`).
+        ice: bool,
+    },
 }
 
 /// One namespaced gesture: WHICH effect spoke, and WHAT it said. The
@@ -750,6 +770,31 @@ pub struct EventMeta {
     /// `0.0` is the identity: every caller that does not stamp it, and every
     /// archived render, is byte-identical.
     pub block_lead_s: f32,
+    /// **FLOW HEAT**, 0..1 — how far into flow state the typist is, published
+    /// by the glow engine's flow counter (keys typed at `disp >= 0.8` with no
+    /// delete; the counter opens the theme at ~24 and exits on a delete, a
+    /// Kill or a slow key).
+    ///
+    /// DISTINCT FROM [`SoundEvent::heat`], which is the glow's momentum blaze
+    /// — a continuous function of how fast the keys are arriving, warm again
+    /// two keystrokes after a deletion. Flow heat is the EARNED state: it
+    /// only climbs on a clean fast run and it drops to zero the instant the
+    /// run is broken. The two are not interchangeable and the music box reads
+    /// only this one, so a fast burst of backspaces cannot open the box.
+    ///
+    /// The music box takes it as a LERP parameter and nothing else: at `0.0`
+    /// every flow-priced quantity is exactly its shipped constant, so the
+    /// default IS the identity and every unstamped caller — every archived
+    /// render, every one of the nine other palettes, every host that has no
+    /// flow counter — is byte-identical. See
+    /// `rainbow_kitty_v2::FLOW_BASS_DECAY_S` and `FLOW_P2_LVL` for what it buys at 1.0.
+    ///
+    /// It rides the side-car rather than [`SoundEvent`] for the reason the
+    /// side-car exists (see this type's own doc): a fourth struct-literal
+    /// field would be a compile error at 22 call sites in four other crates'
+    /// files, and a defaulted side-car field is the same number with the same
+    /// identity and no edit outside this file.
+    pub flow: f32,
 }
 
 /// The engine's own ceiling on [`EventMeta::block_lead_s`]: 50 ms, five of
@@ -3392,12 +3437,19 @@ impl TrailSynth {
     /// (found in review, 2026-09-06); the latch is gone and the rule is the
     /// event's own two fields.
     fn v2_engaged(&self, ev: &SoundEvent) -> bool {
-        matches!(ev.kind, SoundGesture::Trail(_))
-            && match ev.voice {
-                SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
-                SoundVoice::Style => ev.style == GlowStyle::RainbowKitty,
-                _ => false,
-            }
+        // THE VERDICT joins the trail gestures here — it is the only non-trail
+        // gesture the music box voices, and it must fork BEFORE the palette
+        // dispatch for exactly the reason §16 row 9 gives for the trail: its
+        // cadence is built out of `CHORD_LOOP` and `TINE_BASE_HZ`, which are
+        // v2's lattice and nothing else's.
+        matches!(
+            ev.kind,
+            SoundGesture::Trail(_) | SoundGesture::Output(OutputGesture::Verdict { .. })
+        ) && match ev.voice {
+            SoundVoice::RainbowKittyV2 | SoundVoice::Of(GlowStyle::RainbowKitty) => true,
+            SoundVoice::Style => ev.style == GlowStyle::RainbowKitty,
+            _ => false,
+        }
     }
 
     /// [`Self::push`] with the v2 side-car (§16 rows 6-8). Hosts that have
@@ -3415,11 +3467,15 @@ impl TrailSynth {
         {
             return;
         }
-        if !meta.pan_from.is_finite() || !meta.block_lead_s.is_finite() {
+        if !meta.pan_from.is_finite() || !meta.block_lead_s.is_finite() || !meta.flow.is_finite() {
             return;
         }
         let meta = EventMeta {
             pan_from: meta.pan_from.clamp(-1.0, 1.0),
+            // Flow heat is a LERP parameter and a LERP parameter only: out of
+            // 0..1 it would extrapolate the bass decay and the octave partial
+            // past the two ends the law was measured on.
+            flow: meta.flow.clamp(0.0, 1.0),
             // A pre-roll is at most one block by the host's own clamp; the
             // engine's bound is generous enough for any real block size and
             // tight enough that a mis-stamped host cannot schedule a note
@@ -4941,9 +4997,23 @@ impl TrailSynth {
     /// dropped and less of everything: a release is never louder than its
     /// onset.
     fn design_output_pip(&mut self, ev: &SoundEvent, gesture: OutputGesture, duck: f32) {
+        // **THE VERDICT IS THE MUSIC BOX'S ALONE.** It reaches this function
+        // only when some OTHER instrument is speaking (`v2_engaged` forks
+        // every music-box verdict into `push_v2` before the palette dispatch),
+        // and the other instruments do not have a verdict: a plagal cadence
+        // needs the chord loop, and the chord loop is v2's. Silence, not a
+        // borrowed pip — which is also what keeps the nine palettes and both
+        // audio goldens byte-identical through this whole change.
+        if matches!(gesture, OutputGesture::Verdict { .. }) {
+            return;
+        }
         let kind_gain = match gesture {
             OutputGesture::Shimmer => OUTPUT_PIP_KIND_GAIN,
             OutputGesture::Settle => OUTPUT_SETTLE_KIND_GAIN,
+            // Unreachable: the early return above sends every verdict home.
+            // Named rather than wildcarded so a THIRD output gesture cannot
+            // arrive here mute by accident.
+            OutputGesture::Verdict { .. } => OUTPUT_SETTLE_KIND_GAIN,
         };
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat) * kind_gain;
         // Five lattice degrees, chosen by the theme-seeded hue. Deliberately
@@ -4952,7 +5022,7 @@ impl TrailSynth {
         let f = self.melody_hz(palette_for(ev.voice, ev.style).anchor_hz(), deg);
         let octave = match gesture {
             OutputGesture::Shimmer => 0.25,
-            OutputGesture::Settle => 0.0,
+            OutputGesture::Settle | OutputGesture::Verdict { .. } => 0.0,
         };
         let v = Voice {
             dur: 0.34,
@@ -15673,7 +15743,57 @@ mod tests {
         /// is why that body and this re-bake share one commit: revert it
         /// and the tree is the tournament entrant alone, green, on the old
         /// folds. Previous: `0xd12d_77a1_3fe1_f68a`.
-        pub const ORACLE_SCRIPT_FOLD: u64 = 0x13cf_37ca_06db_6ad4;
+        ///
+        /// **RE-BAKED 2026-09-09, from a run, on the panel's rulings (§9 of
+        /// `docs/measured/prism-sound-2026-09-08.md`).** This fold is the
+        /// melody AND the timbre, and the panel moved both, so it could not
+        /// have stayed still. What moved, in the order the render hears it:
+        ///
+        /// - **The melody (Q1/Q4).** A rest no longer feeds the tempo EMA,
+        ///   so the keys after a pause are no longer forced upward against a
+        ///   stale-slow reference; the subject is no longer re-latched at
+        ///   every Enter and must now be a figure (no zero interval, no
+        ///   three identical strides); it is answered every third word head
+        ///   rather than every fourth; and a capital is lifted three degrees
+        ///   at a word head or a shift transition, reflected at the
+        ///   register's bound, rather than five degrees on every shifted key
+        ///   clamped to it. This script's 50-key flood therefore derives
+        ///   different degrees.
+        /// - **The timbre (Q2).** The felt mallet's 5 ms sweep runs UPWARD
+        ///   (900 → 3200 Hz) on the owner's glass-bell ruling; every struck
+        ///   key now carries a glint at −24 dB; `hue_air`'s floor is 0.80
+        ///   rather than 0.55; and the bloom's hang and head follow the
+        ///   note's own τ_v under their old constants as ceilings. At 25 cps
+        ///   that last one binds hard — a 340 ms hang becomes 87 ms — so
+        ///   every key of the flood is a different waveform by construction.
+        /// - **The bed (Q6).** −3 dB, partials truncated to the 4th, tilt
+        ///   350 → 900 Hz. The script's events carry `bed: true`, so the pad
+        ///   under all fifty keys and the exhale moved with it.
+        ///
+        /// The eight v1 palettes are still within `V056_TOLERANCE` of the
+        /// v0.56 oracle on this same run: every one of these changes is
+        /// inside v2, which is what that half of the test says.
+        /// Previous: `0x13cf_37ca_06db_6ad4`.
+        ///
+        /// **RE-BAKED 2026-09-09, from a run, for the SPARKLE'S ARRIVAL
+        /// alone** (`rainbow_kitty_v2::KEY_GLINT_DELAY_S`). The panel's glint
+        /// was spawned at delay zero, inside the tine's own 4 ms attack; it
+        /// now arrives at the bloom's opening, 30 ms behind the key, because a
+        /// voice that peaks on the strike's crest adds to the crest, and
+        /// §9.6 rules that brightness may never be a decibel. Fifty typed
+        /// keys at 40 ms each carry fifty glints, so a whole-render hash
+        /// cannot stay fixed under a moved envelope.
+        ///
+        /// **ONLY that change reaches this script**, and the narrowness is
+        /// the evidence: the other two things this commit moved are §22's
+        /// flow echo — its interval and its attack — and both are behind
+        /// `flow > 0.0`, while this script pushes UNSTAMPED events whose
+        /// `EventMeta::flow` is `0.0`. The cold box is byte-identical under
+        /// them by construction, which is the same argument §9.7 makes for
+        /// the bed's exact-zero floor. `BRRRRING_FOLD` did not move at all:
+        /// six Jumps spawn no typed key, so the sparkle cannot reach it
+        /// either. Previous: `0xc771_4d38_1246_a3aa`.
+        pub const ORACLE_SCRIPT_FOLD: u64 = 0x78f6_6fed_25f0_3fbc;
         /// `brrrring_of_rapid_line_feeds_is_pinned`'s script (six Jumps at
         /// 30 ms, a 1 s ring-out), seed `0x5EED_50FD`.
         pub const BRRRRING_SAMPLES: usize = 113_280;
@@ -15691,7 +15811,22 @@ mod tests {
         /// kick the bed by v1's 0.5 each, and the music box's bed now sounds.
         /// `BRRRRING_ONSETS` is unchanged at 6 — the cascade itself is
         /// untouched. Previous: `0x67e4_959d_a518_30a9`.
-        pub const BRRRRING_FOLD: u64 = 0x8f4c_7088_3ba4_04fb;
+        ///
+        /// **RE-BAKED 2026-09-09, from a run, on the panel's Q6 ruling.**
+        /// This one moved for the BED alone, and that is worth saying
+        /// because it is the narrow case: the script is six Jumps, which
+        /// spawn a cascade and no typed key, so none of the melody rulings
+        /// (Q1, Q4) and none of the per-key timbre rulings (Q2's glint,
+        /// mallet and bloom head all ride a typed strike) can reach it. What
+        /// it does carry is `bed: true` on all six, and the sky under them
+        /// is now −3 dB (`BED_LEVEL` 0.012_6 → 0.008_9), voiced on four
+        /// partials instead of seven, and tilted 350 → 900 Hz instead of
+        /// 700 → 2600 — measured at 12 % of its power sitting inside the
+        /// melody's own 450-1900 Hz band, which is what the trim and the
+        /// truncation take out. `BRRRRING_ONSETS` is unchanged at 6: the
+        /// cascade is untouched, again.
+        /// Previous: `0x8f4c_7088_3ba4_04fb`.
+        pub const BRRRRING_FOLD: u64 = 0xcbd2_c6b8_d155_65bb;
         /// Pitched onsets the six-jump burst spawns under the music box (D18:
         /// one four-note cascade, then at most one quiet top-note re-strike per
         /// 60 ms).

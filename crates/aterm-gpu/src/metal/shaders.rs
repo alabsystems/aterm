@@ -51,14 +51,14 @@
 //!
 //! | shader   | WGSL | MSL | what changed |
 //! |----------|-----:|----:|--------------|
-//! | `cell`     | 479 | 496 | Attribute structs replace `@location` params (`[[attribute(n)]]` + `[[stage_in]]`); `@interpolate(flat)` -> `[[flat]]`; `bitcast<i32>` -> `as_type<int>`; the rain weight and both fire shading tails factored into shared `static inline` helpers so the parity kernel calls the SAME code the fragments do. All integer math otherwise op-for-op. |
+//! | `cell`     | 484 | 506 | Attribute structs replace `@location` params (`[[attribute(n)]]` + `[[stage_in]]`); `@interpolate(flat)` -> `[[flat]]`; `bitcast<i32>` -> `as_type<int>`; the rain weight and both fire shading tails factored into shared `static inline` helpers so the parity kernel calls the SAME code the fragments do. All integer math otherwise op-for-op. |
 //! | `blit`     | 153 | 121 | `textureLoad(t, vec2<i32>(p), 0)` -> `t.read(uint2(p), 0)` (both truncate toward zero, and `p` is bounds-checked non-negative first); `select` kept as-is; the long W1/M3/M5/H1 rationale comments condensed, no logic touched. |
-//! | `hdr_glow` |  65 |  68 | Uniform becomes a `constant HdrU&` argument on both stages; `select(lo, hi, c > 0.04045)` maps 1:1 (MSL `select(a,b,cond)` is `cond ? b : a`, the same argument order as WGSL). |
+//! | `hdr_glow` |  87 |  91 | Uniform becomes a `constant HdrU&` argument on both stages; `select(lo, hi, c > 0.04045)` maps 1:1 (MSL `select(a,b,cond)` is `cond ? b : a`, the same argument order as WGSL); §L5's `white_part` helper and `smoothstep(0.35, 0.60, ..)` boost curve map argument-for-argument. |
 //! | `tray`     |  39 |  41 | Uniform/texture/sampler become function arguments; 4-vertex triangle-strip corner table unchanged. |
-//! | `bloom`    |  36 |  36 | Identical apart from the argument-binding form; the 5x5 loop, `exp` weights and normalization are unchanged. |
-//! | `shimmer`  |  80 |  81 | `array<vec4<f32>,16>` -> `float4 heat[16]` (same 16-byte stride, so the Rust struct is unchanged); `textureSampleLevel(..., 0.0)` -> `sample(..., level(0.0))`; `heat_at` takes the uniform by reference since MSL has no module-scope uniform. |
+//! | `bloom`    |  62 |  67 | Identical apart from the argument-binding form; the 5x5 loop, `exp` weights and normalization are unchanged, and §L5's white/chroma radius split is the same two samples per tap on both. |
+//! | `shimmer`  |  87 |  87 | `array<vec4<f32>,16>` -> `float4 heat[16]` (same 16-byte stride, so the Rust struct is unchanged); `textureSampleLevel(..., 0.0)` -> `sample(..., level(0.0))`; `heat_at` takes the uniform by reference since MSL has no module-scope uniform. |
 //!
-//! Totals: 852 WGSL -> 843 MSL (plus a 62-line verification-only
+//! Totals: 912 WGSL -> 913 MSL (plus a 62-line verification-only
 //! `parity_kernel.metal` that is never part of a shipping pipeline).
 //!
 //! # Constructs with NO direct MSL equivalent

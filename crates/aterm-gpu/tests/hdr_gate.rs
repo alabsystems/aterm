@@ -722,3 +722,367 @@ fn every_surface_reconfigure_retags_scrgb() {
         "the retag helper must exist for this closure to mean anything"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WHITE IS HOT — the EDR crown's per-fragment boost (design §L5)
+// ---------------------------------------------------------------------------
+
+/// One mark of the rainbow-kitty palette as it reaches the crown: the colour
+/// the effect emits and the composited coverage §3.2 pins for it. The stream
+/// carries PREMULTIPLIED colour, so this is exactly what `fs_hdr_glow` sees.
+struct Mark {
+    name: &'static str,
+    rgb: u32,
+    cov: u8,
+    /// A white CORE — the marks §3.2 ranks 1, 2, 4 (m1) and 5, the ones the
+    /// hierarchy says are hotter than any hue.
+    white_core: bool,
+}
+
+/// The palette, straight off the design: five white cores and the coloured
+/// company they must not drag over reference white with them.
+const PALETTE: &[Mark] = &[
+    // §3.2 rank 1 / 5 / 2 — the meteor's head and the landing pin.
+    Mark {
+        name: "meteor nucleus core",
+        rgb: 0x00FF_FFFF,
+        cov: 118,
+        white_core: true,
+    },
+    Mark {
+        name: "meteor white shoulder",
+        rgb: 0x00FF_FFFF,
+        cov: 118,
+        white_core: true,
+    },
+    Mark {
+        name: "landing pin nucleus",
+        rgb: 0x00FF_FFFF,
+        cov: 118,
+        white_core: true,
+    },
+    // §3.2 rank 4 — the field m1 core, the brightest small thing that persists.
+    Mark {
+        name: "field star core m1",
+        rgb: 0x00FF_FFFF,
+        cov: 143,
+        white_core: true,
+    },
+    // §3.2 rank 2 — the caret's flare frame, opaque white for one frame.
+    Mark {
+        name: "caret flare frame",
+        rgb: 0x00FF_FFFF,
+        cov: 255,
+        white_core: true,
+    },
+    // Everything coloured: spectrum stops (a zero channel, so no white part at
+    // any coverage), the m2's 60 %-tint body, the coma's half-white blend, and
+    // the two hot-edge inks §4.1 lifted furthest toward white.
+    Mark {
+        name: "star bar / m3 body",
+        rgb: 0x00FF_0000,
+        cov: 98,
+        white_core: false,
+    },
+    Mark {
+        name: "transient m2 body",
+        rgb: 0x0066_66FF,
+        cov: 130,
+        white_core: false,
+    },
+    Mark {
+        name: "ring vertex",
+        rgb: 0x0000_FF00,
+        cov: 130,
+        white_core: false,
+    },
+    Mark {
+        name: "fan grain (gold)",
+        rgb: 0x00FF_FF00,
+        cov: 80,
+        white_core: false,
+    },
+    Mark {
+        name: "halo (violet stop)",
+        rgb: 0x0094_00D3,
+        cov: 61,
+        white_core: false,
+    },
+    Mark {
+        name: "meteor coma",
+        rgb: 0x00FF_7F7F,
+        cov: 40,
+        white_core: false,
+    },
+    Mark {
+        name: "hot edge (lifted red)",
+        rgb: 0x00FF_5D5D,
+        cov: 118,
+        white_core: false,
+    },
+    Mark {
+        name: "hot edge (lifted violet)",
+        rgb: 0x00D1_64FF,
+        cov: 118,
+        white_core: false,
+    },
+    Mark {
+        name: "aurora veil",
+        rgb: 0x0000_00FF,
+        cov: 40,
+        white_core: false,
+    },
+];
+
+/// The CPU twin of `HDR_GLOW_SHADER::white_part` + the §L5 boost curve —
+/// `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))`, capped at 3x linear. Below
+/// the knee this is EXACTLY 1.0, and `x * 1.0` is exact in IEEE-754, so a mark
+/// with no white part emits the very bits it emitted before the crown learned
+/// about white.
+fn white_boost(premul: [f32; 3]) -> f32 {
+    let w = premul[0].min(premul[1]).min(premul[2]);
+    let t = ((w - 0.35) / (0.60 - 0.35)).clamp(0.0, 1.0);
+    (1.0 + 2.0 * (t * t * (3.0 - 2.0 * t))).min(3.0)
+}
+
+/// The premultiplied channels one [`Mark`] hands the crown.
+fn mark_channels(m: &Mark) -> [f32; 3] {
+    let p = premul_rgb(m.rgb, m.cov);
+    [
+        ((p >> 16) & 0xff) as f32 / 255.0,
+        ((p >> 8) & 0xff) as f32 / 255.0,
+        (p & 0xff) as f32 / 255.0,
+    ]
+}
+
+/// A frame carrying the whole [`PALETTE`], one cell-sized quad per mark, laid
+/// left to right from (row 1, col 1). Returns the frame and each mark's cell.
+fn palette_input(
+    cpu_cell: (usize, usize),
+    rows: usize,
+    cols: usize,
+) -> (RenderInput, Vec<(usize, usize)>) {
+    let (cw, ch) = cpu_cell;
+    let mut t = Terminal::new(rows as u16, cols as u16);
+    let mut input = t.cell_frame(rows, cols);
+    input.cursor_visible = false;
+    let per_row = cols - 2;
+    let mut cells = Vec::new();
+    for (i, m) in PALETTE.iter().enumerate() {
+        let (row, col) = (1 + i / per_row, 1 + i % per_row);
+        input.cursor_glow_add.push(GlowQuad {
+            row: row as u16,
+            x: (col * cw) as u16,
+            y: (row * ch) as u16,
+            w: cw as u16,
+            h: ch as u16,
+            color: premul_rgb(m.rgb, m.cov),
+            // ADDITIVE light (see `GlowQuad::alpha`).
+            alpha: 0,
+        });
+        cells.push((row, col));
+    }
+    (input, cells)
+}
+
+/// WHITE IS HOT (§L5). The EDR crown prices every fragment by the WHITE PART of
+/// its own colour — `1 + 2*smoothstep(0.35, 0.60, min(r, g, b))`, capped at 3x
+/// linear and clamped, as ever, to the panel's real headroom. Measured on the
+/// REAL pipeline as the difference between the pass-less and the crowned
+/// present, mark by mark, over the whole rainbow-kitty palette:
+///
+///   * every coloured mark — the spectrum stops of the star bars, the ring and
+///     the fan grains, the m2's 60 %-tint body, the coma, and BOTH of §4.1's
+///     hot-edge inks at the transient cap — is multiplied by EXACTLY 1.0, i.e.
+///     emits what it emitted before this law existed;
+///   * every white core climbs, and a white core is strictly brighter on glass
+///     than a coloured mark of the SAME coverage on the same channel — which is
+///     the whole sentence "white is hot", and which was an EQUALITY before;
+///   * the pixels that end up over reference white are exactly the ones the
+///     twin predicts, with no mark left within 3 % of the boundary to make the
+///     comparison a coin flip.
+#[test]
+fn only_the_whitest_cores_exceed_reference_white() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(true);
+    let mut win = WindowGpu::new();
+    // A 4.0x panel: headroom 3.0 == the cap, so nothing but opaque white is
+    // clamped and every factor in the curve is observable.
+    win.set_edr_max(4.0);
+    let headroom = hdr::additive_headroom(4.0);
+    assert_eq!(headroom, 3.0);
+    let (cw, ch) = gpu.cell_size();
+    let (rows, cols) = (6usize, 9usize);
+    let (input, cells) = palette_input((cw, ch), rows, cols);
+
+    let (plain, w, _h) = gpu.present_hdr_for_test(&mut win, &input, false);
+    let (lit, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+
+    let mut over_white_cells = 0usize;
+    for (m, &(row, col)) in PALETTE.iter().zip(&cells) {
+        let (px, py) = (col * cw + cw / 2, row * ch + ch / 2);
+        let base = (py * w as usize + px) * 4;
+        let c = mark_channels(m);
+        let hot = white_boost(c);
+        assert_eq!(
+            m.white_core,
+            hot > 1.0,
+            "{}: white part {:.3} -> factor {hot:.3}, which disagrees with the design's rank",
+            m.name,
+            c[0].min(c[1]).min(c[2])
+        );
+        let mut any_over = false;
+        for (i, &ch_v) in c.iter().enumerate() {
+            let lin = hdr::srgb_channel_to_linear(ch_v);
+            let want_add = (lin * hdr::HDR_GLOW_BOOST * hot).min(headroom).max(0.0);
+            let got_add = lit[base + i] - plain[base + i];
+            assert!(
+                (got_add - want_add).abs() <= 8e-3,
+                "{} ch {i}: the crown added {got_add} where the §L5 curve says \
+                 {want_add} (linear {lin:.4} x factor {hot:.3})",
+                m.name
+            );
+            // The predicted composite, taken off the measured pass-less present
+            // so the SDR grid underneath is the pipeline's own answer.
+            let want_total = plain[base + i] + want_add;
+            assert!(
+                (want_total - 1.0).abs() > 0.03,
+                "{} ch {i}: predicted {want_total} sits on the reference-white \
+                 boundary — pick a coverage that makes the comparison mean something",
+                m.name
+            );
+            assert_eq!(
+                lit[base + i] > 1.0,
+                want_total > 1.0,
+                "{} ch {i}: measured {} vs predicted {want_total} across reference white",
+                m.name,
+                lit[base + i]
+            );
+            any_over |= lit[base + i] > 1.0;
+        }
+        over_white_cells += usize::from(any_over);
+        println!(
+            "{:<26} rgb {:06x} cov {:>3} white {:.3} factor {:.3} add {:.4} lit {:.4}",
+            m.name,
+            m.rgb,
+            m.cov,
+            c[0].min(c[1]).min(c[2]),
+            hot,
+            lit[base] - plain[base],
+            lit[base]
+        );
+    }
+    // NON-VACUITY: the law has both kinds of mark to separate, and something
+    // really does end up over reference white.
+    assert!(
+        over_white_cells > 0,
+        "no mark reached reference white — the differential is vacuous"
+    );
+
+    // "WHITE IS HOT", stated as the comparison it names: at the SAME coverage
+    // and on the SAME channel, the white core out-emits its coloured twin.
+    // Before the per-fragment boost these two were EQUAL.
+    let white = PALETTE
+        .iter()
+        .position(|m| m.name == "field star core m1")
+        .expect("white core");
+    let gold = PALETTE
+        .iter()
+        .position(|m| m.name == "fan grain (gold)")
+        .expect("gold grain");
+    let sample = |i: usize, chan: usize| {
+        let (row, col) = cells[i];
+        let (px, py) = (col * cw + cw / 2, row * ch + ch / 2);
+        let b = (py * w as usize + px) * 4 + chan;
+        (lit[b], lit[b] - plain[b])
+    };
+    // Re-emit the gold grain at the white core's coverage so only the white
+    // part differs, then compare the RED channel both marks carry at 1.0.
+    let mut twin = input.clone();
+    twin.cursor_glow_add[gold].color = premul_rgb(PALETTE[gold].rgb, PALETTE[white].cov);
+    let (twin_plain, _, _) = gpu.present_hdr_for_test(&mut win, &twin, false);
+    let (twin_lit, _, _) = gpu.present_hdr_for_test(&mut win, &twin, true);
+    let (grow, gcol) = cells[gold];
+    let gb = ((grow * ch + ch / 2) * w as usize + (gcol * cw + cw / 2)) * 4;
+    let (white_lit, white_add) = sample(white, 0);
+    let (gold_lit, gold_add) = (twin_lit[gb], twin_lit[gb] - twin_plain[gb]);
+    println!(
+        "same coverage {}: white core add {white_add:.4} lit {white_lit:.4} \
+         vs gold grain add {gold_add:.4} lit {gold_lit:.4}",
+        PALETTE[white].cov
+    );
+    assert!(
+        white_add > gold_add * 1.5,
+        "at equal coverage the white core must out-emit the coloured mark by \
+         its whiteness factor ({white_add} vs {gold_add})"
+    );
+    assert!(
+        white_lit > 1.0 && gold_lit < 1.0,
+        "the white core crosses reference white where its coloured twin does \
+         not ({white_lit} vs {gold_lit})"
+    );
+}
+
+/// AN SDR PANEL IS BYTE-IDENTICAL (§L5). The crown's new appetite is spent
+/// strictly inside the headroom the panel actually reports: at `edr_max = 1.0`
+/// the pass is skipped whole and the present is bit-for-bit the pass-less one,
+/// over the ENTIRE palette — including the white cores that would triple on an
+/// EDR panel. (The SDR *crown* on a non-f16 swapchain is `fs_sdr_glow`, a
+/// separate fragment this law never touched.)
+#[test]
+fn an_sdr_panel_is_byte_identical() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(true);
+    let mut win = WindowGpu::new();
+    let (cw, ch) = gpu.cell_size();
+    let (input, cells) = palette_input((cw, ch), 6, 9);
+
+    win.set_edr_max(1.0);
+    assert_eq!(hdr::additive_headroom(1.0), 0.0);
+    let (boosted, w, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+    let (plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
+    assert_eq!(
+        boosted, plain,
+        "zero headroom must leave the whitened crown a provable no-op"
+    );
+    for &v in &boosted {
+        assert!(v <= 1.0, "an SDR panel must stay at reference white ({v})");
+    }
+
+    // NON-VACUITY: the very same frame on a panel WITH headroom does boost —
+    // and boosts only the white part. Without this the equality above would
+    // hold just as well for a crown that had been deleted.
+    win.set_edr_max(4.0);
+    let (edr_plain, _, _) = gpu.present_hdr_for_test(&mut win, &input, false);
+    let (edr_lit, _, _) = gpu.present_hdr_for_test(&mut win, &input, true);
+    let factor = |i: usize| {
+        let (row, col) = cells[i];
+        let b = ((row * ch + ch / 2) * w as usize + (col * cw + cw / 2)) * 4;
+        let c = mark_channels(&PALETTE[i]);
+        let lin = hdr::srgb_channel_to_linear(c[0]);
+        (edr_lit[b] - edr_plain[b]) / lin
+    };
+    let core = PALETTE
+        .iter()
+        .position(|m| m.name == "field star core m1")
+        .expect("core");
+    let bar = PALETTE
+        .iter()
+        .position(|m| m.name == "star bar / m3 body")
+        .expect("bar");
+    println!(
+        "edr 4.0x: white core factor {:.3}, coloured bar factor {:.3}",
+        factor(core),
+        factor(bar)
+    );
+    assert!(
+        factor(core) > 2.0,
+        "the m1 core must climb on a panel with headroom (factor {})",
+        factor(core)
+    );
+    assert!(
+        (factor(bar) - 1.0).abs() <= 1e-2,
+        "a coloured mark must stay at reference emission (factor {})",
+        factor(bar)
+    );
+}

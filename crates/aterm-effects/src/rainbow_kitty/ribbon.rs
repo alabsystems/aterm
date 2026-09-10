@@ -274,6 +274,17 @@ pub const RIBBON_QUAD_BUDGET: usize = 10_240;
 /// Cells the hot edge reaches back from the head (§4.1).
 pub const HOT_EDGE_CELLS: f32 = 3.0;
 
+/// **THE SURGE'S CEILING** — the furthest back the crisp edge may reach, in
+/// cells, when a key is born on a CHANGE OF SPEED or under an open theme
+/// (§23's addendum "Flow state", 2026-09-09; the design's
+/// `edge_cells = 3 + 4·Δ/0.5` capped at 5). Five cells at `cw 15` is 75 px of
+/// hairline — two vertices more than the base reach, and the same alpha law
+/// over a longer `d`, so the edge reads as a longer SPEED streak and never as
+/// a brighter one: [`HOT_EDGE_ALPHA`]'s normalised falloff still lands on
+/// exact zero at the reach, and [`HOT_EDGE_COV_MAX`] — the transient cap
+/// itself — is untouched.
+pub const HOT_EDGE_CELLS_MAX: f32 = 5.0;
+
 /// The hot edge's falloff shape, normalised at the head cell:
 /// `alpha(d) = 0.38·(1 − d/3)²`, so the request is
 /// `HOT_EDGE_COV_MAX · (1 − d/3)²` with `d` in cells behind the head.
@@ -857,6 +868,12 @@ pub struct Cell {
     /// for ~100 ms after the hand stopped, which is the "light with no
     /// keystroke behind it" class this module is written against.
     pub birth_disp: f32,
+    /// **THE CRISP EDGE'S REACH**, in cells, priced at BIRTH by
+    /// [`edge_cells`] from the surge and flow's heat — one `f32`, read only
+    /// by [`Ribbon::emit_hot_edge`] and only from the HEAD cell, and never
+    /// re-read from the live spine (the same law as [`Cell::cov0`]: shape may
+    /// follow the spine, light and reach may not).
+    pub edge_cells: f32,
 }
 
 /// A COHORT — one contiguous run of cells laid by one typing burst on one row,
@@ -1392,6 +1409,30 @@ fn onto_luma(rgb: u32, target: f32) -> u32 {
 #[must_use]
 pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
+}
+
+/// **THE CRISP EDGE'S REACH, PRICED AT BIRTH** — how many cells back the
+/// hairline of a cell laid on this tick may run ([`Cell::edge_cells`]).
+///
+/// Two things stretch it, and it takes the longer of them:
+///
+/// * **THE SURGE** ([`super::spine::Spine::surge`]) — a key whose birth price
+///   exceeded the previous key's by [`super::spine::SURGE_MIN_RISE`], or a key
+///   the follower is slamming for: a change of speed wears a longer streak,
+///   in full at [`super::spine::SURGE_FULL_RISE`]. `3 + 4·Δ/0.5` capped at 5,
+///   which is exactly `HOT_EDGE_CELLS + (MAX − HOT_EDGE_CELLS)·surge`.
+/// * **THE OPEN THEME** ([`super::Flow::heat`]) — flow raises the FLOOR from
+///   3 to 5 as it opens, so an unbroken run's every key wears the long edge
+///   and the hand's own speed still shows above it.
+///
+/// At `surge = 0` and `heat = 0` this is [`HOT_EDGE_CELLS`] exactly — the
+/// value the constant had before flow, and the reason a cold frame is
+/// byte-identical.
+#[inline]
+#[must_use]
+pub fn edge_cells(surge: f32, heat: f32) -> f32 {
+    let stretch = clamp01(surge).max(clamp01(heat));
+    HOT_EDGE_CELLS + (HOT_EDGE_CELLS_MAX - HOT_EDGE_CELLS) * stretch
 }
 
 /// **THE HOT EDGE'S INK** — the stop, lifted until it is at least
@@ -2005,6 +2046,7 @@ impl Ribbon {
             typing,
             retract_at: None,
             birth_disp,
+            edge_cells: edge_cells(ctx.surge, ctx.flow.heat),
         };
         self.place(idx, cell, at);
     }
@@ -2185,6 +2227,9 @@ impl Ribbon {
                 typing: false,
                 retract_at: None,
                 birth_disp,
+                // A wake cell is the swoosh's reach, not a key: no key, no
+                // surge, and the crisp edge is the head's property anyway.
+                edge_cells: HOT_EDGE_CELLS,
             };
             self.place(idx, cell, at);
         }
@@ -2463,6 +2508,7 @@ impl Ribbon {
             typing: false,
             retract_at: tail.retract_at,
             birth_disp: tail.birth_disp,
+            edge_cells: tail.edge_cells,
         });
         if let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cohort) {
             coh.col0 = coh.col0.min(col);
@@ -3085,7 +3131,13 @@ impl Ribbon {
             return;
         }
         let head_x = self.plan[run.head].x;
-        let reach = HOT_EDGE_CELLS * ctx.geom.cw as f32;
+        // THE HEAD CELL'S OWN REACH ([`edge_cells`]), priced when it was laid:
+        // the hairline is the head's property, and the key that bought a
+        // longer streak keeps it for as long as that key is the head.
+        let cells = head_cell
+            .edge_cells
+            .clamp(HOT_EDGE_CELLS, HOT_EDGE_CELLS_MAX);
+        let reach = cells * ctx.geom.cw as f32;
         frame.beams.clear();
         for seg in self.plan[run.lo..run.hi]
             .iter()
@@ -3098,7 +3150,7 @@ impl Ribbon {
                 continue;
             }
             let d = behind / ctx.geom.cw as f32;
-            let a = HOT_EDGE_ALPHA * (1.0 - d / HOT_EDGE_CELLS).powi(2);
+            let a = HOT_EDGE_ALPHA * (1.0 - d / cells).powi(2);
             let cov = (HOT_EDGE_COV_MAX * (a / HOT_EDGE_ALPHA) * gain * clamp01(ctx.cfg.intensity))
                 .clamp(0.0, HOT_EDGE_COV_MAX);
             frame.beams.push(BeamVertex {
@@ -3474,6 +3526,7 @@ mod tests {
     use aterm_render::{GlowQuad, RainHalo, over_premul, premul_rgb};
     use std::time::Duration;
 
+    use super::super::spine::{SURGE_FULL_RISE, SURGE_MIN_RISE};
     use super::super::{CaretSeam, Dir, TypedClass};
 
     /// The shipped dark theme, which every legibility number in the family is
@@ -3538,6 +3591,8 @@ mod tests {
             caret,
             caret_t: 0.0,
             mend: None,
+            surge: 0.0,
+            flow: Default::default(),
         }
     }
 
@@ -4667,8 +4722,8 @@ mod tests {
                     "{label}: the hot edge ran PAST the head cell (x = {x}, head = {head_x})"
                 );
                 assert!(
-                    head_x - x <= HOT_EDGE_CELLS * g.cw as f32 + f32::from(q.w) + 1.0,
-                    "{label}: the hot edge reached further than {HOT_EDGE_CELLS} cells behind the head"
+                    head_x - x <= HOT_EDGE_CELLS_MAX * g.cw as f32 + f32::from(q.w) + 1.0,
+                    "{label}: the hot edge reached further than {HOT_EDGE_CELLS_MAX} cells behind the head"
                 );
                 let y = f32::from(q.y);
                 assert!(
@@ -4729,6 +4784,99 @@ mod tests {
         assert!(
             sink.out.is_empty(),
             "a word that is entirely draining has no wet head; the hot edge sat on erased cells"
+        );
+    }
+
+    /// **THE SURGE** (§23's addendum "Flow state", 2026-09-09) — a key born
+    /// on a CHANGE OF SPEED wears a LONGER crisp edge, and an open theme
+    /// raises the floor to the same ceiling. The price first
+    /// ([`edge_cells`]), then the pixels: the hairline of a surged head
+    /// reaches further behind the hand than a steady head's, and neither
+    /// reaches past [`HOT_EDGE_CELLS_MAX`].
+    ///
+    /// The alpha law and the transient cap are untouched by it — the same
+    /// normalised falloff over a longer `d`, so a surged edge is LONGER and
+    /// never brighter: the peak coverage is `HOT_EDGE_COV_MAX` either way.
+    #[test]
+    fn the_surge_stretches_the_edge_on_a_change_of_speed() {
+        // -- 1. the price: `3 + 4·Δ/0.5`, capped at 5 -----------------------
+        assert!(
+            (edge_cells(0.0, 0.0) - HOT_EDGE_CELLS).abs() < 1e-6,
+            "no surge and no flow is the constant the theme had before flow"
+        );
+        // The spine hands the rise over normalised by `SURGE_FULL_RISE`; the
+        // gate rise is 0.15 of it, and `3 + 4·0.15/0.5 = 4.2`.
+        let gate = SURGE_MIN_RISE / SURGE_FULL_RISE;
+        assert!(
+            (edge_cells(gate, 0.0) - (HOT_EDGE_CELLS + 4.0 * SURGE_MIN_RISE / 0.5)).abs() < 1e-5,
+            "the gate rise buys {} cells, want 3 + 4·0.15/0.5",
+            edge_cells(gate, 0.0)
+        );
+        assert!(
+            (edge_cells(1.0, 0.0) - HOT_EDGE_CELLS_MAX).abs() < 1e-6,
+            "the full rise buys the whole stretch"
+        );
+        assert!(
+            (edge_cells(0.0, 1.0) - HOT_EDGE_CELLS_MAX).abs() < 1e-6,
+            "an OPEN theme raises the floor from 3 to 5 with no surge at all"
+        );
+        assert!(
+            edge_cells(0.0, 0.5) > HOT_EDGE_CELLS && edge_cells(0.0, 0.5) < HOT_EDGE_CELLS_MAX,
+            "the floor LERPS as the theme opens; it does not snap"
+        );
+
+        // -- 2. the pixels: how far the hairline actually reaches -----------
+        let dark = cfg(true, true);
+        let g = geom();
+        // The furthest a hot-edge quad sits behind the head, in cells, for a
+        // ten-key run whose LAST key was born with `surge`.
+        let reach_of = |surge: f32, heat: f32| -> f32 {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            for i in 0..10u16 {
+                let now = at(t0, u64::from(i) * 60);
+                let mut cx = ctx_in(now, &dark, (2, 9 + i), 0.9, g);
+                if i == 9 {
+                    cx.surge = surge;
+                    cx.flow.heat = heat;
+                }
+                rib.on_event(&typed(), now, &cx);
+                rib.plan(&cx);
+            }
+            let cx = ctx_in(at(t0, 9 * 60), &dark, (2, 18), 0.9, g);
+            rib.plan(&cx);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            assert!(!sink.out.is_empty(), "a hot hand must leave a hot edge");
+            let head_x = f32::from(g.origin_x) + 18.0 * g.cw as f32;
+            let far = sink
+                .out
+                .iter()
+                .map(|q| head_x - f32::from(q.x))
+                .fold(0.0f32, f32::max);
+            far / g.cw as f32
+        };
+        let steady = reach_of(0.0, 0.0);
+        let surged = reach_of(1.0, 0.0);
+        let flowing = reach_of(0.0, 1.0);
+        assert!(
+            surged > steady + 0.9,
+            "a surged head reaches {surged:.2} cells behind the hand, a steady one {steady:.2} — the stretch is not on the glass"
+        );
+        assert!(
+            (flowing - surged).abs() < 0.01,
+            "an open theme reaches the same ceiling as a full surge ({flowing:.2} vs {surged:.2})"
+        );
+        assert!(
+            surged <= HOT_EDGE_CELLS_MAX,
+            "the stretched edge ran past its own ceiling ({surged:.2} cells)"
+        );
+        assert!(
+            steady <= HOT_EDGE_CELLS,
+            "a steady head must reach exactly what it always did ({steady:.2} cells)"
         );
     }
 

@@ -45,9 +45,27 @@ vertex HdrVsOut vs_hdr_glow(uint vi [[vertex_id]],
     return o;
 }
 
+// WHITE IS HOT (design §L5). The WHITE PART of a premultiplied sRGB colour is
+// its smallest channel: a spectrum stop (`#FF0000`, `#FFFF00`, ...) has a zero
+// channel and therefore NO white part, however bright it is, while `#FFFFFF`
+// at coverage `k` is white all the way to `k`. So `min(r, g, b)` reads the
+// luminance hierarchy off the colour itself, with no side channel and no
+// per-quad tagging.
+static inline float white_part(float3 c) {
+    return min(min(c.r, c.g), c.b);
+}
+
 // Decode the premultiplied sRGB-space aurora colour to linear (same piecewise
 // s2l as everywhere), boost, clamp to the headroom (never negative), and emit
 // into the One/One add. COLOR write-mask: the blit's alpha stays 1.0.
+//
+// THE BOOST IS PER-FRAGMENT (§L5, "in EDR, `out` transients <= 460 ms may
+// exceed reference white"): `1 + 2*smoothstep(0.35, 0.60, white_part)`, capped
+// at 3x linear and then clamped to the panel's real headroom exactly as
+// before. Below the 0.35 knee the factor is EXACTLY 1.0 and a multiply by 1.0
+// is exact in IEEE-754, so every coloured mark emits the same bits it did
+// before this pass learned about white. MSL smoothstep(edge0, edge1, x) is
+// WGSL smoothstep(low, high, x), argument for argument.
 fragment float4 fs_hdr_glow(HdrVsOut in [[stage_in]],
                             constant HdrU& hu [[buffer(0)]]) {
     float3 c = clamp(in.color.rgb, float3(0.0), float3(1.0));
@@ -56,8 +74,9 @@ fragment float4 fs_hdr_glow(HdrVsOut in [[stage_in]],
     // MSL select(a,b,cond) == cond ? b : a — the SAME argument order as WGSL's
     // select(false_val, true_val, cond). Verified against the WGSL line-for-line.
     float3 lin = select(lo, hi, c > float3(0.04045));
+    float hot = min(1.0 + 2.0 * smoothstep(0.35, 0.60, white_part(c)), 3.0);
     float bound = max(hu.headroom, 0.0);
-    float3 add = max(min(lin * hu.boost, float3(bound)), float3(0.0));
+    float3 add = max(min(lin * hu.boost * hot, float3(bound)), float3(0.0));
     return float4(add, 0.0);
 }
 

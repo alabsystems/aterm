@@ -6950,6 +6950,10 @@ pub(crate) fn companion_pet_sense(
         phase: 0.0,
         caret: host.caret.unwrap_or((0, 0)),
         caret_t: 0.0,
+        // The same zeros, for the same reason: the router reads neither the
+        // crisp edge's stretch nor the flow state.
+        surge: 0.0,
+        flow: aterm_effects::rainbow_kitty::Flow::default(),
         // The companion router reads no birth price, so the tick's mend mark
         // (the typo-fix birth, `RAINBOW-KITTY-V2.md` §23) is nothing to it.
         mend: None,
@@ -7139,11 +7143,59 @@ pub(crate) fn route_v2_companion(
     }
 }
 
+/// **THE RESIDENT'S OFFER SEAM** (`rainbow_kitty::companion` panel #10, D13)
+/// — v2's per-frame offer to the pet, minted and delivered, in the one place
+/// both render arms can share.
+///
+/// Called immediately after the pet's OWN tick, with the frame that tick just
+/// published: the sky reads the cat one frame stale by design (`PetOnGlass`),
+/// which is exactly why this needs no new plumbing — the brain ticks where it
+/// ticked before and v2 reads the value it always published.
+///
+/// **ORDER IS THE ONE RULE.** This must run BEFORE
+/// [`route_v2_companion`], because the perk edge lives in the same impulse
+/// slot that router drains, and a drained slot offers nothing. Both arms
+/// satisfy that by construction: the pet's tick precedes the companion
+/// emission in the single-pane path (`emit_single_cursor_companion`) and the
+/// composed one (`compose_cursor_companion`) alike.
+///
+/// `pane_off` is the pet's world inside the WINDOW grid — `(0, 0)` for a
+/// single pane, the focused pane's `(row_off, col_off)` in a split. The pet's
+/// frame is pane-local there (`compose_pet_companion` translates it at emit
+/// time) while the sky's stars and ribbon are window-absolute, so the body is
+/// shifted into the sky's coordinates before the two are compared. Nothing is
+/// stored and nothing is relocated: the shifted copy exists for the length of
+/// this call.
+///
+/// Inert on every other style: one `Option` read (`v2_status`) and a
+/// `PetOffer::default()` the receiver spends two writes on.
+pub(crate) fn route_v2_pet_offer(
+    ws: &mut WindowState,
+    pet_frame: &aterm_effects::kitty_pet::PetFrame,
+    geom: crate::cursor_glow::Geom,
+    pane_off: (u16, u16),
+    now: Instant,
+) {
+    let on_glass = ws.cursor_glow.v2_status().is_some().then(|| {
+        let mut frame = *pet_frame;
+        frame.row += f32::from(pane_off.0);
+        frame.col += f32::from(pane_off.1);
+        aterm_effects::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
+    });
+    let offer = ws.cursor_glow.pet_offer(geom, on_glass.flatten());
+    // LATCH-DON'T-ACT, host side: the brain takes what it wants and hands
+    // back at most one star, on the paw's landing frame. `catch_star` spends
+    // that star's remaining life and draws nothing at all.
+    if let Some(star) = ws.cursor_pet.note_v2_offer(&offer) {
+        ws.cursor_glow.catch_star(star, now);
+    }
+}
+
 #[cfg(test)]
 mod v2_companion_router_tests {
     use super::{
         CompanionDuty, CompanionInk, companion_pet_sense, flying_head_lead_px, input_clock_ms,
-        route_v2_companion,
+        route_v2_companion, route_v2_pet_offer,
     };
     use crate::{App, WindowId};
     use aterm_core::terminal::RenderCell;
@@ -7319,6 +7371,68 @@ mod v2_companion_router_tests {
         );
         assert_eq!(frame.pose.lead, before.pose.lead);
         assert_eq!(frame.bob, before.bob);
+    }
+
+    /// **THE OFFER SEAM DELIVERS** ([`route_v2_pet_offer`], panel #10) — the
+    /// host half of the wiring the round exists to close. v2 mints the perk
+    /// edge for a real 40-cell nav meteor, the seam runs where both render
+    /// arms run it (after the pet's own tick, before the router drains the
+    /// impulse), and the RESIDENT ends up holding it. A seam that ran and
+    /// delivered nothing would leave this latch shut, which is exactly the
+    /// shape of the defect [`aterm_effects::rainbow_kitty::companion`]
+    /// documents against `BodyImpulse::Perk`.
+    #[test]
+    fn the_offer_seam_hands_the_meteors_arrival_to_the_resident() {
+        let mut app = App::headless_for_test();
+        let cfg = app.glow_config();
+        let now = Instant::now();
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        let mut out = Vec::new();
+        // Seat the caret; the rainbow kitty engages v2 on its first tick.
+        ws.cursor_glow
+            .tick(Some((3, 0)), now, &cfg, glow_geom(), &mut out);
+        assert!(
+            ws.cursor_glow.v2_status().is_some(),
+            "fixture: v2 owns the frame"
+        );
+        assert_eq!(
+            ws.cursor_pet.pending_v2_offer(),
+            (false, false),
+            "fixture: the resident has been offered nothing"
+        );
+        // A 40-cell LICENSED nav jump — a meteor by every measure (§6.1).
+        let t1 = now + Duration::from_millis(16);
+        ws.cursor_glow.note_navigation(t1);
+        ws.cursor_glow
+            .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
+        // The host's order, verbatim: the pet's own tick, then the offer.
+        let host = HostSense {
+            caret: Some((3, 40)),
+            ..HostSense::default()
+        };
+        let pet_frame = ws
+            .cursor_pet
+            .tick(companion_pet_sense(t1, GEOM, &cfg, false, host));
+        route_v2_pet_offer(ws, &pet_frame, glow_geom(), (0, 0), t1);
+        assert!(
+            ws.cursor_pet.pending_v2_offer().0,
+            "the meteor's arrival edge never reached the resident"
+        );
+        // …and the router's drain still had the impulse to route: the offer
+        // is a pure READ, and running it first costs the flying head nothing.
+        let mut cat = ws.cursor_cat.static_frame(t1);
+        route_v2_companion(
+            ws,
+            CompanionInk::Single,
+            CompanionDuty::FlyingHead { cell: (3, 40) },
+            t1,
+            GEOM,
+            &mut cat,
+        );
+        assert!(
+            ws.cursor_glow.take_companion_impulse().is_none(),
+            "the router drains the slot; nothing may be left for a second reader"
+        );
     }
 }
 
@@ -11000,6 +11114,76 @@ fn pet_hit_rect_for_frame(
         .then(|| frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows))
         .flatten();
     pet_hit_rect_win(body, origin)
+}
+
+// ═══════════════════════════ THE VERDICT ═══════════════════════════
+//
+// A command's exit code, in three senses, on one clock: the shell's own OSC
+// 133/633 `D`, which carries an authenticated exit status and an execution
+// duration that no heuristic could have inferred. The pet feels it, the music
+// box says it, and the rainbow prices the next key you type by it.
+//
+// ARMED BY THE KEYED ENTER, SPENT BY THE FIRST `D`. The arm is the session's
+// accepted plain-Enter turn boundary (`OutputEchoTracker` — a real key event
+// or raw editor bytes ending in a newline, which is also how `aterm ctl send`
+// counts, an agent's keypress being a keypress). A `D` whose boundary this
+// window has already spent is a `D` with no armed Enter and is SILENT:
+// program output never speaks.
+
+/// A command must have RUN this long before its success is worth saying
+/// anything about — the same two seconds that separate "the shell answered"
+/// from "the machine worked" everywhere else in the companion family
+/// (`kitty_pet`'s `CHEER_MIN_MS`). Under it: nothing at all.
+const VERDICT_MIN_MS: u64 = 2_000;
+/// …and this long before it was a BUILD: the faraway ice bell rings over the
+/// cadence, and the next key you type is born hot (`kitty_pet`'s
+/// `CHEER_BIG_MS`, `rainbow_kitty::spine::VERDICT_WINDOW_S`).
+const VERDICT_ICE_MS: u64 = 30_000;
+
+/// **THE ARM**, as a pure function of the window's spend latch and the
+/// session's last accepted plain-Enter turn boundary: `true` iff this `D` was
+/// run by a keystroke — and the arm is SPENT by the answer, whatever the
+/// answer turns out to be.
+///
+/// It is the boundary's own STAMP that is spent, not a counter, so the three
+/// ways a `D` can arrive with no keystroke behind it all fall out of one
+/// comparison: a program that emits the marks itself and a shell restoring a
+/// session's history carry no newer boundary; a second `D` for one Enter
+/// carries the boundary already spent; and a fresh window that has never seen
+/// an Enter carries `None`.
+pub(crate) fn verdict_armed(
+    spent: &mut Option<(u64, std::time::Instant)>,
+    session: u64,
+    boundary: Option<std::time::Instant>,
+) -> bool {
+    let Some(at) = boundary else {
+        return false;
+    };
+    if *spent == Some((session, at)) {
+        return false;
+    }
+    *spent = Some((session, at));
+    true
+}
+
+/// What THE VERDICT does with one `D`, as a pure function of the three facts
+/// the shell handed over — so the law is testable without a terminal, a
+/// window, or a synth.
+///
+/// * `None` — say nothing. A success under [`VERDICT_MIN_MS`]: the shell
+///   answered, and an answer is not news.
+/// * `Some((failed, ice))` — sound the verdict; `ice` adds the bell and is
+///   only ever true for a GREEN command past [`VERDICT_ICE_MS`].
+///
+/// A FAILURE ALWAYS SPEAKS, however fast it was: `cc: command not found`
+/// comes back in eight milliseconds and is the single most useful thing a
+/// terminal could tell you in that eighth of a second.
+pub(crate) fn verdict_voice(failed: bool, dur_ms: Option<u64>) -> Option<(bool, bool)> {
+    let dur = dur_ms.unwrap_or(0);
+    if failed {
+        return Some((true, false));
+    }
+    (dur >= VERDICT_MIN_MS).then_some((false, dur >= VERDICT_ICE_MS))
 }
 
 /// PERK-AND-WATCH (wave 2): the burst conjunction, in one pure function so
@@ -23042,6 +23226,12 @@ impl App {
             // the glass. `None` ⇒ nobody claimed the block, so the terminal's
             // own cursor colour (OSC 12 / `cursor_color`) is what is on it.
             block_fill: ws.block_fill,
+            // FLOW — the row's one reading about the PERSON. Taken from the
+            // engine's own counter through the seam
+            // ([`aterm_effects::cursor_glow::CursorGlow::flow_status`]), never
+            // re-derived here: an agent that reads `flow=1.00` off this socket
+            // and holds its turn is reading the same run the theme opened for.
+            flow: ws.cursor_glow.flow_status(),
         }
         // Rainbow Kitty v2's rows (`v2_quads=` … `v2_meteors=`) trail the
         // line ONLY while v2 owns the frame; every existing reader parses the
@@ -23363,6 +23553,9 @@ impl App {
             // it did before. `the_drain_stamps_each_echo_cue_at_its_own_instant`
             // pins it.
             let mut last_at_ms = 0u32;
+            // Read BEFORE the drain takes `cursor_glow` mutably: one `f32`,
+            // constant for the frame, exactly like the policy fields above.
+            let flow_heat = ws.cursor_glow.flow_status().heat;
             drain_trail_sound_cues(
                 &mut ws.cursor_glow,
                 glow_cfg.style,
@@ -23385,6 +23578,11 @@ impl App {
                             pan_from: 0.0,
                             // Stamped by the audio worker (`MacOut::push_meta`).
                             block_lead_s: 0.0,
+                            // FLOW HEAT, from the one counter
+                            // (`CursorGlow::flow_status`) — the same number
+                            // this window's `trail status` row prints as
+                            // `flow=`.
+                            flow: flow_heat,
                         },
                     );
                 },
@@ -27739,6 +27937,14 @@ impl App {
             // history), the None→Some edge within one session is a real
             // first completion, and the note itself only latches — the tick
             // below is what acts, under the brain's precedence ladder.
+            //
+            // ═══ THE VERDICT rides this same edge ═══ (see `verdict_voice`).
+            // Three senses, one clock: the pet's latch is already here, the
+            // music box's cue is collected into `verdict_cue` for the audio
+            // push below, and the rainbow's hot-resume door is opened on the
+            // glow engine in place. Nothing here draws: the light rides the
+            // KEY the door prices, never this edge.
+            let mut verdict_cue: Option<(bool, bool)> = None;
             {
                 let seq = cmd_done.map_or(0, |(e, _)| e);
                 let key = (front_terminal.session, seq);
@@ -27750,9 +27956,39 @@ impl App {
                     if same_session && let Some((_, code)) = cmd_done {
                         ws.cursor_pet
                             .note_command_done(frame_started, code != 0, cmd_dur_ms);
+                        // THE ARM ([`verdict_armed`]), spent whatever it says
+                        // — including by a command too quick to be worth a
+                        // word. One Enter, one command, one verdict.
+                        if verdict_armed(
+                            &mut ws.verdict_spent,
+                            front_terminal.session,
+                            output_echo.last_boundary_at,
+                        ) {
+                            let failed = code != 0;
+                            verdict_cue = verdict_voice(failed, cmd_dur_ms);
+                            // SENSE 3, THE RAINBOW: a green build opens the
+                            // door and mints nothing. The first key typed
+                            // inside it is born at full momentum with its
+                            // tine lit — the light rides that key, not this.
+                            if let Some((false, true)) = verdict_cue {
+                                ws.cursor_glow.note_command_verdict(frame_started);
+                            }
+                            // …and THE ONE GUARD arms with it: the exhale
+                            // PRISM WAKE owes this episode is now the
+                            // verdict's to speak (drained at the streak's
+                            // voice below).
+                            ws.verdict_hush |= verdict_cue.is_some();
+                        }
                     }
                 }
             }
+            // THE VIGIL'S LEVEL (THE VERDICT, sense 1): the OSC 133/633
+            // EXECUTE phase, forwarded every composed frame. The host read it
+            // under LOCK A for the perk-and-watch conjunction long before the
+            // verdict wanted it, so this is a bool and never a wake. The pet
+            // starts no clock of its own and strikes no pose here — the note
+            // idiom, held to for a level as for an edge.
+            ws.cursor_pet.note_executing(frame_started, shell_executing);
             // PERK-AND-WATCH (wave 2): is the pane genuinely STREAMING this
             // frame? Every input is per-frame state the LOCK-A probe already
             // read — new scrollback rows, the content clock, the OSC 133/633
@@ -27805,6 +28041,14 @@ impl App {
             // hushes the caret-jump fanfare — no party ring at a failure.
             if ws.cursor_pet.grieving() {
                 ws.cursor_glow.hush_fanfare(frame_started);
+            }
+            // THE HAND FOUND ITS FLOW: one latch per flow ENTRY, drained here
+            // beside the grief gate because this is where the host already
+            // holds both engines. Nothing is forwarded on an EXIT, and the
+            // latch buys no frame — it rides the pet tick this arm is running
+            // anyway (`kitty_pet::PetBrain::note_flow`).
+            if ws.cursor_glow.take_flow_entry() {
+                ws.cursor_pet.note_flow(frame_started);
             }
             // WHAT THE PET SENSES is projected by Rainbow Kitty v2's router
             // ([`companion_pet_sense`]) for BOTH render arms, from the four
@@ -27861,6 +28105,13 @@ impl App {
                 },
             ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
+            // RAINBOW KITTY v2's OFFER TO THE RESIDENT ([`route_v2_pet_offer`],
+            // panel #10) — after the pet's own tick, on the frame it just
+            // published, and BEFORE `emit_single_cursor_companion` drains the
+            // impulse slot the perk edge lives in. The shed alpha is already
+            // folded in above, so the sky is offered the cat that is actually
+            // on the glass. Single pane: the pet's world IS the window grid.
+            route_v2_pet_offer(ws, &pet_frame, glow_geom, (0, 0), frame_started);
             // The brain can begin returning below the face-swap threshold,
             // but only one companion is put on glass.
             let pet_on_glass =
@@ -28739,6 +28990,71 @@ impl App {
             // light (the one-event law), through the ONE focus x master x
             // volume law every other voice delegates to — with the streak's
             // own opt-out folded in, so quieting the pip never quiets typing.
+            // ═══════════════════ THE ONE GUARD ═══════════════════
+            //
+            // PRISM WAKE's closing exhale and THE VERDICT are the same
+            // gesture: "that is over". The exhale fires later — on the
+            // streak's own analytic momentum drain — so left alone, the end
+            // of every long command speaks twice, the second time worse. The
+            // verdict REPLACES it.
+            //
+            // Only the VOICE is replaced. The ribbon still retires on glass
+            // exactly as it did; the streak engine's state machine is not
+            // touched, which is why this is a filter on the cue and not a
+            // call into the engine.
+            let streak_cue = streak_cue.filter(|cue| match cue.sound {
+                // A new episode owns its own exhale: the pip that opens it
+                // clears any hush still standing, so the latch can never
+                // swallow a settle it was not aimed at.
+                crate::output_streak::StreakSound::Shimmer => {
+                    ws.verdict_hush = false;
+                    true
+                }
+                crate::output_streak::StreakSound::Settle => {
+                    !std::mem::replace(&mut ws.verdict_hush, false)
+                }
+            });
+            // ═══════════ THE VERDICT'S VOICE (sense 2) ═══════════
+            //
+            // Through the same focus × master × volume law every other voice
+            // delegates to — but NOT behind the output-streak opt-out, and
+            // deliberately: the verdict is a trail gesture (the music box's
+            // own cadence, in the theme's own lattice), and it is the pip's
+            // replacement rather than another one of them. Silencing the pip
+            // must not silence the answer to your build.
+            //
+            // Every instrument but the music box is silent for it
+            // (`design_output_pip`'s early return), which is what keeps the
+            // nine other voices and both audio goldens byte-exact.
+            if let Some((failed, ice)) = verdict_cue
+                && let Some(gain) = trail_sound_gain(
+                    ws.focused,
+                    self.config.trail_sounds_or_default(),
+                    self.config.trail_sound_volume(),
+                )
+            {
+                self.trail_audio
+                    .push(aterm_effects::trail_sound::SoundEvent {
+                        style: glow_cfg.style,
+                        voice: self.config.trail_sound_voice(),
+                        kind: aterm_effects::trail_sound::SoundGesture::Output(
+                            aterm_effects::trail_sound::OutputGesture::Verdict { failed, ice },
+                        ),
+                        // CENTRED, like every downbeat: the verdict is about
+                        // the command and not about a column.
+                        pan: 0.0,
+                        // An exit code is not authorship — a busy hand must
+                        // not make the machine's answer louder.
+                        heat: 0.0,
+                        hue: 0.0,
+                        gain,
+                        shifted: false,
+                        tone: aterm_effects::tone::Tone::Technical,
+                        // Never feeds the ambient bed: punctuation, not
+                        // weather (the output pip's own law).
+                        bed: false,
+                    });
+            }
             if let Some(cue) = streak_cue
                 && let Some(gain) = trail_sound_gain(
                     ws.focused,
@@ -33225,7 +33541,23 @@ impl App {
         // world (and so `body_px`) is that pane's grid, exactly like
         // `compose_pet_companion`'s translate step. Derived before the `ws`
         // borrow (it reads `&self`).
-        let (fx_ox, fx_oy, _, _, _) = self.effects_origin_win(wid, rows, cols, glow_ch);
+        let (fx_ox, fx_oy, fx_w, fx_h, fx_head) = self.effects_origin_win(wid, rows, cols, glow_ch);
+        // THE SKY'S GEOMETRY, restated for this arm — the WINDOW grid, field
+        // for field the same `cursor_glow::Geom` `tick_cursor_fx` ticked the
+        // engine with on this frame (one shared derivation,
+        // `effects_origin_win`). Rainbow Kitty v2's marks are window-absolute
+        // px; only the resident's own world is the pane.
+        let pane_geom = crate::cursor_glow::Geom {
+            cw: glow_cw,
+            ch: glow_ch,
+            rows,
+            cols,
+            origin_x: fx_ox,
+            origin_y: fx_oy,
+            win_w: fx_w,
+            win_h: fx_h,
+            head: fx_head,
+        };
         let pet_origin = (
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
@@ -33372,6 +33704,15 @@ impl App {
                     }
                 }
             }
+            // THE VIGIL'S LEVEL (THE VERDICT, sense 1) — the single-pane
+            // twin, on the focused pane's own Execute level. The vigil is the
+            // PET's sense and travels with the pet into a split; the
+            // verdict's VOICE and its rainbow door stay with the single-pane
+            // arm, which is the one that also holds the streak cue THE ONE
+            // GUARD has to replace (the composed path pushes each pane's pip
+            // from `compose_output_streak`, where no single episode is "the"
+            // one a focused command ended).
+            ws.cursor_pet.note_executing(now, focus_shell_exec);
             // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
             // split twin: the focused pane's scroll delta, content
             // clock, Execute LEVEL and live bottom, through the same
@@ -33425,6 +33766,11 @@ impl App {
             if ws.cursor_pet.grieving() {
                 ws.cursor_glow.hush_fanfare(now);
             }
+            // THE HAND FOUND ITS FLOW, split-path twin — the same one-shot
+            // drain, on the same arm's clock.
+            if ws.cursor_glow.take_flow_entry() {
+                ws.cursor_pet.note_flow(now);
+            }
             // The single-pane twin's projection ([`companion_pet_sense`]) at
             // the focused PANE's geometry — one router, both arms.
             let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
@@ -33464,6 +33810,14 @@ impl App {
                 },
             ));
             pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
+            // RAINBOW KITTY v2's OFFER TO THE RESIDENT — the single-pane
+            // seam's twin, through the same one function
+            // ([`route_v2_pet_offer`]), before `compose_cursor_companion`
+            // drains the impulse. The pet's world is the FOCUSED PANE and the
+            // sky's is the window, so the focused pane's offset is what
+            // reconciles them; the glow engine ticked on `pane_geom`'s window
+            // grid in `tick_cursor_fx` this same frame.
+            route_v2_pet_offer(ws, &pet_frame, pane_geom, focus_off, now);
             // PETTING (wave 1): stash/clear the hit-box post-tick — the
             // single-pane law verbatim, at the focused pane's origin.
             ws.pet_hit_rect = pet_hit_rect_for_frame(
@@ -45835,6 +46189,112 @@ mod link_target_caption_tests {
             rows[0].contains(TARGET),
             "the caption took the free end instead: {:?}",
             rows[0]
+        );
+    }
+}
+
+/// **THE VERDICT's host gate** — the two laws that decide whether a shell's
+/// `D` is allowed to speak at all, tested as the pure functions they are.
+#[cfg(test)]
+mod trail_verdict {
+    use super::{verdict_armed, verdict_voice};
+    use std::time::{Duration, Instant};
+
+    /// **A `D` WITH NO ARMED ENTER IS SILENT.** THE LAWS: every light has a
+    /// keystroke behind it, and program output alone does not count. A shell
+    /// mark is an authenticated fact, but it is not a hand — so the verdict is
+    /// ARMED by the accepted plain-Enter turn boundary and SPENT by the first
+    /// `D` after it. All four ways a `D` can arrive unearned fall out of the
+    /// one stamp comparison.
+    ///
+    /// Before the change there was no arm at all: any `D` would have spoken,
+    /// including the ones a program emitted for itself.
+    #[test]
+    fn a_command_that_speaks_was_run_by_a_keystroke() {
+        let t = Instant::now();
+        let mut spent = None;
+
+        // A window that has never seen an Enter: a `D` arriving with the
+        // marks a program printed itself says nothing.
+        assert!(
+            !verdict_armed(&mut spent, 7, None),
+            "a D with no Enter behind it at all is silent"
+        );
+        assert_eq!(spent, None, "…and it spends nothing either");
+
+        // You press Enter; the command runs; the `D` comes back.
+        let enter = t;
+        assert!(
+            verdict_armed(&mut spent, 7, Some(enter)),
+            "a D behind a keyed Enter speaks"
+        );
+
+        // The shell repeats its marks — a redraw, a resumed session, a second
+        // `D` for the one command. One Enter, one verdict.
+        assert!(
+            !verdict_armed(&mut spent, 7, Some(enter)),
+            "the same Enter cannot buy a second verdict"
+        );
+
+        // Another window's session, same instant: the arm is per session, so
+        // a tab switch re-baselines instead of replaying.
+        assert!(
+            verdict_armed(&mut spent, 9, Some(enter)),
+            "another session's Enter is another session's verdict"
+        );
+
+        // …and the next real Enter arms again.
+        assert!(
+            verdict_armed(&mut spent, 9, Some(enter + Duration::from_secs(1))),
+            "a new Enter is a new verdict"
+        );
+    }
+
+    /// **A QUICK COMMAND IS SILENT.** Two seconds separates "the shell
+    /// answered" from "the machine worked": under it the verdict says nothing
+    /// at all, because an answer is not news. A FAILURE always speaks however
+    /// fast it was — `cc: command not found` comes back in eight milliseconds
+    /// and is the most useful thing a terminal could tell you in that eighth
+    /// of a second — and past half a minute a green one earns the ice bell.
+    ///
+    /// Before the change every `D` past the arm would have sounded, `ls`
+    /// included.
+    #[test]
+    fn a_quick_command_is_silent() {
+        assert_eq!(
+            verdict_voice(false, Some(120)),
+            None,
+            "`ls` says nothing: it answered, it did not work"
+        );
+        assert_eq!(
+            verdict_voice(false, Some(1_999)),
+            None,
+            "…and neither does anything under two seconds"
+        );
+        assert_eq!(
+            verdict_voice(false, None),
+            None,
+            "a shell that reported no timestamps is treated as quick, not long"
+        );
+        assert_eq!(
+            verdict_voice(false, Some(2_000)),
+            Some((false, false)),
+            "two seconds is the wall, and it speaks the plagal cadence"
+        );
+        assert_eq!(
+            verdict_voice(false, Some(30_000)),
+            Some((false, true)),
+            "half a minute was a BUILD: the ice bell rings over the resolution"
+        );
+        assert_eq!(
+            verdict_voice(true, Some(8)),
+            Some((true, false)),
+            "a failure always speaks, however fast — and never rings the bell"
+        );
+        assert_eq!(
+            verdict_voice(true, Some(600_000)),
+            Some((true, false)),
+            "…including a ten-minute one: the bell is the green cadence's"
         );
     }
 }

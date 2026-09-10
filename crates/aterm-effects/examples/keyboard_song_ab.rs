@@ -17,7 +17,7 @@
 //!       --example keyboard_song_ab -- <out_dir> \
 //!       [--tag <name>] [--voice <name>] [--style <name>]
 //!       [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]
-//!       [--timbre plain|bloom|hue|room] [--jitterfix j0|j1] [--metronome]
+//!       [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]
 //!       [--census] [--probes]
 //!
 //! `--metronome` types the prose scene as a STRICT metronome — no sentence
@@ -155,6 +155,10 @@ impl Cue {
             // The bench renders on its own grid: cues land ON a block
             // boundary by construction, so there is no pre-roll to hand over.
             block_lead_s: 0.0,
+            // §22's FLOW HEAT. The bench plays the COLD box: flow is a
+            // state the hand earns at the keyboard, and a scripted take
+            // has no hand. 0.0 is the identity.
+            flow: 0.0,
         }
     }
 }
@@ -1291,6 +1295,10 @@ fn probe(
         rank: 0,
         pan_from: 0.0,
         block_lead_s: 0.0,
+        // §22's FLOW HEAT. The bench plays the COLD box: flow is a
+        // state the hand earns at the keyboard, and a scripted take
+        // has no hand. 0.0 is the identity.
+        flow: 0.0,
     };
     // THREE settling keystrokes, ~340 ms apart: enough that the previous
     // note's tail is dead, and — since the bar's accents fall every third
@@ -2070,8 +2078,8 @@ fn census(
             "NOTE: spawn is {fix:?}, so the `blockclk` control is not discriminating\n\
              here — an unstamped push reads the spawn grid, and off Ship that grid\n\
              is (near) the cue's own time. `blockclk` converging on `letters` in\n\
-             THIS table is arithmetic, not an unwired stamp. Re-run without\n\
-             --jitterfix to falsify the stamp.\n"
+             THIS table is arithmetic, not an unwired stamp. Re-run with\n\
+             --jitterfix ship to falsify the stamp.\n"
         );
     }
     println!(
@@ -2181,7 +2189,7 @@ fn usage() -> ! {
     eprintln!(
         "keyboard_song_ab <out_dir> [--tag <name>] [--voice <name>] [--style <name>]\n\
         \x20   [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]\n\
-        \x20   [--timbre plain|bloom|hue|room] [--jitterfix j0|j1] [--metronome]\n\
+        \x20   [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]\n\
         \x20   [--census] [--probes]"
     );
     std::process::exit(2)
@@ -2200,7 +2208,20 @@ fn main() {
     let mut timbre = Timbre::Room;
     let mut timbre_named = false;
     let mut want_probes = false;
-    let mut fix = BlockFix::Ship;
+    // **J1 IS WHAT SHIPS, SO IT IS WHAT THE BENCH RENDERS** (the panel's Q3
+    // ruling, 2026-09-09; §9). The host already sets
+    // `EventMeta::block_lead_s` on every `push_meta`
+    // (`aterm_gui::trail_audio::…::push_meta`) and the engine already spends
+    // it at `v.t = -(v.delay + self.block_lead_s)`, which puts every onset a
+    // constant one block after its press: J1, live, today. `Ship` here was
+    // modelling the block clock as it behaved BEFORE that wire existed, so a
+    // default of `Ship` meant every reel measured a jitter the product does
+    // not have. The ruling took J1 over J0 on the transient — J0's 0-10.7 ms
+    // bite out of the mallet's head varies with block phase, i.e. randomly
+    // per key, which trades a constant nobody can hear for an attack
+    // brightness that changes on every note — so the bench's default is now
+    // the shipping behaviour and `--jitterfix ship` is the historical one.
+    let mut fix = BlockFix::J1;
     let mut want_census = false;
     let mut metronome = false;
     while let Some(a) = args.next() {

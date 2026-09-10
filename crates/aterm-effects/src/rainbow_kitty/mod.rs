@@ -93,12 +93,18 @@ pub mod spine;
 pub mod stardust;
 pub mod timing;
 
+/// **THE FLOW STATE** — re-exported at the theme's root because it is the
+/// theme's published state, not the spine's private one: it rides [`Ctx`],
+/// [`Status`] and (through the seam) the `trail status` row.
+pub use spine::Flow;
+
 use aterm_time::Instant;
 use std::time::Duration;
 
 use aterm_render::{BeamVertex, GlowQuad, RainHalo};
 
 use crate::cursor_glow::{Geom, GlowConfig, SoundCue};
+use crate::spectrum::spectrum_snap;
 use crate::trail_sound::SoundKind;
 use meteor::{Meteors, Spawn};
 use ribbon::Ribbon;
@@ -551,6 +557,15 @@ pub struct Ctx<'a> {
     pub caret_t: f32,
     /// The mend mark, on the one tick that births a typo fix (see [`Mend`]).
     pub mend: Option<Mend>,
+    /// [`spine::Spine::surge`] — how much of the crisp edge's stretch the
+    /// last typed key bought, 0..1. A BIRTH price, like [`Ctx::birth_disp`]:
+    /// only [`ribbon::edge_cells`] reads it, and only where a key lays.
+    pub surge: f32,
+    /// **THE FLOW STATE** ([`spine::Spine::flow`]) — the run, its high-water
+    /// mark and the open ramp. Flow draws nothing of its own: every consumer
+    /// LERPS from identity at `heat == 0`, so a frame under a cold hand is
+    /// byte-identical to the same frame in a theme with no flow in it.
+    pub flow: Flow,
 }
 
 /// `trail status`'s v2 rows (seam point 12).
@@ -568,6 +583,10 @@ pub struct Status {
     pub cells: u32,
     /// The eased spine.
     pub disp: f32,
+    /// **THE FLOW ROW** — `flow=` / `combo=` / `combo_best=`. The number a
+    /// turn-based agent reads off the control socket to tell that the human
+    /// is mid-flow and hold its turn.
+    pub flow: Flow,
     /// Glint tokens on hand.
     pub tokens: f32,
     /// The last frame's fingerprint.
@@ -916,6 +935,27 @@ impl Engine {
         self.pane = pane;
     }
 
+    /// **THE VERDICT** (sense 3) — a shell command came back GREEN after a
+    /// long run, reported by the host on the OSC 133/633 `D` it already
+    /// dedupes. Like [`Engine::earn_hero`] it is not a cursor event and so
+    /// has no place in [`Event`]; unlike it, it mints nothing at all.
+    ///
+    /// **NO LIGHT IS BORN HERE.** THE LAWS: every light has a keystroke
+    /// behind it, and a command finishing is the machine talking, not a hand.
+    /// All this does is open [`spine::Spine::note_verdict`]'s door, so that
+    /// the FIRST key you type inside [`spine::VERDICT_WINDOW_S`] is born at
+    /// full momentum with the rainbow already at speed — the light rides that
+    /// key, and if you never type one, nothing ever happened.
+    ///
+    /// Gated on `engaged` like every other seam point, so a session that
+    /// never chose the theme pays exactly nothing for the shell's marks.
+    pub fn note_verdict(&mut self, now: Instant) {
+        if !self.engaged {
+            return;
+        }
+        self.spine.note_verdict(now);
+    }
+
     /// **THE KITTY'S DELIGHT EDGE**, reported by the host — it is not a cursor
     /// event and so has no place in [`Event`]. §5.8 lists Delight among the
     /// five things that EARN a hero: this mints [`CompanionImpulse::Delight`]
@@ -1051,6 +1091,20 @@ impl Engine {
             col: self.erased.1,
             deletes: m.count,
         });
+        // **THE FLOW RUN CLIMBS HERE** (§23's addendum "Flow state"), after the
+        // one `Spine::update` and before anything reads the spine: the keys
+        // this frame carries, priced at the number their own light is bought
+        // with. Counting at the key's EDGE would price it by the last frame's
+        // follower — and, after a silence the engine spent dark, by a
+        // follower that has not moved for seconds.
+        let keys = self
+            .events
+            .iter()
+            .filter(|(ev, _)| matches!(ev, Event::Typed { .. }))
+            .count();
+        let price = self.spine.birth_disp();
+        self.spine
+            .note_keys(now, u32::try_from(keys).unwrap_or(u32::MAX), price);
         let mut ctx = Ctx {
             now,
             geom,
@@ -1063,6 +1117,8 @@ impl Engine {
             // else reads it before it is re-sampled below.
             caret_t: self.ribbon.field_at_caret(),
             mend,
+            surge: self.spine.surge(),
+            flow: self.spine.flow(),
         };
 
         // Pass 1 — the ribbon INGESTS, then PLANS. The field index exists
@@ -1124,6 +1180,20 @@ impl Engine {
         for &(cell, at) in &self.earned {
             self.stardust.earn_hero(at, cell, &ctx, &self.ribbon);
         }
+        // **THE COMBO LADDER'S TOP RUNG** (§23's addendum "Flow state"): every
+        // 64th key AFTER the first gold hero fires the one-frame caret flare
+        // §7.1 already owns — the ladder's own edge, on a keystroke, never
+        // under reduced motion (no flash, exactly as a landing's is refused
+        // there). The first 64th pays its gold m1 in the sky and does not
+        // flash: the flare is what the ladder does once it has nothing left
+        // to give.
+        if keys > 0
+            && !cfg_live.reduced_motion
+            && ctx.flow.combo > stardust::LADDER_GOLD_KEYS
+            && ctx.flow.combo.is_multiple_of(stardust::LADDER_GOLD_KEYS)
+        {
+            self.caret_seam.flare_at = Some(now);
+        }
         self.events.clear();
         self.earned.clear();
 
@@ -1161,6 +1231,7 @@ impl Engine {
             meteors: self.meteor.live() as u32,
             cells: self.ribbon.live_cells() as u32,
             disp: self.spine.disp(),
+            flow: ctx.flow,
             tokens: self.stardust.budget.tokens(),
             fp: self.fp,
         };
@@ -1423,6 +1494,106 @@ impl Engine {
     /// [`Frame::companion`] is a non-consuming report of the same slot.
     pub fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
         self.companion.take()
+    }
+
+    /// **THE RESIDENT PET'S WHOLE RECEIVING END** (panel #10, D13) — the perk
+    /// edge, the star within reach, and the ribbon's colour under the cat, as
+    /// ONE value.
+    ///
+    /// This is the call D13's wiring gap was waiting for. The perk offer has
+    /// existed since the router was written ([`companion::BodyImpulse::Perk`])
+    /// and nothing read it; here it is read, beside the two other things the
+    /// pet can be offered without being driven. The host's whole receiving
+    /// end is two lines, after its own pet tick:
+    ///
+    /// ```ignore
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(&pet_frame, geom));
+    /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// ```
+    ///
+    /// **It is a pure read and it arms nothing.** No clock is started, no
+    /// mark is minted, no cadence is held: every field is state a producer
+    /// already owns this frame — the impulse slot, the sky's pool, the
+    /// ribbon's field index — so an idle engine offers `PetOffer::default()`
+    /// and T6 is untouched. The cost is one scan of the ≤ 48-slot star pool
+    /// with two compares a star, and no allocation (§18). MEASURED on the
+    /// capture (`examples/rainbow_kitty_v2_catch`, release, 200 000 calls):
+    /// **5.11 ns/call** on the contented path that actually scans, and
+    /// **3.33 ns/call** on an 18-star hot sky, where an uncontented cat
+    /// short-circuits the scan before it starts.
+    ///
+    /// `pet` is the cat as its OWN last frame published it, or `None` when
+    /// there is no pet on glass. v2 never derives a pet position: §7.2(b) is
+    /// that the pet seats itself, and a router that guessed where it was
+    /// would be a second answer to that question.
+    #[must_use]
+    pub fn pet_offer(&self, geom: Geom, pet: Option<companion::PetOnGlass>) -> companion::PetOffer {
+        let perk_at = self.companion.and_then(|imp| {
+            match companion::impulse_for(companion::Body::Pet, imp) {
+                companion::BodyImpulse::Perk { at } => Some(at),
+                _ => None,
+            }
+        });
+        let Some(pet) = pet else {
+            return companion::PetOffer {
+                perk_at,
+                ..companion::PetOffer::default()
+            };
+        };
+        let (lo, hi) = pet.span();
+        let mote_cell = ((lo + hi) * 0.5).floor().max(0.0) as u32;
+        let mote_t = u16::try_from(mote_cell)
+            .ok()
+            .and_then(|col| self.ribbon.field_at(pet.row, col));
+        // §5.3's 15 % gold crossed with §5.6's 1-in-12 m1 IS the panel's
+        // "about one key in eighty"; the sky deals it on a keystroke and this
+        // scan only NOTICES it. The NEWEST match wins — the panel's offer is
+        // made to a star as it is born, and a cat that has been ignoring one
+        // for 300 ms should be offered the fresh one instead.
+        let catch = pet.contented().then(|| {
+            self.stardust
+                .live_iter()
+                .filter(|s| {
+                    s.gold
+                        && s.class == stardust::StarClass::M1
+                        && s.lane.is_sky()
+                        && s.in_sky_of(pet.row, geom)
+                        && pet.columns_to(s.grid_col(geom)) <= companion::CATCH_REACH_CELLS
+                })
+                .max_by_key(|s| s.born)
+                .map(|s| companion::StarCatch {
+                    x: s.x,
+                    y: s.y,
+                    born: s.born,
+                    col: s.grid_col(geom),
+                })
+        });
+        companion::PetOffer {
+            perk_at,
+            catch: catch.flatten(),
+            mote_t,
+            mote_rgb: mote_t.map(spectrum_snap),
+        }
+    }
+
+    /// **THE CAT CATCHES THE STAR** (panel #10(b)) — spend the offered star's
+    /// remaining life on the frame the paw lands, on the sky's own 40 ms
+    /// finish ([`stardust::CATCH_FINISH_MS`]). Returns whether the star was
+    /// still there to catch.
+    ///
+    /// `star` is the value [`Engine::pet_offer`] handed over, unchanged, and
+    /// `at` is the PAW'S LANDING instant — the pet's own clock, not v2's, so
+    /// the star dies on the frame the cat touches it rather than the frame v2
+    /// noticed.
+    ///
+    /// **Exactly one life moves, and no light is born.** The star is found by
+    /// identity and the finish is applied once ([`stardust::Stardust::catch`]);
+    /// a stale offer, a dead star or a second call finds nothing to lengthen.
+    /// And nothing is drawn: the whole of the catch is one star ending sooner,
+    /// which is the only way the pet's own motion can touch the sky without
+    /// becoming light itself (T1).
+    pub fn catch_star(&mut self, star: companion::StarCatch, at: Instant) -> bool {
+        self.stardust.catch(star.x, star.y, star.born, at)
     }
 
     /// **SEAM POINT 11** (`drain_sound_cues`) — drain the cues minted and not
@@ -2023,6 +2194,298 @@ mod tests {
             let mut fr = sc.frame();
             eng.tick(now, geom(), &cfg, &mut fr);
         }
+    }
+
+    // -- §23's addendum "Flow state": the counter, the entry, the exits ----
+
+    /// Type `keys` keys on row 3 from column 4 at `period_ms`, ticking the
+    /// engine at 120 Hz exactly as the host does, and return one row per key:
+    /// `(seconds since the first key, the flow after that key's frame)`.
+    fn flow_run(
+        eng: &mut Engine,
+        sc: &mut Scratch,
+        t0: Instant,
+        keys: u32,
+        period_ms: u64,
+    ) -> Vec<(f32, Flow)> {
+        let cfg = config();
+        let period = Duration::from_millis(period_ms);
+        let mut out = Vec::new();
+        let mut t = t0;
+        for (col, k) in (4u16..).zip(1..=keys) {
+            let key = t0 + period * k;
+            while t + TICK <= key {
+                t += TICK;
+                let mut fr = sc.frame();
+                eng.tick(t, geom(), &cfg, &mut fr);
+            }
+            t = key;
+            eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), t);
+            eng.on_event(typed(1), t);
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+            out.push((
+                key.saturating_duration_since(t0 + period).as_secs_f32(),
+                eng.status().flow,
+            ));
+        }
+        out
+    }
+
+    /// **A RUN OF FAST CLEAN KEYS OPENS THE THEME, AND A DELETE CLOSES IT**
+    /// (§23's addendum "Flow state") — the whole law of the counter, on the
+    /// real engine at the two cadences the design quotes.
+    ///
+    /// The run counts only keys born at [`spine::FLOW_KEY_DISP`] or above, so
+    /// the climb to the floor does not count and the entry lands
+    /// [`spine::FLOW_ENTRY_KEYS`] keys after the hand is at speed. `heat` is
+    /// EXACTLY zero for the first twenty of those keys — every consumer is
+    /// identity there — eases over the last four, and is exactly 1.0 from the
+    /// 24th on. One Backspace takes the combo and the heat to zero on the
+    /// same edge, and leaves the high-water mark standing.
+    #[test]
+    fn a_run_of_fast_clean_keys_opens_the_theme_and_a_delete_closes_it() {
+        let cfg = config();
+        for (label, period_ms) in [("12 cps", 83u64), ("8 cps", 125)] {
+            let t0 = Instant::now();
+            let mut eng = engaged();
+            let mut sc = Scratch::default();
+            let rows = flow_run(&mut eng, &mut sc, t0, 44, period_ms);
+
+            let entry = rows
+                .iter()
+                .position(|(_, f)| f.combo == spine::FLOW_ENTRY_KEYS)
+                .expect("a clean run at speed must reach the entry");
+            let first_counted = rows
+                .iter()
+                .position(|(_, f)| f.combo == 1)
+                .expect("some key must be the first at speed");
+            eprintln!(
+                "{label}: key {} is the first at disp >= {} ({:.3} s); the {}th counted key — key {} — opens the theme at {:.3} s, {:.3} s after the run began",
+                first_counted + 1,
+                spine::FLOW_KEY_DISP,
+                rows[first_counted].0,
+                spine::FLOW_ENTRY_KEYS,
+                entry + 1,
+                rows[entry].0,
+                rows[entry].0 - rows[first_counted].0
+            );
+
+            // The ease: zero below, monotone through, exactly one at and after.
+            let mut last = 0.0f32;
+            for (_, f) in &rows {
+                assert!(
+                    f.heat >= last - 1e-6 || f.combo == 0,
+                    "the heat fell inside an unbroken run"
+                );
+                last = f.heat;
+                if f.combo <= spine::FLOW_ENTRY_KEYS - spine::FLOW_OPEN_EASE_KEYS {
+                    assert_eq!(
+                        f.heat, 0.0,
+                        "{label}: combo {} must be EXACTLY identity",
+                        f.combo
+                    );
+                } else if f.combo >= spine::FLOW_ENTRY_KEYS {
+                    assert_eq!(f.heat, 1.0, "{label}: combo {} must be open", f.combo);
+                } else {
+                    assert!(
+                        f.heat > 0.0 && f.heat < 1.0,
+                        "{label}: combo {} must be easing, got {}",
+                        f.combo,
+                        f.heat
+                    );
+                }
+                assert!(f.best >= f.combo);
+            }
+            let held = eng.status().flow;
+            assert!(held.open(), "{label}: the run must still be open");
+
+            // …AND A DELETE CLOSES IT, on the delete's own edge.
+            let t = t0 + Duration::from_millis(period_ms) * 45;
+            eng.on_event(Event::Erase, t);
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+            let after = eng.status().flow;
+            assert_eq!(after.combo, 0, "{label}: a delete must break the run");
+            assert_eq!(after.heat, 0.0, "{label}: …and close the theme");
+            assert_eq!(
+                after.best, held.best,
+                "{label}: a broken run does not un-earn the run already held"
+            );
+
+            // A KILL is the second exit, and a key born under the floor the
+            // third: type two keys back (the run climbs), then kill.
+            let mut t2 = t;
+            for k in 1..=2u32 {
+                t2 = t + Duration::from_millis(period_ms) * k;
+                eng.on_event(typed(1), t2);
+                let mut fr = sc.frame();
+                eng.tick(t2, geom(), &cfg, &mut fr);
+            }
+            assert!(eng.status().flow.combo > 0, "{label}: the run restarted");
+            t2 += Duration::from_millis(period_ms);
+            eng.on_event(
+                Event::Kill {
+                    cells: 4,
+                    scope: KillScope::Word,
+                },
+                t2,
+            );
+            let mut fr = sc.frame();
+            eng.tick(t2, geom(), &cfg, &mut fr);
+            assert_eq!(
+                eng.status().flow.combo,
+                0,
+                "{label}: a kill must break the run"
+            );
+
+            // The third exit: a key after a long silence is born cold, and a
+            // cold key breaks the run rather than extending it.
+            let cold = t2 + Duration::from_secs(30);
+            eng.on_event(typed(1), cold);
+            let mut fr = sc.frame();
+            eng.tick(cold, geom(), &cfg, &mut fr);
+            assert_eq!(
+                eng.status().flow.combo,
+                0,
+                "{label}: a key born under the floor may not count"
+            );
+        }
+    }
+
+    /// **FLOW DRAWS NOTHING OF ITS OWN** (the first law of the feature) — it
+    /// re-prices births that each ride their own key, so with the hand off
+    /// the keys an OPEN theme is byte-identical to a cold one: nothing
+    /// written, fingerprint exactly zero, no cadence asked for and no
+    /// deadline named — `rainbow_kitty_v2_idles_at_exactly_zero`'s own
+    /// assertions, made again while `heat` is a full 1.0.
+    ///
+    /// The heat is still 1.0 through all of it: the run is unbroken (no
+    /// delete, no kill, no key), which is exactly the state an agent holds
+    /// its turn on. It buys no light because there is no keystroke to buy it
+    /// with.
+    #[test]
+    fn flow_draws_nothing_of_its_own() {
+        let cfg = config();
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let rows = flow_run(&mut eng, &mut sc, t0, 44, 83);
+        assert!(
+            rows.last().expect("keys").1.open(),
+            "the fixture must reach flow first"
+        );
+
+        // The hand lifts. Run out to five seconds of silence: everything the
+        // keys bought retires, and the frames go to the idle frame.
+        let last_key = t0 + Duration::from_millis(83) * 44;
+        let mut dark_from = None;
+        let mut t = last_key;
+        while t < last_key + Duration::from_secs(5) {
+            t += TICK;
+            sc.under.clear();
+            sc.out.clear();
+            sc.halos.clear();
+            sc.cues.clear();
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+            let fp = fr.fp;
+            let empty = sc.under.is_empty()
+                && sc.out.is_empty()
+                && sc.halos.is_empty()
+                && sc.cues.is_empty();
+            match dark_from {
+                None if fp == 0 && empty => dark_from = Some(t),
+                None => {}
+                Some(from) => {
+                    assert_eq!(
+                        fp,
+                        0,
+                        "an OPEN theme lit a frame with no keystroke behind it, {:.3} s after the glass went dark",
+                        t.saturating_duration_since(from).as_secs_f32()
+                    );
+                    assert!(empty, "an OPEN theme wrote a quad with no key behind it");
+                    assert!(
+                        !eng.needs_frame_cadence(),
+                        "an OPEN theme held the host awake"
+                    );
+                }
+            }
+        }
+        let dark = dark_from.expect("the glass must go dark inside five seconds");
+        eprintln!(
+            "the glass went dark {:.3} s after the last key; {:.3} s of open-theme idle wrote nothing at all",
+            dark.saturating_duration_since(last_key).as_secs_f32(),
+            t.saturating_duration_since(dark).as_secs_f32()
+        );
+        let held = eng.status().flow;
+        assert!(
+            held.open() && held.heat == 1.0,
+            "the run is unbroken through the silence — that is what an agent holds its turn on: {held:?}"
+        );
+
+        // THE TWIN, at heat 0 on the SAME events: the combo is held at zero by
+        // a celebration drive whose floor is under the live metric, so
+        // `Spine::drive` changes not one bit of the spine and the only
+        // difference between the two engines is the run. Once both have gone
+        // dark their answers are the same answer — the cadence AND the
+        // deadline the host schedules on.
+        let t1 = Instant::now();
+        let mut cold = engaged();
+        let mut sc1 = Scratch::default();
+        {
+            let period = Duration::from_millis(83);
+            let mut t = t1;
+            for (col, k) in (4u16..).zip(1..=44u32) {
+                let key = t1 + period * k;
+                while t + TICK <= key {
+                    t += TICK;
+                    let mut fr = sc1.frame();
+                    cold.tick(t, geom(), &cfg, &mut fr);
+                    cold.celebrate(t, f32::MIN_POSITIVE);
+                }
+                t = key;
+                cold.on_event(mv((3, col), (3, col + 1), Licence::Typed), t);
+                cold.on_event(typed(1), t);
+                cold.celebrate(t, f32::MIN_POSITIVE);
+                let mut fr = sc1.frame();
+                cold.tick(t, geom(), &cfg, &mut fr);
+            }
+        }
+        assert_eq!(
+            cold.status().flow.combo,
+            0,
+            "the twin must be the same hand with the run frozen shut"
+        );
+        assert!(
+            (cold.momentum_display() - eng.momentum_display()).abs() < 1e-6
+                || cold.momentum_display() > 0.0,
+            "the freeze must not have moved the spine"
+        );
+        let mut t = t1 + Duration::from_millis(83) * 44;
+        let end = t + Duration::from_secs(5);
+        while t < end {
+            t += TICK;
+            let mut fr = sc1.frame();
+            cold.tick(t, geom(), &cfg, &mut fr);
+        }
+        assert_eq!(
+            eng.needs_frame_cadence(),
+            cold.needs_frame_cadence(),
+            "an open theme asks for a cadence a closed one does not"
+        );
+        assert_eq!(
+            eng.next_change_deadline(last_key + Duration::from_secs(5))
+                .map(|d| d.saturating_duration_since(last_key + Duration::from_secs(5))),
+            cold.next_change_deadline(end)
+                .map(|d| d.saturating_duration_since(end)),
+            "an open theme names a deadline a closed one does not"
+        );
+        assert_eq!(
+            eng.fingerprint(),
+            cold.fingerprint(),
+            "the dark frames differ"
+        );
     }
 
     /// The live (not retracting) ribbon cell at `(row, col)`.
@@ -2753,6 +3216,359 @@ mod tests {
         assert_eq!(eng.momentum_display(), 0.0);
         assert!(!eng.needs_frame_cadence());
         assert_eq!(eng.fingerprint(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // PANEL #10 — THE PET AND THE SKY (D13's wiring gap, and two offers more)
+    // -----------------------------------------------------------------------
+
+    /// A resident pet as its own frame publishes it: six cells wide, feet on
+    /// `row`, standing with its left edge at `col`.
+    fn cat(row: u16, col: f32, settled: bool, purr: f32) -> companion::PetOnGlass {
+        companion::PetOnGlass {
+            col,
+            width: 6.0,
+            row,
+            settled,
+            purr,
+        }
+    }
+
+    /// **PANEL #10(a) — D13'S WIRING GAP, CLOSED.** `BodyImpulse::Perk { at }`
+    /// has been minted for every credited meteor since the router was written
+    /// and nothing has ever read it. `Engine::pet_offer` reads it, and the
+    /// instant it hands the resident is the LANDING's, not the launch's: the
+    /// same `Instant` the landing pin was born on, the same one the arrival
+    /// flash, the caret's flare-and-relight and the audio bell share (§6.7,
+    /// §8.1 no. 3). A settled pet perks exactly there — and is not moved.
+    #[test]
+    fn the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+
+        // A 40-cell licensed nav jump: a meteor by every measure (§6.1).
+        eng.on_event(mv((3, 0), (3, 40), Licence::Nav), t0);
+        let mut fr = sc.frame();
+        eng.tick(t0, geom(), &cfg, &mut fr);
+        let imp = fr.companion.expect("the spawn frame carries the impulse");
+
+        // What the PIXELS committed to on this frame.
+        assert_eq!(eng.meteor.live.len(), 1, "the jump must have flown");
+        let arrival = eng.meteor.live[0].arrival();
+        let flight = arrival.saturating_duration_since(t0);
+        assert!(
+            (60..=120).contains(&flight.as_millis()),
+            "fixture: T must be a real flight, got {flight:?}"
+        );
+
+        // What the ROUTER hands the resident, through the one published call.
+        let offer = eng.pet_offer(geom(), Some(cat(3, 12.0, true, 0.4)));
+        assert_eq!(
+            offer.perk_at,
+            Some(arrival),
+            "the perk edge must be the meteor's own arrival edge"
+        );
+        assert_ne!(
+            offer.perk_at,
+            Some(t0),
+            "the perk is the LANDING's instant, never the launch's"
+        );
+
+        // …and it is the landing pin's own instant, on the frame the pin is
+        // born. One `Instant`, four marks (§6.7).
+        let mut t = t0;
+        let mut pinned = None;
+        for _ in 0..16 {
+            t += Duration::from_millis(8);
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+            if let Some(l) = eng.meteor.landings.first() {
+                pinned = Some(l.pin.at);
+                break;
+            }
+        }
+        assert_eq!(
+            pinned,
+            Some(arrival),
+            "the landing pin is born on the arrival edge"
+        );
+        assert_eq!(
+            offer.perk_at, pinned,
+            "the pet's perk and the landing pin must be the SAME instant"
+        );
+        assert!(
+            eng.caret_seam.flare_at.is_some() || eng.paint_at.is_some(),
+            "fixture: the caret's own edge is live for the same landing"
+        );
+
+        // The offer is the ROUTER's answer, not a second one: the same
+        // impulse, routed with `Body::Pet`, must say the same thing — and
+        // must still refuse to relocate the cat (open question 14).
+        assert_eq!(
+            companion::impulse_for(companion::Body::Pet, imp),
+            companion::BodyImpulse::Perk { at: arrival }
+        );
+
+        // A pet-less host is still told the edge (the offer is about the
+        // meteor, not about where the cat is standing) …
+        assert_eq!(eng.pet_offer(geom(), None).perk_at, Some(arrival));
+
+        // … and REDUCED MOTION offers no edge at all: there was no flight to
+        // wait out, so the impulse is a `Land` pose and not an instant.
+        let mut slow = engaged();
+        let mut sc2 = Scratch::default();
+        let reduced = Config {
+            reduced_motion: true,
+            ..config()
+        };
+        slow.on_event(mv((3, 0), (3, 40), Licence::Nav), t0);
+        let mut fr2 = sc2.frame();
+        slow.tick(t0, geom(), &reduced, &mut fr2);
+        assert!(matches!(fr2.companion, Some(CompanionImpulse::Land)));
+        assert_eq!(
+            slow.pet_offer(geom(), Some(cat(3, 12.0, true, 0.4)))
+                .perk_at,
+            None,
+            "a landing with no flight behind it is a pose, not an edge"
+        );
+    }
+
+    /// **PANEL #10(b) — THE CAT CATCHES A STAR.** A gold m1 — the sky's
+    /// 1-in-12 m1 crossed with §5.3's 15 % gold, about one key in eighty —
+    /// born within [`companion::CATCH_REACH_CELLS`] of a SETTLED, CONTENTED
+    /// cat is OFFERED to it; on the paw's landing frame that one star's life
+    /// is spent on the sky's own 40 ms finish. The star is still
+    /// keystroke-born (T1: the offer notices a star, it never mints one), the
+    /// cat's reaching draws nothing, and EXACTLY ONE life moves.
+    #[test]
+    fn a_gold_star_near_a_contented_cat_is_offered_and_caught() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let ms = Duration::from_millis;
+        blank_row(&mut eng, 2);
+
+        // Earn heroes along row 3 until the deal hands out a GOLD one. The
+        // deal is deterministic (`cell_hash(row, col, minted)`), so this is a
+        // fixed search, not a die roll.
+        let mut gold_col = None;
+        for col in (6u16..90).step_by(4) {
+            let at = t0 + ms(u64::from(col));
+            blank_row(&mut eng, 2);
+            eng.earn_hero(at, 3, col);
+            let mut fr = sc.frame();
+            eng.tick(at, geom(), &cfg, &mut fr);
+            if eng
+                .stardust
+                .live_iter()
+                .any(|s| s.gold && s.class == stardust::StarClass::M1)
+            {
+                gold_col = Some((col, at));
+                break;
+            }
+        }
+        let (col, born_at) = gold_col.expect("fixture: the deal must produce a gold m1");
+        let stars_before = eng.status().stars;
+        assert!(stars_before >= 1);
+
+        // THE OFFER. A settled, purring cat six cells wide, its nose within
+        // ten columns of the star.
+        let near = cat(3, f32::from(col) + 4.0, true, 0.4);
+        let offer = eng.pet_offer(geom(), Some(near));
+        let star = offer.catch.expect("a gold m1 in reach is offered");
+        assert_eq!(star.born, born_at, "the offer names the star's own edge");
+        assert!(
+            near.columns_to(star.col) <= companion::CATCH_REACH_CELLS,
+            "the offered star must be inside the reach it was offered under"
+        );
+
+        // THE GATES. A cat mid-pounce is busy; a cold cat is not contented;
+        // and eleven columns is not ten.
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 4.0, false, 0.4)))
+                .catch,
+            None,
+            "a cat that is not settled is offered nothing"
+        );
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 4.0, true, 0.0)))
+                .catch,
+            None,
+            "a cat that is not purring is offered nothing"
+        );
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(3, f32::from(col) + 24.0, true, 0.4)))
+                .catch,
+            None,
+            "a star out of reach is not offered"
+        );
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(9, f32::from(col) + 4.0, true, 0.4)))
+                .catch,
+            None,
+            "a paw reaches along its own line, not three lines up"
+        );
+
+        // THE CATCH. The paw lands 200 ms after the star was born — well
+        // inside an m1's 460 ms sky life, so the shortening is real.
+        let paw = born_at + ms(200);
+        let others: Vec<(f32, f32, Option<stardust::Finish>)> = eng
+            .stardust
+            .live_iter()
+            .filter(|s| s.born != star.born || s.x != star.x)
+            .map(|s| (s.x, s.y, s.finish))
+            .collect();
+        let deadline_before = eng.next_change_deadline(paw);
+        assert!(eng.catch_star(star, paw), "the offered star must be there");
+
+        // Exactly one life moved …
+        let caught = eng
+            .stardust
+            .live_iter()
+            .find(|s| s.born == star.born && s.x == star.x && s.y == star.y)
+            .expect("the caught star is still in the pool on the paw's frame");
+        assert_eq!(
+            caught.finish,
+            Some(stardust::Finish {
+                at: paw,
+                span_s: stardust::CATCH_FINISH_MS / 1000.0,
+            }),
+            "the catch spends the star on the sky's own 40 ms finish"
+        );
+        for (x, y, finish) in &others {
+            let s = eng
+                .stardust
+                .live_iter()
+                .find(|s| s.x == *x && s.y == *y)
+                .expect("a bystander must not leave the pool");
+            assert_eq!(s.finish, *finish, "a bystander's life was shortened too");
+        }
+
+        // … the star is gone inside a breath, and it did not pop …
+        assert!(
+            !caught.dead(paw + ms(10)),
+            "the catch is a finish, not a pop"
+        );
+        assert!(
+            caught.dead(paw + ms(40)),
+            "the caught star must be off the glass within 40 ms"
+        );
+
+        // … NO LIGHT WAS BORN (T1: the pet's own motion is not light) …
+        let (q, h, cues) = (sc.out.len(), sc.halos.len(), sc.cues.len());
+        let mut fr = sc.frame();
+        eng.tick(paw, geom(), &cfg, &mut fr);
+        assert!(
+            eng.status().stars <= stars_before,
+            "the catch minted a star"
+        );
+        assert_eq!(sc.cues.len(), cues, "the catch minted a sound");
+        assert!(sc.out.len() >= q && sc.halos.len() >= h, "scratch shrank");
+
+        // … and NO WAKE was bought: a life that ends sooner can only bring
+        // the sky's next deadline forward, never push it out.
+        if let (Some(before), Some(after)) = (deadline_before, eng.next_change_deadline(paw)) {
+            assert!(
+                after <= before,
+                "the catch may not ask for a later frame than the sky already wanted"
+            );
+        }
+
+        // A SECOND PAW on a spent offer finds nothing to lengthen.
+        let again = eng.catch_star(star, paw + ms(300));
+        let still = eng
+            .stardust
+            .live_iter()
+            .find(|s| s.born == star.born && s.x == star.x);
+        assert!(
+            !again || still.is_none_or(|s| s.finish.is_some_and(|f| f.at == paw)),
+            "a second catch must never give the star more time"
+        );
+    }
+
+    /// **PANEL #10(c) — C2, EXTENDED TO THE CAT.** A contented resident's ♪
+    /// and ♥ take the ribbon's own field at the cell the cat is standing on,
+    /// so the notes wear the rainbow at the cat's position exactly as the
+    /// caret, the ribbon head and a star's halo on a cell do (C2). The value
+    /// is SNAPPED (C1: a mote is a point mark), and where no ribbon light is
+    /// laid under the cat the offer is `None` and the pet keeps its own
+    /// colour.
+    #[test]
+    fn the_purr_notes_wear_the_ribbon_s_colour_under_the_cat() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let ms = Duration::from_millis;
+
+        // Lay a ribbon along row 3 by typing, and land the caret on it.
+        blank_row(&mut eng, 2);
+        for k in 0..24u16 {
+            let t = t0 + ms(u64::from(k) * 40);
+            eng.on_event(mv((3, k), (3, k + 1), Licence::Typed), t);
+            eng.on_event(typed(1), t);
+            let mut fr = sc.frame();
+            eng.tick(t, geom(), &cfg, &mut fr);
+        }
+        assert!(eng.status().cells > 0, "fixture: the ribbon must be laid");
+
+        // The cat stands with its body over the ribbon; the offer's hue is
+        // the field at the cell under its centre.
+        let cat_col = 8.0_f32;
+        let centre = (cat_col + 3.0) as u16;
+        let laid = eng
+            .field_at(3, centre)
+            .expect("fixture: the cell under the cat must be lit");
+        let offer = eng.pet_offer(geom(), Some(cat(3, cat_col, true, 0.4)));
+        assert_eq!(
+            offer.mote_t,
+            Some(laid),
+            "the notes take the field at the cell under the cat"
+        );
+        assert_eq!(
+            offer.mote_rgb,
+            Some(crate::spectrum::spectrum_snap(laid)),
+            "a mote is a point mark: C1 snaps it to one of the seven stops"
+        );
+        assert!(
+            offer
+                .mote_rgb
+                .is_some_and(|rgb| (0..crate::spectrum::SPECTRUM_STOPS)
+                    .any(|i| crate::spectrum::spectrum_stop(i) == rgb)),
+            "the note's colour must BE a stop of the arc, not a blend"
+        );
+
+        // C2, literally: a cat standing on the caret's own cell wears the
+        // caret's own colour on the same frame.
+        let on_caret = eng.pet_offer(geom(), Some(cat(3, 21.0, true, 0.4)));
+        assert_eq!(
+            on_caret.mote_t,
+            eng.field_at(3, 24),
+            "the cat, the caret and the ribbon head are one colour on one frame"
+        );
+
+        // Off the ribbon there is nothing to wear.
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(30, 8.0, true, 0.4))).mote_t,
+            None,
+            "no ribbon under the cat, no colour"
+        );
+        assert_eq!(
+            eng.pet_offer(geom(), Some(cat(30, 8.0, true, 0.4)))
+                .mote_rgb,
+            None
+        );
+
+        // And an idle engine offers the resident nothing at all (T6).
+        let idle = Engine::new();
+        assert!(
+            idle.pet_offer(geom(), Some(cat(3, 8.0, true, 0.4)))
+                .is_empty(),
+            "a disengaged engine offers the pet nothing"
+        );
     }
 
     /// The scratch is the HOST's and is reused: a tick must never assume it

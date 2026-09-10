@@ -124,6 +124,19 @@ pub const STAR_CAP: usize = 40;
 /// curve, compressed — it never pops (T5). `stars_over_the_cap_finish_oldest_first_within_forty_ms`.
 pub const EVICT_FINISH_MS: f32 = 40.0;
 
+/// **THE CATCH'S SHORTENED LIFE**, ms (panel #10(b), the pet and the sky): a
+/// gold m1 the resident pet reached for is put on a
+/// [`EVICT_FINISH_MS`]-length finish on the frame the paw lands, so the star
+/// is gone inside a breath *on the theme's own curve* — the cat caught it, it
+/// did not blink out (T5).
+///
+/// It is the SAME 40 ms the cap already spends, and deliberately so: the
+/// theme has exactly one "gone now, but not popped" number, and a catch is
+/// that event with a paw in front of it. `spend(u)` takes the star under
+/// [`STAR_CULL_ALPHA`] at `u = 1 − √0.20`, so the last lit frame is ~22 ms
+/// after the paw and the pool is clear at 40.
+pub const CATCH_FINISH_MS: f32 = EVICT_FINISH_MS;
+
 /// How many FINISHING stars the pool holds beyond [`STAR_CAP`] before the one
 /// nearest the end of its finish is dropped outright. Eight evictions inside
 /// one 40 ms window is > 200 births/s — nothing a hand or a landing produces —
@@ -203,6 +216,53 @@ pub const FIELD_DEAL_IN_HOT: u32 = 1;
 /// The spine at or above which the field deal is [`FIELD_DEAL_IN_HOT`]
 /// instead of [`FIELD_DEAL_IN`].
 pub const FIELD_HOT_DISP: f32 = 0.7;
+
+/// **THE SKY OPENS** — the share of laid cells that carry a field star at
+/// flow's `heat == 1`: every one of them, exactly [`FIELD_DEAL_IN_HOT`] read
+/// as a probability.
+///
+/// The hot deal above is a STEP at `disp ≥ 0.7`; flow's is a LERP from the
+/// cold share ([`FIELD_SHARE_COLD`]) to this one over
+/// [`super::Flow::heat`], and the two are folded with a `max`, so at
+/// `heat == 0` the field deal is EXACTLY what it was (the same probability,
+/// against the same hash, on the same cells — the byte-identity a cold frame
+/// is pinned on) and flow can only ever open the sky further. What it buys
+/// that the step could not: an open theme holds the sky open through the
+/// dips — a hand at speed whose honest `disp` breathes under 0.7 between
+/// words keeps its grain, because the RUN has not broken.
+pub const FIELD_SHARE_FLOW: f32 = 1.0 / FIELD_DEAL_IN_HOT as f32;
+
+/// The share of laid cells that carry a field star at `heat == 0` — the
+/// other end of [`FIELD_SHARE_FLOW`]'s lerp, and [`FIELD_DEAL_IN`] read as a
+/// probability.
+pub const FIELD_SHARE_COLD: f32 = 1.0 / FIELD_DEAL_IN as f32;
+
+/// **THE COMBO LADDER'S FIRST RUNG** — every 16th key of a run takes an m2
+/// where the strike deal would have given it a grain or nothing (§23's
+/// addendum "Flow state", 2026-09-09).
+///
+/// The ladder is flow's PAYOUT and it is deterministic: it is not a deal, it
+/// is a debt the run has earned, so a rung never draws and never leaves its
+/// key dark. It never LOWERS a magnitude either — a 16th key that already
+/// drew an m1 keeps it — and every rung is dealt through
+/// [`Stardust::deal_star`] like any other star, so the spacing law, the row
+/// cap, the one-star-per-cell law, the live cap and the quad budget all hold
+/// over it exactly as they hold over the deal it replaces.
+pub const LADDER_M2_KEYS: u32 = 16;
+
+/// **THE SECOND RUNG** — every 32nd key of a run takes a WHITE m2: the
+/// A-type white the tint deal gives 10 % of stars ([`TINT_WHITE_RGB`]), here
+/// by rule instead of by draw, so the second rung reads as a different mark
+/// from the first and not merely a repeat of it.
+pub const LADDER_WHITE_KEYS: u32 = 32;
+
+/// **THE TOP RUNG** — every 64th key of a run takes a GOLD m1
+/// ([`TINT_GOLD_RGB`]), EARNED: an earned hero is never demoted by the
+/// spacing law or by a dry bucket (§5.8, D5), so the rung always pays. It
+/// chimes only if a token is on hand, which is the glint law unchanged (D5)
+/// — the light is not rationed, the sound is. Past the first one, every
+/// 64th also fires the caret flare (`Engine::tick`).
+pub const LADDER_GOLD_KEYS: u32 = 64;
 
 /// **A FIELD STAR'S LIFE, s** (§5.6's Field row: "rides the cell's own edge
 /// envelope × retract — alpha only"; "its field stars die with their
@@ -1773,6 +1833,25 @@ impl Star {
         }
     }
 
+    /// **THIS STAR'S GRID COLUMN** — its HOME pixel read back as a column
+    /// (§5.4: `x` is pinned at birth and every drift is an integer step off
+    /// it, so this is stable for the star's whole life). The reach law of the
+    /// pet's catch (`companion::CATCH_REACH_CELLS`) is measured against it.
+    #[must_use]
+    pub fn grid_col(&self, geom: Geom) -> i32 {
+        px_col(self.x, geom)
+    }
+
+    /// **IS THIS STAR IN THE SKY OF `row`?** — the band a star born over that
+    /// row's cells occupies, which is "row or row − 1" whichever ribbon
+    /// spelling the host runs ([`in_sky_of_row`]). The vertical half of the
+    /// catch's reach: a paw reaches along its own line and the sky directly
+    /// over it, never three lines up.
+    #[must_use]
+    pub fn in_sky_of(&self, row: u16, geom: Geom) -> bool {
+        in_sky_of_row(self.y, row, geom)
+    }
+
     /// TRUE for a WARM tint — R, O, Y of the seven stops, plus gold and plus
     /// the achromatic A-type white (§5.5).
     ///
@@ -2558,6 +2637,11 @@ struct Deal {
     /// typo run — born over the erased cell and pulled into `cell`, the
     /// caret's.
     pull: Option<Pull>,
+    /// A tint fixed BY RULE rather than dealt — `(rgb, gold)`, exactly
+    /// [`deal_tint`]'s pair. `None` everywhere except the combo ladder's two
+    /// top rungs, whose colour is the payout ([`LADDER_WHITE_KEYS`],
+    /// [`LADDER_GOLD_KEYS`]).
+    tint: Option<(u32, bool)>,
 }
 
 /// Where a mend's star is pulled FROM, as [`Stardust::deal_star`] takes it
@@ -2792,6 +2876,7 @@ impl Stardust {
             cell,
             earned: true,
             pull: None,
+            tint: None,
         };
         self.deal_star(spec, at, ctx, ribbon);
     }
@@ -2804,6 +2889,40 @@ impl Stardust {
     fn sow(&mut self, star: Star) {
         self.make_room(star.born);
         self.stars.push(star);
+    }
+
+    /// **THE CAT CATCHES A STAR** (panel #10(b)) — shorten the life of the
+    /// ONE live star whose home pixel and birth edge are `(x, y, born)`, on
+    /// the frame the paw lands. Returns whether a star was there to catch.
+    ///
+    /// **Exactly one life moves, structurally.** The triple is a star's
+    /// identity: `x`/`y` are pinned device pixels at birth (§5.4) and `born`
+    /// is the edge, so the search is a `find` — it stops at the first match
+    /// and touches nothing else in the pool. A star that already died, or a
+    /// second paw landing on an offer already spent, finds nothing (or finds
+    /// the same star and re-asserts a finish [`Star::finish_by`] refuses to
+    /// lengthen), so the catch is idempotent and can never shorten a
+    /// bystander.
+    ///
+    /// **Only a gold m1 of the sky is catchable**, the class the offer names
+    /// — the reach law is the router's ([`super::companion::PetOffer`]), but
+    /// the CLASS law is asserted here so a mis-wired receiver cannot spend a
+    /// grain's life. And nothing is BORN here: the catch spends a star a
+    /// keystroke already made (T1) and mints no light of its own — the pet's
+    /// own motion is not light.
+    pub fn catch(&mut self, x: f32, y: f32, born: Instant, at: Instant) -> bool {
+        let Some(star) = self.stars.iter_mut().find(|s| {
+            s.gold
+                && s.class == StarClass::M1
+                && s.lane.is_sky()
+                && s.born == born
+                && s.x == x
+                && s.y == y
+        }) else {
+            return false;
+        };
+        star.finish_by(at, CATCH_FINISH_MS / 1000.0);
+        true
     }
 
     /// **SHED FRAGMENTS** (§6.5 layer 5): `spec.n` m3 grains born **AT THE
@@ -3317,12 +3436,17 @@ impl Stardust {
             LIGHT_COUNT_SCALE
         };
         // A hot hand deals every cell a field star (`FIELD_DEAL_IN_HOT`), on
-        // the honest spine, like the second grain.
-        let field_in = if ctx.disp >= FIELD_HOT_DISP {
-            FIELD_DEAL_IN_HOT
+        // the honest spine, like the second grain — and an OPEN THEME holds
+        // that share through the dips, lerped over flow's heat so nothing
+        // snaps and `heat == 0` is the step's own answer to the bit
+        // (`FIELD_SHARE_FLOW`).
+        let field_step = if ctx.disp >= FIELD_HOT_DISP {
+            FIELD_SHARE_FLOW
         } else {
-            FIELD_DEAL_IN
+            FIELD_SHARE_COLD
         };
+        let field_share = field_step
+            .max(FIELD_SHARE_COLD + (FIELD_SHARE_FLOW - FIELD_SHARE_COLD) * clamp01(ctx.flow.heat));
         let m1 = scale / DEAL_M1_IN as f32;
         let m2 = m1 + scale / DEAL_M2_IN as f32;
         let m3 = m2 + scale / DEAL_M3_IN as f32;
@@ -3357,6 +3481,7 @@ impl Stardust {
                             from: cell,
                             disp: m.disp,
                         }),
+                        tint: None,
                     },
                     at,
                     ctx,
@@ -3378,6 +3503,28 @@ impl Stardust {
             } else {
                 None
             };
+            // **THE COMBO LADDER** — flow's payout, on the key's OWN cell (the
+            // last of a coalesced echo, which is the cell the head sits on).
+            // It rewrites the strike this key was going to take rather than
+            // adding a star beside it: one key, one strike, and the ladder's
+            // rung is what that strike IS.
+            let rung = (k + 1 == cells.max(1) && !mended)
+                .then(|| ladder_rung(ctx.flow.combo))
+                .flatten();
+            let (dealt, earned, tint) = match rung {
+                Some(Rung::Promote) => (
+                    Some(dealt.map_or(StarClass::M2, |c| c.min(StarClass::M2))),
+                    earned,
+                    None,
+                ),
+                Some(Rung::White) => (
+                    Some(dealt.map_or(StarClass::M2, |c| c.min(StarClass::M2))),
+                    earned,
+                    Some((TINT_WHITE_RGB, false)),
+                ),
+                Some(Rung::Gold) => (Some(StarClass::M1), true, Some((TINT_GOLD_RGB, true))),
+                None => (dealt, earned, None),
+            };
             if let Some(class) = dealt
                 && let Some(free) = self.free_sky_cell(cell, ctx.geom)
             {
@@ -3388,6 +3535,7 @@ impl Stardust {
                         cell: free,
                         earned,
                         pull: None,
+                        tint,
                     },
                     at,
                     ctx,
@@ -3409,6 +3557,7 @@ impl Stardust {
                         cell: lead,
                         earned: false,
                         pull: None,
+                        tint: None,
                     },
                     at,
                     ctx,
@@ -3429,7 +3578,7 @@ impl Stardust {
             if mended {
                 continue;
             }
-            if deal(h, SALT_FIELD, field_in, scale) {
+            if deal_p(h, SALT_FIELD, scale * field_share) {
                 if self.adopt_field(cell, at, ctx.geom) {
                     continue;
                 }
@@ -3445,6 +3594,7 @@ impl Stardust {
                         cell,
                         earned: false,
                         pull: None,
+                        tint: None,
                     },
                     at,
                     ctx,
@@ -3601,7 +3751,9 @@ impl Stardust {
                 class = StarClass::M2;
             }
         }
-        let (tint, gold) = class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon));
+        let (tint, gold) = spec
+            .tint
+            .unwrap_or_else(|| class_tint(class, seed, self.field_t(spec.cell, ctx, ribbon)));
         let v0 = match (class, spec.lane) {
             // A mend's star is pinned once home (1e: "then pinned").
             _ if spec.pull.is_some() => (0.0, 0.0),
@@ -4877,6 +5029,46 @@ fn deal(cell: u32, salt: u32, den: u32, scale: f32) -> bool {
     hash01(mix32(cell ^ salt)) < scale / den as f32
 }
 
+/// The same deal against a SHARE rather than a denominator — what a rate that
+/// is lerped (flow's field share) needs, and the same draw on the same cell
+/// as [`deal`] with `share == scale / den`, to the bit.
+#[inline]
+fn deal_p(cell: u32, salt: u32, share: f32) -> bool {
+    hash01(mix32(cell ^ salt)) < share
+}
+
+/// **THE COMBO LADDER'S RUNGS**, in the order a key claims them: the highest
+/// rung a run length has reached wins, so the 64th key pays gold and not the
+/// 16th's promotion three times over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rung {
+    /// [`LADDER_M2_KEYS`] — the strike is an m2 at least.
+    Promote,
+    /// [`LADDER_WHITE_KEYS`] — an m2, white by rule.
+    White,
+    /// [`LADDER_GOLD_KEYS`] — an earned gold m1, glinting if a token is on
+    /// hand.
+    Gold,
+}
+
+/// Which rung a run of `combo` keys pays on its newest key, if any. Zero pays
+/// nothing (a broken run owes nothing).
+#[inline]
+#[must_use]
+fn ladder_rung(combo: u32) -> Option<Rung> {
+    if combo == 0 {
+        None
+    } else if combo.is_multiple_of(LADDER_GOLD_KEYS) {
+        Some(Rung::Gold)
+    } else if combo.is_multiple_of(LADDER_WHITE_KEYS) {
+        Some(Rung::White)
+    } else if combo.is_multiple_of(LADDER_M2_KEYS) {
+        Some(Rung::Promote)
+    } else {
+        None
+    }
+}
+
 /// The seeded ARM-SIZE scintillation rate in Hz, `8 + 4·hash01` (§5.5). The
 /// audio glint that rides a star twinkles at this same number (§13).
 #[inline]
@@ -5678,6 +5870,8 @@ fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::Flow;
+    use super::super::spine::FLOW_ENTRY_KEYS;
     use super::*;
     use crate::rainbow_kitty::ribbon::RETRACT_START_S;
     use crate::rainbow_kitty::{KillScope, Mend};
@@ -5742,6 +5936,8 @@ mod tests {
             caret,
             caret_t: 0.5,
             mend: None,
+            surge: 0.0,
+            flow: Default::default(),
         }
     }
 
@@ -9568,6 +9764,169 @@ mod tests {
             "momentum bought no density: field-held {} → {}",
             cold.1,
             hot.1
+        );
+    }
+
+    /// **THE COMBO LADDER** (§23's addendum "Flow state", 2026-09-09) — flow's
+    /// payout, deterministic and keystroke-born: every
+    /// [`LADDER_M2_KEYS`]th key of a run promotes its strike star to an m2,
+    /// every [`LADDER_WHITE_KEYS`]th takes a WHITE m2, and every
+    /// [`LADDER_GOLD_KEYS`]th takes a GOLD m1 — earned, so no spacing law and
+    /// no dry bucket may demote it.
+    ///
+    /// Deterministic is the whole point: seventy keys of one run, and the
+    /// rungs are the rungs on every one of them, while the keys between them
+    /// still take the ordinary strike DEAL (some of them a grain, some of
+    /// them nothing) — which is the control that says the ladder is a payout
+    /// and not the deal getting brighter.
+    #[test]
+    fn the_combo_ladder_pays_at_sixteen_thirty_two_and_sixty_four() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(4, &[false; 120]);
+        // The brightest STRIKE star born on each key's own edge, by combo.
+        /// `(class, tint, gold)` of the brightest strike star one key drew.
+        type Paid = (StarClass, u32, bool);
+        let mut rung: Vec<(u32, Option<Paid>)> = Vec::new();
+        for k in 0..70u16 {
+            let at = key_at(t0, k);
+            let combo = u32::from(k) + 1;
+            let mut cx = ctx(at, &c, (5, 10 + k));
+            cx.disp = 0.9;
+            cx.birth_disp = 0.9;
+            cx.flow = Flow {
+                heat: 1.0,
+                combo,
+                best: combo,
+            };
+            sky.budget.refill(at);
+            sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+            let best = sky
+                .live_iter()
+                .filter(|s| s.born == at && s.lane == StarLane::Strike)
+                .min_by_key(|s| s.class)
+                .map(|s| (s.class, s.tint, s.gold));
+            rung.push((combo, best));
+        }
+        let paid = |combo: u32| -> Paid {
+            rung.iter()
+                .find(|(n, _)| *n == combo)
+                .and_then(|(_, s)| *s)
+                .unwrap_or_else(|| panic!("key {combo} of an open run drew NO strike star at all"))
+        };
+        for n in [LADDER_M2_KEYS, LADDER_M2_KEYS * 3] {
+            let (class, _, _) = paid(n);
+            assert!(
+                class <= StarClass::M2,
+                "key {n} paid a {class:?}, not the ladder's m2 or better"
+            );
+        }
+        let (class, tint, gold) = paid(LADDER_WHITE_KEYS);
+        assert_eq!(class, StarClass::M2, "the 32nd key pays an m2");
+        assert_eq!(
+            tint, TINT_WHITE_RGB,
+            "…and it is WHITE by rule, not by deal"
+        );
+        assert!(!gold, "a white rung carries no glints");
+        let (class, tint, gold) = paid(LADDER_GOLD_KEYS);
+        assert_eq!(class, StarClass::M1, "the 64th key pays a hero");
+        assert_eq!(tint, TINT_GOLD_RGB, "…gold by rule");
+        assert!(gold, "…and gold-ness is the class that carries glints");
+
+        // THE CONTROL: the keys between the rungs are still the DEAL — some
+        // of them a grain, some of them nothing at all.
+        let plain = rung
+            .iter()
+            .filter(|(n, _)| !n.is_multiple_of(LADDER_M2_KEYS))
+            .filter(|(_, s)| s.is_none_or(|(c, _, _)| c == StarClass::M3))
+            .count();
+        assert!(
+            plain > 20,
+            "only {plain} of the non-rung keys took a grain or nothing — the ladder is not a payout, the deal moved"
+        );
+        eprintln!(
+            "ladder: 16 {:?}, 32 {:?}, 64 {:?}; {plain} of the 65 non-rung keys took a grain or nothing",
+            paid(LADDER_M2_KEYS).0,
+            paid(LADDER_WHITE_KEYS).0,
+            paid(LADDER_GOLD_KEYS).0
+        );
+    }
+
+    /// **THE SKY OPENS** ([`FIELD_SHARE_FLOW`]) — an open theme deals every
+    /// laid cell its grain, and holds that share through a dip in the honest
+    /// spine that would close the STEP deal ([`FIELD_HOT_DISP`]). Measured
+    /// cold, dipping and flowing on the same sixty keys.
+    #[test]
+    fn an_open_theme_holds_the_sky_open_through_a_dip() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let ribbon = Ribbon::new();
+        // Births per key, the share of the last sixteen laid cells holding a
+        // FIELD-lane star (dealt or adopted — the field is what "every laid
+        // cell gets its grain" means), and the live pool.
+        let census = |disp: f32, heat: f32| -> (f32, f32, usize) {
+            let mut sky = Stardust::new();
+            sky.probe_mut().probe_row(4, &[false; 120]);
+            let mut born = 0usize;
+            for k in 0..60u16 {
+                let at = key_at(t0, k);
+                let mut cx = ctx(at, &c, (5, 10 + k));
+                cx.disp = disp;
+                cx.birth_disp = disp;
+                cx.flow = Flow {
+                    heat,
+                    combo: if heat > 0.0 { FLOW_ENTRY_KEYS } else { 0 },
+                    best: FLOW_ENTRY_KEYS,
+                };
+                sky.budget.refill(at);
+                sky.on_event(&typed(TypedClass::Glyph), at, &cx, &ribbon);
+                born += sky.live_iter().filter(|s| s.born == at).count();
+            }
+            let field: std::collections::BTreeSet<i32> = sky
+                .live_iter()
+                .filter(|s| s.lane == StarLane::Field)
+                .map(col_of)
+                .collect();
+            let held = (53..69).filter(|col| field.contains(col)).count();
+            (born as f32 / 60.0, held as f32 / 16.0, sky.live())
+        };
+        // The dip: a hand whose honest spine has breathed under the step's
+        // 0.7 but whose RUN has not broken.
+        let dip = FIELD_HOT_DISP - 0.05;
+        let cold = census(dip, 0.0);
+        let flowing = census(dip, 1.0);
+        let hot = census(0.9, 0.0);
+        eprintln!(
+            "at disp {dip}: cold {:.2} stars/key, field-held {:.2}, live {}; flowing {:.2}, {:.2}, live {}. The step at disp 0.9: {:.2}, {:.2}, live {}",
+            cold.0, cold.1, cold.2, flowing.0, flowing.1, flowing.2, hot.0, hot.1, hot.2
+        );
+        assert!(
+            flowing.1 >= 0.999,
+            "an open theme left {:.2} of the last sixteen cells without a field star",
+            1.0 - flowing.1
+        );
+        assert!(
+            flowing.1 > cold.1 + 0.2 && flowing.2 > cold.2,
+            "an open theme bought no density in the dip: field-held {:.2} → {:.2}, live {} → {}",
+            cold.1,
+            flowing.1,
+            cold.2,
+            flowing.2
+        );
+        assert!(
+            (flowing.1 - hot.1).abs() < 0.01 && flowing.2 == hot.2,
+            "an open theme's sky at a dip (field-held {:.2}, live {}) is not the hot step's ({:.2}, {})",
+            flowing.1,
+            flowing.2,
+            hot.1,
+            hot.2
+        );
+        assert!(
+            flowing.2 <= STAR_CAP,
+            "the open sky ran past the live cap: {} of {STAR_CAP}",
+            flowing.2
         );
     }
 

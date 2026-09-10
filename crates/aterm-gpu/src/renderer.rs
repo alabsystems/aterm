@@ -1106,17 +1106,39 @@ fn vs_hdr_glow(@builtin(vertex_index) vi: u32,
     return o;
 }
 
+// WHITE IS HOT (design §L5). The WHITE PART of a premultiplied sRGB colour is
+// its smallest channel: a spectrum stop (`#FF0000`, `#FFFF00`, ...) has a zero
+// channel and therefore NO white part, however bright it is, while `#FFFFFF`
+// at coverage `k` is white all the way to `k`. So `min(r, g, b)` reads the
+// luminance hierarchy off the colour itself, with no side channel and no
+// per-quad tagging.
+fn white_part(c: vec3<f32>) -> f32 {
+    return min(min(c.r, c.g), c.b);
+}
+
 // Decode the premultiplied sRGB-space aurora colour to linear (same piecewise
 // s2l as everywhere), boost, clamp to the headroom (never negative), and emit
 // into the One/One add. COLOR write-mask: the blit's alpha stays 1.0.
+//
+// THE BOOST IS PER-FRAGMENT (§L5, "in EDR, `out` transients <= 460 ms may
+// exceed reference white"): `1 + 2*smoothstep(0.35, 0.60, white_part)`, capped
+// at 3x linear and then clamped to the panel's real headroom exactly as
+// before. Below the 0.35 knee the factor is EXACTLY 1.0 and a multiply by 1.0
+// is exact in IEEE-754, so every coloured mark — star bars, halos, the ring,
+// the fan grains, the ribbon's 0.15 hot edge — emits the same bits it did
+// before this pass learned about white. Only the whitest cores (the meteor
+// nucleus and its white shoulder, the smallest star cores, the landing pin,
+// the caret's flare frame) climb, and they are the smallest marks on the
+// glass — which is what makes the hierarchy read as light instead of as gain.
 @fragment
 fn fs_hdr_glow(in: HdrVsOut) -> @location(0) vec4<f32> {
     let c = clamp(in.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     let lo = c / 12.92;
     let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
     let lin = select(lo, hi, c > vec3<f32>(0.04045));
+    let hot = min(1.0 + 2.0 * smoothstep(0.35, 0.60, white_part(c)), 3.0);
     let bound = max(hu.headroom, 0.0);
-    let add = max(min(lin * hu.boost, vec3<f32>(bound)), vec3<f32>(0.0));
+    let add = max(min(lin * hu.boost * hot, vec3<f32>(bound)), vec3<f32>(0.0));
     return vec4<f32>(add, 0.0);
 }
 
@@ -1240,39 +1262,72 @@ fn vs_fs(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @group(0) @binding(0) var bloom_src: texture_2d<f32>;
 @group(0) @binding(1) var bloom_samp: sampler;
-struct BloomU { texel: vec2<f32>, strength: f32, radius: f32 };
+struct BloomU {
+    texel: vec2<f32>,
+    strength: f32,
+    radius: f32,        // the WHITE part's radius, half-res texels
+    chroma_radius: f32, // the COLOURED part's, always the shorter of the two
+    _pad0: f32,
+    _pad1: f32,
+};
 @group(0) @binding(2) var<uniform> bu: BloomU;
 
+// The bloom's twin of `HDR_GLOW_SHADER::white_part` — the smallest channel is
+// the white light in a premultiplied colour, the rest is its chroma.
+fn white_part(c: vec3<f32>) -> f32 {
+    return min(min(c.r, c.g), c.b);
+}
+
+// WHITE IS HOT (design §L5), the halo's half: ONE 25-tap kernel, two radii.
+// The white part of the source spreads at `radius`, the chroma at the shorter
+// `chroma_radius`, and the two are summed back into one halo — so a meteor
+// reads as an over-white streak dying into a coloured train, and less coloured
+// light smears sideways into the glyphs beside it. The taps, their gaussian
+// weights and the normalization are the kernel that was here before; only the
+// offset each half samples at differs, and the shorter chroma offset stays
+// well inside the composite scissor the longer white radius already dilates.
 @fragment
 fn fs_bloom(in: VsOut) -> @location(0) vec4<f32> {
-    var sum = vec3<f32>(0.0, 0.0, 0.0);
+    var white = 0.0;
+    var chroma = vec3<f32>(0.0, 0.0, 0.0);
     var wsum = 0.0;
     for (var j: i32 = -2; j <= 2; j = j + 1) {
         for (var i: i32 = -2; i <= 2; i = i + 1) {
-            let off = vec2<f32>(f32(i), f32(j)) * bu.texel * bu.radius;
+            let tap = vec2<f32>(f32(i), f32(j)) * bu.texel;
             let d2 = f32(i * i + j * j);
             let w = exp(-d2 / 4.0);
-            sum = sum + textureSample(bloom_src, bloom_samp, in.uv + off).rgb * w;
+            let sw = textureSample(bloom_src, bloom_samp, in.uv + tap * bu.radius).rgb;
+            white = white + white_part(sw) * w;
+            let sc = textureSample(bloom_src, bloom_samp, in.uv + tap * bu.chroma_radius).rgb;
+            chroma = chroma + (sc - vec3<f32>(white_part(sc))) * w;
             wsum = wsum + w;
         }
     }
+    let sum = vec3<f32>(white) + chroma;
     return vec4<f32>(sum / wsum * bu.strength, 1.0);
 }
 "#;
 
-/// Bloom uniform — std140 16-byte layout matching WGSL `BloomU` (vec2 at 0, two
-/// f32 at 8/12). `texel` is 1/half-res-dims; `strength`/`radius` tune the halo.
+/// Bloom uniform — std140 32-byte layout matching WGSL `BloomU` (vec2 at 0,
+/// three f32 at 8/12/16, 12 bytes of tail pad rounding the uniform-address-space
+/// stride up to 32). `texel` is 1/half-res-dims; `strength` and the two radii
+/// tune the halo (`radius` the white part, `chroma_radius` the colour — see
+/// [`BLOOM_CHROMA_RADIUS`]).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq)]
 struct BloomUniform {
     texel: [f32; 2],
     strength: f32,
     radius: f32,
+    chroma_radius: f32,
+    _pad: [f32; 3],
 }
 impl_pod_zeroable!(BloomUniform {
     texel: [f32; 2],
     strength: f32,
-    radius: f32
+    radius: f32,
+    chroma_radius: f32,
+    _pad: [f32; 3]
 });
 
 /// GPU-only HEAT SHIMMER (the bloom parity class, present time only): the air
@@ -5474,7 +5529,26 @@ const BLOOM_DOWNSCALE: u32 = 2;
 /// Bloom additive strength — fraction of the blurred glow added back over the frame.
 const BLOOM_STRENGTH: f32 = 0.85;
 /// Bloom blur radius in half-res texels — how far the radiant halo spreads.
+/// This is the WHITE part's radius (see [`BLOOM_CHROMA_RADIUS`]).
 const BLOOM_RADIUS: f32 = 2.2;
+/// The CHROMA half of the same 25-tap kernel (design §L5, "white is hot"): the
+/// coloured part of the halo spreads 1.2 half-res texels against the white
+/// part's 2.2, so a meteor is an over-white streak dying into a coloured train
+/// and less coloured light smears into the glyphs beside it. Always the shorter
+/// of the two, so the composite scissor — dilated by the WHITE radius — already
+/// bounds it.
+const BLOOM_CHROMA_RADIUS: f32 = 1.2;
+/// The chroma radius as a share of the white one, so the config knob
+/// (`cursor_trail_bloom_radius`, [`GpuRenderer::set_bloom_params`]) moves both
+/// halves together and the shipped default lands on [`BLOOM_CHROMA_RADIUS`].
+const BLOOM_CHROMA_SHARE: f32 = BLOOM_CHROMA_RADIUS / BLOOM_RADIUS;
+
+/// The chroma radius that pairs with a white blur `radius` — one spelling for
+/// every uniform write site (wgpu present, Metal present, Metal replay, the
+/// test fixture), so the two halves of the kernel can never drift apart.
+pub(crate) fn bloom_chroma_radius(radius: f32) -> f32 {
+    radius * BLOOM_CHROMA_SHARE
+}
 
 /// Build the GPU-only BLOOM resources: shader module, the bind-group layout
 /// (half-res glow texture + linear sampler + `BloomUniform`), a LINEAR clamp
@@ -9232,6 +9306,8 @@ impl GpuRenderer {
                 texel: [1.0 / bw as f32, 1.0 / bh as f32],
                 strength: self.bloom_strength,
                 radius: self.bloom_radius,
+                chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                _pad: [0.0; 3],
             }),
         )?;
         // The composite scissor — `encode_bloom_halo`'s spelling, clip and
@@ -10393,6 +10469,8 @@ impl GpuRenderer {
                     texel: [1.0 / bw as f32, 1.0 / bh as f32],
                     strength: self.bloom_strength,
                     radius: self.bloom_radius,
+                    chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                    _pad: [0.0; 3],
                 }),
             )?;
             let clip = input.fx_clip.map(|(cx0, cy0, cx1, cy1)| {
@@ -13747,6 +13825,8 @@ impl GpuRenderer {
             texel: [1.0 / bt.bw as f32, 1.0 / bt.bh as f32],
             strength: self.bloom_strength,
             radius: self.bloom_radius,
+            chroma_radius: bloom_chroma_radius(self.bloom_radius),
+            _pad: [0.0; 3],
         };
         self.ctx
             .queue
@@ -21151,6 +21231,8 @@ impl GpuRenderer {
                         texel: [1.0 / bw as f32, 1.0 / bh as f32],
                         strength: self.bloom_strength,
                         radius: self.bloom_radius,
+                        chroma_radius: bloom_chroma_radius(self.bloom_radius),
+                        _pad: [0.0; 3],
                     }),
                 );
             }
@@ -21622,6 +21704,8 @@ impl GpuRenderer {
                 texel: [1.0 / bw as f32, 1.0 / bh as f32],
                 strength,
                 radius,
+                chroma_radius: bloom_chroma_radius(radius),
+                _pad: [0.0; 3],
             }),
         );
         let bind = self

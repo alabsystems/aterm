@@ -4232,7 +4232,15 @@ impl WordDecorations {
                 ay: tile.ay,
                 aw: side,
                 ah: side,
-                tint: Self::pet_mote_tint(m.kind, colors),
+                // THE RIBBON'S STOP, WORN (Rainbow Kitty v2 panel #10(c)):
+                // a ♪/♥ born over a lit ribbon carries the colour v2 offered
+                // the pet at that cell ([`crate::kitty_pet::PetMoteSprite::rgb`]),
+                // already snapped to one of the seven stops by the engine —
+                // a mote is a POINT MARK and takes the same C1 snap a star's
+                // tint and a pin's arms take. Every other mote, and every ♪
+                // born with no ribbon under the cat, keeps this lane's own
+                // per-kind tint.
+                tint: m.rgb.unwrap_or_else(|| Self::pet_mote_tint(m.kind, colors)),
                 alpha,
                 flip_x: false,
                 z: FreeZ::OverText,
@@ -24717,6 +24725,7 @@ mod pet_stays_inside_the_grid_tests {
             scale: 0.58,
             rot: 0.4,
             alpha: 200,
+            rgb: None,
         });
         crate::kitty_pet::PetFrame {
             alpha: 255,

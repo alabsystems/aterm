@@ -1084,7 +1084,7 @@ pub const VERBS: &[VerbSpec] = &[
          config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
          licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
          ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
-         momentum_display= glow_active= pet_active= cat_active= \
+         momentum_display= flow= combo= combo_best= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
          pet_action= pet_content= pet_pending= pet_body=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
@@ -1100,8 +1100,15 @@ pub const VERBS: &[VerbSpec] = &[
          FROM and which source supplied it (`cursor_color`/`trail_color`/`style_identity`, \
          or `white` — a CursorColor-based owner handed no pinned cursor colour builds from \
          the theme-polar white, and the shipped-default rainbow style takes that path) — \
-         so a caret that ignored OSC 12 is separable from one that honoured it. In a \
-         `--headless` instance the engine ticks only while a capture drives its clock (`image` \
+         so a caret that ignored OSC 12 is separable from one that honoured it. \
+         `flow=`/`combo=`/`combo_best=` are the row's one reading about the PERSON: \
+         `combo=` counts keys typed at speed (the eased spine at 0.8 or above) with no \
+         delete, and zeroes on a delete, a kill, or a hand that dropped below speed; \
+         `flow=` is that run's climb toward the 24-key bar the theme OPENS at, 0.00-1.00; \
+         `combo_best=` is the window's high-water mark, which an exit never resets. A \
+         driver that reads `flow=1.00` is looking at a human mid-flow and can hold its \
+         turn. The three are 0 on every style but rainbow kitty, whose spine prices them. \
+         In a `--headless` instance the engine ticks only while a capture drives its clock (`image` \
          after each key, or a `video`), and a caret on ROW 0 has no sky band there (no chrome \
          head band above the grid), so `v2_stars=0` on row 0 is the geometry, not a dark trail \
          - judge stars from row 1 or lower. Read-only; typed text is never reported. \

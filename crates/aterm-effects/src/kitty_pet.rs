@@ -239,6 +239,7 @@ use crate::cat_baker::CatColorKey;
 use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
 use crate::pet_stroke::StrokeDetector;
 use crate::rainbow_kitty::ARM_MIN;
+use crate::rainbow_kitty::companion::{PetOffer, StarCatch};
 
 // ── the chase ───────────────────────────────────────────────────────────────
 
@@ -1240,6 +1241,19 @@ const SULK_CONTENT: f32 = 0.25;
 /// slower than fright ([`STARTLE_HOLD`]) and slower than play
 /// ([`FROLIC_HOLD`]) — that is what makes it read as a mood, not a flinch.
 const DROOP_HOLD: f32 = 1.6;
+/// **THE VIGIL** (THE VERDICT, sense 1): how long the shell must have been
+/// EXECUTING — with the pet's one bounded stare already spent
+/// ([`WATCH_MAX`]) — before a settled pet drops into the crouch and waits at
+/// the door. Thirty seconds is the same wall the cheer calls a BUILD
+/// ([`CHEER_BIG_MS`]), read FORWARD instead of backward: a pet cannot know a
+/// command's duration until it ends, but it always knows how long it has
+/// already been waiting.
+const VIGIL_AFTER: f32 = 30.0;
+/// **THE FORGIVEN SUCCESS**: a green command this soon after a failure is a
+/// BIG cheer whatever it ran for — `cargo build`, one typo fixed, `cargo
+/// build` again, and the second one is over in four seconds. Ten minutes is
+/// a debugging session; a coincidence would need to be one too.
+const SULK_FORGIVEN: f32 = 600.0;
 /// How long a latched pet (a click on the cat) stays actionable — long
 /// enough to survive any single flight + landing, short enough that a click
 /// from before a burst of typing does not purr a minute later.
@@ -1247,6 +1261,43 @@ const PET_LATCH_TTL: f32 = 2.0;
 /// How many pets can queue. Clicks past the cap are absorbed silently —
 /// the cat is already as petted as it can be.
 const PET_LATCH_MAX: u8 = 3;
+/// **THE V2 PERK'S LATE BOUND** (Rainbow Kitty v2 panel #10(a)) — how far
+/// past the offered arrival edge `t₀ + T` that edge is still the arrival.
+///
+/// One frame at 30 fps. The perk is the pet's answer to a LANDING, and a
+/// landing is a place on the clock, not a mood: a cat that notices it two
+/// frames late is a cat noticing something else. Nothing can hold the latch
+/// open — the offer buys no wake ([`PetBrain::needs_frames`]) — so this is
+/// what retires an edge the pet's own work ticked straight past.
+const V2_PERK_LATE: f32 = 0.033;
+/// **THE OFFERED STAR'S TTL** (panel #10(b)) — how long a latched
+/// [`StarCatch`] stays actionable, on the injected clock.
+///
+/// A sky m1 lives 0.46 s at most (`stardust::StarClass::life_s`), and v2
+/// re-mints the offer on every frame the star is still in reach, so a latch
+/// this old names a star that is either gone or about to be — and the fresh
+/// one is already waiting. Short by design: the cat reaches for the star it
+/// just saw, or not at all (`note_flow`'s law).
+const V2_CATCH_TTL: f32 = 0.25;
+/// **ONE REACH PER GESTURE** — the cooldown a spent catch owes, on the
+/// brain's own clock.
+///
+/// A hand at 12 cps deals a gold m1 about one key in eighty, but a hot sky
+/// can put two inside a second; without this a purring cat would bat at the
+/// air in a flurry, and the reach reads as a moment only if it is one. Twice
+/// [`BAT_HOLD`], so the previous reach is over and its pose has resolved
+/// before another can start — and, since a star lives well under it, this is
+/// also what makes it impossible for one star's life to be shortened twice.
+const V2_CATCH_COOL: f32 = 1.2;
+/// How long a latched FLOW ENTRY stays actionable ([`PetBrain::note_flow`]).
+///
+/// Short on purpose, and the shortest of the wave-1 TTLs bar the bell: the
+/// cat noticing that the hand found its flow is only charming AT the moment
+/// it happens. A latch the pet's work outlasted expires unconsumed — the
+/// documented bell shape — and because it expires it can never strand the
+/// lane awake (idle → zero holds without the latch ever appearing in
+/// `needs_frames`: flow buys no frame of its own).
+const FLOW_LATCH_TTL: f32 = 0.9;
 /// The petting hold: a purr-flavored beat per consumption, whatever the
 /// contentment says — affection is answered even by a cold cat.
 const PET_HOLD: f32 = 1.1;
@@ -1805,6 +1856,18 @@ pub struct PetMoteSprite {
     pub rot: f32,
     /// 0..=255 fade envelope; the emitter multiplies the pet's own alpha in.
     pub alpha: u8,
+    /// **THE RIBBON'S COLOUR, WORN** (Rainbow Kitty v2 panel #10(c)) — the
+    /// snapped spectrum stop the sky offered under the cat at this mote's
+    /// BIRTH ([`PetBrain::note_v2_offer`]), or `None` for the emitter's own
+    /// per-kind tint.
+    ///
+    /// Stamped at birth and never changed, which is the whole reason it costs
+    /// no wake: a mote's colour is constant across its life, so
+    /// [`PetBrain::next_change_deadline`] has no new edge to name and the
+    /// frames a ♪ is drawn on are exactly the frames it was drawn on before.
+    /// Only the ♪ and the ♥ ever carry one — the dust, the z and its pop are
+    /// the pet's own weather and wear the pet's own colours.
+    pub rgb: Option<u32>,
 }
 
 /// One live mote's birth record (brain-side; sprites are derived per frame).
@@ -1820,6 +1883,11 @@ struct Mote {
     dir: f32,
     /// Deterministic scatter index (a serial, not a die roll).
     seed: u8,
+    /// The ribbon's snapped colour under the cat when this mote was BORN,
+    /// stamped by [`PetBrain::spawn_mote`] and never re-read — see
+    /// [`PetMoteSprite::rgb`]. Every spawn site leaves it `None`; the funnel
+    /// is the one author of it, so a new mote can never forget the law.
+    rgb: Option<u32>,
 }
 
 impl Mote {
@@ -2601,6 +2669,47 @@ pub struct PetBrain {
     pending_cheer: Option<bool>,
     /// A command failed: droop as soon as the pet is free.
     pending_sulk: bool,
+    /// **THE HAND FOUND ITS FLOW** (`cursor_glow::CursorGlow::take_flow_entry`
+    /// — one latch per flow ENTRY, nothing on exit): when it was noted, so
+    /// `tick` can expire it against [`FLOW_LATCH_TTL`] on the injected clock.
+    ///
+    /// A latch, never a light and never a wake: it spawns no motes, it does
+    /// not wake a sleeping cat, and it holds no frame open — it rides the
+    /// cadence the pet is already running at while its owner types, which is
+    /// the only time it can be set at all.
+    pending_flow: Option<Instant>,
+    /// **RAINBOW KITTY v2's PERK EDGE** (panel #10(a), D13): the offered
+    /// `t₀ + T` — the meteor's ARRIVAL — latched by
+    /// [`Self::note_v2_offer`] and taken by a settled pet when the clock
+    /// reaches it, never before and never by moving (owner Q14, "no
+    /// teleport"). `perk_spent` is the edge already taken: the host holds one
+    /// impulse for a whole frame and re-mints the same offer while it does,
+    /// so an arrival must be spendable exactly once.
+    ///
+    /// The `pending_flow` law, verbatim: no light, no wake, no frame — and
+    /// dropped rather than parked when there is no cat on glass to act it.
+    pending_perk: Option<Instant>,
+    perk_spent: Option<Instant>,
+    /// **THE OFFERED STAR** (panel #10(b)). Consumed on the ground into the
+    /// reach; the star is handed back to v2 on that one frame and the sky
+    /// shortens its life by exactly that much. Its [`V2_CATCH_TTL`] clock is
+    /// the star's OWN birth ([`StarCatch::born`]) rather than a second
+    /// timestamp — v2 re-mints the offer every frame the star is still in
+    /// reach, so "how old is the star" is exactly the question the TTL asks.
+    pending_catch: Option<StarCatch>,
+    /// The star handed back this tick — the one-frame outbox
+    /// [`Self::note_v2_offer`] drains, so the catch is reported by the call
+    /// that made the offer rather than acted on at the call site.
+    caught: Option<StarCatch>,
+    /// Seconds owed before another star may be reached for ([`V2_CATCH_COOL`]).
+    catch_cool: f32,
+    /// **THE RIBBON'S COLOUR UNDER THE CAT** (panel #10(c)) — the snapped
+    /// spectrum stop v2 last offered, or `None` where no ribbon light is laid
+    /// under the body. A LEVEL, not a latch (`note_executing`'s idiom): it is
+    /// re-stated every frame and read only at a ♪/♥'s BIRTH
+    /// ([`Self::spawn_mote`]), which is what keeps it free of the wake
+    /// question entirely — a mote's colour never changes once it is on glass.
+    mote_rgb: Option<u32>,
     /// Queued pets (clicks on the cat), capped at [`PET_LATCH_MAX`], and
     /// when the LAST one landed (the [`PET_LATCH_TTL`] clock).
     pending_pet: u8,
@@ -2624,6 +2733,36 @@ pub struct PetBrain {
     /// [`WATCH_GATE`] — an all-day stream gets ONE bounded stare, then a
     /// parked gaze, never a pinned frame lane.
     watch_spent: bool,
+    /// **THE VIGIL** (THE VERDICT, sense 1): when the shell's OSC 133/633
+    /// EXECUTE phase began in the pane this pet is chasing — forwarded as a
+    /// LEVEL by the host ([`PetBrain::note_executing`]), which is the same
+    /// authenticated fact the verdict's other two senses rest on. `None`
+    /// between commands. The vigil's clock is READ off it every tick rather
+    /// than integrated, so a lane that did not run for a minute still
+    /// measures the minute the human sat through.
+    exec_since: Option<Instant>,
+    /// The stare capped DURING this execute phase — the vigil's precondition,
+    /// which is the whole of "with its watch capped". Cleared with the phase.
+    vigil_armed: bool,
+    /// Seconds the armed vigil has held, recomputed each tick from
+    /// [`Self::exec_since`]; exactly `0.0` whenever there is nothing to wait
+    /// for.
+    vigil_t: f32,
+    /// The live [`PetAction::Crouch`] is THE VIGIL'S — a HELD pose and not a
+    /// coil: no butt-wiggle, no gather envelope, no launch frame, and no
+    /// claim of its own on the frame train ([`Self::needs_frames`]).
+    vigil: bool,
+    /// A GREEN verdict landed on a live vigil: the crouch converts into the
+    /// strike it already knows (the play flight), aimed at the row the prompt
+    /// is coming back to.
+    pending_vigil_pounce: bool,
+    /// The cheer that pounce is CARRYING — spent by the LANDING, so the ♪/♥
+    /// shower belongs to the frolic and never to the launch.
+    vigil_cheer: Option<bool>,
+    /// The pet's own clock at the last failure — [`SULK_FORGIVEN`]'s window,
+    /// and the whole of "a success within ten minutes of a sulk is a big
+    /// cheer whatever the duration".
+    sulk_at: Option<f64>,
     /// POINTER PLAY (wave 2): the pointer cell as of the previous tick — the
     /// pet's own pointer sensor, exactly like `last_caret`.
     last_pointer: Option<(f32, f32)>,
@@ -2967,6 +3106,13 @@ impl Default for PetBrain {
             pending_bell: None,
             pending_cheer: None,
             pending_sulk: false,
+            pending_flow: None,
+            pending_perk: None,
+            perk_spent: None,
+            pending_catch: None,
+            caught: None,
+            catch_cool: 0.0,
+            mote_rgb: None,
             pending_pet: 0,
             pet_at: None,
             pet_hold_t: 0.0,
@@ -2974,6 +3120,13 @@ impl Default for PetBrain {
             watch_heat: 0.0,
             watch_t: 0.0,
             watch_spent: false,
+            exec_since: None,
+            vigil_armed: false,
+            vigil_t: 0.0,
+            vigil: false,
+            pending_vigil_pounce: false,
+            vigil_cheer: None,
+            sulk_at: None,
             last_pointer: None,
             pointer_vx: 0.0,
             pointer_vy: 0.0,
@@ -3667,21 +3820,78 @@ impl PetBrain {
         // The injected clock is the idiom's signature; this stimulus keys
         // its consumption off the ledger and the latch, not off a TTL.
         let _ = now;
+        // THE VIGIL IS SPENT BY THE VERDICT, whatever the verdict says: the
+        // wait is over either way, and only a GREEN one buys the strike.
+        let vigil = self.vigil_t >= VIGIL_AFTER;
+        self.exec_since = None;
+        self.vigil_armed = false;
+        self.vigil_t = 0.0;
         if failed {
             self.content = (self.content - SULK_CONTENT).max(0.0);
             self.pending_sulk = true;
+            // The grief is DATED (THE VERDICT): the next green command inside
+            // [`SULK_FORGIVEN`] is the one the cat has been waiting for.
+            self.sulk_at = Some(self.clock);
             return;
         }
+        // **THE FORGIVEN SUCCESS.** A green command within [`SULK_FORGIVEN`]
+        // of a failure is the big cheer WHATEVER it ran for — the fix for a
+        // broken build is usually four seconds long, and a cat that shrugged
+        // at it would have understood nothing about the last ten minutes.
+        let forgiven = self
+            .sulk_at
+            .is_some_and(|at| (self.clock - at) as f32 <= SULK_FORGIVEN);
         match dur_ms {
             Some(dur) if dur >= CHEER_MIN_MS => {
                 self.content = (self.content + CHEER_CONTENT).min(1.0);
-                self.pending_cheer = Some(dur >= CHEER_BIG_MS);
+                self.pending_cheer = Some(forgiven || dur >= CHEER_BIG_MS);
+                // Only a real vigil earns the flight: a two-second success
+                // the cat never got up for takes the ordinary cheer.
+                self.pending_vigil_pounce = vigil;
+            }
+            _ if forgiven => {
+                // Under two seconds, but it is THE ONE: the ledger moves the
+                // long success's distance and the body celebrates.
+                self.content = (self.content + CHEER_CONTENT).min(1.0);
+                self.pending_cheer = Some(true);
+                self.pending_vigil_pounce = vigil;
             }
             _ => {
                 // Under two seconds (or no timestamps at all): the ledger
                 // only — no latch, no choreography.
                 self.content = (self.content + CHEER_FAST_CONTENT).min(1.0);
             }
+        }
+        // Forgiveness is spent by the cheer it bought; the NEXT failure dates
+        // its own window.
+        if forgiven {
+            self.sulk_at = None;
+        }
+    }
+
+    /// **THE SHELL IS EXECUTING** (THE VERDICT, sense 1) — the OSC 133/633
+    /// C..D phase in the pane this pet is chasing, forwarded as a LEVEL by
+    /// the host every frame it already composes (never a new wake, never a
+    /// new lock: the host read the phase for the perk-and-watch conjunction
+    /// long before the verdict wanted it).
+    ///
+    /// A fact, not a stimulus: it starts and stops the vigil's clock and
+    /// touches no pose. Everything the vigil DOES happens in `tick`, under
+    /// the same precedence ladder as every other reaction — the note idiom,
+    /// held to even here, where the note is a level rather than an edge.
+    pub fn note_executing(&mut self, now: Instant, executing: bool) {
+        if executing {
+            if self.exec_since.is_none() {
+                self.exec_since = Some(now);
+            }
+        } else {
+            // The phase ended. A shell that reports C..D but no exit status
+            // (or a command killed before its D) leaves no verdict at all,
+            // and this is what stands the vigil down for it: the clock reads
+            // zero next tick, and the crouch's own arm returns the cat to its
+            // feet. Nothing is latched, so nothing can be stranded.
+            self.exec_since = None;
+            self.vigil_armed = false;
         }
     }
 
@@ -3691,6 +3901,98 @@ impl PetBrain {
     pub fn note_petted(&mut self, now: Instant) {
         self.pending_pet = self.pending_pet.saturating_add(1).min(PET_LATCH_MAX);
         self.pet_at = Some(now);
+    }
+
+    /// **THE HAND FOUND ITS FLOW** — the human crossed into flow state (24
+    /// keys at speed with no delete,
+    /// `rainbow_kitty::spine::FLOW_ENTRY_KEYS`), forwarded
+    /// once per ENTRY by the host draining
+    /// [`crate::cursor_glow::CursorGlow::take_flow_entry`]. Nothing at all is
+    /// forwarded on an exit: leaving flow is not an event the cat gets to
+    /// have an opinion about.
+    ///
+    /// The `note_bell` idiom exactly — latch, never act — with the two
+    /// restraints flow adds: it spawns NO motes (the cheer's flourish is
+    /// earned by a green build, not by typing) and it never wakes a sleeping
+    /// cat, so it can add no light and no frame the pet was not already
+    /// drawing. A latch the pet's work outlasted expires at
+    /// [`FLOW_LATCH_TTL`], unconsumed.
+    pub fn note_flow(&mut self, now: Instant) {
+        self.pending_flow = Some(now);
+    }
+
+    /// **RAINBOW KITTY v2's PER-FRAME OFFER, RECEIVED** (`rainbow_kitty::
+    /// companion` panel #10) — the whole of the resident's receiving end, and
+    /// the one call that closes D13's wiring gap.
+    ///
+    /// The host's two lines, after the pet's own tick:
+    ///
+    /// ```ignore
+    /// let offer = v2.pet_offer(geom, companion::PetOnGlass::of(&pet_frame, geom));
+    /// if let Some(star) = pet.note_v2_offer(&offer) { v2.catch_star(star, now); }
+    /// ```
+    ///
+    /// Consume what this body wants and return the star to spend, on the
+    /// paw's landing frame ONLY (`Some` on exactly that one frame, `None` on
+    /// every other):
+    ///
+    /// * `offer.perk_at` — the meteor's arrival edge `t₀ + T`. LATCHED here
+    ///   (the `note_bell` / `pending_pounce` idiom); when the clock reaches
+    ///   it, a SETTLED pet takes it as its [`PERK_HOLD`] edge. NO RELOCATION
+    ///   (D13, owner Q14): the cat keeps its own pounce, and this adds no
+    ///   travel, no station and no flight.
+    /// * `offer.catch` — a gold m1 in reach. Latched, played as a reach on
+    ///   the ground, and handed back once — [`Self::caught`]'s outbox, drained
+    ///   below.
+    /// * `offer.mote_rgb` — the ribbon's snapped colour under the cat, worn
+    ///   by the ♪/♥ born while it stands. `None` ⇒ the pet's own colour.
+    ///
+    /// **LATCH, NEVER ACT.** Nothing here touches a pose, a clock or the
+    /// mote lane: every consumption happens inside [`Self::tick`], under the
+    /// same precedence ladder as the bell, the cheer and the bat. Acting at
+    /// note time would fire mid-flight or mid-hold, which is the exact bug
+    /// [`Self::pending_pounce`] exists to prevent.
+    ///
+    /// **AND IT BUYS NO WAKE.** None of the three is in
+    /// [`Self::needs_frames`] or [`Self::next_change_deadline`]: the offer
+    /// rides the frames the pet was already drawing, exactly like
+    /// [`Self::note_flow`], and a latch the pet's own work outlasted expires
+    /// unconsumed ([`V2_PERK_LATE`], [`V2_CATCH_TTL`]). An empty offer — the
+    /// common case, and every frame of every other style — writes one `None`
+    /// and returns.
+    pub fn note_v2_offer(&mut self, offer: &PetOffer) -> Option<StarCatch> {
+        // (c) THE HUE is a level, restated every frame — including the
+        // `None` that says the ribbon under the cat has gone out.
+        self.mote_rgb = offer.mote_rgb;
+        // (a) THE PERK EDGE. The host holds one impulse for the whole frame,
+        // so the SAME arrival is offered again on the next; an edge already
+        // taken is not a second arrival.
+        if let Some(at) = offer.perk_at
+            && self.perk_spent != Some(at)
+        {
+            self.pending_perk = Some(at);
+        }
+        // (b) THE STAR. Newest wins, exactly as `Engine::pet_offer` deals it
+        // — a cat that has been ignoring one for 300 ms should be offered the
+        // fresh one instead. The clock is the star's own birth, which is the
+        // only instant this call is given.
+        if let Some(star) = offer.catch
+            && self.catch_cool <= 0.0
+        {
+            self.pending_catch = Some(star);
+        }
+        // The one-frame outbox: what the tick above actually reached for.
+        self.caught.take()
+    }
+
+    /// **THE V2 OFFER'S LATCHES**, `(perk, catch)` — host observability, on
+    /// [`Self::pending_pets`]'s precedent exactly: the offer seam's unit
+    /// tests assert the latch MOVED without driving a full frame, which is
+    /// the only way a host can prove it wired panel #10 up at all. Reads
+    /// nothing else and changes nothing.
+    #[must_use]
+    pub fn pending_v2_offer(&self) -> (bool, bool) {
+        (self.pending_perk.is_some(), self.pending_catch.is_some())
     }
 
     /// Queued, not-yet-consumed pets — host observability (the click seam's
@@ -3932,6 +4234,19 @@ impl PetBrain {
                 && self.pending_bell.is_none()
                 && self.pending_cheer.is_none()
                 && !self.pending_sulk
+                // A flow latch cannot outlive its TTL, and the sweep that
+                // retires it lives on the slow path — so a stale one costs
+                // exactly ONE ordinary frame (byte-identical to this arm's)
+                // and the fast path is back. It can never hold a frame open:
+                // the latch is deliberately absent from `needs_frames`.
+                && self.pending_flow.is_none()
+                // v2's two offers (panel #10) join the flow latch for the
+                // same reason and at the same cost: neither is in
+                // `needs_frames`, so a stale one costs exactly ONE ordinary
+                // frame — byte-identical to this arm's — while the slow path
+                // drops it, and the fast path is back on the next tick.
+                && self.pending_perk.is_none()
+                && self.pending_catch.is_none()
                 && self.pending_pet == 0
                 && self.pet_at.is_none()
                 && self.pending_bat.is_none()
@@ -4002,6 +4317,15 @@ impl PetBrain {
             self.pending_bell = None;
             self.pending_cheer = None;
             self.pending_sulk = false;
+            self.pending_flow = None;
+            // …and v2's offers with them: an arrival nobody can watch and a
+            // star over an invisible cat are offers to nobody, and the hue is
+            // a level about a body that is not on glass.
+            self.pending_perk = None;
+            self.pending_catch = None;
+            self.caught = None;
+            self.catch_cool = 0.0;
+            self.mote_rgb = None;
             self.pending_pet = 0;
             self.pet_at = None;
             self.pet_hold_t = 0.0;
@@ -4288,6 +4612,16 @@ impl PetBrain {
             self.pending_bell = None;
             self.pending_cheer = None;
             self.pending_sulk = false;
+            self.pending_flow = None;
+            // v2's offers are theater too: reduced motion has no notice to
+            // play and no paw to put out (the impulse is a `Land` there by
+            // law, and a landing is a pose, not an edge to wait for). The hue
+            // is dropped with them — a still frame deals no motes.
+            self.pending_perk = None;
+            self.pending_catch = None;
+            self.caught = None;
+            self.catch_cool = 0.0;
+            self.mote_rgb = None;
             self.pet_hold_t = 0.0;
             // Wave 2 is theater and theater only: no perk at a stream under
             // reduced motion, no pointer play, and no heat left behind to
@@ -4374,6 +4708,40 @@ impl PetBrain {
             self.pending_pet = 0;
             self.pet_at = None;
         }
+        // The FLOW latch's TTL: the cat notices the hand finding its flow AT
+        // the moment it happens or not at all. Expiring here — on every
+        // non-deep-sleep frame, before `consume_stimuli` — is also what keeps
+        // it out of `needs_frames`: an unconsumed latch retires on the ticks
+        // the pet was already running, so it can never pin the lane.
+        if self.pending_flow.is_some_and(|at| {
+            sense.now.saturating_duration_since(at).as_secs_f32() > FLOW_LATCH_TTL
+        }) {
+            self.pending_flow = None;
+        }
+        // RAINBOW KITTY v2's TWO LATCHES retire on the same terms and for the
+        // same reason: they are deliberately absent from `needs_frames`, so
+        // an unconsumed one must retire on the ticks the pet was ALREADY
+        // running or it would sit there until the next meteor. The perk's
+        // window opens at the arrival and closes [`V2_PERK_LATE`] later — a
+        // landing is a place on the clock; the star's is measured from its own
+        // birth ([`V2_CATCH_TTL`]), because that is what "is it still there"
+        // means for a mark whose whole life is under half a second.
+        if self
+            .pending_perk
+            .is_some_and(|at| sense.now.saturating_duration_since(at).as_secs_f32() > V2_PERK_LATE)
+        {
+            self.pending_perk = None;
+        }
+        if self.pending_catch.is_some_and(|star| {
+            sense.now.saturating_duration_since(star.born).as_secs_f32() > V2_CATCH_TTL
+        }) {
+            self.pending_catch = None;
+        }
+        // The reach's cooldown, spent in WALL TIME like `bored_cool` and
+        // `pursuit_cool` below — a cat that sat for a second has sat for a
+        // second whether the lane ticked sixty times or three, and a cooldown
+        // on the motion-clamped `dt` would outlive its own second under load.
+        self.catch_cool = (self.catch_cool - elapsed).max(0.0);
         // The bat's TTL (wave 2): a peek the pet's work outlasted is not a
         // toy any more — the head has pulled back behind its line.
         if self
@@ -4420,6 +4788,15 @@ impl PetBrain {
             self.watch_t = 0.0;
             self.watch_spent = false;
         }
+        // THE VIGIL'S CLOCK (THE VERDICT, sense 1): READ, never integrated —
+        // how long the shell has been executing since the stare capped. A
+        // window that parked for a minute must measure the minute, and the
+        // `dt` clamp above exists precisely so that motion cannot; the wall
+        // clock is the ledger's, and the wait is the human's.
+        self.vigil_t = match self.exec_since {
+            Some(at) if self.vigil_armed => sense.now.saturating_duration_since(at).as_secs_f32(),
+            _ => 0.0,
+        };
         // IDLE MICRO-LIFE (wave 2), the ear twitch: an output PULSE — the
         // burst's rising edge — at a settled, awake pet still below the
         // watch gate flicks one ear (which ear: mote-serial parity at arm
@@ -5189,6 +5566,14 @@ impl PetBrain {
                         self.play_frolic = true;
                         self.play_hold = POINTER_PLAY_HOLD;
                         self.set_action(PetAction::Frolic);
+                        // THE VERDICT'S PARTY, spent HERE: the pounce carried
+                        // the cheer through the prompt-return jump so the ♪/♥
+                        // shower is thrown by the frolic that lands, not by
+                        // the crouch that left. A pointer pounce carries
+                        // nothing and this is `None` for it.
+                        if let Some(big) = self.vigil_cheer.take() {
+                            self.spawn_cheer_motes(big, width);
+                        }
                         return self.emit(sense, width);
                     }
                     PlayLand::BatSwipe { col, row } => {
@@ -5354,6 +5739,49 @@ impl PetBrain {
                     return self.emit(sense, width);
                 }
                 self.tennis = false;
+            }
+            PetAction::Crouch if self.vigil => {
+                // **THE VIGIL CROUCH** (THE VERDICT, sense 1): the cat at the
+                // door. A HELD pose in the stakeout's exact shape — planted
+                // art, no coil, no wiggle, zero motes, zero light — and the
+                // only thing that ends it is the command.
+                //
+                // A GREEN verdict converts it into the STRIKE: the same play
+                // flight the pounce always was, aimed at the caret, which at
+                // a `D` is the row the prompt is coming back to. The cheer
+                // rides along to be spent by the LANDING, so the ♪/♥ belong
+                // to the frolic. Anything else — a failure, a command with no
+                // status, a phase that simply ended — stands the cat back up
+                // and lets the ladder below have its say THIS SAME TICK.
+                if self.pending_vigil_pounce {
+                    self.pending_vigil_pounce = false;
+                    self.vigil = false;
+                    if let Some((cr, ccol)) = sense.caret {
+                        self.vigil_cheer = self.pending_cheer.take();
+                        self.quiet = 0.0;
+                        let to_col = (f32::from(ccol) - width * 0.5)
+                            .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                        let to_row =
+                            f32::from(cr).clamp(0.0, f32::from(sense.rows.saturating_sub(1)));
+                        self.facing_left = to_col < self.col;
+                        self.play_to = Some((to_col, to_row));
+                        self.play_land = Some(PlayLand::PointerFrolic);
+                        self.hop_crouch = false;
+                        self.big_gather = false;
+                        return self.emit(sense, width);
+                    }
+                    // No caret to land on (hidden, or scrolled out of view):
+                    // the flight is dropped and `pending_cheer` stays exactly
+                    // where it was, for the ordinary perk-and-frolic below.
+                }
+                if self.vigil_t >= VIGIL_AFTER && !self.pending_sulk && self.pending_cheer.is_none()
+                {
+                    self.facing_left = f32::from(cc) < self.col + width * 0.5;
+                    self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+                self.vigil = false;
+                self.set_action_keep(PetAction::Stand);
             }
             PetAction::Crouch if self.hiding => {
                 // THE HIDE (wave 4c): lurking behind the word — drawn under
@@ -5885,6 +6313,13 @@ impl PetBrain {
             if self.consume_stimuli(cc, width) {
                 return self.emit(sense, width);
             }
+            // RAINBOW KITTY v2's OFFER (panel #10) — ranked below the pet's
+            // OWN stimuli and above every toy: an arrival and a star are
+            // things the sky did, and the bell, the verdict and the hand on
+            // the cat are things that happened to this animal.
+            if self.consume_v2_offer(&sense, width) {
+                return self.emit(sense, width);
+            }
             // THE WORD-CAT BAT (wave 2): below caret work by construction
             // (this ladder never runs while travel is pending), above
             // pointer play — the peek is the rarer toy.
@@ -6033,6 +6468,47 @@ impl PetBrain {
                 if self.action != PetAction::Groom {
                     self.set_action(PetAction::Groom);
                 }
+                return self.emit(sense, width);
+            }
+            // **THE VIGIL** (THE VERDICT, sense 1): the stare is spent, the
+            // command is still running, and it has been running for
+            // [`VIGIL_AFTER`]. A settled cat gets up, crouches facing the row
+            // the prompt will return to, and waits. Ranked here — under every
+            // latched stimulus and every toy, over the ambient watch it
+            // succeeds — because waiting is the LOWEST-priority thing a cat
+            // can be doing and still be doing something.
+            //
+            // It buys no frame, no mote and no light: the pose is planted
+            // ([`Self::needs_frames`] releases the lane for it, and
+            // [`Self::next_change_secs`] offers nothing), so the whole vigil
+            // rides the offers the settled pet already had.
+            // A DOZING CAT TAKES IT TOO, and this is the one place a
+            // sleeper is roused by something that is not an event — with a
+            // reason, and at no cost. `Sleep` is `settled()`; what is skipped
+            // is the WAKE: no startled z, no [`PetAction::Waking`] stretch, no
+            // `quiet` reset (the flow latch's precedent — a vigil is not a
+            // caret event). And it can only ever happen on a frame the host
+            // is ALREADY drawing, because a pet with nothing on its lane is
+            // not being ticked at all: a build that prints keeps the pet
+            // ticking and the cat gets up at the half-minute mark; a build
+            // that links in silence draws nothing, so the cat sleeps through
+            // it and is woken by the verdict itself, exactly as it always
+            // was. Idle → zero wakes, unmoved either way.
+            if self.vigil_t >= VIGIL_AFTER
+                && !self.vigil
+                && self.action.settled()
+                && self.action != PetAction::Waking
+                && !self.stakeout
+                && !self.hiding
+                && self.pursuit_t.is_none()
+                && self.play_to.is_none()
+            {
+                self.vigil = true;
+                self.hop_crouch = false;
+                self.big_gather = false;
+                self.facing_left = f32::from(cc) < self.col + width * 0.5;
+                self.speed = 0.0;
+                self.set_action(PetAction::Crouch);
                 return self.emit(sense, width);
             }
             // PERK-AND-WATCH (wave 2): an ambient hold, ranked below every
@@ -7565,13 +8041,30 @@ impl PetBrain {
                 row: self.row + 0.31,
                 dir: -self.skid_dir,
                 seed,
+                rgb: None,
             });
         }
         self.mote_serial = self.mote_serial.wrapping_add(3);
     }
 
     /// Spawn into a free slot; a full lane drops the mote (bounded by law).
-    fn spawn_mote(&mut self, m: Mote) {
+    ///
+    /// **THE ONE PLACE A MOTE IS DRESSED** (Rainbow Kitty v2 panel #10(c)):
+    /// a ♪ or a ♥ born while the ribbon is lit under the cat wears the stop
+    /// v2 last offered ([`Self::mote_rgb`]), stamped HERE, at birth, and
+    /// never re-read — so the tell, the cheer's flourish and the petting
+    /// hand's hearts all obey one law and none of them can forget it. The
+    /// dust, the z and its startled pop are the pet's own weather and keep
+    /// the emitter's colours whatever the sky is doing.
+    ///
+    /// Birth-stamping is also what keeps the whole of #10(c) free: a mote's
+    /// colour is constant across its life, so nothing here adds an edge to
+    /// [`Self::next_change_deadline`] or a frame to [`Self::needs_frames`] —
+    /// the ♪ is drawn on exactly the frames it was drawn on before.
+    fn spawn_mote(&mut self, mut m: Mote) {
+        if matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart) {
+            m.rgb = self.mote_rgb;
+        }
         if let Some(slot) = self.motes.iter_mut().find(|s| s.is_none()) {
             *slot = Some(m);
         }
@@ -7713,6 +8206,7 @@ impl PetBrain {
                         row: hy,
                         dir: if self.facing_left { -1.0 } else { 1.0 },
                         seed,
+                        rgb: None,
                     });
                 }
             }
@@ -7742,6 +8236,7 @@ impl PetBrain {
                         row: self.row - 0.27,
                         dir: if self.facing_left { -1.0 } else { 1.0 },
                         seed,
+                        rgb: None,
                     });
                 }
             }
@@ -7762,6 +8257,7 @@ impl PetBrain {
             row: hy,
             dir: if self.facing_left { -1.0 } else { 1.0 },
             seed,
+            rgb: None,
         });
     }
 
@@ -7856,6 +8352,27 @@ impl PetBrain {
             self.spawn_pet_hearts(n, width);
             return true;
         }
+        // THE HAND FOUND ITS FLOW — last in the ladder, because every other
+        // stimulus is something that HAPPENED TO the pet and this one is
+        // something it noticed. One Frolic, and that is the whole of it:
+        //
+        // * NO MOTES. The cheer's ♪/♥ shower is bought by a green build; a
+        //   frolic bought by typing must add no light of its own — the flow
+        //   law, and the reason this branch cannot be `pending_cheer` with a
+        //   different latch.
+        // * NO WAKE. A sleeping cat does not get woken to be told the hand is
+        //   fast; the latch is DROPPED rather than kept across a wake (the
+        //   cheer keeps its latch, this one does not).
+        // * NO QUIET RESET. Flow is not a caret event — `note_petted`'s
+        //   documented precedent — so a settled cat returns from the frolic
+        //   to exactly the ladder rung it was on.
+        if self.pending_flow.take().is_some() {
+            if self.action == PetAction::Sleep {
+                return false;
+            }
+            self.set_action(PetAction::Frolic);
+            return true;
+        }
         false
     }
 
@@ -7869,6 +8386,16 @@ impl PetBrain {
     /// stakeout stood down, the far look and the owed groom forgotten — work
     /// first. Shared by the jump latch and the snap.
     fn clear_play_intents(&mut self) {
+        // The vigil is a POSE, not an intent: the caret moving means the human
+        // is back, so the cat leaves the door. The verdict's own latches
+        // (`pending_vigil_pounce`, `pending_cheer`) are NOT dropped here —
+        // they are owed, and a command that ends while you type still gets its
+        // answer.
+        self.vigil = false;
+        // A star offered to a cat that has to get back to work is not owed to
+        // anybody: v2 re-mints the offer every frame the star is still in
+        // reach, so nothing is lost that the next frame will not offer again.
+        self.pending_catch = None;
         self.pending_pointer_pounce = None;
         self.play_to = None;
         self.play_land = None;
@@ -7933,6 +8460,7 @@ impl PetBrain {
         self.play_frolic = false;
         self.play_hold = 0.0;
         self.swipe = false;
+        self.pending_catch = None;
         self.pending_bat = None;
         self.bat_at = None;
         // The wave-3 games drop with the rest of play (no cooldown owed:
@@ -7942,6 +8470,70 @@ impl PetBrain {
         self.pending_look = None;
         self.look_at = None;
         self.groom_owed = false;
+    }
+
+    /// **RAINBOW KITTY v2's OFFER, CONSUMED** (panel #10) — the perk edge
+    /// first, then the star. Called from the arrived branch only, so every
+    /// caret-travel intent and every one-shot hold has already had its turn
+    /// (the `pending_pounce` law). Returns whether it acted.
+    ///
+    /// **(a) THE PERK.** A settled pet takes the offered `t₀ + T` as its
+    /// [`PERK_HOLD`] edge on the first tick at or after that instant, and
+    /// takes it as a POSE: ears up where it stands. Nothing here sets a
+    /// station, a flight or a pounce latch — D13's ruling and the owner's
+    /// word on A/B #14 ("no teleport") are that the pet is offered, never
+    /// relocated. A sleeper is not woken for it and the edge is dropped
+    /// rather than kept across a wake ([`Self::note_flow`]'s precedent: an
+    /// arrival nobody was awake for is not an arrival).
+    ///
+    /// **(b) THE CATCH.** A contented cat reaches for the star: it faces the
+    /// column the sky named and bats at it in place, on the bored vignette's
+    /// own in-place swipe ([`BAT_HOLD`], the [`PetGlyphId::PetBat`] pose) —
+    /// no approach, no standoff, no flight, because a star is not a toy the
+    /// cat may cross the pane for. The star is put in the outbox on THIS
+    /// frame, which is the paw's landing: the reach is the follow-through.
+    ///
+    /// **The reach draws NOTHING** — no dust, no mote, no light of any kind.
+    /// `companion.rs` rules it in as many words ("the cat's reaching for it
+    /// draws nothing"), and it is what keeps T1 whole: the only thing in the
+    /// world that changes is one keystroke-born star ending sooner.
+    fn consume_v2_offer(&mut self, sense: &PetSense, width: f32) -> bool {
+        let asleep = matches!(self.action, PetAction::Sleep | PetAction::Waking);
+        if let Some(at) = self.pending_perk
+            && sense.now >= at
+        {
+            self.pending_perk = None;
+            self.perk_spent = Some(at);
+            if !asleep && self.action.settled() {
+                // NOT a quiet reset (`note_petted`'s documented precedent):
+                // the sky landing something is not a caret event, so a
+                // long-settled cat comes back from the notice to exactly the
+                // ladder rung it was on.
+                if self.action == PetAction::Perk {
+                    self.action_t = 0.0;
+                } else {
+                    self.set_action(PetAction::Perk);
+                }
+                return true;
+            }
+        }
+        let Some(star) = self.pending_catch else {
+            return false;
+        };
+        if asleep || !self.action.settled() {
+            // Kept, not dropped: the TTL above is the only thing that retires
+            // a star, and a cat one tick from its feet may still get there.
+            return false;
+        }
+        self.pending_catch = None;
+        self.catch_cool = V2_CATCH_COOL;
+        self.caught = Some(star);
+        self.facing_left = star.col as f32 <= self.col + width * 0.5;
+        self.play_frolic = true;
+        self.swipe = true;
+        self.play_hold = BAT_HOLD;
+        self.set_action(PetAction::Frolic);
+        true
     }
 
     /// THE WORD-CAT BAT (wave 2): consume a noted peek, on the ground —
@@ -7992,6 +8584,7 @@ impl PetBrain {
             // Kicked the way the swipe travels — the pet faces the head.
             dir: if self.facing_left { -1.0 } else { 1.0 },
             seed,
+            rgb: None,
         });
     }
 
@@ -8045,6 +8638,11 @@ impl PetBrain {
             // parking the eyes toward the caret — which is where the output
             // is pouring — as a still, frame-free sticker.
             self.watch_spent = true;
+            // …and THE VIGIL ARMS HERE (THE VERDICT, sense 1). "With its
+            // watch capped" is exactly this instant, and it is only a vigil
+            // if a command is actually running: a capped stare at a program
+            // the shell never announced waits for nothing.
+            self.vigil_armed = self.exec_since.is_some();
             return false;
         }
         // The watch: perk toward the stream (the caret rides the output's
@@ -8089,6 +8687,7 @@ impl PetBrain {
                 row: self.row - 0.27 - 0.13 * f32::from(k),
                 dir: if self.facing_left { -1.0 } else { 1.0 },
                 seed,
+                rgb: None,
             });
         }
     }
@@ -8108,6 +8707,7 @@ impl PetBrain {
                 row: self.row - 0.27 - 0.11 * f32::from(k),
                 dir: if self.facing_left { -1.0 } else { 1.0 },
                 seed,
+                rgb: None,
             });
         }
     }
@@ -8145,6 +8745,7 @@ impl PetBrain {
                     // Nonzero at every age, by construction.
                     rot: spin * (0.12 + 0.05 * f32::from(m.seed % 3) + 0.6 * u),
                     alpha: (fade_in * fade_out * 235.0) as u8,
+                    rgb: m.rgb,
                 },
                 PetMoteKind::Zee | PetMoteKind::ZeePop => {
                     let (col, row, scale, rot, peak, env, ink) = if m.kind == PetMoteKind::Zee {
@@ -8204,6 +8805,7 @@ impl PetBrain {
                         scale,
                         rot,
                         alpha: (env * ink * peak) as u8,
+                        rgb: m.rgb,
                     }
                 }
                 PetMoteKind::Note | PetMoteKind::Heart => {
@@ -8227,6 +8829,7 @@ impl PetBrain {
                         rot: spin * (0.11 + 0.05 * f32::from(m.seed % 3) + 0.4 * su),
                         alpha: ((su / 0.15).min(1.0) * ((1.0 - su) / 0.35).clamp(0.0, 1.0) * 240.0)
                             as u8,
+                        rgb: m.rgb,
                     }
                 }
             });
@@ -8737,7 +9340,9 @@ impl PetBrain {
                     PetGlyphId::PetCrouch
                 }
             }
-            PetAction::Crouch if !self.hiding && !self.stakeout && self.play_to.is_none() => {
+            PetAction::Crouch
+                if !self.hiding && !self.stakeout && !self.vigil && self.play_to.is_none() =>
+            {
                 // The pounce coil, squashing through its span-scaled length
                 // (kept live by the launch arm). The guard is the KIND law's
                 // other half: the hide, the stakeout and the play crouches
@@ -9277,6 +9882,11 @@ impl PetBrain {
             || self.pending_cheer.is_some()
             || self.pending_sulk
             || self.pending_pet > 0
+            // THE VERDICT's two: the strike waits for the ground, and the
+            // cheer it carries waits for the landing. Both are finite by
+            // construction — one crouch, one flight, one flourish.
+            || self.pending_vigil_pounce
+            || self.vigil_cheer.is_some()
         {
             return true;
         }
@@ -9403,6 +10013,18 @@ impl PetBrain {
         //     brake; a swipe's puff is a pointer beat; none is ever idle.
         if self.motes.iter().flatten().any(|m| !m.kind.rides_offer()) {
             return true;
+        }
+        // **THE VIGIL CROUCH IS STILL** (THE VERDICT, sense 1). It is the one
+        // unsettled pose that animates NOTHING — the coil arm is guarded off
+        // it, so there is no gather envelope and no butt-wiggle, and the arm
+        // that holds it plants `speed` at zero — so it is the one unsettled
+        // pose that must not pin the lane. A cat waiting out a twenty-minute
+        // build at 60 fps would be the most expensive thing in the terminal.
+        // Every term above still applies (a live mote, a flight, a latched
+        // verdict), and the verdict itself arrives as a `note_*` edge, which
+        // is a wake the host already has.
+        if self.vigil && self.action == PetAction::Crouch {
+            return false;
         }
         if !self.action.settled() {
             return true; // walking, running, startled, frolicking, waking
@@ -9571,6 +10193,14 @@ impl PetBrain {
         // the same instants under reduced motion and in the deep sleep the
         // spawn cut-off ([`tend_motes`]) keeps the z from ever reaching.
         self.mote_edges(&mut soon);
+        // **THE VIGIL CROUCH OFFERS NOTHING** (THE VERDICT, sense 1): the
+        // pose is held byte-stable and the only thing that can change it is
+        // the command ending — an EVENT, which no brain clock could name.
+        // Its live motes (a z dreamed before the wait began) keep their own
+        // edges above, which is the whole of "it rides the existing offer".
+        if self.vigil && self.action == PetAction::Crouch {
+            return soon.0;
+        }
         if self.last_reduced {
             // Reduced motion draws one still per pose; the only edge left is
             // the ladder's sleep (the reduced arm of `tick` verdicts it).
@@ -10212,6 +10842,147 @@ mod tests {
             "the next lawful sighting wears the latest parked identity"
         );
         assert!(pet.pending_worn.is_none());
+    }
+
+    /// **THE VERDICT, sense 1 — the pet.** A command's exit code, in the body.
+    ///
+    /// The fixture is the real thing: the shell announces it is EXECUTING, the
+    /// pane streams until the pet's one bounded stare caps ([`WATCH_MAX`]),
+    /// and then the build goes quiet and keeps running. Past [`VIGIL_AFTER`]
+    /// the settled cat gets up and CROUCHES facing the prompt row — a held
+    /// pose that claims no frame ([`PetBrain::needs_frames`]) and offers no
+    /// wake ([`PetBrain::next_change_deadline`]).
+    ///
+    /// Then the verdict lands. **Green: it pounces** — the play flight it
+    /// already knows, aimed at the caret, which at a `D` is the row the prompt
+    /// is coming back to, landing in Frolic. **Red: it droops**, from the same
+    /// crouch, on the same tick.
+    ///
+    /// Before the change the whole vigil did not exist: the pet sat through
+    /// the build (`Sit`), and a green build perked and frolicked WHERE IT SAT
+    /// with no flight at all.
+    #[test]
+    fn a_long_green_command_pounces_and_a_red_one_droops() {
+        /// A pet that has been waiting at the door for [`VIGIL_AFTER`]: the
+        /// perk-and-watch fixture's own streaming pane, executing throughout,
+        /// held past the [`WATCH_MAX`] cap and on past [`VIGIL_AFTER`].
+        fn vigil(t0: Instant) -> (PetBrain, Instant) {
+            let mut pet = PetBrain::default();
+            // A cat is asleep until somebody types (`quiet` opens at
+            // [`SLEEP_AFTER`]); the command was launched by a hand, so the
+            // fixture types the Enter's worth of keys that launched it.
+            let (mut t, _) = type_run(&mut pet, t0, 10, 20, 6, 0.12);
+            let end = t + Duration::from_secs_f32(VIGIL_AFTER + 1.0);
+            while t < end {
+                t += Duration::from_millis(50);
+                pet.note_executing(t, true);
+                let mut sn = sense(t, Some((10, 20)));
+                sn.output_burst = true;
+                let _ = pet.tick(sn);
+            }
+            // …and then the printing stops while the command runs on (the
+            // link step). The watch heat drains, and what is left holding the
+            // lane is the crouch alone — which is the point of the next two
+            // assertions.
+            for _ in 0..20 {
+                t += Duration::from_millis(100);
+                pet.note_executing(t, true);
+                let _ = pet.tick(sense(t, Some((10, 20))));
+            }
+            (pet, t)
+        }
+
+        let t0 = Instant::now();
+
+        let (mut pet, t) = vigil(t0);
+        assert_eq!(
+            pet.action,
+            PetAction::Crouch,
+            "after {VIGIL_AFTER} s of executing with its watch capped the cat \
+             waits at the door — it was {:?}",
+            pet.action
+        );
+        assert!(pet.vigil, "…and the crouch is the VIGIL'S, not a coil");
+        assert!(
+            !pet.needs_frames(),
+            "the vigil crouch is a HELD pose: zero wakes, or a twenty-minute \
+             build costs a twenty-minute frame train"
+        );
+        assert!(
+            pet.next_change_deadline(t).is_none(),
+            "…and it offers nothing either: it rides the offers it already had"
+        );
+
+        // GREEN, and it took forty seconds.
+        pet.note_command_done(t, false, Some(40_000));
+        let mut t_g = t;
+        let mut frolicked = false;
+        let mut left_the_ground = false;
+        for _ in 0..200 {
+            t_g += Duration::from_millis(16);
+            pet.note_executing(t_g, false);
+            let f = pet.tick(sense(t_g, Some((10, 20))));
+            left_the_ground |= f.action.airborne();
+            if f.action == PetAction::Frolic {
+                frolicked = true;
+                break;
+            }
+        }
+        assert!(
+            left_the_ground,
+            "a green verdict on a live vigil takes the POUNCE — the cat must \
+             leave the ground for the prompt row"
+        );
+        assert!(frolicked, "…and land in Frolic");
+
+        // RED, from the same vigil.
+        let (mut pet, t) = vigil(t0);
+        assert!(pet.vigil, "the fixture is the same crouch");
+        pet.note_command_done(t, true, Some(40_000));
+        let mut t_r = t;
+        let mut drooped = false;
+        for _ in 0..40 {
+            t_r += Duration::from_millis(16);
+            pet.note_executing(t_r, false);
+            if pet.tick(sense(t_r, Some((10, 20)))).action == PetAction::Droop {
+                drooped = true;
+                break;
+            }
+        }
+        assert!(drooped, "a non-zero exit droops — no flight, no party");
+    }
+
+    /// **THE FORGIVEN SUCCESS** (THE VERDICT, sense 1's last clause): a green
+    /// command within [`SULK_FORGIVEN`] of a failure is the BIG cheer whatever
+    /// it ran for. The fix for a broken build is four seconds long; a cat that
+    /// shrugged at it would have understood nothing about the last ten
+    /// minutes.
+    ///
+    /// Before the change, a four-second success after a failure took the
+    /// silent [`CHEER_FAST_CONTENT`] nudge — no latch, no body at all.
+    #[test]
+    fn a_success_soon_after_a_sulk_is_a_big_cheer() {
+        let t = Instant::now();
+        let mut pet = PetBrain::default();
+        pet.note_command_done(t, true, Some(9_000));
+        assert!(pet.pending_sulk, "the failure sulks");
+        pet.pending_sulk = false;
+        pet.note_command_done(t, false, Some(4_000));
+        assert_eq!(
+            pet.pending_cheer,
+            Some(true),
+            "the fix is the BIG cheer, at four seconds, because of what came \
+             four seconds before it"
+        );
+
+        // …and a cold four-second success is still only a nudge.
+        let mut cold = PetBrain::default();
+        cold.note_command_done(t, false, Some(4_000));
+        assert_eq!(
+            cold.pending_cheer,
+            Some(false),
+            "with nothing to forgive, four seconds is an ordinary cheer"
+        );
     }
 
     fn sense(now: Instant, caret: Option<(u16, u16)>) -> PetSense {
@@ -16442,6 +17213,102 @@ mod tests {
             frolicked |= f.action == PetAction::Frolic;
         }
         assert!(frolicked, "and frolics one beat on the landing");
+    }
+
+    /// **THE PET NOTICES THE HAND FINDING ITS FLOW — ONCE, AND QUIETLY.**
+    ///
+    /// One Frolic per flow ENTRY, and that is the whole of what flow buys the
+    /// cat: no motes (the ♪/♥ shower is a green build's), no wake (a sleeping
+    /// cat is not roused to be told the typing is fast), no second frolic
+    /// while the run continues, and NOTHING AT ALL on the way out — the pet
+    /// hears entries, and there is no exit note to hear.
+    ///
+    /// The idle law is unchanged either way: a latch nobody consumed expires
+    /// on [`FLOW_LATCH_TTL`] and the cat settles to a still frame exactly as
+    /// it did before, because flow never asks for a frame of its own.
+    #[test]
+    fn the_pet_frolics_once_when_the_hand_finds_its_flow() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 20);
+        let (mut t, f) = idle(&mut pet, t, (4, 22), SIT_AFTER + 0.2);
+        assert!(f.action.settled(), "fixture: a settled, awake cat");
+        assert!(
+            f.motes.iter().all(Option::is_none),
+            "fixture: no light on glass"
+        );
+
+        // ONE ENTRY: the host drains `take_flow_entry` and forwards it once.
+        pet.note_flow(t);
+        let (mut frolics, mut lit) = (0u32, 0u32);
+        for _ in 0..40u16 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 22))));
+            if f.action == PetAction::Frolic {
+                frolics += 1;
+            }
+            lit += f.motes.iter().flatten().count() as u32;
+        }
+        assert!(frolics > 0, "the cat notices the hand finding its flow");
+        assert_eq!(lit, 0, "…and it is a POSE, not a light: {lit} motes flew");
+
+        // THE RUN CONTINUES — no second note, so no second frolic. (The host
+        // sends one per ENTRY; `take_flow_entry` is an edge, not a level.)
+        let settled = idle(&mut pet, t, (4, 22), FROLIC_HOLD + 1.0).0;
+        let mut again = 0u32;
+        let mut t2 = settled;
+        for _ in 0..120u16 {
+            t2 += Duration::from_millis(16);
+            if pet.tick(sense(t2, Some((4, 22)))).action == PetAction::Frolic {
+                again += 1;
+            }
+        }
+        assert_eq!(again, 0, "one entry is one frolic, not a standing state");
+
+        // NOTHING ON EXIT: leaving flow forwards no note, so the surface a
+        // host could use to tell the cat about it does not exist — the only
+        // stimulus is the entry it just consumed, and it is spent.
+        assert!(
+            pet.pending_flow.is_none(),
+            "the entry latch is spent, and no exit ever sets one"
+        );
+
+        // A SLEEPING CAT IS NOT WOKEN. The latch is dropped where the cheer's
+        // would have been kept across the wake.
+        let (mut pet, t, f) = a_sleeping_cat(false);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: asleep");
+        let (mut t, _) = idle(&mut pet, t, SLEEPER_CARET, 0.2);
+        pet.note_flow(t);
+        for _ in 0..60u16 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some(SLEEPER_CARET)));
+            assert_eq!(
+                f.action,
+                PetAction::Sleep,
+                "flow never wakes a sleeping cat"
+            );
+        }
+
+        // IDLE → EXACTLY ZERO, unchanged: an UNCONSUMED latch expires on its
+        // own TTL and never holds the lane open.
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 20);
+        let (t, _) = idle(&mut pet, t, (4, 22), 0.2);
+        pet.note_flow(t);
+        assert!(pet.pending_flow.is_some(), "fixture: the latch is live");
+        assert!(
+            !pet.needs_frames(),
+            "a flow latch buys NO frame — it rides the cadence or expires"
+        );
+        let (t, _) = idle(&mut pet, t, (4, 22), FLOW_LATCH_TTL + 0.2);
+        assert!(pet.pending_flow.is_none(), "an unconsumed latch expires");
+        let (_, f) = idle(&mut pet, t, (4, 22), SLEEP_AFTER + BREATH_WINDOW + 1.0);
+        assert_eq!(f.action, PetAction::Sleep, "and the cat still settles");
+        assert!(
+            f.motes.iter().all(Option::is_none) && !pet.needs_frames(),
+            "…to exactly zero light, asking for no further frame"
+        );
     }
 
     #[test]
@@ -24325,5 +25192,261 @@ mod tests {
             "the follower reached its station at {worst_at_rest} c/s with the caret at \
              rest — it has momentum now, so the drift-brake's gate is worth re-opening"
         );
+    }
+
+    // ── RAINBOW KITTY v2's OFFER, RECEIVED (companion.rs panel #10) ───────
+    //
+    // The four laws of `note_v2_offer`, as sentences. Every one is about the
+    // RECEIVER: v2 mints the offer, the pet decides, and the only thing that
+    // ever crosses back is the star handed over on the paw's landing frame.
+
+    /// A star as the sky names one, at `col` on the pet's own row band.
+    fn offered_star(t: Instant, col: i32) -> StarCatch {
+        StarCatch {
+            x: col as f32 * 10.0 + 5.0,
+            y: 4.0 * 20.0 - 3.0,
+            born: t,
+            col,
+        }
+    }
+
+    /// **(a) THE PERK EDGE.** v2 offers `t₀ + T` — the meteor's ARRIVAL, the
+    /// same instant the landing pin, the arrival flash and the bell read. A
+    /// settled resident takes it THERE: not on the launch, not on the frame
+    /// the offer was noted, and never by moving (D13, owner Q14 "no
+    /// teleport"). The host re-mints the same offer every frame it holds the
+    /// impulse, so the edge must also be spent exactly once.
+    #[test]
+    fn the_meteor_s_perk_reaches_the_resident_at_the_landing_s_own_instant() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = settled_pair(start, 5.0);
+        assert!(pet.action.settled(), "fixture: settled ({:?})", pet.action);
+        // The arrival edge, five frames out — a 90 ms meteor.
+        let perk_at = t + Duration::from_millis(90);
+        let offer = PetOffer {
+            perk_at: Some(perk_at),
+            ..PetOffer::default()
+        };
+        // The twin is the SAME cat on the SAME clock, offered nothing: the
+        // whole of "no relocation" is that the two bodies are at the same
+        // place on the frame the notice lands.
+        let mut perk: Option<(Instant, PetFrame, PetFrame)> = None;
+        let mut twin_perked = false;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            let g = twin.tick(sense(t, Some((4, 12))));
+            // The host's line, after the pet's own tick — and the impulse
+            // slot still holds the SAME meteor, so the same edge is offered
+            // again on the next frame.
+            assert!(pet.note_v2_offer(&offer).is_none(), "a perk is not a catch");
+            twin_perked |= g.action == PetAction::Perk;
+            if f.action == PetAction::Perk && perk.is_none() {
+                perk = Some((t, f, g));
+            }
+        }
+        let (at, f, g) = perk.expect("the offered perk edge reaches the pet");
+        assert!(
+            !twin_perked,
+            "fixture: nothing but the offer can perk this cat"
+        );
+        assert!(
+            at >= perk_at,
+            "the perk landed {:?} BEFORE the arrival — that is the launch, not the landing",
+            perk_at - at
+        );
+        assert!(
+            at - perk_at < Duration::from_millis(17),
+            "the perk landed {:?} after the arrival — later than the first frame at t0+T",
+            at - perk_at
+        );
+        assert_eq!(
+            (f.col.to_bits(), f.row.to_bits(), f.lift.to_bits()),
+            (g.col.to_bits(), g.row.to_bits(), g.lift.to_bits()),
+            "NO RELOCATION (D13, owner Q14): the offered cat is at ({}, {}) and the \
+             un-offered twin at ({}, {}) on the arrival's own frame",
+            f.col,
+            f.row,
+            g.col,
+            g.row
+        );
+    }
+
+    /// **(b) THE CATCH.** A gold m1 within reach of a contented cat is
+    /// latched, played as a reach, and handed BACK exactly once — on the
+    /// paw's landing frame — so the star's life is shortened by exactly one
+    /// catch however long the offer stands.
+    #[test]
+    fn a_gold_star_near_a_contented_cat_is_offered_caught_and_spent_once() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = contented_pair(start, SIT_AFTER + 0.3);
+        assert!(pet.purring(), "fixture: a contented cat ({:?})", pet.action);
+        let star = offered_star(t, pet.col.round() as i32 + 4);
+        // The offer STANDS: v2 re-mints it on every frame the star is in
+        // reach, and the sky may shorten one star's life exactly once.
+        let offer = PetOffer {
+            catch: Some(star),
+            ..PetOffer::default()
+        };
+        let mut caught: Vec<(PetFrame, PetFrame)> = Vec::new();
+        let mut motes = 0usize;
+        for _ in 0..300 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 72))));
+            let g = twin.tick(sense(t, Some((4, 72))));
+            if let Some(back) = pet.note_v2_offer(&offer) {
+                assert_eq!(back, star, "the star handed back is the star offered");
+                motes = f.motes.iter().flatten().count();
+                caught.push((f, g));
+            }
+        }
+        assert_eq!(
+            caught.len(),
+            1,
+            "the offer stood for 300 frames and the star's life may shorten ONCE: {} catches",
+            caught.len()
+        );
+        let (f, g) = caught[0];
+        assert_eq!(
+            f.action,
+            PetAction::Frolic,
+            "the catch is played as the reach, not taken invisibly"
+        );
+        assert_eq!(
+            f.pose,
+            PetSpecies::Cat.skin(PetGlyphId::PetBat),
+            "the paw is out on the landing frame"
+        );
+        assert_eq!(
+            motes,
+            g.motes.iter().flatten().count(),
+            "the reach draws NOTHING: it spawned a mote the un-offered twin did not"
+        );
+        // A REACH IS NOT A TRIP. The body is on the twin's own line, within
+        // a twentieth of a cell of it (the settled follower's ease, which the
+        // Frolic hold pauses exactly as the bored vignette's swipe does), and
+        // NOTHING that could take the cat anywhere was set: no flight, no
+        // play destination, no landing, no pounce latch. That is the whole of
+        // "the pet is offered, never relocated".
+        assert_eq!(f.row.to_bits(), g.row.to_bits(), "the reach changed lines");
+        assert!(
+            (f.col - g.col).abs() < 0.05 && f.lift.to_bits() == g.lift.to_bits(),
+            "a reach is not a trip: the reaching cat is at ({}, {}) and the un-offered \
+             twin at ({}, {})",
+            f.col,
+            f.row,
+            g.col,
+            g.row
+        );
+        assert!(
+            pet.flight.is_none()
+                && pet.play_to.is_none()
+                && pet.play_land.is_none()
+                && !pet.pending_pounce
+                && !pet.pending_big_jump,
+            "the catch set travel: flight {:?}, to {:?}, land {:?}",
+            pet.flight.is_some(),
+            pet.play_to,
+            pet.play_land.is_some()
+        );
+    }
+
+    /// **(c) THE PURR'S HUE.** With the ribbon lit under the cat the tell's
+    /// ♪/♥ wear its snapped stop; with no ribbon light there they keep the
+    /// emitter's own gold and pink. Two brains, one clock, one difference.
+    #[test]
+    fn the_purr_notes_wear_the_ribbon_s_colour_under_the_cat() {
+        const RIBBON: u32 = 0x0000_7FFF;
+        let start = Instant::now();
+        let (mut lit, mut dark, mut t) = contented_pair(start, SIT_AFTER + 0.3);
+        let under = PetOffer {
+            mote_t: Some(0.5),
+            mote_rgb: Some(RIBBON),
+            ..PetOffer::default()
+        };
+        let none = PetOffer::default();
+        let (mut lit_note, mut dark_note) = (None, None);
+        for _ in 0..800 {
+            t += Duration::from_millis(16);
+            let a = lit.tick(sense(t, Some((4, 72))));
+            let b = dark.tick(sense(t, Some((4, 72))));
+            assert!(lit.note_v2_offer(&under).is_none());
+            assert!(dark.note_v2_offer(&none).is_none());
+            let purr = |f: &PetFrame| {
+                f.motes
+                    .iter()
+                    .flatten()
+                    .find(|m| matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart))
+                    .copied()
+            };
+            if lit_note.is_none() {
+                lit_note = purr(&a);
+            }
+            if dark_note.is_none() {
+                dark_note = purr(&b);
+            }
+            if lit_note.is_some() && dark_note.is_some() {
+                break;
+            }
+        }
+        let lit_note = lit_note.expect("fixture: the lit seat floats a ♪ or ♥");
+        let dark_note = dark_note.expect("fixture: the dark seat floats a ♪ or ♥");
+        assert_eq!(
+            lit_note.rgb,
+            Some(RIBBON),
+            "a {:?} over a lit ribbon wears the ribbon's stop",
+            lit_note.kind
+        );
+        assert_eq!(
+            dark_note.rgb, None,
+            "a {:?} with no ribbon under the cat keeps the pet's own colour",
+            dark_note.kind
+        );
+    }
+
+    /// **THE OFFER BUYS NO WAKE.** A latched offer is invisible to both the
+    /// frame train (`needs_frames`) and the coarse offer
+    /// (`next_change_deadline`) — the `note_flow` law, held to for a value
+    /// that arrives from another engine. And the latch is REAL: the same
+    /// parked cat, ticked on to the arrival edge, takes the perk it was
+    /// offered while it slept through no extra frame at all.
+    #[test]
+    fn the_offer_buys_no_wake() {
+        let start = Instant::now();
+        let (mut pet, _twin, mut t) = settled_pair(start, 5.0);
+        assert!(!pet.needs_frames(), "fixture: a parked cat");
+        let horizon = pet
+            .next_change_deadline(t)
+            .expect("fixture: a settled cat names its next step");
+        let perk_at = t + Duration::from_millis(400);
+        let offer = PetOffer {
+            perk_at: Some(perk_at),
+            catch: Some(offered_star(t, pet.col.round() as i32 + 3)),
+            mote_t: Some(0.5),
+            mote_rgb: Some(0x00FF_0000),
+        };
+        assert!(
+            pet.note_v2_offer(&offer).is_none(),
+            "noting is not catching"
+        );
+        assert!(
+            !pet.needs_frames(),
+            "an offer must never pin the frame lane"
+        );
+        assert_eq!(
+            pet.next_change_deadline(t),
+            Some(horizon),
+            "an offer must never move the idle horizon"
+        );
+        // …and it was genuinely LATCHED, not discarded: the very next frame
+        // the cat was already going to draw, it reaches for the star it was
+        // offered while it was parked.
+        let mut reached = false;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((4, 12))));
+            reached |= pet.note_v2_offer(&offer).is_some();
+        }
+        assert!(reached, "a latch that buys no wake is still a latch");
     }
 }

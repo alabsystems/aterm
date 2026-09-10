@@ -5274,18 +5274,25 @@ mod tests {
         let sampler = dev
             .new_sampler(SamplerDesc::LINEAR_CLAMP)
             .expect("linear sampler");
+        // The SHIPPING layout, field for field (`renderer::BloomUniform` /
+        // `bloom.metal`'s `BloomU`): the two radii of the white/chroma split
+        // plus the tail pad that rounds the uniform stride to 32.
         #[repr(C)]
         #[derive(Clone, Copy)]
         struct BloomU {
             texel: [f32; 2],
             strength: f32,
             radius: f32,
+            chroma_radius: f32,
+            _pad: [f32; 3],
         }
         #[expect(clippy::cast_precision_loss, reason = "test extents")]
         let bu = BloomU {
             texel: [1.0 / BW as f32, 1.0 / BH as f32],
             strength: STRENGTH,
             radius: RADIUS,
+            chroma_radius: crate::renderer::bloom_chroma_radius(RADIUS),
+            _pad: [0.0; 3],
         };
         let ubuf = dev.new_buffer(size_of::<BloomU>()).expect("uniform");
         // SAFETY: repr(C) into an exactly-sized fresh shared buffer.

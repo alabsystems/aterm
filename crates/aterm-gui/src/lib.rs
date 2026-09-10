@@ -8224,6 +8224,31 @@ struct WindowState {
     /// gate and the pet must feel a finished command even when no rain is
     /// falling (exit-code empathy is a pet feature, not a rain one).
     pet_last_cmd: Option<(u64, u64)>,
+    /// **THE VERDICT'S ARM** — `(session, the accepted plain-Enter boundary
+    /// this window has already SPENT)`. THE VERDICT is armed by a keyed Enter
+    /// and spent by the first OSC 133/633 `D` after it: a `D` whose session's
+    /// `last_boundary_at` still equals this is a `D` with no armed Enter, and
+    /// it is SILENT — program output, a shell re-emitting its marks, a
+    /// restored session's history. Every light and every sound in the theme
+    /// has a keystroke behind it, and this is the keystroke behind this one.
+    ///
+    /// `None` is "nothing spent yet"; a session change re-baselines it the
+    /// same silent way `pet_last_cmd` does.
+    verdict_spent: Option<(u64, std::time::Instant)>,
+    /// **THE ONE GUARD**: PRISM WAKE's closing
+    /// [`aterm_effects::output_streak::StreakSound::Settle`] exhale is HUSHED
+    /// — the verdict just said the same thing, better. The exhale fires on
+    /// the streak's own momentum drain, which lands a beat AFTER the `D` that
+    /// ended the output; without this the finish of every long command speaks
+    /// twice. The visual ribbon is untouched: only the voice is replaced.
+    ///
+    /// A LATCH and not a deadline, because the exhale has no fixed lateness:
+    /// it fires on the momentum's analytic drain, which is a beat after a
+    /// short burst and up to `StreakConfig::idle_secs` after a stuttering
+    /// one. It is spent by the exhale it swallows, and cleared by the next
+    /// episode's opening pip — so it can only ever silence the exhale of the
+    /// episode that was live when the verdict spoke, and never one after it.
+    verdict_hush: bool,
     /// The pet's LIVE drawn body this frame, `(x0, x1, y0, y1)` right/bottom-
     /// exclusive in FRAME px: `PetFrame::body_px` offset by the effects
     /// origin (plus the focused pane's origin on the composed path), stashed
@@ -10363,6 +10388,8 @@ impl WindowState {
             installed_kitty_asset_fp: 0,
             rain_last_cmd: None,
             pet_last_cmd: None,
+            verdict_spent: None,
+            verdict_hush: false,
             pet_hit_rect: None,
             kitty_tenure: crate::app_kitty::KittyTenure::default(),
             kitty_rung: crate::launch_kitty::CompanionRung::Launch,
@@ -14682,6 +14709,8 @@ impl App {
             // Rebaseline silently on the first tick of the replacement owner.
             ws.pet_last_cmd = None;
             ws.pet_content_seq = None;
+            // THE VERDICT's arm describes the old terminal's Enter, too.
+            ws.verdict_spent = None;
             // The SCROLL ANCHOR belongs to the old terminal for exactly the same
             // reason. Two panes carry independent histories, so diffing the new
             // pane's `scrollback_lines()` against the old pane's total reports a
