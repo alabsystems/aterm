@@ -838,6 +838,22 @@ pub fn download_error_is_rate_limit(error: &str) -> bool {
     error.contains(RATE_LIMIT_ERROR_PREFIX)
 }
 
+/// The marker [`download_bytes`] puts in front of a web-host 404 (`classify_asset_failure`),
+/// so a caller holding only the error string can tell "the release does not carry this
+/// asset" from a broken download.
+const NOT_FOUND_ERROR_PREFIX: &str = "HTTP 404";
+
+/// Whether a [`download_bytes`] / [`download_to`] error is the web host's 404 verdict:
+/// the release exists (the pointer named it) but does not carry the asset that was
+/// asked for. That is the shape of a SOURCE-ONLY channel head — a `vX.Y.0` release the
+/// source publisher minted before the app cut attached its appcast — and the check lane
+/// answers it by electing the newest release that does carry one, never by booking a
+/// `pipeline` failure against a host that answered correctly.
+#[must_use]
+pub fn download_error_is_not_found(error: &str) -> bool {
+    error.starts_with(NOT_FOUND_ERROR_PREFIX)
+}
+
 /// Whether an HTTP status on `url` is GitHub telling this client to slow down. PER HOST:
 /// a 429 is that on every host; a 403 is that ONLY on `api.github.com`, whose asset
 /// endpoint never answers 403 for any other reason to an anonymous public-channel
@@ -1341,6 +1357,14 @@ mod tests {
             "{missing}"
         );
         assert!(!super::download_error_is_rate_limit(&missing));
+        // …and the 404 IS the not-found verdict the check lane's source-only-head
+        // fallback keys on; nothing else is.
+        assert!(super::download_error_is_not_found(&missing));
+        assert!(!super::download_error_is_not_found(&forbidden));
+        assert!(!super::download_error_is_not_found(&throttled));
+        assert!(!super::download_error_is_not_found(
+            "curl asset download failed (exit status: 22): 404"
+        ));
         // A 5xx on the web host is still the retry path, not a verdict.
         assert_eq!(
             super::classify_asset_failure(WEB_ASSET, &curl_err(502)),

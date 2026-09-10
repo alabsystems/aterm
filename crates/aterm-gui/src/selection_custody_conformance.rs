@@ -76,8 +76,11 @@
 //! So THIS module remains the part that carries real weight. It drives real gestures
 //! and real `Terminal::process` batches, projects the engine before and after, and
 //! asserts the model admits the transition — plus negative controls asserting the model
-//! REFUSES the regression members. Deleting `force_selection_invalidation()` from ED 3
-//! in the shipping grid turns it red; that is the standard each case is held to.
+//! REFUSES the regression members. Deleting ED 3's own wholesale-damage call from the
+//! shipping grid (`Grid::discard_history_selection`, which since 2026-09-10 records the
+//! `SelectionDamage::All` that `force_selection_invalidation` used to record here —
+//! without the host-coordinate claim ED 3 was never entitled to) turns it red; that is
+//! the standard each case is held to.
 //!
 //! * `Terminal::post_process`'s `SelectionDamage::All` arm — for
 //!   `WholesaleInvalidate`, driven with real ED 3 (`\x1b[3J`) and RIS (`\x1bc`) bytes.

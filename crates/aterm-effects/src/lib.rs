@@ -123,6 +123,8 @@ pub mod output_streak;
 /// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
 pub mod pet_baker;
 mod pet_stroke;
+/// Bounded, coherent terminal occupancy and text-free content anchors.
+pub mod pet_world;
 /// `@generated` — the checked-in const drawlists for the PET roster (do not edit
 /// by hand). Produced by `cargo run -p aterm-effects --example gen_pet_glyphs`;
 /// kept honest by the `pet_glyphs_gen_matches_assets` drift test. `include!`d for

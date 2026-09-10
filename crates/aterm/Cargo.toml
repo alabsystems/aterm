@@ -24,6 +24,11 @@ aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
 # background check/stage loop (round-11 — a terminal-only Mac used to run NONE
 # of the updater, while install.sh promised automatic updates).
 aterm-update = { path = "../aterm-update" }
+# The atpkg "never checked" read (R3/R4, 2026-09-10): one tiny shared reader of
+# `<prefix>/status.toml` so the session lane says on stderr that packages cannot
+# be updated yet, and spawns the one-shot pass, without reaching into atpkg's
+# internals beyond the file.
+aterm-update-core = { path = "../aterm-update-core" }
 aterm-log = { path = "../aterm-log" }    # stderr logger for the headless update lane
 # THE compiler gate (crates/trust-gate): a build script with no dependencies
 # that refuses any non-Trust rustc FIRST, with the one message naming the fix

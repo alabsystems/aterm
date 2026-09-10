@@ -336,7 +336,15 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
-        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), true);
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), false);
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
@@ -355,7 +363,15 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
-        self.damage_selection_visible_rows_ext(0, cursor_row, true);
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        self.damage_selection_visible_rows_ext(0, cursor_row, false);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
     }
@@ -387,8 +403,16 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
         let last = self.storage.visible_rows.saturating_sub(1);
-        self.damage_selection_visible_rows_ext(0, last, true);
+        self.damage_selection_visible_rows_ext(0, last, false);
         // ED 2's blanks are genuine — an in-flight offloaded reflow must not
         // deficit-fill the cleared screen from pre-erase history (fixwave5).
         self.invalidate_pending_fill_target();
@@ -438,10 +462,14 @@ impl Grid {
             self.storage.ring_extras.clear();
             self.storage.display_offset = 0;
             self.storage.mark_content_full();
-            // SELECTION CUSTODY Phase 4: ED 3 destroys the coordinate space itself —
-            // history is discarded wholesale — so no band can describe it. `All` is
-            // the honest answer, and `force_selection_invalidation` is now its name.
-            self.force_selection_invalidation();
+            // SELECTION CUSTODY Phase 4: ED 3 discards history wholesale, so no
+            // band can describe it and `All` is the honest answer. It does NOT
+            // move a live coordinate — the visible rows are preserved in place
+            // and `absolute_row_counter` never moves — so it must not bump
+            // `invalidation_epoch` (2026-09-10, the `clear` command's residual;
+            // see `discard_history_selection` and
+            // `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`).
+            self.discard_history_selection();
             // ED 3 touches only scrollback, not the active line — deferred wrap
             // survives (xterm preserves it; see erase_to_end_of_line).
             debug_assert_eq!(self.storage.display_offset, 0);
@@ -483,8 +511,9 @@ impl Grid {
         // as scrollback rows don't have extras (they're saved as Line objects)
         self.storage.mark_content_full();
         // SELECTION CUSTODY Phase 4: as above — ED 3 discards history wholesale, so
-        // the damage is `All`, not a band.
-        self.force_selection_invalidation();
+        // the damage is `All`, not a band. And as above, evicting history moves no
+        // live coordinate: see `discard_history_selection`.
+        self.discard_history_selection();
         // ED 3 touches only scrollback, not the active line — deferred wrap
         // survives (xterm preserves it; see erase_to_end_of_line).
         debug_assert_eq!(self.storage.display_offset, 0);
@@ -543,7 +572,15 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
-        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), true);
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), false);
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
@@ -563,7 +600,15 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
-        self.damage_selection_visible_rows_ext(0, cursor_row, true);
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+        self.damage_selection_visible_rows_ext(0, cursor_row, false);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
     }
@@ -580,8 +625,16 @@ impl Grid {
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
+        // `moves_coordinates = false`: an erase REWRITES CELLS IN PLACE. Row r,
+        // column c names the same cell before and after, so nothing a host cached
+        // about grid coordinates went stale (the rule is stated on the parameter
+        // itself). Claiming `true` bumped `invalidation_epoch`, which the GUI
+        // reads to reset the cursor effects — the owner's 2026-09-10 "when the
+        // screen is refreshed the rainbow disapears", fired by every `ESC[J` a
+        // zsh prompt redraw emits. Pinned by
+        // `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
         let last = self.storage.visible_rows.saturating_sub(1);
-        self.damage_selection_visible_rows_ext(0, last, true);
+        self.damage_selection_visible_rows_ext(0, last, false);
         self.storage.mark_content_full();
     }
 
@@ -632,8 +685,11 @@ impl Grid {
 
         // SELECTION CUSTODY Phase 4: DECALN replaces every VISIBLE cell; history is
         // untouched, so a scrollback selection survives.
+        // `moves_coordinates = false` for the same reason the ED family carries
+        // it: replacing every cell's CONTENT moves no row, so no host coordinate
+        // cache went stale.
         let last = self.storage.visible_rows.saturating_sub(1);
-        self.damage_selection_visible_rows_ext(0, last, true);
+        self.damage_selection_visible_rows_ext(0, last, false);
         self.storage.mark_content_full();
         debug_assert_eq!(self.storage.cursor.row, 0);
         debug_assert_eq!(self.storage.cursor.col, 0);

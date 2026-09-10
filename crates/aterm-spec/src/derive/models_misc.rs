@@ -1427,10 +1427,18 @@ pub fn press_custody_model() -> Model {
 /// this enumerates "every legitimate destroyer" would be false.
 ///
 /// `WholesaleInvalidate` is ONE action, not an alt-enter/alt-exit pair, because the
-/// three `force_selection_invalidation` callers outside the screen switch — ED 3,
-/// `clear_scrollback`, and a Kitty unscroll that renumbers history — are one class:
-/// the coordinate space itself is gone, so no band can describe the damage and
-/// `All` is the honest answer.
+/// three engine sites that record `SelectionDamage::All` outside the screen switch —
+/// ED 3 / `clear_scrollback` (`Grid::discard_history_selection`), reflow pullback, and
+/// a Kitty unscroll that renumbers history (`force_selection_invalidation`) — are one
+/// class: the coordinate space the selection named is gone, so no band can describe
+/// the damage and `All` is the honest answer.
+///
+/// Which of the two spellings a site uses is a question about HOST COORDINATES, not
+/// about the selection, and this model is deliberately blind to it: ED 3 evicts
+/// history without moving a live coordinate (2026-09-10 — see
+/// `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`) while a Kitty
+/// unscroll renumbers retained rows and does. Both destroy the selection identically,
+/// which is the only thing `WholesaleInvalidate` claims.
 ///
 /// `Buggy = 1` is the regression FAMILY, one member per destroyer, each falsifying
 /// a NAMED invariant (`derived_ring_ty.rs` asserts that mapping member by member,

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{CustodyTransition, Terminal};
+use aterm_effects::kitty_pet::PetInputKind;
 use aterm_session::sink::{AcceptedOrder, SinkWriter};
 use winit::event::{ElementState, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -1702,6 +1703,9 @@ fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
 /// cosmetic feeds). Pure over the event — no terminal or App state — and it
 /// NEVER gates bytes.
 struct PressClass<'ev> {
+    /// One classified input intent for the resident pet. This is not a claim
+    /// about delivery or changed ink; the post-egress caller admits it once.
+    console_input: Option<PetInputKind>,
     /// Predictive-echo candidate for a BARE printable key (no ⌃/⌥/⌘):
     /// `(Some(glyph), false)` registers a speculative glyph, `(None, true)` is
     /// a Backspace retraction. The predictor's `predict_mode` gate stays at
@@ -2043,7 +2047,30 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
             && !mods.contains(TMods::ALT)
             && !mods.contains(TMods::SUPER)
     );
+    let console_input = if matches!(
+        ev,
+        InputEvent::Key {
+            event_type: aterm_types::keyboard::KeyEventType::Release,
+            ..
+        }
+    ) || inert_modifier
+    {
+        None
+    } else if enter_like {
+        Some(PetInputKind::Submit)
+    } else if backspace || kill_key {
+        Some(PetInputKind::Delete)
+    } else if navigation_key || tab_key {
+        Some(PetInputKind::Navigate)
+    } else if typed.is_some() || ime.is_some() {
+        // A committed IME bundle is ONE event, including a combining-only
+        // edit that changes a glyph without moving the caret.
+        Some(PetInputKind::Text)
+    } else {
+        None
+    };
     PressClass {
+        console_input,
         predict_candidate,
         typed_forward,
         navigation_key,
@@ -3318,6 +3345,7 @@ impl App {
                 // shared by the pre-egress hint/predictor block and the
                 // post-egress cosmetic feeds.
                 let PressClass {
+                    console_input,
                     predict_candidate,
                     typed_forward,
                     navigation_key,
@@ -4124,6 +4152,17 @@ impl App {
                     input::EgressMode::Interactive,
                 );
                 let outcome = egress_to_outcome(receipt.egress);
+                // Successful FIFO admission commits an input INTENT, not a
+                // delivery or edit witness. Inline input needs an accepted
+                // non-empty frame. Neither this note nor its later PTY echo
+                // grants contact with text; the pet can only pay attention.
+                if outcome == InputOutcome::Ok
+                    && (!wrote_inline || receipt.accepted_order().is_some())
+                    && let (Some(now), Some(kind)) = (input_now, console_input)
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    ws.cursor_pet.note_console_input(now, kind);
+                }
                 // A queued key has not crossed the PTY boundary yet, and a
                 // failed inline write never will. Its arrival-time cursor
                 // licences must not be spendable by concurrent program output.
@@ -5163,6 +5202,10 @@ impl App {
         if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
             ws.cursor_glow.revoke_input_hints_at(input_now);
             ws.cursor_trail.revoke_input_hints_at(input_now);
+            // One accepted paste gesture cancels curiosity. It is not a
+            // claim that the asynchronous write landed or changed the grid.
+            ws.cursor_pet
+                .note_console_input(input_now, PetInputKind::Paste);
         }
         InputOutcome::Ok
     }
@@ -14596,6 +14639,175 @@ mod press_path_lock_elision_tests {
                 "…clearing the selection exactly as typing any key does"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pet_console_input_tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aterm_effects::kitty_pet::PetInputKind;
+    use aterm_session::sink::SinkWriter;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    use crate::input::{InputEvent, InputOutcome, PasteFraming, Source};
+    use crate::{App, WindowId, term_lock};
+
+    const CTL: Source = Source::Controller {
+        op: aterm_session::Op::WriteInput,
+    };
+
+    fn observing_app() -> (App, [OwnedFd; 2]) {
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let fds = unsafe { [OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])] };
+        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(fds[1].as_raw_fd())));
+        (app, fds)
+    }
+
+    fn press(key: Key) -> InputEvent {
+        InputEvent::Key {
+            key,
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    fn observed(app: &App) -> (u64, Option<PetInputKind>) {
+        let pet = &app.windows[&WindowId(0)].cursor_pet;
+        (pet.console_input_seq(), pet.console_input_kind())
+    }
+
+    #[test]
+    fn human_and_control_input_note_once_without_caret_travel_or_echo_credit() {
+        for source in [Source::Human, CTL] {
+            let (mut app, _fds) = observing_app();
+            let wid = WindowId(0);
+            let term = app.front_terminal(wid).unwrap().term.clone();
+            term_lock(&term).process(b"old\r");
+            let before = observed(&app).0;
+            assert_eq!(
+                app.input(wid, press(Key::Character('n')), source),
+                InputOutcome::Ok
+            );
+            assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Text)));
+            // An overwrite can return the caret to the same cell; neither this
+            // delayed echo nor a later unrelated repaint is another input.
+            term_lock(&term).process(b"n\r");
+            term_lock(&term).process(b"\x1b[2Kprogram repaint\r");
+            assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Text)));
+        }
+    }
+
+    #[test]
+    fn ime_preview_is_silent_and_each_commit_bundle_notes_once() {
+        let (mut app, _fds) = observing_app();
+        let wid = WindowId(0);
+        let before = observed(&app).0;
+        app.on_ime_preedit(wid, "中文".into(), Some((0, 0)));
+        assert_eq!(observed(&app).0, before);
+        app.on_ime_commit(wid, "中文🙂".into());
+        assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Text)));
+        app.on_ime_commit(wid, "\u{0301}".into());
+        assert_eq!(observed(&app), (before + 2, Some(PetInputKind::Text)));
+        app.on_ime_commit(wid, String::new());
+        assert_eq!(observed(&app).0, before + 2);
+    }
+
+    #[test]
+    fn navigation_and_delete_keep_distinct_intents_at_the_real_seam() {
+        let (mut app, _fds) = observing_app();
+        let wid = WindowId(0);
+        for (key, kind) in [
+            (NamedKey::ArrowLeft, PetInputKind::Navigate),
+            (NamedKey::Home, PetInputKind::Navigate),
+            (NamedKey::Tab, PetInputKind::Navigate),
+            (NamedKey::Backspace, PetInputKind::Delete),
+            (NamedKey::Delete, PetInputKind::Delete),
+            (NamedKey::Enter, PetInputKind::Submit),
+        ] {
+            let before = observed(&app).0;
+            assert_eq!(
+                app.input(wid, press(Key::Named(key)), CTL),
+                InputOutcome::Ok
+            );
+            assert_eq!(observed(&app), (before + 1, Some(kind)));
+        }
+    }
+
+    #[test]
+    fn releases_modifiers_raw_sequences_and_failed_writes_cannot_claim_an_edit() {
+        let (mut app, _fds) = observing_app();
+        let wid = WindowId(0);
+        let before = observed(&app).0;
+        let release = InputEvent::Key {
+            key: Key::Character('x'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Release,
+        };
+        for event in [
+            release,
+            press(Key::Named(NamedKey::ShiftLeft)),
+            InputEvent::Text(String::new()),
+            InputEvent::KeySequence(b"\x1b[D".to_vec()),
+        ] {
+            assert_eq!(app.input(wid, event, CTL), InputOutcome::Ok);
+            assert_eq!(observed(&app).0, before);
+        }
+        let mut failed = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(-1)));
+        let before = observed(&failed).0;
+        assert_eq!(
+            failed.input(wid, press(Key::Character('x')), Source::Human),
+            InputOutcome::WriteFailed
+        );
+        assert_eq!(observed(&failed).0, before);
+    }
+
+    #[test]
+    fn a_paste_and_queued_key_each_commit_one_intent_without_drain_replay() {
+        let (mut app, fds) = observing_app();
+        let wid = WindowId(0);
+        let sink = app.front_terminal(wid).unwrap().sink.clone();
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        let before = observed(&app).0;
+        for text in ["", "\x1b\x03\u{009b}\x7f"] {
+            assert_eq!(
+                app.input(
+                    wid,
+                    InputEvent::Paste(text.into(), PasteFraming::AtDrain),
+                    Source::Human
+                ),
+                InputOutcome::Ok
+            );
+            assert_eq!(observed(&app).0, before);
+        }
+        assert_eq!(
+            app.input(
+                wid,
+                InputEvent::Paste("a whole pasted sentence".into(), PasteFraming::AtDrain),
+                Source::Human
+            ),
+            InputOutcome::Ok
+        );
+        assert_eq!(observed(&app), (before + 1, Some(PetInputKind::Paste)));
+        assert_eq!(
+            app.input(wid, press(Key::Character('x')), CTL),
+            InputOutcome::Ok
+        );
+        assert_eq!(observed(&app), (before + 2, Some(PetInputKind::Text)));
+        drop(pin);
+        for _ in 0..200 {
+            if !super::paste_order::is_ordering(fds[1].as_raw_fd()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(fds[1].as_raw_fd()));
+        assert_eq!(observed(&app), (before + 2, Some(PetInputKind::Text)));
     }
 }
 

@@ -39,6 +39,10 @@ pub const SYSTEM_PREFIX: &str = "system: ";
 pub const SYSTEM_TAIL: &str = " — not managed by aterm";
 /// The head of an extra that has not been opted in to.
 pub const EXTRA_PREFIX: &str = "extra — not installed";
+/// The whole row of an AGENT PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) the pass has not
+/// installed yet: default-set on this client, so it is COMING — never `extra — not
+/// installed (opt in: …)`, the row an older pass wrote under the opt-in policy.
+pub const AGENT_INSTALLING: &str = "agent program — installing";
 /// The head of a member obtained through another protocol.
 pub const INSTALLED_VIA_PREFIX: &str = "installed via ";
 /// The head of a member waiting on elevation.
@@ -47,6 +51,12 @@ pub const NEEDS_ADMIN_PREFIX: &str = "needs admin";
 pub const UNAVAILABLE_PREFIX: &str = "unavailable on ";
 /// The hint an index row that names none falls back to.
 pub const UNAVAILABLE_DEFAULT_HINT: &str = "no build is published for this target";
+/// The whole row of a member whose channel PIN is on the `yanked` list or below
+/// `min_build` ([`crate::gate::ApplyDecision::Tombstone`]): there is no safe build, so
+/// nothing installs and a live copy is tombstoned. One spelling for the update lane and
+/// both default-set arms, so `which`/`doctor`/Settings read the same words — a
+/// `tombstoned:` prefix, which doctor counts as a FAULT (it is one: the fix is upstream).
+pub const TOMBSTONED_PIN: &str = "tombstoned: pin yanked/below floor";
 /// The head of a member waiting on one of its `requires`: `blocked by <dep>: <dep state>`.
 /// Distinct from the `blocked:` FAULT prefix `doctor` matches (`blocked: no build for this
 /// architecture`, the toolset-wide verdict): a space, not a colon, follows the word.
@@ -95,6 +105,13 @@ pub fn extra_not_installed(name: &str) -> String {
     s.push_str(name);
     s.push(')');
     s
+}
+
+/// `agent program — installing` ([`AGENT_INSTALLING`]): the one row a wanted agent program
+/// carries between adoption and its install.
+#[must_use]
+pub fn agent_installing() -> String {
+    String::from(AGENT_INSTALLING)
 }
 
 /// `installed via <protocol>: <path>`.

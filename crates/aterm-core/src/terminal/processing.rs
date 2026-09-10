@@ -1086,9 +1086,13 @@ mod tests {
     /// cells from the other buffer. One batch per spelling, so each bump is
     /// attributable.
     ///
-    /// Delete the four calls instead of replacing them and five of these six fail.
-    /// Only 1049-ENTER survives — its `new_grid.erase_screen()` bumps the epoch by
-    /// itself — which makes it this test's built-in vacuity control.
+    /// Delete the four calls instead of replacing them and ALL SIX fail. That was
+    /// five of six until 2026-09-10: 1049-ENTER used to survive on its
+    /// `new_grid.erase_screen()`, which bumped the epoch by itself. It no longer
+    /// does — an erase rewrites cells in place and moves nothing
+    /// (`an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`) —
+    /// so the switch's own explicit call is now the only thing holding this up,
+    /// which is exactly what the test is for.
     #[test]
     fn every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once() {
         let mut term = TerminalBuilder::new()
@@ -1116,6 +1120,242 @@ mod tests {
                 "{spelling:?}: a buffer swap is not a translation the host can apply"
             );
         }
+    }
+
+    /// **D2 — the owner, 2026-09-10: "when the screen is refreshed the rainbow
+    /// disapears".** An ERASE REWRITES CELLS IN PLACE AND MOVES NOTHING, so it
+    /// invalidates no host-cached grid COORDINATE.
+    ///
+    /// That is not a new rule; it is the rule `damage_selection_visible_rows_ext`
+    /// already documents at its `moves_coordinates` parameter ("A scroll or
+    /// line-edit moves rows; an erase or a rectangle op rewrites cells in place
+    /// and moves nothing"). Every ED spelling passed `true` anyway. The flag sets
+    /// `coordinates_invalidated`, which this function folds into
+    /// `invalidates_coordinates`, which bumps `ContentScrollState::invalidation_epoch`
+    /// — and `invalidation_epoch` is exactly what the GUI's
+    /// `cursor_effect_scroll_decision` reads to call `cursor_glow.reset()`. So a
+    /// bare `ESC[J` from a zsh prompt redraw (measured: four per interaction)
+    /// annihilated the whole earned rainbow ribbon with the caret still, the grid
+    /// unchanged and the terminal the same one.
+    ///
+    /// Row `r`, column `c` names the same cell before and after every sequence
+    /// below, which is the whole content of the claim. The EL family and DECERA
+    /// are the built-in refutation controls — they erase the same cells and were
+    /// always honest — and the scroll at the end is the vacuity control: the epoch
+    /// must still move when rows really do move.
+    #[test]
+    fn an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate() {
+        // ED and its selective twin, every spelling, plus DECALN — which
+        // overwrites all 24x80 cells with 'E' and still moves no row.
+        for spelling in [
+            &b"\x1b[J"[..],   // ED 0
+            &b"\x1b[0J"[..],  // ED 0, explicit
+            &b"\x1b[1J"[..],  // ED 1
+            &b"\x1b[2J"[..],  // ED 2
+            &b"\x1b[?J"[..],  // DECSED 0
+            &b"\x1b[?1J"[..], // DECSED 1
+            &b"\x1b[?2J"[..], // DECSED 2
+            &b"\x1b#8"[..],   // DECALN
+        ] {
+            let mut term = TerminalBuilder::new()
+                .size(4, 12)
+                .ring_buffer_size(8)
+                .build();
+            term.process(b"\x1b[2;1Hthe quick");
+            let before = term.content_scroll_state();
+            term.process(spelling);
+            let after = term.content_scroll_state();
+            assert_eq!(
+                after.invalidation_epoch, before.invalidation_epoch,
+                "{spelling:?} rewrites cells in place: no host coordinate went stale"
+            );
+            assert_eq!(
+                after.uniform_up_rows, before.uniform_up_rows,
+                "{spelling:?} is not a translation either"
+            );
+        }
+
+        // THE REFUTATION CONTROLS: the neighbouring erases that were always
+        // honest. If the assertion above ever passes for the wrong reason (the
+        // epoch stops moving at all), these still pass and the vacuity control
+        // below fails, which is how the pin stays readable.
+        for spelling in [
+            &b"\x1b[K"[..],          // EL 0
+            &b"\x1b[2K"[..],         // EL 2
+            &b"\x1b[1;1;4;12$z"[..], // DECERA over the whole screen
+        ] {
+            let mut term = TerminalBuilder::new()
+                .size(4, 12)
+                .ring_buffer_size(8)
+                .build();
+            term.process(b"\x1b[2;1Hthe quick");
+            let before = term.content_scroll_state();
+            term.process(spelling);
+            assert_eq!(
+                term.content_scroll_state().invalidation_epoch,
+                before.invalidation_epoch,
+                "{spelling:?} was already honest and must stay so"
+            );
+        }
+
+        // VACUITY CONTROL: a line-edit really does move rows, so the epoch must
+        // still move. Delete the fix and this passes; delete the SIGNAL and this
+        // is the test that catches it.
+        let mut term = TerminalBuilder::new()
+            .size(4, 12)
+            .ring_buffer_size(8)
+            .build();
+        term.process(b"\x1b[2;1Hthe quick");
+        let before = term.content_scroll_state();
+        term.process(b"\x1b[1;1H\x1b[L"); // IL — rows below the cursor move down
+        assert_eq!(
+            term.content_scroll_state().invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "an insert-line MOVES rows and must still invalidate host coordinates"
+        );
+    }
+
+    /// **D2's residual — the `clear` COMMAND.** DISCARDING SCROLLBACK EVICTS
+    /// HISTORY; IT MOVES NO LIVE COORDINATE.
+    ///
+    /// Ctrl-L was fixed by
+    /// `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`:
+    /// zsh's Ctrl-L sends terminfo's `clear=`, `ESC[H ESC[2J`, and an ED moves
+    /// nothing. The `clear` COMMAND sends `ESC[3J ESC[H ESC[2J`, and the leading
+    /// ED 3 kept cliffing the ribbon on its own.
+    ///
+    /// ED 3 reached `Grid::erase_scrollback`, which called
+    /// `force_selection_invalidation` — three signals under one name:
+    /// `SelectionDamage::All`, the `content_scroll_delta == i32::MAX` sentinel,
+    /// and `coordinates_invalidated`. The last two each independently force
+    /// `invalidates_coordinates` in `post_process`, which bumps
+    /// `ContentScrollState::invalidation_epoch`, which is what the GUI's
+    /// `cursor_effect_scroll_decision` reads to call `cursor_glow.reset()`.
+    ///
+    /// **The live viewport does not move, and the code says so.**
+    /// `erase_scrollback` copies visible rows `[live_top, live_top + visible_rows)`
+    /// into `new_rows[0..visible_rows]` and sets `ring_head = 0`, `total_lines =
+    /// visible_rows`. With `display_offset` at 0 — which the SCR-1 prologue
+    /// guarantees for the whole of a processing batch (`processing.rs`: "we reset
+    /// to 0 for the duration") — `row_index(i)` reads `(ring_head + total_lines -
+    /// visible_rows + i)`, i.e. `(live_top + i)` before and `i` after: the SAME
+    /// row. It never touches `absolute_row_counter` or `visible_rows`, so
+    /// `visible_to_absolute(i)` is unchanged too. Both are asserted below, because
+    /// they are the whole content of the claim.
+    ///
+    /// What genuinely changes is `oldest_absolute_row()`, which rises to the top
+    /// visible row: history is EVICTED. Eviction is not renumbering — the Kitty
+    /// unscroll that really does renumber retained history has its own
+    /// `history_renumber_epoch` (`scroll_unscroll.rs`) and is untouched here.
+    ///
+    /// So ED 3 keeps `SelectionDamage::All` — no band can describe history that no
+    /// longer exists — and stops claiming a coordinate move. The selection control
+    /// below is not decoration: it is what stops this pin passing because the
+    /// signal was deleted rather than corrected.
+    #[test]
+    fn discarding_scrollback_evicts_history_and_moves_no_live_coordinate() {
+        use crate::selection::{SelectionSide, SelectionType};
+
+        // ED 3 alone, and the `clear` command's exact three-escape sequence.
+        for spelling in [&b"\x1b[3J"[..], &b"\x1b[3J\x1b[H\x1b[2J"[..]] {
+            let mut term = TerminalBuilder::new()
+                .size(4, 12)
+                .ring_buffer_size(64)
+                .build();
+            for i in 0..20 {
+                term.process(format!("line-{i}\r\n").as_bytes());
+            }
+            term.process(b"\x1b[2;1Hthe quick");
+            assert!(
+                term.grid().scrollback_lines() > 0,
+                "precondition: there is history for {spelling:?} to discard"
+            );
+
+            let rows = term.grid().rows();
+            let before = term.content_scroll_state();
+            let live_before: Vec<(u64, Option<String>)> = (0..rows)
+                .map(|r| (term.grid().visible_to_absolute(r), term.row_text(r.into())))
+                .collect();
+
+            term.process(spelling);
+
+            let after = term.content_scroll_state();
+            assert_eq!(
+                after.invalidation_epoch, before.invalidation_epoch,
+                "{spelling:?} discards HISTORY: no live host coordinate went stale"
+            );
+            assert_eq!(
+                after.uniform_up_rows, before.uniform_up_rows,
+                "{spelling:?} is not a translation either"
+            );
+            assert_eq!(
+                term.grid().scrollback_lines(),
+                0,
+                "{spelling:?} really did discard the scrollback"
+            );
+            // ED 2 in the second spelling blanks the live rows, so compare TEXT
+            // only for the spelling that leaves them alone. The absolute
+            // numbering is compared for both — that is the coordinate claim.
+            let live_after: Vec<(u64, Option<String>)> = (0..rows)
+                .map(|r| (term.grid().visible_to_absolute(r), term.row_text(r.into())))
+                .collect();
+            let abs_before: Vec<u64> = live_before.iter().map(|(a, _)| *a).collect();
+            let abs_after: Vec<u64> = live_after.iter().map(|(a, _)| *a).collect();
+            assert_eq!(
+                abs_before, abs_after,
+                "{spelling:?}: visible row r must keep its absolute number"
+            );
+            if spelling == b"\x1b[3J" {
+                assert_eq!(
+                    live_before, live_after,
+                    "ED 3 alone: visible row r, column c is the same cell before and after"
+                );
+            }
+        }
+
+        // THE CONTROL THAT STOPS THIS PIN GOING VACUOUS. ED 3 must still destroy
+        // the selection: the coordinate space it was anchored in is gone, and
+        // `SelectionDamage::All` is deliberately KEPT. Delete the whole
+        // `force_selection_invalidation` call rather than correcting it and this
+        // is what fails (and with it the selection-custody conformance's
+        // `WholesaleInvalidate`, driven with these same bytes).
+        let mut term = TerminalBuilder::new()
+            .size(4, 12)
+            .ring_buffer_size(64)
+            .build();
+        for i in 0..20 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        {
+            let sel = term.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        assert!(
+            term.text_selection().has_selection(),
+            "precondition: a selection exists to destroy"
+        );
+        term.process(b"\x1b[3J");
+        assert!(
+            !term.text_selection().has_selection(),
+            "ED 3 discards the coordinate space the selection named: it must still clear"
+        );
+
+        // VACUITY CONTROL: an op that really does move rows must still bump the
+        // epoch. Delete the SIGNAL instead of the lie and this is the failure.
+        let mut term = TerminalBuilder::new()
+            .size(4, 12)
+            .ring_buffer_size(64)
+            .build();
+        term.process(b"\x1b[2;1Hthe quick");
+        let before = term.content_scroll_state();
+        term.process(b"\x1b[1;1H\x1b[L");
+        assert_eq!(
+            term.content_scroll_state().invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "an insert-line MOVES rows and must still invalidate host coordinates"
+        );
     }
 
     #[test]

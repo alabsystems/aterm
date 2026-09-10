@@ -34,6 +34,29 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
+/// THE ONE WAY THIS FILE SPAWNS `aterm --session` (2026-09-10 review). The session
+/// lane reads the machine's atpkg prefix under `$HOME` and may spawn a DETACHED
+/// `aterm pkg update` against it; run as-is from `cargo test`, that pass rewrote
+/// the owner's REAL `<prefix>/status.toml`. Every launch here therefore gets (a)
+/// `ATPKG_DISABLE=1`, which the lane honours before it resolves a store, and (b) a
+/// SCRATCH `HOME` under the temp dir, so even a binary that ignored the knob could
+/// only touch a throwaway prefix. `/bin/sh` is the shell (a known POSIX shell,
+/// env-independent), and piped stdio still routes to the SESSION, not the window.
+#[cfg(unix)]
+fn session_command(test: &str) -> Command {
+    let home = std::env::temp_dir().join(format!(
+        "aterm-protected-spawn-{test}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).expect("create the scratch HOME");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    cmd.arg("--session")
+        .env("SHELL", "/bin/sh")
+        .env("HOME", &home)
+        .env("ATPKG_DISABLE", "1");
+    cmd
+}
+
 /// Bounded replacement for `Child::wait_with_output`, shared by every test in
 /// this file. Dedicated threads drain the child's stdout/stderr pipes into
 /// buffers (so the child can never stall on a full pipe while we wait), and the
@@ -110,9 +133,7 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
 #[cfg(unix)]
 #[test]
 fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aterm"))
-        .arg("--session") // piped stdio must still be the SESSION, not the window
-        .env("SHELL", "/bin/sh") // a known POSIX shell — env-independent
+    let mut child = session_command("protected")
         .env_remove("ATERM_CONTAINMENT_MODE") // default User mode: no sandbox, fast
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -156,10 +177,8 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
 #[test]
 fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
     let run = |model: Option<&str>| -> String {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-        cmd.arg("--session")
-            .env("SHELL", "/bin/sh")
-            .env("ATERM_VERBOSE", "1") // the epilogue is the observable
+        let mut cmd = session_command("model");
+        cmd.env("ATERM_VERBOSE", "1") // the epilogue is the observable
             .env_remove("ATERM_CONTAINMENT_MODE")
             .env_remove("ATERM_SESSION_MODEL")
             .stdin(Stdio::piped())
@@ -213,9 +232,7 @@ fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
 #[cfg(target_os = "macos")]
 #[test]
 fn cli_runs_under_the_os_sandbox_in_containment_mode() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aterm"))
-        .arg("--session") // piped stdio must still be the SESSION, not the window
-        .env("SHELL", "/bin/sh")
+    let mut child = session_command("containment")
         .env("ATERM_CONTAINMENT_MODE", "containment")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -252,9 +269,7 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
 #[cfg(unix)]
 #[test]
 fn malformed_containment_mode_fails_closed_not_open() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_aterm"))
-        .arg("--session") // piped stdio must still be the SESSION, not the window
-        .env("SHELL", "/bin/sh")
+    let mut child = session_command("malformed")
         .env("ATERM_CONTAINMENT_MODE", "definitely-not-a-real-mode")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

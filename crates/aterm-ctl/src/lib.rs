@@ -4312,9 +4312,13 @@ fn exchange(
             Some(n) => n,
             None => return Err(malformed_header_error(status_line)),
         };
-        // Mirror the zero-count stderr hint below: a silent empty body is
-        // indistinguishable from a failed call.
-        if nbytes == 0 {
+        // `inbox get` may carry `truncated=1 len=<true-size>`: the body is
+        // complete AS HELD by this endpoint, not necessarily the whole message.
+        // Preserve its complete header on stderr while stdout stays byte-exact.
+        // Other verbs retain their existing empty-body hint.
+        if verb == "inbox" {
+            stderr_line(status_line)?;
+        } else if nbytes == 0 {
             let mut msg = String::from(status_line);
             msg.push_str(" (");
             msg.push_str(verb);
@@ -4400,7 +4404,13 @@ fn exchange(
         // Built by hand (byte-identical to the previous
         // `eprintln!("aterm-ctl: {status_line} ({verb}: no results)")`) so the
         // strict Trust gate never sees an inline `format_args!`.
-        if count == 0 {
+        // Inbox headers carry hold/seen/dropped/pending even with nonempty
+        // results. Dropping that header hid the facts a consumer needs before
+        // acknowledging a prefix. Emit it for BOTH empty and nonempty inboxes;
+        // keep stdout as rows and avoid a duplicate empty-result diagnostic.
+        if verb == "inbox" {
+            stderr_line(status_line)?;
+        } else if count == 0 {
             let mut msg = String::from(status_line);
             msg.push_str(" (");
             msg.push_str(verb);

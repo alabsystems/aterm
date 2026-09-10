@@ -23918,6 +23918,7 @@ mod tests {
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
             seams: Vec::new(),
+            last_success_at: String::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -23959,6 +23960,7 @@ mod tests {
                 index_source: "alabsystems/aterm".to_string(),
                 outcome: "up to date".to_string(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs: std::collections::BTreeMap::new(),
             }),
             &[],
@@ -24114,6 +24116,7 @@ mod tests {
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
             seams: Vec::new(),
+            last_success_at: String::new(),
             programs,
         };
         let mut service = crate::packages_screen::PackagesService::new();
@@ -24355,7 +24358,7 @@ mod tests {
     /// with vendor · license · size; §17.8's door): a store with a default member, an
     /// extra awaiting consent and the two admin rows derives three group headings, an
     /// Install control on the extra and on each admin row (macOS) — and the controls
-    /// dispatch the typed doors: the extra's `InstallExtra { codex }`, the admin control
+    /// dispatch the typed doors: the extra's `InstallExtra { vendorx }`, the admin control
     /// on `brew` the door for `clt` THEN `brew`. A forged action id for a name that is
     /// not waiting is refused in user voice without an effect.
     #[test]
@@ -24364,7 +24367,11 @@ mod tests {
             let mut programs = std::collections::BTreeMap::new();
             for (name, state, build) in [
                 ("ay", atpkg::state::managed(1971, 41), Some(1971)),
-                ("codex", atpkg::state::extra_not_installed("codex"), None),
+                (
+                    "vendorx",
+                    atpkg::state::extra_not_installed("vendorx"),
+                    None,
+                ),
                 ("clt", atpkg::state::needs_admin("clt"), None),
                 (
                     "brew",
@@ -24388,6 +24395,7 @@ mod tests {
                 index_source: "alabsystems/aterm".to_string(),
                 outcome: "up to date".to_string(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs,
             };
             let mut service = crate::packages_screen::PackagesService::new();
@@ -24417,7 +24425,7 @@ mod tests {
                 "packages/programs/group/default-set",
                 "packages/programs/ay",
                 "packages/programs/group/extras",
-                "packages/programs/codex",
+                "packages/programs/vendorx",
                 "packages/programs/group/needs-admin",
                 "packages/programs/brew",
                 "packages/programs/clt",
@@ -24431,15 +24439,15 @@ mod tests {
             "ay  ·  build 1971  ·  managed 1971 — pinned by index 41"
         );
         assert!(line("packages/programs/ay").install.is_none());
-        let codex = line("packages/programs/codex");
+        let vendorx = line("packages/programs/vendorx");
         assert_eq!(
-            codex.text,
-            "codex  ·  extra — not installed (opt in: aterm pkg install codex)  ·  OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB"
+            vendorx.text,
+            "vendorx  ·  extra — not installed (opt in: aterm pkg install vendorx)"
         );
         assert_eq!(
-            codex.install,
+            vendorx.install,
             Some(ProgramInstall {
-                action: "packages/extras/install/codex".to_string(),
+                action: "packages/extras/install/vendorx".to_string(),
                 busy: PackagesBusy::InstallExtra,
             })
         );
@@ -24523,15 +24531,15 @@ mod tests {
             state.feedback.clone().unwrap_or_default()
         };
         assert_eq!(
-            press(&mut runtime, "packages/extras/install/codex"),
+            press(&mut runtime, "packages/extras/install/vendorx"),
             Some(crate::native_app::PackagesRequest::InstallExtra {
-                name: "codex".to_string()
+                name: "vendorx".to_string()
             })
         );
         assert_eq!(
             feedback(&runtime),
-            "Installing codex (OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB)…",
-            "the press names the vendor"
+            "Installing vendorx…",
+            "an unauthored extra installs under its bare name"
         );
         assert_eq!(
             press(&mut runtime, "packages/extras/install/ay"),

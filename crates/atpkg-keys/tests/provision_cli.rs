@@ -991,6 +991,7 @@ fn setup_over_a_real_terminal_shows_the_phrase_there_and_never_on_stdout() {
 /// and this proves the loop is survivable: mistype, fix the paper, proceed.
 #[test]
 fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
+    const RETYPE_PROMPT: &str = "retype the phrase FROM YOUR PAPER (echo off; spaces ignored; Ctrl-C aborts, nothing is armed): ";
     let dir = scratch("setup-retype-mismatch");
     std::fs::write(p(&dir, "pins.rs"), pins_fixture("")).expect("unarmed fixture");
 
@@ -1015,15 +1016,30 @@ fn a_mistyped_retype_reshows_the_phrase_and_a_correct_one_arms() {
     let mut typed_right = false;
     loop {
         pty.drain(&mut terminal);
-        if !typed_wrong && terminal.contains("retype the phrase FROM YOUR PAPER") {
+        if !typed_wrong && terminal.contains(RETYPE_PROMPT) {
             // A valid 52-character phrase that is not the shown one.
             let wrong = "7".repeat(51) + "0";
             pty.type_line(&wrong);
             typed_wrong = true;
         }
-        if typed_wrong && !typed_right && terminal.contains("NO MATCH") {
-            // The re-shown phrase is the fix path: read it as the operator would.
-            let phrase = phrase_on(&terminal).expect("the phrase is re-shown after NO MATCH");
+        if typed_wrong
+            && !typed_right
+            && let Some((_, retry)) = terminal.split_once("NO MATCH")
+            && retry.contains(RETYPE_PROMPT)
+        {
+            // The retry switches terminal mode with TCSAFLUSH before printing
+            // its prompt. Sending on NO MATCH alone races that flush and loses
+            // the correction. Wait for this fresh complete prompt, and read
+            // only its re-shown phrase rather than the initial ceremony line.
+            let phrase = phrase_on(retry).expect("the phrase is re-shown after NO MATCH");
+            let unarmed = std::fs::read_to_string(p(&dir, "pins.rs")).unwrap();
+            assert!(
+                read_anchor(&unarmed, MASTER_ANCHOR)
+                    .unwrap()
+                    .members
+                    .is_empty(),
+                "a wrong retype must leave the master anchor unarmed"
+            );
             pty.type_line(&phrase);
             typed_right = true;
         }

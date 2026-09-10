@@ -502,9 +502,21 @@ second so new instances federate too:
 `GAP` frames are dropped — `events` is a lossy digest by design.
 
 `exec` reads `@<sid> <verb> [args…]` lines from stdin (blank/`#` skipped) and emits
-`{"subject":"/fleet/commands/<sid>/result","sid":"…","ok":true,"reply":"…"}`. Everything
-after the verb is passed as **one** argument, so payload spacing survives. `reply` is stdout
-on success, stderr on failure — so a `turn` verdict lands in `reply` only when it failed.
+`{"subject":"/fleet/commands/<sid>/result","sid":"…","ok":true,"exit_code":0,"stdout":"…","stderr":"…","reply":"…"}`.
+Everything after the verb is passed as **one** argument, so payload spacing survives.
+Read `stdout` for a returned screen and `stderr` for the `turn` verdict, including on
+success. `exit_code` is null when no numeric child exit status exists. The legacy `reply`
+is still trimmed stdout on success and trimmed stderr on failure. The batch exits 1 if
+any child exits nonzero, including 124, but continues to emit results for later commands.
+That is an aggregate CLI-completion verdict, not proof that a target task failed: 124 may
+follow a successful submission or a client timeout with an uncertain result. Inspect
+each record and reconcile the target; never retry the whole batch on its exit code alone.
+The text fields replace invalid UTF-8 with U+FFFD; use the direct CLI for exact binary
+bodies. `reply` duplicates one stream for compatibility, so budget that extra copy.
+An input failure emits a terminal `kind:"batch_error"` record with `input_line` (1-based,
+including blank/comment lines), `dispatched` (commands attempted) and `error`. Check
+`kind` before treating a record as a command result; batch errors have no `sid` or
+`exit_code`. Output failure can prevent even that record; stderr and the nonzero exit remain significant.
 
 `fleet` is pure glue over `aterm-ctl` and depends on default-dir discovery — same
 `XDG_RUNTIME_DIR` caveat as `ls`.

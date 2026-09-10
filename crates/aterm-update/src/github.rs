@@ -472,6 +472,12 @@ struct Release {
     /// GitHub's `latest` excludes drafts and prereleases by construction.)
     #[serde(default)]
     draft: bool,
+    /// A prerelease is published but is not the channel head — GitHub's `latest`
+    /// excludes it by construction, and the web lane's LIST fallback
+    /// ([`web_head_fallback`]) must apply the same rule or the two lanes would
+    /// disagree about what "newest published release" means.
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<Asset>,
 }
@@ -836,6 +842,12 @@ struct AuthoritativeFetch {
     /// (zip when the manifest carries a resolvable one, else the DMG).
     selected: Option<(Manifest, Release, StageArtifact)>,
     appcast_fetch_error: bool,
+    /// The `appcast_fetch_error` was the MANIFEST ITSELF answering 404 on the web
+    /// host: the release the pointer names exists but carries no `aterm-appcast.toml`
+    /// — the SOURCE-ONLY channel head every promote opens for ~19 minutes (and for as
+    /// long as an app cut is late). Not a pipeline fault; the web lane answers it by
+    /// electing the newest release that does carry one ([`web_head_fallback`]).
+    appcast_missing: bool,
     /// The `appcast_fetch_error` was a GitHub RATE LIMIT on an asset fetch, not a
     /// broken download: a token's API window running out, or a `github.com` 429 —
     /// weather on either lane, and never a `pipeline`-class failure.
@@ -1080,6 +1092,7 @@ fn fetch_authoritative_release(
             fetched.appcast_fetch_error = true;
             fetched.asset_fetch_rate_limited =
                 aterm_update_core::download_error_is_rate_limit(&error);
+            fetched.appcast_missing = aterm_update_core::download_error_is_not_found(&error);
             return fetched;
         }
     };
@@ -1772,6 +1785,7 @@ fn web_release(
         release: Release {
             tag_name: tag.to_string(),
             draft: false,
+            prerelease: false,
             assets,
         },
         manifest_index: 0,
@@ -1842,6 +1856,133 @@ fn resolve_web_head(
     // rather than trust it, because every later GET is addressed by the derived one.
     debug_assert_eq!(candidate.release.assets[0].url, pointer.location);
     Ok(WebHead::New(candidate))
+}
+
+/// What the web lane does about a channel head that carries no appcast.
+#[derive(Debug)]
+enum HeadFallback {
+    /// The head's appcast was fetched, or failed for some other reason: the check
+    /// proceeds on the head exactly as before, and the LIST was never asked for.
+    NotNeeded,
+    /// The newest published (non-draft, non-prerelease) release that DOES carry an
+    /// appcast, synthesized under the derived tag-specific URLs like any web-lane
+    /// candidate — the check proceeds on it.
+    Candidate(AuthoritativeRelease),
+    /// No published release carries an appcast at all: nothing to install from.
+    Nothing,
+    /// The LIST could not answer this check (rate-limited, or an election that failed
+    /// closed); the outcome is already recorded and the check ends.
+    Ended,
+}
+
+/// THE SOURCE-ONLY HEAD (2026-09-10, m21). The publication train mints the shared
+/// `vX.Y.0` GitHub release from the SOURCE side first — with `SHA256SUMS` and a roster
+/// copy, and no app assets — and the app cut attaches `aterm-appcast.toml` under the
+/// same tag later: ~19 minutes on an ordinary promote, and indefinitely when no cut
+/// follows (v0.80.0 sat source-only for a night). GitHub's `latest` pointer moves to
+/// that release the moment it is published, so every credential-less client derived
+/// `…/download/v0.80.0/aterm-appcast.toml`, met a 404, booked a `pipeline` failure and
+/// told its owner "this build's download pipeline is likely broken" — while v0.79.0,
+/// one release down, carried a perfectly good app build that the same client would
+/// have installed from.
+///
+/// The answer is the rule `tools/install.sh`'s `select_authoritative_tag` and the
+/// website's download button already apply: the newest non-draft, non-prerelease
+/// release that carries the manifest, skipping releases with zero manifests. It costs
+/// ONE anonymous LIST of the releases API — the only request the web lane ever makes
+/// there, and only after the head's appcast has answered 404 — because the web host
+/// serves no listing. At the web lane's cadence that is at most two metered requests
+/// an hour against the ~60/hour anonymous budget, for as long as the head stays
+/// source-only; a rate-limited LIST is a deferral, never a failure.
+///
+/// `head_tag` is excluded from the election by fact rather than by name (it carries
+/// no appcast, so it cannot be elected), but the candidate is still checked against
+/// it so the head can never be re-elected through a listing that disagrees with the
+/// download host. The elected release is rebuilt through [`web_release`]: every later
+/// GET is addressed by the DERIVED tag-specific URL, never by an asset URL the listing
+/// handed back — the listing is consulted for tag and asset NAMES only.
+///
+/// Recorded outcome wording: the distinct sentence `channel head <tag> has no app
+/// manifest` rides the check note onto every later record of this check, so
+/// `aterm ctl update status` and the update screen say what is actually going on.
+fn web_head_fallback(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    fetched: &AuthoritativeFetch,
+    head_tag: &str,
+    list: ListFetch<'_>,
+    pinned_update_pubkeys: &[&str],
+) -> Result<HeadFallback, String> {
+    if !fetched.appcast_missing {
+        return Ok(HeadFallback::NotNeeded);
+    }
+    crate::warn(&format!(
+        "channel head {head_tag} has no app manifest (a source-only release); electing the \
+         newest published release that carries one"
+    ));
+    let mut catalog: Vec<Release> = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let url = releases_page_url(source, page);
+        // Anonymous: the empty credential is the web lane's, and the transport's own
+        // host gate keeps it that way.
+        let body = match list(&url, "") {
+            Ok(body) => body,
+            Err(error @ HttpError::RateLimited { .. }) => {
+                record_web_deferral(
+                    staging,
+                    current_build,
+                    &format!(
+                        "update check deferred: channel head {head_tag} has no app manifest, \
+                         and the release listing that would name the newest app release is \
+                         rate-limited ({error}) — will retry on the next check"
+                    ),
+                );
+                return Ok(HeadFallback::Ended);
+            }
+            Err(error) => {
+                let message = format!(
+                    "channel head {head_tag} has no app manifest, and the release listing \
+                     could not be read: {error}"
+                );
+                crate::health::Health::record_failure(&staging.health(), "network", &message);
+                return Err(message);
+            }
+        };
+        let releases: Vec<Release> = match aterm_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                let message = format!(
+                    "channel head {head_tag} has no app manifest, and the release listing \
+                     did not parse: {e}"
+                );
+                crate::health::Health::record_failure(&staging.health(), "network", &message);
+                return Err(message);
+            }
+        };
+        let page_len = releases.len();
+        catalog.extend(
+            releases
+                .into_iter()
+                .filter(|r| !r.draft && !r.prerelease && r.tag_name != head_tag),
+        );
+        if page_len < PER_PAGE as usize {
+            break;
+        }
+    }
+    let elected = match select_authoritative_release(catalog, pinned_update_pubkeys) {
+        Ok(elected) => elected,
+        Err(error) => {
+            record_untrustworthy_election(staging, current_build, &error);
+            return Ok(HeadFallback::Ended);
+        }
+    };
+    let Some(elected) = elected else {
+        return Ok(HeadFallback::Nothing);
+    };
+    // Rebuilt under the derived URLs: the listing chose the TAG, and nothing else.
+    let candidate = web_release(source, &elected.release.tag_name, pinned_update_pubkeys)?;
+    Ok(HeadFallback::Candidate(candidate))
 }
 
 /// THE URL CROSS-CHECK, web lane only: the signed manifest names its container's
@@ -2205,7 +2346,11 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // no sink: the headers ARE its answer.
     let header_sink = staging.list_headers();
     let mut list = |url: &str, token: &str| {
-        aterm_update_core::api_get_with_headers(url, Some(token), Some(header_sink.as_path()))
+        // An EMPTY credential is the web lane's anonymous LIST (`web_head_fallback`,
+        // after a source-only head): no `Authorization` header at all, rather than a
+        // bearer token of nothing.
+        let token = (!token.is_empty()).then_some(token);
+        aterm_update_core::api_get_with_headers(url, token, Some(header_sink.as_path()))
     };
     let mut head = aterm_update_core::head_no_redirect;
     let acquired = match acquire(
@@ -2276,6 +2421,57 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         &mut download,
         &roster_policy,
     );
+    // THE SOURCE-ONLY HEAD, web lane only: the pointer named a release whose appcast
+    // answers 404. Elect the newest published release that carries one and proceed
+    // on it — `web_tag` follows, so the tag recorded as authorized is the release
+    // actually judged, and the head itself is re-fetched on the next check (the cut
+    // that attaches its app assets later must not be missed by a ledger that
+    // "authorized" the tag while it carried nothing).
+    let mut web_tag = web_tag;
+    if lane == Lane::Web
+        && let Some(head) = web_tag.clone()
+    {
+        match web_head_fallback(
+            &staging,
+            current_build,
+            source,
+            &fetched,
+            &head,
+            &mut list,
+            crate::PINNED_UPDATE_PUBKEYS,
+        )? {
+            HeadFallback::NotNeeded => {}
+            HeadFallback::Candidate(candidate) => {
+                let tag = candidate.release.tag_name.clone();
+                crate::status::set_check_note(format!(
+                    "channel head {head} has no app manifest; the newest app release is {tag}"
+                ));
+                web_tag = Some(tag);
+                fetched = fetch_authoritative_release(
+                    Some(candidate),
+                    crate::PINNED_UPDATE_PUBKEYS,
+                    &mut download,
+                    &roster_policy,
+                );
+            }
+            HeadFallback::Nothing => {
+                // The check itself ran fine — the head was read, the listing answered,
+                // and nothing carries a manifest — so health reflects THIS check.
+                crate::health::Health::record_success(&staging.health());
+                crate::status::record(
+                    &staging,
+                    current_build,
+                    &format!(
+                        "channel head {head} has no app manifest, and no published release \
+                         carries one{}",
+                        lane_note(source)
+                    ),
+                );
+                return Ok(None);
+            }
+            HeadFallback::Ended => return Ok(None),
+        }
+    }
     // THE URL CROSS-CHECK, after every signature has been verified and the version
     // bound, and before anything is staged: on the web lane the signed manifest must
     // name the very container URL this client derived under the pointer's tag.
@@ -3131,6 +3327,7 @@ mod tests {
         Release {
             tag_name: tag.into(),
             draft: false,
+            prerelease: false,
             assets: vec![
                 Asset {
                     name: "aterm-appcast.toml".into(),
@@ -3151,6 +3348,7 @@ mod tests {
         Release {
             tag_name: tag.into(),
             draft: false,
+            prerelease: false,
             assets: vec![
                 Asset {
                     name: "aterm-appcast.toml".into(),
@@ -4003,6 +4201,7 @@ mod tests {
             let renamed = Release {
                 tag_name: historical.into(),
                 draft: false,
+                prerelease: false,
                 assets: vec![Asset {
                     name: format!("aterm-appcast-{historical}.toml"),
                     url: "archive-must-not-be-fetched".into(),
@@ -6634,6 +6833,309 @@ mod tests {
         );
         assert!(fetched.selected.is_none() && fetched.appcast_fetch_error);
         assert!(fetched.asset_fetch_rate_limited);
+    }
+
+    /// The listing GitHub's API answers while the channel head is SOURCE-ONLY (the
+    /// measured 2026-09-10 shape): the head carries only the attestation pair, the
+    /// release below it carries the app set, an older one too; a prerelease and a
+    /// draft above them both carry appcasts and must not be elected.
+    fn source_only_head_listing() -> Vec<u8> {
+        br#"[
+          {"tag_name":"v0.82.0","draft":true,"prerelease":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/90","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/91","size":64}]},
+          {"tag_name":"v0.81.0","draft":false,"prerelease":true,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/80","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/81","size":64}]},
+          {"tag_name":"v0.80.0","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-machines.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/70","size":427},
+            {"name":"aterm-machines.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/71","size":64},
+            {"name":"SHA256SUMS","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/72","size":9000},
+            {"name":"SHA256SUMS.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/73","size":64}]},
+          {"tag_name":"v0.79.0","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/60","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/61","size":64},
+            {"name":"aterm-machines.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/62","size":541},
+            {"name":"aterm-0.79.0.dmg","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/63","size":1}]},
+          {"tag_name":"v0.78.0","draft":false,"prerelease":false,"assets":[
+            {"name":"aterm-appcast.toml","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/50","size":512},
+            {"name":"aterm-appcast.toml.sig","url":"https://api.github.com/repos/alabsystems/aterm/releases/assets/51","size":64}]}
+        ]"#
+        .to_vec()
+    }
+
+    /// A fetch whose manifest answered the web host's 404 — the source-only head.
+    fn head_without_appcast() -> AuthoritativeFetch {
+        AuthoritativeFetch {
+            appcast_fetch_error: true,
+            appcast_missing: true,
+            ..AuthoritativeFetch::default()
+        }
+    }
+
+    /// THE SOURCE-ONLY HEAD (m21, 2026-09-10): the pointer names v0.80.0, whose
+    /// appcast 404s; the fallback elects v0.79.0 — the newest non-draft,
+    /// non-prerelease release carrying an appcast — from ONE anonymous LIST, and
+    /// hands back a candidate whose every asset URL is the DERIVED tag-specific one
+    /// (never the listing's API asset URLs). The prerelease and the draft above it
+    /// carry appcasts and are skipped, exactly as `install.sh` and the pointer do.
+    #[test]
+    fn a_source_only_channel_head_falls_back_to_the_newest_release_with_an_appcast() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("source-only-head");
+        let source = test_source();
+        let mut requests: Vec<(String, String)> = Vec::new();
+        let mut list = |url: &str, token: &str| {
+            requests.push((url.to_string(), token.to_string()));
+            Ok(source_only_head_listing())
+        };
+        let outcome = web_head_fallback(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &head_without_appcast(),
+            "v0.80.0",
+            &mut list,
+            crate::PINNED_UPDATE_PUBKEYS,
+        );
+        let Ok(HeadFallback::Candidate(candidate)) = outcome else {
+            panic!("the newest release with an appcast is elected: {outcome:?}");
+        };
+        assert_eq!(candidate.release.tag_name, "v0.79.0");
+        assert_eq!(candidate.version, "0.79.0");
+        for asset in &candidate.release.assets {
+            assert_eq!(
+                asset.url,
+                tag_url("v0.79.0", &asset.name),
+                "every asset URL is the derived tag-specific one, not the listing's"
+            );
+            assert!(!aterm_update_core::cdn::is_api_host(&asset.url));
+        }
+        assert_eq!(
+            requests.len(),
+            1,
+            "one anonymous LIST, one page: {requests:?}"
+        );
+        let (url, token) = &requests[0];
+        assert!(aterm_update_core::cdn::is_api_host(url), "{url}");
+        assert!(
+            token.is_empty(),
+            "no credential ever rides the web lane's LIST"
+        );
+        assert!(
+            !staging.health().exists(),
+            "a source-only head is not a pipeline fault"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// THE FAST PATH: when the head's appcast was fetched (or failed for any reason
+    /// other than the web host's 404) the LIST is never consulted — the LIST fake
+    /// panics on any call, so "zero `api.github.com` requests on a healthy check" stays
+    /// a measured fact.
+    #[test]
+    fn a_head_that_carries_its_appcast_never_consults_the_listing() {
+        let staging = Staging::scratch("head-has-appcast");
+        let source = test_source();
+        let mut list = no_api_ever;
+        for fetched in [
+            AuthoritativeFetch::default(),
+            AuthoritativeFetch {
+                appcast_fetch_error: true,
+                asset_fetch_rate_limited: true,
+                ..AuthoritativeFetch::default()
+            },
+            AuthoritativeFetch {
+                appcast_fetch_error: true,
+                ..AuthoritativeFetch::default()
+            },
+            AuthoritativeFetch {
+                manifest_rejected: true,
+                ..AuthoritativeFetch::default()
+            },
+        ] {
+            assert!(matches!(
+                web_head_fallback(
+                    &staging,
+                    WEB_BUILD,
+                    &source,
+                    &fetched,
+                    WEB_TAG,
+                    &mut list,
+                    crate::PINNED_UPDATE_PUBKEYS,
+                ),
+                Ok(HeadFallback::NotNeeded)
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A listing in which NOTHING carries an appcast (every release source-only, or
+    /// empty) ends the check as "nothing to install from"; a rate-limited listing is a
+    /// deferral with no health entry; a listing that cannot be read is `network`-class.
+    #[test]
+    fn the_fallback_listing_s_empty_deferred_and_failed_answers_are_classified() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("fallback-classes");
+        let source = test_source();
+        crate::status::clear_check_note();
+
+        let mut empty = |_url: &str, _token: &str| Ok(b"[]".to_vec());
+        assert!(matches!(
+            web_head_fallback(
+                &staging,
+                WEB_BUILD,
+                &source,
+                &head_without_appcast(),
+                "v0.80.0",
+                &mut empty,
+                crate::PINNED_UPDATE_PUBKEYS,
+            ),
+            Ok(HeadFallback::Nothing)
+        ));
+        let mut only_source = |_url: &str, _token: &str| {
+            Ok(br#"[{"tag_name":"v0.80.0","draft":false,"assets":[{"name":"SHA256SUMS","url":"u","size":1}]},
+                    {"tag_name":"v0.79.0","draft":false,"assets":[{"name":"SHA256SUMS","url":"u","size":1}]}]"#
+                .to_vec())
+        };
+        assert!(matches!(
+            web_head_fallback(
+                &staging,
+                WEB_BUILD,
+                &source,
+                &head_without_appcast(),
+                "v0.80.0",
+                &mut only_source,
+                crate::PINNED_UPDATE_PUBKEYS,
+            ),
+            Ok(HeadFallback::Nothing)
+        ));
+
+        let mut limited = |url: &str, _token: &str| {
+            Err(HttpError::RateLimited {
+                code: 403,
+                url: url.to_string(),
+                authenticated: false,
+            })
+        };
+        assert!(matches!(
+            web_head_fallback(
+                &staging,
+                WEB_BUILD,
+                &source,
+                &head_without_appcast(),
+                "v0.80.0",
+                &mut limited,
+                crate::PINNED_UPDATE_PUBKEYS,
+            ),
+            Ok(HeadFallback::Ended)
+        ));
+        assert!(
+            !staging.health().exists(),
+            "a rate-limited listing is weather, not a fault"
+        );
+        let recorded = std::fs::read_to_string(&staging.status).unwrap_or_default();
+        assert!(
+            recorded.contains("deferred") && recorded.contains("has no app manifest"),
+            "{recorded}"
+        );
+
+        let mut broken = |_url: &str, _token: &str| Err(HttpError::Transport("dns".into()));
+        let error = web_head_fallback(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &head_without_appcast(),
+            "v0.80.0",
+            &mut broken,
+            crate::PINNED_UPDATE_PUBKEYS,
+        )
+        .expect_err("an unreadable listing is a failure");
+        assert!(
+            error.contains("channel head v0.80.0 has no app manifest"),
+            "{error}"
+        );
+        let h = crate::health::Health::read(&staging.health());
+        assert_eq!((h.network_failures, h.pipeline_failures), (1, 0));
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// END TO END on the fixture channel: the pointer names a tag above [`WEB_TAG`]
+    /// whose appcast the download host does not carry; the fallback elects
+    /// [`WEB_TAG`] from the listing and the armed roster chain accepts it over the
+    /// derived URLs — with no request to the API beyond the one LIST, and no GET
+    /// through `latest`.
+    #[test]
+    fn a_source_only_head_is_bypassed_and_the_release_below_it_is_authorized() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("source-only-e2e");
+        let source = test_source();
+        let channel = web_channel(Some(&tag_url(WEB_TAG, "aterm-0.10.0.dmg")));
+        let masters = [channel.master_pub.as_str()];
+        let head = "v0.11.0";
+        let mut gets: Vec<String> = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            gets.push(url.to_string());
+            channel.serve(url)
+        };
+        // The head as the web lane synthesizes it, and its fetch: the appcast 404s.
+        let candidate = web_release(&source, head, crate::PINNED_UPDATE_PUBKEYS).unwrap();
+        let fetched = fetch_authoritative_release(
+            Some(candidate),
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        assert!(fetched.selected.is_none() && fetched.appcast_missing);
+        let mut lists = 0;
+        let mut list = |_url: &str, _token: &str| {
+            lists += 1;
+            Ok(format!(
+                r#"[{{"tag_name":"{head}","draft":false,"assets":[{{"name":"SHA256SUMS","url":"u","size":1}}]}},
+                    {{"tag_name":"{WEB_TAG}","draft":false,"assets":[
+                      {{"name":"aterm-appcast.toml","url":"https://api.github.com/x/1","size":1}},
+                      {{"name":"aterm-appcast.toml.sig","url":"https://api.github.com/x/2","size":1}}]}}]"#
+            )
+            .into_bytes())
+        };
+        let Ok(HeadFallback::Candidate(below)) = web_head_fallback(
+            &staging,
+            WEB_BUILD,
+            &source,
+            &fetched,
+            head,
+            &mut list,
+            crate::PINNED_UPDATE_PUBKEYS,
+        ) else {
+            panic!("the release below the head is elected");
+        };
+        assert_eq!(below.release.tag_name, WEB_TAG);
+        let fetched = fetch_authoritative_release(
+            Some(below),
+            crate::PINNED_UPDATE_PUBKEYS,
+            &mut download,
+            &channel.policy(&masters),
+        );
+        let (manifest, release, _) = fetched
+            .selected
+            .as_ref()
+            .expect("the armed chain accepts the release below the source-only head");
+        assert_eq!(release.tag_name, WEB_TAG);
+        web_container_url_agrees(&source, &release.tag_name, manifest)
+            .expect("the manifest binds to the elected tag, not the head");
+        assert_eq!(lists, 1, "one LIST");
+        assert!(
+            gets.iter()
+                .all(|u| !aterm_update_core::cdn::is_api_host(u) && !u.contains("/latest/")),
+            "{gets:?}"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 
     /// The TOKEN lane is today's LIST, byte for byte: every page is an `api.github.com`

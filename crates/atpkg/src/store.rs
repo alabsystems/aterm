@@ -131,6 +131,27 @@ impl Layout {
         crate::reroute::dir(self)
     }
 
+    /// `agents/` — the ONE managed directory that goes FIRST on `PATH` (the shell hook
+    /// prepends it, [`crate::hooks`]; the GUI's spawn seam front-inserts it beside
+    /// `reroute/`). It holds ONLY the shims of the agent programs
+    /// ([`crate::stub::AGENT_PROGRAMS`]), each byte-identical to its `bin/` twin
+    /// ([`crate::activate::reconcile_agents`]), so `claude`/`codex` run the managed copy
+    /// ahead of a vendor's native install or a brew cask — the rule-1 exception (owner
+    /// decision 2026-09-10: aterm is the version manager for the coding agents;
+    /// docs/design/DESIGN-which-copy-runs). Every other managed tool stays in `bin/`,
+    /// appended LAST as before, so [`shim_allowed`]'s deny-list keeps its meaning.
+    #[must_use]
+    pub fn agents_dir(&self) -> PathBuf {
+        self.prefix.join("agents")
+    }
+
+    /// `agents/<tool>` — an agent program's front-of-`PATH` shim ([`Self::agents_dir`]);
+    /// the same [`ToolName`] gate as [`Self::shim`].
+    #[must_use]
+    pub fn agent_shim(&self, tool: &ToolName) -> PathBuf {
+        self.agents_dir().join(tool.shim_file())
+    }
+
     /// `bin/<tool>` — a single shim. The concrete file name is [`ToolName::shim_file`]
     /// (`bin/ay` on Unix, `bin/ay.cmd` on Windows).
     ///

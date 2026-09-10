@@ -310,7 +310,10 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     //    std::fs::read_link) so this works on Windows, where a shim is a `.cmd` regular file
     //    that read_link Errs on — leaving orphaned shims that still forward to the (about-to-
     //    be-deleted) store tree and that `atpkg which` still reports as installed.
-    if let Ok(entries) = std::fs::read_dir(layout.bin_dir()) {
+    for dir in [layout.bin_dir(), layout.agents_dir()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let path = e.path();
             if let Some(target) = crate::platform::resolve_shim(&path)
@@ -320,6 +323,11 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
             }
         }
     }
+    // (The `agents/` twin — an agent program's front-of-PATH shim — is swept with the
+    // same predicate above, and once more here for anything the predicate could not
+    // resolve: this directory is FIRST on every PATH, so nothing may outlive its
+    // primary in it.)
+    crate::activate::sweep_agents_dir(layout);
 
     // 2. Drop channel `current` links that point into this program's store tree (so no
     //    dangling active-set link remains after the builds are gone). Removal goes through

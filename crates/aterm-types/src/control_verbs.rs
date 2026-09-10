@@ -160,7 +160,13 @@ pub const SUMMARY_MAX_CHARS: usize = summary_max_chars!();
 /// [`SUMMARY_MAX_CHARS`] — and that shape is unchanged. The earlier move from
 /// the design's 4 KiB to 8 KiB is the same accounting
 /// (`docs/AGENT-EXPERIENCE-2026-08-26.md`, S7).
-pub const SHORT_CATALOG_MAX_BYTES: usize = 9216;
+///
+/// RAISED AGAIN FROM 9216 when `appnotice` landed (2026-09-10, the pull-down's
+/// out-of-process voice — STATUS-SURFACE.md): the GUI's short `help` (the header
+/// block plus these rows) measured 9 323 B against 9 216 with the row added, and
+/// the same choice was made for the same reason. The shape is still one summary
+/// row per verb under [`SUMMARY_MAX_CHARS`].
+pub const SHORT_CATALOG_MAX_BYTES: usize = 9472;
 /// The column a catalog row's text starts in: a 28-wide name plus one space.
 pub const CATALOG_TEXT_COLUMN: usize = 29;
 /// The width a `help <verb>` entry is wrapped to.
@@ -580,6 +586,23 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "OK <n> + one `activity` row per live/finished app-initiated job",
         "What aterm has been doing on its own initiative — a toolchain install, a self-update download — as the two status bars show it, plus the finished jobs the ring still remembers. Rows are `activity kind=<toolchain|update> phase=<live|done> progress=<pct>/100|- title=<t> detail=<d> stats=<s> outcome=<ok|warn|-> [since_ms=<ms>]` — progress= is `-` on every phase=done row (and on a live bar with no fill yet), and stats= is empty on done rows; live rows first, then finished oldest-first. Free text is percent-encoded. Read-only: it starts and cancels nothing.",
+    ),
+    // `appnotice` is the WRITE face of the same surface: a row posted from OUTSIDE
+    // the process. Owner-only (a child edge must not be able to forge "aterm-managed,
+    // current" onto the pull-down), Write op-class because it mutates app state.
+    va(
+        "appnotice",
+        Write,
+        Status,
+        App,
+        OwnerOnly,
+        "appnotice <toolchain|update> <text>: post a text row to the pull-down status bars",
+        "The out-of-process voice of the status surface: an `aterm pkg install claude` run in a \
+         terminal (no GUI child to stream markers) says what it did on the same rows the GUI's \
+         own passes use. On the `toolchain` lane a text of the shape `managed-current: …` or \
+         `machine-settings: …` renders as the row that atpkg marker raises; any other text is \
+         an Info row on the named lane, held 30 s, then kept in the `appstatus` ledger. Reply \
+         `OK posted`. Owner-only: only the instance token may write to the pull-down.",
     ),
     v(
         "chrome",
@@ -1086,7 +1109,8 @@ pub const VERBS: &[VerbSpec] = &[
          ribbon_segments= ribbon_hue_bands= field= sparks= momentum= \
          momentum_display= flow= combo= combo_best= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
-         pet_action= pet_content= pet_pending= pet_body=` (every gate \
+         pet_action= pet_content= pet_pending= pet_body= pet_focus= pet_reason= \
+         pet_anchor= pet_event_seq= pet_pose=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
@@ -1116,7 +1140,11 @@ pub const VERBS: &[VerbSpec] = &[
          in lowercase (`none` without a drawn body), `pet_content` is earned contentment \
          in 0..1, and `pet_pending` counts queued clicks/strokes. `pet_body` is the last \
          drawn body as `x0,x1,y0,y1` in frame pixels, right/bottom exclusive, or `none`; \
-         these are observations, and reading them never advances the pet",
+         `pet_focus` and `pet_reason` name located console attention and its cause, \
+         `pet_anchor` names its command block or `none`, `pet_event_seq` identifies \
+         the coalesced source observation within that reason, and `pet_pose` names \
+         the last resolved full-body art pose. These are observations, and reading \
+         them never advances the pet",
     ),
     // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven
     // custody-moving events last fired. Several of them leave identical state behind
@@ -1299,11 +1327,14 @@ pub const VERBS: &[VerbSpec] = &[
          line and `len=` names the true size, so that message is NOT recoverable in full here — \
          a cut row carries `more=1` too, even when what survived is under 512 B. `dropped=` \
          counts UNHANDLED rows the bounded ring evicted (never silently) — every evicted row \
-         above `seen=`, not merely one nobody listed — and `pending=` the delivered rows this \
-         reply did not carry. A bare `inbox` advances the LISTED watermark — what the ring counts \
-         as read for eviction and for the per-peer quota — while `--peek` moves nothing and \
-         `--meta` omits `text=`; the HANDLED watermark `seen=` moves only on `inbox seen`, which \
-         also LISTS every row at or below its argument (see that entry).",
+         above `seen=`, not merely one nobody listed — and `pending=` the unlisted delivered \
+         rows this reply did not carry. `inbox <n>` selects the NEWEST n rows matching `since=`, \
+         returned in increasing id order; it is not a FIFO batch. Without `--peek`, only the \
+         returned message rows become LISTED — per-row state used by eviction and the per-peer \
+         quota. `--peek` changes no listed state and `--meta` omits `text=`. The HANDLED \
+         watermark `seen=` moves only on `inbox seen`, which also LISTS every row at or below \
+         its argument (see that entry). Batch consumers must not advance `seen=` across \
+         omitted older rows they have not handled.",
     ),
     v(
         "inbox get",
@@ -2357,6 +2388,7 @@ mod tests {
         assert_eq!(
             owner_only,
             [
+                "appnotice",
                 "operator",
                 "operator-propose-bin",
                 "sessions",

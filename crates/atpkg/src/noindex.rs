@@ -57,6 +57,45 @@
 //! where it was. Both halves would then agree — measured, confident, and wrong — that a
 //! tree Spotlight is actively indexing is excluded (measured 2026-09-02).
 //!
+//! # Git checkouts: the symlink, never the config (2026-09-10)
+//!
+//! Re-pointing cargo by writing `[build] target-dir` into `.cargo/config.toml` is right
+//! for a repo nobody versions and WRONG for a git checkout: the aterm repo's
+//! `.cargo/config.toml` is TRACKED (every worktree's with it) and the release cutter
+//! (`crates/aterm-release/src/gates.rs::clean_tree`, `git status --porcelain`) refuses a
+//! dirty tree — so the first pass after landing would have broken every cut, and an
+//! untracked `.cargo/config.toml` in any other checkout is the same `??` row. In a git
+//! checkout ([`is_git_checkout`]: a `.git` at the repo root, or `git rev-parse` succeeding
+//! for a crate nested inside one) [`apply_one`] therefore renames `target ->
+//! target.noindex`, leaves a RELATIVE symlink `target -> target.noindex` where the
+//! directory was, and never opens the config: cargo keeps writing to `<repo>/target` and
+//! the bytes land under the excluded name. The config edit is kept for repos that are not
+//! under git. `git status --porcelain` stays empty because the NEW name — which a
+//! `target` pattern does NOT match — is appended to the clone's own `.git/info/exclude`
+//! (per clone, outside the working tree, shared by its worktrees) unless git already
+//! ignores it, and the LINK is either caught by the same `.gitignore` entry that caught
+//! the directory or, when that entry is directory-only (`target/`, `/target-tippy/`,
+//! `**/target/` — the shape 20 of the 26 planned dirs on m21 carry, and the aterm
+//! checkout's own `/target-tippy/`), which matches a directory and NOT the symlink that
+//! replaces it, excluded the same way: the directory is probed with `git check-ignore`
+//! BEFORE the rename, and a link that git no longer ignores where the directory was gets
+//! its own `.git/info/exclude` line, read back through git. Status is exactly what it
+//! was. A repo that did not ignore the directory at all gets the same link and one line
+//! saying the link shows as untracked, exactly as the directory did.
+//!
+//! Measured on macOS 26.6.2 (25G83) on 2026-09-10 with a scratch tree under `$HOME`
+//! (`repo/target/debug/<token>.txt`, `mdimport`ed, then polled with `mdfind -onlyin`):
+//!
+//! * the file under the plain `target/` was returned within 1 s of the import;
+//! * after `mv target target.noindex && ln -s target.noindex target` the same query
+//!   returned nothing within 1 s — the index follows the REAL path, and the rename took
+//!   the entry out (the tree was not re-imported);
+//! * `mdfind -onlyin repo/target` (the symlink) returned nothing;
+//! * a NEW file written THROUGH the symlink and `mdimport`ed by its symlink spelling was
+//!   still absent 20 s later, while a control planted in a plain sibling directory at the
+//!   same moment was returned within 1 s. A symlink is not a way into the index: `mds`
+//!   records real paths, and the real path ends `.noindex`.
+//!
 //! Non-macOS is a clean no-op in every entry point: [`scan`] returns an empty complete
 //! scan, [`migrate`] returns [`Migration::NotApplicable`], [`verify`] returns
 //! [`Verdict::NotApplicable`]. Callers need no `cfg` — [`crate::doctor`] has none.
@@ -644,6 +683,673 @@ pub fn migrate(dir: &Path, dry_run: bool) -> Result<Migration, MigrateError> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Apply — the doctor's remedy, done: migrate + re-point cargo, per repo, idempotent
+// ---------------------------------------------------------------------------------------
+
+/// What `apply` did (or would do) about one repo's cargo config after a migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigNote {
+    /// `[build] target-dir` was written (a new `[build]` table, or a key under the
+    /// existing one) into this `.cargo/config.toml`.
+    Written(PathBuf),
+    /// An existing `target-dir` that named the old directory was rewritten.
+    Rewritten(PathBuf),
+    /// A git checkout (module doc): NO config edit. A relative symlink `link -> <new
+    /// name>` stands where the directory was, so cargo's pointer is unchanged; `exclude`
+    /// says what keeps `git status` clean about the new name, and `link_exclude` what
+    /// keeps it clean about the link: [`ExcludeNote::AlreadyIgnored`] when the entry that
+    /// ignored the directory matches the link too, [`ExcludeNote::Added`] when that entry
+    /// was directory-only (`target/`) and the link got its own `.git/info/exclude` line,
+    /// [`ExcludeNote::NotIgnored`] when the link shows as untracked — as the directory did
+    /// in a repo that never ignored it, or because excluding it failed.
+    Linked {
+        link: PathBuf,
+        exclude: ExcludeNote,
+        link_exclude: ExcludeNote,
+    },
+    /// Nothing written, and why: no `Cargo.toml` beside the directory, an existing
+    /// `target-dir` pointing elsewhere, or a write/parse failure.
+    Untouched(String),
+}
+
+/// What [`apply_one`] did about one path — the migrated name, or the link standing
+/// where the directory was — in a git checkout's ignore rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExcludeNote {
+    /// `git check-ignore` already matched the path (a `target*` pattern, the entry that
+    /// ignored the directory, or an earlier pass's line): nothing written.
+    AlreadyIgnored,
+    /// The path was appended to this exclude file — `.git/info/exclude`, per clone,
+    /// outside the working tree, shared by the clone's worktrees.
+    Added(PathBuf),
+    /// Nothing written, and why (git could not be run, the path could not be related to
+    /// the toplevel, the write failed, or — for the link — the directory was never
+    /// ignored either): `git status` shows the path until the user excludes it.
+    NotIgnored(String),
+}
+
+/// How [`apply_one`] keeps cargo pointed at a migrated directory — decided BEFORE the
+/// rename, so a dry run can say it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pointer {
+    /// A git checkout: a relative symlink `<old name> -> <new name>` where the directory
+    /// was; `.cargo/config.toml` is never opened.
+    Symlink,
+    /// Not under git: `[build] target-dir` goes into this `.cargo/config.toml`.
+    Config(PathBuf),
+    /// No `Cargo.toml` beside it: nothing to point — the pointer is an env var.
+    None,
+}
+
+/// One directory's outcome under [`apply_one`] / [`apply_under`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Renamed, and cargo (re-)pointed as `config` says.
+    Migrated {
+        from: PathBuf,
+        to: PathBuf,
+        config: ConfigNote,
+    },
+    /// Dry run: the rename that would happen, and how cargo would stay pointed.
+    Planned {
+        from: PathBuf,
+        to: PathBuf,
+        pointer: Pointer,
+    },
+    /// Already `.noindex` (or dot-hidden): nothing to do — a SUCCESS for a loop.
+    AlreadyExcluded(PathBuf),
+    /// Left alone, with the one reason: a build holds the cargo lock, no repo beside it
+    /// (under `--all`), a symlink, a destination in the way, a failed rename.
+    Skipped { path: PathBuf, reason: String },
+}
+
+impl Applied {
+    /// Whether this outcome MOVED a directory this pass — what the `machine-settings:`
+    /// count reports.
+    #[must_use]
+    pub const fn migrated(&self) -> bool {
+        matches!(self, Applied::Migrated { .. })
+    }
+}
+
+/// How many subdirectories [`build_in_progress`] looks into per level. Cargo's layout
+/// has a handful (`debug`, `release`, one dir per `--target` triple, and under each of
+/// those `build`, `deps`, `incremental`, `examples`, `.fingerprint`); the cap bounds the
+/// probe on a directory that is not cargo's at all.
+const MAX_LOCK_PROBE_ENTRIES: usize = 64;
+
+/// The directory a build in `dir` holds locked, if one is running: cargo takes an
+/// exclusive `flock(2)` on `<target>/<profile>/.cargo-lock` for the whole build (and on
+/// `<target>/.cargo-lock` for some ops) — and a `--target <triple>` build one level
+/// deeper, on `<target>/<triple>/<profile>/.cargo-lock`, which is why the probe reaches
+/// two levels down (bounded by [`MAX_LOCK_PROBE_ENTRIES`] per level; noted in review
+/// 2026-09-10). A lock we cannot take non-blockingly is a live build; renaming its tree
+/// from under it would strand every path the compiler holds. Probed, never held: the lock
+/// is released again immediately. Non-Unix: `None`.
+#[must_use]
+pub fn build_in_progress(dir: &Path) -> Option<PathBuf> {
+    fn subdirs(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|read| {
+                read.flatten()
+                    .map(|entry| entry.path())
+                    .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                    .take(MAX_LOCK_PROBE_ENTRIES)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let mut candidates = vec![dir.join(".cargo-lock")];
+    for profile_or_triple in subdirs(dir) {
+        candidates.push(profile_or_triple.join(".cargo-lock"));
+        for profile in subdirs(&profile_or_triple) {
+            candidates.push(profile.join(".cargo-lock"));
+        }
+    }
+    candidates.into_iter().find(|lock| lock_is_held(lock))
+}
+
+/// Whether someone else holds `flock(2)` on `lock` right now.
+#[cfg(unix)]
+fn lock_is_held(lock: &Path) -> bool {
+    use std::os::unix::io::AsRawFd as _;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(lock) else {
+        return false;
+    };
+    // SAFETY: flock on a valid open descriptor; LOCK_NB makes it return at once.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // SAFETY: releasing the lock this probe just took on the same descriptor.
+        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return false;
+    }
+    let err = std::io::Error::last_os_error();
+    matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK))
+}
+
+#[cfg(not(unix))]
+fn lock_is_held(_lock: &Path) -> bool {
+    false
+}
+
+/// The repo a target dir belongs to: its parent, when that holds a `Cargo.toml`.
+/// `None` for a free-standing target dir (`~/.cargo-target-m7c`,
+/// `~/aterm-agent-targets/<branch>`), whose pointer is an env var this module cannot see.
+#[must_use]
+pub fn repo_of(dir: &Path) -> Option<PathBuf> {
+    let parent = dir.parent()?;
+    parent
+        .join("Cargo.toml")
+        .is_file()
+        .then(|| parent.to_path_buf())
+}
+
+/// The `target-dir` VALUE to write for `dest` in `repo`'s config: the bare name when the
+/// directory is a direct child of the repo (relative paths in `.cargo/config.toml`
+/// resolve against the directory holding `.cargo`, so `target.noindex` follows a moved
+/// checkout), the absolute path otherwise.
+#[must_use]
+pub fn target_dir_value(repo: &Path, dest: &Path) -> String {
+    match (dest.parent(), dest.file_name()) {
+        (Some(parent), Some(name)) if parent == repo => name.to_string_lossy().into_owned(),
+        _ => dest.display().to_string(),
+    }
+}
+
+/// What [`point_cargo_config`] decided about one config text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigEdit {
+    /// The new text, with `[build] target-dir` set to the value (table added if absent).
+    Written(String),
+    /// The new text, with an existing `target-dir` line rewritten.
+    Rewritten(String),
+    /// An existing `target-dir` names something other than the old directory: leave
+    /// it — the migrated directory was not the one cargo used.
+    PointsElsewhere(String),
+    /// The edit would not parse (a `[build]` we could not find the end of, a quoting
+    /// shape we do not understand): nothing written.
+    Unparseable(String),
+}
+
+/// Pure: `text` is the repo's `.cargo/config.toml` (or empty when absent), `old_name`
+/// the migrated directory's former name, `value` what `target-dir` must now say.
+///
+/// Three shapes, each measured against a real file: no `[build]` table ⇒ one is
+/// appended (`[build]\ntarget-dir = "…"`); a `[build]` table with no `target-dir` ⇒ the
+/// key goes on the line after the header; an existing `target-dir` ⇒ rewritten when it
+/// named the old directory (bare name, `./name`, or an absolute path ending in it),
+/// left alone otherwise. The result is re-parsed as TOML before it is returned, so a
+/// file this cannot edit safely is never written.
+#[must_use]
+pub fn point_cargo_config(text: &str, old_name: &str, value: &str) -> ConfigEdit {
+    let key_line = format!(
+        "target-dir = \"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let mut out: Vec<String> = Vec::new();
+    let mut in_build = false;
+    let mut seen_build = false;
+    let mut rewrote = false;
+    let mut existing_elsewhere: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_build = trimmed == "[build]";
+            if in_build {
+                seen_build = true;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if in_build
+            && let Some(rest) = trimmed.strip_prefix("target-dir")
+            && rest.trim_start().starts_with('=')
+        {
+            let current = rest
+                .trim_start()
+                .trim_start_matches('=')
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+            if names_dir(current, old_name) {
+                out.push(key_line.clone());
+                rewrote = true;
+            } else {
+                existing_elsewhere = Some(current.to_string());
+                out.push(line.to_string());
+            }
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if let Some(elsewhere) = existing_elsewhere
+        && !rewrote
+    {
+        return ConfigEdit::PointsElsewhere(elsewhere);
+    }
+    let mut result = if rewrote {
+        out.join("\n")
+    } else if seen_build {
+        // The key goes right after the `[build]` header, before any comment or key.
+        let mut with_key: Vec<String> = Vec::with_capacity(out.len() + 1);
+        let mut inserted = false;
+        for line in out {
+            let is_header = line.trim() == "[build]";
+            with_key.push(line);
+            if is_header && !inserted {
+                with_key.push(key_line.clone());
+                inserted = true;
+            }
+        }
+        with_key.join("\n")
+    } else {
+        let mut t = out.join("\n");
+        if !t.is_empty() && !t.ends_with('\n') {
+            t.push('\n');
+        }
+        if !t.is_empty() {
+            t.push('\n');
+        }
+        t.push_str("[build]\n");
+        t.push_str(&key_line);
+        t
+    };
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    if aterm_toml::from_str::<aterm_toml::Value>(&result).is_err() {
+        return ConfigEdit::Unparseable(result);
+    }
+    if rewrote {
+        ConfigEdit::Rewritten(result)
+    } else {
+        ConfigEdit::Written(result)
+    }
+}
+
+/// Whether a `target-dir` value names the directory called `old_name` in this repo:
+/// the bare name, `./name`, or any path whose last component is it.
+fn names_dir(value: &str, old_name: &str) -> bool {
+    let v = value.trim_end_matches('/');
+    v == old_name
+        || v.strip_prefix("./") == Some(old_name)
+        || Path::new(v).file_name().is_some_and(|n| n == old_name)
+}
+
+/// Write `[build] target-dir` for the migration `from -> to` into `repo`'s
+/// `.cargo/config.toml` (creating `.cargo/` and the file when absent).
+fn point_repo(repo: &Path, from: &Path, to: &Path) -> ConfigNote {
+    let config = repo.join(".cargo").join("config.toml");
+    let text = match std::fs::read_to_string(&config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return ConfigNote::Untouched(format!("{} unreadable ({e})", config.display())),
+    };
+    let old_name = from
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let value = target_dir_value(repo, to);
+    let (new_text, rewritten) = match point_cargo_config(&text, &old_name, &value) {
+        ConfigEdit::Written(t) => (t, false),
+        ConfigEdit::Rewritten(t) => (t, true),
+        ConfigEdit::PointsElsewhere(v) => {
+            return ConfigNote::Untouched(format!(
+                "{} already sets target-dir = {v:?}, which is not the migrated directory — \
+                 left as is",
+                config.display()
+            ));
+        }
+        ConfigEdit::Unparseable(_) => {
+            return ConfigNote::Untouched(format!(
+                "{} could not be edited into valid TOML — point cargo at {} yourself",
+                config.display(),
+                to.display()
+            ));
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(repo.join(".cargo")) {
+        return ConfigNote::Untouched(format!("{}: {e}", repo.join(".cargo").display()));
+    }
+    // Atomic: temp + rename, so a crash mid-write cannot leave cargo a half config.
+    let tmp = repo.join(".cargo").join(".config.toml.atpkg-tmp");
+    if let Err(e) = std::fs::write(&tmp, new_text.as_bytes()) {
+        return ConfigNote::Untouched(format!("{}: {e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &config) {
+        let _ = std::fs::remove_file(&tmp);
+        return ConfigNote::Untouched(format!("{}: {e}", config.display()));
+    }
+    if rewritten {
+        ConfigNote::Rewritten(config)
+    } else {
+        ConfigNote::Written(config)
+    }
+}
+
+/// One bounded `git -C <repo> <args>` (the doctor's 5 s probe clock; stderr dropped).
+/// `None` when git could not be spawned or did not finish — every caller reads that as
+/// "not known", never as "not a checkout" on its own.
+fn git(repo: &Path, args: &[&str]) -> Option<std::process::Output> {
+    crate::doctor::output_bounded(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args),
+    )
+}
+
+/// `git rev-parse <args>` in `repo`, as a path; relative answers are resolved against
+/// `repo` (git prints them relative to its `-C` directory).
+fn git_path(repo: &Path, args: &[&str]) -> Option<PathBuf> {
+    let mut full = vec!["rev-parse"];
+    full.extend_from_slice(args);
+    let out = git(repo, &full).filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(text);
+    Some(if p.is_absolute() { p } else { repo.join(p) })
+}
+
+/// Whether `repo` is inside a git checkout: a `.git` at its root (a directory, or the
+/// FILE a linked worktree carries) answers without spawning anything; otherwise
+/// `git rev-parse --show-toplevel` decides, so a crate nested inside a checkout counts
+/// too. False when git cannot run and there is no `.git` — the config edit is then the
+/// fallback, which is the pre-2026-09-10 behaviour.
+#[must_use]
+pub fn is_git_checkout(repo: &Path) -> bool {
+    std::fs::symlink_metadata(repo.join(".git")).is_ok()
+        || git(repo, &["rev-parse", "--show-toplevel"]).is_some_and(|o| o.status.success())
+}
+
+/// How cargo would be kept pointed at `dir`'s migrated name: the symlink in a git
+/// checkout, the config edit elsewhere, nothing for a free-standing directory.
+#[must_use]
+pub fn pointer_for(repo: Option<&Path>) -> Pointer {
+    match repo {
+        None => Pointer::None,
+        Some(repo) if is_git_checkout(repo) => Pointer::Symlink,
+        Some(repo) => Pointer::Config(repo.join(".cargo").join("config.toml")),
+    }
+}
+
+/// Whether git ignores `path` in `repo`: `Some(true)`/`Some(false)` from
+/// `check-ignore`'s 0/1, `None` when git could not answer (not spawnable, timed out,
+/// or exit 128 — a path outside the repository).
+fn git_ignores(repo: &Path, path: &Path) -> Option<bool> {
+    let shown = path.to_string_lossy();
+    let out = git(repo, &["check-ignore", "-q", "--", &shown])?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Keep `git status` clean about `path` (the migrated name, or the link left where the
+/// directory was): nothing when git already ignores it, else one line — `/<path
+/// relative to the toplevel>` under `comment` — appended to the clone's
+/// `.git/info/exclude` (`git rev-parse --git-path info/exclude`, which is the COMMON
+/// dir's file from a linked worktree too, so every worktree of the clone shares the
+/// line). Never `.gitignore`: that is a tracked file, and editing it is the dirty tree
+/// this whole path exists to avoid.
+fn exclude_in_git(repo: &Path, path: &Path, comment: &str) -> ExcludeNote {
+    match git_ignores(repo, path) {
+        Some(true) => return ExcludeNote::AlreadyIgnored,
+        Some(false) => {}
+        None => {
+            return ExcludeNote::NotIgnored(
+                "git could not be asked — add the new name to .git/info/exclude yourself"
+                    .to_string(),
+            );
+        }
+    }
+    let Some(toplevel) = git_path(repo, &["--show-toplevel"]) else {
+        return ExcludeNote::NotIgnored("git rev-parse --show-toplevel failed".to_string());
+    };
+    let Some(exclude) = git_path(repo, &["--git-path", "info/exclude"]) else {
+        return ExcludeNote::NotIgnored("git rev-parse --git-path info/exclude failed".to_string());
+    };
+    // `--show-toplevel` is canonical (symlinks resolved), so the path must be canonical
+    // too before the one can be stripped off the other — its PARENT: canonicalizing the
+    // link itself would resolve it to the new name and exclude the wrong path.
+    let real_path = match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            std::fs::canonicalize(parent).map_or_else(|_| path.to_path_buf(), |p| p.join(name))
+        }
+        _ => path.to_path_buf(),
+    };
+    let real_top = std::fs::canonicalize(&toplevel).unwrap_or(toplevel);
+    let Ok(rel) = real_path.strip_prefix(&real_top) else {
+        return ExcludeNote::NotIgnored(format!(
+            "{} is not under the toplevel {}",
+            real_path.display(),
+            real_top.display()
+        ));
+    };
+    let pattern = format!("/{}", rel.display());
+    let mut text = match std::fs::read_to_string(&exclude) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return ExcludeNote::NotIgnored(format!("{} unreadable ({e})", exclude.display()));
+        }
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(comment);
+    text.push('\n');
+    text.push_str(&pattern);
+    text.push('\n');
+    if let Some(parent) = exclude.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return ExcludeNote::NotIgnored(format!("{}: {e}", parent.display()));
+    }
+    if let Err(e) = std::fs::write(&exclude, text.as_bytes()) {
+        return ExcludeNote::NotIgnored(format!("{}: {e}", exclude.display()));
+    }
+    // Read back through git: the line is only worth reporting if git agrees.
+    match git_ignores(repo, &real_path) {
+        Some(true) => ExcludeNote::Added(exclude),
+        _ => ExcludeNote::NotIgnored(format!(
+            "{pattern} was written to {} but git still does not ignore it",
+            exclude.display()
+        )),
+    }
+}
+
+/// The exclude-file comment over the migrated name's line.
+const EXCLUDE_NEW_NAME: &str =
+    "# atpkg noindex: the cargo target dir migrated out of Spotlight's index";
+/// The exclude-file comment over the link's line — written only when the entry that
+/// ignored the directory is directory-only and so stops matching at the link.
+const EXCLUDE_LINK: &str = "# atpkg noindex: the symlink standing where the directory was — the \
+                            ignore entry that matched the directory is directory-only";
+
+/// The git-checkout pointer: a RELATIVE symlink `from -> <file name of to>` (same
+/// parent, so a moved checkout keeps working), then the exclude lines: the new name's,
+/// and the link's own when `dir_ignored` (git's answer about the DIRECTORY, probed
+/// before the rename) was true but the link is not — a directory-only pattern
+/// (`target/`) matches the directory and not the symlink that replaces it, and without
+/// this line the pass would turn an ignored directory into a `?? target` row. A link
+/// that cannot be laid rolls the rename back — a renamed tree with no pointer would
+/// break the next build silently — and reports why.
+#[cfg(unix)]
+fn link_in_place(
+    repo: &Path,
+    from: &Path,
+    to: &Path,
+    dir_ignored: Option<bool>,
+) -> Result<ConfigNote, String> {
+    let Some(name) = to.file_name() else {
+        return Err(format!("{} has no file name", to.display()));
+    };
+    if let Err(e) = std::os::unix::fs::symlink(name, from) {
+        return Err(format!(
+            "the symlink {} -> {} could not be laid ({e})",
+            from.display(),
+            Path::new(name).display()
+        ));
+    }
+    let exclude = exclude_in_git(repo, to, EXCLUDE_NEW_NAME);
+    let link_exclude = match git_ignores(repo, from) {
+        // The entry that ignored the directory matches the link too. An unanswerable
+        // git reads as ignored here because the alternative is a warning about a state
+        // nothing measured.
+        Some(true) | None => ExcludeNote::AlreadyIgnored,
+        Some(false) => match dir_ignored {
+            Some(true) => match exclude_in_git(repo, from, EXCLUDE_LINK) {
+                ExcludeNote::NotIgnored(why) => ExcludeNote::NotIgnored(format!(
+                    "the directory was ignored by a directory-only pattern the link does not \
+                     match, and excluding the link failed — {why}; git status shows it until it \
+                     is excluded"
+                )),
+                note => note,
+            },
+            Some(false) => ExcludeNote::NotIgnored(
+                "the link shows as untracked, as the directory did".to_string(),
+            ),
+            None => ExcludeNote::NotIgnored(
+                "the link shows as untracked (whether git ignored the directory could not be \
+                 asked before the rename)"
+                    .to_string(),
+            ),
+        },
+    };
+    Ok(ConfigNote::Linked {
+        link: from.to_path_buf(),
+        exclude,
+        link_exclude,
+    })
+}
+
+#[cfg(not(unix))]
+fn link_in_place(
+    _repo: &Path,
+    from: &Path,
+    to: &Path,
+    _dir_ignored: Option<bool>,
+) -> Result<ConfigNote, String> {
+    Err(format!(
+        "a symlink {} -> {} is not laid on this platform",
+        from.display(),
+        to.display()
+    ))
+}
+
+/// Apply the remedy to ONE target dir: refuse a live build, [`migrate`] it, and keep
+/// its repo's cargo pointed at the new name — a symlink in a git checkout, the config
+/// edit elsewhere ([`pointer_for`]). `require_repo` (the `--all` walk) skips a
+/// free-standing target dir — renaming one whose pointer is an env var this cannot see
+/// would break the next build silently; a directory the user NAMED is migrated anyway,
+/// with the hint the standalone verb prints. Idempotent: an already-excluded directory
+/// is `AlreadyExcluded`, never an error.
+#[must_use]
+pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
+    if !SUPPORTED {
+        return Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason: "not applicable — Spotlight is a macOS index".to_string(),
+        };
+    }
+    // The link a previous pass left (`target -> target.noindex`), or any symlink whose
+    // real path is already excluded: a success, not the refusal `migrate` gives a link
+    // into an INDEXED tree.
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink())
+        && let Ok(real) = std::fs::canonicalize(dir)
+        && exclusion_of(&real) != Exclusion::Exposed
+    {
+        return Applied::AlreadyExcluded(dir.to_path_buf());
+    }
+    let repo = repo_of(dir);
+    if require_repo && repo.is_none() {
+        return Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason: "not beside a Cargo.toml — its pointer is an env var this cannot re-point; \
+                     `aterm pkg noindex apply <dir>` migrates it by name"
+                .to_string(),
+        };
+    }
+    if let Some(lock) = build_in_progress(dir) {
+        return Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason: format!("a build holds {} — retried next pass", lock.display()),
+        };
+    }
+    let pointer = pointer_for(repo.as_deref());
+    // Git's answer about the DIRECTORY, taken while it still is one: a directory-only
+    // ignore pattern (`target/`) stops matching once a symlink stands there, and the
+    // link then needs its own exclude line (`link_in_place`).
+    let dir_ignored = match (&repo, &pointer) {
+        (Some(repo), Pointer::Symlink) if !dry_run => git_ignores(repo, dir),
+        _ => None,
+    };
+    match migrate(dir, dry_run) {
+        Ok(Migration::Migrated { from, to }) => {
+            let config = match (&repo, &pointer) {
+                (Some(repo), Pointer::Symlink) => {
+                    match link_in_place(repo, &from, &to, dir_ignored) {
+                        Ok(note) => note,
+                        Err(why) => {
+                            return match std::fs::rename(&to, &from) {
+                                Ok(()) => Applied::Skipped {
+                                    path: dir.to_path_buf(),
+                                    reason: format!("{why} — the rename was rolled back"),
+                                },
+                                Err(e) => Applied::Migrated {
+                                    from,
+                                    to,
+                                    config: ConfigNote::Untouched(format!(
+                                        "{why}, and rolling the rename back failed ({e}) — lay the \
+                                     link or point cargo at the new name yourself"
+                                    )),
+                                },
+                            };
+                        }
+                    }
+                }
+                (Some(repo), _) => point_repo(repo, &from, &to),
+                (None, _) => ConfigNote::Untouched(
+                    "no Cargo.toml beside it — point cargo at the new name yourself".to_string(),
+                ),
+            };
+            Applied::Migrated { from, to, config }
+        }
+        Ok(Migration::Planned { from, to }) => Applied::Planned { from, to, pointer },
+        Ok(Migration::AlreadyExcluded(p)) => Applied::AlreadyExcluded(p),
+        Ok(Migration::NotApplicable) => Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason: "not applicable".to_string(),
+        },
+        Err(e) => Applied::Skipped {
+            path: dir.to_path_buf(),
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// The doctor's scan, then [`apply_one`] over every EXPOSED target dir it found, repos
+/// only (`require_repo`). Returns the outcomes in path order and whether the scan was
+/// complete (a truncated walk is a floor, and the caller must not call it a census).
+#[must_use]
+pub fn apply_under(
+    root: &Path,
+    max_depth: usize,
+    budget: &Budget,
+    dry_run: bool,
+) -> (Vec<Applied>, bool) {
+    let found = scan(root, max_depth, budget);
+    let outcomes = found
+        .exposed()
+        .map(|t| apply_one(&t.path, true, dry_run))
+        .collect();
+    (outcomes, found.complete)
+}
+
+// ---------------------------------------------------------------------------------------
 // Verification — the empirical probe
 // ---------------------------------------------------------------------------------------
 
@@ -1068,6 +1774,650 @@ mod tests {
         let mut tag = String::from(CACHEDIR_TAG_SIGNATURE);
         tag.push_str("\n# This file is a cache directory tag created by cargo.\n");
         std::fs::write(at.join("CACHEDIR.TAG"), tag.as_bytes()).unwrap();
+    }
+
+    // --- APPLY ------------------------------------------------------------------------
+
+    // The pure config editor over the three shapes a real `.cargo/config.toml` takes,
+    // plus the two refusals. The aterm repo's own config (a `[target.'cfg(…)']` table,
+    // `[alias]`, no `[build]`) is the appended case.
+    #[test]
+    fn point_cargo_config_covers_absent_table_existing_table_and_existing_key() {
+        // No file at all.
+        assert_eq!(
+            point_cargo_config("", "target", "target.noindex"),
+            ConfigEdit::Written("[build]\ntarget-dir = \"target.noindex\"\n".to_string())
+        );
+        // Tables but no [build]: appended after a blank line, other tables untouched.
+        let aterm = "[target.'cfg(trust_verify)']\nrustflags = [\"-Ztrust-verify=off\"]\n\n\
+                     [alias]\nship = \"run --release -p aterm-release --\"\n";
+        let ConfigEdit::Written(t) = point_cargo_config(aterm, "target", "target.noindex") else {
+            panic!("appended");
+        };
+        assert!(t.starts_with(aterm), "{t}");
+        assert!(
+            t.ends_with("\n[build]\ntarget-dir = \"target.noindex\"\n"),
+            "{t}"
+        );
+        // An existing [build] with other keys: the key lands right under the header.
+        let with_build = "[build]\njobs = 4\n\n[alias]\nx = \"y\"\n";
+        let ConfigEdit::Written(t) = point_cargo_config(with_build, "target", "target.noindex")
+        else {
+            panic!("inserted");
+        };
+        assert_eq!(
+            t,
+            "[build]\ntarget-dir = \"target.noindex\"\njobs = 4\n\n[alias]\nx = \"y\"\n"
+        );
+        // An existing target-dir naming the old directory (three spellings) is rewritten.
+        for old in ["target", "./target", "/Users//x/repo/target/"] {
+            let text = format!("[build]\ntarget-dir = \"{old}\"\n");
+            assert_eq!(
+                point_cargo_config(&text, "target", "target.noindex"),
+                ConfigEdit::Rewritten("[build]\ntarget-dir = \"target.noindex\"\n".to_string()),
+                "{old}"
+            );
+        }
+        // An existing target-dir pointing elsewhere is left alone.
+        assert_eq!(
+            point_cargo_config("[build]\ntarget-dir = \"/Volumes/fast/t\"\n", "target", "x"),
+            ConfigEdit::PointsElsewhere("/Volumes/fast/t".to_string())
+        );
+        // A target-dir key OUTSIDE [build] is not cargo's and is ignored.
+        let ConfigEdit::Written(t) =
+            point_cargo_config("[other]\ntarget-dir = \"z\"\n", "target", "target.noindex")
+        else {
+            panic!("written");
+        };
+        assert!(t.contains("[other]\ntarget-dir = \"z\"\n"), "{t}");
+        // Something that cannot be made to parse is refused, never written.
+        assert!(matches!(
+            point_cargo_config("[build\nbroken = ", "target", "t"),
+            ConfigEdit::Unparseable(_)
+        ));
+        // The value is relative when the target is a direct child of the repo.
+        assert_eq!(
+            target_dir_value(Path::new("/r"), Path::new("/r/target.noindex")),
+            "target.noindex"
+        );
+        assert_eq!(
+            target_dir_value(Path::new("/r"), Path::new("/elsewhere/target.noindex")),
+            "/elsewhere/target.noindex"
+        );
+    }
+
+    // `apply_one` over a synthetic repo: the rename, the config write (with the
+    // relative name), idempotence on the second run, and the build-output sentinel
+    // (`.metadata_never_index`, which cli.rs reads four levels above a seed dir)
+    // travelling with the tree so the reader and the writers keep agreeing.
+    #[test]
+    fn apply_one_migrates_points_cargo_and_is_idempotent() {
+        if !SUPPORTED {
+            let root = scratch("apply-na");
+            assert!(matches!(
+                apply_one(&root, false, false),
+                Applied::Skipped { .. }
+            ));
+            return;
+        }
+        let root = scratch("apply-one");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = repo.join("target");
+        tagged_target(&target);
+        // `aterm-release` writes the sentinel into the directory it produces the
+        // bundle IN (`target/release/`), and cli.rs reads it four levels above the
+        // seed dir: seed → Resources → Contents → aterm.app → release.
+        let seed = target.join("release/aterm.app/Contents/Resources/seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(target.join("release/.metadata_never_index"), "").unwrap();
+        // Dry run first: nothing moves, the plan names the config.
+        match apply_one(&target, true, true) {
+            Applied::Planned { from, to, pointer } => {
+                assert_eq!(from, target);
+                assert_eq!(to, repo.join("target.noindex"));
+                assert_eq!(pointer, Pointer::Config(repo.join(".cargo/config.toml")));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(target.is_dir() && !repo.join("target.noindex").exists());
+        // The real thing.
+        let out = apply_one(&target, true, false);
+        let Applied::Migrated { from, to, config } = out else {
+            panic!("{out:?}");
+        };
+        assert!(out_is(&from, &target) && to == repo.join("target.noindex"));
+        assert_eq!(config, ConfigNote::Written(repo.join(".cargo/config.toml")));
+        assert!(!target.exists() && to.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target.noindex\"\n"
+        );
+        // The sentinel moved with the tree, four levels above the seed dir.
+        let moved_seed = to.join("release/aterm.app/Contents/Resources/seed");
+        assert!(
+            moved_seed
+                .ancestors()
+                .nth(4)
+                .is_some_and(|d| d.join(".metadata_never_index").exists()),
+            "the build-output sentinel travels with the renamed tree"
+        );
+        // Idempotent: the new name is already excluded; the config is not rewritten.
+        assert_eq!(
+            apply_one(&to, true, false),
+            Applied::AlreadyExcluded(to.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".cargo/config.toml")).unwrap(),
+            "[build]\ntarget-dir = \"target.noindex\"\n"
+        );
+        // A free-standing target dir is skipped under the walk, migrated by name.
+        let free = root.join("free-target");
+        tagged_target(&free);
+        assert!(matches!(
+            apply_one(&free, true, false),
+            Applied::Skipped { ref reason, .. } if reason.contains("not beside a Cargo.toml")
+        ));
+        assert!(free.is_dir());
+        let out = apply_one(&free, false, false);
+        assert!(
+            matches!(out, Applied::Migrated { ref config, .. } if matches!(config, ConfigNote::Untouched(_))),
+            "{out:?}"
+        );
+        assert!(root.join("free-target.noindex").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn out_is(a: &Path, b: &Path) -> bool {
+        a == b
+    }
+
+    // A build holding cargo's lock refuses the migration — probed with a real
+    // `flock(2)` on `<target>/debug/.cargo-lock`, released, then the migration goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_cargo_lock_refuses_the_migration_until_released() {
+        use std::os::unix::io::AsRawFd as _;
+        let root = scratch("apply-lock");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = repo.join("target");
+        tagged_target(&target);
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let lock_path = target.join("debug/.cargo-lock");
+        std::fs::write(&lock_path, "").unwrap();
+        assert_eq!(
+            build_in_progress(&target),
+            None,
+            "an unheld lock file is not a build"
+        );
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: flock on an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(build_in_progress(&target), Some(lock_path.clone()));
+        if SUPPORTED {
+            let out = apply_one(&target, true, false);
+            assert!(
+                matches!(out, Applied::Skipped { ref reason, .. } if reason.contains("a build holds")),
+                "{out:?}"
+            );
+            assert!(target.is_dir(), "nothing moved under a live build");
+        }
+        drop(held);
+        assert_eq!(build_in_progress(&target), None);
+        // A `--target <triple>` build locks one level deeper — seen too (review
+        // 2026-09-10), and a plain file at that depth that nobody holds is not a build.
+        let deep = target.join("aarch64-apple-darwin/release/.cargo-lock");
+        std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+        std::fs::write(&deep, "").unwrap();
+        assert_eq!(build_in_progress(&target), None);
+        let held = std::fs::OpenOptions::new().write(true).open(&deep).unwrap();
+        // SAFETY: flock on an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(build_in_progress(&target), Some(deep.clone()));
+        drop(held);
+        assert_eq!(build_in_progress(&target), None);
+        if SUPPORTED {
+            assert!(apply_one(&target, true, false).migrated());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `git` with the user's global and system config masked, so a signing or hooks
+    /// setting on the developer's machine cannot shape the fixture.
+    #[cfg(unix)]
+    fn git_fixture(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[cfg(unix)]
+    fn git_status(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["status", "--porcelain"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// THE DESIGN RULE (module doc, 2026-09-10): a git checkout is NEVER dirtied. The
+    /// fixture is the aterm repo's shape — a TRACKED `.cargo/config.toml`, `target` in
+    /// `.gitignore` — plus a linked worktree (a `.git` FILE) and a crate nested inside
+    /// the checkout (no `.git` beside it). After `apply` in each: `target` is a relative
+    /// symlink to `target.noindex`, the config is byte-identical, and `git status
+    /// --porcelain` is EMPTY — the release cutter's own dirty test. A repo that does not
+    /// ignore `target` still gets no config write and is told the link is untracked.
+    /// Then the shape the first cut of this got WRONG: a repo whose ignore entries are
+    /// directory-only (`target/`, `/target-tippy/` — the aterm checkout's own
+    /// `.gitignore:55`, and 20 of the 26 planned dirs on m21). Those match the directory
+    /// and NOT the symlink, so without the link's own exclude line the pass turned an
+    /// ignored directory into a `?? target` row that `clean_tree` would refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_checkout_gets_a_symlink_and_stays_clean_never_a_config_edit() {
+        if !SUPPORTED {
+            return;
+        }
+        let root = scratch("apply-git");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        if !git_fixture(&repo, &["init", "-q", "--template=", "-b", "main"]) {
+            eprintln!("git is not runnable here; the checkout fixture is skipped");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let config = repo.join(".cargo/config.toml");
+        let config_text = "[alias]\nx = \"y\"\n";
+        std::fs::write(&config, config_text).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "target\n").unwrap();
+        assert!(git_fixture(&repo, &["add", "."]));
+        assert!(git_fixture(&repo, &["commit", "-q", "-m", "fixture"]));
+        let target = repo.join("target");
+        tagged_target(&target);
+        std::fs::write(target.join("debug-artifact"), b"payload").unwrap();
+        assert_eq!(git_status(&repo), "", "the fixture starts clean");
+        assert!(is_git_checkout(&repo));
+        assert_eq!(pointer_for(Some(&repo)), Pointer::Symlink);
+
+        // Dry run: the plan names the symlink, and nothing moves or is written.
+        match apply_one(&target, true, true) {
+            Applied::Planned { from, to, pointer } => {
+                assert_eq!(from, target);
+                assert_eq!(to, repo.join("target.noindex"));
+                assert_eq!(pointer, Pointer::Symlink);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+        assert_eq!(git_status(&repo), "");
+
+        // The real thing.
+        let out = apply_one(&target, true, false);
+        let Applied::Migrated {
+            from,
+            to,
+            config: note,
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(from, target);
+        assert_eq!(to, repo.join("target.noindex"));
+        let ConfigNote::Linked {
+            link,
+            exclude,
+            link_exclude,
+        } = note
+        else {
+            panic!("a git checkout is linked, never config-edited: {note:?}");
+        };
+        assert_eq!(link, target);
+        assert_eq!(
+            link_exclude,
+            ExcludeNote::AlreadyIgnored,
+            "`target` (no slash) in .gitignore matches the link too"
+        );
+        let ExcludeNote::Added(exclude_file) = exclude else {
+            panic!("the new name is not matched by `target`, so it is excluded: {exclude:?}");
+        };
+        assert!(
+            exclude_file.starts_with(repo.join(".git")),
+            "outside the working tree: {}",
+            exclude_file.display()
+        );
+        assert!(
+            std::fs::read_to_string(&exclude_file)
+                .unwrap()
+                .contains("/target.noindex\n")
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            Path::new("target.noindex"),
+            "a RELATIVE link"
+        );
+        assert!(to.is_dir());
+        assert_eq!(
+            std::fs::read(target.join("debug-artifact")).unwrap(),
+            b"payload",
+            "cargo's path still reaches the tree, through the link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            config_text,
+            "the tracked config is byte-identical"
+        );
+        assert!(!repo.join(".cargo/.config.toml.atpkg-tmp").exists());
+        assert_eq!(
+            git_status(&repo),
+            "",
+            "the working tree is CLEAN after apply"
+        );
+
+        // Idempotent from either spelling; the exclude file is not appended to again.
+        let exclude_once = std::fs::read_to_string(&exclude_file).unwrap();
+        assert_eq!(
+            apply_one(&target, true, false),
+            Applied::AlreadyExcluded(target.clone()),
+            "the link a previous pass left is a success, not a symlink refusal"
+        );
+        assert_eq!(
+            apply_one(&to, true, false),
+            Applied::AlreadyExcluded(to.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&exclude_file).unwrap(),
+            exclude_once
+        );
+        assert_eq!(git_status(&repo), "");
+
+        // A linked worktree: `.git` is a FILE, the exclude is the clone's shared one,
+        // so the second checkout's name is already ignored.
+        let wt = root.join("wt");
+        assert!(git_fixture(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                &wt.display().to_string(),
+                "-b",
+                "wt"
+            ]
+        ));
+        assert!(
+            std::fs::symlink_metadata(wt.join(".git"))
+                .unwrap()
+                .is_file()
+        );
+        tagged_target(&wt.join("target"));
+        assert_eq!(git_status(&wt), "");
+        let out = apply_one(&wt.join("target"), true, false);
+        assert!(
+            matches!(
+                &out,
+                Applied::Migrated {
+                    config: ConfigNote::Linked {
+                        exclude: ExcludeNote::AlreadyIgnored,
+                        link_exclude: ExcludeNote::AlreadyIgnored,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_link(wt.join("target")).unwrap(),
+            Path::new("target.noindex")
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".cargo/config.toml")).unwrap(),
+            config_text,
+            "the worktree's checked-out config is byte-identical"
+        );
+        assert_eq!(git_status(&wt), "", "the worktree is CLEAN after apply");
+
+        // A crate nested inside the checkout: no `.git` beside it, git rev-parse says
+        // it is inside one, and the exclude line is relative to the TOPLEVEL.
+        let nested = repo.join("crates/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"i\"\n").unwrap();
+        std::fs::write(nested.join("lib.rs"), "").unwrap();
+        assert!(git_fixture(&repo, &["add", "."]));
+        assert!(git_fixture(&repo, &["commit", "-q", "-m", "nested"]));
+        tagged_target(&nested.join("target"));
+        assert!(!nested.join(".git").exists());
+        assert!(is_git_checkout(&nested));
+        let out = apply_one(&nested.join("target"), true, false);
+        assert!(
+            matches!(
+                &out,
+                Applied::Migrated {
+                    config: ConfigNote::Linked {
+                        exclude: ExcludeNote::Added(_),
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert!(
+            std::fs::read_to_string(&exclude_file)
+                .unwrap()
+                .contains("/crates/inner/target.noindex\n")
+        );
+        assert!(!nested.join(".cargo").exists());
+        assert_eq!(
+            git_status(&repo),
+            "",
+            "the checkout is CLEAN after the nested apply"
+        );
+
+        // A checkout that does NOT ignore `target`: still no config, the link is laid,
+        // the new name is excluded, and the note says the link shows as untracked —
+        // exactly as the directory did before.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(git_fixture(
+            &bare,
+            &["init", "-q", "--template=", "-b", "main"]
+        ));
+        std::fs::write(bare.join("Cargo.toml"), "[package]\nname = \"b\"\n").unwrap();
+        assert!(git_fixture(&bare, &["add", "."]));
+        assert!(git_fixture(&bare, &["commit", "-q", "-m", "fixture"]));
+        tagged_target(&bare.join("target"));
+        assert_eq!(git_status(&bare), "?? target/\n", "untracked before");
+        let out = apply_one(&bare.join("target"), true, false);
+        assert!(
+            matches!(
+                &out,
+                Applied::Migrated {
+                    config: ConfigNote::Linked {
+                        exclude: ExcludeNote::Added(_),
+                        link_exclude: ExcludeNote::NotIgnored(why),
+                        ..
+                    },
+                    ..
+                } if why == "the link shows as untracked, as the directory did"
+            ),
+            "{out:?}"
+        );
+        assert!(
+            !bare.join(".cargo").exists(),
+            "no config edit, gitignore or not"
+        );
+        assert_eq!(
+            git_status(&bare),
+            "?? target\n",
+            "the link is untracked as the directory was; the new name is not"
+        );
+
+        // Directory-only ignore entries: `target/` and `/target-tippy/` match the
+        // directories and NOT the symlinks that replace them (measured: `git
+        // check-ignore` answers 0 for the directory, 1 for the link). The pass probes
+        // the directory before the rename and gives each link its own exclude line, so
+        // status is exactly what it was — empty — and a second apply is `AlreadyExcluded`
+        // with the exclude file untouched.
+        let slashed = root.join("slashed");
+        std::fs::create_dir_all(&slashed).unwrap();
+        assert!(git_fixture(
+            &slashed,
+            &["init", "-q", "--template=", "-b", "main"]
+        ));
+        std::fs::write(slashed.join("Cargo.toml"), "[package]\nname = \"s\"\n").unwrap();
+        std::fs::write(slashed.join(".gitignore"), "target/\n/target-tippy/\n").unwrap();
+        assert!(git_fixture(&slashed, &["add", "."]));
+        assert!(git_fixture(&slashed, &["commit", "-q", "-m", "fixture"]));
+        let s_target = slashed.join("target");
+        let s_tippy = slashed.join("target-tippy");
+        tagged_target(&s_target);
+        tagged_target(&s_tippy);
+        assert_eq!(
+            git_status(&slashed),
+            "",
+            "the directory-only patterns ignore both DIRECTORIES"
+        );
+        assert_eq!(git_ignores(&slashed, &s_target), Some(true));
+        assert_eq!(git_ignores(&slashed, &s_tippy), Some(true));
+        let mut s_exclude = None;
+        for (dir, new_name) in [
+            (&s_target, "target.noindex"),
+            (&s_tippy, "target-tippy.noindex"),
+        ] {
+            let out = apply_one(dir, true, false);
+            let Applied::Migrated {
+                config:
+                    ConfigNote::Linked {
+                        link,
+                        exclude: ExcludeNote::Added(exclude_file),
+                        link_exclude: ExcludeNote::Added(link_file),
+                    },
+                ..
+            } = out
+            else {
+                panic!("the new name AND the link are excluded: {out:?}");
+            };
+            assert_eq!(&link, dir);
+            assert_eq!(
+                link_file, exclude_file,
+                "the link's line lands in the same exclude file"
+            );
+            assert!(exclude_file.starts_with(slashed.join(".git")));
+            assert_eq!(std::fs::read_link(dir).unwrap(), Path::new(new_name));
+            assert_eq!(
+                git_ignores(&slashed, dir),
+                Some(true),
+                "read back through git: the link is ignored again"
+            );
+            assert_eq!(
+                git_status(&slashed),
+                "",
+                "the tree is as clean after {} as before — no `?? {}` row",
+                dir.display(),
+                dir.file_name().unwrap().to_string_lossy()
+            );
+            s_exclude = Some(exclude_file);
+        }
+        let s_exclude = s_exclude.unwrap();
+        let s_text = std::fs::read_to_string(&s_exclude).unwrap();
+        for line in [
+            "/target.noindex",
+            "/target",
+            "/target-tippy.noindex",
+            "/target-tippy",
+        ] {
+            assert!(
+                s_text.lines().any(|l| l == line),
+                "{line} is in the exclude file:\n{s_text}"
+            );
+        }
+        assert!(
+            !slashed.join(".cargo").exists(),
+            "no config edit here either"
+        );
+        // Idempotent: the links a previous pass left are a success, and nothing is
+        // appended again.
+        assert_eq!(
+            apply_one(&s_target, true, false),
+            Applied::AlreadyExcluded(s_target.clone())
+        );
+        assert_eq!(
+            apply_one(&s_tippy, true, false),
+            Applied::AlreadyExcluded(s_tippy.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&s_exclude).unwrap(),
+            s_text,
+            "the second apply re-appends nothing"
+        );
+        assert_eq!(
+            git_status(&slashed),
+            "",
+            "still clean after the second apply"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The walk: exposed repo targets migrate, a free-standing one is skipped with its
+    // reason, an already-hidden one is not touched, and the count of MIGRATED is what
+    // the pass reports.
+    #[test]
+    fn apply_under_migrates_repo_targets_and_reports_only_what_moved() {
+        if !SUPPORTED {
+            return;
+        }
+        let root = scratch("apply-under");
+        for name in ["a", "b"] {
+            let repo = root.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+            tagged_target(&repo.join("target"));
+        }
+        tagged_target(&root.join("free-target"));
+        tagged_target(&root.join("c/target.noindex"));
+        let (outcomes, complete) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        assert!(complete);
+        let migrated = outcomes.iter().filter(|o| o.migrated()).count();
+        assert_eq!(migrated, 2, "{outcomes:?}");
+        assert!(root.join("a/target.noindex").is_dir());
+        assert!(root.join("b/target.noindex").is_dir());
+        assert!(root.join("free-target").is_dir(), "free-standing: skipped");
+        assert!(root.join("c/target.noindex").is_dir());
+        assert!(outcomes.iter().any(
+            |o| matches!(o, Applied::Skipped { path, .. } if path == &root.join("free-target"))
+        ));
+        // Second pass: nothing exposed but the free one; zero migrated.
+        let (outcomes, _) = apply_under(&root, DOCTOR_DEPTH, &Budget::VERB, false);
+        assert_eq!(outcomes.iter().filter(|o| o.migrated()).count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // --- PURE -------------------------------------------------------------------------

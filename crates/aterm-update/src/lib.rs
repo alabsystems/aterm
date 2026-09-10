@@ -984,7 +984,18 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
 /// the user (`(title, body)` — e.g. posted to the event loop and shown as an OS
 /// notification). Health problems must not stay buried in `status.toml`: the
 /// build-826 incident was a persistently-broken updater that nothing surfaced.
+///
+/// The hook also carries the RECOVERY: once this process has reported a persistent
+/// failure and a later check finds the ledger healed, it is called once more with
+/// [`HEALTH_RECOVERED_TITLE`] and an empty body, so a surface that STANDS while the
+/// failure stands (the pull-down's health row) knows when to leave. No notification
+/// is owed for it — the row leaving is the whole message.
 pub type HealthNotify = Box<dyn Fn(String, String) + Send>;
+
+/// The `title` [`HealthNotify`] is called with when a persistent failure this
+/// process reported has HEALED. Pinned so the GUI matches on it rather than on the
+/// shape of the body.
+pub const HEALTH_RECOVERED_TITLE: &str = "aterm auto-update recovered";
 
 /// A GUI-supplied hook fired when a strictly-newer build has just been STAGED, so the
 /// GUI can arm the in-session apply lane and show the update-ready nudge (the Version
@@ -1480,7 +1491,12 @@ pub fn spawn_background_check(
                             ),
                         );
                     } else if !h.is_persistent() {
-                        notified_failing = None; // all healed → any class may speak again
+                        // All healed → any class may speak again. A failure THIS
+                        // process reported gets its recovery reported too, once, so
+                        // the standing pull-down row can leave.
+                        if notified_failing.take().is_some() {
+                            cb(HEALTH_RECOVERED_TITLE.to_string(), String::new());
+                        }
                     }
                 }
                 if interval == 0 {

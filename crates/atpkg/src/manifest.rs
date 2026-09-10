@@ -249,9 +249,9 @@ impl Index {
     ) -> BTreeSet<String> {
         let mut set: BTreeSet<String> = if include.is_empty() {
             self.programs
-                .iter()
-                .filter(|(_, p)| !p.extra)
-                .map(|(n, _)| n.clone())
+                .keys()
+                .filter(|n| !self.is_extra(n))
+                .cloned()
                 .collect()
         } else {
             include
@@ -261,7 +261,7 @@ impl Index {
                 .collect()
         };
         for name in optins {
-            if self.programs.get(name.as_str()).is_some_and(|p| p.extra) {
+            if self.is_extra(name) {
                 set.insert(name.clone());
             }
         }
@@ -273,10 +273,16 @@ impl Index {
 
     /// Whether `name` is an index-named EXTRA ([`Program::extra`]): available on request,
     /// never a default-set member. `false` for a default-set program AND for a name the
-    /// index does not carry (nothing outside the signed set is an extra either).
+    /// index does not carry (nothing outside the signed set is an extra either) — AND
+    /// for an agent program ([`crate::stub::AGENT_PROGRAMS`]), whatever the row says:
+    /// the client treats `claude`/`codex` as default-set even under an index that still
+    /// flags them (owner decision 2026-09-10; index build 21 does). THIS is the one
+    /// question every default-set decision asks — `installable_with_optins`, the
+    /// consent-stub candidates, the explicit door's opt-in note — so the override lives
+    /// here and nowhere reads the raw flag for that purpose.
     #[must_use]
     pub fn is_extra(&self, name: &str) -> bool {
-        self.programs.get(name).is_some_and(|p| p.extra)
+        !crate::stub::is_agent_program(name) && self.programs.get(name).is_some_and(|p| p.extra)
     }
 }
 
@@ -796,6 +802,11 @@ repo = "codex"
 policy = "prebuilt-only"
 extra = true
 
+[programs.vendorx]
+repo = "vendorx"
+policy = "prebuilt-only"
+extra = true
+
 [programs.gh]
 repo = "gh"
 policy = "prebuilt-only"
@@ -806,7 +817,7 @@ name = "stable"
 channel_build = 137
 min_build = 120
 yanked = ["trust@4790"]
-pin = {{ aterm = 1234, trust = 4821, ay = 18, codex = 2026082601, gh = 2026082601 }}
+pin = {{ aterm = 1234, trust = 4821, ay = 18, codex = 2026082601, vendorx = 1, gh = 2026082601 }}
 
 [channels.meta]
 nightly = "nightly-2025-12-03"
@@ -878,11 +889,12 @@ trust_mc_rev = "0.67.0"
     #[test]
     fn include_exclude_are_narrowing_only() {
         let idx = parse_index(&verified(&full_index())).unwrap();
-        // Default (empty include): every named DEFAULT-SET program (`codex` is an extra
-        // and stays out; `gh` is default-set — `system` is a satisfaction rule, not a tier).
+        // Default (empty include): every named DEFAULT-SET program (`vendorx` is an extra
+        // and stays out; `codex` is flagged but is an AGENT PROGRAM, so it is IN; `gh` is
+        // default-set — `system` is a satisfaction rule, not a tier).
         assert_eq!(
             idx.installable(&[], &[]),
-            ["aterm", "ay", "gh", "trust"]
+            ["aterm", "ay", "codex", "gh", "trust"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -903,7 +915,10 @@ trust_mc_rev = "0.67.0"
         // exclude subtracts.
         assert_eq!(
             idx.installable(&[], &["trust".into(), "gh".into()]),
-            ["aterm", "ay"].iter().map(|s| s.to_string()).collect()
+            ["aterm", "ay", "codex"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         );
     }
 
@@ -914,9 +929,22 @@ trust_mc_rev = "0.67.0"
     fn extras_are_excluded_by_default_and_join_by_include_or_optin() {
         let idx = parse_index(&verified(&full_index())).unwrap();
         // Parsed as declared; absent ⇒ false; `system` parsed beside it.
-        assert!(idx.program("codex").unwrap().extra);
+        assert!(idx.program("vendorx").unwrap().extra);
         assert!(!idx.program("ay").unwrap().extra);
-        assert!(idx.is_extra("codex"));
+        // But the AGENT override outranks the raw flag (owner decision 2026-09-10):
+        // codex is default-set on this client even under an index that flags it.
+        assert!(
+            idx.program("codex").unwrap().extra,
+            "the raw flag is parsed as declared"
+        );
+        assert!(
+            !idx.is_extra("codex"),
+            "an agent program is never an extra, whatever the index says"
+        );
+        assert!(
+            idx.installable(&[], &[]).contains("codex"),
+            "codex joins the default set without an opt-in"
+        );
         assert!(!idx.is_extra("ay"), "a default-set program is not an extra");
         assert!(
             !idx.is_extra("dotfiles"),
@@ -925,18 +953,18 @@ trust_mc_rev = "0.67.0"
         assert_eq!(idx.program("gh").unwrap().system.as_deref(), Some("gh"));
         assert_eq!(idx.program("ay").unwrap().system, None);
         // Reachable by name (the channel pins it) — but not in the default set.
-        assert!(idx.is_program("codex"));
-        assert!(!idx.installable(&[], &[]).contains("codex"));
+        assert!(idx.is_program("vendorx"));
+        assert!(!idx.installable(&[], &[]).contains("vendorx"));
         // `include` may name it: index-named, so this never widens past the signed set.
         assert_eq!(
-            idx.installable(&["codex".into()], &[]),
-            ["codex"].iter().map(|s| s.to_string()).collect()
+            idx.installable(&["vendorx".into()], &[]),
+            ["vendorx"].iter().map(|s| s.to_string()).collect()
         );
         // An opt-in marker unions it into the default set...
-        let optins: BTreeSet<String> = ["codex".to_string()].into_iter().collect();
+        let optins: BTreeSet<String> = ["vendorx".to_string()].into_iter().collect();
         assert_eq!(
             idx.installable_with_optins(&[], &[], &optins),
-            ["aterm", "ay", "codex", "gh", "trust"]
+            ["aterm", "ay", "codex", "vendorx", "gh", "trust"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -951,8 +979,8 @@ trust_mc_rev = "0.67.0"
         );
         // ...and `exclude` still beats a marker.
         assert!(
-            !idx.installable_with_optins(&[], &["codex".into()], &optins)
-                .contains("codex")
+            !idx.installable_with_optins(&[], &["vendorx".into()], &optins)
+                .contains("vendorx")
         );
         // The no-marker form is the marker form with no markers.
         assert_eq!(
@@ -1176,18 +1204,18 @@ vendor = "Apple"
         // Allowed: a dependency on an EXTRA (the consent surfaces name it), and one
         // between two members of ONE group (the tuple's transaction satisfies it).
         let ok = with(
-            "requires = [\"codex\"]\n",
+            "requires = [\"vendorx\"]\n",
             "coherence_group = \"rustc\"\nrequires = [\"trust\"]\n",
             "",
         );
         let idx = parse_index(&verified(&ok)).expect("an extra dep and an intra-group dep parse");
         assert_eq!(
             idx.program("gh").unwrap().requires,
-            vec!["codex".to_string()]
+            vec!["vendorx".to_string()]
         );
-        assert!(idx.is_extra("codex"));
+        assert!(idx.is_extra("vendorx"));
         assert!(
-            !idx.installable(&[], &[]).contains("codex"),
+            !idx.installable(&[], &[]).contains("vendorx"),
             "a dependency on an extra never opts it in"
         );
     }

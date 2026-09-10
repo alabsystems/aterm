@@ -370,7 +370,85 @@ fn main() -> ExitCode {
         );
     }
 
+    // THE TOOLCHAIN'S OWN CHECK, from the session lane (R3/R4, 2026-09-10). Only
+    // the WINDOW ran `atpkg update` — a terminal-only Mac never provisioned or
+    // updated its packages, and nothing anywhere said so. Two things, before the
+    // PTY exists so neither interleaves with a running shell:
+    //
+    //  1. If no atpkg pass has EVER succeeded here (status.toml absent, or no
+    //     `last_success_at` — the stamp atpkg writes only on success), the one
+    //     stderr line every console edge prints (`NEVER_CHECKED_STDERR_LINE`),
+    //     unless `--quiet` — and only while `[packages] enabled` is on: a user who
+    //     turned packages off is not told every session to run a pass.
+    //  2. If the last ATTEMPT (`updated_at`, moved by every pass, failed or not) is
+    //     older than the window loop's interval (6 h, or `ATPKG_UPDATE_INTERVAL_SECS`;
+    //     `0` disarms this edge), a DETACHED one-shot `aterm pkg update` — its own
+    //     process group, stdio on /dev/null, never waited for — so a session launch
+    //     is covered by the same pass the window runs at first open. The attempt,
+    //     not the success, on purpose: a pass that keeps failing is retried once per
+    //     interval, not once per tab (atpkg's store lock only dedups CONCURRENT
+    //     passes). Gated on the same `[packages]` bits the window reads (`enabled`,
+    //     `auto_update`), on `ATPKG_DISABLE`, and on this being an INTERACTIVE
+    //     launch: stdin a terminal and no `ATERM_SESSION_MODEL` — a harness driving
+    //     the session over pipes (the integration tests, a driver's `--session`
+    //     child) must never provision the machine's real prefix as a side effect
+    //     (2026-09-10 review: `targo test -p aterm` rewrote the owner's status.toml).
+    if let Some(layout) = atpkg::store::resolve_configured()
+        && std::env::var_os("ATPKG_DISABLE").is_none()
+    {
+        use aterm_update_core::pkg_check;
+        let status = layout.status();
+        let cfg = atpkg::config::cached();
+        let enabled = cfg.enabled.unwrap_or(true);
+        if !quiet && enabled && pkg_check::never_checked(&status) {
+            eprintln!("{}", pkg_check::NEVER_CHECKED_STDERR_LINE);
+        }
+        if enabled && cfg.auto_update.unwrap_or(true) && session_lane_is_interactive() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            let age = pkg_check::last_attempt_age_secs(&status, now);
+            if pkg_check::session_pass_due(age, pkg_check::update_interval_secs()) {
+                spawn_detached_pkg_update();
+            }
+        }
+    }
+
     session_lane(quiet)
+}
+
+/// Whether this `--session` launch is a PERSON's terminal rather than a harness's
+/// child: stdin is a terminal and no `ATERM_SESSION_MODEL` is set (the driver /
+/// integration-test knob that arms the session's VT model). Only such a launch may
+/// spawn the detached toolchain pass — a piped launch is a test or a driver, and a
+/// test must never mutate the machine's real package prefix.
+fn session_lane_is_interactive() -> bool {
+    stdin_is_terminal() && std::env::var_os("ATERM_SESSION_MODEL").is_none()
+}
+
+/// One DETACHED `aterm pkg update` (R4): this very binary, the `pkg` verb, its own
+/// process group so the session's exit (and the SIGHUP that follows it) cannot
+/// take the pass down mid-install, stdio on `/dev/null` (atpkg records its own
+/// `status.toml`; the window's loop is the surface that streams markers), and the
+/// child never waited for. A spawn that fails is said on stderr once — a session
+/// must never be blocked by its package manager.
+fn spawn_detached_pkg_update() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["pkg", "update"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    if let Err(error) = cmd.spawn() {
+        eprintln!("aterm: could not start the background `aterm pkg update` pass: {error}");
+    }
 }
 
 /// The SESSION route as a function that RETURNS an `ExitCode`, like every other

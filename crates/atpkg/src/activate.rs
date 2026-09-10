@@ -62,12 +62,17 @@ pub enum Aliases {
 }
 
 impl Aliases {
-    /// The policy for an index entry: ALab's own ⇔ no `system` key and not an `extra`.
-    /// An UNLISTED program (`None`) is not ALab's: nothing vouches for it.
+    /// The policy for an index entry: ALab's own ⇔ no `system` key, not an `extra`, and
+    /// not an AGENT PROGRAM (`claude`/`codex` are a vendor's whatever their row's flag
+    /// says — [`crate::stub::AGENT_PROGRAMS`] — so dropping `extra` from the spec never
+    /// grows an `alab-claude`). An UNLISTED program (`None`) is not ALab's: nothing
+    /// vouches for it.
     #[must_use]
-    pub fn for_program(program: Option<&crate::manifest::Program>) -> Self {
+    pub fn for_program(name: &str, program: Option<&crate::manifest::Program>) -> Self {
         match program {
-            Some(p) if p.system.is_none() && !p.extra => Self::Alab,
+            Some(p) if p.system.is_none() && !p.extra && !crate::stub::is_agent_program(name) => {
+                Self::Alab
+            }
             _ => Self::Off,
         }
     }
@@ -214,7 +219,95 @@ pub(crate) fn install_tools_env(
         }
     }
     prune_stale_shims(layout, build_dir, tools, aliases);
+    // The front-of-PATH twin of an agent program's shim (owner decision 2026-09-10),
+    // laid from the `bin/` shim just written so the two can never disagree.
+    reconcile_agents(layout);
     Ok(())
+}
+
+/// Bring `<prefix>/agents/` ([`Layout::agents_dir`]) in line with `bin/`: for every AGENT
+/// PROGRAM ([`crate::stub::AGENT_PROGRAMS`]) whose `bin/` shim resolves into the store,
+/// lay — or refresh — the twin `agents/<tool>` with the SAME target and the SAME exported
+/// environment (read off the `bin/` shim as laid, never re-derived, for the reason
+/// [`reconcile_aliases`] gives), then sweep everything else out of `agents/`
+/// ([`sweep_agents_dir`]). Idempotent: a twin that already resolves where the primary
+/// does with the same env is left alone, so the six-hourly tick rewrites nothing.
+///
+/// Called at the end of every shim-laying pass ([`install_tools_env`], the per-pass
+/// [`reconcile_aliases`], hence `repair` and the update pass too), so an agent program
+/// installed by an older client gains its twin the first pass after this one lands, and
+/// an uninstalled or tombstoned one loses it in the same motion.
+///
+/// BEST-EFFORT, like [`sweep_agents_dir`]: a twin that cannot be laid — `agents/`
+/// uncreatable, the link refused — is reported on stderr and the pass goes on, because
+/// this runs inside EVERY program's install and an `ay` or `trust` install must not fail
+/// over a directory only `claude` and `codex` use (review 2026-09-10). The `bin/` shim
+/// is already laid by then; the twin is retried on the next pass.
+///
+/// The keep-predicate is [`sweep_agents_dir`]'s: the primary must resolve into an AGENT
+/// PROGRAM's store tree — a `bin/claude` into some other program's tree earns no twin,
+/// which is what the sweep would have removed again anyway.
+pub fn reconcile_agents(layout: &Layout) {
+    for name in crate::stub::AGENT_PROGRAMS {
+        let Some(tool) = ToolName::new(name) else {
+            continue;
+        };
+        let primary = layout.shim(&tool);
+        let Some(target) = platform::resolve_shim(&primary).filter(|t| {
+            crate::ops::store_build_of(&layout.prefix, t)
+                .is_some_and(|(program, _)| crate::stub::is_agent_program(&program))
+        }) else {
+            continue; // not installed here (a pending stub, a tombstone, a dev link): the sweep answers
+        };
+        let env = platform::shim_env_of(&primary);
+        let twin = layout.agent_shim(&tool);
+        if platform::resolve_shim(&twin).is_some_and(|t| t == target)
+            && platform::shim_env_of(&twin) == env
+        {
+            continue;
+        }
+        let laid = layout
+            .ensure_dir(&layout.agents_dir())
+            .and_then(|()| platform::install_shim_to_env(&twin, &target, &env));
+        if let Err(e) = laid {
+            eprintln!(
+                "atpkg: {name}: the agents/ twin {} was not laid ({e}) — bin/{name} is in \
+                 place; retried next pass",
+                twin.display()
+            );
+        }
+    }
+    sweep_agents_dir(layout);
+}
+
+/// Keep `agents/` holding ONLY live agent shims: an entry stays iff its name is an agent
+/// program's, it resolves into that program's store tree, and the `bin/` shim of the same
+/// name resolves to the SAME target. Everything else — a name that is not an agent
+/// program's, a twin of a build the primary has moved off (rolled back, updated), a twin
+/// whose primary is now a tombstone or gone (uninstalled), a hand-dropped file — is
+/// removed: this directory is FIRST on every `PATH`, so nothing may sit in it that
+/// `bin/` does not vouch for. Best-effort and silent, like every sweep here.
+pub fn sweep_agents_dir(layout: &Layout) {
+    let Ok(entries) = std::fs::read_dir(layout.agents_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let keep = name
+            .to_str()
+            .and_then(ToolName::from_shim_file)
+            .is_some_and(|tool| {
+                crate::stub::is_agent_program(tool.as_str())
+                    && platform::resolve_shim(&entry.path()).is_some_and(|t| {
+                        crate::ops::store_build_of(&layout.prefix, &t)
+                            .is_some_and(|(p, _)| crate::stub::is_agent_program(&p))
+                            && platform::resolve_shim(&layout.shim(&tool)).is_some_and(|b| b == t)
+                    })
+            });
+        if !keep {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Lay `bin/<alias>` forwarding to the SAME executable `tool`'s own shim forwards to:
@@ -288,6 +381,10 @@ pub(crate) fn reconcile_aliases(
         }
     }
     prune_stale_shims(layout, build_dir, tools, aliases);
+    // The agents twin rides the same per-pass reconcile: an agent program a pre-agents
+    // client installed gains its front-of-PATH shim here, the first pass after this
+    // client lands, without its primary being rewritten.
+    reconcile_agents(layout);
     Ok(())
 }
 
@@ -391,6 +488,8 @@ pub(crate) fn undo_activation(layout: &Layout, channel: &str, build_dir: &Path) 
             }
         }
     }
+    // A twin whose primary just went is a twin with nothing to vouch for it.
+    sweep_agents_dir(layout);
 }
 
 /// Install a **failing tombstone shim** at `bin/<tool>` — a tiny script that prints a
@@ -419,7 +518,11 @@ pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()
     message.push_str(" was yanked/revoked — run `aterm pkg update`");
     // Atomic install through the platform backend (Unix: an executable `sh` script
     // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
-    platform::install_tombstone_shim(&shim, &message)
+    platform::install_tombstone_shim(&shim, &message)?;
+    // A revoked agent program must not stay runnable through its front-of-PATH twin:
+    // the tombstone resolves to no target, so the sweep drops the twin.
+    sweep_agents_dir(layout);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1055,6 +1158,173 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// THE AGENTS TWIN (owner decision 2026-09-10): installing an agent program lays
+    /// `agents/<tool>` beside `bin/<tool>` — same target, same exported env — and nothing
+    /// else ever lands in `agents/`: an ALab tool gets no twin, a hand-dropped file and a
+    /// foreign name are swept, the twin follows its primary across an update, a
+    /// tombstone, a rollback-undo and an uninstall, and the per-pass alias reconcile
+    /// re-lays a twin an older client never laid.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_program_gets_a_front_of_path_twin_that_follows_its_primary() {
+        let layout = temp_prefix("agents-twin");
+        let claude = tool("claude");
+        let env = crate::shim_env::ShimEnv::admit(&["DISABLE_AUTOUPDATER=1".to_string()]).unwrap();
+        let c1 = make_build(&layout, "claude", 2026091001, &["claude"]);
+        install_tools_env(
+            &layout,
+            &c1,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        let twin = layout.agent_shim(&claude);
+        assert_eq!(
+            platform::resolve_shim(&twin),
+            platform::resolve_shim(&layout.shim(&claude)),
+            "the twin forwards exactly where the primary does"
+        );
+        assert_eq!(
+            platform::shim_env_of(&twin),
+            env,
+            "and exports exactly what the primary exports"
+        );
+        // An ALab tool gets no twin; the agents dir holds ONLY agent programs.
+        let ay = make_build(&layout, "ay", 18, &["ay"]);
+        install_shims(&layout, &ay, &["ay".into()], Aliases::Alab).unwrap();
+        assert!(!layout.agent_shim(&tool("ay")).exists());
+        // Foreign entries are swept: a hand-dropped file, and a symlink under an agent
+        // name that points OUTSIDE the store (nothing in bin/ vouches for it).
+        std::fs::write(layout.agents_dir().join("mine"), b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/true", layout.agents_dir().join("codex")).unwrap();
+        reconcile_agents(&layout);
+        assert!(
+            !layout.agents_dir().join("mine").exists(),
+            "not an agent name"
+        );
+        assert!(
+            !layout.agents_dir().join("codex").exists(),
+            "not into the store"
+        );
+        assert!(twin.exists(), "the live twin survives the sweep");
+        // The twin follows an update to a newer build.
+        let c2 = make_build(&layout, "claude", 2026091101, &["claude"]);
+        install_tools_env(
+            &layout,
+            &c2,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        assert!(
+            platform::resolve_shim(&twin).is_some_and(|t| t.starts_with(&c2)),
+            "twin moved with the primary"
+        );
+        // A pre-agents client's install: primary present, twin missing — the per-pass
+        // alias reconcile lays it without touching the primary.
+        std::fs::remove_file(&twin).unwrap();
+        reconcile_aliases(&layout, &c2, std::slice::from_ref(&claude), Aliases::Off).unwrap();
+        assert_eq!(
+            platform::resolve_shim(&twin),
+            platform::resolve_shim(&layout.shim(&claude))
+        );
+        // A tombstoned primary takes the twin with it (a yanked build must not stay
+        // runnable through the front-of-PATH copy) …
+        install_tombstone_shim(&layout, &claude).unwrap();
+        assert!(!twin.exists(), "no twin over a tombstone");
+        // … a re-install brings it back …
+        install_tools_env(
+            &layout,
+            &c2,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        assert!(twin.exists());
+        // … undoing that activation drops it again …
+        undo_activation(&layout, "stable", &c2);
+        assert!(!twin.exists(), "undo sweeps the twin of the doomed build");
+        // … and an uninstall leaves nothing under agents/ at all.
+        install_tools_env(
+            &layout,
+            &c2,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .unwrap();
+        assert!(twin.exists());
+        crate::ops::uninstall(&layout, "claude").unwrap();
+        assert!(!twin.exists(), "uninstall removes the twin");
+        assert!(
+            std::fs::read_dir(layout.agents_dir())
+                .map(|d| d.count() == 0)
+                .unwrap_or(true),
+            "agents/ is empty after the only agent program is gone"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The twin is BEST-EFFORT and agent-store-only (review 2026-09-10): with `agents/`
+    /// unmakeable (a file squats on its name) an `ay` install — and a `claude` install —
+    /// still succeeds, `bin/` is laid, and nothing in `agents/` is claimed; and a
+    /// `bin/claude` that resolves into a NON-agent store tree earns no twin, which is the
+    /// predicate the sweep applies, so the two never disagree pass over pass.
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_twin_is_best_effort_and_agent_store_only() {
+        let layout = temp_prefix("agents-best-effort");
+        let env = crate::shim_env::ShimEnv::NONE;
+        // A regular file where `agents/` must be a directory: ensure_dir fails.
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::write(layout.agents_dir(), b"squatter").unwrap();
+        let ay = make_build(&layout, "ay", 18, &["ay"]);
+        install_tools_env(&layout, &ay, &[tool("ay")], Aliases::Alab, &env)
+            .expect("a non-agent install never fails over the agents dir");
+        assert!(shim_of(&layout, "ay").exists());
+        let claude = tool("claude");
+        let c1 = make_build(&layout, "claude", 2026091001, &["claude"]);
+        install_tools_env(
+            &layout,
+            &c1,
+            std::slice::from_ref(&claude),
+            Aliases::Off,
+            &env,
+        )
+        .expect("even the agent program's own install: bin/ is laid, the twin is retried");
+        assert!(platform::resolve_shim(&layout.shim(&claude)).is_some());
+        assert!(
+            std::fs::symlink_metadata(layout.agents_dir())
+                .unwrap()
+                .is_file(),
+            "the squatter is not replaced"
+        );
+        // Clear the squatter: the next pass lays the twin.
+        std::fs::remove_file(layout.agents_dir()).unwrap();
+        reconcile_agents(&layout);
+        let twin = layout.agent_shim(&claude);
+        assert_eq!(
+            platform::resolve_shim(&twin),
+            platform::resolve_shim(&layout.shim(&claude))
+        );
+        // A `bin/codex` into a NON-agent program's store tree: no twin laid — and the
+        // sweep, which applies the same predicate, has nothing to remove.
+        let codex = tool("codex");
+        let foreign = make_build(&layout, "ay", 19, &["codex"]);
+        platform::install_shim_env(&foreign.join("bin"), &codex, &layout.shim(&codex), &env)
+            .unwrap();
+        reconcile_agents(&layout);
+        assert!(
+            !layout.agent_shim(&codex).exists(),
+            "a primary outside an agent program's store tree earns no twin"
+        );
+        assert!(twin.exists(), "the real twin is untouched");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     /// The alias policy is read off the SIGNED index entry: ALab's own (no `system`, not an
     /// `extra`) aliases; a vendor tool, a system-satisfiable member and an unlisted name
     /// do not.
@@ -1070,21 +1340,26 @@ mod tests {
             requires: vec![],
         };
         assert_eq!(
-            Aliases::for_program(Some(&program(false, None))),
+            Aliases::for_program("ay", Some(&program(false, None))),
             Aliases::Alab,
             "trust/ay/ty/clean: ALab's own"
         );
         assert_eq!(
-            Aliases::for_program(Some(&program(true, None))),
+            Aliases::for_program("emacs", Some(&program(true, None))),
             Aliases::Off,
-            "codex/claude: a vendor extra"
+            "a vendor extra"
         );
         assert_eq!(
-            Aliases::for_program(Some(&program(false, Some("gh")))),
+            Aliases::for_program("claude", Some(&program(false, None))),
+            Aliases::Off,
+            "codex/claude: an agent program is a vendor's even with `extra` dropped"
+        );
+        assert_eq!(
+            Aliases::for_program("gh", Some(&program(false, Some("gh")))),
             Aliases::Off,
             "gh/emacs: a system copy may satisfy it"
         );
-        assert_eq!(Aliases::for_program(None), Aliases::Off, "unlisted");
+        assert_eq!(Aliases::for_program("x", None), Aliases::Off, "unlisted");
     }
 
     /// `alab-<tool>` is laid beside every `<tool>` shim of an ALab program, forwarding to

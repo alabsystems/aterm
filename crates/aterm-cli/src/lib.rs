@@ -62,7 +62,7 @@ mod driver;
 mod manual;
 
 // The coding-agent primer installer behind `aterm agents` lives in the
-// `aterm-primer` crate — it manages the 3-line, self-gating aterm primer in
+// `aterm-primer` crate — it manages the self-gating aterm primer block in
 // agents' global context files (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ...),
 // the one channel that reliably reaches an agent's context in every project. The
 // delivery half of the manual: `manual` is what an agent reads once it knows to
@@ -324,10 +324,12 @@ impl Verb {
                 "terminal-only machine uses to learn it is stale.",
             ],
             Verb::Agents => &[
-                "Make coding agents aterm-aware: manage the 3-line aterm",
-                "primer in their global context files (status | install |",
-                "remove | primer). aterm also keeps it installed for every",
-                "detected agent each time it opens a session.",
+                "Make coding agents aterm-aware: manage the marker-fenced",
+                "aterm primer in their global context files (status |",
+                "install | remove | primer). The aterm WINDOW also re-installs",
+                "it for every detected agent when it spawns a session — at",
+                "most once a minute, and only while `agents_auto_prime` is on;",
+                "a plain `aterm` shell session never does.",
             ],
             Verb::NewTab => &[
                 "Open a terminal tab. Where it opens is the",
@@ -2067,6 +2069,32 @@ mod tests {
     /// `--help` is RENDERED from the roster, so this pins the rendering itself:
     /// the alignment column and the continuation indent that make the VERBS block
     /// read as one table.
+    /// The `agents` blurb must not restate a primer size, and must state the
+    /// re-install contract the code actually keeps — the GUI spawn path,
+    /// throttled and config-gated — not "each time it opens a session", which
+    /// a plain `aterm` shell session never does (audit finding, 2026-09-01:
+    /// `spawn.rs` is the only auto-prime site; `session_main` has none).
+    #[test]
+    fn the_agents_blurb_states_the_real_reinstall_contract() {
+        let blurb = Verb::Agents.blurb().join(" ");
+        assert!(
+            !blurb.contains("-line"),
+            "no hand-typed primer size: {blurb}"
+        );
+        assert!(
+            !blurb.contains("each time it opens a session"),
+            "the CLI session never primes; the claim was false: {blurb}"
+        );
+        for must in ["WINDOW", "once a minute", "agents_auto_prime", "never"] {
+            assert!(blurb.contains(must), "blurb must state {must:?}: {blurb}");
+        }
+        let (page, _) = crate::manual::render(Some("agents"), None);
+        assert!(
+            !page.contains("-line primer"),
+            "manual tagline restated the size: {page}"
+        );
+    }
+
     #[test]
     fn verb_help_blocks_align_to_one_column() {
         for verb in Verb::ALL {

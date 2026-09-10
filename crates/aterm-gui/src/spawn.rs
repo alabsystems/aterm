@@ -3448,8 +3448,19 @@ pub(crate) fn bundle_dir(exe: Option<&std::path::Path>) -> Option<String> {
 ///
 /// `None` when there is nothing to inject (no reroute dir, and the bundle dir is
 /// absent or already reachable), so a dev build off a bare PATH adds no pair at all.
+///
+/// `agents_dir` (2026-09-10, R1) — `<prefix>/agents/`, the directory holding ONLY the
+/// shims of the AGENT programs aterm is the version manager for (`claude`, `codex`;
+/// `atpkg::stub::AGENT_PROGRAMS`) — rides beside the reroute dir with the same
+/// move-to-front rule: it must outrank `~/.local/bin/claude` (Anthropic's native
+/// installer), `/opt/homebrew/bin/claude` and `/opt/homebrew/bin/codex` (casks),
+/// which the managed `bin/` — APPENDED to PATH by the shell hook — measurably lost
+/// to on m21 (PATH[1], [13] and [16] respectively). Owner decision 2026-09-10 (the
+/// rule-1 exception in `docs/DESIGN-which-copy-runs-2026-08-27.md`): for these two
+/// names aterm's copy IS what runs. Passed only when the directory exists.
 pub(crate) fn reroute_path_env(
     reroute_dir: Option<&str>,
+    agents_dir: Option<&str>,
     bundle_dir: Option<&str>,
     inherited: Option<&str>,
 ) -> Option<(String, String)> {
@@ -3465,12 +3476,132 @@ pub(crate) fn reroute_path_env(
         entries.insert(0, bundle);
         injected = true;
     }
+    // Front-inserted in this order so the final PATH reads reroute, agents, …: the
+    // two name sets are disjoint (upstream Rust names vs. the agent programs), so
+    // which of the two is first is immaterial; that BOTH precede everything else is
+    // the point.
+    if let Some(agents) = agents_dir {
+        entries.retain(|entry| *entry != agents);
+        entries.insert(0, agents);
+        injected = true;
+    }
     if let Some(reroute) = reroute_dir {
         entries.retain(|entry| *entry != reroute);
         entries.insert(0, reroute);
         injected = true;
     }
     injected.then(|| ("PATH".to_string(), entries.join(&sep.to_string())))
+}
+
+/// THE PATH THE CO-LOCATED atpkg CHILDREN RUN WITH (2026-09-10, R1). A Finder-launched
+/// app inherits launchd's `PATH=/usr/bin:/bin:/usr/sbin:/sbin` (measured on m21:
+/// `ps -E` on the running window), so the `atpkg seed`/`atpkg update` children it
+/// spawns could not see `~/.local/bin/claude` or `/opt/homebrew/bin/codex` — the
+/// foreign copies `reconcile_shadowed` exists to report — and `aterm pkg which` from
+/// inside the window disagreed with the same verb in a terminal. The login shell's
+/// PATH is what the user's terminal has, so it is what the children get: ONE
+/// `$SHELL -l -i -c 'printf %s "$PATH"'` (zsh/bash/fish; `/bin/zsh` otherwise),
+/// bounded by [`LOGIN_PATH_BUDGET`], falling back to the process PATH plus
+/// `~/.local/bin` and `/opt/homebrew/bin` when the shell will not answer.
+pub(crate) fn atpkg_child_path() -> String {
+    login_shell_path().unwrap_or_else(|| {
+        fallback_child_path(
+            std::env::var("PATH").ok().as_deref(),
+            aterm_types::dirs::home_dir().as_deref(),
+        )
+    })
+}
+
+/// How long [`atpkg_child_path`] waits for the login shell before falling back: an
+/// rc file that blocks (a `read`, an `ssh-add` prompt) must not stall provisioning.
+const LOGIN_PATH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The user's login-shell `PATH`, or `None` when the shell did not answer in time /
+/// printed nothing that looks like one.
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| {
+            matches!(
+                std::path::Path::new(s).file_name().and_then(|n| n.to_str()),
+                Some("zsh" | "bash" | "fish")
+            )
+        })
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut child = std::process::Command::new(&shell)
+        .args(["-l", "-i", "-c", "printf '%s\\n' \"$PATH\""])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drain on a helper so a chatty rc file cannot fill the pipe and wedge the
+    // child against the poll below (the two-pipe rule, one pipe over).
+    let reader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + LOGIN_PATH_BUDGET;
+    let answered = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let text = reader.join().ok()?;
+    if !answered {
+        return None;
+    }
+    pick_login_path(&text)
+}
+
+/// The PATH line out of a login shell's output: the LAST non-empty line that starts
+/// with `/` (rc-file banners print before it; a PATH may contain spaces — the managed
+/// store lives under `Application Support`). Pure, so the shape is testable.
+pub(crate) fn pick_login_path(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with('/') && line.contains(':'))
+        .map(str::to_string)
+}
+
+/// The fallback child PATH: the process PATH (launchd's four dirs, for a Finder
+/// launch) plus the two places a foreign `claude`/`codex` measurably lives —
+/// `~/.local/bin` (Anthropic's native installer) and `/opt/homebrew/bin` (casks) —
+/// and `/usr/local/bin`, each appended once. Pure.
+pub(crate) fn fallback_child_path(
+    process_path: Option<&str>,
+    home: Option<&std::path::Path>,
+) -> String {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut entries: Vec<String> = process_path
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split(sep).map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut extra: Vec<String> = Vec::new();
+    if let Some(home) = home {
+        extra.push(home.join(".local/bin").to_string_lossy().into_owned());
+    }
+    extra.push("/opt/homebrew/bin".to_string());
+    extra.push("/usr/local/bin".to_string());
+    for dir in extra {
+        if !entries.contains(&dir) {
+            entries.push(dir);
+        }
+    }
+    entries.join(&sep.to_string())
 }
 
 #[cfg(test)]
@@ -3486,11 +3617,92 @@ mod reroute_path_env_tests {
         parts.join(&SEP.to_string())
     }
 
+    const AGENTS: &str = "/Users//u/Library/Application Support/aterm/pkg/agents";
+
+    /// R1 (2026-09-10): the agents dir rides beside the reroute dir at the FRONT —
+    /// ahead of the bundle dir and of every inherited entry, including
+    /// `~/.local/bin` and `/opt/homebrew/bin` (the foreign `claude`/`codex` homes
+    /// measured on m21) — and is moved, not duplicated, when it is already present.
+    #[test]
+    fn the_agents_dir_is_front_inserted_beside_the_reroute_dir() {
+        let inherited = path(&[
+            "/Users//u/.local/bin",
+            "/opt/homebrew/bin",
+            "/usr/bin",
+            AGENTS,
+        ]);
+        let (_, value) =
+            reroute_path_env(Some(REROUTE), Some(AGENTS), Some(BUNDLE), Some(&inherited))
+                .expect("injects");
+        assert_eq!(
+            value,
+            path(&[
+                REROUTE,
+                AGENTS,
+                BUNDLE,
+                "/Users//u/.local/bin",
+                "/opt/homebrew/bin",
+                "/usr/bin"
+            ]),
+            "reroute, agents, bundle, then the user's PATH with the agents dir moved"
+        );
+        assert_eq!(
+            value.matches(AGENTS).count(),
+            1,
+            "moved to the front, never duplicated"
+        );
+        // Without a reroute dir the agents dir alone is still an injection…
+        let (_, value) =
+            reroute_path_env(None, Some(AGENTS), None, Some("/usr/bin")).expect("injects");
+        assert_eq!(value, path(&[AGENTS, "/usr/bin"]));
+        // …and with neither, nothing changes.
+        assert_eq!(reroute_path_env(None, None, None, Some("/usr/bin")), None);
+    }
+
+    /// The atpkg children's PATH: the login shell's answer is the last `/…:…` line
+    /// (banners before it, spaces inside it); the fallback appends the two foreign
+    /// homes and `/usr/local/bin` to whatever the process had, once each.
+    #[test]
+    fn the_atpkg_child_path_is_the_login_shells_or_the_fallback() {
+        use super::{fallback_child_path, pick_login_path};
+        let banner = "Welcome!\nLast login: never\n/Users//u/.local/bin:/Users//u/Library/Application Support/aterm/pkg/bin:/usr/bin\n";
+        assert_eq!(
+            pick_login_path(banner).as_deref(),
+            Some("/Users//u/.local/bin:/Users//u/Library/Application Support/aterm/pkg/bin:/usr/bin")
+        );
+        assert_eq!(pick_login_path("nothing here\n"), None);
+        assert_eq!(pick_login_path(""), None);
+        let home = Path::new("/Users//u");
+        assert_eq!(
+            fallback_child_path(Some("/usr/bin:/bin:/usr/sbin:/sbin"), Some(home)),
+            path(&[
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                "/Users//u/.local/bin",
+                "/opt/homebrew/bin",
+                "/usr/local/bin"
+            ]),
+            "launchd's four, then the foreign homes"
+        );
+        assert_eq!(
+            fallback_child_path(Some("/opt/homebrew/bin:/usr/bin"), None),
+            path(&["/opt/homebrew/bin", "/usr/bin", "/usr/local/bin"]),
+            "already-present dirs are not repeated; no home, no ~/.local/bin"
+        );
+        assert_eq!(
+            fallback_child_path(None, Some(home)),
+            path(&["/Users//u/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"])
+        );
+    }
+
     /// The reroute dir lands FIRST, ahead of the bundle dir and the inherited PATH.
     #[test]
     fn reroute_dir_is_first_then_bundle_then_inherited() {
         let got = reroute_path_env(
             Some(REROUTE),
+            None,
             Some(BUNDLE),
             Some(&path(&["/usr/bin", "/bin"])),
         );
@@ -3516,7 +3728,8 @@ mod reroute_path_env_tests {
             "/usr/bin",
             REROUTE,
         ]);
-        let (_, value) = reroute_path_env(Some(REROUTE), None, Some(&inherited)).expect("injects");
+        let (_, value) =
+            reroute_path_env(Some(REROUTE), None, None, Some(&inherited)).expect("injects");
         assert_eq!(
             value,
             path(&[
@@ -3527,7 +3740,8 @@ mod reroute_path_env_tests {
             ])
         );
         assert_eq!(value.matches(REROUTE).count(), 1);
-        let (_, again) = reroute_path_env(Some(REROUTE), None, Some(&value)).expect("injects");
+        let (_, again) =
+            reroute_path_env(Some(REROUTE), None, None, Some(&value)).expect("injects");
         assert_eq!(again, value, "idempotent under nesting");
     }
 
@@ -3538,13 +3752,16 @@ mod reroute_path_env_tests {
     fn bundle_dir_composes_once() {
         let already = path(&[BUNDLE, "/usr/bin"]);
         let (_, value) =
-            reroute_path_env(Some(REROUTE), Some(BUNDLE), Some(&already)).expect("injects");
+            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), Some(&already)).expect("injects");
         assert_eq!(value, path(&[REROUTE, BUNDLE, "/usr/bin"]));
         assert_eq!(
-            reroute_path_env(None, Some(BUNDLE), Some("/usr/bin")),
+            reroute_path_env(None, None, Some(BUNDLE), Some("/usr/bin")),
             Some(("PATH".to_string(), path(&[BUNDLE, "/usr/bin"])))
         );
-        assert_eq!(reroute_path_env(None, Some(BUNDLE), Some(&already)), None);
+        assert_eq!(
+            reroute_path_env(None, None, Some(BUNDLE), Some(&already)),
+            None
+        );
     }
 
     /// No inherited PATH at all (odd launchd edge) or an empty one: the injected dirs
@@ -3553,18 +3770,22 @@ mod reroute_path_env_tests {
     #[test]
     fn empty_or_absent_inherited_path_and_nothing_to_inject() {
         assert_eq!(
-            reroute_path_env(Some(REROUTE), Some(BUNDLE), None).map(|p| p.1),
+            reroute_path_env(Some(REROUTE), None, Some(BUNDLE), None).map(|p| p.1),
             Some(path(&[REROUTE, BUNDLE]))
         );
         assert_eq!(
-            reroute_path_env(Some(REROUTE), None, Some("")).map(|p| p.1),
+            reroute_path_env(Some(REROUTE), None, None, Some("")).map(|p| p.1),
             Some(REROUTE.to_string())
         );
-        assert_eq!(reroute_path_env(None, None, Some("/usr/bin")), None);
-        assert_eq!(reroute_path_env(None, None, None), None);
-        let (_, value) =
-            reroute_path_env(Some(REROUTE), None, Some(&path(&["/usr/bin", "", "/bin"])))
-                .expect("injects");
+        assert_eq!(reroute_path_env(None, None, None, Some("/usr/bin")), None);
+        assert_eq!(reroute_path_env(None, None, None, None), None);
+        let (_, value) = reroute_path_env(
+            Some(REROUTE),
+            None,
+            None,
+            Some(&path(&["/usr/bin", "", "/bin"])),
+        )
+        .expect("injects");
         assert_eq!(value, path(&[REROUTE, "/usr/bin", "", "/bin"]));
     }
 

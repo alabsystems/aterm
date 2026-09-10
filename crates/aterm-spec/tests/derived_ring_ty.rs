@@ -8851,3 +8851,17 @@ fn derived_proxy_forward_proves_and_catches_forward_cycle() {
     // rewrite ever regresses, this exhaustive check fails.
     assert_proves_and_catches(&proxy_forward_model());
 }
+
+#[test]
+fn derived_console_life_episodes_prove_and_catch_replay_and_stale_ownership() {
+    let model = aterm_spec::derive::console_life_episode_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["StateBounded"]);
+}
+
+#[test]
+fn derived_console_resident_handoff_proves_and_catches_stranded_or_perpetual_wakes() {
+    let model = aterm_spec::derive::console_resident_handoff_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["StateBounded"]);
+}

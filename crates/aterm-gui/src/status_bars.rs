@@ -73,6 +73,15 @@ pub(crate) const HOLD_OK: Duration = Duration::from_secs(8);
 /// read a sentence and may want to click through; bounded because a status bar
 /// that never leaves is the floating card's mistake in a different shape.
 pub(crate) const HOLD_WARN: Duration = Duration::from_secs(45);
+/// How long a NOTICE holds — a text row posted through `aterm ctl appnotice`:
+/// longer than [`HOLD_OK`] because it may name versions a person wants to read,
+/// shorter than [`HOLD_WARN`] because nothing is wrong.
+pub(crate) const HOLD_NOTICE: Duration = Duration::from_secs(30);
+/// How long the "Claude Code X · Codex Y — aterm-managed, current" row holds.
+/// Its own constant (UX review, 2026-09-10): good news that comes at every open
+/// needs less time than a notice, and an undo-bearing machine-settings row may
+/// be waiting behind it.
+pub(crate) const HOLD_MANAGED: Duration = Duration::from_secs(15);
 /// How long a STAGED update bar stays up while the AUTOMATIC lane is armed to
 /// apply it — the pull-down IS the "update ready" surface now (2026-09-07),
 /// so it holds until the apply lands (forced within ~2 min; the typing hold can
@@ -111,8 +120,20 @@ const METER_MIN: usize = 8;
 const MARGIN: usize = 1;
 /// Cap on a sanitized failure reason inside a bar.
 const ERROR_CAP: usize = 60;
+/// Cap on an OUTCOME detail — long enough for the updater's health sentence
+/// (count, date, cause, the `aterm-ctl` command and the Settings pointer) to
+/// arrive whole. Measured on m21 (2026-09-10): the body was 178 chars, the
+/// Settings clause made it 211, and the old 160-char cap cut the row at
+/// `Run \`aterm-c…` — both affordances lost on the one row whose job was to
+/// route the user somewhere. Shaping ([`shape_detail`]) keeps the command
+/// intact even when the prose is longer than this.
+const DETAIL_CAP: usize = 240;
 /// Cap on a program name inside a bar (the store's own names are short).
 const NAME_CAP: usize = 24;
+/// The fewest cells a detail is drawn in when it does not fit whole: below this
+/// it is dropped rather than shown as a stub ("these are wha…" at 80 cols was
+/// the row the 2026-09-10 review measured). Drawn whole-ish or not at all.
+const DETAIL_FLOOR: usize = 20;
 
 /// Which bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +282,41 @@ fn restate_staged_bar(bar: &mut Bar, build: u64, posture: ApplyPosture, now: Ins
     true
 }
 
+/// A detail that ALWAYS keeps its command. Sanitized like every other cell
+/// string; when longer than `cap`, the PROSE is what gives way — the tail from
+/// the first backtick-quoted command sentence (`Run \`…\` …`) to the end is kept
+/// whole and the prefix is cut to fit, with the ellipsis on the prose. A detail
+/// without a command truncates from the right as before. Pure, so the width law
+/// is testable on literal values.
+pub(crate) fn shape_detail(detail: &str, cap: usize) -> String {
+    let clean = sanitize_for_tty(detail, usize::MAX);
+    if clean.chars().count() <= cap {
+        return clean;
+    }
+    // The command sentence: "Run `…" when there is one, else the first backtick.
+    let command_at = clean.find("Run `").or_else(|| clean.find('`')).map(|at| {
+        // Back up to the start of the sentence the backtick sits in, so the
+        // kept tail reads as a sentence and not as half of one.
+        clean[..at].rfind(". ").map_or(at, |dot| dot + 2).min(at)
+    });
+    let Some(at) = command_at else {
+        return sanitize_for_tty(&clean, cap);
+    };
+    let tail = &clean[at..];
+    let tail_len = tail.chars().count();
+    if tail_len + 2 > cap {
+        // Even the command sentence alone is too long: keep as much of IT as fits
+        // from its start — the command is at its front.
+        return sanitize_for_tty(tail, cap);
+    }
+    let head_budget = cap - tail_len - 2;
+    let mut out: String = clean[..at].trim_end().chars().take(head_budget).collect();
+    out = out.trim_end().to_string();
+    out.push_str("\u{2026} ");
+    out.push_str(tail);
+    out
+}
+
 /// A title without the press affordance — exact-suffix, so a version string
 /// that happens to contain the separator is left alone. What the ledger
 /// records (`appstatus` cannot click) and what a restatement rebuilds from.
@@ -398,6 +454,11 @@ pub(crate) struct Bar {
     /// posture can be re-stated on it ([`StatusBars::restate_apply_posture`]) and
     /// on nothing else. `None` on every other bar.
     pub staged_build: Option<u64>,
+    /// The STANDING check-health warning ([`StatusBars::update_health_standing`]):
+    /// no hold and no staleness cap — it leaves when the ledger heals
+    /// ([`StatusBars::update_health_healed`]) or the process ends. `false` on
+    /// every other bar.
+    pub health: bool,
 }
 
 impl Bar {
@@ -481,6 +542,7 @@ fn installing_bar(version: &str, now: Instant) -> Bar {
         stale_at: Some(now + HANDOFF_STALE),
         pass_id: None,
         staged_build: None,
+        health: false,
     }
 }
 
@@ -502,6 +564,31 @@ pub(crate) struct StatusBars {
     /// than leaving the lane empty after one transient blocker. Cleared by
     /// any new report on the lane.
     staged_behind_outcome: Option<Bar>,
+    /// The STANDING health warning an OUTCOME row was posted over
+    /// ([`Self::update_outcome`], [`Self::update_health_standing`] while another
+    /// row holds the lane): the ledger still says checks are failing, so when the
+    /// covering row retires the warning comes back — restated with its newest
+    /// words — rather than vanishing for the rest of the process (the updater's
+    /// `HealthNotify` fires ONCE per class, so nothing else would restate it;
+    /// 2026-09-10 review). It leaves only through [`Self::update_health_healed`],
+    /// into the ledger, like the row on glass.
+    health_behind_outcome: Option<Bar>,
+    /// TERMINAL toolchain rows waiting behind the live one, oldest first, each
+    /// with the hold it takes when it is promoted ([`Self::settle_with`]). One
+    /// pass can end with several things to say — "installed", then "Claude Code
+    /// X · Codex Y — aterm-managed, current", then "machine settings applied" —
+    /// and a lane holds one bar; replacement by assignment showed only the last
+    /// and DROPPED the rest, unrecorded (they never folded, so they never reached
+    /// the ledger). Queued rows are read in order and each retires into the
+    /// ledger like any other.
+    toolchain_queue: std::collections::VecDeque<(Bar, Duration)>,
+    /// The `managed-current:` wire text the lane last raised a row for. atpkg
+    /// prints the marker on EVERY pass, changed or not, and the recurring 6 h
+    /// pass parses it exactly like the seed pass — so the row went up on every
+    /// no-change pass, moving the grid a row for 30 s twice (two PTY resizes for
+    /// a running TUI; UX review, 2026-09-10). The same text again is recorded
+    /// in the ledger and not posted; the first pass after launch always posts.
+    last_managed_current: Option<String>,
 }
 
 impl StatusBars {
@@ -594,10 +681,7 @@ impl StatusBars {
             }
         }
         for row in retired {
-            if self.ledger.len() == LEDGER_ROWS {
-                self.ledger.pop_front();
-            }
-            self.ledger.push_back(row);
+            self.record(row);
         }
         // The outcome has had its say: the ready row it covered returns, if its
         // own hold has not run out meanwhile. Same row count — a repaint, not a
@@ -610,7 +694,39 @@ impl StatusBars {
             self.update = Some(staged);
             restored = true;
         }
-        self.rows() != before || restored
+        // No ready row to hand back: the standing health warning the outcome
+        // covered returns instead (it waits behind a restored Staged row, and
+        // comes back when THAT folds — a stage outranks it, as ever).
+        if update_retired
+            && !restored
+            && let Some(health) = self.health_behind_outcome.take()
+        {
+            self.update = Some(health);
+            restored = true;
+        }
+        // The toolchain lane is free: the next queued terminal row takes it, with
+        // its hold anchored NOW (not at the instant it was posted, or a row queued
+        // behind a long hold would arrive already expired). Same row count — a
+        // repaint, not a re-grid.
+        let mut promoted = false;
+        if self.toolchain.is_none()
+            && let Some((mut bar, hold)) = self.toolchain_queue.pop_front()
+        {
+            bar.fold_at = Some(now + hold);
+            bar.stale_at = None;
+            self.toolchain = Some(bar);
+            promoted = true;
+        }
+        self.rows() != before || restored || promoted
+    }
+
+    /// A finished activity into the ledger, oldest first, capped at
+    /// [`LEDGER_ROWS`].
+    fn record(&mut self, row: LedgerRow) {
+        if self.ledger.len() == LEDGER_ROWS {
+            self.ledger.pop_front();
+        }
+        self.ledger.push_back(row);
     }
 
     /// The finished activities, oldest first — the `appstatus` ledger.
@@ -739,6 +855,7 @@ impl StatusBars {
             stale_at: Some(now + ANNOUNCE_STALE),
             pass_id: None,
             staged_build: None,
+            health: false,
         });
     }
 
@@ -790,6 +907,7 @@ impl StatusBars {
                 stale_at: snap.running.then_some(now + TAILED_STALE),
                 pass_id: None,
                 staged_build: None,
+                health: false,
             });
             return;
         }
@@ -859,6 +977,7 @@ impl StatusBars {
                 stale_at: Some(now + TAILED_STALE),
                 pass_id,
                 staged_build: None,
+                health: false,
             });
             return;
         }
@@ -902,6 +1021,7 @@ impl StatusBars {
                 stale_at: None,
                 pass_id: None,
                 staged_build: None,
+                health: false,
             });
         } else {
             // A live-looking file whose writer is gone (dead pid / stale
@@ -927,6 +1047,7 @@ impl StatusBars {
                 stale_at: None,
                 pass_id: None,
                 staged_build: None,
+                health: false,
             });
         }
     }
@@ -953,6 +1074,7 @@ impl StatusBars {
             stale_at: None,
             pass_id: None,
             staged_build: None,
+            health: false,
         });
     }
 
@@ -974,7 +1096,174 @@ impl StatusBars {
             stale_at: None,
             pass_id: None,
             staged_build: None,
+            health: false,
         });
+    }
+
+    /// Post a TERMINAL toolchain row that must be READ, not merely shown: behind
+    /// a terminal row still inside its hold it queues ([`Self::settle_with`]
+    /// promotes it when the lane frees); over a live row, or an empty lane, it
+    /// is the lane's newest truth and goes up at once with `hold` from now.
+    fn post_toolchain_terminal(&mut self, bar: Bar, hold: Duration, now: Instant) {
+        self.post_toolchain_terminal_at(bar, hold, now, false);
+    }
+
+    /// [`Self::post_toolchain_terminal`], with the queue position chosen:
+    /// `ahead_of_notices` puts a row that must be ACTED on (a machine-settings
+    /// change with its undo) in front of the first queued Success notice (the
+    /// managed-current row) — behind anything already queued ahead of that one,
+    /// so several such rows keep their order — rather than 38 s behind the pass
+    /// (UX review, 2026-09-10).
+    fn post_toolchain_terminal_at(
+        &mut self,
+        mut bar: Bar,
+        hold: Duration,
+        now: Instant,
+        ahead_of_notices: bool,
+    ) {
+        let held = self
+            .toolchain
+            .as_ref()
+            .is_some_and(|live| live.terminal() && live.retires_at().is_some_and(|at| now < at));
+        if held {
+            let at = if ahead_of_notices {
+                self.toolchain_queue
+                    .iter()
+                    .position(|(queued, _)| queued.text.tone == Tone::Success)
+                    .unwrap_or(self.toolchain_queue.len())
+            } else {
+                self.toolchain_queue.len()
+            };
+            self.toolchain_queue.insert(at, (bar, hold));
+            return;
+        }
+        bar.fold_at = Some(now + hold);
+        bar.stale_at = None;
+        self.toolchain = Some(bar);
+    }
+
+    /// `managed-current:` — every AGENT program (claude, codex) that is installed
+    /// AND at the index pin, as atpkg lists it: `claude 2.1.267 (build 2026091001);
+    /// codex 0.154.0 (build 2026091001)`. The row's TITLE names the programs the
+    /// way a person knows them ("Claude Code 2.1.267 · Codex 0.154.0 —
+    /// aterm-managed, current"); the detail says what the parsed NAMES run and
+    /// carries the build ([`managed_current_words`]). Success, held
+    /// [`HOLD_MANAGED`], queued behind a pass row so both are read (R6,
+    /// 2026-09-10).
+    ///
+    /// ONCE PER TEXT PER LAUNCH: atpkg prints the marker on every pass, and the
+    /// recurring pass would otherwise raise the row — and move the grid — every
+    /// 6 h for nothing new. A repeat of the last text is recorded in the ledger
+    /// and not posted; the first pass after launch posts, as the owner wants to
+    /// see it at open.
+    pub(crate) fn toolchain_managed_current(&mut self, text: &str, now: Instant) {
+        let Some((title, detail)) = managed_current_words(text) else {
+            return;
+        };
+        let key = text.trim();
+        if self.last_managed_current.as_deref() == Some(key) {
+            self.record(LedgerRow {
+                lane: Lane::Toolchain,
+                title,
+                detail,
+                outcome: Outcome::Ok,
+                finished: now,
+            });
+            return;
+        }
+        self.last_managed_current = Some(key.to_string());
+        self.post_toolchain_terminal(
+            Bar {
+                text: BarText {
+                    glyph: '\u{2713}',
+                    title,
+                    detail,
+                    stats: String::new(),
+                    tone: Tone::Success,
+                },
+                fill: None,
+                fold_at: None,
+                stale_at: None,
+                pass_id: None,
+                staged_build: None,
+                health: false,
+            },
+            HOLD_MANAGED,
+            now,
+        );
+    }
+
+    /// `machine-settings:` — the machine-level settings a pass CHANGED per
+    /// doctor, as atpkg lists them: `spotlight-noindex 73 dir(s) migrated;
+    /// universal-control disabled`. ONE ROW PER ITEM ([`machine_setting_words`]),
+    /// Info, each held [`HOLD_WARN`]: the old single row put the Universal
+    /// Control revert LAST on a right-truncating detail, invisible below 1328 px
+    /// (UX review, 2026-09-10). The rows that carry an undo go first, and all of
+    /// them go ahead of a queued managed-current notice, so the thing a person
+    /// may want to reverse is the next thing they read after the pass row.
+    /// The glyph is `↻` ("changed"), from the painter's documented set — `⚙`
+    /// is outside it and rendered BLANK in the headless CPU font; `✓` stays the
+    /// managed-current row's ("current").
+    pub(crate) fn toolchain_machine_settings(&mut self, text: &str, now: Instant) {
+        let (undo, plain): (Vec<BarText>, Vec<BarText>) = text
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(machine_setting_words)
+            .partition(|words| !words.detail.is_empty());
+        for words in undo.into_iter().chain(plain) {
+            self.post_toolchain_terminal_at(
+                Bar {
+                    text: words,
+                    fill: None,
+                    fold_at: None,
+                    stale_at: None,
+                    pass_id: None,
+                    staged_build: None,
+                    health: false,
+                },
+                HOLD_WARN,
+                now,
+                true,
+            );
+        }
+    }
+
+    /// A plain text row on a lane, posted from OUTSIDE the process (`aterm ctl
+    /// appnotice <lane> <text>`): the voice of an `aterm pkg install claude` run
+    /// in a terminal, which has no GUI child to stream markers through. Info,
+    /// held [`HOLD_NOTICE`]; the toolchain lane queues it like any terminal row,
+    /// the update lane posts it as an outcome (the Staged row it may cover comes
+    /// back when it folds).
+    pub(crate) fn notice(&mut self, lane: Lane, text: &str, now: Instant) {
+        let text = sanitize_for_tty(text, 120);
+        match lane {
+            Lane::Toolchain => self.post_toolchain_terminal(
+                Bar {
+                    text: BarText {
+                        glyph: '\u{2139}',
+                        title: text,
+                        detail: String::new(),
+                        stats: String::new(),
+                        tone: Tone::Info,
+                    },
+                    fill: None,
+                    fold_at: None,
+                    stale_at: None,
+                    pass_id: None,
+                    staged_build: None,
+                    health: false,
+                },
+                HOLD_NOTICE,
+                now,
+            ),
+            Lane::Update => {
+                self.update_outcome('\u{2139}', &text, "", Tone::Info, now);
+                if let Some(bar) = self.update.as_mut() {
+                    bar.fold_at = Some(now + HOLD_NOTICE);
+                }
+            }
+        }
     }
 
     // ---- the update lane ----------------------------------------------------
@@ -997,6 +1286,11 @@ impl StatusBars {
         let v = |version: &str| sanitize_for_tty(version, 32);
         // A new report is the lane's newest truth: nothing older waits behind it.
         self.staged_behind_outcome = None;
+        // …and a check that DOWNLOADS is a check that works: the standing health
+        // warning, if it is up, is over — recorded, not silently dropped.
+        if !matches!(p, P::Deferred { .. } | P::Failed { .. }) {
+            self.update_health_healed(now);
+        }
         match p {
             P::Downloading {
                 version,
@@ -1025,6 +1319,7 @@ impl StatusBars {
                     stale_at: Some(now + UPDATE_STALE),
                     pass_id: None,
                     staged_build: None,
+                    health: false,
                 });
             }
             P::Verifying { version } => {
@@ -1041,6 +1336,7 @@ impl StatusBars {
                     stale_at: Some(now + UPDATE_STALE),
                     pass_id: None,
                     staged_build: None,
+                    health: false,
                 });
             }
             P::Staged { version, build } => {
@@ -1067,6 +1363,7 @@ impl StatusBars {
                     stale_at: None,
                     pass_id: None,
                     staged_build: Some(*build),
+                    health: false,
                 });
             }
             P::Deferred { detail } => {
@@ -1083,6 +1380,7 @@ impl StatusBars {
                     stale_at: None,
                     pass_id: None,
                     staged_build: None,
+                    health: false,
                 });
             }
             P::Failed { detail } => {
@@ -1102,6 +1400,7 @@ impl StatusBars {
                     stale_at: None,
                     pass_id: None,
                     staged_build: None,
+                    health: false,
                 });
             }
         }
@@ -1189,6 +1488,7 @@ impl StatusBars {
     /// phase in it. Never a new row — the row is the carried one.
     pub(crate) fn update_finishing(&mut self, version: &str, now: Instant) {
         self.staged_behind_outcome = None;
+        self.update_health_healed(now);
         self.update = Some(Bar {
             text: BarText {
                 glyph: '\u{2191}',
@@ -1202,6 +1502,7 @@ impl StatusBars {
             stale_at: Some(now + HANDOFF_STALE),
             pass_id: None,
             staged_build: None,
+            health: false,
         });
     }
 
@@ -1215,6 +1516,7 @@ impl StatusBars {
         now: Instant,
     ) {
         self.staged_behind_outcome = None;
+        self.update_health_healed(now);
         let v = sanitize_for_tty(version, 32);
         let title = if v.is_empty() {
             format!("Updated \u{2014} now on build {build}")
@@ -1242,6 +1544,7 @@ impl StatusBars {
             stale_at: None,
             pass_id: None,
             staged_build: None,
+            health: false,
         });
     }
 
@@ -1269,11 +1572,17 @@ impl StatusBars {
         {
             self.staged_behind_outcome = Some(staged.clone());
         }
+        // A STANDING health warning the outcome covers is not over — the ledger
+        // has not healed — so it waits behind the outcome and returns when the
+        // outcome folds ([`Self::health_behind_outcome`]).
+        if let Some(health) = self.update.as_ref().filter(|bar| bar.health) {
+            self.health_behind_outcome = Some(health.clone());
+        }
         self.update = Some(Bar {
             text: BarText {
                 glyph,
                 title: sanitize_for_tty(title, 80),
-                detail: sanitize_for_tty(detail, 160),
+                detail: shape_detail(detail, DETAIL_CAP),
                 stats: String::new(),
                 tone,
             },
@@ -1282,7 +1591,96 @@ impl StatusBars {
             stale_at: None,
             pass_id: None,
             staged_build: None,
+            health: false,
         });
+    }
+
+    /// THE STANDING CHECK-HEALTH WARNING (2026-09-10). The updater's ledger says
+    /// checks are PERSISTENTLY failing (`failing_persistent`): the one state the
+    /// pull-down — "the update-ready surface" — used to say nothing about for
+    /// the life of the process beyond one 45-second outcome row. On m21 the
+    /// pipeline had been `FAILING` since 2026-08-27 and the row was on glass for
+    /// 45 s of a night. This row has NO hold and NO staleness cap: it stands
+    /// until the ledger heals ([`Self::update_health_healed`]) or the process
+    /// ends (a carried copy folds on the successor's handoff cap like any other).
+    ///
+    /// It yields to real activity on its lane: a live download, a staged build
+    /// (a stage proves the check works), an installing/finishing row, an outcome
+    /// — none are clobbered. The warning WAITS behind the row that holds the lane
+    /// ([`Self::health_behind_outcome`], with the newest words) and takes the
+    /// lane when that row retires, unless the ledger heals first. A standing row
+    /// already up is REWRITTEN in place (a repaint, never a re-grid). Returns
+    /// whether the glass changed.
+    pub(crate) fn update_health_standing(&mut self, title: &str, detail: &str) -> bool {
+        let text = BarText {
+            glyph: '\u{26a0}',
+            title: sanitize_for_tty(title, 80),
+            detail: shape_detail(detail, DETAIL_CAP),
+            stats: String::new(),
+            tone: Tone::Warn,
+        };
+        let standing = |text| Bar {
+            text,
+            fill: None,
+            fold_at: None,
+            stale_at: None,
+            pass_id: None,
+            staged_build: None,
+            health: true,
+        };
+        match self.update.as_mut() {
+            Some(bar) if bar.health => {
+                if bar.text == text {
+                    return false;
+                }
+                bar.text = text;
+                true
+            }
+            Some(_) => {
+                self.health_behind_outcome = Some(standing(text));
+                false
+            }
+            None => {
+                self.health_behind_outcome = None;
+                self.update = Some(standing(text));
+                true
+            }
+        }
+    }
+
+    /// The ledger healed (a check completed end to end): the standing warning
+    /// leaves the glass and its last words go to the ledger, exactly as a folded
+    /// row's do — `appstatus` still answers for the stretch it stood. `true` when
+    /// a row left.
+    pub(crate) fn update_health_healed(&mut self, now: Instant) -> bool {
+        let on_glass = self.update.as_ref().is_some_and(|bar| bar.health);
+        let retired = if on_glass {
+            self.update.take()
+        } else {
+            // Waiting behind an outcome ([`Self::health_behind_outcome`]): it
+            // was on glass before the outcome covered it, so it is on record too.
+            self.health_behind_outcome.take()
+        };
+        let Some(bar) = retired else {
+            return false;
+        };
+        if self.ledger.len() == LEDGER_ROWS {
+            self.ledger.pop_front();
+        }
+        self.ledger.push_back(LedgerRow {
+            lane: Lane::Update,
+            title: bar.text.title,
+            detail: bar.text.detail,
+            outcome: Outcome::Warn,
+            finished: now,
+        });
+        on_glass
+    }
+
+    /// Whether the live update bar is the standing check-health warning.
+    #[cfg(test)]
+    pub(crate) fn update_bar_is_health(&self) -> bool {
+        self.update.as_ref().is_some_and(|bar| bar.health)
     }
 
     /// Drop the Staged row waiting behind an outcome ([`Self::update_outcome`]):
@@ -1379,6 +1777,7 @@ impl StatusBars {
                 stale_at: Some(now + HANDOFF_STALE),
                 pass_id: None,
                 staged_build: None,
+                health: false,
             };
             match carried.lane.as_str() {
                 "toolchain" => {
@@ -1590,8 +1989,15 @@ pub(crate) fn layout(text: &BarText, fill: Option<f32>, cols: usize) -> Layout {
         used += detail_w;
     } else if detail_w > 0 {
         let room = budget.saturating_sub(used);
-        if room >= 2 + 4 {
-            let d = truncate(&text.detail, room - 2);
+        if room >= 2 + DETAIL_FLOOR {
+            // A detail with a backtick command keeps the command and cuts the
+            // prose ([`shape_detail`]); its cap counts the cells BEFORE the
+            // ellipsis, hence the extra one. A plain detail truncates.
+            let d = if text.detail.contains('`') {
+                shape_detail(&text.detail, room - 3)
+            } else {
+                truncate(&text.detail, room - 2)
+            };
             used += 2 + width(&d);
             detail = Some(d);
         }
@@ -1630,6 +2036,126 @@ pub(crate) fn layout(text: &BarText, fill: Option<f32>, cols: usize) -> Layout {
     }
     let _ = used;
     out
+}
+
+/// The managed-current row's words from the wire text, or `None` for an empty
+/// body. The title names the programs as a person knows them ("Claude Code
+/// 2.1.267 · Codex 0.154.0 — aterm-managed, current"); the detail says what
+/// the parsed NAMES run — "what `claude` and `codex` run in new tabs", one name
+/// "what `claude` runs in a new tab" — built from the wire and never hardcoded,
+/// so `gemini` reads as gemini. The builds ride the end: one distinct build
+/// "· build 2026091001", differing ones "· builds 2026091001 / 2026091002",
+/// nothing when the wire carried none.
+fn managed_current_words(text: &str) -> Option<(String, String)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut builds: Vec<String> = Vec::new();
+    for item in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        // `<name> <version> (build <N>)` — the version and the build are each
+        // optional on the wire, so a bare name still renders.
+        let (head, build) = match item.split_once('(') {
+            Some((head, tail)) => (head.trim(), tail.trim_end_matches(')').trim()),
+            None => (item, ""),
+        };
+        let mut words = head.split_whitespace();
+        let name = words.next().unwrap_or_default();
+        let version = words.next().unwrap_or_default();
+        let display = match name {
+            "claude" => "Claude Code",
+            "codex" => "Codex",
+            other => other,
+        };
+        names.push(if version.is_empty() {
+            sanitize_for_tty(display, NAME_CAP)
+        } else {
+            sanitize_for_tty(&format!("{display} {version}"), NAME_CAP + 24)
+        });
+        // The command a tab runs is the wire name itself; a backtick in it would
+        // break the quoting the detail relies on.
+        commands.push(sanitize_for_tty(&name.replace('`', ""), NAME_CAP));
+        let build = build.strip_prefix("build").map_or(build, str::trim);
+        if !build.is_empty() {
+            let build = sanitize_for_tty(build, 32);
+            if !builds.contains(&build) {
+                builds.push(build);
+            }
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    let title = sanitize_for_tty(
+        &format!(
+            "{} \u{2014} aterm-managed, current",
+            names.join(" \u{00b7} ")
+        ),
+        120,
+    );
+    let quoted: Vec<String> = commands.iter().map(|c| format!("`{c}`")).collect();
+    let mut detail = match quoted.as_slice() {
+        [one] => format!("what {one} runs in a new tab"),
+        [head @ .., last] => format!("what {} and {last} run in new tabs", head.join(", ")),
+        [] => unreachable!("names and commands are pushed together"),
+    };
+    match builds.as_slice() {
+        [] => {}
+        [one] => {
+            detail.push_str(" \u{00b7} build ");
+            detail.push_str(one);
+        }
+        many => {
+            detail.push_str(" \u{00b7} builds ");
+            detail.push_str(&many.join(" / "));
+        }
+    }
+    Some((title, shape_detail(&detail, DETAIL_CAP)))
+}
+
+/// One machine-settings wire item as its own row's words. The two items atpkg
+/// emits today read as a person would say them: `universal-control disabled`
+/// → **"Universal Control disabled"** with the undo in the detail — the
+/// pointer first (`aterm pkg doctor` prints the revert), then the revert
+/// command itself, byte-identical to [`atpkg::machine::UNIVERSAL_CONTROL_REVERT`],
+/// so a narrow row drops the command last of all; `spotlight-noindex N dir(s)
+/// migrated` → **"Spotlight: N build dirs moved to .noindex"**, no detail. An
+/// item this build does not know is its own title, verbatim. Info, `↻`.
+fn machine_setting_words(item: &str) -> BarText {
+    let item = sanitize_for_tty(item, 80);
+    let (title, detail) = if item == atpkg::machine::UNIVERSAL_CONTROL_ENTRY {
+        (
+            "Universal Control disabled".to_string(),
+            format!(
+                "undo: `aterm pkg doctor` prints the revert \u{00b7} {}",
+                atpkg::machine::UNIVERSAL_CONTROL_REVERT
+            ),
+        )
+    } else if let Some(count) = spotlight_noindex_count(&item) {
+        (
+            format!(
+                "Spotlight: {count} build {} moved to .noindex",
+                if count == 1 { "dir" } else { "dirs" }
+            ),
+            String::new(),
+        )
+    } else {
+        (item.clone(), String::new())
+    };
+    BarText {
+        glyph: '\u{21bb}',
+        title: sanitize_for_tty(&title, 120),
+        detail: shape_detail(&detail, DETAIL_CAP),
+        stats: String::new(),
+        tone: Tone::Info,
+    }
+}
+
+/// The N of `spotlight-noindex N dir(s) migrated`, when the item is that.
+fn spotlight_noindex_count(item: &str) -> Option<u64> {
+    item.strip_prefix("spotlight-noindex ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// `s` cut to at most `max` cells, ending in `…` when anything was cut.
@@ -2134,6 +2660,579 @@ mod tests {
             0,
             "FL-1: a full ledger is still an idle zero — the record is not a repaint"
         );
+    }
+
+    /// ONE PASS, FOUR THINGS TO SAY (R6, 2026-09-10): "installed", then the
+    /// machine settings — one row per changed item, the undo-bearing one first —
+    /// then the managed agents. The lane holds one bar, so the later rows QUEUE
+    /// and are read in order as each earlier one folds — and every one of them
+    /// lands in the ledger. Replacement by assignment showed only the last and
+    /// dropped the rest without a record; the machine rows go AHEAD of the
+    /// managed notice (UX review, 2026-09-10) so the undo is read 8 s after the
+    /// pass, not 38.
+    #[test]
+    fn terminal_rows_queue_behind_the_live_one_and_are_read_in_order() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_installed(
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            now,
+        );
+        bars.toolchain_managed_current(
+            "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)",
+            now,
+        );
+        bars.toolchain_machine_settings(
+            "spotlight-noindex 73 dir(s) migrated; universal-control disabled",
+            now,
+        );
+        assert_eq!(bars.rows(), 1, "one lane, one row");
+        let title = |bars: &StatusBars| bars.bars().next().unwrap().1.text.title.clone();
+        assert_eq!(title(&bars), "ALab toolchain installed");
+
+        // The installed row folds; the undo-bearing machine row is promoted in
+        // its place — a repaint, same row count — ahead of the managed notice
+        // that was queued before it.
+        assert!(bars.settle(now + HOLD_OK), "the glass changed");
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(title(&bars), "Universal Control disabled");
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(bar.text.tone, Tone::Info);
+        assert_eq!(bar.text.glyph, '\u{21bb}');
+        assert_eq!(
+            bar.text.detail,
+            format!(
+                "undo: `aterm pkg doctor` prints the revert \u{00b7} {}",
+                atpkg::machine::UNIVERSAL_CONTROL_REVERT
+            )
+        );
+        assert!(
+            bar.text
+                .detail
+                .ends_with("defaults -currentHost delete com.apple.universalcontrol Disable"),
+            "the revert is byte-identical to atpkg's: {}",
+            bar.text.detail
+        );
+        assert_eq!(
+            bar.fold_at,
+            Some(now + HOLD_OK + HOLD_WARN),
+            "the hold is anchored at promotion, not at posting"
+        );
+        assert_eq!(bars.ledger().count(), 1);
+
+        // Then the Spotlight row — its own row, no detail to truncate.
+        assert!(bars.settle(now + HOLD_OK + HOLD_WARN));
+        assert_eq!(title(&bars), "Spotlight: 73 build dirs moved to .noindex");
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(bar.text.tone, Tone::Info);
+        assert!(bar.text.detail.is_empty(), "{}", bar.text.detail);
+        assert_eq!(bars.ledger().count(), 2);
+
+        // Then the managed-current notice, on its own shorter hold.
+        assert!(bars.settle(now + HOLD_OK + 2 * HOLD_WARN));
+        assert_eq!(
+            title(&bars),
+            "Claude Code 2.1.267 \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current"
+        );
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(bar.text.tone, Tone::Success);
+        assert_eq!(bar.text.glyph, '\u{2713}');
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` and `codex` run in new tabs \u{00b7} build 2026091001"
+        );
+        assert_eq!(
+            bar.fold_at,
+            Some(now + HOLD_OK + 2 * HOLD_WARN + HOLD_MANAGED)
+        );
+        assert_eq!(bars.ledger().count(), 3);
+
+        // And it folds too; the ledger has all four, oldest first.
+        assert!(bars.settle(now + HOLD_OK + 2 * HOLD_WARN + HOLD_MANAGED));
+        assert_eq!(bars.rows(), 0);
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].title, "ALab toolchain installed");
+        assert_eq!(rows[1].title, "Universal Control disabled");
+        assert_eq!(rows[2].title, "Spotlight: 73 build dirs moved to .noindex");
+        assert!(rows[3].title.starts_with("Claude Code 2.1.267"));
+        assert!(
+            rows.iter()
+                .all(|r| r.lane == Lane::Toolchain && r.outcome == Outcome::Ok)
+        );
+        assert!(
+            !bars.settle(now + Duration::from_secs(3600)),
+            "nothing left to promote"
+        );
+    }
+
+    /// The R6 rows on an EMPTY lane go up at once, and their words: one agent
+    /// alone, an unknown name, a bare name, a build-less item; a Spotlight item
+    /// alone raises only its own row; nothing at all for an empty marker body.
+    #[test]
+    fn the_managed_and_machine_rows_render_their_words() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.title,
+            "Claude Code 2.1.267 \u{2014} aterm-managed, current"
+        );
+        assert_eq!(
+            bar.text.detail, "what `claude` runs in a new tab \u{00b7} build 2026091001",
+            "one name reads singular"
+        );
+        assert_eq!(bar.fold_at, Some(now + HOLD_MANAGED));
+        assert_eq!(bar.fill, None, "a notice carries no meter");
+
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current("gemini; codex 0.154.0", now);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(
+            bar.text.title,
+            "gemini \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current"
+        );
+        assert_eq!(
+            bar.text.detail, "what `gemini` and `codex` run in new tabs",
+            "the names are the wire's, never a hardcoded pair; no builds, no build clause"
+        );
+
+        let mut bars = StatusBars::default();
+        bars.toolchain_managed_current("  ;  ", now);
+        assert_eq!(bars.rows(), 0, "an empty body raises nothing");
+
+        let mut bars = StatusBars::default();
+        bars.toolchain_machine_settings("spotlight-noindex 12 dir(s) migrated", now);
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert_eq!(bar.text.title, "Spotlight: 12 build dirs moved to .noindex");
+        assert!(
+            bar.text.detail.is_empty(),
+            "nothing to undo, nothing to say"
+        );
+        assert_eq!(bar.text.tone, Tone::Info);
+        assert_eq!(
+            bar.text.glyph, '\u{21bb}',
+            "from the painter's documented set (⇣ ↻ ✓ ⚠ ⏸) — ⚙ rendered blank headless"
+        );
+        assert_eq!(bar.fold_at, Some(now + HOLD_WARN));
+        assert!(
+            !bars.settle(now + HOLD_WARN - Duration::from_secs(1)),
+            "nothing queued behind a lone item"
+        );
+
+        // A terminal row replaces a LIVE (announced, meter-less) row — the pass is
+        // over and this is its newest truth — rather than queueing behind it.
+        let mut bars = StatusBars::default();
+        bars.toolchain_announced("installing 2 program(s) (about 1 GB)", now);
+        bars.toolchain_managed_current("codex 0.154.0 (build 2026091001)", now);
+        assert_eq!(bars.rows(), 1);
+        assert!(
+            bars.bars()
+                .next()
+                .unwrap()
+                .1
+                .text
+                .title
+                .starts_with("Codex 0.154.0")
+        );
+    }
+
+    /// THE MANAGED ROW POSTS ONCE PER TEXT PER LAUNCH (UX review, 2026-09-10).
+    /// atpkg prints `managed-current:` on every pass and the recurring 6 h pass
+    /// parses it like the seed pass, so the row — and the grid move it costs a
+    /// running TUI — recurred every 6 h with nothing new. The first pass after
+    /// launch posts; the same text again is ledger-only; a CHANGED text posts.
+    #[test]
+    fn the_managed_row_posts_once_per_text_and_a_repeat_is_ledger_only() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        let wire = "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)";
+        bars.toolchain_managed_current(wire, now);
+        assert_eq!(bars.rows(), 1, "the first pass after launch posts");
+        assert!(bars.settle(now + HOLD_MANAGED));
+        assert_eq!(bars.rows(), 0);
+        assert_eq!(bars.ledger().count(), 1);
+
+        // Six hours on: the same text, with or without whitespace around it.
+        let later = now + Duration::from_secs(6 * 3600);
+        bars.toolchain_managed_current(&format!("  {wire} "), later);
+        assert_eq!(bars.rows(), 0, "no row, no grid move");
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 2, "but the pass is on the record");
+        assert!(rows[1].title.starts_with("Claude Code 2.1.267"));
+        assert_eq!(rows[1].outcome, Outcome::Ok);
+        assert_eq!(rows[1].finished, later);
+
+        // A new version: a new row.
+        bars.toolchain_managed_current(
+            "claude 2.1.268 (build 2026091002); codex 0.154.0 (build 2026091001)",
+            later,
+        );
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(bar.text.title.starts_with("Claude Code 2.1.268"));
+        assert_eq!(
+            bar.text.detail,
+            "what `claude` and `codex` run in new tabs \u{00b7} builds 2026091002 / 2026091001",
+            "differing builds are listed"
+        );
+        // And a repeat of THAT is ledger-only again.
+        bars.toolchain_managed_current(
+            "claude 2.1.268 (build 2026091002); codex 0.154.0 (build 2026091001)",
+            later,
+        );
+        assert!(
+            bars.toolchain_queue.is_empty(),
+            "nothing queued behind the live row"
+        );
+        assert_eq!(bars.ledger().count(), 3);
+    }
+
+    /// MACHINE SETTINGS: ONE ROW PER CHANGED ITEM, THE UNDO-BEARING ONE FIRST,
+    /// AHEAD OF A QUEUED NOTICE (UX review, 2026-09-10). The old single row put
+    /// "universal-control disabled — revert: `defaults …`" last on a
+    /// right-truncating detail, invisible below 1328 px. An item this build does
+    /// not know is its own title, verbatim.
+    #[test]
+    fn machine_settings_post_one_row_per_item_undo_first_and_ahead_of_notices() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_installed(
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            now,
+        );
+        bars.toolchain_managed_current("claude 2.1.267 (build 2026091001)", now);
+        bars.toolchain_machine_settings(
+            "spotlight-noindex 1 dir(s) migrated; something-new tuned; universal-control disabled",
+            now,
+        );
+        let queued: Vec<String> = bars
+            .toolchain_queue
+            .iter()
+            .map(|(bar, _)| bar.text.title.clone())
+            .collect();
+        assert_eq!(
+            queued,
+            [
+                "Universal Control disabled",
+                "Spotlight: 1 build dir moved to .noindex",
+                "something-new tuned",
+                "Claude Code 2.1.267 \u{2014} aterm-managed, current",
+            ],
+            "undo first, then wire order, all ahead of the managed notice"
+        );
+        let holds: Vec<Duration> = bars.toolchain_queue.iter().map(|(_, h)| *h).collect();
+        assert_eq!(holds, [HOLD_WARN, HOLD_WARN, HOLD_WARN, HOLD_MANAGED]);
+        let unknown = &bars.toolchain_queue[2].0.text;
+        assert_eq!(unknown.tone, Tone::Info);
+        assert!(unknown.detail.is_empty());
+        assert_eq!(unknown.glyph, '\u{21bb}');
+
+        // The undo row's detail: the pointer first, the revert command last,
+        // byte-identical to what `aterm pkg doctor` prints.
+        let undo = &bars.toolchain_queue[0].0.text;
+        assert_eq!(
+            undo.detail,
+            "undo: `aterm pkg doctor` prints the revert \u{00b7} \
+             defaults -currentHost delete com.apple.universalcontrol Disable"
+        );
+        assert_eq!(
+            atpkg::machine::UNIVERSAL_CONTROL_REVERT,
+            "defaults -currentHost delete com.apple.universalcontrol Disable"
+        );
+
+        // A machine row arriving on an EMPTY lane goes up at once; a second
+        // item queues behind it in order.
+        let mut bars = StatusBars::default();
+        bars.toolchain_machine_settings(
+            "spotlight-noindex 73 dir(s) migrated; universal-control disabled",
+            now,
+        );
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "Universal Control disabled"
+        );
+        assert_eq!(bars.toolchain_queue.len(), 1);
+        assert!(bars.settle(now + HOLD_WARN));
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "Spotlight: 73 build dirs moved to .noindex"
+        );
+        let mut bars = StatusBars::default();
+        bars.toolchain_machine_settings(" ; ", now);
+        assert_eq!(bars.rows(), 0, "an empty body raises nothing");
+    }
+
+    /// `aterm ctl appnotice <lane> <text>`: an Info row on either lane, held
+    /// [`HOLD_NOTICE`], recorded when it folds — the terminal-run install's voice.
+    #[test]
+    fn a_notice_posts_a_text_row_on_either_lane_and_is_recorded() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.notice(
+            Lane::Toolchain,
+            "aterm pkg install claude: 2.1.267 installed",
+            now,
+        );
+        bars.notice(Lane::Update, "hello\u{1b}[2J from the terminal", now);
+        assert_eq!(bars.rows(), 2);
+        let rows: Vec<_> = bars.bars().collect();
+        assert_eq!(rows[0].0, Lane::Toolchain);
+        assert_eq!(
+            rows[0].1.text.title,
+            "aterm pkg install claude: 2.1.267 installed"
+        );
+        assert_eq!(rows[0].1.text.tone, Tone::Info);
+        assert_eq!(rows[0].1.fold_at, Some(now + HOLD_NOTICE));
+        assert_eq!(rows[1].0, Lane::Update);
+        assert_eq!(
+            rows[1].1.text.title, "hello[2J from the terminal",
+            "sanitized"
+        );
+        assert_eq!(rows[1].1.fold_at, Some(now + HOLD_NOTICE));
+        assert!(bars.settle(now + HOLD_NOTICE));
+        assert_eq!(bars.rows(), 0);
+        assert_eq!(bars.ledger().count(), 2);
+    }
+
+    /// The row m21 actually showed (2026-09-10): the updater's 178-char health body
+    /// plus the GUI's Settings clause, cut at `Run \`aterm-c…` by the old 160-char
+    /// cap — both affordances gone. The command sentence now survives whatever the
+    /// prose does, and the prose is what carries the ellipsis.
+    #[test]
+    fn the_command_in_a_detail_survives_the_cap() {
+        let body = "20 consecutive checks since 2026-08-27T22:04:36Z: release manifests exist \
+                    but cannot be downloaded \u{2014} this build's update pipeline is likely \
+                    broken. Run `aterm-ctl update status` for details. \u{2014} see Settings \
+                    \u{25b8} Software Update";
+        assert!(body.chars().count() > 160);
+        // Under the shipping cap the whole sentence fits.
+        let whole = shape_detail(body, DETAIL_CAP);
+        assert_eq!(whole, body, "a body under the cap is untouched");
+        // Under a cap it cannot fit, the COMMAND is whole and the prose gives way.
+        let shaped = shape_detail(body, 120);
+        assert!(shaped.chars().count() <= 120, "{}", shaped.chars().count());
+        assert!(
+            shaped.contains("Run `aterm-ctl update status` for details."),
+            "the command sentence is intact: {shaped}"
+        );
+        assert!(
+            shaped.contains("Settings \u{25b8} Software Update"),
+            "and so is the pointer after it: {shaped}"
+        );
+        assert!(
+            shaped.starts_with("20 consecutive checks") && shaped.contains("\u{2026} Run `"),
+            "the prose is what was cut, with the ellipsis on it: {shaped}"
+        );
+        // No command: plain right truncation, as before.
+        let plain = "x".repeat(300);
+        assert_eq!(
+            shape_detail(&plain, 10),
+            format!("{}\u{2026}", "x".repeat(10))
+        );
+        // Control characters never reach the cell either way.
+        assert_eq!(shape_detail("a\u{1b}[2Jb. Run `c`", 200), "a[2Jb. Run `c`");
+        // Through the outcome row itself.
+        let mut bars = StatusBars::default();
+        bars.update_outcome(
+            '\u{26a0}',
+            "aterm auto-update is failing",
+            body,
+            Tone::Warn,
+            t0(),
+        );
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(bar.text.detail.contains("`aterm-ctl update status`"));
+    }
+
+    /// THE STANDING WARNING: a persistent check failure stays on the pull-down until
+    /// the ledger heals — not for 45 s of a process that runs for weeks. It never
+    /// folds on a hold, it is restated in place, it yields to a staged build, and
+    /// when the ledger heals it leaves through the ledger like any other row.
+    #[test]
+    fn a_persistent_check_failure_stands_until_the_ledger_heals() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        let detail = "20 consecutive checks since 2026-08-27T22:04:36Z: … Run `aterm-ctl update status` for details.";
+        assert!(bars.update_health_standing("aterm auto-update is failing", detail));
+        assert!(bars.update_bar_is_health());
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(
+            bars.deadline(),
+            None,
+            "no hold and no staleness cap: nothing to wake for"
+        );
+        // A day later it is still there, and the ledger has nothing.
+        assert!(!bars.settle(now + Duration::from_secs(24 * 60 * 60)));
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(bars.ledger().count(), 0);
+        // Restated with the same words: no change; with new words: rewritten in place.
+        assert!(!bars.update_health_standing("aterm auto-update is failing", detail));
+        assert!(bars.update_health_standing(
+            "aterm auto-update is failing",
+            "21 consecutive checks … Run `aterm-ctl update status` for details."
+        ));
+        assert_eq!(bars.rows(), 1, "a repaint, never a re-grid");
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(bar.text.detail.starts_with("21 consecutive"));
+        assert_eq!(bar.text.tone, Tone::Warn);
+        // The wire says it is live and warn-toned.
+        let rows = bars.activity_rows(now);
+        assert!(
+            rows[0].starts_with("activity kind=update phase=live "),
+            "{}",
+            rows[0]
+        );
+        // Healed: it leaves through the ledger.
+        assert!(bars.update_health_healed(now + HOLD_WARN));
+        assert_eq!(bars.rows(), 0);
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].lane, rows[0].outcome),
+            (Lane::Update, Outcome::Warn)
+        );
+        assert!(rows[0].detail.contains("`aterm-ctl update status`"));
+        assert!(
+            !bars.update_health_healed(now),
+            "idempotent: nothing to heal twice"
+        );
+
+        // It yields to a staged build — a stage proves the check works.
+        let mut bars = StatusBars::default();
+        bars.update_progress(
+            &aterm_update::Progress::Staged {
+                version: "0.81.0".into(),
+                build: 99,
+            },
+            Some(ApplyPosture::Automatic),
+            now,
+        );
+        assert!(!bars.update_health_standing("aterm auto-update is failing", detail));
+        assert!(bars.update_bar_is_staged(), "the staged row is untouched");
+        // …and a download that begins over a standing warning retires it INTO the
+        // ledger rather than dropping it.
+        let mut bars = StatusBars::default();
+        assert!(bars.update_health_standing("aterm auto-update is failing", detail));
+        bars.update_progress(
+            &aterm_update::Progress::Downloading {
+                version: "0.81.0".into(),
+                bytes_done: 1,
+                bytes_total: 2,
+            },
+            None,
+            now,
+        );
+        assert!(!bars.update_bar_is_health());
+        assert_eq!(
+            bars.ledger().count(),
+            1,
+            "the warning it replaced is on record"
+        );
+    }
+
+    /// AN OUTCOME OVER THE STANDING WARNING QUEUES IT, NEVER DROPS IT (2026-09-10
+    /// review). The updater's `HealthNotify` fires once per class per process, so
+    /// a warning an apply-lane outcome (or an `aterm ctl appnotice update …`)
+    /// replaced by assignment was gone for the life of the process — the ledger
+    /// still failing, the glass silent. Now it waits behind the outcome, with its
+    /// newest words, and returns when the outcome folds; a Staged row that was
+    /// also waiting outranks it; and a heal while it waits retires it INTO the
+    /// ledger, so nothing comes back.
+    #[test]
+    fn an_outcome_over_a_standing_health_row_restates_it_when_the_outcome_folds() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        let detail = "20 consecutive checks since 2026-08-27T22:04:36Z: … Run `aterm-ctl update status` for details.";
+        assert!(bars.update_health_standing("aterm auto-update is failing", detail));
+
+        // A notice covers it: the glass shows the notice, the ledger has nothing
+        // (the warning was not retired — it is waiting).
+        bars.notice(Lane::Update, "update paused by the operator", now);
+        assert!(!bars.update_bar_is_health());
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(
+            bars.ledger().count(),
+            0,
+            "queued, not dropped into the ledger"
+        );
+        // Restated while covered: the glass does not change, the words do.
+        assert!(!bars.update_health_standing(
+            "aterm auto-update is failing",
+            "21 consecutive checks … Run `aterm-ctl update status` for details."
+        ));
+        assert!(!bars.update_bar_is_health());
+        // The notice folds: it goes to the ledger and the warning is back, with
+        // the newest words, standing (no hold, no staleness cap).
+        assert!(bars.settle(now + HOLD_NOTICE));
+        assert!(bars.update_bar_is_health(), "the warning returned");
+        assert_eq!(bars.rows(), 1);
+        let (_, bar) = bars.bars().next().unwrap();
+        assert!(
+            bar.text.detail.starts_with("21 consecutive"),
+            "{}",
+            bar.text.detail
+        );
+        assert_eq!(bar.fold_at, None);
+        assert_eq!(bar.stale_at, None);
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].lane, rows[0].outcome), (Lane::Update, Outcome::Ok));
+        assert!(rows[0].title.contains("paused"));
+
+        // A Warn outcome covers it, then the ledger heals while it waits: the
+        // warning retires into the ledger from the queue, and NOTHING returns
+        // when the outcome folds.
+        bars.update_outcome(
+            '\u{26a0}',
+            "Update delayed",
+            "a shell is busy",
+            Tone::Warn,
+            now,
+        );
+        assert!(!bars.update_bar_is_health());
+        assert!(
+            !bars.update_health_healed(now),
+            "nothing left the GLASS — the outcome is still up"
+        );
+        let rows: Vec<_> = bars.ledger().collect();
+        assert_eq!(rows.len(), 2, "…but the queued warning is on record");
+        assert_eq!(rows[1].outcome, Outcome::Warn);
+        assert!(rows[1].detail.starts_with("21 consecutive"));
+        assert!(bars.settle(now + HOLD_WARN));
+        assert_eq!(bars.rows(), 0, "healed: the warning does not come back");
+        assert!(!bars.update_health_healed(now), "idempotent");
+
+        // A Staged row waiting behind the same outcome outranks the warning: the
+        // ready row returns first; the warning returns when the ready row folds.
+        let mut bars = StatusBars::default();
+        bars.update_progress(
+            &aterm_update::Progress::Staged {
+                version: "0.81.0".into(),
+                build: 99,
+            },
+            Some(ApplyPosture::Automatic),
+            now,
+        );
+        assert!(!bars.update_health_standing("aterm auto-update is failing", detail));
+        assert!(bars.update_bar_is_staged());
+        bars.update_outcome('\u{23f8}', "Update paused", "", Tone::Info, now);
+        assert!(bars.settle(now + HOLD_OK));
+        assert!(
+            bars.update_bar_is_staged(),
+            "the ready row comes back first"
+        );
+        let staged_folds = bars.deadline().expect("the staged row has a hold");
+        assert!(bars.settle(staged_folds));
+        assert!(
+            bars.update_bar_is_health(),
+            "…and the warning takes the lane when the ready row folds"
+        );
+        assert_eq!(bars.ledger().count(), 2, "the outcome and the staged row");
     }
 
     /// The wire is a SEPARATE grammar from the glass. `layout` makes a hostile
@@ -2688,6 +3787,77 @@ mod tests {
                 assert_eq!(end(*c, s), cols - MARGIN, "cols {cols}");
             }
         }
+    }
+
+    /// A DETAIL IS DRAWN WHOLE-ISH OR NOT AT ALL, AND A COMMAND OUTRANKS ITS
+    /// PROSE (UX review, 2026-09-10). At 80 cols the managed row showed "these
+    /// are wha…" — a stub that said nothing; the floor is [`DETAIL_FLOOR`] cells
+    /// now. When a detail with a backtick command must be cut, the prose gives
+    /// way and the command survives, still inside the row.
+    #[test]
+    fn a_short_detail_is_dropped_and_a_cut_detail_keeps_its_command() {
+        let title = "Claude Code 2.1.267 \u{00b7} Codex 0.154.0 \u{2014} aterm-managed, current";
+        let text = BarText {
+            glyph: '\u{2713}',
+            title: title.into(),
+            detail: "what `claude` and `codex` run in new tabs \u{00b7} build 2026091001".into(),
+            stats: String::new(),
+            tone: Tone::Success,
+        };
+        // 80 cols: 16 cells left after the head — below the floor, no stub.
+        let l = layout(&text, None, 80);
+        assert_eq!(l.title, title);
+        assert!(l.detail.is_none(), "{:?}", l.detail);
+        // Just enough room for the floor: the detail is shaped, and the
+        // commands are whole while the prose carries the ellipsis.
+        let cols = 2 * MARGIN + 2 + title.chars().count() + 2 + DETAIL_FLOOR + 8;
+        let l = layout(&text, None, cols);
+        let (col, d) = l.detail.clone().expect("a detail at the floor");
+        assert!(d.contains("`claude`"), "{d}");
+        assert!(d.contains('\u{2026}'), "{d}");
+        assert!(col + d.chars().count() <= cols - MARGIN, "{d}");
+        // One cell short of the floor: nothing.
+        let l = layout(&text, None, cols - 9);
+        assert!(l.detail.is_none(), "{:?}", l.detail);
+        // The undo row: the pointer outranks the revert command, which is the
+        // last thing to go — and never the first.
+        let undo = BarText {
+            glyph: '\u{21bb}',
+            title: "Universal Control disabled".into(),
+            detail: format!(
+                "undo: `aterm pkg doctor` prints the revert \u{00b7} {}",
+                atpkg::machine::UNIVERSAL_CONTROL_REVERT
+            ),
+            stats: String::new(),
+            tone: Tone::Info,
+        };
+        for cols in [60usize, 70, 80, 100, 130, 150] {
+            let l = layout(&undo, None, cols);
+            let (col, d) = l.detail.clone().expect("the undo row keeps a detail");
+            assert!(d.contains("`aterm pkg doctor`"), "cols {cols}: {d}");
+            assert!(col + d.chars().count() <= cols - MARGIN, "cols {cols}: {d}");
+        }
+        // 28 cells of head, 107 of detail: whole from 139 cols.
+        let l = layout(&undo, None, 150);
+        assert!(
+            l.detail
+                .unwrap()
+                .1
+                .ends_with("com.apple.universalcontrol Disable"),
+            "wide enough, the revert is whole"
+        );
+        // A plain detail still truncates from the right.
+        let plain = BarText {
+            glyph: '\u{2713}',
+            title: "ALab toolchain installed".into(),
+            detail: "x".repeat(200),
+            stats: String::new(),
+            tone: Tone::Success,
+        };
+        let l = layout(&plain, None, 60);
+        let (col, d) = l.detail.unwrap();
+        assert!(d.ends_with('\u{2026}') && d.starts_with("xxxx"));
+        assert_eq!(col + d.chars().count(), 60 - MARGIN);
     }
 
     #[test]

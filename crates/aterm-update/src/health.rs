@@ -254,12 +254,23 @@ impl Health {
     /// standing apply streak of 7 printed `failing=9:network failing_applies=7` —
     /// nine consecutive failures of class `network` when two checks had failed —
     /// sending a reader after an acquisition fault that did not exist.
+    ///
+    /// NOT A SUM ACROSS CLASSES (2026-09-10). The four acquisition streaks used to be
+    /// added together, and a ledger that inherited another build's dead `manifest`
+    /// streak of 999 beside this build's 20 `pipeline` failures printed
+    /// `failing=1019:pipeline` — a count no lane ever produced, attached to the one
+    /// class that happened to be standing. The field now reports the STANDING
+    /// class's own count ([`Self::standing_acquisition_class`], the same class the
+    /// `:kind` suffix names), so the number and the label describe one streak.
     #[must_use]
     pub fn acquisition_failures(&self) -> u32 {
-        self.network_failures
-            .saturating_add(self.pipeline_failures)
-            .saturating_add(self.manifest_failures)
-            .saturating_add(self.stage_failures)
+        match self.standing_acquisition_class() {
+            Some("pipeline") => self.pipeline_failures,
+            Some("manifest") => self.manifest_failures,
+            Some("stage") => self.stage_failures,
+            Some("network") => self.network_failures,
+            _ => 0,
+        }
     }
 
     /// The `(streak, start-of-streak)` pair a failure class owns, or `None` for an
@@ -381,8 +392,41 @@ impl Health {
         if let Some((count, since)) = h.class_streak_mut(kind) {
             if *count == 0 {
                 *since = now.clone();
+            } else if since.is_empty() {
+                // A COUNT WITHOUT ITS CLOCK is a streak this ledger cannot vouch
+                // for: it was written by a build that predates per-class clocks
+                // (or by a build on another lane entirely). Carrying it forward
+                // printed "FAILING (20 consecutive checks since <the manifest
+                // streak's date>)" on a build that had failed exactly one check —
+                // the count from one build, the date from another class
+                // (2026-09-10 audit, m21). The streak restarts HERE, dated now,
+                // so the count and the date describe failures this ledger saw.
+                *count = 0;
+                *since = now.clone();
             }
             *count = count.saturating_add(1);
+        }
+        // ONE CHECK, ONE DIAGNOSIS. `pipeline` (the manifest could not be fetched),
+        // `manifest` (it was fetched and rejected) and `stage` (it was accepted and
+        // the artifact would not stage) are mutually exclusive verdicts about the
+        // same check, so a failure of one of them means the check did NOT fail the
+        // other two — their streaks are no longer consecutive and are cleared here,
+        // with their clocks. Without this a dead `manifest` streak from a previous
+        // build sat beside a live `pipeline` one and the two were summed
+        // (`total_failures`) into a count no lane produced. `network` is left
+        // alone on purpose: it is weather, and the module's standing rule is that
+        // a blip must not reset a standing diagnosis (nor does a diagnosis need to
+        // forget a blip); `apply` is a different lane and is never touched by a
+        // check ([`Self::record_success`]).
+        if matches!(kind, "pipeline" | "manifest" | "stage") {
+            for sibling in ["pipeline", "manifest", "stage"] {
+                if sibling != kind
+                    && let Some((count, since)) = h.class_streak_mut(sibling)
+                {
+                    *count = 0;
+                    since.clear();
+                }
+            }
         }
         h.kind = kind.to_string();
         if h.failing_since.is_empty() {
@@ -1220,6 +1264,84 @@ mod tests {
         let long = "e".repeat(2000);
         let h = Health::record_failure(&p, "pipeline", &long);
         assert_eq!(h.last_error.len(), 400, "stored error text is capped");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE SPLICE MEASURED ON m21 (2026-09-10): a ledger carrying a dead `manifest`
+    /// streak of 999 (another build's, clock-less) met this build's `pipeline`
+    /// failures and `update status` printed `failing=1019:pipeline` — the classes
+    /// summed, the date borrowed. A pipeline failure now CLEARS its sibling
+    /// diagnoses, the reported count is the standing class's own, and a clock-less
+    /// count restarts under a clock of its own.
+    #[test]
+    fn a_pipeline_failure_clears_its_sibling_diagnoses_and_the_count_is_its_own() {
+        let p = tmp("sibling-clear");
+        // The inherited ledger: a big manifest streak with no per-class clock, and a
+        // pipeline count with no clock either (both written by an older build).
+        let legacy = Health {
+            manifest_failures: 999,
+            pipeline_failures: 19,
+            kind: "pipeline".to_string(),
+            failing_since: "2026-08-27T22:04:36Z".to_string(),
+            ..Health::default()
+        };
+        legacy.write(&p);
+        let h = Health::record_failure(&p, "pipeline", "HTTP 404 on the appcast");
+        assert_eq!(h.manifest_failures, 0, "the sibling diagnosis is retired");
+        assert!(h.manifest_since.is_empty());
+        assert_eq!(
+            h.pipeline_failures, 1,
+            "a clock-less count is another build's; this ledger's streak starts at one"
+        );
+        assert!(
+            !h.pipeline_since.is_empty() && h.pipeline_since != "2026-08-27T22:04:36Z",
+            "the pipeline clock is its own, not the any-class fallback: {}",
+            h.pipeline_since
+        );
+        assert_eq!(
+            h.acquisition_failures(),
+            1,
+            "the count is the standing class's"
+        );
+        assert_eq!(h.standing_acquisition_class(), Some("pipeline"));
+
+        // A network blip still resets nothing (the module's standing rule)…
+        Health::record_failure(&p, "pipeline", "again");
+        let h = Health::record_failure(&p, "network", "dns");
+        assert_eq!(h.pipeline_failures, 2);
+        assert_eq!(
+            h.acquisition_failures(),
+            2,
+            "the pipeline streak outranks the blip and is reported alone, not summed"
+        );
+        // …and the COUNT and the CLASS the status line prints name the same
+        // streak: `kind` records the LAST failure (the blip), so a renderer that
+        // paired `acquisition_failures()` with `kind` would print `2:network` —
+        // two failures of a class that failed once. The standing class is the
+        // label that goes with the count; `UpdateStatus` renders from that pair
+        // (`failing_checks` / `failing_checks_kind`), never from `kind`.
+        assert_eq!(h.kind, "network", "the last failure was the blip");
+        assert_eq!(
+            h.standing_acquisition_class(),
+            Some("pipeline"),
+            "the label beside the count is the standing class, not the last blip"
+        );
+        assert_eq!(h.network_failures, 1);
+        assert_ne!(
+            (h.acquisition_failures(), h.kind.as_str()),
+            (h.network_failures, "network"),
+            "count and kind must not be read as one pair"
+        );
+        // …and a manifest verdict retires the pipeline streak, because the manifest
+        // was evidently fetched this time.
+        let h = Health::record_failure(&p, "manifest", "bad signature");
+        assert_eq!((h.pipeline_failures, h.manifest_failures), (0, 1));
+        assert!(h.pipeline_since.is_empty());
+        assert_eq!(h.acquisition_failures(), 1);
+        assert_eq!(
+            h.network_failures, 1,
+            "weather is neither reset nor summed in"
+        );
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

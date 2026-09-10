@@ -472,10 +472,37 @@ pub struct Baseline {
 //     121). winit's dominator cost 83,310 -> 83,332; mac-arm 391,436 ->
 //     391,458, linux 2,739,645 -> 2,739,667, win 3,586,874 -> 3,586,896 —
 //     the same +22 on each cell that vendors winit.
+// (9) 2026-09-09, the Rust-lane commit 907ef0bf6: `aterm help rust` MEASURES
+//     which toolchain a directory actually gets — it calls
+//     `aterm_verify::toolchain::Toolchain::discover`, reads the atpkg store's
+//     winner and the refused candidates, and runs the resolved `rustc`/`targo`
+//     for their versions — so `crates/aterm-cli` declares `aterm-verify`. That
+//     crate has NO dependencies of its own (deliberately, and its manifest says
+//     so), which is why this is the narrowest possible movement: +1 workspace
+//     node and +1 resolved node on every cell that resolves aterm-cli, and
+//     nothing else. third_party is untouched on all three (40 / 188 / 91), and
+//     so is every third_party_loc, every build-script and proc-macro count, and
+//     every duplicate-name count. mac-arm 109 -> 110, linux 259 -> 260, win
+//     160 -> 161; workspace 69 -> 70, 71 -> 72, 69 -> 70. The wasm modules are
+//     rooted at the engine, not at the `aterm` binary, so they never resolve
+//     aterm-cli and do not move.
+//
+//     WHY THIS SAT UNMEASURED FOR TWO DAYS, which is the part worth recording:
+//     three gates (0.79.0 and both 0.80.0 attempts) were read as "forge green"
+//     when aterm-forge had never RUN. The workspace test stage aborted earlier
+//     at `-p aterm-conformance --test paint`, whose rows were flaking under
+//     gate load, and a stage that stops at the first failing binary never
+//     reaches the later ones. The tell was in the logs all along: 3, then 4,
+//     then 11 mentions of forge — the first run that reached it is the first
+//     run that disagreed. An ABSENCE OF FAILURE IS NOT A PASS, and a ratchet
+//     that is never executed guards nothing.
+//
+//     Console-life integration adds a direct aterm-effects -> aterm-types
+//     dependency, but core/render already resolve it normally; this adds no node.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 109,
-    workspace: 69,
+    resolved: 110,
+    workspace: 70,
     third_party: 40,
     third_party_loc: 391_458,
     build_scripts: 9,
@@ -485,8 +512,8 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 259,
-    workspace: 71,
+    resolved: 260,
+    workspace: 72,
     third_party: 188,
     third_party_loc: 2_739_667,
     build_scripts: 31,
@@ -496,8 +523,8 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 160,
-    workspace: 69,
+    resolved: 161,
+    workspace: 70,
     third_party: 91,
     third_party_loc: 3_586_896,
     build_scripts: 19,

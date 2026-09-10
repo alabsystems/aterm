@@ -160,7 +160,9 @@ impl PackagesProgramRow {
             name: name.to_string(),
             installed_build: program.installed_build,
             state: program.state.clone(),
-            facts: (group == RowGroup::Extras)
+            // The authored vendor · license · size line rides on every extra AND on the
+            // agent programs (default-set, but still a vendor's proprietary tool).
+            facts: (group == RowGroup::Extras || atpkg::stub::is_agent_program(name))
                 .then(|| atpkg::stub::describe(name).map(ExtraFacts::parse))
                 .flatten(),
             kind,
@@ -193,7 +195,14 @@ pub(crate) enum RowGroup {
 
 impl RowGroup {
     fn of(name: &str, kind: &ProgramStateKind) -> Self {
-        if matches!(kind, ProgramStateKind::ExtraNotInstalled) || atpkg::stub::compiled_extra(name)
+        // The agent programs (`atpkg::stub::AGENT_PROGRAMS`: claude, codex) are
+        // default-set members since the 2026-09-10 owner decision — installed by the
+        // pass unasked, never behind an Install control — whatever a stale
+        // `extra — not installed` row from an older atpkg still says.
+        let agent = atpkg::stub::is_agent_program(name);
+        if !agent
+            && (matches!(kind, ProgramStateKind::ExtraNotInstalled)
+                || atpkg::stub::compiled_extra(name))
         {
             // Needs-admin membership is decided over the WHOLE row set (a blocked
             // chain reaches other rows), in `PackagesStatusReport::from_parts`.
@@ -233,6 +242,10 @@ pub(crate) enum ProgramStateKind {
         retired: Option<String>,
     },
     ExtraNotInstalled,
+    /// An agent program the pass has not installed YET (`agent program — installing`,
+    /// `atpkg::state::AGENT_INSTALLING`): a default-set row on its way, never an
+    /// extra waiting for consent.
+    AgentInstalling,
     InstalledVia {
         protocol: String,
         path: String,
@@ -262,6 +275,9 @@ impl ProgramStateKind {
                 path: path.to_string(),
                 retired: atpkg::state::system_retired(state).map(str::to_string),
             };
+        }
+        if state.starts_with(atpkg::state::AGENT_INSTALLING) {
+            return Self::AgentInstalling;
         }
         if state.starts_with(atpkg::state::EXTRA_PREFIX) {
             return Self::ExtraNotInstalled;
@@ -1198,6 +1214,7 @@ mod tests {
             index_source: "alabsystems/aterm".to_string(),
             outcome: outcome.to_string(),
             seams: Vec::new(),
+            last_success_at: String::new(),
             programs,
         }
     }
@@ -1515,8 +1532,13 @@ mod tests {
                 atpkg::state::system(p("/opt/homebrew/bin/gh"), Some("2026-08-27")),
                 None,
             ),
-            ("codex", atpkg::state::extra_not_installed("codex"), None),
+            ("codex", atpkg::state::agent_installing(), None),
             ("claude", atpkg::state::managed(2231, 41), Some(2231)),
+            (
+                "vendorx",
+                atpkg::state::extra_not_installed("vendorx"),
+                None,
+            ),
             ("clt", atpkg::state::needs_admin("clt"), None),
             (
                 "brew",
@@ -1553,6 +1575,7 @@ mod tests {
             index_source: "alabsystems/aterm".to_string(),
             outcome: "up to date".to_string(),
             seams: Vec::new(),
+            last_success_at: String::new(),
             programs,
         };
         let text = status.to_toml().unwrap();
@@ -1594,7 +1617,8 @@ mod tests {
                 retired: Some("2026-08-27".into())
             }
         );
-        assert_eq!(row("codex").kind, ProgramStateKind::ExtraNotInstalled);
+        assert_eq!(row("codex").kind, ProgramStateKind::AgentInstalling);
+        assert_eq!(row("vendorx").kind, ProgramStateKind::ExtraNotInstalled);
         assert_eq!(row("clt").kind, ProgramStateKind::NeedsAdmin);
         assert_eq!(
             row("brew").kind,
@@ -1619,16 +1643,27 @@ mod tests {
             assert!(row(name).facts.is_none(), "{name} carries no extra facts");
             assert!(!row(name).offers_extra_install(), "{name}");
         }
-        assert_eq!(row("codex").group, RowGroup::Extras);
-        assert!(row("codex").offers_extra_install());
+        // The agent programs are DEFAULT-SET (owner decision 2026-09-10): the pass
+        // installs them unasked, so neither the one still installing nor the one
+        // already managed is an extra, and neither offers an Install control.
+        assert_eq!(
+            row("codex").group,
+            RowGroup::Default,
+            "an agent program installing"
+        );
+        assert!(!row("codex").offers_extra_install());
         assert_eq!(
             row("claude").group,
-            RowGroup::Extras,
-            "an installed extra is still an extra (the compiled roster says so)"
+            RowGroup::Default,
+            "an agent program installed"
         );
+        assert!(!row("claude").offers_extra_install());
+        // A real opt-in extra still waits for consent behind the Install control.
+        assert_eq!(row("vendorx").group, RowGroup::Extras);
+        assert!(row("vendorx").offers_extra_install());
         assert!(
-            !row("claude").offers_extra_install(),
-            "an installed extra offers no Install"
+            row("vendorx").facts.is_none(),
+            "an unauthored extra carries no facts"
         );
         assert_eq!(row("clt").group, RowGroup::NeedsAdmin);
         assert_eq!(

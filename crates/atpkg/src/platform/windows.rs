@@ -101,6 +101,18 @@ pub fn spotlight_indexing_enabled(_path: &Path) -> Option<bool> {
     None
 }
 
+/// Universal Control is a macOS feature; there is nothing to read here.
+#[must_use]
+pub fn universal_control_state() -> [Option<bool>; 2] {
+    [None, None]
+}
+
+/// Universal Control is a macOS feature; nothing is written and nothing changed.
+#[must_use]
+pub fn universal_control_disable() -> bool {
+    false
+}
+
 /// Shared-directory creation. On Windows POSIX modes do not apply, so this is just
 /// `create_dir_all`; the per-directory ACL governs access, exactly as it does for
 /// `ensure_private_dir`.

@@ -53,13 +53,16 @@ use std::path::{Path, PathBuf};
 /// tests (c) and (d); the spec's COHERENCE GROUP note is the prose twin.
 const RUSTC_TUPLE: [&str; 4] = ["trust", "trust-ir", "trust-cg", "trust-vc"];
 
-/// The owner's decisions (2026-08-26) for the vendor-fetched members: the two
-/// agent CLIs are EXTRAS — listed and pinned, installed only on request (the
-/// typed-name consent stub) — and `gh`/`emacs` are default-set members that a
-/// system install of the same name satisfies. Every one of these must be a
-/// spec row (active or pending) carrying exactly these flags, and the set is
-/// exactly the refresher's `VENDOR_PROGRAMS` exemption.
-const VENDOR_EXTRAS: [&str; 2] = ["codex", "claude"];
+/// The owner's decisions for the vendor-fetched members: the two agent CLIs are
+/// DEFAULT-SET members (2026-09-10 — aterm is their version manager; until then they
+/// were `extra`, installed only through the typed-name consent stub), carrying NO
+/// flag, and `gh`/`emacs` are default-set members that a system install of the same
+/// name satisfies. Every one of these must be a spec row (active or pending) carrying
+/// exactly these flags, and the set is exactly the refresher's `VENDOR_PROGRAMS`
+/// exemption. The agent set must equal the client's compiled roster
+/// (`atpkg::stub::AGENT_PROGRAMS`), which treats them as default-set even under an
+/// index that still flags them.
+const VENDOR_AGENTS: [&str; 2] = ["codex", "claude"];
 const VENDOR_SYSTEM: [(&str, &str); 2] = [("gh", "gh"), ("emacs", "emacs")];
 
 /// What Homebrew requires first: the Command Line Tools.
@@ -700,14 +703,22 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
             )
         })
     };
-    for name in VENDOR_EXTRAS {
+    let mut agents: Vec<&str> = VENDOR_AGENTS.to_vec();
+    agents.sort_unstable();
+    let mut compiled: Vec<&str> = atpkg::stub::AGENT_PROGRAMS.to_vec();
+    compiled.sort_unstable();
+    assert_eq!(
+        agents, compiled,
+        "the spec's agent set and the client's compiled AGENT_PROGRAMS roster must agree"
+    );
+    for name in VENDOR_AGENTS {
         let row = find(name);
         assert_eq!(
             row.flags,
-            vec![Flag::Extra],
-            "tools/atpkg-programs.spec:{}: {name:?} must carry exactly the \
-             `extra` flag (owner decision: listed + pinned, installed only on \
-             request through the typed-name consent stub)",
+            vec![],
+            "tools/atpkg-programs.spec:{}: {name:?} must carry NO flag (owner decision \
+             2026-09-10: a default-set member — aterm is its version manager — never \
+             `extra`)",
             row.line_no
         );
         // Owner direction 2026-09-08: the manifest-only releases of a vendor member
@@ -755,7 +766,7 @@ fn vendor_members_carry_the_owner_decisions_and_the_seed_exemption() {
         "tools/atpkg-programs.spec: the clt row (line {clt_line}) must precede the brew \
          row (line {brew_line}) — brew requires clt, and the spec reads top to bottom"
     );
-    let decided: BTreeSet<String> = VENDOR_EXTRAS
+    let decided: BTreeSet<String> = VENDOR_AGENTS
         .iter()
         .copied()
         .chain(VENDOR_SYSTEM.iter().map(|(n, _)| *n))
@@ -870,7 +881,7 @@ fn the_authoring_script_serves_exactly_the_vendor_and_os_installed_members() {
         .expect("tools/atpkg-author-vendor.sh dispatches on \"$PROG\"");
     let pattern = line.trim().split(')').next().unwrap_or("");
     let offered: BTreeSet<String> = pattern.split('|').map(str::to_string).collect();
-    let decided: BTreeSet<String> = VENDOR_EXTRAS
+    let decided: BTreeSet<String> = VENDOR_AGENTS
         .iter()
         .copied()
         .chain(VENDOR_SYSTEM.iter().map(|(n, _)| *n))

@@ -639,7 +639,77 @@ IDLE = [
       tail=(-172.0, -182.0, -190.0, -198.0), tail_len=14.5),
 ]
 
-CAT_POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW + ROLL + LWALK + LOCO + IDLE
+# ── console contact: weight, local attention, and a supported edge ─────────
+# These are authored joint poses, not transforms of a rasterized rest frame.
+# Every one is weight-bearing: registration keeps its lowest ink at 143 and
+# the engine supplies any movement between safe places. In particular an edge
+# pose does not put a dangling limb below the sprite's shared contact plane.
+CONTACT = [
+    D("pet_contact_brace", "Ink contact: chest recoils over spread planted paws, ears back, tail curled clear.",
+      yaw=0.8, bx=92.0, by=76.0, brx=39.0, bry=22.0, brot=-7.0,
+      hx=139.0, hy=48.0, hrot=-12.0, eyes="wide", mouth="oof", ear_flat=0.72,
+      fl_root=(121.0, 86.0),
+      fl_near=leg(48.0, 12.0, 19.0, 15.0), fl_far=leg(35.0, 8.0, 19.0, 15.0),
+      hl_near=leg(-30.0, 12.0, 17.0, 14.0), hl_far=leg(-20.0, 6.0, 17.0, 14.0),
+      tail_root=(55.0, 73.0), tail=(20.0, 72.0, 140.0, 192.0),
+      tail_len=10.5, tail_thick=8.0),
+    D("pet_tail_tuck", "Ink clearance: the standing cat draws its long tail into a tight hook under the flank.",
+      tail_root=(52.0, 77.0), tail=(18.0, 66.0, 133.0, 190.0),
+      tail_len=11.5, tail_thick=8.0, gaze=(-1.2, 0.5), ear_far=-12.0),
+    D("pet_contact_recover", "Contact recovery: weight returns to three paws while the near forepaw gathers for one step.",
+      yaw=0.8, by=65.0, brx=39.0, bry=22.0, hx=148.0, hy=37.0, hrot=-5.0,
+      fl_near=leg(-25.0, 60.0, 17.0, 12.0), fl_far=leg(2.0, -2.0),
+      hl_near=leg(-12.0, 18.0), hl_far=leg(5.0, -8.0),
+      tail=(-105.0, -138.0, -177.0, -214.0), tail_len=12.0),
+    D("pet_inspect_down", "Inspect a local edit: neck extends down over the planted forepaws, pupils aimed at the vacancy.",
+      **{**SIT_BASE, "hx": 145.0, "hy": 55.0, "hrot": 27.0, "yaw": 0.65,
+         "gaze": (1.2, 2.5), "ear_near": 8.0, "ear_far": -12.0,
+         "whisker_far": False, "whisker_near": False, "blush": False}),
+    D("pet_reach_paw", "Validated edit vacancy: one long forepaw reaches forward and down while the other supports the same seat.",
+      **{**SIT_BASE, "hx": 139.0, "hy": 48.0, "hrot": 18.0, "yaw": 0.7,
+         "gaze": (1.2, 2.0), "eyes": "open", "mouth": "smile",
+         "fl_near": leg(65.0, 78.0, 32.0, 28.0),
+         "whisker_far": False, "whisker_near": False}),
+    D("pet_withdraw_paw", "Replacement arrives: the reaching forepaw folds back under the chest; the supported seat stays put.",
+      **{**SIT_BASE, "hx": 139.0, "hy": 48.0, "hrot": 18.0, "yaw": 0.7,
+         "gaze": (1.2, 2.0), "eyes": "open", "mouth": "smile",
+         "fl_near": leg(-20.0, 100.0, 17.0, 15.0),
+         "whisker_far": False, "whisker_near": False}),
+    D("pet_edge_perch", "Safe block edge: a compact supported seat, forepaws together at the lip and tail counterbalancing behind.",
+      **{**SIT_BASE, "bx": 102.0, "by": 62.0, "brx": 26.0, "bry": 25.0,
+         "brot": -4.0, "haunch_at": (83.0, 88.0, 26.0),
+         "hx": 138.0, "hy": 41.0, "hrot": 6.0, "yaw": 0.6,
+         "fl_root": (124.0, 77.0),
+         "fl_near": leg(24.0, -24.0, 20.0, 18.0),
+         "fl_far": leg(-7.0, 4.0, 20.0, 18.0),
+         "tail_root": (67.0, 92.0), "tail": (-158.0, -120.0, -68.0, -12.0),
+         "tail_len": 11.0, "gaze": (1.0, 1.0), "whisker_far": False}),
+    D("pet_edge_lean", "Inspect below an edge: head and shoulder lean beyond the planted mitts, tail opposing the weight.",
+      **{**SIT_BASE, "bx": 108.0, "by": 63.0, "brx": 26.0, "bry": 25.0,
+         "brot": -15.0, "haunch_at": (83.0, 88.0, 26.0),
+         "hx": 153.0, "hy": 57.0, "hrot": 24.0, "yaw": 0.8,
+         "fl_root": (129.0, 77.0),
+         "fl_near": leg(24.0, -24.0, 20.0, 18.0),
+         "fl_far": leg(-7.0, 4.0, 20.0, 18.0),
+         "tail_root": (67.0, 92.0), "tail": (-158.0, -120.0, -68.0, -12.0),
+         "tail_len": 11.0, "gaze": (1.2, 2.5), "whisker_far": False,
+         "whisker_near": False, "blush": False}),
+]
+
+# Reading moves only the head and pupils. Derive these from the exact edge
+# seat instead of repeating body parameters; registered body paths are pinned
+# byte-for-byte by the art test. No body lean while reading a selected range.
+EDGE_PERCH = next(p for p in CONTACT if p.ident == "pet_edge_perch")
+CONTACT += [
+    replace(EDGE_PERCH, ident="pet_edge_look_up",
+            note="Reading above: only the head lifts and pupils rise; the supported perch remains planted.",
+            hrot=-20.0, gaze=(1.0, -2.5)),
+    replace(EDGE_PERCH, ident="pet_edge_look_down",
+            note="Reading below: only the head dips and pupils lower; the supported perch remains planted.",
+            hrot=25.0, gaze=(1.0, 2.5), whisker_near=False),
+]
+
+CAT_POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW + ROLL + LWALK + LOCO + IDLE + CONTACT
 
 # THE DOG IS THE SAME POSE SHEET, RE-SKINNED. Owner, 2026-08-11: "make a dog
 # like the walking cat … you can use the same code." Taking that literally is

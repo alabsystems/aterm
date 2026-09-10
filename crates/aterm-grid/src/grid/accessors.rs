@@ -150,6 +150,46 @@ impl Grid {
         self.storage.coordinates_invalidated = true;
     }
 
+    /// Record that RETAINED HISTORY was discarded wholesale — the third half of
+    /// [`Self::force_selection_invalidation`], and the one that must NOT claim a
+    /// coordinate move.
+    ///
+    /// The selection half is identical and deliberately so: history that no
+    /// longer exists cannot be named by a band, so `All` is the only honest
+    /// answer and every anchor must go. What ED 3 / `clear_scrollback` does NOT
+    /// do is move a live coordinate. `erase_scrollback` copies the visible rows
+    /// `[live_top, live_top + visible_rows)` into `new_rows[0..visible_rows]` and
+    /// sets `ring_head = 0`; with `display_offset` at 0 — which the SCR-1
+    /// processing prologue guarantees for the whole of a batch —
+    /// `GridStorage::row_index` reads `(live_top + i)` before and `i` after, the
+    /// same row. `absolute_row_counter` and `visible_rows` are untouched, so
+    /// `visible_to_absolute` is unchanged as well: row `r`, column `c` is the
+    /// same cell, with the same absolute number, before and after. Only
+    /// `oldest_absolute_row()` moves, and it moves because history was EVICTED —
+    /// which is not the same event as history being RENUMBERED (that one has its
+    /// own `history_renumber_epoch`, bumped by the Kitty unscroll in
+    /// `scroll_unscroll.rs` and by nothing here).
+    ///
+    /// Claiming the move anyway bumped `ContentScrollState::invalidation_epoch`,
+    /// which the GUI reads to call `cursor_glow.reset()` — so the `clear` command
+    /// annihilated the earned rainbow ribbon exactly as every ED spelling used to
+    /// before `an_erase_rewrites_cells_in_place_and_invalidates_no_host_coordinate`.
+    /// The `content_scroll_delta == i32::MAX` sentinel is dropped with it and for
+    /// the same reason: `post_process` folds it into `invalidates_coordinates`
+    /// independently, and its OTHER job — clearing the selection — is exactly what
+    /// the damage lattice does here (`SelectionDamage::All` short-circuits
+    /// `clears_selection` to true without consulting the overlap predicate).
+    ///
+    /// Pinned by `discarding_scrollback_evicts_history_and_moves_no_live_coordinate`,
+    /// whose selection control is what refuses the "delete the call" mutant.
+    #[inline]
+    pub fn discard_history_selection(&mut self) {
+        self.storage.selection_damage = self
+            .storage
+            .selection_damage
+            .union(crate::SelectionDamage::All);
+    }
+
     /// SELECTION CUSTODY Phase 4: record the SCROLL REGION's rows as damaged.
     ///
     /// The shorthand for the line/column editing family — IL, DL, DECIC, DECDC, SL,

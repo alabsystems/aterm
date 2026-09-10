@@ -119,6 +119,21 @@ pub(super) fn reset_common_fields(
     grid.clear_line_attributes();
     grid.set_cursor(0, 0);
     grid.reset_tab_stops();
+    // RIS REPLACES EVERY VISIBLE COORDINATE, and says so in its own name rather
+    // than borrowing someone else's signal (2026-09-10). It has just swapped the
+    // main grid back out of `alt_grid` (a buffer swap — the exact case
+    // `invalidate_host_coordinates` was split out for), erased the screen, cleared
+    // the line attributes and homed the cursor: a host caching grid coordinates
+    // must REBUILD, not translate.
+    //
+    // Until now the byte-stream `ESC c` path got that bump only as a side effect of
+    // `erase_scrollback` claiming a coordinate move — a claim that was false for
+    // ED 3 and is now gone (`Grid::discard_history_selection`). `Terminal::reset()`,
+    // the direct path, always stated it explicitly at the end of its own body and
+    // drains this flag before doing so, so it still reports exactly ONCE
+    // (`content_scroll_state_survives_direct_and_ris_reset_without_double_counting`
+    // holds both halves).
+    grid.invalidate_host_coordinates();
     // Alternate screen — already consumed by the swap above; ensure cleared.
     *alt_grid = None;
     cursor_save.reset();

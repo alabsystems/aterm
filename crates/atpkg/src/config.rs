@@ -269,12 +269,70 @@ pub fn config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
 }
 
-/// Deserialization wrapper: ONLY the `[packages]` table is read out of the whole
-/// `aterm.toml`; every other table/key is ignored (the GUI owns that schema).
+/// The `[machine]` table — the machine settings the update/seed pass applies at first
+/// open and keeps applied (R5, owner decisions 2026-09-10). Read by atpkg because atpkg
+/// APPLIES them: the GUI only renders the resulting `machine-settings:` row.
+///
+/// All-Option like [`PackagesConfig`]; defaults live ONLY in the resolver methods. Both
+/// defaults ACT — this is the one table whose "absent" means "do the doctor's remedy" —
+/// so the opt-outs are spelled explicitly: `spotlight_noindex = false`,
+/// `universal_control = "leave"`.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct MachineConfig {
+    /// `[machine].spotlight_noindex`: rename every cargo target dir the doctor's scan
+    /// finds under `$HOME` to its `.noindex` form and point that repo's
+    /// `.cargo/config.toml` at it, at the end of each pass. Default `true`.
+    pub spotlight_noindex: Option<bool>,
+    /// `[machine].universal_control`: `"off"` (default) writes
+    /// `com.apple.universalcontrol Disable`/`DisableMagicEdges` for the current host when
+    /// they are not already set; `"leave"` never touches them.
+    pub universal_control: Option<String>,
+}
+
+/// What the pass does about macOS Universal Control (the cursor/keyboard roaming to
+/// other Macs and iPads signed into the same Apple account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UniversalControlPolicy {
+    /// Disable it for this host (both keys), if not already disabled. The default.
+    Off,
+    /// Do nothing, ever.
+    Leave,
+}
+
+impl MachineConfig {
+    /// `[machine].spotlight_noindex`, default `true`.
+    #[must_use]
+    pub fn spotlight_noindex(&self) -> bool {
+        self.spotlight_noindex.unwrap_or(true)
+    }
+
+    /// `[machine].universal_control`, default `off`. An unrecognised spelling is
+    /// `Leave` — the inert reading — and says so once on stderr, rather than acting on
+    /// a machine setting over a word the owner did not write.
+    #[must_use]
+    pub fn universal_control(&self) -> UniversalControlPolicy {
+        match self.universal_control.as_deref().map(str::trim) {
+            None | Some("") | Some("off") => UniversalControlPolicy::Off,
+            Some("leave") => UniversalControlPolicy::Leave,
+            Some(other) => {
+                eprintln!(
+                    "atpkg: [machine] universal_control = {other:?} is not \"off\" or \
+                     \"leave\" — leaving Universal Control alone"
+                );
+                UniversalControlPolicy::Leave
+            }
+        }
+    }
+}
+
+/// Deserialization wrapper: ONLY the `[packages]` and `[machine]` tables are read out of
+/// the whole `aterm.toml`; every other table/key is ignored (the GUI owns that schema).
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]
 struct RootConfig {
     packages: Option<PackagesConfig>,
+    machine: Option<MachineConfig>,
 }
 
 /// Parse the `[packages]` table out of full `aterm.toml` text. A file without the
@@ -292,6 +350,19 @@ pub fn parse_packages(text: &str) -> PackagesConfig {
     }
 }
 
+/// Parse the `[machine]` table out of full `aterm.toml` text — the same rules as
+/// [`parse_packages`]: no table ⇒ defaults, malformed ⇒ loud defaults.
+#[must_use]
+pub fn parse_machine(text: &str) -> MachineConfig {
+    match aterm_toml::from_str::<RootConfig>(text) {
+        Ok(root) => root.machine.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("atpkg: ignoring malformed aterm.toml [machine] config: {e}");
+            MachineConfig::default()
+        }
+    }
+}
+
 /// Load the `[packages]` table from the real config file (missing/unreadable ⇒
 /// defaults, malformed ⇒ loud defaults via [`parse_packages`]).
 #[must_use]
@@ -302,17 +373,36 @@ pub fn load() -> PackagesConfig {
     load_from_path(&path)
 }
 
-fn load_from_path(path: &Path) -> PackagesConfig {
+/// Load the `[machine]` table from the real config file, under [`load`]'s rules.
+#[must_use]
+pub fn load_machine() -> MachineConfig {
+    config_path()
+        .and_then(|p| read_config_text(&p))
+        .map_or_else(MachineConfig::default, |t| parse_machine(&t))
+}
+
+/// The admitted text of the config file, or `None` when absent/unreadable.
+fn read_config_text(path: &Path) -> Option<String> {
     // The config file itself may legitimately be a dotfile-manager symlink.
     // Resolve only that bounded final-link chain, then admit/read the selected
     // regular target through one non-blocking, bounded handle.
-    let Ok(text) = crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
+    crate::metadata_io::read_bounded_regular_utf8_follow_final_links(
         path,
         MAX_PACKAGES_CONFIG_BYTES,
-    ) else {
-        return PackagesConfig::default(); // not present / unreadable → defaults
-    };
-    parse_packages(&text)
+    )
+    .ok()
+}
+
+fn load_from_path(path: &Path) -> PackagesConfig {
+    // not present / unreadable → defaults
+    read_config_text(path).map_or_else(PackagesConfig::default, |t| parse_packages(&t))
+}
+
+/// The process-wide `[machine]` config, read ONCE per invocation like [`cached`].
+#[must_use]
+pub fn cached_machine() -> &'static MachineConfig {
+    static CFG: std::sync::OnceLock<MachineConfig> = std::sync::OnceLock::new();
+    CFG.get_or_init(load_machine)
 }
 
 /// The process-wide `[packages]` config, read ONCE per invocation (atpkg is a
@@ -329,6 +419,35 @@ pub fn cached() -> &'static PackagesConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `[machine]`: both defaults ACT (spotlight on, Universal Control off); the two
+    // opt-outs are the explicit spellings; a word the owner did not write is inert.
+    #[test]
+    fn machine_table_defaults_act_and_opt_outs_are_explicit() {
+        let none = parse_machine("font_px = 12.0\n[packages]\nchannel = \"stable\"\n");
+        assert!(none.spotlight_noindex());
+        assert_eq!(none.universal_control(), UniversalControlPolicy::Off);
+        let off =
+            parse_machine("[machine]\nspotlight_noindex = false\nuniversal_control = \"leave\"\n");
+        assert!(!off.spotlight_noindex());
+        assert_eq!(off.universal_control(), UniversalControlPolicy::Leave);
+        let explicit = parse_machine("[machine]\nuniversal_control = \"off\"\n");
+        assert_eq!(explicit.universal_control(), UniversalControlPolicy::Off);
+        assert_eq!(
+            parse_machine("[machine]\nuniversal_control = \" OFF \"\n").universal_control(),
+            UniversalControlPolicy::Leave,
+            "an unknown spelling never acts"
+        );
+        assert_eq!(
+            parse_machine("[machine]\nuniversal_control = 1\n").universal_control(),
+            UniversalControlPolicy::Off,
+            "a malformed table falls to the defaults, loudly"
+        );
+        // The two tables come out of one file, independently.
+        let both = "[packages]\nchannel = \"nightly\"\n[machine]\nspotlight_noindex = false\n";
+        assert_eq!(parse_packages(both).channel(), "nightly");
+        assert!(!parse_machine(both).spotlight_noindex());
+    }
 
     #[test]
     fn absent_table_yields_inert_defaults() {

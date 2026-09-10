@@ -1942,7 +1942,7 @@ pub(crate) fn cmd_inbox(ctx: &SessionCtx, rest: &str) -> String {
     // reply leaves older rows unlisted BELOW the newest one it carried. A
     // watermark test called every one of those "not pending" and reported
     // `pending=0` with mail still sitting in the ring — the verb table promises
-    // "the delivered rows this reply did not carry", with no watermark qualifier,
+    // "the unlisted delivered rows this reply did not carry", with no watermark qualifier,
     // and this is that number. (The watermark field is gone: one value with two
     // copies is how the two came to disagree.)
     let pending = inbox
@@ -4857,6 +4857,12 @@ mod inbox_hold {
             ),
             ("rain", "a visual effect on the window"),
             ("hover", "toggles the drop-target highlight"),
+            (
+                "appnotice",
+                "posts a text row on the pull-down status bars (chrome, not the \
+                 grid); it puts no bytes on a PTY and retires no session, and it is \
+                 Owner-only at the socket besides",
+            ),
             (
                 "spawn",
                 "MINTS a session rather than driving or retiring one, and a halt \

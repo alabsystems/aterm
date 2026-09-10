@@ -4,10 +4,10 @@
 //! The pet roster's art gate — the twin of `cat_art_quality.rs` for the
 //! full-body companion under `art/pet/`.
 //!
-//! The cat roster's assets are independent characters; the pet's 55 poses are
+//! The cat roster's assets are independent characters; the pet's poses are
 //! frames of ONE animal that the renderer swaps in place at gait rate. That
 //! changes what needs pinning: a head glyph is wrong if it is ugly, but a pose
-//! is wrong if it disagrees with the other fifty-four. So the checks here are
+//! is wrong if it disagrees with the rest of the sheet. So the checks here are
 //! mostly about the roster being internally consistent, and about the two
 //! silent-corruption traps the pipeline has — coordinates outside the viewbox
 //! are CLAMPED without a word by the codegen's `quant`, and a mismatched viewbox
@@ -328,6 +328,10 @@ fn the_layout_constants_match_the_art_and_fit_the_atlas_slot() {
 /// Bake one pose through the real path on the dark ground band, the gallery's
 /// reference coat/iris, width from the pose's own aspect.
 fn bake_dark(pose: PetGlyphId, h: u32) -> Tile {
+    bake_ground(pose, h, 0)
+}
+
+fn bake_ground(pose: PetGlyphId, h: u32, background: u8) -> Tile {
     let w = ((h as f32) * PetBaker::aspect(pose)).round().max(1.0) as u32;
     PetBakeKey {
         pose,
@@ -335,7 +339,7 @@ fn bake_dark(pose: PetGlyphId, h: u32) -> Tile {
         iris: 4,
         colors: CatColorKey {
             accent: 12,
-            background: 0,
+            background,
         },
         w: w as u16,
         h: h as u16,
@@ -473,5 +477,130 @@ fn the_gaits_vertical_survives_the_pixel_grid_at_every_cell_height() {
             "{id}: the gallop's suspension clears only {px:.2} px at the ship cell — \
              the brain adds no lift on a run, so this is the whole vertical"
         );
+    }
+}
+
+/// Contact beats must change the body contour at the small sizes users see;
+/// changing only a mouth culled by LOD would pass source-difference checks.
+/// Compare with the prior pose each beat replaces, and compare the paired
+/// reach/withdraw and perch/lean beats with each other. Both species matter.
+#[test]
+fn contact_beats_have_distinct_silhouettes_at_terminal_sizes() {
+    use PetGlyphId::*;
+    let pairs = [
+        (PetContactBrace, PetSkid),
+        (PetTailTuck, PetStand),
+        (PetContactRecover, PetWalk1),
+        (PetInspectDown, PetSitLookdown),
+        (PetReachPaw, PetBat),
+        (PetWithdrawPaw, PetReachPaw),
+        (PetEdgePerch, PetSit),
+        (PetEdgeLean, PetEdgePerch),
+        (PetEdgeLookUp, PetEdgePerch),
+        (PetEdgeLookDown, PetEdgePerch),
+        (PetDogContactBrace, PetDogSkid),
+        (PetDogTailTuck, PetDogStand),
+        (PetDogContactRecover, PetDogWalk1),
+        (PetDogInspectDown, PetDogSitLookdown),
+        (PetDogReachPaw, PetDogBat),
+        (PetDogWithdrawPaw, PetDogReachPaw),
+        (PetDogEdgePerch, PetDogSit),
+        (PetDogEdgeLean, PetDogEdgePerch),
+        (PetDogEdgeLookUp, PetDogEdgePerch),
+        (PetDogEdgeLookDown, PetDogEdgePerch),
+    ];
+    fn changed_silhouette(a: &Tile, b: &Tile) -> usize {
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        a.pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(b.pixels().as_chunks::<4>().0)
+            .filter(|(a, b)| (a[3] > 128) != (b[3] > 128))
+            .count()
+    }
+    for background in [0, 3] {
+        for h in [16, 24, 32, 34] {
+            for (pose, prior) in pairs {
+                let new = bake_ground(pose, h, background);
+                let old = bake_ground(prior, h, background);
+                let difference = changed_silhouette(&new, &old);
+                assert!(
+                    difference >= 3,
+                    "{pose:?} vs {prior:?} at {h}px, ground {background}: only \
+                     {difference} changed silhouette pixels; the contact beat disappeared"
+                );
+                // Deliberately substitute the prior pose: a mislabeled asset
+                // or a test that merely counted ink must not pass this bar.
+                assert_eq!(changed_silhouette(&old, &old), 0);
+            }
+        }
+    }
+}
+
+/// Reading follows the range with the head while keeping the body still.
+/// Check the actual registered asset strings, so a change to registration or
+/// the Python sheet cannot move the torso/paws/tail under an unchanged anchor.
+#[test]
+fn reading_gaze_keeps_the_perch_body_geometry_fixed() {
+    fn role_paths<'a>(p: &'a Pose, role: &str) -> Vec<&'a str> {
+        layers(p)
+            .iter()
+            .filter(|layer| layer.get("role").and_then(aterm_toml::Value::as_str) == Some(role))
+            .flat_map(|layer| {
+                layer
+                    .get("paths")
+                    .and_then(aterm_toml::Value::as_array)
+                    .unwrap()
+            })
+            .map(|path| path.as_str().expect("path string"))
+            .collect()
+    }
+    fn body(p: &Pose) -> Vec<&str> {
+        ["outline", "coat"]
+            .into_iter()
+            .flat_map(|role| {
+                let paths = role_paths(p, role);
+                // The edge rig paints tail, far foreleg, haunch, torso, near
+                // foreleg, then two ears and the skull. Pin the partition:
+                // an omitted limb must not make a vacuous prefix compare.
+                assert_eq!(paths.len(), 8, "{}: {role} part count", p.id);
+                paths.into_iter().take(5)
+            })
+            .collect()
+    }
+    let all = poses();
+    for species in ["pet_", "pet_dog_"] {
+        let get = |suffix: &str| {
+            all.iter()
+                .find(|p| p.id == format!("{species}{suffix}"))
+                .expect("reading pose")
+        };
+        let perch = get("edge_perch");
+        for suffix in ["edge_look_up", "edge_look_down"] {
+            let gaze = get(suffix);
+            assert_eq!(
+                body(gaze),
+                body(perch),
+                "{}: reading moved the body",
+                gaze.id
+            );
+            assert_eq!(role_paths(gaze, "pattern"), role_paths(perch, "pattern"));
+            assert_ne!(
+                role_paths(gaze, "eye"),
+                role_paths(perch, "eye"),
+                "{}: head gaze did not move",
+                gaze.id
+            );
+            assert_ne!(
+                role_paths(gaze, "detail"),
+                role_paths(perch, "detail"),
+                "{}: pupils did not move",
+                gaze.id
+            );
+        }
+        // A real forward lean is the negative control: it deliberately moves
+        // the shoulder and supporting paw and cannot substitute for reading.
+        assert_ne!(body(get("edge_lean")), body(perch));
     }
 }

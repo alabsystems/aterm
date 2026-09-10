@@ -5,17 +5,18 @@
 //! Source-scan gate: the THREE app-owned render paths (application-present
 //! composition, SIGUSR1 `snapshot`, control-socket `image`) suppress the
 //! transient effects — visual-bell invert, drag-drop wash, level-up glow —
-//! behind the SAME predicate, `WindowState::overlay_open()`.
+//! through the same overlay policy. Bell/drag and the landing celebration yield
+//! to `WindowState::overlay_open()`; the functional charging rim stays visible.
 //!
 //! # Why a source-scanning test
 //!
 //! The invariant tested here is narrower: application-present composition,
-//! `snapshot`, and `image` use the same overlay-open suppression policy for
+//! `snapshot`, and `image` use the same phase-aware overlay policy for
 //! these three transient effects. The 2026-07 audit found mutually inconsistent
 //! policies across those paths. The compiler cannot see that three distant code
 //! sites implement one policy, so this structural test reads the committed
-//! sources and fails when any transient-effect site stops consulting
-//! `overlay_open`. It does not inspect WSI, compositor selection, or scanout.
+//! sources and checks both the policy and capture's route to that policy.
+//! It does not inspect WSI, compositor selection, or scanout.
 //!
 //! Each pattern below is matched on WHITESPACE-NORMALIZED source (newlines and
 //! runs of spaces collapsed), so rustfmt churn cannot break it.
@@ -50,15 +51,20 @@ fn normalized_section(rel: &str, start: &str, end: &str) -> String {
 }
 
 #[test]
-fn application_present_gates_all_three_transients_on_overlay_open() {
-    let src = normalized("src/app_render.rs");
+fn application_present_uses_the_phase_aware_overlay_policy() {
+    let src = normalized_section(
+        "src/app_render.rs",
+        "fn redraw_window_with_layout(",
+        "pub(crate) fn redraw_tab_strip_state(",
+    );
     for needle in [
         // bell invert + drag wash read the shared gate once...
         "let overlay_open = ws0.overlay_open();",
         "let invert = ws0.bell_flash.is_active(Instant::now()) && !overlay_open;",
         "let drag_hover = ws0.drag_hover && !overlay_open;",
-        // ...and the level-up glow arm consults the SAME local.
-        "self.level_up .as_ref() .filter(|_| !overlay_open)",
+        // ...and the surge consults the SAME local, with only its functional
+        // charging phase admitted over a modal (LevelUp's policy below).
+        "self.level_up .as_ref() .filter(|l| !overlay_open || l.paints_over_overlay())",
     ] {
         assert!(
             src.contains(needle),
@@ -75,29 +81,120 @@ fn application_present_gates_all_three_transients_on_overlay_open() {
 }
 
 #[test]
-fn snapshot_and_image_gate_all_three_transients_on_overlay_open() {
-    let src = normalized("src/app_introspect.rs");
-    let gated_invert = "ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),";
-    let gated_drag = "if ws.drag_hover && !ws.overlay_open() {";
-    let gated_glow = "} else if !ws.overlay_open() && let Some((wash_a, border_a)) = level_up_glow";
-    // Two capture paths (snapshot + render_image) — each must carry each gate.
-    for (needle, what) in [
-        (gated_invert, "bell-invert"),
-        (gated_drag, "drag-wash"),
-        (gated_glow, "level-up glow"),
+fn shared_visual_policy_keeps_only_the_charging_exception() {
+    let src = normalized_section(
+        "src/app_render.rs",
+        "pub(crate) fn host_visual_state(",
+        "pub(crate) fn finalize_successful_terminal_present_for_test(",
+    );
+    for needle in [
+        "let overlay_open = window.overlay_open();",
+        "let invert = window.bell_flash.is_active(now) && !overlay_open;",
+        "if window.drag_hover && !overlay_open {",
+        "self.level_up .as_ref() .filter(|l| !overlay_open || l.paints_over_overlay())",
     ] {
-        let n = src.matches(needle).count();
+        assert!(src.contains(needle), "shared visual policy lost `{needle}`");
+    }
+    let phase = normalized_section(
+        "src/level_up.rs",
+        "pub(crate) const fn paints_over_overlay(",
+        "pub(crate) const fn phase(",
+    );
+    assert!(
+        phase.contains("matches!(self.phase, Phase::Charging)"),
+        "the overlay exception belongs only to Charging, never the Landing celebration"
+    );
+}
+
+/// Structural closure of the fallback capture policy, including its consumers.
+/// Compact only for matching punctuation across optional rustfmt line breaks.
+fn capture_uses_shared_visual_policy(src: &str, authority: &str) -> bool {
+    let src = src.split_whitespace().collect::<String>();
+    let mapping = ".map(|presented|crate::app_render::HostVisualState{\
+        invert:presented.invert,overlay:presented.overlay,})";
+    let fallback = ".unwrap_or_else(||self.host_visual_state(front,Instant::now()))";
+    let retained_first = match authority {
+        "presented_visuals" => {
+            src.contains(&format!(
+                "letpresented_visuals=presented.as_ref(){mapping};"
+            )) && src.contains(&format!("letvisuals=presented_visuals{fallback};"))
+        }
+        "presented_authority" => src.contains(&format!(
+            "letvisuals=presented_authority{mapping}{fallback};"
+        )),
+        _ => false,
+    };
+    retained_first
+        && src.contains("apply_bell_invert(&mutframe,visuals.invert);")
+        && src.contains("ifletSome(overlay)=visuals.overlay{")
+        && ![
+            "letlevel_up_glow=",
+            "letlevel_up_style=",
+            "ws.overlay_open()",
+            "ws.bell_flash",
+            "ws.drag_hover",
+        ]
+        .iter()
+        .any(|needle| src.contains(*needle))
+}
+
+#[test]
+fn snapshot_and_image_resolve_retained_or_shared_visuals_without_a_second_policy() {
+    for (path, start, end, authority) in [
+        (
+            "snapshot",
+            "pub(crate) fn snapshot(&mut self)",
+            "pub(crate) fn submit_encode_job(",
+            "presented_visuals",
+        ),
+        (
+            "image",
+            "pub(crate) fn render_image(&mut self, req: ImageReq)",
+            "pub(crate) fn read_native_chrome",
+            "presented_authority",
+        ),
+    ] {
+        let src = normalized_section("src/app_introspect.rs", start, end);
         assert!(
-            n >= 2,
-            "expected the {what} overlay_open gate in BOTH capture paths of \
-             app_introspect.rs (snapshot + render_image), found {n} of `{needle}`"
+            capture_uses_shared_visual_policy(&src, authority),
+            "{path} must retain presented visuals when available, otherwise resolve \
+             host_visual_state once and consume its invert/overlay without a local policy"
+        );
+
+        // These mutations replay the historical capture-policy divergence and
+        // the opposite failure (capturing a default instead of the live rim).
+        // Each path is checked independently, so the other path cannot mask it.
+        let compact = src.split_whitespace().collect::<String>();
+        for (mutation, replacement) in [
+            (
+                "self.host_visual_state(front,Instant::now())",
+                "HostVisualState::default()",
+            ),
+            (
+                "ifletSome(overlay)=visuals.overlay{",
+                "if!ws.overlay_open()&&letSome(overlay)=visuals.overlay{",
+            ),
+            (
+                "apply_bell_invert(&mutframe,visuals.invert);",
+                "apply_bell_invert(&mutframe,ws.bell_flash.is_active(Instant::now()));",
+            ),
+        ] {
+            assert!(
+                !capture_uses_shared_visual_policy(
+                    &compact.replace(mutation, replacement),
+                    authority,
+                ),
+                "{path} gate accepted policy-divergence mutation `{replacement}`"
+            );
+        }
+        assert!(
+            !capture_uses_shared_visual_policy(
+                &compact.replace(&format!("letvisuals={authority}"), "letvisuals=None"),
+                authority,
+            ),
+            "{path} gate accepted dropping retained visual authority"
         );
     }
-    // No capture path may invert unconditionally (the pre-audit `image` policy).
-    assert!(
-        !src.contains("apply_bell_invert(&mut frame, ws.bell_flash.is_active(Instant::now()));"),
-        "a capture path applies the bell invert without the overlay_open gate"
-    );
 }
 
 /// API-closure guard for the two deliberately different pixel verbs.

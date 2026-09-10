@@ -3119,6 +3119,35 @@ pub(crate) fn cmd_appstatus(proxy: &EventLoopProxy<Wake>) -> String {
     }
 }
 
+/// `appnotice <toolchain|update> <text>` -> `OK posted`: a text row on the named
+/// pull-down lane, from OUTSIDE the process. The write face of the STATUS SURFACE
+/// (`appstatus` is the read face): an `aterm pkg install claude` run in a terminal
+/// has no GUI child to stream markers through, so this is how it says what it did
+/// on the same rows the GUI's own passes use. The text is bounded and sanitized for
+/// cells on the main thread like every other row; the lane word is checked HERE so
+/// a bad lane is a usage error and never a wake.
+pub(crate) fn cmd_appnotice(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    const USAGE: &str = "ERR usage: appnotice <toolchain|update> <text>\n";
+    /// Longer than any marker body atpkg prints; a row is one line of chrome.
+    const MAX_TEXT_BYTES: usize = 512;
+    let t = rest.trim();
+    let Some((lane, text)) = t.split_once(char::is_whitespace) else {
+        return USAGE.to_string();
+    };
+    let text = text.trim();
+    if !matches!(lane, "toolchain" | "update") || text.is_empty() {
+        return USAGE.to_string();
+    }
+    if text.len() > MAX_TEXT_BYTES {
+        return format!("ERR appnotice: text is longer than {MAX_TEXT_BYTES} bytes\n");
+    }
+    let (lane, text) = (lane.to_string(), text.to_string());
+    match control_media::call_main(proxy, |reply| Wake::AppNotice { lane, text, reply }) {
+        Ok(Ok(())) => "OK posted\n".to_string(),
+        Ok(Err(error)) | Err(error) => format!("ERR {error}\n"),
+    }
+}
+
 pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
     format!("OK {}\n", t.title())

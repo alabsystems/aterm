@@ -123,6 +123,27 @@ impl AtermTerminal {
             .note_committed_char(&mut self.term, &self.frame_scratch, ch)
     }
 
+    /// Report one accepted input intent: `text`, `delete`, `navigate`,
+    /// `submit`, or `paste`. Call AFTER transport admission, once for an
+    /// entire committed IME run or paste, never for composition preview,
+    /// formatting, or PTY output. Empty or sanitizer-empty input needs no note.
+    ///
+    /// For a scalar already reported through [`Self::note_typed_char`], do
+    /// not also call this method. For an IME bundle use this once instead of
+    /// calling `note_typed_char` per character. This supplies pet attention,
+    /// not cursor-motion credit or evidence of changed text. Text-blind
+    /// [`Self::note_keystroke`] may be called alongside it for cadence.
+    /// Returns `false` for an unknown kind without scheduling a frame.
+    pub fn note_console_input(&mut self, kind: &str) -> bool {
+        let Some(kind) = aterm_effects::kitty_pet::PetInputKind::parse(kind) else {
+            return false;
+        };
+        // WF-1: a stationary-caret edit still needs one presentation.
+        self.note_host_visual_change();
+        self.effects.note_console_input(kind);
+        true
+    }
+
     /// Configure the LUMEN cursor aurora (additive light in the cursor's
     /// wake). Mirrors the native knobs + clamps: `style` ∈
     /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet` (unknown →

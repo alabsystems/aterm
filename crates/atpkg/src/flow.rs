@@ -1051,7 +1051,7 @@ fn install_inner(
     // error arms below unwind identically. (audit: resolve-failure left-active wedge.)
     // ALab's own tools get their `alab-<tool>` aliases; a vendor extra or a
     // system-satisfiable member does not (`activate.rs` module doc).
-    let aliases = Aliases::for_program(index.program(program));
+    let aliases = Aliases::for_program(program, index.program(program));
     let staged = Staged {
         build: pinned,
         build_dir: build_dir.clone(),
@@ -2464,7 +2464,7 @@ pub fn rollback(
         // ALab program keeps its aliases across the rollback, a vendor extra or a
         // system-satisfiable member grows none — whatever a hand-made `alab-*` link in
         // bin/ might suggest.
-        aliases: Aliases::for_program(index.program(program)),
+        aliases: Aliases::for_program(program, index.program(program)),
     };
     rollback_member(layout, channel, program, &staged);
     Ok(RollbackReport {
@@ -2808,7 +2808,7 @@ fn stage_member(
         was_live,
         reloc,
         tree_root: artifact.tree_root.clone(),
-        aliases: Aliases::for_program(index.program(program)),
+        aliases: Aliases::for_program(program, index.program(program)),
     })
 }
 

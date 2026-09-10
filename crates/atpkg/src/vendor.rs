@@ -959,7 +959,26 @@ fn first_foreign_on_path(
         if managed_dir {
             match at_managed {
                 AtManaged::Skip => continue,
-                AtManaged::Stop => return None,
+                // Only the managed `bin/` ends the shadow walk unconditionally ("the
+                // managed copy — or its stub — answers from here; everything after
+                // loses"). Every OTHER prefix-owned entry — `reroute/`, which an aterm
+                // session puts FIRST and which carries only `cargo`/`rustc`/… stubs;
+                // `agents/`, first too and carrying only `claude`/`codex`; a store dir
+                // someone put on PATH — is TRANSPARENT unless it actually holds the
+                // name: then the managed copy runs (Stop), else the walk goes on. Before
+                // this (2026-09-10 audit) the reroute dir at PATH[0] made every
+                // `which`/doctor/reconcile run inside a session blind to the foreign
+                // `~/.local/bin/claude` that was what really ran.
+                AtManaged::Stop => {
+                    if is_managed_bin_dir(prefix, &prefix_real, &dir)
+                        || lookup_candidates(&dir, bin)
+                            .iter()
+                            .any(|c| is_executable_file(c))
+                    {
+                        return None;
+                    }
+                    continue;
+                }
             }
         }
         for candidate in lookup_candidates(&dir, bin) {
@@ -981,6 +1000,60 @@ fn first_foreign_on_path(
         }
     }
     None
+}
+
+/// Whether `dir` (as spelled, or as it resolves) IS the managed `<prefix>/bin` — the one
+/// prefix-owned `PATH` entry that ends a shadow walk unconditionally.
+fn is_managed_bin_dir(prefix: &Path, prefix_real: &Path, dir: &Path) -> bool {
+    let bin = prefix.join("bin");
+    let bin_real = prefix_real.join("bin");
+    dir == bin
+        || dir == bin_real
+        || std::fs::canonicalize(dir).is_ok_and(|real| real == bin || real == bin_real)
+}
+
+/// EVERY foreign executable named `bin` on `path_var`, in `PATH` order — the same walk
+/// as [`system_binary_on_path`] (absolute entries only; the managed prefix and any hit
+/// resolving into it skipped; `PATHEXT` on Windows) continued past the first hit, and
+/// de-duplicated by where each hit really lives (a `~/.local/bin/claude` symlinked to
+/// `/opt/homebrew/bin/claude` is one copy, not two). What `which` prints after the
+/// managed line for an agent program as `foreign copies out-ranked: …`, so the user can
+/// see the native install and the brew cask the front-of-PATH shim beat. Empty for a
+/// name the [`ToolName`] gate refuses, or with no `PATH` at all.
+#[must_use]
+pub fn foreign_copies_on_path(prefix: &Path, bin: &str, path_var: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if ToolName::new(bin).is_none() || !bare_file_name(bin) {
+        return out;
+    }
+    let Some(path_var) = path_var else {
+        return out;
+    };
+    let prefix_real = std::fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in std::env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        if under_prefix(prefix, &prefix_real, &dir)
+            || std::fs::canonicalize(&dir)
+                .is_ok_and(|real| under_prefix(prefix, &prefix_real, &real))
+        {
+            continue;
+        }
+        for candidate in lookup_candidates(&dir, bin) {
+            if !is_executable_file(&candidate) {
+                continue;
+            }
+            let real = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            if under_prefix(prefix, &prefix_real, &real) || seen.contains(&real) {
+                continue;
+            }
+            seen.push(real);
+            out.push(candidate);
+        }
+    }
+    out
 }
 
 /// Probe `path_var` (a `PATH` value) for an executable named `bin`, skipping every
@@ -2095,13 +2168,67 @@ mod tests {
             shadowing_binary_on_path(&prefix, "trust", Some(&absent)),
             Some(exe.clone())
         );
-        // A store dir on PATH ahead of bin/ is atpkg's own — it stops the walk too.
+        // A store dir on PATH ahead of bin/ is atpkg's own — holding the name, it stops
+        // the walk too.
         let store_first =
             std::env::join_paths([prefix.join("store/trust/6808/bin"), local.clone()]).unwrap();
         assert_eq!(
             shadowing_binary_on_path(&prefix, "trust", Some(&store_first)),
             None
         );
+        // THE TRANSPARENT MANAGED DIRS (2026-09-10 audit): `reroute/` at PATH[0] — where
+        // every aterm session puts it — carries only the upstream-Rust stubs, so it must
+        // NOT hide a foreign `trust` behind it; the walk goes on and reports the shadow.
+        let reroute = prefix.join("reroute");
+        lay_exe(&reroute, "cargo");
+        let reroute_first =
+            std::env::join_paths([reroute.clone(), local.clone(), prefix.join("bin")]).unwrap();
+        assert_eq!(
+            shadowing_binary_on_path(&prefix, "trust", Some(&reroute_first)),
+            Some(exe.clone()),
+            "the reroute dir is transparent for a name it does not carry"
+        );
+        // `agents/` at PATH[0] carrying the name IS the managed copy running: nothing
+        // after it shadows (this is what makes the managed claude win) — and for a name
+        // it does not carry it is transparent like the reroute dir.
+        let agents = prefix.join("agents");
+        lay_exe(&agents, "claude");
+        lay_exe(&prefix.join("store/claude/2026091001/bin"), "claude");
+        let foreign_claude = lay_exe(&local, "claude");
+        let agents_first =
+            std::env::join_paths([agents.clone(), local.clone(), prefix.join("bin")]).unwrap();
+        assert_eq!(
+            shadowing_binary_on_path(&prefix, "claude", Some(&agents_first)),
+            None,
+            "the agents twin at PATH[0] is the managed copy running"
+        );
+        assert_eq!(
+            shadowing_binary_on_path(&prefix, "trust", Some(&agents_first)),
+            Some(exe.clone()),
+            "and transparent for every other name"
+        );
+        // The out-ranked list: every foreign copy, in PATH order, the managed dirs and
+        // store-resolving links skipped, duplicates by real location folded.
+        let other = root.join("other-bin");
+        let other_claude = lay_exe(&other, "claude");
+        let dup = root.join("dup-bin");
+        std::fs::create_dir_all(&dup).unwrap();
+        std::os::unix::fs::symlink(&other_claude, dup.join("claude")).unwrap();
+        let wide = std::env::join_paths([
+            agents.clone(),
+            local.clone(),
+            other.clone(),
+            dup.clone(),
+            prefix.join("bin"),
+        ])
+        .unwrap();
+        assert_eq!(
+            foreign_copies_on_path(&prefix, "claude", Some(&wide)),
+            vec![foreign_claude.clone(), other_claude.clone()]
+        );
+        assert!(foreign_copies_on_path(&prefix, "trust-mc", Some(&wide)).is_empty());
+        assert!(foreign_copies_on_path(&prefix, "claude", None).is_empty());
+        assert!(foreign_copies_on_path(&prefix, "../claude", Some(&wide)).is_empty());
         // A symlink into the store is not a shadow.
         let link_dir = root.join("home-bin");
         std::fs::create_dir_all(&link_dir).unwrap();

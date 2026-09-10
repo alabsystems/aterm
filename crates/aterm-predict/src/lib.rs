@@ -687,6 +687,25 @@ impl Predictor {
         self.preds.is_empty()
     }
 
+    /// Half-open `(row_start, col_start, row_end, col_end)` hull of pending
+    /// single-cell guesses. A presentation consumer can reserve their space
+    /// without calling `overlay`, which expires guesses and changes state.
+    /// Includes currently unshown guesses because reconciliation later in the
+    /// same frame can admit them. Empty after the ordinary expiry/reset path.
+    #[must_use]
+    pub fn pending_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        self.preds
+            .iter()
+            .map(|p| {
+                let row = usize::from(p.row);
+                let col = usize::from(p.col);
+                (row, col, row + 1, col + 1)
+            })
+            .reduce(|(r0, c0, r1, c1), (s0, d0, s1, d1)| {
+                (r0.min(s0), c0.min(d0), r1.max(s1), c1.max(d1))
+            })
+    }
+
     /// Whether predictions are actually being DISPLAYED (not merely tracked) — the
     /// render early-out consults this instead of `is_active` so Adaptive on a fast
     /// local link (where nothing shows) does not force a redundant repaint per
@@ -885,6 +904,23 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn pending_bounds_reserves_wrapped_guesses_without_consuming_them() {
+        let mut predictor = Predictor::new(PredictMode::Always);
+        let now = t0();
+        assert_eq!(predictor.pending_bounds(), None);
+        for ch in ['a', 'b', 'c'] {
+            assert!(predictor.predict_char_in_grid(ch, (2, 9), (10, 10), now));
+        }
+        let deadline = predictor.next_deadline();
+        assert_eq!(predictor.pending_bounds(), Some((2, 0, 4, 10)));
+        assert_eq!(predictor.pending_bounds(), Some((2, 0, 4, 10)));
+        assert_eq!(predictor.preds.len(), 3);
+        assert_eq!(predictor.next_deadline(), deadline);
+        predictor.reset();
+        assert_eq!(predictor.pending_bounds(), None);
     }
 
     /// One complete type→echo turn on row 0: arm `ch` at `col` at `at`, then confirm it

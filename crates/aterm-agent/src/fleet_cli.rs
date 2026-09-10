@@ -51,10 +51,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             federate();
             ExitCode::SUCCESS
         }
-        Some("exec") => {
-            dispatch();
-            ExitCode::SUCCESS
-        }
+        Some("exec") => dispatch(),
         Some(
             command @ ("status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack"
             | "reconcile" | "clear-fault" | "propose"),
@@ -74,6 +71,8 @@ fn usage(code: u8) -> ExitCode {
          \x20                        as NDJSON, addressed by astream Subject /fleet/<pid>/events/<sid>\n\
          \x20 aterm-fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
          \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
+         \x20                        retain stdout/stderr and exit_code; exit 1 if any command fails\n\
+         \x20                        stdin failure emits batch_error with input_line and dispatched count\n\
          \x20 aterm-fleet status     show the embedded operator and managed allowlist\n\
          \x20 aterm-fleet inspect <event>\n\
          \x20 aterm-fleet manage <sid> | unmanage <sid>\n\
@@ -561,13 +560,58 @@ fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::SyncSender<Str
 }
 
 /// EXEC: dispatch command lines from stdin (`@<sid> <verb> [args…]`) to the fleet.
-fn dispatch() {
+fn dispatch() -> ExitCode {
     let ctl = ctl_bin();
     eprintln!("aterm-fleet: dispatching commands from stdin (`@<sid> <verb> [args...]` per line)");
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let mut w = stdout.lock();
-    for line in stdin.lock().lines().map_while(Result::ok) {
+    match dispatch_lines(stdin.lock(), &mut stdout.lock(), |argv| {
+        Command::new(&ctl).args(argv).output()
+    }) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(error) => {
+            eprintln!("aterm-fleet: dispatch I/O failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Keep processing after a child failure so every submitted command receives its
+/// own result. The aggregate verdict also covers input/output errors, which must
+/// never turn a truncated batch into an apparently successful one.
+fn dispatch_lines(
+    reader: impl BufRead,
+    writer: &mut impl Write,
+    mut run: impl FnMut(&[String]) -> io::Result<std::process::Output>,
+) -> io::Result<bool> {
+    let mut all_ok = true;
+    // These report input consumption, never whether a target performed an
+    // action. `dispatched` includes attempts whose child failed to launch.
+    let mut dispatched = 0usize;
+    for (index, line) in reader.lines().enumerate() {
+        let input_line = index.saturating_add(1);
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                let message = format!("input read failed: {error}");
+                let record = batch_error_record(input_line, dispatched, &message);
+                if let Err(output_error) = write_dispatch_record(writer, &record) {
+                    return Err(dispatch_io_error(
+                        &format!("output write failed while reporting {message}"),
+                        input_line,
+                        dispatched,
+                        output_error,
+                    ));
+                }
+                return Err(dispatch_io_error(
+                    "input read failed",
+                    input_line,
+                    dispatched,
+                    error,
+                ));
+            }
+        };
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -577,22 +621,49 @@ fn dispatch() {
         // as ONE argument, so a `turn`/`send` payload's internal whitespace and quoting
         // survive intact (see `dispatch_argv`) instead of collapsing.
         let (sid, argv) = dispatch_argv(line);
-        let rec = match Command::new(&ctl).args(&argv).output() {
+        dispatched = dispatched.saturating_add(1);
+        let rec = match run(&argv) {
             Ok(o) => {
-                let stream = if o.status.success() {
-                    &o.stdout
-                } else {
-                    &o.stderr
-                };
-                result_record(&sid, o.status.success(), &String::from_utf8_lossy(stream))
+                all_ok &= o.status.success();
+                result_record(
+                    &sid,
+                    o.status.success(),
+                    o.status.code(),
+                    &String::from_utf8_lossy(&o.stdout),
+                    &String::from_utf8_lossy(&o.stderr),
+                )
             }
-            Err(e) => result_record(&sid, false, &format!("dispatch failed: {e}")),
+            Err(e) => {
+                all_ok = false;
+                result_record(&sid, false, None, "", &format!("dispatch failed: {e}"))
+            }
         };
-        if w.write_all(rec.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
-            break;
-        }
-        let _ = w.flush();
+        // The command may already have acted when its result cannot be
+        // written. Do not attempt another stdout record or replay the command;
+        // return enough context for the caller's stderr diagnostic instead.
+        write_dispatch_record(writer, &rec).map_err(|error| {
+            dispatch_io_error("output write failed", input_line, dispatched, error)
+        })?;
     }
+    Ok(all_ok)
+}
+
+fn write_dispatch_record(writer: &mut impl Write, record: &str) -> io::Result<()> {
+    writer.write_all(record.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn dispatch_io_error(
+    stage: &str,
+    input_line: usize,
+    dispatched: usize,
+    error: io::Error,
+) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!("{stage} (input_line={input_line} dispatched={dispatched}): {error}"),
+    )
 }
 
 /// Parse one dispatch line into `(sid, argv)` for `aterm-ctl`, MIRRORING the server's
@@ -647,13 +718,34 @@ fn event_record(pid: &str, sid: &str, body: &str) -> String {
     )
 }
 
-fn result_record(sid: &str, ok: bool, reply: &str) -> String {
+fn result_record(
+    sid: &str,
+    ok: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    // Preserve the historical convenience field while retaining BOTH streams:
+    // a successful `turn` puts its screen on stdout and its verdict on stderr.
+    // The streams keep trailing newlines; only the legacy reply is trimmed.
+    let reply = if ok { stdout } else { stderr };
+    let exit_code = exit_code.map_or_else(|| "null".to_string(), |code| code.to_string());
     format!(
-        "{{\"subject\":\"/fleet/commands/{}/result\",\"sid\":\"{}\",\"ok\":{},\"reply\":\"{}\"}}",
-        sid,
-        sid,
+        "{{\"subject\":\"/fleet/commands/{}/result\",\"sid\":\"{}\",\"ok\":{},\"reply\":\"{}\",\"exit_code\":{},\"stdout\":\"{}\",\"stderr\":\"{}\"}}",
+        json_escape(sid),
+        json_escape(sid),
         ok,
         json_escape(reply.trim_end()),
+        exit_code,
+        json_escape(stdout),
+        json_escape(stderr),
+    )
+}
+
+fn batch_error_record(input_line: usize, dispatched: usize, error: &str) -> String {
+    format!(
+        "{{\"subject\":\"/fleet/commands/batch_error\",\"kind\":\"batch_error\",\"ok\":false,\"input_line\":{input_line},\"dispatched\":{dispatched},\"error\":\"{}\"}}",
+        json_escape(error),
     )
 }
 
@@ -826,11 +918,179 @@ mod tests {
 
     #[test]
     fn result_record_reports_ok_and_escapes() {
-        let ok = result_record("s-a", true, "OK closed s-a\n");
+        let ok = result_record("s-a", true, Some(0), "OK closed s-a\n", "");
         assert!(ok.contains("\"ok\":true") && ok.contains("OK closed s-a"));
-        let bad = result_record("s-a", false, "ERR \"quoted\"\tvalue");
+        let bad = result_record("s-a", false, Some(1), "", "ERR \"quoted\"\tvalue");
         assert!(bad.contains("\"ok\":false"));
         assert!(bad.contains("\\\"quoted\\\"") && bad.contains("\\t"));
+    }
+
+    #[test]
+    fn result_record_preserves_turn_screen_verdict_and_exit_status() {
+        let record = result_record(
+            "s-a",
+            true,
+            Some(0),
+            "answer\n\n",
+            "aterm-ctl: turn submitted=1 status=settled\n",
+        );
+        assert_eq!(
+            record,
+            concat!(
+                "{\"subject\":\"/fleet/commands/s-a/result\",\"sid\":\"s-a\",",
+                "\"ok\":true,\"reply\":\"answer\",\"exit_code\":0,",
+                "\"stdout\":\"answer\\n\\n\",",
+                "\"stderr\":\"aterm-ctl: turn submitted=1 status=settled\\n\"}"
+            )
+        );
+        let timeout = result_record("s-a", false, Some(124), "partial\n", "timeout\n");
+        assert!(timeout.contains("\"exit_code\":124"));
+        assert!(timeout.contains("\"stdout\":\"partial\\n\""));
+        assert!(timeout.contains("\"reply\":\"timeout\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_reports_child_failure_and_still_processes_the_remaining_batch() {
+        let mut output = Vec::new();
+        let mut called = Vec::new();
+        let all_ok = dispatch_lines(
+            io::Cursor::new("# ignored\n\n@s-a turn first\n@s-b text\n"),
+            &mut output,
+            |argv| {
+                called.push(argv.to_vec());
+                let script = if called.len() == 1 {
+                    "printf 'partial screen\\n'; printf 'turn status=timeout\\n' >&2; exit 124"
+                } else {
+                    "printf 'ready\\n'; printf 'second verdict\\n' >&2"
+                };
+                Command::new("/bin/sh").args(["-c", script]).output()
+            },
+        )
+        .unwrap();
+        assert!(!all_ok, "a failed child makes the whole batch fail");
+        assert_eq!(
+            called.len(),
+            2,
+            "a failed child must not discard later commands"
+        );
+        assert_eq!(called[0], ["@s-a", "turn", "first"]);
+        assert_eq!(called[1], ["@s-b", "text"]);
+        let records = String::from_utf8(output).unwrap();
+        let records: Vec<_> = records.lines().collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].contains("\"ok\":false"));
+        assert!(records[0].contains("\"exit_code\":124"));
+        assert!(records[0].contains("\"stdout\":\"partial screen\\n\""));
+        assert!(records[1].contains("\"ok\":true"));
+        assert!(records[1].contains("\"exit_code\":0"));
+        assert!(records[1].contains("\"stderr\":\"second verdict\\n\""));
+    }
+
+    #[test]
+    fn dispatch_launch_failure_has_no_fabricated_exit_code() {
+        let mut output = Vec::new();
+        let all_ok = dispatch_lines(io::Cursor::new("@s-a text\n"), &mut output, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing control client",
+            ))
+        })
+        .unwrap();
+        assert!(!all_ok);
+        let record = String::from_utf8(output).unwrap();
+        assert!(record.contains("\"ok\":false"));
+        assert!(record.contains("\"exit_code\":null"));
+        assert!(record.contains("\"stderr\":\"dispatch failed: missing control client\""));
+    }
+
+    #[test]
+    fn dispatch_input_failure_is_not_silently_a_successful_empty_batch() {
+        let mut output = Vec::new();
+        let result = dispatch_lines(io::Cursor::new([0xff, b'\n']), &mut output, |_| {
+            panic!("invalid UTF-8 input must not dispatch a command")
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let record = String::from_utf8(output).unwrap();
+        assert_eq!(record.lines().count(), 1, "one terminal batch error");
+        assert!(record.contains("\"kind\":\"batch_error\""));
+        assert!(record.contains("\"ok\":false"));
+        assert!(record.contains("\"input_line\":1,\"dispatched\":0"));
+        assert!(record.contains("\"error\":\"input read failed:"));
+        let mut output = Vec::new();
+        assert!(
+            dispatch_lines(io::Cursor::new("# only a comment\n"), &mut output, |_| {
+                panic!("comments are not commands")
+            })
+            .unwrap(),
+            "an empty valid batch remains successful"
+        );
+        assert!(output.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_invalid_input_reports_the_executed_prefix_and_stops() {
+        let mut output = Vec::new();
+        let mut calls = 0;
+        let error = dispatch_lines(
+            io::Cursor::new(b"# comment\n\n@s-a text\n\xff\n@s-b text\n"),
+            &mut output,
+            |_| {
+                calls += 1;
+                Command::new("/bin/sh")
+                    .args(["-c", "printf 'first command finished\\n'"])
+                    .output()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1, "never execute input after the invalid line");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("input_line=4 dispatched=1"));
+        let records = String::from_utf8(output).unwrap();
+        let records: Vec<_> = records.lines().collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "the result is followed by the batch error"
+        );
+        assert!(records[0].contains("\"ok\":true"));
+        assert!(records[0].contains("first command finished"));
+        assert!(records[1].contains("\"subject\":\"/fleet/commands/batch_error\""));
+        assert!(records[1].contains("\"kind\":\"batch_error\""));
+        assert!(records[1].contains("\"input_line\":4,\"dispatched\":1"));
+    }
+
+    #[test]
+    fn dispatch_broken_output_reports_possible_effects_without_retrying() {
+        struct BrokenWriter {
+            writes: usize,
+        }
+        impl Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed receiver"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("a failed write cannot reach flush")
+            }
+        }
+        let mut writer = BrokenWriter { writes: 0 };
+        let mut calls = 0;
+        let error = dispatch_lines(
+            io::Cursor::new("# comment\n@s-a text\n@s-b text\n"),
+            &mut writer,
+            |_| {
+                calls += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing client"))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1, "a failed result write stops further dispatch");
+        assert_eq!(writer.writes, 1, "never retry on a broken output stream");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("output write failed"));
+        assert!(error.to_string().contains("input_line=2 dispatched=1"));
     }
 
     #[test]

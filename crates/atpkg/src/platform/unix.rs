@@ -223,6 +223,66 @@ pub fn spotlight_indexing_enabled(path: &Path) -> Option<bool> {
     }
 }
 
+/// The `defaults(1)` domain of macOS Universal Control, per-host (`-currentHost`).
+pub const UNIVERSAL_CONTROL_DOMAIN: &str = "com.apple.universalcontrol";
+/// The two keys that switch it off: the feature, and the screen-edge hand-off.
+pub const UNIVERSAL_CONTROL_KEYS: [&str; 2] = ["Disable", "DisableMagicEdges"];
+
+/// Universal Control's per-host switches, as `defaults -currentHost read` answers:
+/// `[Disable, DisableMagicEdges]`, each `Some(true)` when set to a true value,
+/// `Some(false)` when set false, `None` when the key is absent (the OS default —
+/// `defaults` exits 1 with "does not exist") or could not be asked.
+///
+/// READ-ONLY. `/usr/bin/defaults` is named absolutely, never through `PATH`, like the
+/// Spotlight probes above. Non-macOS: `[None, None]`.
+#[must_use]
+pub fn universal_control_state() -> [Option<bool>; 2] {
+    #[cfg(target_os = "macos")]
+    {
+        let read = |key: &str| {
+            let mut cmd = Command::new("/usr/bin/defaults");
+            cmd.arg("-currentHost")
+                .arg("read")
+                .arg(UNIVERSAL_CONTROL_DOMAIN)
+                .arg(key);
+            bounded_stdout(&mut cmd).and_then(|out| crate::machine::parse_defaults_bool(&out))
+        };
+        [
+            read(UNIVERSAL_CONTROL_KEYS[0]),
+            read(UNIVERSAL_CONTROL_KEYS[1]),
+        ]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [None, None]
+    }
+}
+
+/// Write both Universal Control switches true for the current host (`defaults
+/// -currentHost write com.apple.universalcontrol <key> -bool true`). `true` iff both
+/// writes exited 0. No sudo: the domain is the user's. The revert is
+/// [`crate::machine::UNIVERSAL_CONTROL_REVERT`]. Non-macOS: `false`, nothing run.
+#[must_use]
+pub fn universal_control_disable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        UNIVERSAL_CONTROL_KEYS.iter().all(|key| {
+            let mut cmd = Command::new("/usr/bin/defaults");
+            cmd.arg("-currentHost")
+                .arg("write")
+                .arg(UNIVERSAL_CONTROL_DOMAIN)
+                .arg(key)
+                .arg("-bool")
+                .arg("true");
+            bounded_stdout(&mut cmd).is_some()
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// The mount point of the volume holding `path` (`statfs(2)`'s `f_mntonname`), or `None`
 /// when `statfs` failed — a path that does not exist, or a name too long to make a
 /// `CString`. The one caller ([`spotlight_indexing_enabled`]) falls back to `path` itself,

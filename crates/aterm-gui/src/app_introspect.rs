@@ -22,9 +22,8 @@ use crate::WindowId;
 #[cfg(test)]
 use crate::app_render::sync_cursor_effect_scroll;
 use crate::app_render::{
-    OverlayGlow, apply_bell_invert, apply_drop_overlay, apply_host_chrome_at, apply_overlay_at,
-    composite_tray_quad_at, prepare_resident_pet_tick, sync_cursor_effect_coordinate_space,
-    tray_quad_below_y,
+    OverlayGlow, apply_bell_invert, apply_host_chrome_at, apply_overlay_at, composite_tray_quad_at,
+    prepare_resident_pet_tick, sync_cursor_effect_coordinate_space, tray_quad_below_y,
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
@@ -4510,9 +4509,13 @@ impl App {
             Some(ws) => ws.cols as usize,
             None => return,
         };
-        let presented_visuals = presented
-            .as_ref()
-            .map(|presented| (presented.invert, presented.overlay));
+        let presented_visuals =
+            presented
+                .as_ref()
+                .map(|presented| crate::app_render::HostVisualState {
+                    invert: presented.invert,
+                    overlay: presented.overlay,
+                });
         let mut capture_input = match presented {
             Some(presented) => presented.input,
             None => self.windows[&front].input_scratch.clone(),
@@ -4548,22 +4551,10 @@ impl App {
             });
             return;
         }
-        // Accent for the drop-target highlight / level-up glow, read before the disjoint
-        // borrow. The level-up glow's breathing alphas are sampled here too, matching
-        // application-present transient state.
-        let accent = self.theme.cursor;
-        let level_up_glow = self
-            .level_up
-            .as_ref()
-            .map(|l| (l.wash_alpha(Instant::now()), l.border_alpha(Instant::now())));
-        // The surge's colour and rim thickness at the same instant — the two
-        // parameters the glow adds over the drop target's fixed ones.
-        let level_up_style = self.level_up.as_ref().map(|l| {
-            (
-                l.accent(accent, Instant::now()),
-                l.border_scale_q4(Instant::now()),
-            )
-        });
+        // A retained frame owns even an absent overlay. Only an unpresented
+        // capture samples current host policy, once before the disjoint borrow.
+        let visuals =
+            presented_visuals.unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
         let tray_floor_y = self.config_notice_tray_floor_y(front);
         self.bind_window_renderer_state(front);
         // Disjoint borrows: `self.backend` (renderer), the introspection GPU
@@ -4620,21 +4611,11 @@ impl App {
         {
             composite_tray_quad_at(&mut frame.pixels, frame.width, frame.height, 0, 0, quad);
         }
-        // Match application-present visual-bell composition (CPU
-        // `src ^ 0x00ff_ffff`; GPU blit shader) so capture preserves the same
-        // app-owned transient state. Suppress it under any modal overlay, as the
-        // application-present path does. The compositor and scanout remain
-        // outside this comparison.
-        let invert = presented_visuals.map_or_else(
-            || ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),
-            |(invert, _)| invert,
-        );
-        apply_bell_invert(&mut frame, invert);
-        // Match application-present drop-target/LEVEL-UP overlay composition so
-        // capture preserves the same app-owned transient state. Suppressed under
-        // a modal, matching the live `!overlay_open` gate.
-        let retained_overlay = presented_visuals.and_then(|(_, overlay)| overlay);
-        if let Some(overlay) = retained_overlay {
+        // Preserve the retained or shared host visual policy, including the
+        // functional charging rim over modal overlays. This matches app-owned
+        // composition; the compositor and scanout remain outside the comparison.
+        apply_bell_invert(&mut frame, visuals.invert);
+        if let Some(overlay) = visuals.overlay {
             apply_overlay_at(
                 &mut frame.pixels,
                 frame.width,
@@ -4645,28 +4626,6 @@ impl App {
                 frame.height,
                 overlay,
             );
-        } else if presented_visuals.is_none() {
-            if ws.drag_hover && !ws.overlay_open() {
-                apply_drop_overlay(&mut frame.pixels, frame.width, frame.height, accent);
-            } else if !ws.overlay_open()
-                && let Some((wash_a, border_a)) = level_up_glow
-            {
-                apply_overlay_at(
-                    &mut frame.pixels,
-                    frame.width,
-                    frame.height,
-                    0,
-                    0,
-                    frame.width,
-                    frame.height,
-                    OverlayGlow {
-                        accent: level_up_style.map_or(accent, |s| s.0),
-                        wash_a,
-                        border_a,
-                        border_scale_q4: level_up_style.map_or(0, |s| s.1),
-                    },
-                );
-            }
         }
         // `text` was projected before the disjoint renderer borrow. Terminal
         // rows share the accessibility serializer; native rows come from the
@@ -5693,22 +5652,14 @@ impl App {
         // window scratch that a later present/capture reuses.
         let mut capture_input =
             presented_input.unwrap_or_else(|| self.windows[&front].input_scratch.clone());
-        // Accent for the drop-target highlight / level-up glow, read before the disjoint
-        // borrow. The level-up glow's breathing alphas are sampled here too,
-        // matching application-present transient state.
-        let accent = self.theme.cursor;
-        let level_up_glow = self
-            .level_up
-            .as_ref()
-            .map(|l| (l.wash_alpha(Instant::now()), l.border_alpha(Instant::now())));
-        // The surge's colour and rim thickness at the same instant — the two
-        // parameters the glow adds over the drop target's fixed ones.
-        let level_up_style = self.level_up.as_ref().map(|l| {
-            (
-                l.accent(accent, Instant::now()),
-                l.border_scale_q4(Instant::now()),
-            )
-        });
+        // Preserve retained absence as authority; only the unpresented fallback
+        // samples the shared phase-aware host policy before the disjoint borrow.
+        let visuals = presented_authority
+            .map(|presented| crate::app_render::HostVisualState {
+                invert: presented.invert,
+                overlay: presented.overlay,
+            })
+            .unwrap_or_else(|| self.host_visual_state(front, Instant::now()));
         let tray_floor_y = self.config_notice_tray_floor_y(front);
         let theme_fingerprint = presented_authority.map_or_else(
             || self.image_theme_fingerprint(),
@@ -5794,22 +5745,12 @@ impl App {
             let render_ns = render_t0.elapsed().as_nanos() as u64;
             crate::metrics::record_offscreen_raster(render_ns);
         }
-        // I-2: match the on-screen visual-bell invert (see `snapshot`) so the
-        // `image` verb is WYSIWYG even during a bell flash. Suppressed while ANY modal
-        // overlay is open — the SAME `overlay_open()` gate the glass present and the
-        // snapshot path consult, so all three can never disagree (SACRED WYSIWYG).
-        // The boundary is the APPLICATION surface: the compositor and scanout stay
-        // outside this comparison.
+        // Match app-owned visual composition, including the charging rim over
+        // overlays. Exact destinations already contain these passes and must
+        // not receive them twice; compositor/scanout are outside this boundary.
         if !exact_destination {
-            let invert = presented_authority.map_or_else(
-                || ws.bell_flash.is_active(Instant::now()) && !ws.overlay_open(),
-                |presented| presented.invert,
-            );
-            apply_bell_invert(&mut frame, invert);
-            // Match application-present drop-target/LEVEL-UP overlay composition;
-            // both are suppressed under the same modal-overlay predicate.
-            let retained_overlay = presented_authority.and_then(|presented| presented.overlay);
-            if let Some(overlay) = retained_overlay {
+            apply_bell_invert(&mut frame, visuals.invert);
+            if let Some(overlay) = visuals.overlay {
                 apply_overlay_at(
                     &mut frame.pixels,
                     frame.width,
@@ -5820,28 +5761,6 @@ impl App {
                     frame.height,
                     overlay,
                 );
-            } else if presented_authority.is_none() {
-                if ws.drag_hover && !ws.overlay_open() {
-                    apply_drop_overlay(&mut frame.pixels, frame.width, frame.height, accent);
-                } else if !ws.overlay_open()
-                    && let Some((wash_a, border_a)) = level_up_glow
-                {
-                    apply_overlay_at(
-                        &mut frame.pixels,
-                        frame.width,
-                        frame.height,
-                        0,
-                        0,
-                        frame.width,
-                        frame.height,
-                        OverlayGlow {
-                            accent: level_up_style.map_or(accent, |s| s.0),
-                            wash_a,
-                            border_a,
-                            border_scale_q4: level_up_style.map_or(0, |s| s.1),
-                        },
-                    );
-                }
             }
         }
         if want_metadata {
@@ -10613,6 +10532,162 @@ mod encode_worker_tests {
 
     fn confined(dir: &std::path::Path, name: &str) -> control_auth::ConfinedImage {
         control_auth::ConfinedImage::for_test(dir, name)
+    }
+
+    fn visual_capture_pixels(
+        app: &mut App,
+        dir: &std::path::Path,
+        name: &str,
+        presented: Option<PresentedFrameCapture>,
+    ) -> Frame {
+        let (reply, rx) = std::sync::mpsc::channel();
+        let frame_metadata = std::sync::Arc::new(std::sync::OnceLock::new());
+        if let Some(presented) = presented {
+            app.render_native_image(NativeImageRequest {
+                front: crate::WindowId(0),
+                clean: true,
+                presented: Some(presented),
+                request_layout: None,
+                presented_metadata: None,
+                exact_frame: None,
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                target: confined(dir, name),
+                want_bytes: true,
+                want_metadata: false,
+                cancel: crate::control::CaptureCancellation::new(),
+                frame_metadata: &frame_metadata,
+                reply,
+            });
+        } else {
+            app.render_image(crate::control::ImageReq {
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                target: confined(dir, name),
+                clean: true,
+                session: None,
+                want_bytes: true,
+                want_metadata: false,
+                frame_metadata,
+                cancel: crate::control::CaptureCancellation::new(),
+                reply,
+            });
+        }
+        let (_, _, png) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("visual capture worker reply")
+            .expect("visual capture succeeds")
+            .value;
+        let (rgba, width, height) =
+            aterm_render::decode_png_rgba8(&png.expect("capture PNG bytes")).unwrap();
+        let (pixels, remainder) = rgba.as_chunks::<4>();
+        assert!(remainder.is_empty());
+        Frame {
+            width,
+            height,
+            pixels: pixels
+                .iter()
+                .map(|p| (u32::from(p[0]) << 16) | (u32::from(p[1]) << 8) | u32::from(p[2]))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn capture_visual_policy_terminal_fallback_keeps_charging_over_a_palette() {
+        let dir = unique_dir("capture-visual-charging");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.palette_enter();
+        assert!(app.windows[&wid].overlay_open());
+        assert!(app.windows[&wid].os_window.is_none());
+        assert_eq!(app.windows[&wid].capture_present_serial, 0);
+        let baseline = visual_capture_pixels(&mut app, &dir, "baseline.png", None);
+
+        let now = Instant::now();
+        app.level_up = Some(crate::level_up::LevelUp::charging_continued(7, now, 0.0));
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.drag_hover = true;
+        window.bell_flash.ring(now);
+        let visuals = app.host_visual_state(wid, now);
+        assert!(!visuals.invert, "a modal still suppresses the bell");
+        let overlay = visuals.overlay.expect("charging remains admitted");
+        let charged = visual_capture_pixels(&mut app, &dir, "charging.png", None);
+        assert_eq!(
+            (charged.width, charged.height),
+            (baseline.width, baseline.height)
+        );
+        let mut expected = baseline.clone();
+        apply_overlay_at(
+            &mut expected.pixels,
+            expected.width,
+            expected.height,
+            0,
+            0,
+            expected.width,
+            expected.height,
+            overlay,
+        );
+        // The outer corner is outside terminal glyphs and cards, so cursor
+        // timing cannot satisfy this comparison. The old blanket suppression
+        // returned the baseline pixel here and fails the positive control.
+        assert_ne!(expected.pixels[0], baseline.pixels[0]);
+        assert_eq!(charged.pixels[0], expected.pixels[0]);
+
+        app.level_up = Some(crate::level_up::LevelUp::landing(7, Instant::now(), 0.0));
+        assert_eq!(app.host_visual_state(wid, Instant::now()).overlay, None);
+        let landed = visual_capture_pixels(&mut app, &dir, "landing.png", None);
+        assert_eq!(
+            landed.pixels[0], baseline.pixels[0],
+            "landing and drag yield to the modal"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn capture_visual_policy_retained_absence_ignores_a_new_live_glow() {
+        let dir = unique_dir("capture-visual-retained");
+        ensure_private_dir(&dir).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(app.prepare_native_input_scratch(wid));
+        let retained = PresentedFrameCapture {
+            input: app.windows[&wid].input_scratch.clone(),
+            invert: false,
+            overlay: None,
+            serial: 1,
+        };
+        let baseline =
+            visual_capture_pixels(&mut app, &dir, "retained.png", Some(retained.clone()));
+        app.level_up = Some(crate::level_up::LevelUp::charging_continued(
+            8,
+            Instant::now(),
+            0.0,
+        ));
+        let overlay = app
+            .host_visual_state(wid, Instant::now())
+            .overlay
+            .expect("live glow");
+        let captured =
+            visual_capture_pixels(&mut app, &dir, "retained-none.png", Some(retained.clone()));
+        assert_eq!(
+            captured.pixels, baseline.pixels,
+            "retained None is authoritative, not a request to resample"
+        );
+
+        let painted = visual_capture_pixels(
+            &mut app,
+            &dir,
+            "retained-glow.png",
+            Some(PresentedFrameCapture {
+                overlay: Some(overlay),
+                ..retained
+            }),
+        );
+        assert_ne!(
+            painted.pixels[0], baseline.pixels[0],
+            "the retained overlay path really reaches encoded pixels"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The encode worker's contract: a guarded result is transferred only AFTER

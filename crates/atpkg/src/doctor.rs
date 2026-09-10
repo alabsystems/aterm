@@ -12,7 +12,7 @@
 //! the durable [`crate::sig::Floor`].
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::store::Layout;
 
@@ -159,6 +159,149 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
 /// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
 /// + the `[packages]` config account + the token chain's SOURCE label — never the token).
 #[must_use]
+/// What the WORKSPACE the operator is standing in demands of the installed Trust
+/// toolchain, as decided by the installed `targo` itself (`targo locate-project
+/// --workspace` parses the manifest, compiles nothing, and refuses a `[trust]` policy
+/// key it does not know).
+///
+/// This is the check that names the 2026-09-10 failure in one line. The `ty` repo
+/// gained `[trust] compiler_timeout_secs` on 2026-09-09 from a machine building on a
+/// LOCAL Trust seal newer than anything atpkg had published; every atpkg-managed
+/// machine then failed to open the workspace with targo, with an "unknown field"
+/// error that reads like a typo and says nothing about which toolchain is behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspacePolicy {
+    /// The installed targo accepts the workspace's `[trust]` policy.
+    Accepted,
+    /// The installed targo refuses a policy key it does not know: the workspace
+    /// needs a NEWER Trust build than atpkg has published.
+    UnknownField { field: String },
+    /// The probe could not run (no targo in the store, spawn failure); reported, never
+    /// counted as a problem.
+    ProbeFailed { why: String },
+}
+
+/// The workspace probe's result, bound to the directory it was taken in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePolicyProbe {
+    pub workspace: PathBuf,
+    pub policy: WorkspacePolicy,
+}
+
+/// rustup's `trust` channel resolving OUTSIDE the atpkg store: a locally built or
+/// sealed toolchain. Not wrong in itself — a publisher machine builds Trust — but
+/// anything committed against a feature only that toolchain has will not build on an
+/// atpkg-managed machine until the seal is PUBLISHED. Naming it is what lets the
+/// operator see, on the machine that seals, that the seal is still local only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSealProbe {
+    pub link_target: PathBuf,
+    /// `trustc -Vv`'s commit hash (first 10 characters), or "unknown".
+    pub trustc: String,
+}
+
+/// The environment-dependent probes `run` takes and `run_with` only reports, so the
+/// reporting surface stays testable without spawning targo or reading rustup state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Probes {
+    pub workspace: Option<WorkspacePolicyProbe>,
+    pub local_seal: Option<LocalSealProbe>,
+}
+
+/// The publisher-side act that cures an `UnknownField` verdict: publish the newer
+/// Trust coherence group from the seal the workspace was committed against.
+pub const PUBLISH_RUSTC_GROUP: &str = "tools/atpkg-publish-rustc-group.sh";
+
+/// Find the nearest ancestor of `start` (inclusive) whose `Cargo.toml` carries a
+/// `[trust]` table. `None` when no manifest on the way up declares one.
+fn workspace_with_trust_table(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let manifest = d.join("Cargo.toml");
+        if let Ok(text) = std::fs::read_to_string(&manifest)
+            && text.lines().any(|l| l.trim() == "[trust]")
+        {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// The field name out of targo's refusal, e.g. ``unknown field `compiler_timeout_secs`,
+/// expected one of …`` → `compiler_timeout_secs`.
+fn unknown_field_in(stderr: &str) -> Option<String> {
+    let marker = "unknown field `";
+    let start = stderr.find(marker)? + marker.len();
+    let rest = &stderr[start..];
+    let end = rest.find('`')?;
+    let field = &rest[..end];
+    (!field.is_empty()).then(|| field.to_string())
+}
+
+/// Ask the INSTALLED targo whether it accepts the workspace's `[trust]` policy.
+/// `locate-project --workspace` parses the manifest and compiles nothing.
+fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicyProbe> {
+    let workspace = workspace_with_trust_table(cwd)?;
+    let trust_build = crate::ops::active_builds(layout)
+        .into_iter()
+        .find(|(p, _)| p == "trust")
+        .map(|(_, b)| b)?;
+    let targo = layout.build_dir("trust", trust_build).join("bin").join("targo");
+    if !targo.is_file() {
+        return Some(WorkspacePolicyProbe {
+            workspace,
+            policy: WorkspacePolicy::ProbeFailed { why: format!("no targo at {}", targo.display()) },
+        });
+    }
+    let probe = std::process::Command::new(&targo)
+        .args(["locate-project", "--workspace"])
+        .current_dir(&workspace)
+        .env_remove("RUSTFLAGS")
+        .output();
+    let policy = match probe {
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            match unknown_field_in(&stderr) {
+                Some(field) => WorkspacePolicy::UnknownField { field },
+                None if out.status.success() => WorkspacePolicy::Accepted,
+                None => WorkspacePolicy::ProbeFailed {
+                    why: stderr.lines().next().unwrap_or("targo failed").to_string(),
+                },
+            }
+        }
+        Err(e) => WorkspacePolicy::ProbeFailed { why: e.to_string() },
+    };
+    Some(WorkspacePolicyProbe { workspace, policy })
+}
+
+/// Where rustup's `trust` channel points, when that is NOT inside the atpkg store.
+fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealProbe> {
+    let link = home?.join(".rustup").join("toolchains").join("trust");
+    let target = std::fs::read_link(&link).ok()?;
+    let target = if target.is_absolute() { target } else { link.parent()?.join(target) };
+    let canonical_target = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    let canonical_prefix =
+        std::fs::canonicalize(&layout.prefix).unwrap_or_else(|_| layout.prefix.clone());
+    if canonical_target.starts_with(&canonical_prefix) {
+        return None;
+    }
+    let trustc = target.join("bin").join("trustc");
+    let commit = std::process::Command::new(&trustc)
+        .arg("-Vv")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("commit-hash: ")
+                    .map(|c| c.chars().take(10).collect::<String>())
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(LocalSealProbe { link_target: target, trustc: commit })
+}
+
 pub fn run(layout: &Layout, prefix: &str) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
@@ -166,6 +309,12 @@ pub fn run(layout: &Layout, prefix: &str) -> bool {
     // Which source supplies a GitHub token (§5.1 private-repo aid): `$ATPKG_TOKEN`,
     // else aterm-update-core's chain. Only the LABEL is surfaced.
     let (_token, token_source) = crate::cli::resolve_pkg_token(layout);
+    let probes = Probes {
+        workspace: std::env::current_dir()
+            .ok()
+            .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
+        local_seal: probe_local_seal(layout, home.as_deref()),
+    };
     run_with(
         layout,
         home.as_deref(),
@@ -174,6 +323,7 @@ pub fn run(layout: &Layout, prefix: &str) -> bool {
         cfg_account.as_deref(),
         token_source.as_deref(),
         prefix,
+        &probes,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
@@ -193,6 +343,7 @@ pub fn run_with(
     cfg_account: Option<&str>,
     token_source: Option<&str>,
     prefix: &str,
+    probes: &Probes,
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> bool {
@@ -478,6 +629,66 @@ pub fn run_with(
     // builds forever — so this is the surface that makes it visible. A genuine disagreement
     // is STRUCTURAL: whichever view is stale, some tool on PATH is running a build activation
     // does not select. A merely-absent witness is not breakage, so it warns.
+    // (5d) THE WORKSPACE THE OPERATOR IS STANDING IN vs THE INSTALLED TRUST.
+    //
+    // atpkg keeps the toolchain current with what is PUBLISHED; it cannot keep a
+    // repository from depending on a Trust build that was never published. When that
+    // happens the symptom is targo refusing the workspace with an "unknown field"
+    // error that looks like a manifest typo. The installed targo decides the verdict
+    // here, and the line says what is actually behind: the toolchain, on the
+    // publisher's side, not this machine.
+    let mut next_publish = false;
+    if let Some(ws) = &probes.workspace {
+        let trust_build = active
+            .iter()
+            .find(|(p, _)| p.as_str() == "trust")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        match &ws.policy {
+            WorkspacePolicy::Accepted => {
+                let _ = writeln!(out,
+                    "{p}: ok — workspace {} declares a [trust] policy the installed trust \
+                     build {trust_build} accepts",
+                    ws.workspace.display()
+                );
+            }
+            WorkspacePolicy::UnknownField { field } => {
+                fails += 1;
+                next_publish = true;
+                let _ = writeln!(err,
+                    "{p}: FAIL — workspace {} declares a [trust] policy key the installed \
+                     trust build {trust_build} does not know: `{field}`. Whoever committed \
+                     it built on a NEWER Trust seal that atpkg has not published, so this \
+                     workspace does not open with targo on any atpkg-managed machine. Cure \
+                     (a rostered publisher, on the machine holding that seal): \
+                     {PUBLISH_RUSTC_GROUP}; then here: aterm pkg update trust",
+                    ws.workspace.display()
+                );
+            }
+            WorkspacePolicy::ProbeFailed { why } => {
+                let _ = writeln!(out,
+                    "{p}: warn — could not ask the installed targo about workspace {} \
+                     ({why})",
+                    ws.workspace.display()
+                );
+            }
+        }
+    }
+
+    // (5e) A LOCAL SEAL BEHIND rustup's `trust` CHANNEL. Correct on a publisher
+    // machine; the warning exists so that machine can see the seal is still local
+    // only — the other half of (5d), seen from the side that causes it.
+    if let Some(seal) = &probes.local_seal {
+        let _ = writeln!(out,
+            "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain, not the \
+             atpkg store: {} (trustc {}). Commits made against features only it has \
+             will not build on atpkg-managed machines until that seal is published \
+             ({PUBLISH_RUSTC_GROUP})",
+            seal.link_target.display(),
+            seal.trustc
+        );
+    }
+
     let live = crate::gc::live_builds(layout);
     // A shim/channel divergence's repair is a re-run of `update` — remembered for the
     // verdict tail's single `next` act.
@@ -653,9 +864,13 @@ pub fn run_with(
                 out,
                 "{p}: warn — {} of {} cargo target dir(s) under {} are indexed by Spotlight \
                  ({}) — `mds` grinding build output was one of the two amplifiers behind the \
-                 2026-09-01 WindowServer watchdog kill; `aterm pkg noindex` lists them, \
-                 `aterm pkg noindex migrate <dir>` excludes one, `aterm pkg noindex verify \
-                 <dir>` measures it",
+                 2026-09-01 WindowServer watchdog kill; the next update pass migrates the \
+                 ones beside a Cargo.toml — a git checkout keeps a `target` symlink and its \
+                 .cargo/config.toml untouched, the new name (and the link, when the ignore \
+                 entry is directory-only) excluded via .git/info/exclude ([machine] \
+                 spotlight_noindex, default on) — now: \
+                 `aterm pkg noindex apply --all`; `aterm pkg noindex` lists them, `aterm pkg \
+                 noindex verify <dir>` measures one",
                 exposed.len(),
                 found.targets.len(),
                 home.display(),
@@ -672,29 +887,60 @@ pub fn run_with(
         }
     }
 
+    // (7b) UNIVERSAL CONTROL (macOS): the other machine setting the pass applies per
+    // this report (R5). Read through `defaults -currentHost`, never written here; the
+    // line carries the revert when it is off and the opt-out when it is about to be.
+    if cfg!(target_os = "macos") {
+        let state = crate::machine::universal_control_state(&crate::machine::SystemDefaults);
+        let policy = crate::config::cached_machine().universal_control();
+        let _ = writeln!(out, "{p}: {}", state.doctor_line(policy));
+    }
+
     // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
+    // The clock is `last_success_at` — stamped ONLY when a pass resolved the index and
+    // applied it clean — never `updated_at`, which every writer moves: a machine whose
+    // passes all failed for a month used to read "0 day(s) since the last successful
+    // update" here off the failure row's own timestamp (2026-09-10 audit).
     if let Some(status) = crate::status::read(layout) {
-        match index_age_days(&status.updated_at, now) {
-            Some(days) if days > 30 => {
-                let _ = writeln!(
-                    out,
-                    "{p}: warn — {days} day(s) since the last successful update ({}) — publishing \
-                 looks frozen or this machine has been offline",
-                    status.updated_at
-                );
-            }
-            Some(days) => {
-                let _ = writeln!(
-                    out,
-                    "{p}: ok — {days} day(s) since the last successful update"
-                );
-            }
-            None => {
-                let _ = writeln!(out, "{p}: warn — could not parse the last-update time");
+        if status.last_success_at.trim().is_empty() {
+            let _ = writeln!(
+                out,
+                "{p}: warn — no successful update pass recorded yet (status last written {}) — \
+                 packages cannot be updated until the first pass completes (run: aterm pkg \
+                 update)",
+                if status.updated_at.is_empty() {
+                    "never"
+                } else {
+                    status.updated_at.as_str()
+                }
+            );
+        } else {
+            match index_age_days(&status.last_success_at, now) {
+                Some(days) if days > 30 => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — {days} day(s) since the last successful update ({}) — \
+                         publishing looks frozen or this machine has been offline",
+                        status.last_success_at
+                    );
+                }
+                Some(days) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: ok — {days} day(s) since the last successful update"
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "{p}: warn — could not parse the last-success time");
+                }
             }
         }
     } else {
-        let _ = writeln!(out, "{p}: warn — no status.toml yet (no update has run)");
+        let _ = writeln!(
+            out,
+            "{p}: warn — no status.toml yet (no update has run) — packages cannot be updated \
+             until the first pass completes (run: aterm pkg update)"
+        );
     }
     // The build floor is printed WITH the generation that recorded it, because that pair
     // is the actual gate: a floor stamped with an older generation is re-based by the next
@@ -726,6 +972,22 @@ pub fn run_with(
             out,
             "{p}: warn — rustup not found (self-contained bundles are portable)"
         );
+    } else if let Some(rustup_home) =
+        crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)
+        && layout.program_current("trust").join("bin").is_dir()
+        && let Some(line) = seam_line(
+            &crate::seam::status(layout, &rustup_home, crate::seam::DEFAULT_SEAM),
+            layout,
+        )
+    {
+        // THE ENTRY EXISTS AND IS NOT OURS. `rustup which cargo --toolchain trust`
+        // succeeds on m21 — the link resolves — so the check below called a
+        // `~/.rustup/toolchains/trust -> $HOME/trust/build/host/stage2` (a from-source
+        // dev build, Jul 19) healthy for seven weeks while the managed 6808 sat
+        // unused by every `cargo +trust` (2026-09-10 audit). Doctor SAYS it and names
+        // the one command; it re-points nothing — an entry under `~/.rustup` that
+        // aterm did not lay is the user's, by the seam module's own rule.
+        let _ = writeln!(out, "{p}: {line}");
     } else if layout.program_current("trust").join("bin").is_dir()
         && !rustup_trust_channel_resolves()
     {
@@ -1049,6 +1311,11 @@ pub fn run_with(
         // line here rather than a second, vaguer act.
         let next = if toolset_problem && installed.is_empty() {
             Some(String::from("aterm pkg install --default-set"))
+        } else if next_publish {
+            Some(format!(
+                "publish the newer Trust coherence group ({PUBLISH_RUSTC_GROUP} on a \
+                 rostered machine holding the seal), then aterm pkg update trust"
+            ))
         } else if (!recorded_problems.is_empty() && !declined) || next_update_divergence {
             Some(String::from("aterm pkg update"))
         } else {
@@ -1105,6 +1372,51 @@ fn index_age_days(updated_at: &str, now: i64) -> Option<i64> {
     Some((now - then) / 86_400)
 }
 
+/// The doctor line for a rustup `trust` entry that is NOT the managed seam, or `None`
+/// when the entry is absent or already ours (the callers' other checks speak then).
+/// Pure over the probe result, so the words are testable without a rustup.
+///
+/// A foreign LINK names the exact re-point (one `ln -sfn`, then `aterm pkg repair` to
+/// record it); a foreign DIRECTORY/FILE cannot be re-pointed over — `ln -sfn` onto a
+/// directory would lay the link INSIDE it — so that shape gets [`crate::seam::DETACH_FIX`].
+/// A link into the store at a NUMBERED build is a note, not a warn: `repair` re-points
+/// it to `current` by itself.
+fn seam_line(st: &crate::seam::SeamStatus, layout: &Layout) -> Option<String> {
+    use crate::seam::Entry;
+    let target = crate::seam::seam_target(layout);
+    match &st.entry {
+        Ok(Entry::Link(raw)) if !st.in_prefix => Some(format!(
+            "warn — rustup `trust` -> {} is NOT the managed store ({}): `cargo +trust`, \
+             `rustup run trust` and every repo pinning `channel = \"trust\"` build with THAT \
+             copy, not the one `aterm pkg update` keeps current. re-point it (doctor never \
+             will): ln -sfn '{}' '{}' — then `aterm pkg repair` records the seam; revert by \
+             re-linking the old target the same way",
+            raw.display(),
+            target.display(),
+            target.display(),
+            st.path.display()
+        )),
+        Ok(Entry::Link(_)) if !st.targets_current => Some(format!(
+            "note — rustup `trust` -> {} is a numbered build inside the store, not \
+             `current`; `aterm pkg repair` re-points it so updates move the channel",
+            st.target.as_deref().unwrap_or(&st.path).display()
+        )),
+        Ok(entry @ (Entry::Dir | Entry::File | Entry::Other)) => Some(format!(
+            "warn — rustup `trust` at {} is {} — not a link into the managed store ({}), so \
+             `cargo +trust` builds with whatever that holds; {}",
+            st.path.display(),
+            entry.describe(layout),
+            target.display(),
+            crate::seam::DETACH_FIX
+        )),
+        Ok(Entry::Link(_) | Entry::Absent) => None,
+        Err(e) => Some(format!(
+            "warn — rustup `trust` at {} could not be inspected ({e})",
+            st.path.display()
+        )),
+    }
+}
+
 /// Whether `rustup` is on PATH and answers `--version`.
 fn rustup_present() -> bool {
     output_bounded(std::process::Command::new("rustup").arg("--version"))
@@ -1148,7 +1460,7 @@ const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// that it never fails because a probe failed — the store integrity checks are
 /// the verdict. A timed-out probe reads `unknown`, exactly like a binary that
 /// will not run.
-fn output_bounded(cmd: &mut std::process::Command) -> Option<std::process::Output> {
+pub(crate) fn output_bounded(cmd: &mut std::process::Command) -> Option<std::process::Output> {
     use std::io::Read as _;
     use std::process::Stdio;
     let mut child = cmd
@@ -1235,20 +1547,45 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
     let Some(support) = layout.prefix.parent() else {
         return;
     };
-    let updates = support.join("Updates");
+    report_aterm_posture_at(&support.join("Updates"), running_bundle_build(), p, out);
+}
+
+/// [`report_aterm_posture`] over an explicit updater ledger dir and the SEALED build
+/// number of the bundle this process runs from (`None` outside a bundle), so the arms
+/// are testable against a fixture.
+///
+/// "Installed on disk" is the NEWER of the updater's receipt and the bundle's own
+/// `CFBundleVersion`: a bundle placed by hand (`install.sh`, a DMG drag) is newer than
+/// any receipt the updater wrote, and reading the receipt alone made doctor say
+/// "running build X but build Y is installed on disk" with Y OLDER than X — on this
+/// very machine, for a month (2026-09-10 audit). The note fires only when what is on
+/// disk is strictly newer than what runs; an equal or older receipt is the quiet line.
+fn report_aterm_posture_at(
+    updates: &Path,
+    bundle_build: Option<u64>,
+    p: &str,
+    out: &mut dyn std::io::Write,
+) {
     let field = |file: &str, key: &str| -> Option<String> {
         let text = std::fs::read_to_string(updates.join(file)).ok()?;
         text.lines()
             .find_map(|l| l.split_once('=').filter(|(k, _)| k.trim() == key))
             .map(|(_, v)| v.trim().trim_matches('"').to_string())
     };
-    let Some(installed) = field("installed.toml", "build_number") else {
+    let Some(receipt) = field("installed.toml", "build_number") else {
         return;
     };
-    match (
-        field("status.toml", "current_build"),
-        field("status.toml", "staged_build"),
-    ) {
+    let installed = match (receipt.parse::<u64>().ok(), bundle_build) {
+        (Some(r), Some(b)) => r.max(b).to_string(),
+        (None, Some(b)) => b.to_string(),
+        _ => receipt,
+    };
+    let current = field("status.toml", "current_build");
+    let newer_on_disk = match (current.as_deref(), installed.parse::<u64>().ok()) {
+        (Some(c), Some(i)) => c.parse::<u64>().is_ok_and(|c| i > c),
+        _ => false,
+    };
+    match (current, field("status.toml", "staged_build")) {
         (Some(current), Some(staged)) if current != staged => {
             // The staged build is applied IN-SESSION by the app's own overlap handoff
             // (automatic at the first quiet moment — forced within ~2 min — by default, one
@@ -1262,7 +1599,7 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
                  `aterm ctl update apply` presses it now)"
             );
         }
-        (Some(current), _) if current != installed => {
+        (Some(current), _) if newer_on_disk => {
             // A newer bundle is already on disk: the GUI activates it in place, the same
             // in-session lane.
             let _ = writeln!(
@@ -1276,6 +1613,39 @@ fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn st
             let _ = writeln!(out, "{p}: ok — aterm build {installed} installed");
         }
     }
+}
+
+/// The sealed `CFBundleVersion` of the `.app` this process runs from, read off its
+/// `Contents/Info.plist`; `None` outside a bundle (a source build, a test binary) or on
+/// any doubt. A plain text scan of the XML plist the release cutter emits — no
+/// `PlistBuddy` subprocess for a diagnostic — that binds the value to the key
+/// immediately before it ([`plist_bundle_version`]).
+fn running_bundle_build() -> Option<u64> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let macos = exe.parent()?;
+    if macos.file_name()?.to_str()? != "MacOS" {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()?.to_str()? != "Contents" {
+        return None;
+    }
+    let text =
+        crate::metadata_io::read_bounded_regular_utf8(&contents.join("Info.plist"), 1024 * 1024)
+            .ok()?;
+    plist_bundle_version(&text)
+}
+
+/// `CFBundleVersion` out of an XML plist: the `<string>` IMMEDIATELY after the key
+/// (modulo whitespace) — never a string further on that another key owns — parsed as
+/// the integer build number the cutter seals. `None` for a missing key, an intervening
+/// element, or a non-integer value.
+fn plist_bundle_version(text: &str) -> Option<u64> {
+    let key = "<key>CFBundleVersion</key>";
+    let after = text.find(key)? + key.len();
+    let value = text[after..].trim_start().strip_prefix("<string>")?;
+    let end = value.find("</string>")?;
+    value[..end].trim().parse::<u64>().ok()
 }
 
 /// The index (in `split_paths` order) of the first `PATH` entry holding an executable
@@ -1473,6 +1843,97 @@ mod tests {
         assert_eq!(index_age_days("not-a-date", then), None);
     }
 
+    // (9) A rustup `trust` entry that RESOLVES but is not the managed seam — m21's
+    // `~/.rustup/toolchains/trust -> $HOME/trust/build/host/stage2` — is a WARN that names
+    // the one re-point command and moves nothing; a link at a numbered store build is a
+    // note; the seam itself and an absent entry say nothing here.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() {
+        let l = layout("foreign-seam");
+        // The managed store: trust/6808 with current -> 6808.
+        let build = l.build_dir("trust", 6808);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        crate::activate::atomic_symlink(&build, &crate::seam::seam_target(&l)).unwrap();
+        let home = synthetic_home("foreign-seam");
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        let dev = home.join("trust/build/host/stage2");
+        std::fs::create_dir_all(dev.join("bin")).unwrap();
+        let entry = rustup.join("toolchains/trust");
+        std::os::unix::fs::symlink(&dev, &entry).unwrap();
+        let st = crate::seam::status(&l, &rustup, "trust");
+        let line = seam_line(&st, &l).expect("a foreign link is said");
+        assert!(line.starts_with("warn — "), "{line}");
+        assert!(line.contains("is NOT the managed store"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "ln -sfn '{}' '{}'",
+                crate::seam::seam_target(&l).display(),
+                entry.display()
+            )),
+            "the exact re-point command, quoted — the real prefix has a space in \
+             `Application Support`: {line}"
+        );
+        assert!(line.contains("aterm pkg repair"), "{line}");
+        // Nothing moved: the entry still points at the dev build.
+        assert_eq!(std::fs::read_link(&entry).unwrap(), dev);
+        // A numbered build inside the store is a note, not a warn.
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(&build, &entry).unwrap();
+        let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
+        assert!(line.starts_with("note — "), "{line}");
+        assert!(line.contains("numbered build"), "{line}");
+        // The seam itself, and no entry at all: nothing to say from this line.
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(crate::seam::seam_target(&l), &entry).unwrap();
+        assert_eq!(
+            seam_line(&crate::seam::status(&l, &rustup, "trust"), &l),
+            None
+        );
+        std::fs::remove_file(&entry).unwrap();
+        assert_eq!(
+            seam_line(&crate::seam::status(&l, &rustup, "trust"), &l),
+            None
+        );
+        // A real directory gets the detach fix, since nothing can be linked over it.
+        std::fs::create_dir_all(entry.join("bin")).unwrap();
+        let line = seam_line(&crate::seam::status(&l, &rustup, "trust"), &l).unwrap();
+        assert!(line.contains("a real directory"), "{line}");
+        assert!(line.contains(crate::seam::DETACH_FIX), "{line}");
+        // Through the whole report, with the synthetic home carrying the foreign link:
+        // the line is printed and the report is still advisory about it.
+        std::fs::remove_dir_all(&entry).unwrap();
+        std::os::unix::fs::symlink(&dev, &entry).unwrap();
+        if rustup_present() && std::env::var_os("RUSTUP_HOME").is_none() {
+            let mut out = Vec::new();
+            let path = std::env::join_paths([l.bin_dir()]).unwrap();
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                "doctor",
+                &Probes::default(),
+                &mut out,
+                &mut std::io::sink());
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.contains("is NOT the managed store"),
+                "the report carries the seam line:\n{text}"
+            );
+            assert_eq!(
+                std::fs::read_link(&entry).unwrap(),
+                dev,
+                "doctor moved nothing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn healthy_layout_returns_true() {
         let l = layout("healthy");
@@ -1489,6 +1950,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1534,9 +1996,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut std::io::sink(),
-            );
+                &mut std::io::sink());
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         // Nothing laid and the reroute dir absent from PATH (a shell outside a session):
@@ -1625,6 +2087,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1691,6 +2154,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1713,6 +2177,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1837,6 +2302,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1887,6 +2353,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1915,6 +2382,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1950,6 +2418,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -1976,6 +2445,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -2007,6 +2477,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -2036,6 +2507,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -2061,6 +2533,7 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut std::io::sink(),
                 &mut std::io::sink()
             ),
@@ -2097,6 +2570,7 @@ mod tests {
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs,
             },
         )
@@ -2115,9 +2589,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut err,
-            );
+                &mut err);
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let (ok, out) = run(&l);
@@ -2182,6 +2656,7 @@ mod tests {
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs,
             },
         )
@@ -2200,9 +2675,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut err,
-            );
+                &mut err);
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let (ok, out) = run(&l);
@@ -2271,6 +2746,7 @@ mod tests {
             index_source: "x/y".into(),
             outcome: "up to date".into(),
             seams: Vec::new(),
+            last_success_at: String::new(),
             programs,
         };
         crate::status::write(&layout, &status).unwrap();
@@ -2291,9 +2767,9 @@ mod tests {
             None,
             None,
             "doctor",
+            &Probes::default(),
             &mut out,
-            &mut err,
-        );
+            &mut err);
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(
             ok,
@@ -2338,9 +2814,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut err,
-            );
+                &mut err);
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let ahead = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
@@ -2409,6 +2885,7 @@ mod tests {
                 index_source: "alabsystems/aterm".into(),
                 outcome: "up to date".into(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs,
             },
         )
@@ -2426,9 +2903,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut err,
-            );
+                &mut err);
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let managed_only = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -2512,9 +2989,9 @@ mod tests {
             None,
             None,
             "doctor",
+            &Probes::default(),
             &mut out,
-            &mut err,
-        );
+            &mut err);
         let out = String::from_utf8_lossy(&out).into_owned();
         assert!(ok, "a shadow is a warning, not a structural fault:\n{out}");
         let state = crate::state::shadowed(6808, &exe);
@@ -2560,6 +3037,7 @@ mod tests {
                 None,
                 None,
                 invoked,
+                &Probes::default(),
                 &mut out,
                 &mut err,
             );
@@ -2598,6 +3076,7 @@ mod tests {
             None,
             None,
             "doctor",
+            &Probes::default(),
             &mut out,
             &mut err
         ));
@@ -2701,6 +3180,91 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base.prefix);
     }
+
+    /// THE HAND-PLACED BUNDLE (m21, 2026-09-10 audit): the updater's receipt says build
+    /// 1786405661 (its last own install, Aug 10) while the bundle on disk — dragged in by
+    /// hand — and the running process are both 1789000876. Reading the receipt alone made
+    /// doctor print "running build 1789000876 but build 1786405661 is installed on disk",
+    /// a note about a DOWNGRADE that does not exist. "On disk" is the newer of receipt and
+    /// sealed bundle, and the note fires only when that is strictly newer than what runs.
+    #[test]
+    fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed_newer_than_running()
+     {
+        let base = layout("posture-bundle");
+        let updates = base.prefix.join("Updates");
+        std::fs::create_dir_all(&updates).unwrap();
+        let report = |bundle: Option<u64>| -> String {
+            let mut out = Vec::new();
+            report_aterm_posture_at(&updates, bundle, "atpkg", &mut out);
+            String::from_utf8(out).unwrap()
+        };
+        std::fs::write(
+            updates.join("installed.toml"),
+            "build_number = 1786405661\n",
+        )
+        .unwrap();
+        std::fs::write(
+            updates.join("status.toml"),
+            "current_build = 1789000876\nstaged_build = 1789000876\n",
+        )
+        .unwrap();
+        // The m21 shape: receipt older than the running build, bundle == running.
+        assert_eq!(
+            report(Some(1_789_000_876)),
+            "atpkg: ok — aterm build 1789000876 installed\n",
+            "on disk is derived from the bundle; no downgrade note"
+        );
+        // Receipt older, no bundle readable (a source build): the receipt is OLDER than
+        // what runs, so still no "installed on disk" note — that note is for NEWER.
+        assert_eq!(
+            report(None),
+            "atpkg: ok — aterm build 1786405661 installed\n"
+        );
+        // A bundle strictly newer than the running process: the activation note.
+        let text = report(Some(1_789_999_999));
+        assert!(
+            text.contains("running build 1789000876 but build 1789999999 is installed on disk"),
+            "{text}"
+        );
+        assert!(text.contains("activates it in-session"), "{text}");
+        // A receipt newer than both (the updater installed, the process predates it):
+        // the receipt wins the max and the note fires off it.
+        std::fs::write(
+            updates.join("installed.toml"),
+            "build_number = 1790000000\n",
+        )
+        .unwrap();
+        let text = report(Some(1_789_000_876));
+        assert!(
+            text.contains("but build 1790000000 is installed on disk"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&base.prefix);
+    }
+
+    /// The plist scan binds the value to the key right before it and parses only an
+    /// integer build.
+    #[test]
+    fn plist_bundle_version_reads_only_the_string_bound_to_the_key() {
+        assert_eq!(
+            plist_bundle_version(
+                "<plist><dict><key>CFBundleShortVersionString</key><string>0.79.0</string>\
+                 <key>CFBundleVersion</key>\n  <string>1789000876</string></dict></plist>"
+            ),
+            Some(1_789_000_876)
+        );
+        assert_eq!(
+            plist_bundle_version("<key>CFBundleVersion</key><key>Other</key><string>54</string>"),
+            None,
+            "an intervening key cannot lend its string"
+        );
+        assert_eq!(
+            plist_bundle_version("<key>CFBundleVersion</key><string>0.79.0</string>"),
+            None,
+            "not an integer build"
+        );
+        assert_eq!(plist_bundle_version("<plist/>"), None);
+    }
     /// Build a directory `scan` will recognize as cargo output by its `RustcInfo` evidence
     /// — the arm measured off `/Users//example/aterm/target` on 2026-09-02, which had
     /// `.rustc_info.json` and `debug/` and no `CACHEDIR.TAG`.
@@ -2746,9 +3310,9 @@ mod tests {
                 None,
                 None,
                 "doctor",
+                &Probes::default(),
                 &mut out,
-                &mut err,
-            );
+                &mut err);
             (
                 ok,
                 String::from_utf8_lossy(&out).into_owned(),
@@ -2768,9 +3332,11 @@ mod tests {
             )),
             "{out}"
         );
-        // The remedy names the verb that MEASURES, because doctor itself never probes.
+        // The remedy names the verb that APPLIES (what the pass runs) and the verb that
+        // MEASURES, because doctor itself never probes and never renames.
         for want in [
-            "aterm pkg noindex migrate <dir>",
+            "aterm pkg noindex apply --all",
+            "[machine] spotlight_noindex",
             "aterm pkg noindex verify <dir>",
             "2026-09-01 WindowServer watchdog kill",
         ] {
@@ -2838,9 +3404,9 @@ mod tests {
             None,
             None,
             "doctor",
+            &Probes::default(),
             &mut out,
-            &mut err,
-        );
+            &mut err);
         let out = String::from_utf8_lossy(&out).into_owned();
         let err = String::from_utf8_lossy(&err).into_owned();
         assert!(ok, "{out}");
@@ -2852,5 +3418,77 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_workspace_policy_the_installed_targo_refuses_is_a_problem_that_names_the_cure() {
+        let l = layout("wspolicy");
+        install(&l, "trust", 6808);
+        let home = synthetic_home("wspolicy");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let probes = Probes {
+            workspace: Some(WorkspacePolicyProbe {
+                workspace: PathBuf::from("/work/ty"),
+                policy: WorkspacePolicy::UnknownField { field: "compiler_timeout_secs".into() },
+            }),
+            local_seal: None,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        assert!(!run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &probes, &mut out, &mut err));
+        let err = String::from_utf8(err).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(err.contains("`compiler_timeout_secs`"), "names the refused key: {err}");
+        assert!(err.contains("build 6808"), "names the installed build: {err}");
+        assert!(err.contains(PUBLISH_RUSTC_GROUP), "names the cure: {err}");
+        assert!(out.contains("next — publish the newer Trust coherence group"), "next act: {out}");
+    }
+
+    #[test]
+    fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
+        let l = layout("wsok");
+        install(&l, "trust", 6808);
+        let home = synthetic_home("wsok");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let probes = Probes {
+            workspace: Some(WorkspacePolicyProbe {
+                workspace: PathBuf::from("/work/aterm"),
+                policy: WorkspacePolicy::Accepted,
+            }),
+            local_seal: Some(LocalSealProbe {
+                link_target: PathBuf::from("/Users//me/toolchains/trust-d3866677"),
+                trustc: "d3866677".into(),
+            }),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        assert!(run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &probes, &mut out, &mut err));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("[trust] policy the installed trust build 6808 accepts"), "{out}");
+        assert!(out.contains("warn — rustup's trust channel resolves to a LOCAL toolchain"), "{out}");
+        assert!(out.contains("trust-d3866677"), "{out}");
+        assert!(out.contains("healthy"), "{out}");
+    }
+
+    #[test]
+    fn targo_refusal_text_yields_the_field_name() {
+        let stderr = "error: unknown field `compiler_timeout_secs`, expected one of `enabled`, \
+                      `level`\n    --> Cargo.toml:3151:1\n";
+        assert_eq!(unknown_field_in(stderr).as_deref(), Some("compiler_timeout_secs"));
+        assert_eq!(unknown_field_in("warning: unused manifest key: trust\n"), None);
+        assert_eq!(unknown_field_in(""), None);
+    }
+
+    #[test]
+    fn the_trust_table_is_found_on_the_nearest_ancestor_manifest() {
+        let root = synthetic_home("wstable");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n\n[trust]\ncompiler_timeout_secs = 1\n").unwrap();
+        let nested = root.join("crates").join("x");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert_eq!(workspace_with_trust_table(&nested), Some(root.clone()));
+        let plain = synthetic_home("wsplain");
+        std::fs::write(plain.join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert_eq!(workspace_with_trust_table(&plain), None);
     }
 }

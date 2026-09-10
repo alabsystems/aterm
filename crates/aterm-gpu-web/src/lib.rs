@@ -3165,6 +3165,60 @@ mod tests {
     /// paste tests build from these bytes rather than `new_from_system`.
     const BUNDLED_FACE: &[u8] = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
 
+    #[test]
+    fn console_input_api_counts_commits_without_replaying_their_echoes() {
+        use aterm_effects::kitty_pet::PetInputKind;
+
+        let mut t = AtermGpuTerminal::new(8, 48, BUNDLED_FACE, 14.0, 0, 0, 0, 0)
+            .expect("the bundled face parses");
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 0);
+        let generation = t.host_visual_gen;
+        assert!(!t.note_console_input("unknown"));
+        assert_eq!(t.host_visual_gen, generation);
+        t.note_keystroke();
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 0);
+        assert!(t.note_typed_char('x'));
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
+        // Same-cell overwrite and subsequent unrelated output do not note input.
+        t.process(b"x\r");
+        t.process(b"program repaint\r");
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 1);
+
+        // The handler reports an entire composition commit, never preedit or
+        // one note per scalar. A zero-advance combining commit counts as well.
+        assert!(t.note_console_input("text"));
+        t.process("中文🙂".as_bytes());
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 2);
+        assert!(!t.note_typed_char('\u{0301}'));
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
+
+        // Formatting is pure; admission owns the single paste event.
+        let paste = t.format_paste("one pasted sentence");
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 3);
+        let generation = t.host_visual_gen;
+        assert!(t.note_console_input("paste"));
+        assert!(
+            t.host_visual_gen > generation,
+            "no-caret-travel input must wake one frame"
+        );
+        t.process(&paste);
+        assert_eq!(t.effects.cursor_pet_console_input_seq(), 4);
+        assert_eq!(
+            t.effects.cursor_pet_console_input_kind(),
+            Some(PetInputKind::Paste)
+        );
+        for (name, kind) in [
+            ("navigate", PetInputKind::Navigate),
+            ("delete", PetInputKind::Delete),
+            ("submit", PetInputKind::Submit),
+        ] {
+            let before = t.effects.cursor_pet_console_input_seq();
+            assert!(t.note_console_input(name));
+            assert_eq!(t.effects.cursor_pet_console_input_seq(), before + 1);
+            assert_eq!(t.effects.cursor_pet_console_input_kind(), Some(kind));
+        }
+    }
+
     /// The web export IS the engine's paste formatter, so a JS host cannot get
     /// the ordering wrong. Sanitize-then-wrap is the whole security property: a
     /// planted `ESC[201~` (or its 8-bit `0x9B 2 0 1 ~` spelling, which closes the

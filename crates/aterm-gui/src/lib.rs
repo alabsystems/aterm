@@ -3629,6 +3629,31 @@ enum Wake {
     /// claims a toolchain the machine does not have, and the failure pill hides the
     /// programs that did arrive.
     PkgSeedPartial { detail: String },
+    /// `managed-current:` — every AGENT program (claude, codex) that is installed AND
+    /// at the index pin, as atpkg lists it at the end of a pass (`claude 2.1.267
+    /// (build 2026091001); codex 0.154.0 (build 2026091001)`). Raises the "Claude
+    /// Code X · Codex Y — aterm-managed, current" row on the toolchain lane (R6,
+    /// 2026-09-10) — once per text per launch: atpkg prints it on every pass and
+    /// this wake fires from the recurring pass too, so `StatusBars` records a
+    /// repeat in the ledger without moving the grid. Display only; no authority
+    /// crosses it.
+    PkgManagedCurrent(String),
+    /// `machine-settings:` — the machine-level settings a pass CHANGED per doctor
+    /// (`spotlight-noindex 73 dir(s) migrated; universal-control disabled`), listed
+    /// only when something changed. Raises ONE row per item — "Universal Control
+    /// disabled", whose detail says how to revert, ahead of "Spotlight: 73 build
+    /// dirs moved to .noindex" (R5/R6, 2026-09-10; per-item since the UX review).
+    PkgMachineSettings(String),
+    /// `aterm ctl appnotice <lane> <text>` — a text row posted to the pull-down from
+    /// OUTSIDE the process (an `aterm pkg install claude` run in a terminal has no
+    /// GUI child to stream markers through). Owner-only at the socket; `lane` is
+    /// `toolchain` or `update`, anything else is refused on the reply. Toolchain text
+    /// shaped like the two markers above renders as that marker's row.
+    AppNotice {
+        lane: String,
+        text: String,
+        reply: std::sync::mpsc::Sender<Result<(), &'static str>>,
+    },
     /// One parsed-and-classified `<prefix>/progress.json` snapshot from the
     /// CHILD-SCOPED tailer thread ([`PkgProgressTailer`]) — the machine channel
     /// the toolchain STATUS BAR renders from (§3 of the streaming-batteries
@@ -20706,20 +20731,39 @@ impl ApplicationHandler<Wake> for App {
             // Self-healing: a ledger threshold event from the background update
             // thread (persistent failure) — surface it.
             Wake::UpdateHealth { title, body } => {
+                // THE LEDGER HEALED: the check thread reports the recovery it
+                // observed (`aterm_update::HEALTH_RECOVERED_TITLE`) so the standing
+                // row below can leave. Nothing to notify about; the log line is the
+                // record.
+                if title == aterm_update::HEALTH_RECOVERED_TITLE {
+                    aterm_log::info!("update-health: {title}");
+                    if self.status_bars.update_health_healed(Instant::now()) {
+                        self.sync_status_bars();
+                    }
+                    self.request_native_update_reconcile(
+                        crate::app_native::NativeUpdateReconcilePurpose::Refresh,
+                    );
+                    return;
+                }
                 aterm_log::warn!("update-health: {title}: {body}");
                 // SAY WHAT IS WRONG, where the user is looking: the typed body carries
                 // the cause and the count; the pill used to discard it and point at a
                 // menu that has no failure text (measured 2026-08-18: eight hours of
                 // publisher-side rejections, invisible in the app). And re-read the
                 // ledger so Settings ▸ Software Update headlines the same verdict.
-                // On the update bar's row (2026-09-07), held the warning's stretch;
-                // never a floating card.
-                self.note_update_outcome(
-                    '\u{26a0}',
+                // On the update bar's row (2026-09-07) — and since 2026-09-10 a
+                // STANDING row: it stays until the ledger heals rather than folding
+                // after 45 s of a process that runs for weeks (m21 showed it for 45 s
+                // of a pipeline that had been failing since 2026-08-27). Never a
+                // floating card. The command in the body survives the width law
+                // (`status_bars::shape_detail`).
+                self.retire_update_installing();
+                if self.status_bars.update_health_standing(
                     &title,
                     &format!("{body} — see Settings ▸ Software Update"),
-                    crate::status_bars::Tone::Warn,
-                );
+                ) {
+                    self.sync_status_bars();
+                }
                 // THE OS NOTIFICATION the updater's contract promises (no_token.rs:
                 // "the only surface the owner sees without going looking"): the
                 // bar row above is visible only while an aterm window is on screen
@@ -20869,6 +20913,54 @@ impl ApplicationHandler<Wake> for App {
                     Instant::now(),
                 );
                 self.sync_status_bars();
+            }
+            // The R6 rows (2026-09-10): the managed agents in use, and the machine
+            // settings a pass changed. Both queue behind a pass row on the toolchain
+            // lane so each is read in turn and each lands in the `appstatus` ledger.
+            Wake::PkgManagedCurrent(detail) => {
+                aterm_log::info!("atpkg managed-current: {detail}");
+                self.status_bars
+                    .toolchain_managed_current(&detail, Instant::now());
+                self.sync_status_bars();
+            }
+            Wake::PkgMachineSettings(detail) => {
+                aterm_log::info!("atpkg machine-settings: {detail}");
+                self.status_bars
+                    .toolchain_machine_settings(&detail, Instant::now());
+                self.sync_status_bars();
+            }
+            // `aterm ctl appnotice <lane> <text>`: the out-of-process voice of the
+            // pull-down. A marker-shaped toolchain text renders as that marker's row;
+            // anything else is a plain Info row on the named lane.
+            Wake::AppNotice { lane, text, reply } => {
+                let now = Instant::now();
+                let result = match lane.as_str() {
+                    "toolchain" => {
+                        if let Some(body) = r6_marker_body(&text, MANAGED_CURRENT_MARKER) {
+                            self.status_bars.toolchain_managed_current(body, now);
+                        } else if let Some(body) = r6_marker_body(&text, MACHINE_SETTINGS_MARKER) {
+                            self.status_bars.toolchain_machine_settings(body, now);
+                        } else {
+                            self.status_bars.notice(
+                                crate::status_bars::Lane::Toolchain,
+                                &text,
+                                now,
+                            );
+                        }
+                        Ok(())
+                    }
+                    "update" => {
+                        self.status_bars
+                            .notice(crate::status_bars::Lane::Update, &text, now);
+                        Ok(())
+                    }
+                    _ => Err("lane must be toolchain or update"),
+                };
+                if result.is_ok() {
+                    aterm_log::info!("appnotice {lane}: {text}");
+                    self.sync_status_bars();
+                }
+                let _ = reply.send(result);
             }
             Wake::PkgSeed { installed, pending } => {
                 if !installed.is_empty() {
@@ -22397,6 +22489,14 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // `None` (no resolvable home) degrades to the pre-progress behavior —
             // children still run, nothing is tailed.
             let layout = atpkg::store::resolve_configured();
+            // THE CHILDREN'S PATH (R1, 2026-09-10): a Finder launch inherits
+            // launchd's `/usr/bin:/bin:/usr/sbin:/sbin` (measured: `ps -E` on the
+            // running window), so the children could not see the foreign
+            // `~/.local/bin/claude` / `/opt/homebrew/bin/codex` that
+            // `reconcile_shadowed` exists to report, and `aterm pkg which` in the
+            // window disagreed with the same verb in a terminal. Resolved ONCE per
+            // thread from the login shell (bounded), and handed to both children.
+            let child_path = crate::spawn::atpkg_child_path();
             // THE FIRST-RUN FILL (docs/GOLDEN-INSTALL-PATH.md §3 — lean-first since
             // 2026-08-26; no release from v0.63.0 on seals a seed): this one-shot
             // `atpkg seed` records adoption, lays a pending stub per default-set name,
@@ -22445,6 +22545,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             let mut seed_cmd = std::process::Command::new(&atpkg);
             seed_cmd
                 .arg("seed")
+                .env("PATH", &child_path)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
             if let Some(l) = &layout {
@@ -22552,6 +22653,17 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // unwritable prefix) that round 8 made visible, and it happens
                 // without any announcement having been opened. Gating this on
                 // `saw_start` would have re-silenced it.
+                // The seed pass's stderr reaches the log whatever the exit
+                // (2026-09-10), like the update pass's below; the refusal
+                // branch keeps its own sentence.
+                if !(!ok && !saw_marker) && !said.trim().is_empty() {
+                    let why: String = said.trim().chars().take(2000).collect();
+                    if ok {
+                        aterm_log::info!("atpkg seed said: {why}");
+                    } else {
+                        aterm_log::warn!("atpkg seed said: {why}");
+                    }
+                }
                 if !ok && !saw_marker {
                     let why = said.trim();
                     aterm_log::warn!(
@@ -22632,6 +22744,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // install this lane IS how the toolchain arrives.
                 update_cmd
                     .arg("update")
+                    .env("PATH", &child_path)
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
                 if let Some(l) = &layout {
@@ -22705,9 +22818,16 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         }
                         // A markerless non-zero exit is the CLI-edge refusal —
                         // the quiet steady state ("everything up to date",
-                        // exit 0, no marker) stays quiet.
+                        // exit 0, no marker) stays quiet ON SCREEN. In the LOG
+                        // every pass leaves a trace (2026-09-10): its stderr,
+                        // whatever the exit and whether or not a marker was
+                        // printed — a pass that exits non-zero AFTER a marker,
+                        // or exits 0 with per-program failure lines, used to
+                        // drop its stderr entirely — and one INFO line naming
+                        // the outcome atpkg recorded, so "did the check run,
+                        // and when?" has an answer beside status.toml.
+                        let why = said.trim();
                         if !ok && !saw_marker {
-                            let why = said.trim();
                             aterm_log::warn!(
                                 "the ALab toolchain update pass did not run: {}",
                                 if why.is_empty() {
@@ -22716,7 +22836,24 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                     why
                                 }
                             );
+                        } else if !why.is_empty() {
+                            let why: String = why.chars().take(2000).collect();
+                            if ok {
+                                aterm_log::info!("atpkg update said: {why}");
+                            } else {
+                                aterm_log::warn!("atpkg update said: {why}");
+                            }
                         }
+                        let outcome = layout
+                            .as_ref()
+                            .and_then(atpkg::status::read)
+                            .map(|status| status.outcome)
+                            .filter(|outcome| !outcome.is_empty())
+                            .unwrap_or_else(|| "(no status.toml)".to_string());
+                        aterm_log::info!(
+                            "atpkg update pass finished: exit={} outcome={outcome}",
+                            if ok { "ok" } else { "failed" }
+                        );
                     }
                     Err(error) => {
                         // A bundle whose co-located atpkg cannot exec is a
@@ -22819,6 +22956,28 @@ fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
     (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
 }
 
+/// The two R6 markers (2026-09-10), the stdout contract beside atpkg's nine
+/// `seed-*`/`net-*` markers: `managed-current: <name> <version> (build <N>); …`
+/// lists every AGENT program installed AND at the index pin, and
+/// `machine-settings: <item>; …` lists only what a pass CHANGED per doctor
+/// (omitted when nothing changed). Printed by `atpkg update`/`seed` with the
+/// `atpkg: ` prefix like every other marker; accepted here with or without it, so a
+/// hand-run `aterm ctl appnotice toolchain managed-current: …` carries the same
+/// body. Spelled here rather than imported so the GUI compiles against the
+/// CONTRACT STRING — the integrator may point these at `atpkg::cli` once both
+/// sides carry the constant.
+pub(crate) const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
+pub(crate) const MACHINE_SETTINGS_MARKER: &str = "machine-settings: ";
+
+/// The body of an R6 marker line, with or without atpkg's `atpkg: ` prefix.
+fn r6_marker_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    line.strip_prefix("atpkg: ")
+        .unwrap_or(line)
+        .strip_prefix(marker)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 /// One STREAMED line of `atpkg seed` stdout → the `Wake` it should raise, if any.
 ///
 /// The line-at-a-time twin of [`parse_seed_markers`] (which stays as the whole-output
@@ -22871,6 +23030,14 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
                 .collect(),
             pending: None,
         });
+    }
+    // The R6 rows: what the managed agents are, and what the machine settings
+    // pass changed. Both are TERMINAL rows the bar queues behind the pass row.
+    if let Some(body) = r6_marker_body(line, MANAGED_CURRENT_MARKER) {
+        return Some(Wake::PkgManagedCurrent(body.to_string()));
+    }
+    if let Some(body) = r6_marker_body(line, MACHINE_SETTINGS_MARKER) {
+        return Some(Wake::PkgMachineSettings(body.to_string()));
     }
     let (installed, pending) = parse_seed_markers(line)?;
     Some(Wake::PkgSeed { installed, pending })
@@ -23031,6 +23198,70 @@ mod seed_marker_tests {
             parse_seed_line("atpkg: seed-starting: ").is_none(),
             "empty tail"
         );
+    }
+
+    /// The two R6 markers (2026-09-10) resolve line-at-a-time, with or without
+    /// atpkg's `atpkg: ` prefix (the `appnotice` verb carries the bare body), the
+    /// prefix stripped and an empty body raising nothing.
+    #[test]
+    fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
+        let managed = "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)";
+        match parse_seed_line(&format!("atpkg: managed-current: {managed}")) {
+            Some(Wake::PkgManagedCurrent(body)) => assert_eq!(body, managed),
+            other => panic!("expected PkgManagedCurrent, got {other:?}"),
+        }
+        match parse_seed_line(&format!("managed-current: {managed}")) {
+            Some(Wake::PkgManagedCurrent(body)) => assert_eq!(body, managed),
+            other => panic!("expected PkgManagedCurrent (bare), got {other:?}"),
+        }
+        let machine = "spotlight-noindex 73 dir(s) migrated; universal-control disabled";
+        match parse_seed_line(&format!("atpkg: machine-settings: {machine}")) {
+            Some(Wake::PkgMachineSettings(body)) => assert_eq!(body, machine),
+            other => panic!("expected PkgMachineSettings, got {other:?}"),
+        }
+        assert!(
+            parse_seed_line("atpkg: managed-current: ").is_none(),
+            "empty tail"
+        );
+        assert!(parse_seed_line("atpkg: machine-settings:").is_none());
+        assert!(
+            parse_seed_line("atpkg: claude: managed 2026091001 — pinned by index 21").is_none(),
+            "a plain state line is not a marker"
+        );
+        // The contract strings themselves.
+        assert_eq!(super::MANAGED_CURRENT_MARKER, "managed-current: ");
+        assert_eq!(super::MACHINE_SETTINGS_MARKER, "machine-settings: ");
+    }
+
+    /// THE ATPKG CONTRACT LITERALS THIS CRATE READS, pinned for the integrator
+    /// (2026-09-10). atpkg's own side of the contract lands on another branch as
+    /// `atpkg::cli::MANAGED_CURRENT_MARKER`, `atpkg::cli::MACHINE_SETTINGS_MARKER`
+    /// and `atpkg::status::NEVER_CHECKED_LINE`; this crate already depends on
+    /// `atpkg`, so once those exist the three literals here (and
+    /// `aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE`) can be pointed
+    /// at them — and this test says, byte for byte, what they must equal for the
+    /// swap to be a no-op. A mismatch here is a contract drift, not a typo.
+    #[test]
+    fn the_atpkg_contract_literals_are_pinned_for_the_integrator() {
+        assert_eq!(super::MANAGED_CURRENT_MARKER, "managed-current: ");
+        assert_eq!(super::MACHINE_SETTINGS_MARKER, "machine-settings: ");
+        assert_eq!(
+            aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE,
+            "atpkg: no update check has run yet on this machine \u{2014} packages cannot be \
+             updated until the first pass completes (run: aterm pkg update)"
+        );
+        // The markers are what `parse_seed_line` strips: a body must survive
+        // the trip through them unchanged.
+        for marker in [
+            super::MANAGED_CURRENT_MARKER,
+            super::MACHINE_SETTINGS_MARKER,
+        ] {
+            assert!(marker.ends_with(": "), "{marker:?}");
+            assert_eq!(
+                super::r6_marker_body(&format!("{marker}body"), marker),
+                Some("body")
+            );
+        }
     }
 
     #[test]
@@ -24285,8 +24516,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let current_exe = std::env::current_exe().ok();
     let bundle_dir = spawn::bundle_dir(current_exe.as_deref());
     let inherited_path = std::env::var("PATH").ok();
+    // `<prefix>/agents/` (R1, 2026-09-10): the shims of the agent programs aterm is
+    // the version manager for, laid by atpkg on activation of a managed claude/codex
+    // build; front-inserted beside the reroute dir only when it exists. The path is
+    // the contract's (`<prefix>/agents`), spelled here so this side compiles
+    // against the layout it reads rather than an accessor the store may add.
+    let agents_dir = atpkg::store::resolve_configured().and_then(|layout| {
+        let dir = layout.prefix.join("agents");
+        dir.to_str().filter(|_| dir.is_dir()).map(str::to_owned)
+    });
     if let Some(path_pair) = spawn::reroute_path_env(
         reroute_dir.as_deref(),
+        agents_dir.as_deref(),
         bundle_dir.as_deref(),
         inherited_path.as_deref(),
     ) {
@@ -24562,7 +24803,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // download, so the "how it applies" line (the posture this process really
     // computes) can be captured too. Inert unless set; never affects a normal
     // launch, and the seeded bars fold at their staleness caps like any other.
-    if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS") {
+    // `=managed` / `=machine` (2026-09-10) seed the two R6 rows — the managed
+    // agents in use, and the machine settings a pass changed — through their real
+    // wakes, and nothing else, so each can be captured on its own.
+    if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS")
+        && (mode == "managed" || mode == "machine")
+    {
+        let proxy = event_loop.create_proxy();
+        let _ = proxy.send_event(if mode == "managed" {
+            Wake::PkgManagedCurrent(
+                "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)".to_string(),
+            )
+        } else {
+            Wake::PkgMachineSettings(
+                "spotlight-noindex 73 dir(s) migrated; universal-control disabled".to_string(),
+            )
+        });
+    } else if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS") {
         let proxy = event_loop.create_proxy();
         let _ = proxy.send_event(Wake::PkgSeedStarted {
             detail: "installing 10 ALab program(s) over the network (about 3 GB on disk \
@@ -24626,6 +24883,30 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
     let package_update_loop_running = !headless && spawn_pkg_update_check(&config, proxy.clone());
+    // R3 (2026-09-10): a launch whose loop will NOT run — headless, `[packages]`
+    // disabled, no co-located atpkg — on a machine where no atpkg pass has ever
+    // succeeded says so on stderr, in the one line every console edge prints
+    // (`aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE`); the session lane
+    // prints the same. A machine that has been checked stays quiet. The LOG copy
+    // is for a WINDOWED run whose loop will not start (the one a person cannot
+    // see stderr of); a headless run — every integration test that drives this
+    // binary — stays out of the machine's real `aterm.log`, which was gaining one
+    // recurring WARN per test run (2026-09-10 review).
+    if !package_update_loop_running
+        && let Some(layout) = atpkg::store::resolve_configured()
+        && aterm_update_core::pkg_check::never_checked(&layout.status())
+    {
+        eprintln!(
+            "{}",
+            aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE
+        );
+        if !headless {
+            aterm_log::warn!(
+                "{}",
+                aterm_update_core::pkg_check::NEVER_CHECKED_STDERR_LINE
+            );
+        }
+    }
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread
@@ -37609,8 +37890,10 @@ mod spec_xref_gate {
             "the module registry contains a DUPLICATE machine name; the count \
              below would have absorbed it"
         );
+        // ConsoleLifeEpisode and ConsoleResidentHandoff add two distinct
+        // machines; the uniqueness assertion above must remain before this pin.
         assert_eq!(
-            total, 149,
+            total, 151,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -37676,29 +37959,46 @@ mod spec_xref_gate {
             .and_then(|p| p.parent()) // workspace root
             .expect("aterm-gui manifest dir has a workspace-root grandparent")
             .to_path_buf();
-        let status = Command::new("cargo")
+        // THE DRIVER THAT RUNS THIS TEST, not a bare `cargo` off PATH. A machine
+        // that carries only the Trust toolchain has no `cargo` on PATH at all
+        // (measured on m27, 2026-09-10: `command -v cargo` is empty), and an aterm
+        // session's reroute stub answers a bare `cargo` with a refusal. The literal
+        // spelling therefore either failed to SPAWN — which `.expect` turned into a
+        // panic before the env-`CARGO` retry below could ever run — or spent a
+        // refusal first. Env `CARGO` is the binary cargo/targo set for the test
+        // process; the bare name stays only as the fallback for a harness that sets
+        // none, and `cargo_lane_args` still asks the resolved driver for its lane.
+        let driver = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let in_tree = Command::new(&driver)
             .current_dir(&root)
-            .args(cargo_lane_args(std::ffi::OsStr::new("cargo")))
+            .args(cargo_lane_args(&driver))
             .arg("run")
             .arg("-q")
             .arg("-p")
             .arg("xtask")
             .arg("--")
             .arg("harness-manifest")
-            .status()
-            .expect("run `cargo run -p xtask -- harness-manifest`");
+            .status();
+        // A spawn that cannot START is the same verdict as one that exits non-zero:
+        // the in-tree attempt failed, and the neutral-cwd retry decides — carrying
+        // the reason, so the notice never hides a missing binary behind a guess.
+        let in_tree_why = match &in_tree {
+            Ok(status) => format!("{status}"),
+            Err(error) => format!("could not start {}: {error}", driver.to_string_lossy()),
+        };
+        let in_tree_ok = in_tree.ok().filter(std::process::ExitStatus::success);
         // Why: a NESTED checkout (aterm under orc's rust/) inherits the host repo's
         // ancestor cargo config, whose vendored-offline [source] replacement lacks
         // aterm's deps and fails the in-tree spawn above. Retry with the SAME cargo
         // binary that runs this test (env `CARGO` — keeps the outer lane's toolchain;
         // rustup's cwd-based pick would regress it) from a config-neutral cwd against
         // the explicit workspace manifest. Never silent: the notice records the lane.
-        let status = if status.success() {
+        let status = if let Some(status) = in_tree_ok {
             status
         } else {
             crate::logging::stderr_line!(
-                "spec_xref_closure: in-tree `cargo run -p xtask` failed (host-repo cargo \
-                 config?) — retrying from a config-neutral cwd via env CARGO"
+                "spec_xref_closure: in-tree `cargo run -p xtask` failed ({in_tree_why}; \
+                 host-repo cargo config?) — retrying from a config-neutral cwd via env CARGO"
             );
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let lane = cargo_lane_args(&cargo);

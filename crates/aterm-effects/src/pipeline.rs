@@ -54,7 +54,7 @@ use crate::host::{
     CaptureMode, ChromeGeom, FrameGeom, HostFrameInput, PressOutcome, SingFacts, TerminalFacts,
     Visibility, Wake,
 };
-use crate::kitty_pet::{PetArrival, PetSpecies};
+use crate::kitty_pet::{PetArrival, PetInputKind, PetSpecies};
 use crate::kitty_registry::KittyLook;
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
@@ -696,6 +696,11 @@ impl EffectsPipeline {
         _input: &RenderInput,
         ch: char,
     ) -> bool {
+        if !ch.is_control() {
+            // A scalar commit is one input event even when it has no advance
+            // (for example a combining mark). Its echo must not mint another.
+            self.note_console_input(PetInputKind::Text);
+        }
         let width = if term.modes().ambiguous_width_double {
             aterm_grapheme::char_width_cjk(ch)
         } else {
@@ -714,6 +719,14 @@ impl EffectsPipeline {
         self.glow.note_typed_cells(now, width as u16);
         self.trail.note_typed(now);
         true
+    }
+
+    /// One accepted input event, including an entire committed IME run or
+    /// paste. Call once after transport admission, never from output parsing
+    /// or composition preview. Admission does not establish an actual edit.
+    /// [`Self::note_committed_char`] already reports a scalar's Text event.
+    pub fn note_console_input(&mut self, kind: PetInputKind) {
+        self.companion.note_console_input(self.now(), kind);
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT
@@ -1020,6 +1033,18 @@ impl EffectsPipeline {
     #[must_use]
     pub fn cursor_pet_alpha(&self) -> u8 {
         self.companion.alpha()
+    }
+
+    /// Count of console input intentions, independent of their later echoes.
+    #[must_use]
+    pub fn cursor_pet_console_input_seq(&self) -> u64 {
+        self.companion.console_input_seq()
+    }
+
+    /// Last classified console input intention; observing it never ticks.
+    #[must_use]
+    pub fn cursor_pet_console_input_kind(&self) -> Option<PetInputKind> {
+        self.companion.console_input_kind()
     }
 
     /// The pet's drawn body this frame in FRAME px `(x0, x1, y0, y1)`, `None`
@@ -1945,6 +1970,14 @@ impl EffectsPipeline {
                 ),
             },
         };
+        if self.pet_style_named && self.glow_cfg.enabled && self.companion.enabled() {
+            let pet_world = crate::pet_world::PetWorldFacts::read(term, term.render_identity());
+            self.companion.observe_console(
+                input,
+                &pet_world,
+                crate::pet_world::PetPane::full(input),
+            );
+        }
         let pet = self.companion.sense(
             PetFacts {
                 facts: &facts,
@@ -2408,6 +2441,7 @@ mod tests {
             .size(5, 16)
             .ring_buffer_size(32)
             .build();
+        configure_glass_theme(&mut term);
         let mut pipeline = EffectsPipeline::new();
         // The pet's owner: the trail master on a pet spelling, plus the seed
         // door — so the Tier-1 bind below projects the REAL resident.
@@ -2628,8 +2662,28 @@ mod tests {
     /// A fresh `rows`×`cols` glass with its first coherent frame extracted.
     fn glass(rows: u16, cols: u16) -> (Terminal, RenderInput) {
         let mut term = Terminal::new(rows, cols);
+        configure_glass_theme(&mut term);
         let input = term.cell_frame(usize::from(rows), usize::from(cols));
         (term, input)
+    }
+
+    fn configure_glass_theme(term: &mut Terminal) {
+        // Real web constructors configure the terminal as well as the
+        // renderer. An unconfigured COLOR_UNSET background is unknown to
+        // PetWorld and cannot certify the fixture's supposedly clear glass.
+        let theme = aterm_render::Theme::default();
+        let rgb = |color: u32| {
+            aterm_core::terminal::Rgb::new(
+                ((color >> 16) & 0xff) as u8,
+                ((color >> 8) & 0xff) as u8,
+                (color & 0xff) as u8,
+            )
+        };
+        term.set_default_foreground(rgb(theme.fg));
+        term.set_default_background(rgb(theme.bg));
+        // Keep the default inherited cursor color: the contrast regression
+        // below deliberately exercises foreground fallback without an override.
+        term.set_default_selection_background(Some(rgb(theme.selection)));
     }
 
     /// Type `text` through the committed-scalar seam, one byte per `dt_ms`
@@ -3078,6 +3132,7 @@ mod tests {
             .size(8, 40)
             .ring_buffer_size(64)
             .build();
+        configure_glass_theme(&mut term);
         let mut input = term.cell_frame(8, 40);
         materialize_pet(&mut p, &mut term, &mut input);
         let worn = p.companion.brain().worn_pair().expect("dressed");

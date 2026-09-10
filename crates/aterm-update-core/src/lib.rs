@@ -38,6 +38,7 @@
 pub mod cdn;
 pub mod manifest;
 pub mod pins;
+pub mod pkg_check;
 pub mod pointer;
 pub mod roster;
 pub mod seal_guard;
@@ -54,9 +55,10 @@ mod sys;
 pub use hash::sha256_file;
 pub use http::{
     HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, RateLimitHeaders, api_get,
-    api_get_classified, api_get_with_headers, download_bytes, download_error_is_rate_limit,
-    download_to, download_to_resumable, download_to_resumable_https_only, head_no_redirect,
-    parse_rate_limit_headers, rate_limit_from_header_dump,
+    api_get_classified, api_get_with_headers, download_bytes, download_error_is_not_found,
+    download_error_is_rate_limit, download_to, download_to_resumable,
+    download_to_resumable_https_only, head_no_redirect, parse_rate_limit_headers,
+    rate_limit_from_header_dump,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

@@ -2622,7 +2622,20 @@ pub(crate) struct TypedStamps {
 /// ([`CursorGlow::RAINBOW_TYPED_SWEEP_MAX`]): one observed move can spend at
 /// most this many cells, so banking more presses than that cannot license
 /// anything a move could ever sweep.
-pub(crate) const TYPED_STAMP_DEPTH: usize = 8;
+///
+/// **32, from 8 (2026-09-10, the owner: "i am still sometimes seeing black
+/// gaps").** 8 was sized for "a frame or two" of PTY batching. A real TUI does
+/// not batch by frames, it batches by its own REPAINT: measured on the shipped
+/// v0.79.0, a hand at 10 keys/s into a 900 ms debounced input box hands the
+/// engine one observed move of 9 and 10 columns, and a hand at the owner's
+/// measured 36 keys/s can hand it 25. Over the cap the sweep was refused
+/// OUTRIGHT and every cell the hand typed but the caret only passed through
+/// stayed background-black — the defect, not a policy. 32 cells is 0.9 s of
+/// typing at 36 keys/s, and it is safe to admit only because the ledger
+/// underneath it is now honest: a 32-cell sweep still has to produce 24
+/// UNSPENT press credits, which one `w` never can (see
+/// [`CursorGlow::RAINBOW_COALESCE_CREDIT_LIFE`]).
+pub(crate) const TYPED_STAMP_DEPTH: usize = 32;
 
 /// Capacity of [`CursorGlow::anchor_rows`] — how many distinct rows' print
 /// endpoints the anchored-echo lane remembers at once. A TUI interleaves the
@@ -3802,6 +3815,12 @@ pub struct TrailStatus<'a> {
     pub pet_content: f32,
     /// Queued clicks/strokes waiting for the brain's existing consumption gate.
     pub pet_pending: u8,
+    /// Located console attention, its cause, source event and command anchor.
+    pub pet_focus: &'a str,
+    pub pet_reason: &'a str,
+    pub pet_anchor: Option<u64>,
+    pub pet_event_seq: u64,
+    pub pet_pose: &'a str,
     /// Last drawn resident body `(x0, x1, y0, y1)` in frame pixels, exclusive ends.
     pub pet_body: Option<(i32, i32, i32, i32)>,
     /// Whether the flying cursor cat is animating.
@@ -3875,7 +3894,8 @@ impl TrailStatus<'_> {
              flow={:.2} combo={} combo_best={} \
              glow_active={} pet_active={} cat_active={} \
              block_fill={} block_fill_rgb={} block_fill_base={} block_fill_base_from={} \
-             pet_action={} pet_content={:.3} pet_pending={} pet_body={}",
+             pet_action={} pet_content={:.3} pet_pending={} pet_body={} \
+             pet_focus={} pet_reason={} pet_anchor={} pet_event_seq={} pet_pose={}",
             self.style_raw,
             self.style.label(),
             self.config_enabled,
@@ -3930,6 +3950,12 @@ impl TrailStatus<'_> {
                 || "none".to_string(),
                 |(x0, x1, y0, y1)| format!("{x0},{x1},{y0},{y1}"),
             ),
+            self.pet_focus,
+            self.pet_reason,
+            self.pet_anchor
+                .map_or_else(|| "none".to_string(), |id| id.to_string()),
+            self.pet_event_seq,
+            self.pet_pose,
         )
     }
 
@@ -4184,17 +4210,46 @@ impl CursorGlow {
     /// not itself a bound on resident work.
     const MAX_PARTICLES: usize = 512;
     /// Longest same-row typed-coalesce the ribbon sweeps as CONTINUED TYPING
-    /// (cells): batched echoes under fast typing / key-repeat rarely hop more
-    /// than a few cells per observed frame, while a repaint re-anchor (Claude
-    /// Code's inset box growing) hops the caret across cells it never visited —
-    /// beyond this cap the move keeps the single landing spark.
+    /// (cells): a repaint re-anchor (Claude Code's inset box growing) hops the
+    /// caret across cells it never visited — beyond this cap the move keeps the
+    /// single landing spark.
+    ///
+    /// It is [`TYPED_STAMP_DEPTH`] (32 since 2026-09-10, see that constant for
+    /// why 8 was a defect), and the two must stay equal: one observed move can
+    /// spend at most this many cells, so banking more presses than that cannot
+    /// license anything a move could ever sweep. What now separates a real
+    /// batched echo from a re-anchor at ANY length is the press ledger
+    /// ([`Self::RAINBOW_COALESCE_CREDIT_LIFE`]), not the length itself.
     const RAINBOW_TYPED_SWEEP_MAX: usize = TYPED_STAMP_DEPTH;
-    /// Press-budget window (seconds) for the typed-coalesce gate: the swept
-    /// cell count must be covered by presses within this window. Coalescing
-    /// only ever collapses echoes batched across a frame or two, so a real
-    /// N-glyph sweep always has N near-simultaneous presses behind it; a
-    /// burst at ≥4 chars/sec keeps 2-cell sweeps (the common case) passing.
-    const RAINBOW_COALESCE_PRESS_WINDOW: f32 = 0.5;
+    /// **HOW LONG AN UNSPENT PRESS CREDIT LIVES** (seconds) — the staleness
+    /// bound on [`Self::type_press_ring`], and no longer the budget itself.
+    ///
+    /// **THE LEDGER, NOT THE CLOCK (2026-09-10).** This used to be a wall-clock
+    /// WINDOW: the swept cells had to be covered by presses inside the last
+    /// 0.5 s *of the observation*. That is the wrong clock, and it is the whole
+    /// of the owner's "i am still sometimes seeing black gaps". The presses that
+    /// PRODUCE a late batch are, by construction, older than the batch — a hand
+    /// at 10 keys/s into a 700 ms debounced repaint offers seven cells backed by
+    /// presses 0.1–0.7 s old, of which the window could see four. Four credits
+    /// against seven cells fails the share rule by exactly one (`20 >= 21`), the
+    /// sweep is refused, and the six cells the hand really typed are never born.
+    /// Measured on glass at the frontier the arithmetic predicts: at five
+    /// credits a 6-column hop paints and a 7-column hop tears, in the same take,
+    /// in the same second.
+    ///
+    /// The honest question was never "how OLD are these presses" but "have these
+    /// presses' cells been LAID yet". A credit is now spent by the cells it lays
+    /// — every forward same-row typed echo spends, not just a coalesced one — so
+    /// the ring holds exactly the presses whose glyphs are still in flight, and
+    /// it self-drains during ordinary typing. That is what makes a long life
+    /// safe: an unspent credit is not a stale one, it is an unpaid one.
+    ///
+    /// 2.0 s is the bound on an echo that is never coming (a key the app
+    /// swallowed, a password prompt). It covers every repaint lag measured on
+    /// the shipped build — a 5 keys/s hand into a 1200 ms debounce leaves its
+    /// oldest press 1.4 s old at the observation — with room, and the ring's own
+    /// [`TYPED_STAMP_DEPTH`] capacity bounds the pool regardless.
+    const RAINBOW_COALESCE_CREDIT_LIFE: f32 = 2.0;
 
     // ── THE ZOOM STREAK'S SHAPE (see `emit_rainbow_jumps`) ─────────────────
     //
@@ -5090,6 +5145,117 @@ impl CursorGlow {
             .sum()
     }
 
+    /// How many UNPAID PRESSES sit in the ring within `window` — the same pool
+    /// [`Self::typed_credits_within`] sums, counted in KEYS instead of cells.
+    ///
+    /// The wide-glyph uprate needs the key count and only the key count: one
+    /// press lays one glyph, and a grid glyph is at most TWO cells wide, so a
+    /// press can be owed at most one column more than the host priced it at.
+    /// Bounding the uprate by this count is what keeps the share rule the
+    /// ordinary three-quarters restated in glyph space instead of a weakening
+    /// of it (see the call site in `classify_move`).
+    fn typed_presses_within(&self, now: Instant, window: f32) -> usize {
+        self.type_press_ring
+            .iter()
+            .flatten()
+            .filter(|(t, c)| *c > 0 && now.saturating_duration_since(*t).as_secs_f32() <= window)
+            .count()
+    }
+
+    /// How many columns of the same-row run `[from_col, to_col)` are WIDE
+    /// CONTINUATIONS — the second cell of a CJK / emoji glyph.
+    ///
+    /// **The width is the grid's, never a guess.** The host's per-frame row
+    /// probe ([`Self::observe_row`]) is captured under the same terminal lock
+    /// as the move being classified and spells a wide glyph's continuation
+    /// column `'\0'` (`Terminal::row_cols_into`'s convention, the one the poof
+    /// detector's column math already depends on). A zero-width joiner sequence
+    /// and a `COMPLEX` cluster reach the probe as their RESOLVED lead char plus
+    /// that same `'\0'`, so they count once and pay for two cells exactly like
+    /// any other wide glyph; a combining mark advances the caret by no column at
+    /// all and so appears in no swept run.
+    ///
+    /// `0` — the answer that changes nothing — whenever the probe cannot speak
+    /// for this row: no probe at all (a headless host, a direct-drive test, a
+    /// scrolled-back or unwired frame), a probe of a DIFFERENT row, or one older
+    /// than [`Self::POOF_PROBE_STALE`]. Both [`ProbeTrust`] classes are read:
+    /// this is a pure content measurement of cells the probe already carries,
+    /// which is precisely what `ContentOnly` exists to serve, and it licenses
+    /// nothing on its own.
+    fn swept_wide_continuations(
+        &self,
+        row: u16,
+        from_col: u16,
+        to_col: u16,
+        now: Instant,
+    ) -> usize {
+        let Some(meta) = self.row_cur_meta else {
+            return 0;
+        };
+        if meta.row != row
+            || now.saturating_duration_since(meta.at).as_secs_f32() > Self::POOF_PROBE_STALE
+        {
+            return 0;
+        }
+        let lo = usize::from(from_col);
+        let hi = usize::from(to_col).min(self.row_cur.len());
+        if lo >= hi {
+            return 0;
+        }
+        self.row_cur[lo..hi]
+            .iter()
+            .filter(|&&ch| ch == '\0')
+            .count()
+    }
+
+    /// **THE OLDEST UNPAID PRESS** — a key whose cells have not been laid and
+    /// whose credit has not gone stale ([`Self::RAINBOW_COALESCE_CREDIT_LIFE`]),
+    /// or `None` if the pool is empty. The typed licence of last resort for a
+    /// same-row forward echo whose repaint landed after every banked stamp went
+    /// stale; see the call site in `classify_move`. Oldest, because presses
+    /// license echoes in press order — the same rule
+    /// [`TypedStamps::take_fresh`] follows.
+    fn oldest_unpaid_press(&self, now: Instant) -> Option<Instant> {
+        self.type_press_ring
+            .iter()
+            .flatten()
+            .filter(|(t, c)| {
+                *c > 0
+                    && now.saturating_duration_since(*t).as_secs_f32()
+                        <= Self::RAINBOW_COALESCE_CREDIT_LIFE
+            })
+            .map(|(t, _)| *t)
+            .min()
+    }
+
+    /// Whether this move is a SAME-ROW FORWARD ECHO with an unpaid press behind
+    /// it — the licence of last resort for a repaint that landed after every
+    /// banked stamp went stale (see the seam in [`Self::spawn`] and the
+    /// classifier fallback in `classify_move`). Rainbow Kitty only: its ribbon
+    /// is a per-cell record of the keys, so a key with no cell is a defect there
+    /// in a way it is not for a comet; every other style keeps the stamp window
+    /// byte-for-byte.
+    fn unpaid_typed_echo(
+        &self,
+        pr: u16,
+        pc: u16,
+        cr: u16,
+        cc: u16,
+        now: Instant,
+        cfg: &GlowConfig,
+    ) -> bool {
+        matches!(cfg.style, GlowStyle::RainbowKitty)
+            && cr == pr
+            && cc > pc
+            // AT LEAST TWO unpaid presses — the same floor the coalesce's own
+            // share rule carries, and for the same reason. One press whose echo
+            // has not come is indistinguishable from a stamp that simply went
+            // stale, and the licence model's `StaleStampMoveDeclines` is right
+            // about that case. TWO or more is a BATCH still in flight, which is
+            // the only shape this licence exists for.
+            && self.typed_credits_within(now, Self::RAINBOW_COALESCE_CREDIT_LIFE) >= 2
+    }
+
     /// SPEND an admitted coalesce's credits, oldest-first: the presses that
     /// produced this echo are the ones consumed, so one pool of real typing
     /// can never fund a SECOND multi-cell echo (a scroll-by that happens to
@@ -5102,7 +5268,7 @@ impl CursorGlow {
                 if let Some((t, c)) = slot
                     && *c > 0
                     && now.saturating_duration_since(*t).as_secs_f32()
-                        <= Self::RAINBOW_COALESCE_PRESS_WINDOW
+                        <= Self::RAINBOW_COALESCE_CREDIT_LIFE
                     && oldest.is_none_or(|(_, ot)| *t < ot)
                 {
                     oldest = Some((i, *t));
@@ -5631,9 +5797,18 @@ impl CursorGlow {
         self.user_gesture_hint = None;
         self.newline_hint = None;
         self.reflow_hint = None;
+        // THE CREDIT RING KEEPS ITS OWN CLOCK (2026-09-10). This retired credits
+        // at `TYPE_HINT_FRESH` too, which unpicked the ledger fix on the one app
+        // that matters most: Claude Code brackets every repaint in a DECTCEM
+        // hide, so a boundary completes mid-batch and took with it every press
+        // older than 0.25 s — the exact presses a late repaint is about to owe
+        // cells for. A credit is retired when its cells are LAID (`spend_typed_credits`)
+        // or when it is stale by its own life, and this comment's own rule
+        // ("credits younger than that are real keys whose echoes have not
+        // landed") is what says so; only the number was wrong.
         for slot in self.type_press_ring.iter_mut() {
             if slot.is_some_and(|(t, _)| {
-                now.saturating_duration_since(t).as_secs_f32() > Self::TYPE_HINT_FRESH
+                now.saturating_duration_since(t).as_secs_f32() > Self::RAINBOW_COALESCE_CREDIT_LIFE
             }) {
                 *slot = None;
             }
@@ -7833,7 +8008,18 @@ impl CursorGlow {
         // the ribbon the user's own typing had just earned, five measured
         // segments at a time, because a spinner two rows away moved its caret.
         // That wipe is the darkness the owner reported, and it is gone.
-        if !self.move_licensed(now) {
+        //
+        // THE UNPAID PRESS IS A LICENCE TOO (2026-09-10, Rainbow Kitty only).
+        // `move_licensed` asks whether a key was pressed RECENTLY; a debounced
+        // app repaints when it likes, and half a second after the hand paused is
+        // routine — the whole batch then declines here, and not one of the cells
+        // the user typed is ever born. `move_licensed` itself is deliberately
+        // untouched: it is a public lockstep contract with the classic trail
+        // (`app_render.rs:635`), so the extension lives at THIS seam, on the ECHO
+        // SHAPE, for the one style whose ribbon is a per-cell record of the keys.
+        // Program output banks no credits, so a keyless caret walk still declines
+        // exactly as before.
+        if !self.move_licensed(now) && !self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg) {
             self.log_decline(now, (pr, pc), (cr, cc), Self::DECLINE_NO_FRESH_HINT);
             return false;
         }
@@ -7950,7 +8136,28 @@ impl CursorGlow {
             // geometry census below cannot see v2's births, so the ring
             // records the licence rather than a false `off-shape`.
             self.spawns += 1;
-            self.log_licensed(now, (pr, pc), (cr, cc));
+            // **A REFUSED SWEEP IS RECORDED AS A REFUSAL** (2026-09-10). This is
+            // the instrument, and until now Rainbow Kitty had none.
+            // `DECLINE_NO_CREDITS` was written only from the v1 spark path below,
+            // which this branch returns before ever reaching — so across three
+            // rounds of hunting, every take that visibly TORE reported
+            // `declined=0 last_decline_reason=none` while cells went black, and
+            // `reason=no-credits` occurred exactly zero times in a defect whose
+            // whole mechanism was the credit budget. The ring said `licensed` for
+            // a sweep it had just refused, and that blindness is why this family
+            // of defects survived as long as it did.
+            //
+            // The move IS licensed and its landing IS laid — `spawns` still counts
+            // it, and not one admission verdict changes here. What changes is only
+            // what the ring is told: when the credit budget and nothing else
+            // refused the coalesce (`credit_starved` mirrors every other clause of
+            // `rainbow_coalesce` exactly), the swept cells the user typed did not
+            // get born, and THAT is the event `ctl trail status` exists to name.
+            if mv.credit_starved {
+                self.log_decline(now, (pr, pc), (cr, cc), Self::DECLINE_NO_CREDITS);
+            } else {
+                self.log_licensed(now, (pr, pc), (cr, cc));
+            }
             return true;
         }
         let boost = self.birth_boost(&mv);
@@ -8131,7 +8338,28 @@ impl CursorGlow {
         // Consume the typed classifier once (one hint, one echo). Peek the
         // quench classifier because the deletion arm below owns its
         // consumption.
-        let typed_at = self.type_hint.take_fresh(now, Self::TYPE_HINT_FRESH);
+        let mut typed_at = self.type_hint.take_fresh(now, Self::TYPE_HINT_FRESH);
+        // **AN UNPAID PRESS IS ITSELF A TYPED LICENCE** (2026-09-10). The stamp
+        // bank asks how long ago the last KEY was; a debounced app repaints when
+        // it likes, and half a second after the hand paused is routine. Measured
+        // against a release build of the ledger fix, at 5 keys/s into a 1200 ms
+        // debounce: every hop painted except the last, which declined
+        // `no-fresh-hint` and left four cells background-black AT THE CARET.
+        //
+        // So when no stamp is fresh, ask the LEDGER instead: is there a press
+        // whose glyph has not been laid? That is the whole content of "a typed
+        // echo", it is the same law the credit ring was fixed to state, and it
+        // is self-limiting — program output banks no credits, so a keyless
+        // caret walk finds an empty pool and is refused exactly as before
+        // (`a_caret_that_advances_with_no_unpaid_press_still_buys_nothing`).
+        // Gated to the ECHO SHAPE, a same-row forward advance; every other
+        // shape keeps the stamp window byte-for-byte. The licence's clock is the
+        // OLDEST unpaid press, matching `take_fresh`'s press order and the rule
+        // that a swept cell is born at its KEY's clock, not its echo's.
+        if typed_at.is_none() && self.unpaid_typed_echo(pr, pc, cr, cc, now, cfg) {
+            typed_at = self.oldest_unpaid_press(now);
+        }
+        let typed_at = typed_at;
         let typed_pair = typed_at.is_some();
         let bs_pair = self.quench_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::QUENCH_HINT_FRESH
@@ -8225,10 +8453,57 @@ impl CursorGlow {
             // cells. `w` over a five-cell word is 1 credit against 5: refused by
             // both clauses. Eight typed cells backed by seven presses: 28 >= 24,
             // admitted, and it paints instead of tearing.
+            //
+            // The SHARE is unchanged; what changed on 2026-09-10 is that the
+            // number it reads is now truthful. `typed_credits_within` counts
+            // UNSPENT credits — presses whose glyphs have not been laid — over a
+            // life long enough to outlast a debounced repaint, instead of counting
+            // whatever happened to fall inside a 0.5 s window measured from the
+            // observation. See `RAINBOW_COALESCE_CREDIT_LIFE`.
+            //
+            // **A PRESS PAYS FOR THE CELLS ITS OWN GLYPH OCCUPIES** (2026-09-10,
+            // the wide-glyph residual). The host prices the width it can SEE — a
+            // committed IME run, a wide character it put on the wire
+            // (`app_input.rs`'s WIDTH-CREDIT PRICING) — and that half has worked
+            // since 2026-08-15. What it cannot see is a PROGRAM that echoes a
+            // different glyph from the key: a terminal-side input method, a TUI
+            // rendering full-width forms, a remote editor. There the host banks
+            // ONE cell per press while the caret advances TWO, and the share reads
+            // `4N >= 6N` — false for every N. A wide batch could never pay for
+            // itself out of its own presses; it was only ever funded by credits
+            // banked from a batch that was ALREADY REFUSED, which is why the
+            // measured ribbon painted in alternating blocks: refuse, accumulate,
+            // admit, refuse. Fifteen-cell black runs at 10 keys/s into a 700 ms
+            // repaint, on a build whose narrow typing was clean.
+            //
+            // So the run's own cells are asked how wide they are, from the grid's
+            // answer rather than a guess: `swept_wide_continuations` counts the
+            // `'\0'` continuation columns the host's row probe already carries
+            // (`observe_row`), captured under the same terminal lock as this move.
+            // Each unpaid press may claim at most ONE of them — one press lays one
+            // glyph and a grid glyph is at most two cells wide — so with every
+            // press priced at a single cell the rule reduces over an all-wide run
+            // to `presses >= 0.75 * glyphs`: the identical fraction the narrow
+            // rule asks for, restated in glyph space. It is not a loosening.
+            //
+            // THE FLOOR IS DELIBERATELY RAW. `credits >= 2` reads the ledger, never
+            // the uprate, because that clause is the anti-stray discriminator: one
+            // press whose echo has not come is indistinguishable from a stale stamp,
+            // and one credit is one credit however wide the cells beneath it are.
+            // Uprating the floor too would let a single `w` across full-width text
+            // buy the word it skimmed —
+            // `a_wide_glyphs_single_press_sweeps_its_continuation_cell`'s skim
+            // control and `a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy`'s
+            // second control are what hold that line.
             && {
                 let credits =
-                    self.typed_credits_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW);
-                credits >= 2 && credits * 4 >= dc_abs as usize * 3
+                    self.typed_credits_within(now, Self::RAINBOW_COALESCE_CREDIT_LIFE);
+                let paid = credits.saturating_add(
+                    self.swept_wide_continuations(cr, pc, cc, now).min(
+                        self.typed_presses_within(now, Self::RAINBOW_COALESCE_CREDIT_LIFE),
+                    ),
+                );
+                credits >= 2 && paid * 4 >= dc_abs as usize * 3
             };
         // The one shape the CREDIT BUDGET, and only the credit budget, refused:
         // everything else about this move said "coalesced typing" and the
@@ -8245,14 +8520,33 @@ impl CursorGlow {
             && dc_abs >= 2
             && dc_abs as usize <= Self::RAINBOW_TYPED_SWEEP_MAX
             && (!self.ctx_alt || blink_fresh);
-        // An admitted coalesce SPENDS what funded it: the same pool can never
-        // pay for a second stray multi-cell echo inside the window.
-        if rainbow_coalesce {
-            // Spend only what was there: the share rule can admit a sweep whose
-            // cells outnumber its credits, and the pool must not go negative or
-            // wrap. What funded it is still consumed, so a second stray echo
-            // inside the same window still cannot be paid for.
-            let credits = self.typed_credits_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW);
+        // **A CREDIT IS SPENT BY THE CELLS IT LAYS** (2026-09-10). Every forward
+        // same-row typed echo spends, not only a coalesced one — an ordinary
+        // 1-cell echo is a press whose glyph has just landed, and a press whose
+        // glyph has landed must not be able to buy a second cell somewhere else.
+        //
+        // This is the whole discrimination the old 0.5 s window was failing to
+        // make, in BOTH directions. It refused a real batched echo because the
+        // presses that produced it had aged out (the owner's black gaps); and it
+        // ADMITTED vim's `w` whenever five ordinary letters happened to have been
+        // typed inside the preceding half second, because those five credits were
+        // still sitting in the ring with their cells already on glass. Draining
+        // the pool as the cells land fixes both at once: what is left in the ring
+        // is exactly the light that has been paid for and not yet delivered.
+        //
+        // Spend only what was there: the share rule can admit a sweep whose cells
+        // outnumber its credits, and the pool must not go negative or wrap.
+        // The FOLD lays its cells too (`lay` walks back across the pane wrap), so
+        // its presses are paid and must leave the pool — otherwise a wrap's
+        // credits sit unspent and fund a later keyless hop on the new row, which
+        // is exactly what `rainbow_typing_wrap_folds_around_the_line_end` refutes.
+        let lays_typed_cells = matches!(cfg.style, GlowStyle::RainbowKitty)
+            && typed_pair
+            && !bs_pair
+            && !nav_paired
+            && ((cr == pr && cc > pc && (rainbow_coalesce || dc_abs == 1)) || shape_wrap);
+        if lays_typed_cells {
+            let credits = self.typed_credits_within(now, Self::RAINBOW_COALESCE_CREDIT_LIFE);
             self.spend_typed_credits(now, (dc_abs as usize).min(credits));
         }
         // Honour BOTH coalesce paths: `rainbow_coalesce` collapses a late-observed
@@ -21497,6 +21791,290 @@ mod tests {
         );
     }
 
+    /// **D1 — the owner, 2026-09-10: "i am still sometimes seeing black gaps".**
+    /// A HAND AT HUMAN SPEED INTO AN APP THAT REPAINTS LATE.
+    ///
+    /// This is the shape neither earlier reproduction could reach, because
+    /// `aterm ctl key` is synchronous per key and always shows the engine a
+    /// 1-cell move. A real TUI (Claude Code, and every debounced input box)
+    /// batches: seven presses at 10 keys/s land, the app repaints once ~700 ms
+    /// later, and ONE observed move hops seven columns. Measured on the shipped
+    /// v0.79.0 that left a literal 7-cell BLACK RUN in the band — pixel-identical
+    /// to the `cursor_trail_style = "off"` control on the same row of the same
+    /// take, i.e. cells holding no effect ink at all.
+    ///
+    /// The refusal came from `rainbow_coalesce`'s press budget being counted over
+    /// a WALL-CLOCK window from the observation: the presses that produced a late
+    /// batch are older than the window, so the very keys that earned the cells
+    /// could not pay for them. A credit is now spent by the cells it lays and
+    /// survives until it is spent, so the ledger says what it always meant to
+    /// say: these are the presses whose glyphs are still in flight.
+    ///
+    /// Both hops here are ones the shipped build refused: seven columns (the
+    /// credit-share frontier — at five credits `20 >= 21` fails by one) and ten
+    /// (over the old `RAINBOW_TYPED_SWEEP_MAX` of 8 outright).
+    #[test]
+    fn a_late_repaint_lays_every_cell_the_hand_typed() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut out = Vec::new();
+
+        for (keys, lag_ms) in [(7u16, 700u64), (10, 900)] {
+            let mut glow = CursorGlow::default();
+            let t0 = Instant::now();
+            glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+            // The hand: one press every 100 ms, nothing echoed yet.
+            for i in 0..u64::from(keys) {
+                glow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
+            }
+            // The app repaints once, `lag_ms` after the first key: all `keys`
+            // glyphs appear at once and the caret is observed `keys` columns on.
+            let at = t0 + Duration::from_millis(lag_ms);
+            glow.tick(Some((3, 2 + keys)), at, &c, g, &mut out);
+
+            let cols = v2_cols(&glow, 3);
+            let dark: Vec<u16> = (2..2 + keys).filter(|col| !cols.contains(col)).collect();
+            assert!(
+                dark.is_empty(),
+                "a {keys}-column batched echo after a {lag_ms} ms repaint left \
+                 cells {dark:?} unlit; lit: {cols:?}"
+            );
+            let tally = glow.admission_tally();
+            assert_eq!(
+                tally.declined, 0,
+                "the batch is typing, not a jump (last_decline_reason={:?})",
+                tally.last_decline_reason
+            );
+        }
+    }
+
+    /// **D1, THE LAST GATE** — the same defect one layer up. A repaint that
+    /// lands after the hand has PAUSED still owes the keys it swallowed.
+    ///
+    /// With the press ledger honest, the residual tear on glass moved to
+    /// `TYPE_HINT_FRESH`: `type_hint.take_fresh(now, 0.25)` asks how long ago the
+    /// last KEY was, and a debounced app can repaint half a second after it.
+    /// Measured against a release build of the ledger fix, at 5 keys/s into a
+    /// 1200 ms debounce: every hop painted except the last, which declined
+    /// `no-fresh-hint` and left cols 22..25 background-black at the caret — the
+    /// owner's symptom, from the one gate still counting the clock.
+    ///
+    /// The licence is now the LEDGER: an unpaid press is a real key whose glyph
+    /// has not landed, and that is the whole content of "a typed echo". Program
+    /// output banks no credits, so it can never take this path.
+    #[test]
+    fn a_repaint_that_lands_after_the_hand_pauses_still_lays_the_keys_it_owes() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        for i in 0..7u64 {
+            glow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
+        }
+        // The hand stopped at +600 ms; the box repaints at +1000 ms, 400 ms
+        // past every banked stamp's freshness.
+        glow.tick(
+            Some((3, 9)),
+            t0 + Duration::from_millis(1000),
+            &c,
+            g,
+            &mut out,
+        );
+        let cols = v2_cols(&glow, 3);
+        let dark: Vec<u16> = (2..9u16).filter(|col| !cols.contains(col)).collect();
+        assert!(
+            dark.is_empty(),
+            "the repaint owed seven cells and left {dark:?} unlit; lit: {cols:?}"
+        );
+    }
+
+    /// THE REFUTATION CONTROL for the gate above: with the pool DRAINED — every
+    /// press's glyph already on glass — a caret that advances on its own is
+    /// program output and buys nothing. This is the stray the freshness window
+    /// was there to refuse, and it is still refused; what changed is only that
+    /// the refusal now reads the ledger instead of a clock the app controls.
+    #[test]
+    fn a_caret_that_advances_with_no_unpaid_press_still_buys_nothing() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        for i in 1..=5u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 40);
+            glow.note_typed_cells(at, 1);
+            glow.tick(
+                Some((3, 2 + i)),
+                at + Duration::from_millis(4),
+                &c,
+                g,
+                &mut out,
+            );
+        }
+        let lit_after_typing = v2_cols(&glow, 3);
+        // 400 ms of silence, then the caret walks four columns by itself.
+        glow.tick(
+            Some((3, 11)),
+            t0 + Duration::from_millis(620),
+            &c,
+            g,
+            &mut out,
+        );
+        let cols = v2_cols(&glow, 3);
+        let bought: Vec<u16> = (7..=10u16).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "keyless output lit {bought:?}; before it: {lit_after_typing:?}, after: {cols:?}"
+        );
+    }
+
+    /// THE REFUTATION CONTROL for [`a_late_repaint_lays_every_cell_the_hand_typed`]:
+    /// the anti-stray shape the press budget exists to refuse must STILL be
+    /// refused. `w` in vim's normal mode is ONE press that hops the caret across
+    /// a whole word, and one key must never paint a ribbon over a word the user
+    /// only skimmed.
+    ///
+    /// The discrimination is no longer "how old are these presses" (which is what
+    /// broke the late repaint above) but "have these presses' cells already been
+    /// laid": five ordinary 1-cell echoes SPEND their five credits as they land,
+    /// so the lone `w` that follows finds an empty pool and its five swept cells
+    /// stay dark. Delete the spend and this test is what fails.
+    #[test]
+    fn one_press_still_cannot_buy_a_word_wide_hop() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+
+        // Five ordinary typed echoes, one cell each, each observed on its own
+        // frame: the everyday case, and the one that drains the pool.
+        for i in 1..=5u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 40);
+            glow.note_typed_cells(at, 1);
+            glow.tick(
+                Some((3, 2 + i)),
+                at + Duration::from_millis(4),
+                &c,
+                g,
+                &mut out,
+            );
+        }
+
+        // ONE press, and the caret jumps five columns: vim's `w`.
+        let at = t0 + Duration::from_millis(260);
+        glow.note_typed_cells(at, 1);
+        glow.tick(
+            Some((3, 12)),
+            at + Duration::from_millis(8),
+            &c,
+            g,
+            &mut out,
+        );
+
+        // The SKIMMED cells — the ones the caret only passed through — stay
+        // dark. The landing cell (11, the glyph cell behind the caret at 12) is
+        // the re-anchor's own single spark, exactly as v1 laid it; `join_cohort`
+        // admits a cell only adjacent to or inside a live cohort's span, so it
+        // MINTS ITS OWN mark rather than extending the typed run at 2..=6. That
+        // is the rule the parent lane wrote down: a cell that cannot be painted
+        // as ink is not CLAIMED as part of the band — here it is unclaimed
+        // ground between two marks, not a hole inside one.
+        let cols = v2_cols(&glow, 3);
+        let bought: Vec<u16> = (7..=10u16).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "one press bought the skimmed cells {bought:?}; lit: {cols:?}"
+        );
+        assert!(
+            (2..=6u16).all(|col| cols.contains(&col)),
+            "the five real echoes keep their own band: {cols:?}"
+        );
+    }
+
+    /// **THE INSTRUMENT.** A Rainbow Kitty sweep the credit budget REFUSED must
+    /// be recorded as a refusal, naming `no-credits`.
+    ///
+    /// This is the pin the whole black-gap family should have had first.
+    /// `DECLINE_NO_CREDITS` was written only from the v1 spark path, which the
+    /// RainbowKitty branch returns before ever reaching — so the ring answered
+    /// `licensed` for a sweep it had just declined. Across every on-glass take of
+    /// the 2026-09-10 round, including every take that visibly TORE,
+    /// `ctl trail status` read `declined=0 last_decline_reason=none` while cells
+    /// went black, and `reason=no-credits` occurred zero times in a defect whose
+    /// entire mechanism was the credit budget.
+    ///
+    /// The refusal itself is unchanged and deliberately so — this test drives the
+    /// exact shape `one_press_still_cannot_buy_a_word_wide_hop` proves must stay
+    /// dark, and asserts only what the ring says about it. The second half is the
+    /// control that keeps it honest: ordinary admitted typing must still read
+    /// `licensed`, or "always declare a decline" would pass this too.
+    #[test]
+    fn a_refused_rainbow_sweep_names_the_credit_budget_that_refused_it() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+
+        // Five ordinary echoes SPEND their five credits as they land.
+        for i in 1..=5u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 40);
+            glow.note_typed_cells(at, 1);
+            glow.tick(
+                Some((3, 2 + i)),
+                at + Duration::from_millis(4),
+                &c,
+                g,
+                &mut out,
+            );
+        }
+        let admitted = glow.admission_tally();
+        assert_eq!(
+            admitted.last_decline_reason, None,
+            "THE CONTROL: ordinary typing that painted must still read licensed"
+        );
+        assert_eq!(
+            admitted.declined, 0,
+            "nothing was refused yet: {admitted:?}"
+        );
+
+        // ONE press, caret jumps five columns: vim's `w`. Refused by the credit
+        // budget — and the ring must now say which budget.
+        let at = t0 + Duration::from_millis(260);
+        glow.note_typed_cells(at, 1);
+        glow.tick(
+            Some((3, 12)),
+            at + Duration::from_millis(8),
+            &c,
+            g,
+            &mut out,
+        );
+
+        let tally = glow.admission_tally();
+        assert_eq!(
+            tally.last_decline_reason,
+            Some(CursorGlow::DECLINE_NO_CREDITS),
+            "a sweep refused by the press budget must NAME it: {tally:?}"
+        );
+        assert!(
+            tally.declined > admitted.declined,
+            "the refusal must be counted, not reported as licensed: {tally:?}"
+        );
+        // And the light is unchanged: this is an instrument, not an admission.
+        let cols = v2_cols(&glow, 3);
+        let bought: Vec<u16> = (7..=10u16).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "recording the decline must not admit the skim: {bought:?}"
+        );
+    }
+
     /// One batched echo must lay exactly the same spatial hue sequence as the
     /// same glyphs observed one frame at a time. This is the production-state
     /// contract behind the advancing ribbon: frame coalescing may change birth
@@ -21600,6 +22178,146 @@ mod tests {
             !v2_cols(&skim, 3).contains(&4),
             "one 1-cell credit must not paint a skimmed continuation cell: {:?}",
             v2_cols(&skim, 3)
+        );
+    }
+
+    /// **D1, the wide-glyph residual (2026-09-10) — a PROGRAM that echoes CJK
+    /// or emoji for narrow keys.** A press may pay for the CELLS ITS OWN GLYPH
+    /// OCCUPIES; the share rule must be denominated in what the presses laid,
+    /// not in raw columns.
+    ///
+    /// The host prices the width it can see — a committed IME run, a wide
+    /// character it put on the wire (`app_input.rs`'s WIDTH-CREDIT PRICING,
+    /// 2026-08-15) — and that half has worked since. What it CANNOT see is a
+    /// program that echoes a *different* glyph from the key: a terminal-side
+    /// input method, a TUI rendering its buffer in full-width forms, a remote
+    /// editor. There the host banks ONE cell per press and the caret advances
+    /// TWO, so `credits * 4 >= dc_abs * 3` reads `4N >= 6N` — false for every
+    /// N. A wide batch could never pay for itself out of its own presses; it
+    /// was only ever funded by credits banked from a batch already refused,
+    /// which is why the measured ribbon painted in ALTERNATING BLOCKS: refuse,
+    /// accumulate, admit, refuse. Measured on the branch build before this fix,
+    /// CJK at 10 keys/s into a 700 ms repaint over 100 columns: longest interior
+    /// black run **15 cells**, 56 % of a 60-cell row lit.
+    ///
+    /// The width is not guessed. The engine already holds the grid's own answer:
+    /// the host's per-frame row probe ([`CursorGlow::observe_row`]) spells a wide
+    /// glyph's continuation column `'\0'`, captured under the same terminal lock
+    /// as the move being classified. Counting those columns inside the swept run
+    /// says exactly how many of its cells are second halves of glyphs the presses
+    /// laid.
+    ///
+    /// THE THREE CONTROLS ARE THE POINT, because the loosening is the risk:
+    ///
+    /// * the SAME probe over NARROW text is unchanged (it passed before this fix
+    ///   and must keep passing — it proves the probe itself neither lights nor
+    ///   darkens anything);
+    /// * ONE press must still not buy a wide hop — the `credits >= 2` floor is
+    ///   deliberately read from the RAW ledger, never from the uprate, so
+    ///   `a_wide_glyphs_single_press_sweeps_its_continuation_cell`'s skim control
+    ///   keeps its meaning;
+    /// * TWO presses must still not buy SEVEN wide glyphs. Each press may claim
+    ///   at most one extra column, because one press lays at most one glyph and a
+    ///   grid glyph is at most two cells wide. That bound is what makes the rule
+    ///   the ordinary ¾ share restated in glyph space rather than a weakening of
+    ///   it: with every press priced at one cell, `paid * 4 >= dc * 3` over an
+    ///   all-wide run reduces to `presses >= 0.75 * glyphs`, the identical
+    ///   fraction the narrow rule asks for.
+    #[test]
+    fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+
+        // A row of `n` WIDE glyphs starting at `from`: lead char at its column,
+        // `'\0'` at the continuation — exactly `Terminal::row_cols_into`'s
+        // convention, which is what the host hands `observe_row`.
+        let wide_row = |from: u16, n: u16| {
+            let mut cols = [' '; 40];
+            for i in 0..n {
+                let at = usize::from(from) + usize::from(i) * 2;
+                cols[at] = '漢';
+                cols[at + 1] = '\0';
+            }
+            cols
+        };
+
+        // THE DEFECT. Seven keys at 10/s; the app repaints once, 700 ms after
+        // the first, and echoes each as a 2-cell glyph — the caret is observed
+        // FOURTEEN columns on in one move.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        for i in 0..7u64 {
+            glow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
+        }
+        let at = t0 + Duration::from_millis(700);
+        glow.observe_row(3, 16, &wide_row(2, 7), at);
+        glow.tick(Some((3, 16)), at, &c, g, &mut out);
+        let cols = v2_cols(&glow, 3);
+        let dark: Vec<u16> = (2..16u16).filter(|col| !cols.contains(col)).collect();
+        assert!(
+            dark.is_empty(),
+            "the seven wide glyphs the hand typed left black cells {dark:?}; lit: {cols:?}"
+        );
+
+        // CONTROL 1 — the same probe, NARROW text. Seven keys, seven columns.
+        // Green before this fix and after it: the probe is a measurement, not a
+        // licence.
+        let mut narrow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        narrow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        for i in 0..7u64 {
+            narrow.note_typed_cells(t0 + Duration::from_millis(i * 100), 1);
+        }
+        let at = t0 + Duration::from_millis(700);
+        let mut plain = [' '; 40];
+        plain[2..9].fill('x');
+        narrow.observe_row(3, 9, &plain, at);
+        narrow.tick(Some((3, 9)), at, &c, g, &mut out);
+        let cols = v2_cols(&narrow, 3);
+        let dark: Vec<u16> = (2..9u16).filter(|col| !cols.contains(col)).collect();
+        assert!(
+            dark.is_empty(),
+            "narrow text under the same probe must be unchanged: dark {dark:?}, lit {cols:?}"
+        );
+
+        // CONTROL 2 — ONE press over the SAME wide row. `w` in vim across
+        // full-width text. The floor reads the raw ledger, so one credit is one
+        // credit however wide the cells under it are.
+        let mut skim = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        skim.tick(Some((3, 2)), t0, &c, g, &mut out);
+        skim.note_typed_cells(t0 + Duration::from_millis(10), 1);
+        let at = t0 + Duration::from_millis(30);
+        skim.observe_row(3, 16, &wide_row(2, 7), at);
+        skim.tick(Some((3, 16)), at, &c, g, &mut out);
+        let cols = v2_cols(&skim, 3);
+        let bought: Vec<u16> = (2..15u16).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "one press bought {bought:?} cells of wide text it only skimmed; lit: {cols:?}"
+        );
+
+        // CONTROL 3 — TWO presses over seven wide glyphs. Two presses may claim
+        // two extra columns, never seven: 4 paid against 14 swept is 16 >= 42,
+        // refused, exactly as two presses against fourteen NARROW cells are.
+        let mut short = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        short.tick(Some((3, 2)), t0, &c, g, &mut out);
+        short.note_typed_cells(t0 + Duration::from_millis(10), 1);
+        short.note_typed_cells(t0 + Duration::from_millis(110), 1);
+        let at = t0 + Duration::from_millis(300);
+        short.observe_row(3, 16, &wide_row(2, 7), at);
+        short.tick(Some((3, 16)), at, &c, g, &mut out);
+        let cols = v2_cols(&short, 3);
+        let bought: Vec<u16> = (2..15u16).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "two presses bought seven wide glyphs {bought:?}; lit: {cols:?}"
         );
     }
 
@@ -24932,6 +25650,11 @@ halo = "add"
             pet_action: "purr",
             pet_content: 0.42,
             pet_pending: 1,
+            pet_focus: "rest",
+            pet_reason: "quiet",
+            pet_anchor: None,
+            pet_event_seq: 0,
+            pet_pose: "pet_sit",
             pet_body: Some((12, 68, 30, 64)),
             cat_active: false,
             block_fill: Some(BlockFill {
@@ -25054,6 +25777,11 @@ halo = "add"
             pet_action: "none",
             pet_content: 0.0,
             pet_pending: 0,
+            pet_focus: "rest",
+            pet_reason: "quiet",
+            pet_anchor: None,
+            pet_event_seq: 0,
+            pet_pose: "pet_sit",
             pet_body: None,
             cat_active: false,
             block_fill: None,
@@ -25238,6 +25966,11 @@ halo = "add"
             pet_action: "none",
             pet_content: 0.0,
             pet_pending: 0,
+            pet_focus: "rest",
+            pet_reason: "quiet",
+            pet_anchor: None,
+            pet_event_seq: 0,
+            pet_pose: "pet_sit",
             pet_body: None,
             cat_active: false,
             block_fill: None,

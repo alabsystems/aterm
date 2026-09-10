@@ -27,6 +27,7 @@ fn report(outcome: &str) -> PackagesStatusReport {
         index_source: "alabsystems/aterm".to_string(),
         outcome: outcome.to_string(),
         seams: Vec::new(),
+        last_success_at: String::new(),
         programs: std::collections::BTreeMap::new(),
     };
     PackagesStatusReport::from_parts(true, true, "fp".to_string(), Some(&status), &[])

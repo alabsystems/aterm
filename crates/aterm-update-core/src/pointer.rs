@@ -30,6 +30,17 @@
 //! not accept — is REFUSED, never "interpreted". A moved-during-check pointer cannot mix
 //! two releases because nothing after the HEAD goes through `latest` again: the tag is
 //! the address of every later GET.
+//!
+//! # What it does NOT promise: that the head carries an app build
+//!
+//! `latest` is the newest PUBLISHED release, and the publication train publishes the
+//! shared `vX.Y.0` release from the source side before the app cut attaches its
+//! assets (measured 2026-09-10: v0.80.0 carried only `SHA256SUMS` and a roster copy
+//! for a whole night, and every client 404'd on `…/v0.80.0/aterm-appcast.toml`). So a
+//! pointer that resolves is not a release that can be installed from; the check lane
+//! treats a 404 on the head's appcast as the distinct "channel head has no app
+//! manifest" state and elects the newest release that does carry one
+//! (`aterm-update`'s `web_head_fallback`) — never as a broken download pipeline.
 
 use crate::cdn::path_segment_safe;
 use crate::http::{HeadAnswer, HttpError};

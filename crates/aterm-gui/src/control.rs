@@ -3806,6 +3806,10 @@ fn dispatch_before_session(
             "exits" => Some(control_session::cmd_exits(store, rest)),
             "dial-list" => Some(cmd_dial_list()),
             "dial-token" => Some(cmd_dial_token(rest)),
+            // `appnotice <lane> <text>`: a row on the pull-down, from outside the
+            // process. App state, so it answers with no terminal at all — which is
+            // exactly the shape of the terminal-run install that posts it.
+            "appnotice" => Some(control_query::cmd_appnotice(proxy, rest)),
             _ => None,
         }
         .map(Into::into);
@@ -7717,6 +7721,7 @@ fn handle(
             // normal-response companions.
             "dial-list" => cmd_dial_list(),
             "dial-token" => cmd_dial_token(rest),
+            "appnotice" => control_query::cmd_appnotice(proxy, rest),
             // A BARE `dial` reaches here: the serve-loop interception fires only on the
             // `"dial "` prefix (a name follows), but `read_request_line` strips the
             // newline leaving exactly "dial" with no trailing space — so a name-less
@@ -9742,12 +9747,27 @@ mod tests {
             ),
             ArtifactAckOutcome::AcknowledgementQuarantined
         );
+        // MEASURE THE AWAIT, NOT THE DRIBBLER. `started.elapsed()` used to be read
+        // AFTER `dribbler.join()`, so the window it bounded was the await PLUS a
+        // helper thread sleeping 25 ms per byte of the ack — tens of bytes, i.e.
+        // most of a second of sleeping this assertion never meant to measure,
+        // against a 2 s ceiling. Under the workspace test stage's own concurrency
+        // that crossed the line and failed a release gate three times on
+        // 2026-09-10 while the property it names was never in doubt (the
+        // `AcknowledgementQuarantined` assertion above IS that property). The
+        // budget belongs to the await alone; the join is teardown.
+        //
+        // Measured after the change: 5/5 green at 1-minute load 53, where the old
+        // form failed at load 10-20; and a +600 ms mutant on `awaited` fails with
+        // "the await ran 850ms against a 20 ms deadline", so the bound still bites.
+        let awaited = started.elapsed();
         let _ = server.shutdown(std::net::Shutdown::Both);
         dribbler.join().unwrap();
         assert!(sent.load(Ordering::Acquire) > 1, "the peer really dribbled");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "per-byte progress must not create a fresh acknowledgement budget"
+            awaited < std::time::Duration::from_millis(500),
+            "per-byte progress must not create a fresh acknowledgement budget: the \
+             await ran {awaited:?} against a 20 ms deadline"
         );
     }
 
@@ -14050,6 +14070,10 @@ mod tests {
                 "deliver",
                 "hold",
                 "outbox sent",
+                // `appnotice` MUTATES the pull-down (a row appears), so it takes the
+                // write op-class; the orthogonal `OwnerOnly` scope gate is what keeps
+                // a child edge from posting one.
+                "appnotice",
             ],
             "WriteInput set (input vocabulary + app-drive verbs)",
         );
@@ -20450,6 +20474,11 @@ mod tests {
             pet_action: "purr",
             pet_content: 0.42,
             pet_pending: 1,
+            pet_focus: "rest",
+            pet_reason: "quiet",
+            pet_anchor: None,
+            pet_event_seq: 0,
+            pet_pose: "pet_sit",
             pet_body: Some((12, 68, 30, 64)),
             cat_active: false,
             // A body PRESENT, so the fields that only a claimed caret fills are

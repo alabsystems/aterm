@@ -75,6 +75,17 @@ pub const DETACH_FIX: &str =
 /// The record-key prefix in `status.toml`'s `seams` list (`rustup:<name>`).
 const RECORD_PREFIX: &str = "rustup:";
 
+/// The `seams` spelling of a REFUSED re-assertion: `refused:rustup:<name>: <why>`.
+///
+/// Until 2026-09-10 a refusal was only `println!`d by the pass verbs — and the 6-hourly
+/// pass the GUI spawns discards stdout, so a machine whose `~/.rustup/toolchains/trust`
+/// pointed at a from-source dev build (m21, since Jul 19) re-printed the refusal into
+/// the void every six hours while `status.toml` said `seams = []` and `doctor` said
+/// healthy. Recorded here it reaches `aterm pkg status` and Settings. The prefix is
+/// chosen so [`recorded_names`] — which strips [`RECORD_PREFIX`] — can never read a
+/// refusal as a seam to re-assert.
+pub const REFUSED_PREFIX: &str = "refused:";
+
 /// Whether `name` is on the allowlist.
 #[must_use]
 pub fn name_allowed(name: &str) -> bool {
@@ -151,7 +162,7 @@ pub enum Entry {
 
 impl Entry {
     /// The words a refusal uses for what was found.
-    fn describe(&self, layout: &Layout) -> String {
+    pub(crate) fn describe(&self, layout: &Layout) -> String {
         match self {
             Entry::Absent => "absent".to_string(),
             Entry::Link(raw) => format!(
@@ -766,6 +777,61 @@ fn unrecord(layout: &Layout, name: &str) -> io::Result<()> {
     crate::status::write(layout, &s)
 }
 
+/// The `seams` key of a refusal for `name`: `refused:rustup:<name>`.
+#[must_use]
+pub fn refused_key(name: &str) -> String {
+    let mut k = String::from(REFUSED_PREFIX);
+    k.push_str(&record_key(name));
+    k
+}
+
+/// Every recorded refusal, as `(name, why)` — what `status`/`doctor` print when the last
+/// pass could not lay a seam. Empty when the last re-assertion of every seam succeeded.
+#[must_use]
+pub fn refusals(layout: &Layout) -> Vec<(String, String)> {
+    recorded_keys(layout)
+        .iter()
+        .filter_map(|k| {
+            let rest = k
+                .strip_prefix(REFUSED_PREFIX)?
+                .strip_prefix(RECORD_PREFIX)?;
+            let (name, why) = rest.split_once(": ")?;
+            Some((name.to_string(), why.to_string()))
+        })
+        .collect()
+}
+
+/// Record that re-asserting `name` was refused with `why` (replacing any earlier
+/// refusal for the same name). Never touches the `rustup:<name>` record itself.
+fn record_refusal(layout: &Layout, name: &str, why: &str) -> io::Result<()> {
+    let key = refused_key(name);
+    let mut entry = key.clone();
+    entry.push_str(": ");
+    entry.push_str(why);
+    let mut s = crate::status::read(layout).unwrap_or_else(fresh_status);
+    if s.seams.contains(&entry) {
+        return Ok(());
+    }
+    s.seams.retain(|k| !k.starts_with(&key));
+    s.seams.push(entry);
+    s.seams.sort();
+    crate::status::write(layout, &s)
+}
+
+/// Drop the recorded refusal for `name`, if any.
+fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
+    let key = refused_key(name);
+    let Some(mut s) = crate::status::read(layout) else {
+        return Ok(());
+    };
+    let before = s.seams.len();
+    s.seams.retain(|k| !k.starts_with(&key));
+    if s.seams.len() == before {
+        return Ok(());
+    }
+    crate::status::write(layout, &s)
+}
+
 /// Re-assert every recorded seam, plus a first attach of [`DEFAULT_SEAM`] when rustup
 /// is present, the entry is absent and trust is installed. Best-effort and quiet:
 /// the returned lines name only what CHANGED (created, re-pointed) and what was
@@ -779,20 +845,37 @@ pub fn reassert(layout: &Layout, rustup_home: &Path) -> Vec<String> {
     }
     let mut names: std::collections::BTreeSet<String> =
         recorded_names(layout).into_iter().collect();
-    if !names.contains(DEFAULT_SEAM)
-        && matches!(
-            inspect(&seam_path(rustup_home, DEFAULT_SEAM)),
-            Ok(Entry::Absent)
-        )
-        && std::fs::symlink_metadata(seam_target(layout)).is_ok()
-    {
+    // The default seam joins whenever trust is INSTALLED — not only when its entry is
+    // absent. `attach` is fail-closed on every shape the entry can take (absent ⇒
+    // created, a link into the store ⇒ adopted or re-pointed, anything foreign ⇒
+    // refused, nothing touched), so the only thing widening this changes is that a
+    // foreign entry is now SAID and RECORDED each pass instead of silently skipped:
+    // m21 ran seven weeks with `~/.rustup/toolchains/trust` pointing at a dev stage2,
+    // `seams = []`, and every pass walking an empty name set (2026-09-10 audit).
+    if !names.contains(DEFAULT_SEAM) && std::fs::symlink_metadata(seam_target(layout)).is_ok() {
         names.insert(DEFAULT_SEAM.to_string());
     }
     for name in names {
         match attach(layout, rustup_home, &name) {
-            Ok(a) if a.changed() => lines.push(a.to_string()),
-            Ok(_) => {}
-            Err(e) => lines.push(e.to_string()),
+            Ok(a) => {
+                // A seam that attaches (or was already right) clears the refusal the
+                // last pass may have recorded — the record follows the disk.
+                let _ = clear_refusal(layout, &name);
+                if a.changed() {
+                    lines.push(a.to_string());
+                }
+            }
+            Err(e) => {
+                let why = e.to_string();
+                // A refusal is RECORDED, not only returned: the pass verbs print these
+                // lines into a stdout the GUI discards. `Io` is a filesystem hiccup, not
+                // a posture — recording it would make one transient EIO a standing
+                // fault in Settings.
+                if !matches!(e, Refusal::Io(_)) {
+                    let _ = record_refusal(layout, &name, &why);
+                }
+                lines.push(why);
+            }
         }
     }
     lines
@@ -1120,6 +1203,49 @@ mod tests {
         assert!(s.to_string().contains("target=(a real directory)"), "{s}");
     }
 
+    // A refused re-assertion is RECORDED in status.toml's `seams` as
+    // `refused:rustup:trust: <why>` — the spelling `recorded_names` can never read as a
+    // seam — and cleared by the first re-assertion that succeeds. Measured need: m21's
+    // `~/.rustup/toolchains/trust` pointed at a dev stage2 for seven weeks while the
+    // 6-hourly pass printed the refusal into a discarded stdout and status said
+    // `seams = []` (2026-09-10 audit).
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_reassertion_is_recorded_until_one_succeeds() {
+        let fx = Fixture::new("refusal-record");
+        fx.install_trust(6808);
+        let elsewhere = fx.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        link(&elsewhere, &fx.seam("trust"));
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(DETACH_FIX), "{lines:?}");
+        let refused = refusals(&fx.layout);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0].0, "trust");
+        assert!(refused[0].1.contains("a symlink to"), "{refused:?}");
+        assert_eq!(
+            fx.seams_recorded(),
+            vec![format!("refused:rustup:trust: {}", refused[0].1)]
+        );
+        // The refusal never masquerades as a recorded seam to re-assert.
+        assert!(recorded_names(&fx.layout).is_empty());
+        // Recording again with the same words is idempotent (one entry, no churn).
+        let _ = reassert(&fx.layout, &fx.rustup);
+        assert_eq!(fx.seams_recorded().len(), 1);
+        // The disk was never touched: the foreign link still points elsewhere.
+        assert_eq!(std::fs::read_link(fx.seam("trust")).unwrap(), elsewhere);
+        // The user re-points the entry into the store; the next pass adopts it and
+        // the refusal leaves the record, replaced by the seam itself.
+        std::fs::remove_file(fx.seam("trust")).unwrap();
+        link(&seam_target(&fx.layout), &fx.seam("trust"));
+        let lines = reassert(&fx.layout, &fx.rustup);
+        assert!(lines.is_empty(), "an adoption is quiet: {lines:?}");
+        assert!(refusals(&fx.layout).is_empty());
+        assert_eq!(fx.seams_recorded(), vec!["rustup:trust".to_string()]);
+        assert_eq!(refused_key("trust"), "refused:rustup:trust");
+    }
+
     #[cfg(unix)]
     #[test]
     fn foreign_symlink_is_refused_and_left_alone() {
@@ -1249,6 +1375,7 @@ mod tests {
                 index_source: "owner/repo".into(),
                 outcome: "up to date".into(),
                 seams: Vec::new(),
+                last_success_at: String::new(),
                 programs,
             },
         )

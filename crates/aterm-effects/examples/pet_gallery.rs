@@ -12,15 +12,18 @@
 //! size users see, both grounds, one page.
 //!
 //! ```text
-//! cargo run -q -p aterm-effects --example pet_gallery -- [out_dir]
+//! targo --unverified run -q -p aterm-effects --example pet_gallery -- [out_dir] [--contact]
 //! (default out_dir: target/pet_gallery)
 //! ```
+//!
+//! `--contact` narrows the sheet to the contact/terrain family and shows
+//! 16/24/32/34/68 px art, with the same production fills and detail culling.
 
 use std::path::Path;
 
 use aterm_effects::cat_baker::CatColorKey;
 use aterm_effects::pet_baker::{PetBakeKey, PetBaker};
-use aterm_effects::pet_glyphs_gen::PET_GLYPH_IDS;
+use aterm_effects::pet_glyphs_gen::{PET_GLYPH_IDS, PetGlyphId};
 use aterm_scene::Tile;
 
 /// Tokyo-Night-ish dark ground / warm paper light ground (kitty_gallery's).
@@ -33,39 +36,80 @@ const LIGHT_FG: [u8; 3] = [0x24, 0x29, 0x2F];
 const SHIP_H: u32 = 34;
 
 fn main() {
-    let out = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "target/pet_gallery".into());
-    std::fs::create_dir_all(&out).expect("create out dir");
-
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let contact = args.last().is_some_and(|flag| flag == "--contact");
+    let positional = if contact {
+        &args[..args.len() - 1]
+    } else {
+        &args[..]
+    };
+    if positional.len() > 1 || positional.first().is_some_and(|out| out.starts_with('-')) {
+        eprintln!("usage: pet_gallery [out_dir] [--contact]");
+        std::process::exit(2);
+    }
+    let out = positional
+        .first()
+        .map_or("target/pet_gallery", String::as_str);
+    std::fs::create_dir_all(out).expect("create out dir");
+    use PetGlyphId::*;
+    let contact_poses = [
+        PetContactBrace,
+        PetTailTuck,
+        PetContactRecover,
+        PetInspectDown,
+        PetReachPaw,
+        PetWithdrawPaw,
+        PetEdgePerch,
+        PetEdgeLookUp,
+        PetEdgeLookDown,
+        PetEdgeLean,
+        PetDogContactBrace,
+        PetDogTailTuck,
+        PetDogContactRecover,
+        PetDogInspectDown,
+        PetDogReachPaw,
+        PetDogWithdrawPaw,
+        PetDogEdgePerch,
+        PetDogEdgeLookUp,
+        PetDogEdgeLookDown,
+        PetDogEdgeLean,
+    ];
+    let poses = if contact {
+        &contact_poses[..]
+    } else {
+        PET_GLYPH_IDS
+    };
+    let heights: &[u32] = if contact {
+        &[16, 24, 32, SHIP_H, SHIP_H * 2]
+    } else {
+        &[SHIP_H, SHIP_H * 2]
+    };
     for &(tag, bg, fg) in &[("light", LIGHT_BG, LIGHT_FG), ("dark", DARK_BG, DARK_FG)] {
         let dark = tag == "dark";
-        let items: Vec<Cell> = PET_GLYPH_IDS
+        let items: Vec<Cell> = poses
             .iter()
             .map(|&pose| {
-                let ship = bake(pose, dark, SHIP_H);
-                let big = bake(pose, dark, SHIP_H * 2);
+                let tiles: Vec<Tile> = heights.iter().map(|&h| bake(pose, dark, h)).collect();
                 Cell {
-                    tile: hstack(&[&ship, &big], bg),
+                    tile: hstack(&tiles.iter().collect::<Vec<_>>(), bg),
                     label: format!("{pose:?}"),
                 }
             })
             .collect();
-        sheet(
-            &format!("PET POSES  ({tag})  {SHIP_H}/{} PX  ONE ANIMAL", SHIP_H * 2),
-            &items,
-            5,
-            bg,
-            fg,
-        )
-        .save(&format!("{out}/poses_{tag}.png"));
+        let title = if contact {
+            format!("PET CONTACT ({tag}) 16/24/32/34/68 PX")
+        } else {
+            format!("PET POSES  ({tag})  {SHIP_H}/{} PX  ONE ANIMAL", SHIP_H * 2)
+        };
+        sheet(&title, &items, if contact { 4 } else { 5 }, bg, fg)
+            .save(&format!("{out}/poses_{tag}.png"));
     }
     println!("pet gallery written to {out}/ (poses_light.png, poses_dark.png)");
 }
 
 /// Bake one pose through the real path at art height `h`, width from the
 /// pose's own aspect, neutral context, the gallery's reference coat/iris.
-fn bake(pose: aterm_effects::pet_glyphs_gen::PetGlyphId, dark: bool, h: u32) -> Tile {
+fn bake(pose: PetGlyphId, dark: bool, h: u32) -> Tile {
     let w = ((h as f32) * PetBaker::aspect(pose)).round().max(1.0) as u32;
     let key = PetBakeKey {
         pose,

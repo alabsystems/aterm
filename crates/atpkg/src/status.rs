@@ -71,9 +71,55 @@ pub struct Status {
     /// a newer record simply ignores the key.
     #[serde(default)]
     pub seams: Vec<String>,
+    /// RFC3339 UTC time of the last SUCCESSFUL update pass — stamped by
+    /// [`stamp_success`] alone, never by the per-program writers, which move
+    /// `updated_at` on every write (a failed resolve, a shadow reconcile, a seed offer
+    /// row) and so made "N day(s) since the last successful update" a sentence about
+    /// the last write of any kind (2026-09-10 audit). Empty ⇒ no successful pass has
+    /// completed since this field existed: [`never_checked`] reads it, and every
+    /// read-only verb prints [`NEVER_CHECKED_LINE`] on stderr while it is empty. A
+    /// record written before the field parses as empty — a machine that has been
+    /// updating for a month reads "never checked" for exactly one pass, then the next
+    /// success stamps it.
+    #[serde(default)]
+    pub last_success_at: String,
     /// Per-program states, keyed by program name.
     #[serde(default)]
     pub programs: BTreeMap<String, ProgramStatus>,
+}
+
+/// The stderr line every read-only verb (`list`, `which`, `status`, `doctor`, the
+/// `__pending` stub) prints while [`never_checked`] holds — R3 (owner requirement
+/// 2026-09-10): a console must SAY that packages cannot be updated yet, not leave it
+/// to a window nobody has opened. Byte-stable: the GUI and the session lane print the
+/// same words from this constant.
+pub const NEVER_CHECKED_LINE: &str = "atpkg: no update check has run yet on this machine — \
+                                      packages cannot be updated until the first pass \
+                                      completes (run: aterm pkg update)";
+
+/// Whether NO update pass has ever completed successfully on this machine:
+/// `status.toml` absent, unreadable, or present with an empty
+/// [`Status::last_success_at`]. This is the R3 condition, and nothing weaker: a record
+/// that exists because a failed resolve wrote its `*index*` row is not a check that
+/// ran.
+#[must_use]
+pub fn never_checked(layout: &Layout) -> bool {
+    read(layout).is_none_or(|s| s.last_success_at.trim().is_empty())
+}
+
+/// Stamp `last_success_at = now` (and `updated_at`, which every write moves) on the
+/// record, creating a minimal one when none exists. Called by the CLI at the END of a
+/// pass that resolved the signed index and applied it without a failure — the one
+/// event that makes "packages can be updated on this machine" true. Best-effort like
+/// every status write.
+pub fn stamp_success(layout: &Layout, now: &str) -> io::Result<()> {
+    let mut status = read(layout).unwrap_or(Status {
+        schema: 1,
+        ..Default::default()
+    });
+    status.last_success_at = now.to_string();
+    status.updated_at = now.to_string();
+    write(layout, &status)
 }
 
 impl Status {
@@ -211,6 +257,7 @@ mod tests {
             index_source: "alabsystems/aterm-toolchain-index".into(),
             outcome: "up to date".into(),
             seams: Vec::new(),
+            last_success_at: "2026-06-29T00:00:00Z".into(),
             programs,
         };
         write(&l, &s).unwrap();
@@ -310,6 +357,7 @@ mod tests {
             index_source: "o/r".into(),
             outcome: "up to date".into(),
             seams: vec!["rustup:trust".into()],
+            last_success_at: String::new(),
             programs,
         };
         write(&l, &s).unwrap();
@@ -334,5 +382,73 @@ mod tests {
         assert!(back.seams.is_empty(), "no key ⇒ no seams");
         assert_eq!(back.programs["trust"].installed_build, Some(6808));
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// R3: "never checked" is exactly `status.toml` absent OR `last_success_at` empty —
+    /// a record a FAILED pass wrote (its `*index*` row, a fresh `updated_at`) still reads
+    /// as never checked; only [`stamp_success`] clears it, and the stamp round-trips
+    /// beside the program rows.
+    #[test]
+    fn never_checked_holds_until_a_successful_pass_stamps_last_success_at() {
+        let l = layout("never-checked");
+        assert!(never_checked(&l), "no status.toml at all");
+        // A failed pass's record: written, stamped, and still not a completed check.
+        let mut programs = BTreeMap::new();
+        programs.insert(
+            "*index*".to_string(),
+            ProgramStatus {
+                installed_build: None,
+                state: "error: index unreachable".into(),
+                tree_root: String::new(),
+            },
+        );
+        write(
+            &l,
+            &Status {
+                schema: 1,
+                updated_at: "2026-09-10T06:40:53Z".into(),
+                outcome: "update failed: index unreachable".into(),
+                programs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            never_checked(&l),
+            "a failed pass moves updated_at but is not a check that ran"
+        );
+        // A record from before the field existed parses as never checked too.
+        let legacy = "schema = 1\nupdated_at = \"2026-08-01T00:00:00Z\"\nenabled = true\n\
+             index_source = \"o/r\"\noutcome = \"up to date\"\n";
+        std::fs::write(l.status(), legacy).unwrap();
+        assert!(never_checked(&l), "pre-field record: empty last_success_at");
+        // The success stamp — and only it — clears the condition, keeping the rest.
+        stamp_success(&l, "2026-09-10T07:00:00Z").unwrap();
+        assert!(!never_checked(&l));
+        let back = read(&l).unwrap();
+        assert_eq!(back.last_success_at, "2026-09-10T07:00:00Z");
+        assert_eq!(back.updated_at, "2026-09-10T07:00:00Z");
+        assert_eq!(back.outcome, "up to date", "the sentence is not touched");
+        let text = std::fs::read_to_string(l.status()).unwrap();
+        assert!(text.contains("last_success_at = \"2026-09-10T07:00:00Z\""));
+        // Whitespace is not a stamp.
+        std::fs::write(l.status(), "schema = 1\nlast_success_at = \"  \"\n").unwrap();
+        assert!(never_checked(&l));
+        // No record at all: the stamp creates a minimal one.
+        std::fs::remove_file(l.status()).unwrap();
+        stamp_success(&l, "2026-09-10T08:00:00Z").unwrap();
+        assert!(!never_checked(&l));
+        assert_eq!(read(&l).unwrap().schema, 1);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The R3 line is a byte-stable contract shared with the session lane and the GUI.
+    #[test]
+    fn the_never_checked_line_is_the_contract_string() {
+        assert_eq!(
+            NEVER_CHECKED_LINE,
+            "atpkg: no update check has run yet on this machine — packages cannot be \
+             updated until the first pass completes (run: aterm pkg update)"
+        );
     }
 }

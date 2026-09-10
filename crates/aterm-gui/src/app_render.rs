@@ -1870,6 +1870,113 @@ mod cursor_scroll_signal_tests {
         );
     }
 
+    /// **D2 — the owner, 2026-09-10: "when the screen is refreshed the rainbow
+    /// disapears".** The consumer end of the erase fix, on a REAL terminal and a
+    /// REAL window: an erase must not reach `cursor_glow.reset()`.
+    ///
+    /// This is the chain the owner was riding, end to end: `ESC[J` ->
+    /// `erase.rs`'s `moves_coordinates` flag -> `coordinates_invalidated` ->
+    /// `ContentScrollState::invalidation_epoch` -> `cursor_effect_scroll_decision`
+    /// -> `Invalidate` -> `sync_cursor_effect_scroll`'s `window.cursor_glow.reset()`
+    /// -> `Engine::reset` -> `Ribbon::reset`. A bare zsh emits `ESC[J` four times
+    /// and `ESC[2J` once in a handful of interactions, so on the shipped v0.79.0
+    /// the whole earned ribbon died at every prompt redraw, with the caret still,
+    /// the grid unchanged and the terminal the same one. Measured on glass as a
+    /// single-frame cliff: chromatic pixels 2149 -> 143 between two consecutive
+    /// 60 fps frames.
+    ///
+    /// The reset itself is RIGHT and stays: it is what stops a phantom comet
+    /// streaking from a cell the cursor never occupied when the grid really did
+    /// move. The scroll below is that case, and it is this test's vacuity control.
+    #[test]
+    fn an_erase_does_not_reset_the_cursor_effects_and_the_ribbon_survives_it() {
+        let mut app = App::headless_for_test();
+        let mut cfg = app.glow_config();
+        cfg.enabled = true;
+        cfg.style = crate::cursor_glow::GlowStyle::RainbowKitty;
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 10,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 160,
+            head: 0,
+        };
+        let t0 = Instant::now();
+
+        // A terminal with a line on it, and a window whose ribbon is earned by
+        // typing that line — the two halves the owner has in front of him.
+        let mut term = Terminal::new(10, 40);
+        term.process(b"the quick brown fox");
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        ws.cursor_scroll_state = Some(term.content_scroll_state());
+        let mut out = Vec::new();
+        ws.cursor_glow.tick(Some((0, 0)), t0, &cfg, geom, &mut out);
+        for i in 1..=9u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 40);
+            ws.cursor_glow.note_synthetic_typed(at, 1);
+            ws.cursor_glow.tick(
+                Some((0, i)),
+                at + Duration::from_millis(4),
+                &cfg,
+                geom,
+                &mut out,
+            );
+        }
+        let earned = ws.cursor_glow.ribbon_segments();
+        assert!(earned > 0, "the take must start with a ribbon to lose");
+
+        // THE REFRESH: a bare erase-in-display, exactly what a zsh prompt redraw
+        // writes. Nothing else happens — no key, no caret move, no resize.
+        for spelling in [
+            &b"\x1b[J"[..],
+            &b"\x1b[1J"[..],
+            &b"\x1b[2J"[..],
+            &b"\x1b#8"[..],
+        ] {
+            term.process(spelling);
+            let decision =
+                cursor_effect_scroll_decision(ws.cursor_scroll_state, term.content_scroll_state());
+            assert_eq!(
+                decision,
+                CursorEffectScrollDecision::Unchanged,
+                "{spelling:?} rewrites cells in place; it is not a coordinate change"
+            );
+            let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+            assert!(
+                !change.invalidated,
+                "{spelling:?} must not retire the cursor effects"
+            );
+            assert_eq!(
+                ws.cursor_glow.ribbon_segments(),
+                earned,
+                "{spelling:?} wiped the earned ribbon: {} -> {}",
+                earned,
+                ws.cursor_glow.ribbon_segments()
+            );
+        }
+
+        // VACUITY CONTROL: a partial-region scroll really does move rows, and it
+        // must still invalidate — otherwise this test would pass on an engine
+        // that had simply stopped listening.
+        term.process(b"\x1b[2;3r\x1b[3;1H\n");
+        assert_eq!(
+            cursor_effect_scroll_decision(ws.cursor_scroll_state, term.content_scroll_state()),
+            CursorEffectScrollDecision::Invalidate,
+            "a region scroll moves rows and must still retire the effects"
+        );
+        let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+        assert!(change.invalidated);
+        assert_eq!(
+            ws.cursor_glow.ribbon_segments(),
+            0,
+            "the reset that stops a phantom comet is intact"
+        );
+    }
+
     #[test]
     fn invalidation_runs_before_current_alt_context_and_drops_old_blink() {
         let mut app = App::headless_for_test();
@@ -6730,6 +6837,90 @@ pub(crate) fn flying_head_footprint_px(
     Some((fp.x, fp.x + i32::from(fp.w), fp.y, fp.y + i32::from(fp.h)))
 }
 
+/// Reserve host glyphs that will be spliced AFTER the console observation.
+/// Pure geometry: prediction expiry/reconciliation remains on its existing
+/// paint path. The current find match is already a terminal selection; both
+/// possible find-bar bands are reserved because its late placement can flip.
+fn pet_console_exclusions(
+    input: &aterm_core::render::RenderInput,
+    preedit: bool,
+    predictions: Option<(usize, usize, usize, usize)>,
+    find_open: bool,
+) -> ([aterm_effects::pet_world::PetRect; 4], usize) {
+    use aterm_effects::pet_world::PetRect;
+    let mut rects = [PetRect::default(); 4];
+    let mut count = 0;
+    if preedit && input.display_offset == 0 && input.cursor_row < input.rows && input.cols > 0 {
+        rects[count] = PetRect::new(input.cursor_row as f32, 0.0, 1.0, input.cols as f32);
+        count += 1;
+    }
+    if input.display_offset == 0
+        && let Some((r0, c0, r1, c1)) = predictions
+    {
+        let r1 = r1.min(input.rows);
+        let c1 = c1.min(input.cols);
+        if r0 < r1 && c0 < c1 {
+            rects[count] = PetRect::new(r0 as f32, c0 as f32, (r1 - r0) as f32, (c1 - c0) as f32);
+            count += 1;
+        }
+    }
+    if find_open && input.rows > 0 && input.cols > 0 {
+        let rows = crate::find_bar::FIND_BAR_ROWS.min(input.rows);
+        rects[count] = PetRect::new(0.0, 0.0, rows as f32, input.cols as f32);
+        rects[count + 1] = PetRect::new(
+            (input.rows - rows) as f32,
+            0.0,
+            rows as f32,
+            input.cols as f32,
+        );
+        count += 2;
+    }
+    (rects, count)
+}
+
+#[cfg(test)]
+mod pet_console_observation_tests {
+    use super::pet_console_exclusions;
+    use aterm_core::terminal::Terminal;
+    use aterm_effects::pet_world::{PetPane, PetRect, PetWorld, PetWorldFacts};
+
+    #[test]
+    fn late_native_overlays_reserve_real_cells_before_pet_planning() {
+        let mut term = Terminal::new(20, 60);
+        term.process(b"\x1b]11;#000000\x07\x1b[6;20H");
+        let input = term.cell_frame(20, 60);
+        let facts = PetWorldFacts::read(&term, 7);
+        let (exclusions, count) = pet_console_exclusions(&input, true, Some((7, 3, 9, 12)), true);
+        assert_eq!(count, 4);
+        let mut world = PetWorld::default();
+        assert!(world.observe_with_exclusions(
+            &input,
+            &facts,
+            PetPane::full(&input),
+            &exclusions[..count]
+        ));
+        for (row, col) in [(5.0, 40.0), (7.0, 6.0), (0.0, 40.0), (19.0, 40.0)] {
+            assert!(!world.clear(PetRect::new(row, col, 1.0, 1.0), 0.0));
+        }
+        assert!(world.clear(PetRect::new(12.0, 40.0, 2.0, 6.0), 0.2));
+        let (_, none) = pet_console_exclusions(&input, false, None, false);
+        assert_eq!(none, 0);
+    }
+
+    #[test]
+    fn history_never_projects_pending_live_input_onto_old_rows() {
+        let mut term = Terminal::new(10, 40);
+        for _ in 0..15 {
+            term.process(b"line\r\n");
+        }
+        term.scroll_display(3);
+        let input = term.cell_frame(10, 40);
+        assert_ne!(input.display_offset, 0);
+        let (_, count) = pet_console_exclusions(&input, true, Some((3, 4, 4, 5)), false);
+        assert_eq!(count, 0);
+    }
+}
+
 /// Feed the resident pet the presentation context shared by live glass and
 /// explicit capture immediately before its one frame tick.
 ///
@@ -9317,9 +9508,10 @@ fn blend_rgb(bg: u32, fg: u32, a: u32) -> u32 {
 /// framebuffer (TT is renderer transmittance): a faint `accent` wash across the whole grid plus a near-opaque
 /// `accent` border inset at the window edge (the chosen "inset accent border +
 /// faint wash" treatment). `pixels` is row-major `w * h` (any trailing pixels are
-/// ignored). Pure + allocation-free, and shared by the live CPU-present
-/// destination and headless `image`/`snapshot` so application-render artifacts
-/// match. The GPU backend reproduces the same look in its blit shader.
+/// ignored). Test convenience for the fixed drag-highlight constants; production
+/// presentation and capture pass their resolved `OverlayGlow` to `apply_overlay_at`.
+/// The GPU backend reproduces the same look in its blit shader.
+#[cfg(test)]
 pub(crate) fn apply_drop_overlay(pixels: &mut [u32], w: usize, h: usize, accent: u32) {
     apply_drop_overlay_at(pixels, w, h, 0, 0, w, h, accent);
 }
@@ -9332,6 +9524,7 @@ pub(crate) fn apply_drop_overlay(pixels: &mut [u32], w: usize, h: usize, accent:
 /// early-out means the highlight never touches the padding bands); drawing is
 /// clipped to the surface. With `ox == oy == 0` and `sw/sh == fw/fh` this is
 /// byte-identical to the historical whole-frame overlay.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a raw surface + a placed frame rect is irreducibly 7 geometry scalars; bundling them into a struct only relocates the list"
@@ -9366,7 +9559,7 @@ pub(crate) fn apply_drop_overlay_at(
 
 /// The alpha-parametrized CORE of the inset-accent-border overlay (the drop target's
 /// fixed alphas OR the level-up glow's breathing alpha), band-aware exactly like
-/// [`apply_drop_overlay_at`] and pure + allocation-free. With the drop-overlay constants
+/// the fixed-alpha test helper and pure + allocation-free. With the drop-overlay constants
 /// this is byte-identical to the historical fixed-alpha pass — that equivalence is
 /// pinned by `band_aware_overlay_twins_shift_without_touching_bands`.
 #[allow(
@@ -23215,6 +23408,11 @@ impl App {
             pet_action: &pet_action,
             pet_content: ws.cursor_pet.content(),
             pet_pending: ws.cursor_pet.pending_pets(),
+            pet_focus: ws.cursor_pet.console_attention().name(),
+            pet_reason: ws.cursor_pet.console_reason(),
+            pet_anchor: ws.cursor_pet.console_anchor_id(),
+            pet_event_seq: ws.cursor_pet.console_event_seq(),
+            pet_pose: ws.cursor_pet.pose_name(),
             pet_body: ws.pet_hit_rect,
             cat_active: ws.cursor_cat.is_active(),
             // WHO OWNS THE CARET — the gate none of the three above reports.
@@ -27034,6 +27232,17 @@ impl App {
             }
         } else {
             let load_shed = self.load_shed_active();
+            // The off path must not allocate or rebuild console perception.
+            // Custody/focus are resolved later; this is only the style owner.
+            let pet_glow = self.glow_config();
+            let pet_console_owned = resident_pet_owner_present(
+                self.trail_presentation().pet_species.is_some(),
+                pet_glow.enabled
+                    && self
+                        .serious_mode_policy()
+                        .allows(crate::motion::SeriousEffect::CursorCat),
+                pet_glow.style,
+            );
             // PHOSPHOR: the FRONT session's effective rain state (its runtime
             // override, else the config `enabled` bit). Read before the `ws`
             // borrow below (`session_rain_enabled` needs `self.pool`); a tab
@@ -27401,6 +27610,9 @@ impl App {
             // will (the write path honors EA-Ambiguous width), so the overlay
             // below reads the SAME mode bit under the same lock.
             let ambiguous_cjk = term.modes().ambiguous_width_double;
+            let mut pet_world_facts = pet_console_owned.then(|| {
+                aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
+            });
             drop(term);
             // Rescan frames extracted under LOCK A and therefore keep these
             // LOCK-A colors. Non-rescan frames overwrite both under LOCK B
@@ -27494,6 +27706,12 @@ impl App {
                 let committed_scroll_state = committed.content_scroll_state();
                 (presented_default_bg_u32, _, presented_cursor_color_u32) =
                     terminal_frame_colors(&committed);
+                pet_world_facts = pet_console_owned.then(|| {
+                    aterm_effects::pet_world::PetWorldFacts::read(
+                        &committed,
+                        front_terminal.session,
+                    )
+                });
                 drop(committed);
                 cursor_fx_commit = classify_cursor_fx_commit(
                     CursorFxProjection {
@@ -27891,9 +28109,32 @@ impl App {
             // momentum gate. Its own
             // fade envelope, driven by whether the caret is visible at all, is
             // the only thing that turns it off.
+            if let Some(facts) = pet_world_facts.as_ref() {
+                let (exclusions, count) = pet_console_exclusions(
+                    &ws.input_scratch,
+                    !ws.preedit.is_empty(),
+                    ws.predictor.pending_bounds(),
+                    ws.search.is_some(),
+                );
+                ws.cursor_pet.observe_console_with_exclusions(
+                    &ws.input_scratch,
+                    facts,
+                    aterm_effects::pet_world::PetPane::full(&ws.input_scratch),
+                    &exclusions[..count],
+                );
+            }
+            // Reading owns a certified content surface, never a fabricated
+            // caret. The flying head retains its live-viewport-only gate.
+            let pet_presentable = !ws.overlay_open()
+                && ws.tab_menu.is_none()
+                && (cursor_companion_presentable
+                    || (shed_companion_presentable(
+                        cursor_companions_allowed && win_focused,
+                        shed_envelope,
+                    ) && ws.cursor_pet.has_reading_interest()));
             let pet_visible = resident_pet_presentation_enabled(
                 pet_mode,
-                cursor_companion_presentable,
+                pet_presentable,
                 glow_cfg.enabled && cursor_companions_allowed,
                 glow_cfg.style,
             );
@@ -28054,6 +28295,10 @@ impl App {
             // ([`companion_pet_sense`]) for BOTH render arms, from the four
             // host facts only the host holds; the geometry and posture ride
             // the same `glow_geom` / motion policy this frame already resolved.
+            ws.cursor_pet.set_console_presentable(
+                pet_companion_admitted(pet_visible, cat_frame.sing)
+                    && shed_companion_alpha(255, shed_envelope) > 0,
+            );
             let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
                 frame_started,
                 aterm_effects::word_decorations::EffectGeom {
@@ -32781,6 +33026,15 @@ impl App {
         // template is the per-terminal `blank` captured under the pane lock below.
         // Cached per config generation (see `predict_mode`), not re-parsed per frame.
         let pmode = self.predict_mode();
+        let pet_glow = self.glow_config();
+        let pet_console_owned = resident_pet_owner_present(
+            self.trail_presentation().pet_species.is_some(),
+            pet_glow.enabled
+                && self
+                    .serious_mode_policy()
+                    .allows(crate::motion::SeriousEffect::CursorCat),
+            pet_glow.style,
+        );
         let sync_hold_timeout = Duration::from_millis(
             self.session_factory
                 .terminal_config
@@ -32851,6 +33105,7 @@ impl App {
         let mut focus_blank = divider_cell(theme);
         let mut focus_title_sample: Arc<str> = Arc::from("");
         let mut focus_snapshot_valid = false;
+        let mut focus_world_facts = None;
         // IME-1 (compose): the focused pane's East-Asian-Ambiguous width mode,
         // sampled under the SAME pass-1 hold as `focus_blank` because PASS 2's
         // focused branch takes no terminal lock (the lock diet). The inline
@@ -33092,6 +33347,8 @@ impl App {
                     // so the historical explicit `take_damage()` is inside it.)
                     metrics::note_frame_refill(refill);
                     focus_snapshot_valid = true;
+                    focus_world_facts = pet_console_owned
+                        .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, focus));
                     let d_off = term.grid().display_offset();
                     focus_scrolled = d_off != 0;
                     focus_no_echo =
@@ -33526,9 +33783,34 @@ impl App {
         let pet_species = trail_presentation
             .pet_species
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
+        let reading_presentable = if let Some(ws) = self.windows.get_mut(&wid) {
+            if pet_mode && let Some(facts) = focus_world_facts.as_ref() {
+                let (exclusions, count) = pet_console_exclusions(
+                    &ws.composed_focus_scratch,
+                    !ws.preedit.is_empty(),
+                    ws.predictor.pending_bounds(),
+                    ws.search.is_some(),
+                );
+                ws.cursor_pet.observe_console_with_exclusions(
+                    &ws.composed_focus_scratch,
+                    facts,
+                    aterm_effects::pet_world::PetPane::full(&ws.composed_focus_scratch),
+                    &exclusions[..count],
+                );
+            }
+            ws.cursor_pet.has_reading_interest()
+        } else {
+            false
+        };
+        let pet_presentable = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none())
+            && (cursor_companion_presentable
+                || (cursor_companions_allowed && decoration_presentable && reading_presentable));
         let pet_visible = resident_pet_presentation_enabled(
             pet_mode,
-            cursor_companion_presentable,
+            pet_presentable,
             glow_cfg.enabled && cursor_companions_allowed,
             glow_cfg.style,
         );
@@ -33774,6 +34056,10 @@ impl App {
             }
             // The single-pane twin's projection ([`companion_pet_sense`]) at
             // the focused PANE's geometry — one router, both arms.
+            ws.cursor_pet.set_console_presentable(
+                pet_companion_admitted(pet_visible, cat_frame.sing)
+                    && shed_companion_alpha(255, shed_envelope) > 0,
+            );
             let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
                 now,
                 aterm_effects::word_decorations::EffectGeom {
@@ -41140,6 +41426,21 @@ mod split_sparkle_tests {
     use crate::{App, WindowId, term_lock};
     use std::time::{Duration, Instant};
 
+    /// Stub terminals deliberately have no host-configured frame background.
+    /// Give these presentation fixtures the headless renderer's actual theme:
+    /// an unresolved default is unknown terrain, not a certified blank perch.
+    fn configure_pane_backgrounds(app: &App, sid: u64) {
+        let bg = aterm_render::Theme::default().bg;
+        for session in [0, sid] {
+            let term = &app.pool.get(session).expect("pane session").term;
+            term_lock(term).set_default_background(aterm_core::terminal::Rgb {
+                r: (bg >> 16) as u8,
+                g: (bg >> 8) as u8,
+                b: bg as u8,
+            });
+        }
+    }
+
     fn place(col_off: u16, cols: u16) -> PanePlace {
         PanePlace {
             row_off: 0,
@@ -41165,6 +41466,7 @@ mod split_sparkle_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let sid = app.split_active_stub_tab(wid);
+        configure_pane_backgrounds(&app, sid);
         app.recompute_sparkle();
         {
             let ws = app.windows.get_mut(&wid).expect("window");
@@ -41313,6 +41615,7 @@ mod split_sparkle_tests {
         // from a default that is now OFF on Windows.
         app.config.cursor_trail = Some(true);
         let sid = app.split_active_stub_tab(wid);
+        configure_pane_backgrounds(&app, sid);
         app.recompute_sparkle();
         assert!(
             app.sparkle.take().is_some(),
@@ -41362,6 +41665,7 @@ mod split_sparkle_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let focus = app.split_active_stub_tab(wid);
+        configure_pane_backgrounds(&app, focus);
         // THE RESIDENT IS THIS TEST'S SUBJECT, so this fixture owns the key that
         // seats it instead of leaning on the default. `cursor_trail`'s default has
         // been platform-split since `bda06044` ([`crate::app_config::
@@ -41434,6 +41738,7 @@ mod split_sparkle_tests {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let focus = app.split_active_stub_tab(wid);
+        configure_pane_backgrounds(&app, focus);
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty pet".into());
         app.config.motion = Some("full".into());
@@ -42379,6 +42684,165 @@ mod find_panel_visual_tests {
         for ch in "needle".chars() {
             app.search_edit_in(narrow, SearchEdit::Insert(ch.to_string()));
         }
+        capture(&mut app, narrow, &dir, "6-narrow");
+    }
+}
+
+/// STATUS-BAR VISUAL CAPTURE (2026-09-10): the pull-down rows the R6 markers and
+/// the standing update-health warning paint, rendered to PNG through the real
+/// compose (`splice_status_bars`) and the CPU renderer, exactly like
+/// `find_panel_visual_capture`. Ignored by default (needs a system monospace
+/// font); the owner's rule is that visible UI changes are captured as real
+/// frames, and this is the frame:
+///
+/// ```text
+/// STATUS_BARS_PNG_DIR=/tmp/bars targo --unverified test -p aterm-gui --lib \
+///     status_bars_visual_capture -- --ignored --nocapture
+/// ```
+///
+/// The live twin on a probe instance: `ATERM_DEBUG_STATUS_BARS=managed|machine`
+/// seeds the same rows through their real wakes; `aterm ctl image bars.png` and
+/// `aterm ctl appstatus` read them back.
+#[cfg(test)]
+mod status_bars_visual_tests {
+    use std::time::Instant;
+
+    use crate::status_bars::{HOLD_OK, HOLD_WARN};
+    use crate::{App, WindowId, term_lock};
+
+    /// Fill the scratch from the engine, splice the bars as a real redraw does,
+    /// render, and write `name.png`. `false` when there is no system font.
+    fn capture(app: &mut App, wid: WindowId, dir: &std::path::Path, name: &str) -> bool {
+        let (rows, cols) = {
+            let ws = &app.windows[&wid];
+            (ws.rows as usize, ws.cols as usize)
+        };
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let mut term = term_lock(&terminal);
+            term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+        }
+        let theme = aterm_render::Theme::default();
+        app.splice_status_bars(wid, theme);
+        let Some(mut cpu) = aterm_render::Renderer::from_system(20.0, theme) else {
+            return false;
+        };
+        let frame = cpu.render_input(&app.windows[&wid].input_scratch);
+        let mut rgb = Vec::with_capacity(frame.pixels.len() * 3);
+        for &p in &frame.pixels {
+            rgb.push((p >> 16) as u8);
+            rgb.push((p >> 8) as u8);
+            rgb.push(p as u8);
+        }
+        let path = dir.join(format!("{name}.png"));
+        let file = std::fs::File::create(&path).expect("create png");
+        let mut encoder = aterm_png::Encoder::new(
+            std::io::BufWriter::new(file),
+            frame.width as u32,
+            frame.height as u32,
+        );
+        encoder.set_color(aterm_png::ColorType::Rgb);
+        encoder.set_depth(aterm_png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("png header")
+            .write_image_data(&rgb)
+            .expect("png data");
+        crate::logging::stderr_line!(
+            "wrote {} ({}x{})",
+            path.display(),
+            frame.width,
+            frame.height
+        );
+        true
+    }
+
+    fn content(app: &App, lines: &[&str]) {
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let mut bytes = Vec::new();
+        for line in lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.extend_from_slice(b"\r\n");
+        }
+        term_lock(&term).process(&bytes);
+    }
+
+    #[test]
+    #[ignore = "visual capture: needs a system font; run with --ignored"]
+    fn status_bars_visual_capture() {
+        let dir = std::env::var("STATUS_BARS_PNG_DIR").map_or_else(
+            |_| std::env::temp_dir().join("status-bars"),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).expect("output dir");
+        let lines = [
+            "$ claude --version",
+            "2.1.267 (Claude Code)",
+            "$ codex --version",
+            "codex-cli 0.154.0",
+            "$ ",
+        ];
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        content(&app, &lines);
+        let now = Instant::now();
+
+        // 1. The pass row, with the two R6 rows queued behind it.
+        app.status_bars.toolchain_installed(
+            "\u{2713} ALab toolchain installed: claude, codex \u{2014} open a new tab to use them",
+            now,
+        );
+        app.status_bars.toolchain_managed_current(
+            "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)",
+            now,
+        );
+        app.status_bars.toolchain_machine_settings(
+            "spotlight-noindex 73 dir(s) migrated; universal-control disabled",
+            now,
+        );
+        app.sync_status_bar_rows();
+        if !capture(&mut app, wid, &dir, "1-installed") {
+            crate::logging::stderr_line!("no system font \u{2014} visual capture skipped");
+            return;
+        }
+
+        // 2. The installed row folds; "Universal Control disabled" — the one
+        //    machine row with an undo — is promoted ahead of the managed notice.
+        assert!(app.settle_status_bars(now + HOLD_OK));
+        app.sync_status_bar_rows();
+        capture(&mut app, wid, &dir, "2-universal-control");
+
+        // 3. Then "Spotlight: 73 build dirs moved to .noindex", its own row.
+        assert!(app.settle_status_bars(now + HOLD_OK + HOLD_WARN));
+        app.sync_status_bar_rows();
+        capture(&mut app, wid, &dir, "3-spotlight-noindex");
+
+        // 4. Then "Claude Code 2.1.267 · Codex 0.154.0 — aterm-managed, current".
+        assert!(app.settle_status_bars(now + HOLD_OK + 2 * HOLD_WARN));
+        app.sync_status_bar_rows();
+        capture(&mut app, wid, &dir, "4-managed-current");
+
+        // 5. The standing update-health warning beneath it — the row m21 showed,
+        //    now with its command intact.
+        assert!(app.status_bars.update_health_standing(
+            "aterm auto-update is failing",
+            "20 consecutive checks since 2026-08-27T22:04:36Z: release manifests exist but \
+             cannot be downloaded \u{2014} this build's update pipeline is likely broken. Run \
+             `aterm-ctl update status` for details. \u{2014} see Settings \u{25b8} Software Update",
+        ));
+        app.sync_status_bar_rows();
+        capture(&mut app, wid, &dir, "5-with-health-standing");
+
+        // 6. A narrow window: the detail gives way, the titles stay whole.
+        let narrow = app.insert_logical_window(crate::stub_session(1), 20, 60);
+        app.frontmost_window = Some(narrow);
+        content(&app, &lines);
+        app.sync_status_bar_rows();
         capture(&mut app, narrow, &dir, "6-narrow");
     }
 }
@@ -44509,9 +44973,18 @@ mod compose_focused_carrier {
         // now asks for the animating resident it is actually testing against instead of
         // leaning on a default that moved.
         app.config.cursor_trail = Some(true);
+        let bg = aterm_render::Theme::default().bg;
         for s in [0u64, sid] {
             let term = app.pool.get(s).expect("pane session").term.clone();
             let mut t = term_lock(&term);
+            // Match the renderer's configured background, as a real host does.
+            // An unconfigured stub's COLOR_UNSET cannot certify the resident's
+            // blank perch or supply the animation that buys a second frame.
+            t.set_default_background(aterm_core::terminal::Rgb {
+                r: (bg >> 16) as u8,
+                g: (bg >> 8) as u8,
+                b: bg as u8,
+            });
             for i in 0..CARET_ROW {
                 t.process(format!("row{i} abcdefgh\r\n").as_bytes());
             }

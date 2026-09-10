@@ -99,6 +99,7 @@ pub mod install;
 pub mod installer_pkg;
 pub mod linkmode;
 pub mod lock;
+pub mod machine;
 pub mod manifest;
 mod metadata_io;
 pub mod net;

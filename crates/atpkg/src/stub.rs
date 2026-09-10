@@ -3,11 +3,12 @@
 
 //! Pending-program stubs (R6): from the moment the lean app first launches (and
 //! immediately after adoption), EVERY default-set program name resolves on `PATH`,
-//! and running one is always helpful — never "command not found". The EXTRAS
-//! (owner decision 2026-08-26: `codex`, `claude`) get the same courtesy with one
-//! difference the stub itself records ([`StubKind`]): typing an extra's name asks a
-//! vendor-named consent question before a byte moves, instead of bumping an install
-//! that is already coming.
+//! and running one is always helpful — never "command not found". An EXTRA (an
+//! index row with `extra = true`; none today — `codex` and `claude` were extras from
+//! 2026-08-26 until the owner made them default-set AGENT PROGRAMS on 2026-09-10,
+//! [`AGENT_PROGRAMS`]) gets the same courtesy with one difference the stub itself
+//! records ([`StubKind`]): typing an extra's name asks a vendor-named consent question
+//! before a byte moves, instead of bumping an install that is already coming.
 //!
 //! A stub is a tiny `/bin/sh` file at `<prefix>/bin/<tool>` (the same seam
 //! [`crate::flow`]'s tombstone shims use — no parallel machinery) that execs
@@ -88,25 +89,58 @@ pub const DEFAULT_SET_STUB_NAMES: &[(&str, &str)] = &[
     ("ty", "ALab's specification checker"),
 ];
 
-/// The compile-time EXTRAS roster: programs the signed index lists with `extra = true`
-/// (owner decision 2026-08-26) — listed and pinned, available on request, NEVER
-/// installed by default. Their stubs are laid at adoption beside the default set's,
-/// but typing the name asks a vendor-named consent question first ([`StubKind::Extra`]);
-/// nothing downloads before the answer. The authored line IS the consent copy, so it
-/// names the vendor, the license, the rough size and the host the bytes come from —
-/// descriptively ("OpenAI Codex CLI", "Anthropic Claude Code"), never as ALab marks.
-/// Names only, no versions/URLs; the index-resolve reconcile is the authority once a
-/// signed index is readable, and its `https` row is what actually pins the bytes.
-pub const EXTRAS_STUB_NAMES: &[(&str, &str)] = &[
-    (
-        "codex",
-        "OpenAI Codex CLI — Apache-2.0, ~90 MB, downloaded from github.com/openai/codex",
-    ),
+/// THE AGENT PROGRAMS (owner decision 2026-09-10): the coding agents aterm is the
+/// version manager for. They are DEFAULT-SET MEMBERS on this client whatever the
+/// signed index says — an index that still marks them `extra = true` (build 21 does)
+/// installs them unasked all the same, because the reversal of the 2026-08-26 opt-in
+/// decision has to hold on a machine that cannot sign a new index. Consequences,
+/// each enforced where it lives:
+///
+/// * [`crate::manifest::Index::is_extra`] answers `false` for them, so
+///   `installable_with_optins` includes them without an opt-in marker;
+/// * no consent stub is ever laid for them ([`lay_adoption_stubs`],
+///   [`reconcile_with_requires`]) and `atpkg __pending` never asks `Install claude?`;
+/// * their shims are ALSO laid under `<prefix>/agents/`, the one managed directory
+///   that goes FIRST on `PATH` ([`crate::activate::lay_agent_shims`]), so the managed
+///   copy is what `claude`/`codex` run — the rule-1 exception recorded in
+///   docs/design/DESIGN-which-copy-runs;
+/// * a pass that leaves them at the index pin says so on stdout
+///   (`crate::cli::MANAGED_CURRENT_MARKER`).
+///
+/// Names only — the signed index pins the bytes, as for every member.
+pub const AGENT_PROGRAMS: &[&str] = &["claude", "codex"];
+
+/// Whether `name` is one of [`AGENT_PROGRAMS`].
+#[must_use]
+pub fn is_agent_program(name: &str) -> bool {
+    AGENT_PROGRAMS.contains(&name)
+}
+
+/// The authored what-it-is line for each agent program (the pre-index stub copy). It
+/// still names the vendor, the license, the rough size and the host the bytes come
+/// from — descriptively ("OpenAI Codex CLI", "Anthropic Claude Code"), never as ALab
+/// marks — because the pending stub prints it while the install is on its way.
+pub const AGENT_STUB_NAMES: &[(&str, &str)] = &[
     (
         "claude",
         "Anthropic Claude Code — proprietary, ~230 MB, downloaded from downloads.claude.ai",
     ),
+    (
+        "codex",
+        "OpenAI Codex CLI — Apache-2.0, ~90 MB, downloaded from github.com/openai/codex",
+    ),
 ];
+
+/// The compile-time EXTRAS roster: programs the signed index lists with `extra = true`
+/// — listed and pinned, available on request, NEVER installed by default. Their stubs
+/// are laid at adoption beside the default set's, but typing the name asks a
+/// vendor-named consent question first ([`StubKind::Extra`]); nothing downloads before
+/// the answer. The authored line IS the consent copy, so it names the vendor, the
+/// license, the rough size and the host the bytes come from. EMPTY since 2026-09-10:
+/// `codex` and `claude` moved to [`AGENT_PROGRAMS`]; the machinery stays for the next
+/// extra the index publishes. Names only, no versions/URLs; the index-resolve
+/// reconcile is the authority once a signed index is readable.
+pub const EXTRAS_STUB_NAMES: &[(&str, &str)] = &[];
 
 /// The authored one-line description for `name`, if either compiled roster carries
 /// one. A program published after this binary gets the honest generic line instead.
@@ -114,6 +148,7 @@ pub const EXTRAS_STUB_NAMES: &[(&str, &str)] = &[
 pub fn describe(name: &str) -> Option<&'static str> {
     DEFAULT_SET_STUB_NAMES
         .iter()
+        .chain(AGENT_STUB_NAMES)
         .chain(EXTRAS_STUB_NAMES)
         .find(|(n, _)| *n == name)
         .map(|(_, d)| *d)
@@ -122,10 +157,10 @@ pub fn describe(name: &str) -> Option<&'static str> {
 /// Whether the compiled EXTRAS roster names `name` — the pre-index answer to "is this
 /// an extra". A stub on disk, kept current by the reconcile from the SIGNED index,
 /// outranks it ([`pending_stub_kind`]); this is the fallback for a name typed with
-/// no stub laid.
+/// no stub laid. Never `true` for an agent program ([`AGENT_PROGRAMS`]).
 #[must_use]
 pub fn compiled_extra(name: &str) -> bool {
-    EXTRAS_STUB_NAMES.iter().any(|(n, _)| *n == name)
+    !is_agent_program(name) && EXTRAS_STUB_NAMES.iter().any(|(n, _)| *n == name)
 }
 
 /// What a pending stub stands for — the ONE fact the stub file carries beyond its
@@ -557,6 +592,7 @@ pub fn lay_adoption_stubs(layout: &Layout) {
     let removed = layout.removed_programs();
     let rosters = DEFAULT_SET_STUB_NAMES
         .iter()
+        .chain(AGENT_STUB_NAMES)
         .map(|(n, _)| (*n, StubKind::DefaultSet))
         .chain(EXTRAS_STUB_NAMES.iter().map(|(n, _)| (*n, StubKind::Extra)));
     for (name, kind) in rosters {
@@ -608,7 +644,9 @@ pub fn reconcile_with_requires(
         let Some(tool) = ToolName::new(name) else {
             continue;
         };
-        let kind = if extras.contains(name.as_str()) {
+        // An agent program is default-set whatever set the caller filed it under: a
+        // consent stub for `claude` would ask a question the owner already answered.
+        let kind = if extras.contains(name.as_str()) && !is_agent_program(name) {
             StubKind::Extra
         } else {
             StubKind::DefaultSet
@@ -899,10 +937,23 @@ mod tests {
                 "{name}: laid at adoption, marked as an extra"
             );
         }
+        // The agent programs ride along as DEFAULT-SET members: no consent stub
+        // (owner decision 2026-09-10).
+        for name in AGENT_PROGRAMS {
+            assert_eq!(
+                pending_stub_kind(&l, name),
+                Some(StubKind::DefaultSet),
+                "{name}: laid at adoption as default-set, never as an extra"
+            );
+        }
         // A foreign file beside them survives the sweep.
         std::fs::write(l.bin_dir().join("mine"), "not a stub").unwrap();
         remove_all_stubs(&l);
-        for (name, _) in DEFAULT_SET_STUB_NAMES.iter().chain(EXTRAS_STUB_NAMES) {
+        for (name, _) in DEFAULT_SET_STUB_NAMES
+            .iter()
+            .chain(AGENT_STUB_NAMES)
+            .chain(EXTRAS_STUB_NAMES)
+        {
             assert!(!pending_stub_exists(&l, name), "{name} swept with the rest");
         }
         assert!(l.bin_dir().join("mine").exists());
@@ -1037,6 +1088,32 @@ mod tests {
         }
         assert!(!compiled_extra("trust"));
         assert!(!compiled_extra("nonesuch"));
+    }
+
+    /// The AGENT roster (owner decision 2026-09-10): `claude` and `codex` are
+    /// default-set members on this client — never compiled extras, never asked
+    /// about — with a shim-admissible name and a vendor-descriptive line the pending
+    /// stub prints while the install is on its way.
+    #[test]
+    fn agent_programs_are_default_set_never_extras() {
+        assert_eq!(AGENT_PROGRAMS, &["claude", "codex"]);
+        for name in AGENT_PROGRAMS {
+            assert!(is_agent_program(name));
+            assert!(!compiled_extra(name), "{name} must never read as an extra");
+            assert!(crate::store::shim_allowed(name));
+            assert!(
+                DEFAULT_SET_STUB_NAMES.iter().all(|(n, _)| n != name),
+                "{name} is in two rosters"
+            );
+            assert!(
+                EXTRAS_STUB_NAMES.iter().all(|(n, _)| n != name),
+                "{name} is in the extras roster too"
+            );
+            let desc = describe(name).expect("an authored line");
+            assert!(desc.contains("downloaded from"), "{name}: {desc}");
+        }
+        assert!(!is_agent_program("trust"));
+        assert!(!is_agent_program("nonesuch"));
         // The consent copy is descriptive of the vendor, never an ALab mark.
         assert!(describe("codex").unwrap().starts_with("OpenAI "));
         assert!(describe("claude").unwrap().starts_with("Anthropic "));
@@ -1057,7 +1134,7 @@ mod tests {
             "clt".to_string(),
         ];
         let sh = stub_content_sh_with(
-            &tool("codex"),
+            &tool("vendorx"),
             Path::new("/x/atpkg"),
             StubKind::Extra,
             &reqs,
@@ -1071,7 +1148,7 @@ mod tests {
             "a refused name is never written: {sh}"
         );
         let cmd = stub_content_cmd_with(
-            &tool("codex"),
+            &tool("vendorx"),
             Path::new("C:\\x\\atpkg.exe"),
             StubKind::Extra,
             &reqs,
@@ -1084,7 +1161,7 @@ mod tests {
         let bin = l.bin_dir();
         std::fs::create_dir_all(&bin).unwrap();
         for (label, body) in [("sh", &sh), ("cmd", &cmd)] {
-            let p = bin.join(format!("codex-{label}"));
+            let p = bin.join(format!("vendorx-{label}"));
             std::fs::write(&p, body).unwrap();
             assert_eq!(stub_kind(&p), Some(StubKind::Extra));
             assert_eq!(
@@ -1097,7 +1174,7 @@ mod tests {
         let plain = bin.join("plain");
         std::fs::write(
             &plain,
-            stub_content_sh(&tool("codex"), Path::new("/x/atpkg"), StubKind::Extra),
+            stub_content_sh(&tool("vendorx"), Path::new("/x/atpkg"), StubKind::Extra),
         )
         .unwrap();
         assert!(stub_requires(&plain).is_empty());
@@ -1111,17 +1188,20 @@ mod tests {
         // reader gives it back; an extra with no relation gets no line.
         let none = BTreeMap::new();
         let mut requires_of = BTreeMap::new();
-        requires_of.insert("codex".to_string(), vec!["clt".to_string()]);
-        let extras: BTreeSet<String> = ["codex".to_string(), "claude".to_string()]
+        requires_of.insert("vendorx".to_string(), vec!["clt".to_string()]);
+        let extras: BTreeSet<String> = ["vendorx".to_string(), "vendory".to_string()]
             .into_iter()
             .collect();
         reconcile_with_requires(&l, &BTreeSet::new(), &extras, &none, &requires_of);
-        assert_eq!(pending_stub_requires(&l, "codex"), vec!["clt".to_string()]);
-        assert!(pending_stub_requires(&l, "claude").is_empty());
-        assert_eq!(pending_stub_kind(&l, "codex"), Some(StubKind::Extra));
+        assert_eq!(
+            pending_stub_requires(&l, "vendorx"),
+            vec!["clt".to_string()]
+        );
+        assert!(pending_stub_requires(&l, "vendory").is_empty());
+        assert_eq!(pending_stub_kind(&l, "vendorx"), Some(StubKind::Extra));
         // A later reconcile with the relation gone rewrites the stub without the line.
         reconcile_with_requires(&l, &BTreeSet::new(), &extras, &none, &BTreeMap::new());
-        assert!(pending_stub_requires(&l, "codex").is_empty());
+        assert!(pending_stub_requires(&l, "vendorx").is_empty());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1175,46 +1255,46 @@ mod tests {
     #[test]
     fn reconcile_keeps_extras_beside_the_wanted_set_and_flips_kind() {
         let l = layout("reconcile-extras");
-        let wanted: BTreeSet<String> = ["ay".to_string(), "claude".to_string()]
+        let wanted: BTreeSet<String> = ["ay".to_string(), "vendory".to_string()]
             .into_iter()
             .collect();
-        let extras: BTreeSet<String> = ["codex".to_string(), "claude".to_string()]
+        let extras: BTreeSet<String> = ["vendorx".to_string(), "vendory".to_string()]
             .into_iter()
             .collect();
         let none: BTreeMap<String, u64> = BTreeMap::new();
         reconcile(&l, &wanted, &extras, &none);
         assert_eq!(pending_stub_kind(&l, "ay"), Some(StubKind::DefaultSet));
         assert_eq!(
-            pending_stub_kind(&l, "codex"),
+            pending_stub_kind(&l, "vendorx"),
             Some(StubKind::Extra),
             "an extra keeps its stub without being wanted"
         );
         assert_eq!(
-            pending_stub_kind(&l, "claude"),
+            pending_stub_kind(&l, "vendory"),
             Some(StubKind::Extra),
             "an opted-in extra (wanted) is still marked as an extra"
         );
-        // The index flag flips: codex becomes a default-set member, claude is
+        // The index flag flips: vendorx becomes a default-set member, vendory is
         // de-listed as an extra and not wanted either.
-        let wanted: BTreeSet<String> = ["ay".to_string(), "codex".to_string()]
+        let wanted: BTreeSet<String> = ["ay".to_string(), "vendorx".to_string()]
             .into_iter()
             .collect();
         reconcile(&l, &wanted, &BTreeSet::new(), &none);
         assert_eq!(
-            pending_stub_kind(&l, "codex"),
+            pending_stub_kind(&l, "vendorx"),
             Some(StubKind::DefaultSet),
             "the rewrite carries the new kind"
         );
         assert!(
-            !pending_stub_exists(&l, "claude"),
+            !pending_stub_exists(&l, "vendory"),
             "neither wanted nor an extra: swept"
         );
         // Installed ⇒ the extra's stub retires, exactly like a member's.
         let installed: BTreeMap<String, u64> =
-            [("codex".to_string(), 2026082601)].into_iter().collect();
+            [("vendorx".to_string(), 2026082601)].into_iter().collect();
         reconcile(&l, &wanted, &extras, &installed);
-        assert!(!pending_stub_exists(&l, "codex"));
-        assert_eq!(pending_stub_kind(&l, "claude"), Some(StubKind::Extra));
+        assert!(!pending_stub_exists(&l, "vendorx"));
+        assert_eq!(pending_stub_kind(&l, "vendory"), Some(StubKind::Extra));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

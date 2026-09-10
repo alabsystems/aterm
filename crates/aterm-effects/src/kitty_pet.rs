@@ -241,6 +241,10 @@ use crate::pet_stroke::StrokeDetector;
 use crate::rainbow_kitty::ARM_MIN;
 use crate::rainbow_kitty::companion::{PetOffer, StarCatch};
 
+mod console_life;
+use console_life::ConsoleLife;
+pub use console_life::{PetAttention, PetEditPhase, PetInputKind};
+
 // ── the chase ───────────────────────────────────────────────────────────────
 
 /// Where the pet wants to stand relative to the caret, in cells, measured from
@@ -2553,6 +2557,8 @@ impl PetSpecies {
 /// The pet's decision layer: a caret follower with a behaviour state machine on
 /// top. `tick` is the whole API; everything else is derived from it.
 pub struct PetBrain {
+    /// Console observations and attention belong to this same resident.
+    console: ConsoleLife,
     /// Which animal to draw. Pure presentation — see [`PetSpecies`]; the
     /// behaviour below never reads it, and `emit` is the only consumer.
     species: PetSpecies,
@@ -3056,6 +3062,7 @@ pub struct PetBrain {
 impl Default for PetBrain {
     fn default() -> Self {
         Self {
+            console: ConsoleLife::default(),
             species: PetSpecies::Cat,
             col: 0.0,
             row: 0.0,
@@ -3446,6 +3453,7 @@ impl PetBrain {
         self.pending_sulk
             || self.action == PetAction::Droop
             || matches!(self.resume, Some((PetAction::Droop, _)))
+            || self.console_grieving()
     }
 
     /// The ink span of an integer row index, in fractional columns —
@@ -3746,6 +3754,10 @@ impl PetBrain {
     /// belongs.
     fn station_safe(&self, caret: (u16, u16), cols: u16, rows: u16, width: f32) -> (f32, f32) {
         let want = self.station_now(caret.1, cols, width);
+        if let Some(station) = self.console_station((want, f32::from(caret.0)), (rows, cols), width)
+        {
+            return station;
+        }
         self.ink_stand(want, f32::from(caret.0), width, cols, rows)
     }
 
@@ -3817,6 +3829,7 @@ impl PetBrain {
     /// that ran at least [`CHEER_MIN_MS`] queues the cheer (upgraded past
     /// [`CHEER_BIG_MS`]), and a fast success only nudges.
     pub fn note_command_done(&mut self, now: Instant, failed: bool, dur_ms: Option<u64>) {
+        self.note_console_completion(now, failed);
         // The injected clock is the idiom's signature; this stimulus keys
         // its consumption off the ledger and the latch, not off a TTL.
         let _ = now;
@@ -4135,6 +4148,11 @@ impl PetBrain {
         self.lane_clock += f64::from(dt);
 
         let width = art_cols(sense.cell_w, sense.cell_h);
+        self.begin_console_tick(sense, width);
+        self.reseat_unshown_console_body(sense, width);
+        if let Some(frame) = self.tick_console_resident(sense, width, dt) {
+            return frame;
+        }
         // Sampled BEFORE either fade arm moves it: "was the pet off the glass
         // when this frame began?" is the question the first-sighting seed
         // below has to ask, and by the time it runs the fade-in has already
@@ -4567,8 +4585,12 @@ impl PetBrain {
             // that raises the flag on a VISIBLE walking cat gets a teleport by
             // construction — see `app_render`'s `pet_reduced_motion`, which is
             // why the performance shed is no longer allowed to reach it.
-            self.col = Self::station(cc, sense.cols, width);
-            self.row = f32::from(cr);
+            let base = (Self::station(cc, sense.cols, width), f32::from(cr));
+            let (col, row) = self
+                .console_station(base, (sense.rows, sense.cols), width)
+                .unwrap_or(base);
+            self.col = col;
+            self.row = row;
             self.speed = 0.0;
             self.flight = None;
             self.land_t = 0.0;
@@ -5021,7 +5043,7 @@ impl PetBrain {
                     | PetAction::Frolic
                     | PetAction::Droop
             )
-            && self.ink_overlaps(self.col, self.row, width)
+            && (self.ink_overlaps(self.col, self.row, width) || self.console_obstructed(sense))
         {
             let watching = self.action == PetAction::Perk
                 && self.watch_heat >= WATCH_GATE
@@ -9605,7 +9627,7 @@ impl PetBrain {
         // for the departure lane: a ghost spawned NOW wears what the user
         // was just looking at, not run frame 0.
         self.last_pose = pose;
-        PetFrame {
+        let mut frame = PetFrame {
             alpha: (self.alpha.clamp(0.0, 1.0) * arrival * 255.0) as u8,
             // The presence envelope ALONE — the departure lane's byte. The
             // arrival ramp above belongs to the live body only (§1.1(a)):
@@ -9627,7 +9649,9 @@ impl PetBrain {
             under_ink: self.hiding,
             motes: self.resolve_motes(),
             departures: self.resolve_departures(),
-        }
+        };
+        self.finish_console_frame(&mut frame, sense);
+        frame
     }
 
     const CYCLE_WALK: [PetGlyphId; 4] = [
@@ -9850,6 +9874,9 @@ impl PetBrain {
     /// keystroke — to draw a 2.4 s breath whose sprite steps every ~100 ms.
     #[must_use]
     pub fn needs_frames(&self) -> bool {
+        if let Some(frames) = self.console_frames() {
+            return frames;
+        }
         if self.alpha < 1.0 {
             // Mid-fade — INCLUDING alpha == 0 with a caret in view, which is the
             // very first tick of a fade-IN (`last_now` is None, so `dt` is 0 and
@@ -10123,7 +10150,13 @@ impl PetBrain {
     /// instants deals the same idle as one ticked sixty times a second.
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
-        let secs = self.next_change_secs()?;
+        let console = self.console_deadline(now);
+        if self.console_frames().is_some() {
+            return console;
+        }
+        let Some(secs) = self.next_change_secs() else {
+            return console;
+        };
         // From the LAST TICK, not `now`: every edge is measured on the clocks
         // that tick advanced, and the host's `now` is later by whatever it
         // spent since. Clamped to a sane span (the longest honest offer is
@@ -10131,7 +10164,7 @@ impl PetBrain {
         // in the far future.
         let base = self.last_now.unwrap_or(now);
         let at = base + Duration::from_secs_f32((secs + OFFER_PAST).clamp(0.0, 60.0));
-        Some(at.max(now + ARM_MIN))
+        Some(console.map_or(at.max(now + ARM_MIN), |c| c.min(at.max(now + ARM_MIN))))
     }
 
     /// THE MOTES' EDGES (A/B #19's residual, and its last mote): for every

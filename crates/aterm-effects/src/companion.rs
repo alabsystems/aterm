@@ -41,7 +41,8 @@ use crate::host::{
     CaptureMode, HostFrameInput, PressOutcome, SingFacts, TerminalFacts, Visibility,
 };
 use crate::kitty_pet::{
-    ART_ASPECT, ART_ROWS, PetArrival, PetBrain, PetFrame, PetSense, PetSpecies, SyncLookOutcome,
+    ART_ASPECT, ART_ROWS, PetArrival, PetBrain, PetFrame, PetInputKind, PetSense, PetSpecies,
+    SyncLookOutcome,
 };
 use crate::kitty_registry::KittyLook;
 use crate::word_decorations::{
@@ -850,6 +851,15 @@ impl CompanionOwner {
     /// UNCONDITIONALLY, with `caret: None` when the pet cannot be drawn.
     /// `on_glass = owned && live_viewport && focused && alpha > 0` (through
     /// the custody law); the hit rect is `body_px + origin`.
+    pub fn observe_console(
+        &mut self,
+        input: &aterm_core::render::RenderInput,
+        facts: &crate::pet_world::PetWorldFacts,
+        pane: crate::pet_world::PetPane,
+    ) {
+        self.pet.observe_console(input, facts, pane);
+    }
+
     pub fn sense(&mut self, f: PetFacts<'_>, decos: &mut WordDecorations) -> CompanionFrame {
         let PetFacts {
             facts,
@@ -877,10 +887,6 @@ impl CompanionOwner {
             self.retire_surface();
         }
         let decoration_presentable = focused && host.visibility != Visibility::Hidden;
-        let cursor_companion_presentable = shed_companion_presentable(
-            cursor_companion_presentable(decoration_presentable, facts.live_viewport),
-            host.shed_envelope,
-        );
         // Ownership: the host's opt-in, serious mode (the glass belongs to
         // the work), and the trail owner's three terms.
         let owned = self.enabled
@@ -894,10 +900,14 @@ impl CompanionOwner {
         // selected, and the shared soft-shed envelope) and none of the
         // momentum gate. Its own fade envelope, driven by whether the caret
         // is visible at all, is the only thing that turns it off.
+        let pet_surface_presentable = shed_companion_presentable(
+            decoration_presentable && (facts.live_viewport || self.pet.has_reading_interest()),
+            host.shed_envelope,
+        );
         let pet_visible = owned
             && resident_pet_presentation_enabled(
                 pet_mode,
-                cursor_companion_presentable,
+                pet_surface_presentable,
                 trail_master,
                 glow.style,
             );
@@ -1044,6 +1054,10 @@ impl CompanionOwner {
                 None
             },
         };
+        self.pet.set_console_presentable(
+            pet_companion_admitted(pet_visible, sing.drive)
+                && shed_companion_alpha(255, host.shed_envelope) > 0,
+        );
         let mut pet_frame = match host.capture {
             CaptureMode::Present => self.pet.tick(sense),
             CaptureMode::StaticCapture => self.pet.tick_static_capture(sense),
@@ -1210,6 +1224,24 @@ impl CompanionOwner {
     /// The terminal BEL rang in the pane this pet is chasing.
     pub fn note_bell(&mut self, now: Instant) {
         self.pet.note_bell(now);
+    }
+
+    /// One accepted console input intent. This supplies attention provenance,
+    /// never evidence that the program changed a particular range of text.
+    pub fn note_console_input(&mut self, now: Instant, kind: PetInputKind) {
+        self.pet.note_console_input(now, kind);
+    }
+
+    /// Accepted input intentions observed by this brain; reading does not tick.
+    #[must_use]
+    pub fn console_input_seq(&self) -> u64 {
+        self.pet.console_input_seq()
+    }
+
+    /// Most recent classified input intention; no display-edit claim is implied.
+    #[must_use]
+    pub fn console_input_kind(&self) -> Option<PetInputKind> {
+        self.pet.console_input_kind()
     }
 
     /// PETTING: a left press at `px` (FRAME px) inside this frame's drawn body

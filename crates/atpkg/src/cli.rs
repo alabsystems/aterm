@@ -141,7 +141,10 @@ const VERB_USAGE: &[(&str, &str)] = &[
         "noindex",
         "atpkg noindex [scan] [<root>] [--depth <n>]  — cargo target dirs Spotlight indexes\n\
          atpkg noindex verify <dir>                   — MEASURE whether <dir> is excluded\n\
-         atpkg noindex migrate <dir> [--dry-run]      — rename <dir> to the excluded form",
+         atpkg noindex migrate <dir> [--dry-run]      — rename <dir> to the excluded form\n\
+         atpkg noindex apply (--all | <dir>...) [--dry-run] — migrate AND keep cargo pointed: \
+         a `target` symlink in a git checkout, [build] target-dir elsewhere (--all: every \
+         repo target dir under $HOME, as doctor scans)",
     ),
 ];
 
@@ -548,6 +551,9 @@ fn cmd_pending(tool: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    // R3: the stub is the first thing a fresh machine's user runs; if no pass has
+    // ever completed, stderr says so before the state machine speaks.
+    warn_if_never_checked(&layout);
     run_pending(&layout, tool)
 }
 
@@ -727,10 +733,14 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
     // the compiled roster answers for a name typed with no stub laid. The opt-in
     // marker says what the user ANSWERED: once it exists the extra is in every
     // pass's wanted set and the ordinary states tell its truth.
-    let extra = crate::stub::pending_stub_kind(layout, name).map_or_else(
-        || crate::stub::compiled_extra(name),
-        |kind| kind == crate::stub::StubKind::Extra,
-    );
+    // An AGENT PROGRAM (`claude`, `codex`) is default-set on this client whatever a
+    // stub laid by an older pass says (owner decision 2026-09-10): the pass is
+    // installing it, so the default-set states below are its truth.
+    let extra = !crate::stub::is_agent_program(name)
+        && crate::stub::pending_stub_kind(layout, name).map_or_else(
+            || crate::stub::compiled_extra(name),
+            |kind| kind == crate::stub::StubKind::Extra,
+        );
     if extra && !layout.optin_exists(name) {
         return pending_extra_consent(layout, &tn, io);
     }
@@ -1230,6 +1240,7 @@ fn doctor(prefix: &str) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1); // HOME unset is itself structural
     };
+    warn_if_never_checked(&layout);
     if crate::doctor::run(&layout, prefix) {
         ExitCode::SUCCESS
     } else {
@@ -1247,6 +1258,7 @@ fn cmd_which(tool: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    warn_if_never_checked(&layout);
     match which_line(&layout, tool, std::env::var_os("PATH").as_deref()) {
         Ok(line) => {
             println!("{line}");
@@ -1337,7 +1349,7 @@ fn which_line(
         // what the managed copy runs with when its shim exports an environment (design
         // S7: `self-update off (DISABLE_AUTOUPDATER=1)`). Read off the shim that runs.
         let state = crate::state::managed(build, index);
-        return Ok(match shim_env_fix(&shim) {
+        let mut line = match shim_env_fix(&shim) {
             Some(fix) => format!(
                 "{tool} → {} → {} — {state} — {fix}",
                 shim.display(),
@@ -1348,7 +1360,53 @@ fn which_line(
                 shim.display(),
                 target.display()
             ),
-        });
+        };
+        // An AGENT PROGRAM's second line (owner decision 2026-09-10): the managed copy
+        // runs because `agents/` is first on PATH, and the copies it beat — a vendor's
+        // native install, a brew cask — are named so nobody has to `which -a` to learn
+        // what a `brew upgrade` or Anthropic's own updater is still moving underneath.
+        if crate::stub::is_agent_program(&program) {
+            let foreign = crate::vendor::foreign_copies_on_path(&layout.prefix, tool, path_var);
+            if !foreign.is_empty() {
+                line.push('\n');
+                line.push_str(&foreign_copies_line(&foreign));
+            }
+        }
+        return Ok(line);
+    }
+    // 1b. An index PROGRAM whose installed build exposes no tool of its own name
+    //     (`trust` exposes trustc/targo/…, `trust-mc` exposes trust-mc-driver): the
+    //     managed bundle answers, with the names it does put on PATH. Without this arm
+    //     `which trust` named Homebrew's p11-kit `trust` as "the system copy" and `which
+    //     trust-mc` said "not installed" over a live store/trust-mc/20065 (2026-09-10
+    //     audit) — the foreign-PATH arm below is for a program's OWN name, and a same-named
+    //     unrelated binary is named as exactly that, after the truth.
+    if let Some(build) = crate::active_builds(layout).get(tool).copied() {
+        let index = row_of(tool)
+            .and_then(|r| crate::state::managed_pin(&r.state))
+            .map_or_else(|| build_floor(layout).index_build, |(_, i)| i);
+        let state = crate::state::managed(build, index);
+        let mut exposes = crate::installed_exposes(layout, tool).unwrap_or_default();
+        exposes.sort();
+        let mut line = match exposes.first() {
+            Some(first) => format!(
+                "{tool} → {} (bundle; exposes {} — run `aterm pkg which {first}`) — {state}",
+                layout.build_dir(tool, build).display(),
+                exposes.join(", ")
+            ),
+            None => format!(
+                "{tool} → {} (bundle; exposes no command of its own) — {state}",
+                layout.build_dir(tool, build).display()
+            ),
+        };
+        if let Some(path) = crate::vendor::system_binary_on_path(&layout.prefix, tool, path_var) {
+            line.push('\n');
+            line.push_str(&format!(
+                "{} on PATH is an unrelated binary, not this program",
+                path.display()
+            ));
+        }
+        return Ok(line);
     }
     // 2. A system copy on PATH outside the prefix: it runs, and atpkg does not manage it.
     //    With a PENDING STUB in the managed bin/ (an extra's consent stub, a default-set
@@ -1420,6 +1478,54 @@ fn which_line(
     Err(not_installed_fix(tool))
 }
 
+/// `foreign copies out-ranked: ~/.local/bin/claude (2.1.267), /opt/homebrew/bin/claude
+/// (2.1.204)` — each path home-abbreviated, each with the version its real location
+/// spells when it does ([`version_from_path`]); no parenthetical otherwise. Nothing is
+/// executed to learn a version: `which` is a read-only verb and a foreign binary is
+/// not ours to run.
+fn foreign_copies_line(foreign: &[std::path::PathBuf]) -> String {
+    let home = aterm_types::dirs::home_dir();
+    let rendered: Vec<String> = foreign
+        .iter()
+        .map(|p| {
+            let shown = home
+                .as_deref()
+                .and_then(|h| p.strip_prefix(h).ok())
+                .map_or_else(
+                    || p.display().to_string(),
+                    |rest| format!("~/{}", rest.display()),
+                );
+            match version_from_path(p) {
+                Some(v) => format!("{shown} ({v})"),
+                None => shown,
+            }
+        })
+        .collect();
+    format!("foreign copies out-ranked: {}", rendered.join(", "))
+}
+
+/// The version a foreign copy's REAL location spells, read off the path alone: the
+/// LAST path component of the canonical path that is dotted digits (`2.1.267` for
+/// Anthropic's `~/.local/share/claude/versions/2.1.267`, `2.1.204` for Homebrew's
+/// `Caskroom/claude-code/2.1.204/claude`, `0.151.0` for `Caskroom/codex/0.151.0/bin/codex`).
+/// `None` when no component qualifies — the line then shows the path alone rather than a
+/// guess. Symlinks are followed (`canonicalize`), which is where those spellings live.
+fn version_from_path(path: &std::path::Path) -> Option<String> {
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    version_from_components(&real)
+}
+
+/// The pure half of [`version_from_path`]: last dotted-digits component wins.
+fn version_from_components(path: &std::path::Path) -> Option<String> {
+    path.components().rev().find_map(|c| {
+        let s = c.as_os_str().to_str()?;
+        let dotted = s.contains('.')
+            && s.split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+        dotted.then(|| s.to_string())
+    })
+}
+
 /// The `which` answer for a REROUTED upstream name (philosophy §4): the stub that runs
 /// inside a session, its state (`laid` / `missing` / `foreign`, [`crate::reroute::states`]),
 /// and the row's policy in the stub's own words ([`crate::reroute::policy_summary`]) —
@@ -1469,9 +1575,9 @@ fn no_alias_line_for(
              may satisfy it: system = \"{}\"); type {base}",
             p.system.as_deref().unwrap_or(base)
         ),
-        Some(p) if p.extra => format!(
-            "atpkg: no alias {alias} — {base} is not one of ALab's own tools (an extra, a \
-             vendor's); type {base}"
+        Some(p) if p.extra || crate::stub::is_agent_program(base) => format!(
+            "atpkg: no alias {alias} — {base} is not one of ALab's own tools (a vendor's); \
+             type {base}"
         ),
         Some(_) if crate::which(layout, base).is_some() => format!(
             "atpkg: {alias} is not laid yet — the next pass lays it beside {base} (now: aterm \
@@ -1638,6 +1744,16 @@ enum NoindexJob {
         /// Print the rename that would happen and touch nothing.
         dry_run: bool,
     },
+    /// `noindex apply (--all | <dir>...) [--dry-run]` — the doctor's remedy, done:
+    /// migrate and re-point cargo per repo ([`crate::noindex::apply_one`]).
+    Apply {
+        /// `--all`: every exposed repo target dir under `$HOME` at the doctor's depth.
+        all: bool,
+        /// The directories named, when not `--all`.
+        dirs: Vec<String>,
+        /// Print what would happen and touch nothing.
+        dry_run: bool,
+    },
 }
 
 /// One usage refusal for `noindex`: the specific complaint, then the grammar, exit 2.
@@ -1665,13 +1781,15 @@ fn noindex_usage_error(problem: &str) -> ExitCode {
 /// per-verb arity work closed everywhere else.
 fn parse_noindex(rest: &[String]) -> Result<NoindexJob, ExitCode> {
     let mut sub: Option<&str> = None;
-    let mut operand: Option<&str> = None;
+    let mut operands: Vec<&str> = Vec::new();
     let mut depth: Option<usize> = None;
     let mut dry_run = false;
+    let mut all = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--dry-run" => dry_run = true,
+            "--all" => all = true,
             "--depth" => {
                 // Bounded at BOTH ends. `--depth 0` walks nothing and would report
                 // "0 indexed" over a home full of build output — the false-clean answer
@@ -1690,10 +1808,13 @@ fn parse_noindex(rest: &[String]) -> Result<NoindexJob, ExitCode> {
             // The subcommand is only a subcommand in the FIRST operand slot, so a
             // directory named `scan` still reaches `noindex migrate ./scan` as the thing
             // to rename.
-            "scan" | "verify" | "migrate" if sub.is_none() && operand.is_none() => {
+            "scan" | "verify" | "migrate" | "apply" if sub.is_none() && operands.is_empty() => {
                 sub = Some(a.as_str());
             }
-            s if !s.starts_with('-') && operand.is_none() => operand = Some(s),
+            // `apply` takes any number of directories; every other form takes at most one.
+            s if !s.starts_with('-') && (operands.is_empty() || sub == Some("apply")) => {
+                operands.push(s);
+            }
             other => {
                 return Err(noindex_usage_error(&format!(
                     "unexpected argument {other:?}"
@@ -1703,7 +1824,26 @@ fn parse_noindex(rest: &[String]) -> Result<NoindexJob, ExitCode> {
     }
     // `scan` is the default subcommand, so bare `atpkg noindex` is a scan of the cwd.
     let sub = sub.unwrap_or("scan");
+    let operand = operands.first().copied();
     match sub {
+        "apply" if depth.is_some() => Err(noindex_usage_error(
+            "--depth belongs to `scan`, not `apply` — `apply --all` scans at doctor's depth",
+        )),
+        "apply" if all && !operands.is_empty() => Err(noindex_usage_error(
+            "`apply` takes --all OR directories, not both",
+        )),
+        "apply" if !all && operands.is_empty() => Err(noindex_usage_error(
+            "`apply` wants --all or the directories to migrate, e.g. `aterm pkg noindex apply \
+             --all`",
+        )),
+        "apply" => Ok(NoindexJob::Apply {
+            all,
+            dirs: operands.iter().map(|s| (*s).to_owned()).collect(),
+            dry_run,
+        }),
+        _ if all => Err(noindex_usage_error(&format!(
+            "--all belongs to `apply`, not `{sub}`"
+        ))),
         "verify" | "migrate" if operand.is_none() => Err(noindex_usage_error(&format!(
             "`{sub}` names no directory — say which one, e.g. `aterm pkg noindex {sub} ./target`"
         ))),
@@ -1750,7 +1890,201 @@ fn cmd_noindex(rest: &[String]) -> ExitCode {
         NoindexJob::Scan { root, depth } => noindex_scan(root.as_deref(), depth),
         NoindexJob::Verify { dir } => noindex_verify(&dir),
         NoindexJob::Migrate { dir, dry_run } => noindex_migrate(&dir, dry_run),
+        NoindexJob::Apply { all, dirs, dry_run } => noindex_apply(all, &dirs, dry_run),
     }
+}
+
+/// `atpkg noindex apply (--all | <dir>...) [--dry-run]` — the doctor's Spotlight remedy,
+/// applied: each exposed cargo target dir is renamed to its `.noindex` form and the
+/// repo's `.cargo/config.toml` is pointed at the new name. `--all` is the doctor's own
+/// scan of `$HOME` (repos only — a free-standing target dir is named and left); named
+/// directories are migrated whether or not a repo sits beside them. Idempotent: an
+/// excluded directory is "already excluded", a live build is "retried next pass".
+///
+/// Exit 1 only when a rename FAILED (an I/O error); a skip with its reason is exit 0 —
+/// the verb the pass runs unattended must not read a busy build as a failure.
+fn noindex_apply(all: bool, dirs: &[String], dry_run: bool) -> ExitCode {
+    if !crate::noindex::SUPPORTED {
+        println!("{NOINDEX_NOT_APPLICABLE}");
+        return ExitCode::SUCCESS;
+    }
+    let (outcomes, complete) = if all {
+        let Some(home) = aterm_types::dirs::home_dir() else {
+            eprintln!("atpkg noindex: no home directory to scan — name the directories instead");
+            return ExitCode::from(1);
+        };
+        println!(
+            "atpkg noindex: scanning {} (depth {})",
+            home.display(),
+            crate::noindex::DOCTOR_DEPTH
+        );
+        crate::noindex::apply_under(
+            &home,
+            crate::noindex::DOCTOR_DEPTH,
+            &crate::noindex::Budget::VERB,
+            dry_run,
+        )
+    } else {
+        (
+            dirs.iter()
+                .map(|d| crate::noindex::apply_one(std::path::Path::new(d), false, dry_run))
+                .collect(),
+            true,
+        )
+    };
+    let mut failed = false;
+    for line in render_applied(&outcomes) {
+        println!("atpkg noindex: {line}");
+    }
+    for o in &outcomes {
+        if let crate::noindex::Applied::Skipped { reason, .. } = o
+            && reason.contains("the rename failed")
+        {
+            failed = true;
+        }
+    }
+    if !complete {
+        println!(
+            "atpkg noindex: the walk stopped at its budget — this list is a floor, not a census"
+        );
+    }
+    let migrated = outcomes.iter().filter(|o| o.migrated()).count();
+    if migrated > 0 {
+        // The same marker the pass prints, so a CLI-run apply reads the same to a parser.
+        println!(
+            "atpkg: {}",
+            machine_settings_line(&[spotlight_entry(migrated)])
+        );
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// One line per outcome of an apply, plus the summary — pure, so the words are pinned.
+fn render_applied(outcomes: &[crate::noindex::Applied]) -> Vec<String> {
+    use crate::noindex::{Applied, ConfigNote, ExcludeNote, Pointer};
+    let mut lines = Vec::new();
+    let (mut migrated, mut excluded, mut skipped, mut planned) = (0usize, 0usize, 0usize, 0usize);
+    for o in outcomes {
+        match o {
+            Applied::Migrated {
+                from,
+                to,
+                config:
+                    ConfigNote::Linked {
+                        link,
+                        exclude,
+                        link_exclude,
+                    },
+            } => {
+                // The git-checkout line (noindex module doc, 2026-09-10): the config is
+                // never opened, so the line says what stands in its place.
+                migrated += 1;
+                lines.push(format!(
+                    "migrated {} -> {} (symlink {} left in place; no config edit: git checkout)",
+                    from.display(),
+                    to.display(),
+                    link.display()
+                ));
+                lines.push(match exclude {
+                    ExcludeNote::AlreadyIgnored => format!(
+                        "  git: {} is already ignored — the working tree stays clean",
+                        to.display()
+                    ),
+                    ExcludeNote::Added(p) => format!(
+                        "  git: {} added to {} — the working tree stays clean",
+                        to.display(),
+                        p.display()
+                    ),
+                    ExcludeNote::NotIgnored(why) => format!(
+                        "  git: {} is NOT ignored — {why}; git status shows it until it is",
+                        to.display()
+                    ),
+                });
+                // The link: silent when the entry that ignored the directory matches it
+                // too; its own exclude line when that entry was directory-only
+                // (`target/` matches a directory, not a symlink); the honest row when the
+                // directory was never ignored either.
+                match link_exclude {
+                    ExcludeNote::AlreadyIgnored => {}
+                    ExcludeNote::Added(p) => lines.push(format!(
+                        "  git: {} added to {} — the ignore entry is directory-only and does \
+                         not match the link; the working tree stays clean",
+                        link.display(),
+                        p.display()
+                    )),
+                    ExcludeNote::NotIgnored(why) => lines.push(format!(
+                        "  git: {} is not gitignored here — {why}",
+                        link.display()
+                    )),
+                }
+            }
+            Applied::Migrated { from, to, config } => {
+                migrated += 1;
+                lines.push(format!("migrated {} -> {}", from.display(), to.display()));
+                lines.push(match config {
+                    ConfigNote::Written(p) => {
+                        format!("  cargo: wrote [build] target-dir into {}", p.display())
+                    }
+                    ConfigNote::Rewritten(p) => {
+                        format!("  cargo: rewrote target-dir in {}", p.display())
+                    }
+                    ConfigNote::Linked { .. } => unreachable!("matched by the arm above"),
+                    ConfigNote::Untouched(why) => format!("  cargo: NOT re-pointed — {why}"),
+                });
+                if matches!(config, ConfigNote::Untouched(_)) {
+                    for hint in crate::noindex::cargo_hint(to) {
+                        lines.push(format!("  {hint}"));
+                    }
+                }
+            }
+            Applied::Planned { from, to, pointer } => {
+                planned += 1;
+                lines.push(format!(
+                    "would rename {} -> {}",
+                    from.display(),
+                    to.display()
+                ));
+                lines.push(match pointer {
+                    Pointer::None => {
+                        "  cargo: no Cargo.toml beside it — nothing would be re-pointed".into()
+                    }
+                    Pointer::Symlink => format!(
+                        "  cargo: would leave a symlink {} in place; no config edit: git checkout",
+                        from.display()
+                    ),
+                    Pointer::Config(config) => format!(
+                        "  cargo: would write [build] target-dir into {}",
+                        config.display()
+                    ),
+                });
+            }
+            Applied::AlreadyExcluded(p) => {
+                excluded += 1;
+                lines.push(format!(
+                    "already excluded — {} (nothing to do)",
+                    p.display()
+                ));
+            }
+            Applied::Skipped { path, reason } => {
+                skipped += 1;
+                lines.push(format!("skipped {} — {reason}", path.display()));
+            }
+        }
+    }
+    if planned > 0 {
+        lines.push(format!(
+            "{planned} would migrate, {excluded} already excluded, {skipped} skipped (dry run)"
+        ));
+    } else {
+        lines.push(format!(
+            "{migrated} migrated, {excluded} already excluded, {skipped} skipped"
+        ));
+    }
+    lines
 }
 
 /// `atpkg noindex scan` — which cargo target dirs under `root` Spotlight is free to walk.
@@ -2173,6 +2507,7 @@ fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
     let Some(layout) = layout else {
         return ExitCode::from(1);
     };
+    warn_if_never_checked(&layout);
     let installed = crate::list_installed(&layout);
     if installed.is_empty() {
         if human {
@@ -3072,8 +3407,10 @@ fn record_status(
     // per-program observability surface (§5/§9) — a fresh single-entry map would
     // erase the rest each pass, and dropping `seams` would silently disown the
     // rustup seam ([`crate::seam`]) on every install.
-    let (mut programs, seams) = crate::status::read(layout)
-        .map(|s| (s.programs, s.seams))
+    // `last_success_at` is carried, never stamped: this writer runs on failure rows
+    // too, and the field means "a pass COMPLETED" ([`record_success`]).
+    let (mut programs, seams, last_success_at) = crate::status::read(layout)
+        .map(|s| (s.programs, s.seams, s.last_success_at))
         .unwrap_or_default();
     programs.insert(program.to_string(), state);
     let status = crate::Status {
@@ -3083,9 +3420,32 @@ fn record_status(
         index_source: crate::resolve_account(crate::config::cached().account()).slug(),
         outcome,
         seams,
+        last_success_at,
         programs,
     };
     let _ = crate::status::write(layout, &status);
+}
+
+/// The ONE writer of `last_success_at` ([`crate::status::stamp_success`]): a pass that
+/// resolved the signed index and finished without a failure. Called at the success
+/// exits of `update` and `install --default-set` — never from a per-program writer, the
+/// error path, the seed offer, or a shadow reconcile, all of which move `updated_at`
+/// and none of which is a completed check.
+fn record_success(layout: &crate::store::Layout) {
+    let _ = crate::status::stamp_success(layout, &now_rfc3339());
+}
+
+/// R3: print [`crate::status::NEVER_CHECKED_LINE`] on STDERR when no update pass has
+/// ever completed on this machine ([`crate::status::never_checked`]) — from every
+/// read-only verb and the pending stub, so a console learns that packages cannot be
+/// updated yet without anyone opening a window. Returns whether it printed, for the
+/// tests; stdout is untouched, so scripts parsing a verb's answer see no change.
+fn warn_if_never_checked(layout: &crate::store::Layout) -> bool {
+    if !crate::status::never_checked(layout) {
+        return false;
+    }
+    eprintln!("{}", crate::status::NEVER_CHECKED_LINE);
+    true
 }
 
 /// Pure precedence core of [`resolve_pkg_token`]: a non-empty `ATPKG_TOKEN` env
@@ -3726,7 +4086,7 @@ fn extra_stub_candidates_with(
         .programs
         .iter()
         .filter(|(name, p)| {
-            p.extra
+            index.is_extra(name)
                 && !removed.contains(name.as_str())
                 && !cfg.exclude().contains(name)
                 && !installed.contains_key(name.as_str())
@@ -3841,6 +4201,36 @@ fn record_state_if_changed(layout: &crate::store::Layout, program: &str, state: 
     true
 }
 
+/// Whether an UpToDate member's row must be rewritten to `managed <build> — pinned by
+/// index <index_build>`: a row that is absent, the legacy `active` spelling (no current
+/// writer emits it — `state.rs` lists it among the "other" strings), or a managed row
+/// whose build or index differs from this pass's. Every OTHER spelling is another arm's
+/// to change — SHADOWED (the shadow reconcile), `system:` (a retirement), a fault
+/// (`tombstoned:`, `error:`), `installed via`, `needs admin` — so it is left alone.
+fn up_to_date_row_needs_rewrite(prior: Option<&str>, build: u64, index_build: u64) -> bool {
+    match prior {
+        None | Some("active") => true,
+        Some(s) => {
+            crate::state::managed_pin(s).is_some_and(|(b, i)| b != build || i != index_build)
+        }
+    }
+}
+
+/// Write one program's row and NOTHING ELSE: the aggregate `outcome` is carried from the
+/// existing record. [`record_status`] takes the sentence as a parameter because its
+/// callers ARE the pass's verdict; a row migration is not, and must not swap `up to date
+/// (index build N)` for a sentence about itself.
+fn record_row_keeping_outcome(
+    layout: &crate::store::Layout,
+    program: &str,
+    row: crate::ProgramStatus,
+) {
+    let outcome = crate::status::read(layout)
+        .map(|s| s.outcome)
+        .unwrap_or_default();
+    record_status(layout, program, row, outcome);
+}
+
 /// Today as `YYYY-MM-DD` (UTC), or empty when the clock is unusable — the retirement
 /// marker's payload. Derived from the same RFC3339 stamp `status.toml` carries.
 fn today_ymd() -> String {
@@ -3899,7 +4289,7 @@ fn reconcile_aliases(layout: &crate::store::Layout, index: &crate::manifest::Ind
             continue;
         }
         let tools = crate::ops::active_tools(layout, &program, build);
-        let aliases = crate::activate::Aliases::for_program(index.program(&program));
+        let aliases = crate::activate::Aliases::for_program(&program, index.program(&program));
         let _ = crate::activate::reconcile_aliases(
             layout,
             &layout.build_dir(&program, build),
@@ -3974,6 +4364,9 @@ fn reconcile_shadowed(
             outcome.clone(),
         );
     }
+    if !shadowed.is_empty() {
+        println!("atpkg: {SHADOWED_MARKER}{}", shadowed.join(", "));
+    }
     shadowed
 }
 
@@ -4004,7 +4397,9 @@ fn explicit_install_door(
     )
     .ok()?;
     let prog = index.program(program)?;
-    if prog.extra && note_extra_optin(layout, &index, program) {
+    // (`note_extra_optin` asks `Index::is_extra`, so an agent program — default-set
+    // whatever its row's flag says — records no opt-in marker.)
+    if note_extra_optin(layout, &index, program) {
         println!("atpkg: {program} is an extra — opted in; later passes keep it current");
     }
     // Its `requires` (§17.10) are resolved FIRST by the flow, in this order, on this
@@ -4100,6 +4495,165 @@ pub const NET_STARTING_MARKER: &str = "net-starting: ";
 /// lane shipped exactly this bug once (a held card that sat for its full 20
 /// minutes), and the marker contract is what prevents the rerun.
 pub const NET_FAILED_MARKER: &str = "net-failed: ";
+/// The SHADOW reconcile's answer ([`reconcile_shadowed`]): the managed programs a
+/// foreign copy out-ranks on this pass's `PATH`, comma-separated — the pass printed
+/// one `<program>: managed <build> — SHADOWED by <path>` line per member and no
+/// machine-readable summary at all (2026-09-10 audit), so a GUI could not tell a pass
+/// that found a shadow from one that found none.
+pub const SHADOWED_MARKER: &str = "shadowed: ";
+/// The MANAGED-CURRENT answer, printed at the end of every successful update/seed
+/// pass: each agent program ([`crate::stub::AGENT_PROGRAMS`]) that is installed AND at
+/// the index pin, as `<name> <version> (build <build>)`, `; `-separated — the R6 row
+/// "the latest aterm-managed claude/codex are in use". Omitted when none qualifies.
+pub const MANAGED_CURRENT_MARKER: &str = "managed-current: ";
+
+/// `machine-settings: spotlight-noindex 73 dir(s) migrated; universal-control disabled`
+/// (R5/R6, contract 2026-09-10): what THIS pass changed about the machine per the
+/// doctor's remedies — entries `; `-separated, the line omitted when nothing changed.
+/// The pull-down row that renders it must carry the revert
+/// ([`crate::machine::UNIVERSAL_CONTROL_REVERT`]).
+pub const MACHINE_SETTINGS_MARKER: &str = "machine-settings: ";
+
+/// The `machine-settings:` line for `entries` (already non-empty).
+#[must_use]
+pub fn machine_settings_line(entries: &[String]) -> String {
+    format!("{MACHINE_SETTINGS_MARKER}{}", entries.join("; "))
+}
+
+/// The Spotlight entry: `spotlight-noindex <n> dir(s) migrated`.
+#[must_use]
+pub fn spotlight_entry(migrated: usize) -> String {
+    format!("spotlight-noindex {migrated} dir(s) migrated")
+}
+
+/// Apply the `[machine]` settings at the end of a pass and print what CHANGED, as the
+/// `machine-settings:` marker (nothing printed when nothing changed — the pull-down row
+/// is for a change, not a state). Spotlight: the doctor's scan of `$HOME`, migrated with
+/// each repo's cargo re-pointed ([`crate::noindex::apply_under`]; a live build is skipped
+/// and retried next pass). Universal Control: [`crate::machine::apply_universal_control`]
+/// through the real `defaults`. Best-effort throughout — a machine setting must never
+/// fail the toolchain pass that carried it — and every migration is also narrated on
+/// its own lines for the log.
+fn apply_machine_settings() {
+    let cfg = crate::config::cached_machine();
+    let mut entries: Vec<String> = Vec::new();
+    if cfg.spotlight_noindex()
+        && crate::noindex::SUPPORTED
+        && let Some(home) = aterm_types::dirs::home_dir()
+    {
+        let (outcomes, _) = crate::noindex::apply_under(
+            &home,
+            crate::noindex::DOCTOR_DEPTH,
+            &crate::noindex::Budget::DOCTOR,
+            false,
+        );
+        for line in render_applied(&outcomes) {
+            // Only the rows that DID something narrate here; the pass log is not the
+            // place for 73 "skipped" lines every six hours.
+            if line.starts_with("migrated ")
+                || line.starts_with("  cargo")
+                || line.starts_with("  git")
+            {
+                println!("atpkg noindex: {line}");
+            }
+        }
+        let migrated = outcomes.iter().filter(|o| o.migrated()).count();
+        if migrated > 0 {
+            entries.push(spotlight_entry(migrated));
+        }
+    }
+    if crate::machine::apply_universal_control(
+        cfg.universal_control(),
+        &crate::machine::SystemDefaults,
+    ) == crate::machine::UniversalControlOutcome::Disabled
+    {
+        println!(
+            "atpkg: Universal Control disabled for this host (revert: {})",
+            crate::machine::UNIVERSAL_CONTROL_REVERT
+        );
+        entries.push(crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string());
+    }
+    if !entries.is_empty() {
+        println!("atpkg: {}", machine_settings_line(&entries));
+    }
+}
+
+/// The `managed-current:` payload ([`MANAGED_CURRENT_MARKER`]) for `entries` —
+/// `(name, version, build)` per agent program that is installed AND at the index pin, in
+/// roster order — as `claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)`.
+/// A version the signed manifest could not be fetched for is left out of its entry
+/// (`claude (build 2026091001)`) rather than guessed. `None` when no entry qualifies: the
+/// line is then omitted, so its presence means exactly "the managed agents are current".
+fn managed_current_line(entries: &[(String, Option<String>, u64)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(name, version, build)| match version {
+            Some(v) => format!("{name} {v} (build {build})"),
+            None => format!("{name} (build {build})"),
+        })
+        .collect();
+    Some(format!("{MANAGED_CURRENT_MARKER}{}", parts.join("; ")))
+}
+
+/// The entries behind [`managed_current_line`]: every [`crate::stub::AGENT_PROGRAMS`]
+/// member whose active build equals the channel's pin, with the version its SIGNED
+/// pkg manifest states (fetched through the pass's memoized fetcher and verified under
+/// the index, as the install did — never a locally recorded string).
+fn managed_current_entries(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::TrustedIndex,
+    channel: &str,
+) -> Vec<(String, Option<String>, u64)> {
+    let Some(ch) = index.channels.iter().find(|c| c.name == channel) else {
+        return Vec::new();
+    };
+    let installed = crate::active_builds(layout);
+    crate::stub::AGENT_PROGRAMS
+        .iter()
+        .filter_map(|name| {
+            let build = *installed.get(*name)?;
+            if ch.pin.get(*name).copied() != Some(build) {
+                return None;
+            }
+            let version = crate::flow::verified_pkg(fetcher, index, ch, name)
+                .filter(|(pinned, _, pkg)| *pinned == build && pkg.is_for(name))
+                .map(|(_, _, pkg)| pkg.version);
+            Some(((*name).to_string(), version, build))
+        })
+        .collect()
+}
+
+/// Print the `managed-current:` marker at the end of a SUCCESSFUL pass (R6: the
+/// pull-down row "the latest aterm-managed claude/codex are in use"). The index resolve
+/// is memoized in the fetcher, so this costs no second round-trip; a resolve that
+/// nevertheless fails prints nothing rather than a guess.
+fn print_managed_current(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+) {
+    let Ok(index) = crate::resolve_verified_index(
+        fetcher,
+        layout,
+        &effective_anchor(layout),
+        build_floor(layout),
+        now_unix(),
+    ) else {
+        return;
+    };
+    if let Some(line) = managed_current_line(&managed_current_entries(
+        layout,
+        fetcher,
+        &index,
+        cfg.channel(),
+    )) {
+        println!("atpkg: {line}");
+    }
+}
 
 /// The human line printed on its own row AFTER an install marker (`seed-installed:` /
 /// `net-installed:`) — never appended to the marker itself, which the GUI parses
@@ -4902,6 +5456,15 @@ fn cmd_update_all() -> ExitCode {
                 "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing —                  see the lines above for each program's reason"
             );
         }
+        // Retire or refresh a stale `*seed*` pending-consent row against what
+        // this pass just proved. The seed lane — the row's only other writer —
+        // hard-skips once the store is non-empty, so nothing else ever
+        // reconciled it: a row written 2026-08-12 was still advertising the
+        // legacy toolset layout on 2026-08-27, several index builds later.
+        // Only a CLEAN pass speaks; a failed one proves nothing about the offer.
+        if net.failures == 0 {
+            reconcile_seed_status(&layout, &net.remaining_missing);
+        }
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
     // done). Best-effort; never fails the update. This verb sweeps the WHOLE prefix, so an
@@ -5011,6 +5574,13 @@ fn cmd_update_all() -> ExitCode {
         // whose triple the index did not serve yet reaches the toolset through
         // THIS lane once artifacts are published (2026-08-20 round-9 audit).
         clear_status_row(&layout, "*toolset*");
+        // R6: which managed agents are at the pin, for the pull-down row.
+        print_managed_current(&layout, &*fetcher, cfg);
+        // R5: the machine settings per doctor, applied at the end of every pass.
+        apply_machine_settings();
+        // A pass that resolved the index and applied it clean: THE event R3's
+        // "never checked" waits for, stamped here and at no failure exit above.
+        record_success(&layout);
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -5050,6 +5620,17 @@ struct DefaultSetOutcome {
     /// CALLER's edge (the `cmd_update_all` precedent), so this rides the outcome out to
     /// where the pass-end `gc::run_keeping_pinned_partials` builds its sparing closure.
     resolved_assets: std::collections::BTreeMap<String, String>,
+    /// Members the pass REFUSED because their coherence tuple was narrowed (a
+    /// config include/exclude, or a member removed on purpose) — sorted. They are
+    /// deliberately absent from the announcement and the plan; the caller's
+    /// summary needs them so "default set complete" cannot claim members the
+    /// pass just declined to install (observed live 2026-08-27).
+    skipped_narrowed: Vec<String>,
+    /// `wanted ∧ absent` at pass end — what a CLEAN pass proved still awaits
+    /// install here (failed members included; narrowed/unserved members not).
+    /// The `*seed*` pending-consent row reconciles against this, so a row
+    /// written in one era cannot keep advertising another era's toolset.
+    remaining_missing: Vec<String>,
 }
 
 /// WHERE a default-set pass's bytes come from — named by the CALLER, which owns
@@ -5184,6 +5765,8 @@ fn install_default_set_inner(
                 failures: 1,
                 announced: false,
                 resolved_assets: std::collections::BTreeMap::new(),
+                skipped_narrowed: Vec::new(),
+                remaining_missing: Vec::new(),
             };
         }
     };
@@ -5212,6 +5795,8 @@ fn install_default_set_inner(
             failures: 1,
             announced: false,
             resolved_assets: std::collections::BTreeMap::new(),
+            skipped_narrowed: Vec::new(),
+            remaining_missing: Vec::new(),
         };
     };
     let mut installed = crate::active_builds(layout);
@@ -5381,6 +5966,91 @@ fn install_default_set_inner(
     for name in extras.iter().filter(|n| !wanted.contains(n.as_str())) {
         record_state_if_changed(layout, name, crate::state::extra_not_installed(name));
     }
+    // THE AGENT PROGRAMS' ROWS (owner decision 2026-09-10): a wanted agent program that
+    // is not installed yet reads `agent program — installing` — never `extra — not
+    // installed (opt in: …)`, the row an older pass wrote under the opt-in policy, which
+    // this corrects the first pass after the client lands.
+    for name in wanted
+        .iter()
+        .filter(|n| crate::stub::is_agent_program(n) && !installed.contains_key(n.as_str()))
+    {
+        record_state_if_changed(layout, name, crate::state::agent_installing());
+    }
+    // A FOREIGN COPY OF AN EXTRA (2026-09-10 audit): an extra with a copy of its own name
+    // on `PATH` gets no consent stub (laid ahead of it, the stub would hijack a working
+    // install) — and, until now, no row either, so `status` listed nothing at all for a
+    // program the user runs every day. Say what runs, in the canonical words:
+    // `system: <path> — not managed by aterm`.
+    {
+        let removed = layout.removed_programs();
+        for name in index.programs.keys().filter(|n| {
+            index.is_extra(n)
+                && !wanted.contains(n.as_str())
+                && !extras.contains(n.as_str())
+                && !installed.contains_key(n.as_str())
+                && !removed.contains(n.as_str())
+                && !cfg.exclude().contains(n)
+        }) {
+            if let Some(path) = crate::vendor::system_binary_on_path(&layout.prefix, name, path_var)
+            {
+                record_state_if_changed(layout, name, crate::state::system(&path, None));
+            }
+        }
+    }
+    // A coherence tuple with a member NARROWED OUT — a `[packages]` include/exclude,
+    // or a member removed on purpose — cannot install whole, and the group arm
+    // below refuses it. Deciding that only AT the arm let one pass contradict
+    // itself three lines apart (observed live 2026-08-27: `net-starting:`
+    // announced trust-cg/ir/vc, the arm then refused the tuple over the
+    // removed member `trust` while blaming include/exclude, the stub reconcile
+    // laid PATH stubs promising the very install just refused, and the summary
+    // claimed the set complete). Decide it HERE, before the stubs and the
+    // announcement: name the true per-member cause once, then narrow the refused
+    // members out of `wanted` so no stub, announcement, plan entry, or
+    // completion claim ever speaks for them. The arm's own check stays as the
+    // transaction's safety net; this prescan is what keeps it unreachable.
+    let removed_markers = removed_programs(layout);
+    let mut skipped_narrowed: Vec<String> = Vec::new();
+    for group in crate::plan_groups(&index, ch) {
+        let Some(g) = &group.group else {
+            continue;
+        };
+        let missing: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let narrowed_out: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| !wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+            .map(|m| {
+                if removed_markers.contains(m.as_str()) {
+                    format!("{m} (removed on this machine — `aterm pkg install --default-set` restores it)")
+                } else {
+                    format!("{m} ([packages] include/exclude)")
+                }
+            })
+            .collect();
+        if narrowed_out.is_empty() {
+            continue;
+        }
+        eprintln!(
+            "atpkg: coherence group '{g}' cannot install whole — narrowed out: {}; a locked \
+             tuple installs whole, so its remaining member(s) are skipped: {}",
+            narrowed_out.join(", "),
+            missing.join(", ")
+        );
+        skipped_narrowed.extend(missing);
+    }
+    for p in &skipped_narrowed {
+        wanted.remove(p.as_str());
+    }
+    skipped_narrowed.sort();
     // Pending-stub reconcile at the index resolve (R6): the SIGNED set replaces the
     // compiled roster the adoption-time stubs were laid from — newly listed names
     // gain stubs (PATH coverage before their bytes move), de-listed/removed/
@@ -5588,13 +6258,8 @@ fn install_default_set_inner(
     // Second stub reconcile, against what ACTUALLY landed: a program whose real
     // shims do not expose its own name would otherwise keep a stale "installing"
     // stub until the next pass.
-    crate::stub::reconcile_with_requires(
-        layout,
-        &wanted,
-        &extras,
-        &crate::active_builds(layout),
-        &requires_of,
-    );
+    let now_active = crate::active_builds(layout);
+    crate::stub::reconcile_with_requires(layout, &wanted, &extras, &now_active, &requires_of);
     // The reroute stubs ride the same reconcile: the embedded atpkg path is refreshed
     // and a row that left the table is swept (philosophy §4).
     lay_reroute_stubs(layout);
@@ -5622,10 +6287,20 @@ fn install_default_set_inner(
         eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
         record_bootstrap_error(layout, program, &e);
     }
+    // What a CLEAN pass proved still awaits install (the narrowed/unserved were
+    // removed from `wanted` above, so this is pending work, not refused work) —
+    // the `*seed*` row reconcile's input at both callers' edges.
+    let remaining_missing: Vec<String> = wanted
+        .iter()
+        .filter(|p| !now_active.contains_key(p.as_str()))
+        .cloned()
+        .collect();
     DefaultSetOutcome {
         failures,
         announced,
         resolved_assets,
+        skipped_narrowed,
+        remaining_missing,
     }
 }
 
@@ -5771,8 +6446,14 @@ fn bootstrap_group(
                 "atpkg: coherence group '{g}': pins tombstoned for {members:?} — \
                  nothing installed"
             );
+            // A CANONICAL ROW, not silence: a yanked pin used to leave the missing
+            // member with no row at all, so `status` listed nothing for a program the
+            // index names and the toolset read as merely incomplete. The words are the
+            // update lane's (`TOMBSTONED_PIN`), and doctor counts them as the fault they are.
             for m in missing {
-                note_finished(m, crate::progress::Phase::Skipped, None);
+                let state = crate::state::TOMBSTONED_PIN.to_string();
+                record_state_if_changed(layout, m, state.clone());
+                note_finished(m, crate::progress::Phase::Skipped, Some(state));
             }
             0
         }
@@ -5939,7 +6620,10 @@ fn bootstrap_singleton(
         }
         Err(e @ crate::FlowError::Tombstoned(_)) => {
             eprintln!("atpkg: {program}: {e} — nothing installed");
-            note_finished(program, crate::progress::Phase::Skipped, None);
+            // The same canonical row the group arm and the update lane write.
+            let state = crate::state::TOMBSTONED_PIN.to_string();
+            record_state_if_changed(layout, program, state.clone());
+            note_finished(program, crate::progress::Phase::Skipped, Some(state));
             0
         }
         Err(e) => {
@@ -5978,6 +6662,19 @@ fn cmd_install_default_set() -> ExitCode {
     };
     let cfg = crate::config::cached();
     reconcile_links(&layout, cfg);
+    // Asking for the toolset is an unambiguous change of mind about any earlier
+    // removal; undoing a decline must never mean hunting for a marker file. The
+    // per-program removals go too — "install the whole set" plainly includes them.
+    // CLEARED BEFORE THE PASS, not after: the pass narrows `wanted` by these very
+    // markers, so the old after-ordering made the one verb whose doctrine says
+    // "change of mind" still honour the old mind for exactly one pass — a removed
+    // coherence-group member narrowed its whole tuple out of the very install
+    // that was asked to restore it (observed live 2026-08-27: a legacy-era
+    // `trust` removal kept trust-cg/ir/vc out of the explicit toolset install,
+    // which then reported the set complete).
+    clear_decline(&layout);
+    let all_removed: Vec<String> = removed_programs(&layout).into_iter().collect();
+    clear_removed(&layout, &all_removed);
     let fetcher = resolve_fetcher(&layout);
     let before = crate::active_builds(&layout);
     let failures_outcome = install_default_set(
@@ -6000,12 +6697,6 @@ fn cmd_install_default_set() -> ExitCode {
     if activated > 0 {
         record_adoption(&layout);
     }
-    // Asking for the toolset is an unambiguous change of mind about any earlier
-    // removal; undoing a decline must never mean hunting for a marker file. The
-    // per-program removals go too — "install the whole set" plainly includes them.
-    clear_decline(&layout);
-    let all_removed: Vec<String> = removed_programs(&layout).into_iter().collect();
-    clear_removed(&layout, &all_removed);
     // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
     // its disclosure of what the pass abstained on, for the same reason: this verb walks the
     // whole prefix, so a skip here is not about a program the user never mentioned.
@@ -6023,17 +6714,40 @@ fn cmd_install_default_set() -> ExitCode {
     if failures > 0 {
         return ExitCode::from(1);
     }
+    // The `*seed*` offer, if one was ever announced, is answered by what this
+    // CLEAN pass just proved: retired when nothing remains to offer (the offer
+    // was taken — or was stale, see `reconcile_seed_status`), refreshed when a
+    // remainder still awaits consent. `record_status` MERGES the program map, so
+    // a row nobody reconciles lives forever and Settings ▸ Packages keeps
+    // advertising an install the user already performed.
+    reconcile_seed_status(&layout, &failures_outcome.remaining_missing);
+    let skipped = &failures_outcome.skipped_narrowed;
     // "Zero failures" is NOT "it worked". Every member can clean-skip — no artifact
     // for this triple (§6), all dev-linked, all tombstoned — and that path used to
     // print "default set complete" and exit 0, which the Packages page renders as
     // "ALab toolset install completed" over an empty program list. Telling a user in
     // green that a multi-GB toolchain installed when nothing happened is the exact
     // silent-and-green shape this codebase keeps having to root out, so the
-    // no-op case gets its own words and its own exit code.
+    // no-op case gets its own words and its own exit code. The same shape hid a
+    // second lie one size smaller: "default set already complete" over members the
+    // pass had just REFUSED (a narrowed tuple), so a summary with skips now names
+    // them instead of claiming completeness (observed live 2026-08-27).
     if activated == 0 {
         let already = !before.is_empty();
         if already {
-            println!("atpkg: default set already complete — nothing to install");
+            if skipped.is_empty() {
+                println!("atpkg: default set already complete — nothing to install");
+            } else {
+                println!(
+                    "atpkg: default set: nothing installed — {} program(s) skipped: {} \
+                     (reasons above)",
+                    skipped.len(),
+                    skipped.join(", ")
+                );
+            }
+            print_managed_current(&layout, &*fetcher, cfg);
+            apply_machine_settings();
+            record_success(&layout);
             return ExitCode::SUCCESS;
         }
         println!(
@@ -6046,11 +6760,19 @@ fn cmd_install_default_set() -> ExitCode {
         // lie) and 1 to a retryable failure (which would be false hope).
         return ExitCode::from(2);
     }
-    // The `*seed*` offer, if one was ever announced, is now TAKEN. `record_status`
-    // MERGES the program map, so a row nobody removes lives forever and Settings ▸
-    // Packages keeps advertising an install the user already performed.
-    clear_seed_status(&layout);
-    println!("atpkg: default set complete ({activated} program(s) installed)");
+    if skipped.is_empty() {
+        println!("atpkg: default set complete ({activated} program(s) installed)");
+    } else {
+        println!(
+            "atpkg: default set: {activated} program(s) installed, {} skipped: {} \
+             (reasons above)",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    print_managed_current(&layout, &*fetcher, cfg);
+    apply_machine_settings();
+    record_success(&layout);
     ExitCode::SUCCESS
 }
 
@@ -6349,6 +7071,9 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         // earlier launch stops being Settings' answer forever.
         clear_status_row(&layout, "*toolset*");
         reclaim_bundled_seed(&seed_dir);
+        // R5: first open IS this pass on a seeded machine — the machine settings apply
+        // here too, not only on the network pass that follows.
+        apply_machine_settings();
     } else {
         println!(
             "atpkg: keeping the bundled seed — {failures} member(s) did not install, and the \
@@ -6891,6 +7616,65 @@ fn clear_seed_status(layout: &crate::store::Layout) {
     let _ = crate::status::write(layout, &status);
 }
 
+/// Retire the `*seed*` row and NOTHING ELSE. [`clear_seed_status`] also rewrites
+/// `status.outcome` to "bundled seed: nothing pending" — right for the seed verbs,
+/// whose pass that sentence describes, and a clobber for `cmd_update_all`, which
+/// has just recorded `up to date (index build N)` and would lose it to a sentence
+/// about a seed that never ran (2026-09-10 audit, adjudicated disagreement 6).
+fn retire_seed_row(layout: &crate::store::Layout) {
+    let Some(mut status) = crate::status::read(layout) else {
+        return;
+    };
+    if status.programs.remove("*seed*").is_none() {
+        return;
+    }
+    status.updated_at = now_rfc3339();
+    let _ = crate::status::write(layout, &status);
+}
+
+/// Reconcile the `*seed*` pending-consent row against what a just-finished CLEAN
+/// network pass PROVED: retired when nothing remains to offer, rewritten when the
+/// remaining offer differs from the recorded one, untouched when no row exists.
+/// `record_status` MERGES the program map, and the row's only other writer
+/// ([`announce_pending_seed`]) lives on the seed lane, which hard-skips once the
+/// store is non-empty — so a row written in one era kept advertising another
+/// era's toolset layout, 15 days and several index builds later (observed live
+/// 2026-08-27). Callers pass a clean pass's `remaining_missing` only: a failed
+/// pass proves nothing about the offer.
+///
+/// ROW-ONLY: the aggregate `outcome` sentence belongs to the pass that just ran
+/// (`up to date (index build N)` for the update lane) and is left alone — except
+/// when it IS the seed offer's own sentence, which follows the row so Settings ▸
+/// Packages never shows one list in the row and another in the detail line.
+fn reconcile_seed_status(layout: &crate::store::Layout, remaining_missing: &[String]) {
+    const OFFER: &str = "ALab toolchain ready: ";
+    if remaining_missing.is_empty() {
+        retire_seed_row(layout);
+        return;
+    }
+    let Some(mut status) = crate::status::read(layout) else {
+        return;
+    };
+    let Some(row) = status.programs.get_mut("*seed*") else {
+        return;
+    };
+    let list = remaining_missing.join(", ");
+    let state = format!("pending-consent: {list}");
+    if row.state == state {
+        return;
+    }
+    row.state = state;
+    row.installed_build = None;
+    row.tree_root = String::new();
+    if status.outcome.starts_with(OFFER) {
+        // The SAME sentence `announce_pending_seed` writes — a drifted wording
+        // here would read as a different offer.
+        status.outcome = format!("{OFFER}{list} — Install ALab toolset below");
+    }
+    status.updated_at = now_rfc3339();
+    let _ = crate::status::write(layout, &status);
+}
+
 /// The consent-pending half of the bundled-seed lane (§11, the
 /// `[packages].seed_install = false` posture): resolve the ONE verified index
 /// through the chain, count the channel-pinned installable members not yet
@@ -7310,25 +8094,35 @@ fn report_channel_apply(
                 // pin has not moved — is UpToDate: nothing flips, so no other arm would
                 // rewrite the row, and the block would outlive the fact it stated.
                 // Restore the canonical managed row, build and attestation kept.
+                //
+                // THE SAME ARM MIGRATES AND RE-STAMPS. A row spelled `active` was
+                // written by a pre-`managed` client and no pass ever rewrote it; a
+                // `managed N — pinned by index 15` row stays at 15 through six index
+                // builds because only an install rewrites it. One healthy store then
+                // read as three spellings — `pinned by index 15`, `active`, `pinned
+                // by index 21` — and the owner took the 15s for stale tools
+                // (2026-09-10 audit). An UpToDate member's row now always names THIS
+                // pass's index; the outcome sentence the pass already recorded is kept
+                // (only the lifted-block case narrates, as before).
                 for prog in &group.members {
                     let Some(build) = post.get(prog).copied() else {
                         continue;
                     };
-                    if !was_blocked(prog) {
+                    let state = crate::state::managed(build, report.index_build);
+                    let row = crate::ProgramStatus {
+                        installed_build: Some(build),
+                        state: state.clone(),
+                        tree_root: effective_tree_root(layout, prog, ""),
+                    };
+                    if was_blocked(prog) {
+                        println!("atpkg: {prog}: {state} (no longer blocked)");
+                        record_status(layout, prog, row, format!("group {label}: up to date"));
                         continue;
                     }
-                    let state = crate::state::managed(build, report.index_build);
-                    println!("atpkg: {prog}: {state} (no longer blocked)");
-                    record_status(
-                        layout,
-                        prog,
-                        crate::ProgramStatus {
-                            installed_build: Some(build),
-                            state,
-                            tree_root: effective_tree_root(layout, prog, ""),
-                        },
-                        format!("group {label}: up to date"),
-                    );
+                    let prior = before.get(prog.as_str()).map(String::as_str);
+                    if up_to_date_row_needs_rewrite(prior, build, report.index_build) {
+                        record_row_keeping_outcome(layout, prog, row);
+                    }
                 }
             }
             crate::TxnOutcome::Applied(members) => {
@@ -7381,7 +8175,7 @@ fn report_channel_apply(
                             // fail-closed, so a single `atpkg pin trust` turned into
                             // "reinstall 3.2 GB to enable verification"
                             // (2026-08-20 round-8 audit).
-                            state: "tombstoned: pin yanked/below floor".into(),
+                            state: crate::state::TOMBSTONED_PIN.into(),
                             tree_root: effective_tree_root(layout, prog, ""),
                         },
                         format!("group {label}: tombstoned"),
@@ -7827,7 +8621,7 @@ fn restore_installed_shims(
 /// installed keeps whatever the pass has laid so far.
 fn alias_policy_offline(layout: &crate::store::Layout, program: &str) -> crate::activate::Aliases {
     match cached_index(layout) {
-        Some(index) => crate::activate::Aliases::for_program(index.program(program)),
+        Some(index) => crate::activate::Aliases::for_program(program, index.program(program)),
         None => crate::activate::Aliases::laid_for(layout, program),
     }
 }
@@ -8570,7 +9364,7 @@ mod tests {
     #[test]
     fn an_extra_joins_the_wanted_set_only_by_opt_in_and_leaves_with_uninstall() {
         let layout = temp_layout("optin");
-        let index = index_of(&[("ay", false, None), ("codex", true, None)]);
+        let index = index_of(&[("ay", false, None), ("vendorx", true, None)]);
         let cfg = crate::config::PackagesConfig::default();
         assert_eq!(wanted_programs(&layout, &index, &cfg), names(&["ay"]));
         // The explicit door records the opt-in for an extra — and ONLY for an extra.
@@ -8583,28 +9377,452 @@ mod tests {
             "unlisted: no marker"
         );
         assert!(layout.optins().is_empty());
-        assert!(note_extra_optin(&layout, &index, "codex"));
-        assert!(layout.optin_exists("codex"));
+        assert!(note_extra_optin(&layout, &index, "vendorx"));
+        assert!(layout.optin_exists("vendorx"));
         assert_eq!(
             wanted_programs(&layout, &index, &cfg),
-            names(&["ay", "codex"])
+            names(&["ay", "vendorx"])
         );
         // A config exclude still beats the marker.
         let narrowed = crate::config::PackagesConfig {
-            exclude: Some(vec!["codex".to_string()]),
+            exclude: Some(vec!["vendorx".to_string()]),
             ..Default::default()
         };
         assert_eq!(wanted_programs(&layout, &index, &narrowed), names(&["ay"]));
-        // `uninstall codex` withdraws the opt-in (the store tree is the thing being removed).
-        std::fs::create_dir_all(layout.build_dir("codex", 1)).unwrap();
-        uninstall_and_retire(&layout, "codex").unwrap();
-        assert!(!layout.optin_exists("codex"));
+        // `uninstall vendorx` withdraws the opt-in (the store tree is the thing being removed).
+        std::fs::create_dir_all(layout.build_dir("vendorx", 1)).unwrap();
+        uninstall_and_retire(&layout, "vendorx").unwrap();
+        assert!(!layout.optin_exists("vendorx"));
         assert_eq!(wanted_programs(&layout, &index, &cfg), names(&["ay"]));
         // A decline withdraws every opt-in at once.
-        assert!(note_extra_optin(&layout, &index, "codex"));
+        assert!(note_extra_optin(&layout, &index, "vendorx"));
         layout.clear_all_optins();
         assert!(layout.optins().is_empty());
         let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    // `which <program>` for a bundle whose build exposes no command of its own name
+    // (`trust` → trustc/targo, `trust-mc` → trust-mc-driver) answers with the managed
+    // store dir and the names it DOES put on PATH; a same-named unrelated binary on PATH
+    // (Homebrew's p11-kit `trust`) is named as exactly that, after the truth — never as
+    // "the system copy" of a program it is not (2026-09-10 audit).
+    #[cfg(unix)]
+    #[test]
+    fn which_for_a_bundle_program_names_the_store_and_its_exposed_tools() {
+        let layout = temp_layout("which-bundle");
+        let build = layout.build_dir("tm", 20065);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        for exe in ["tm-driver", "tm-compiler"] {
+            std::fs::write(build.join("bin").join(exe), b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(
+                build.join("bin").join(exe),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        // Only the driver is exposed — the compiler is an internal, like the real pack.
+        crate::activate::install_shims(
+            &layout,
+            &build,
+            &["tm-driver".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        crate::activate::activate_channel(&layout, "stable", &build).unwrap();
+        crate::store::mark_build_ready(&build).unwrap();
+        record_status(
+            &layout,
+            "tm",
+            crate::ProgramStatus {
+                installed_build: Some(20065),
+                state: crate::state::managed(20065, 21),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        // A same-named UNRELATED binary on PATH (p11-kit's `trust`).
+        let brew = layout.prefix.parent().unwrap().join(format!(
+            "atpkg-main-which-bundle-brew-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&brew);
+        std::fs::create_dir_all(&brew).unwrap();
+        std::fs::write(brew.join("tm"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(brew.join("tm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([brew.clone(), layout.bin_dir()]).unwrap();
+        let line = which_line(&layout, "tm", Some(&path)).unwrap();
+        let mut lines = line.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "tm → {} (bundle; exposes tm-driver — run `aterm pkg which tm-driver`) — \
+                 managed 20065 — pinned by index 21",
+                build.display()
+            )
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "{} on PATH is an unrelated binary, not this program",
+                brew.join("tm").display()
+            )
+        );
+        assert!(lines.next().is_none());
+        // Without the impostor: one line.
+        let line = which_line(&layout, "tm", Some(std::ffi::OsStr::new(""))).unwrap();
+        assert_eq!(line.lines().count(), 1);
+        // The exposed tool itself still answers by the ordinary shim arm.
+        let line = which_line(&layout, "tm-driver", Some(std::ffi::OsStr::new(""))).unwrap();
+        assert!(line.starts_with("tm-driver → "), "{line}");
+        assert!(line.contains("managed 20065"), "{line}");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&brew);
+    }
+
+    /// `atpkg which` for an AGENT PROGRAM (owner decision 2026-09-10): with `agents/`
+    /// first on `PATH` the managed copy is what runs — the canonical managed line — and a
+    /// SECOND line names every foreign copy it out-ranked, home-abbreviated, with the
+    /// version its real location spells; nothing is executed to learn it. Without the
+    /// agents dir on `PATH` (a shell the hook never reached) the same foreign copy is
+    /// reported SHADOWING, as for any member.
+    #[cfg(unix)]
+    #[test]
+    fn which_for_an_agent_program_names_the_managed_copy_and_the_out_ranked_foreign_copies() {
+        let layout = temp_layout("which-agent");
+        let build = layout.build_dir("claude", 2026091001);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        std::fs::write(build.join("bin/claude"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            build.join("bin/claude"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        crate::activate::install_shims(
+            &layout,
+            &build,
+            &["claude".to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        let claude = crate::store::ToolName::new("claude").unwrap();
+        assert!(layout.agent_shim(&claude).exists(), "the twin is laid");
+        record_status(
+            &layout,
+            "claude",
+            crate::ProgramStatus {
+                installed_build: Some(2026091001),
+                state: crate::state::managed(2026091001, 21),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        // Two foreign copies shaped like the real machine: Anthropic's native install
+        // (`~/.local/bin/claude → …/versions/2.1.267`) and a Homebrew cask
+        // (`…/Caskroom/claude-code/2.1.204/claude`), reached through a symlink each.
+        let root = layout.prefix.parent().unwrap().join(format!(
+            "atpkg-main-which-agent-foreign-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let native_real = root.join("share/claude/versions/2.1.267");
+        let cask_real = root.join("Caskroom/claude-code/2.1.204/claude");
+        for real in [&native_real, &cask_real] {
+            std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+            std::fs::write(real, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let local = root.join("local-bin");
+        let brew = root.join("brew-bin");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&brew).unwrap();
+        std::os::unix::fs::symlink(&native_real, local.join("claude")).unwrap();
+        std::os::unix::fs::symlink(&cask_real, brew.join("claude")).unwrap();
+        let agents_first = std::env::join_paths([
+            layout.agents_dir(),
+            local.clone(),
+            brew.clone(),
+            layout.bin_dir(),
+        ])
+        .unwrap();
+        let line = which_line(&layout, "claude", Some(&agents_first)).unwrap();
+        let mut lines = line.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "claude → {} → {} — managed 2026091001 — pinned by index 21",
+                layout.shim(&claude).display(),
+                crate::which(&layout, "claude").unwrap().display()
+            )
+        );
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "foreign copies out-ranked: {} (2.1.267), {} (2.1.204)",
+                local.join("claude").display(),
+                brew.join("claude").display()
+            )
+        );
+        assert_eq!(lines.next(), None);
+        // No foreign copy at all: the managed line alone.
+        let managed_only = std::env::join_paths([layout.agents_dir(), layout.bin_dir()]).unwrap();
+        assert_eq!(
+            which_line(&layout, "claude", Some(&managed_only))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // The agents dir NOT on PATH (a shell the hook never reached): the native
+        // install ahead of bin/ shadows the managed copy, like any member's.
+        let no_agents = std::env::join_paths([local.clone(), layout.bin_dir()]).unwrap();
+        assert_eq!(
+            which_line(&layout, "claude", Some(&no_agents)).unwrap(),
+            format!(
+                "claude → {} — {}",
+                local.join("claude").display(),
+                crate::state::shadowed(2026091001, &local.join("claude"))
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The version a foreign copy's path spells: the LAST dotted-digits component, or
+    /// nothing — never a guess.
+    #[test]
+    fn version_from_components_reads_the_last_dotted_digits_component() {
+        let v = |p: &str| version_from_components(std::path::Path::new(p));
+        assert_eq!(
+            v("/Users//x/.local/share/claude/versions/2.1.267").as_deref(),
+            Some("2.1.267")
+        );
+        assert_eq!(
+            v("/opt/homebrew/Caskroom/claude-code/2.1.204/claude").as_deref(),
+            Some("2.1.204")
+        );
+        assert_eq!(
+            v("/opt/homebrew/Caskroom/codex/0.151.0/bin/codex").as_deref(),
+            Some("0.151.0")
+        );
+        assert_eq!(v("/usr/local/bin/claude"), None);
+        assert_eq!(
+            v("/x/1.2.3/y/4.5/claude").as_deref(),
+            Some("4.5"),
+            "last wins"
+        );
+        assert_eq!(v("/x/v1.2.3/claude"), None, "digits only");
+        assert_eq!(v("/x/.hidden/claude"), None, "a dot alone is not a version");
+    }
+
+    /// R3 at the CLI edge: against a scratch prefix with no `status.toml` the read-only
+    /// verbs' guard prints the contract line (on stderr — it returns `true` when it did);
+    /// a failed pass's record (a `*index*` error row, `updated_at` fresh) does not
+    /// silence it; only [`record_success`] — the stamp the success exits of `update`
+    /// and `install --default-set` write — does, after which the guard is silent.
+    #[test]
+    fn read_only_verbs_warn_on_stderr_until_a_pass_has_succeeded() {
+        let layout = temp_layout("never-checked");
+        assert!(
+            warn_if_never_checked(&layout),
+            "no status.toml: the line prints"
+        );
+        record_status(
+            &layout,
+            "*index*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: "error: index unreachable".into(),
+                tree_root: String::new(),
+            },
+            "update failed: index unreachable".into(),
+        );
+        assert!(
+            warn_if_never_checked(&layout),
+            "a failed pass's record is not a completed check"
+        );
+        record_success(&layout);
+        assert!(!warn_if_never_checked(&layout), "stamped: silent");
+        let back = crate::status::read(&layout).unwrap();
+        assert!(!back.last_success_at.is_empty());
+        // A later per-program write CARRIES the stamp rather than dropping it.
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: crate::state::managed(18, 41),
+                tree_root: String::new(),
+            },
+            "up to date".into(),
+        );
+        assert_eq!(
+            crate::status::read(&layout).unwrap().last_success_at,
+            back.last_success_at,
+            "record_status carries last_success_at"
+        );
+        assert!(!warn_if_never_checked(&layout));
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    // `machine-settings:` is the contract line the GUI parses for the pull-down row:
+    // entries `; `-separated, the Spotlight count as `spotlight-noindex N dir(s)
+    // migrated`, Universal Control as `universal-control disabled`; nothing printed for
+    // an empty pass (the callers check).
+    #[test]
+    fn the_machine_settings_marker_is_byte_stable() {
+        assert_eq!(MACHINE_SETTINGS_MARKER, "machine-settings: ");
+        assert_eq!(spotlight_entry(73), "spotlight-noindex 73 dir(s) migrated");
+        assert_eq!(
+            machine_settings_line(&[
+                spotlight_entry(73),
+                crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()
+            ]),
+            "machine-settings: spotlight-noindex 73 dir(s) migrated; universal-control disabled"
+        );
+        assert_eq!(
+            machine_settings_line(&[crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()]),
+            "machine-settings: universal-control disabled"
+        );
+        // The apply renderer's words, over one of each outcome — the git-checkout line
+        // is the contract spelling from the 2026-09-10 design rule.
+        use crate::noindex::{Applied, ConfigNote, ExcludeNote, Pointer};
+        let lines = render_applied(&[
+            Applied::Migrated {
+                from: PathBuf::from("/r/target"),
+                to: PathBuf::from("/r/target.noindex"),
+                config: ConfigNote::Written(PathBuf::from("/r/.cargo/config.toml")),
+            },
+            Applied::Migrated {
+                from: PathBuf::from("/g/target"),
+                to: PathBuf::from("/g/target.noindex"),
+                config: ConfigNote::Linked {
+                    link: PathBuf::from("/g/target"),
+                    exclude: ExcludeNote::Added(PathBuf::from("/g/.git/info/exclude")),
+                    link_exclude: ExcludeNote::AlreadyIgnored,
+                },
+            },
+            Applied::Migrated {
+                from: PathBuf::from("/h/target"),
+                to: PathBuf::from("/h/target.noindex"),
+                config: ConfigNote::Linked {
+                    link: PathBuf::from("/h/target"),
+                    exclude: ExcludeNote::AlreadyIgnored,
+                    link_exclude: ExcludeNote::NotIgnored(
+                        "the link shows as untracked, as the directory did".into(),
+                    ),
+                },
+            },
+            Applied::Migrated {
+                from: PathBuf::from("/d/target"),
+                to: PathBuf::from("/d/target.noindex"),
+                config: ConfigNote::Linked {
+                    link: PathBuf::from("/d/target"),
+                    exclude: ExcludeNote::Added(PathBuf::from("/d/.git/info/exclude")),
+                    link_exclude: ExcludeNote::Added(PathBuf::from("/d/.git/info/exclude")),
+                },
+            },
+            Applied::AlreadyExcluded(PathBuf::from("/s/target.noindex")),
+            Applied::Skipped {
+                path: PathBuf::from("/t/target"),
+                reason: "a build holds /t/target/debug/.cargo-lock — retried next pass".into(),
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "migrated /r/target -> /r/target.noindex".to_string(),
+                "  cargo: wrote [build] target-dir into /r/.cargo/config.toml".to_string(),
+                "migrated /g/target -> /g/target.noindex (symlink /g/target left in place; no \
+                 config edit: git checkout)"
+                    .to_string(),
+                "  git: /g/target.noindex added to /g/.git/info/exclude — the working tree \
+                 stays clean"
+                    .to_string(),
+                "migrated /h/target -> /h/target.noindex (symlink /h/target left in place; no \
+                 config edit: git checkout)"
+                    .to_string(),
+                "  git: /h/target.noindex is already ignored — the working tree stays clean"
+                    .to_string(),
+                "  git: /h/target is not gitignored here — the link shows as untracked, as the \
+                 directory did"
+                    .to_string(),
+                "migrated /d/target -> /d/target.noindex (symlink /d/target left in place; no \
+                 config edit: git checkout)"
+                    .to_string(),
+                "  git: /d/target.noindex added to /d/.git/info/exclude — the working tree \
+                 stays clean"
+                    .to_string(),
+                "  git: /d/target added to /d/.git/info/exclude — the ignore entry is \
+                 directory-only and does not match the link; the working tree stays clean"
+                    .to_string(),
+                "already excluded — /s/target.noindex (nothing to do)".to_string(),
+                "skipped /t/target — a build holds /t/target/debug/.cargo-lock — retried next \
+                 pass"
+                    .to_string(),
+                "4 migrated, 1 already excluded, 1 skipped".to_string(),
+            ]
+        );
+        // Dry run: the plan names the pointer that would stand — the symlink for a git
+        // checkout, the config elsewhere, nothing for a free-standing directory.
+        let lines = render_applied(&[
+            Applied::Planned {
+                from: PathBuf::from("/g/target"),
+                to: PathBuf::from("/g/target.noindex"),
+                pointer: Pointer::Symlink,
+            },
+            Applied::Planned {
+                from: PathBuf::from("/r/target"),
+                to: PathBuf::from("/r/target.noindex"),
+                pointer: Pointer::Config(PathBuf::from("/r/.cargo/config.toml")),
+            },
+            Applied::Planned {
+                from: PathBuf::from("/f/free"),
+                to: PathBuf::from("/f/free.noindex"),
+                pointer: Pointer::None,
+            },
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "would rename /g/target -> /g/target.noindex".to_string(),
+                "  cargo: would leave a symlink /g/target in place; no config edit: git checkout"
+                    .to_string(),
+                "would rename /r/target -> /r/target.noindex".to_string(),
+                "  cargo: would write [build] target-dir into /r/.cargo/config.toml".to_string(),
+                "would rename /f/free -> /f/free.noindex".to_string(),
+                "  cargo: no Cargo.toml beside it — nothing would be re-pointed".to_string(),
+                "3 would migrate, 0 already excluded, 0 skipped (dry run)".to_string(),
+            ]
+        );
+    }
+
+    /// The stdout markers are a cross-crate contract (`crates/aterm-gui` parses them
+    /// byte-for-byte): pin the two added 2026-09-10 beside the nine before them, and the
+    /// `managed-current:` payload shape the GUI splits on `; `.
+    #[test]
+    fn the_shadowed_and_managed_current_markers_are_byte_stable() {
+        assert_eq!(SHADOWED_MARKER, "shadowed: ");
+        assert_eq!(MANAGED_CURRENT_MARKER, "managed-current: ");
+        assert_eq!(
+            managed_current_line(&[]),
+            None,
+            "omitted when nothing qualifies"
+        );
+        assert_eq!(
+            managed_current_line(&[
+                ("claude".into(), Some("2.1.267".into()), 2026091001),
+                ("codex".into(), Some("0.154.0".into()), 2026091001),
+            ])
+            .as_deref(),
+            Some(
+                "managed-current: claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)"
+            )
+        );
+        assert_eq!(
+            managed_current_line(&[("claude".into(), None, 2026091001)]).as_deref(),
+            Some("managed-current: claude (build 2026091001)"),
+            "no version is no guess"
+        );
     }
 
     /// `atpkg which` (design S6) and the SHADOW reconcile (design S5), over a real store:
@@ -8914,8 +10132,8 @@ mod tests {
         );
         assert_eq!(
             no_alias_line_for(&layout, "alab-codex", "codex", index.program("codex")),
-            "atpkg: no alias alab-codex — codex is not one of ALab's own tools (an extra, a \
-             vendor's); type codex"
+            "atpkg: no alias alab-codex — codex is not one of ALab's own tools (a vendor's); \
+             type codex"
         );
         assert_eq!(
             no_alias_line_for(&layout, "alab-ay", "ay", index.program("ay")),
@@ -9206,8 +10424,11 @@ mod tests {
         let index = index_of(&[
             ("ay", false, None),
             ("gh", false, Some("gh")),
-            ("codex", true, None),
-            ("claude", true, Some("claude")),
+            ("vendorx", true, None),
+            ("vendory", true, Some("vendory")),
+            // An AGENT PROGRAM the index still flags (build 21 does): never a consent
+            // stub candidate — it is default-set on this client (2026-09-10).
+            ("claude", true, None),
         ]);
         let sys = layout
             .prefix
@@ -9216,7 +10437,7 @@ mod tests {
             .join(format!("atpkg-main-extra-sys-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sys);
         std::fs::create_dir_all(&sys).unwrap();
-        for name in ["claude", "gh"] {
+        for name in ["vendory", "gh"] {
             let exe = sys.join(name);
             std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -9224,55 +10445,55 @@ mod tests {
         let path = std::env::join_paths([layout.bin_dir(), sys.clone()]).unwrap();
         let cfg = crate::config::PackagesConfig::default();
         let none = std::collections::BTreeMap::new();
-        // claude: satisfied by the system install; codex: a candidate; ay/gh: not extras.
+        // vendory: satisfied by the system install; vendorx: a candidate; ay/gh: not extras.
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &none, Some(&path)),
-            names(&["codex"])
+            names(&["vendorx"])
         );
-        // No system claude reachable: both extras qualify.
+        // No system vendory reachable: both extras qualify.
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &none, None),
-            names(&["claude", "codex"])
+            names(&["vendory", "vendorx"])
         );
         // Removed on purpose: no stub nagging the user back.
-        std::fs::write(layout.removed(), "codex\n").unwrap();
+        std::fs::write(layout.removed(), "vendorx\n").unwrap();
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &none, None),
-            names(&["claude"])
+            names(&["vendory"])
         );
         std::fs::remove_file(layout.removed()).unwrap();
         // Excluded by config.
         let narrowed = crate::config::PackagesConfig {
-            exclude: Some(vec!["codex".to_string()]),
+            exclude: Some(vec!["vendorx".to_string()]),
             ..Default::default()
         };
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &narrowed, &none, None),
-            names(&["claude"])
+            names(&["vendory"])
         );
         // Installed: the real shim is there, nothing pends.
         let installed: std::collections::BTreeMap<String, u64> =
-            [("codex".to_string(), 1)].into_iter().collect();
+            [("vendorx".to_string(), 1)].into_iter().collect();
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &installed, None),
-            names(&["claude"])
+            names(&["vendory"])
         );
-        // A FOREIGN copy under the program's OWN name (no `system =` flag on codex): a
-        // brew codex on PATH means the name already answers, and a stub laid ahead of it
-        // would hijack it with a consent prompt — so no stub. Remove it and codex pends
+        // A FOREIGN copy under the program's OWN name (no `system =` flag on vendorx): a
+        // brew vendorx on PATH means the name already answers, and a stub laid ahead of it
+        // would hijack it with a consent prompt — so no stub. Remove it and vendorx pends
         // again.
-        let exe = sys.join("codex");
+        let exe = sys.join("vendorx");
         std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &none, Some(&path)),
             names(&[]),
-            "a foreign codex on PATH must suppress the consent stub"
+            "a foreign vendorx on PATH must suppress the consent stub"
         );
         std::fs::remove_file(&exe).unwrap();
         assert_eq!(
             extra_stub_candidates_with(&layout, &index, &cfg, &none, Some(&path)),
-            names(&["codex"])
+            names(&["vendorx"])
         );
         let _ = std::fs::remove_dir_all(&sys);
         let _ = std::fs::remove_dir_all(&layout.prefix);
@@ -9782,7 +11003,7 @@ mod tests {
             // Both of `noindex`'s flags are subcommand-specific, which is precisely why
             // the usage line has to name them: a reader who cannot see that `--depth`
             // belongs to `scan` learns it from a usage error instead.
-            ("noindex", &["--depth", "--dry-run"][..]),
+            ("noindex", &["--depth", "--dry-run", "--all"][..]),
         ] {
             let usage = usage_of(verb).expect("visible option parser has usage");
             for flag in flags {
@@ -9841,7 +11062,39 @@ mod tests {
                 dry_run: false
             })
         );
+        // `apply`: `--all` (the doctor's scan) or any number of directories, dry-runnable.
+        assert_eq!(
+            job("apply --all"),
+            Some(NoindexJob::Apply {
+                all: true,
+                dirs: vec![],
+                dry_run: false
+            })
+        );
+        assert_eq!(
+            job("apply --all --dry-run"),
+            Some(NoindexJob::Apply {
+                all: true,
+                dirs: vec![],
+                dry_run: true
+            })
+        );
+        assert_eq!(
+            job("apply /a/target /b/target"),
+            Some(NoindexJob::Apply {
+                all: false,
+                dirs: vec![String::from("/a/target"), String::from("/b/target")],
+                dry_run: false
+            })
+        );
         for wrong in [
+            // `apply` wants --all or directories, never both, never neither, no --depth.
+            "apply",
+            "apply --all /a",
+            "apply /a --depth 2",
+            "apply --all --depth 2",
+            "scan --all",
+            "migrate /d --all",
             // A flag on the wrong subcommand: refused, never accepted-and-ignored. The
             // ignored spelling would answer "nothing would change" about a form that
             // changes nothing anyway — true, and the wrong answer to what was asked.
@@ -10849,6 +12102,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&co);
     }
 
+    // THE YANK LIST IS HONOURED BY EVERY LANE, WITH ONE STATE STRING. `zz` is pinned at
+    // 5 and `yanked = ["zz@5"]`: the gate decides Tombstone; the default-set pass skips
+    // it (no failure, no store dir, no shim) and records `tombstoned: pin yanked/below
+    // floor`; the update lane tombstones a LIVE zz@5 with the same row and takes its
+    // shims off PATH. Supply side will yank trust-mc 20065 — this is what a client does
+    // with that.
+    #[test]
+    fn a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row() {
+        let dir = scratch("yank-row");
+        write_registry(&dir, "stable");
+        let layout = temp_layout("yank-row");
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        // The pure gate, first.
+        let index = crate::resolve_verified_index(
+            &fetcher,
+            &layout,
+            &test_anchor(),
+            build_floor(&layout),
+            0,
+        )
+        .expect("the signed fixture index verifies");
+        let ch = index
+            .channels
+            .iter()
+            .find(|c| c.name == "stable")
+            .expect("the stable channel");
+        assert!(crate::gate::is_yanked(ch, "zz", 5));
+        assert_eq!(
+            crate::gate::decide(ch, "zz", None),
+            crate::ApplyDecision::Tombstone
+        );
+        assert_eq!(
+            crate::gate::decide(ch, "zz", Some(5)),
+            crate::ApplyDecision::Tombstone,
+            "a live copy of the yanked pin is not kept either"
+        );
+        // The default-set lane: skipped, said, recorded.
+        let cfg = crate::config::PackagesConfig {
+            exclude: Some(vec!["ny".into()]),
+            ..Default::default()
+        };
+        let out = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        );
+        assert_eq!(out.failures, 0, "a yanked pin is a skip, never a failure");
+        let active = crate::active_builds(&layout);
+        assert!(!active.contains_key("zz"), "the yanked pin never installs");
+        assert!(
+            !layout.build_dir("zz", 5).exists(),
+            "not a byte of the yanked build is staged"
+        );
+        assert!(crate::which(&layout, "zz").is_none(), "no shim promises it");
+        let status = crate::status::read(&layout).expect("a status record");
+        assert_eq!(status.programs["zz"].state, crate::state::TOMBSTONED_PIN);
+        assert_eq!(status.programs["zz"].installed_build, None);
+        assert!(
+            crate::state::TOMBSTONED_PIN.starts_with("tombstoned:"),
+            "doctor reads the row as a fault by this prefix"
+        );
+        // The update lane over a LIVE copy of the yanked build: tombstoned with the
+        // same words, shims off PATH.
+        make_live(&layout, "zz", 5);
+        assert_eq!(crate::active_builds(&layout).get("zz").copied(), Some(5));
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert!(
+            matches!(outcome_of(&report, "zz"), crate::TxnOutcome::Tombstoned(_)),
+            "{:?}",
+            report.groups
+        );
+        let status = crate::status::read(&layout).expect("a status record");
+        assert_eq!(status.programs["zz"].state, crate::state::TOMBSTONED_PIN);
+        assert!(
+            !crate::active_builds(&layout).contains_key("zz"),
+            "a tombstoned program's shims no longer resolve to a build"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// AUDIT-2 ITEM 2 (+ design §2): a program the registry publishes NO artifact for
     /// on this triple neither announces, nor counts as a failure, nor leaves a pending
     /// stub on PATH — and ITS OWN status row records the canonical `unavailable on
@@ -10897,8 +12235,12 @@ mod tests {
             "ny was served, so the machine is not blocked as a whole: {:?}",
             status.programs.keys().collect::<Vec<_>>()
         );
+        // (`zz`'s yanked pin IS a fault — its `tombstoned:` row is the point of
+        // `a_yanked_pinned_build_is_skipped_with_a_recorded_tombstone_row`.)
         assert!(
-            crate::doctor::recorded_problems(Some(&status)).is_empty(),
+            crate::doctor::recorded_problems(Some(&status))
+                .iter()
+                .all(|p| !p.starts_with("ay:")),
             "an unserved member is a state, never a doctor fault"
         );
         let lines = pending_state_lines(&layout, "ay");
@@ -11239,6 +12581,85 @@ mod tests {
     /// it to 18 the pass after xc is back. Blocked again later (xc gone a second time),
     /// ay stays on 18 with the row saying so; xc back with nothing left to move, the
     /// UpToDate pass lifts the row to the ordinary managed state.
+    // An UpToDate pass rewrites every live member's row to name THIS pass's index —
+    // migrating the legacy `active` spelling and re-stamping `pinned by index 15` to the
+    // current build — while keeping the pass's own outcome sentence, and leaving every
+    // other spelling (a SHADOWED row, a fault) to the arm that owns it.
+    #[test]
+    fn an_up_to_date_pass_migrates_legacy_rows_and_restamps_the_index() {
+        assert!(up_to_date_row_needs_rewrite(None, 18, 41));
+        assert!(up_to_date_row_needs_rewrite(Some("active"), 18, 41));
+        assert!(up_to_date_row_needs_rewrite(
+            Some(&crate::state::managed(18, 15)),
+            18,
+            41
+        ));
+        assert!(!up_to_date_row_needs_rewrite(
+            Some(&crate::state::managed(18, 41)),
+            18,
+            41
+        ));
+        for other in [
+            crate::state::shadowed(18, Path::new("/opt/homebrew/bin/ay")),
+            "tombstoned: pin yanked/below floor".to_string(),
+            "error: x".to_string(),
+            crate::state::system(Path::new("/p"), None),
+        ] {
+            assert!(
+                !up_to_date_row_needs_rewrite(Some(&other), 18, 41),
+                "{other} belongs to another arm"
+            );
+        }
+        let dir = scratch("update-restamp");
+        write_registry(&dir, "stable"); // index_build 41, ay pinned at 18
+        let layout = temp_layout("update-restamp");
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        make_live(&layout, "ay", 18);
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: "active".into(),
+                tree_root: "abc".into(),
+            },
+            "up to date (index build 41)".into(),
+        );
+        let (report, failures) = update_pass(&layout, &fetcher);
+        assert_eq!(failures, 0);
+        assert!(matches!(
+            outcome_of(&report, "ay"),
+            crate::TxnOutcome::UpToDate
+        ));
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(status.programs["ay"].state, crate::state::managed(18, 41));
+        assert_eq!(status.programs["ay"].installed_build, Some(18));
+        assert_eq!(
+            status.programs["ay"].tree_root, "abc",
+            "the attestation survives a row rewrite"
+        );
+        assert_eq!(
+            status.outcome, "up to date (index build 41)",
+            "a row migration never speaks for the pass"
+        );
+        // A stale index stamp is refreshed the same way.
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: crate::state::managed(18, 15),
+                tree_root: "abc".into(),
+            },
+            "up to date (index build 41)".into(),
+        );
+        let _ = update_pass(&layout, &fetcher);
+        let status = crate::status::read(&layout).unwrap();
+        assert_eq!(status.programs["ay"].state, crate::state::managed(18, 41));
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_update_pass_holds_an_installed_dependent_whose_dependency_was_uninstalled() {
         let dir = scratch("update-blocked");
@@ -11776,6 +13197,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The narrowed-tuple refusal is decided at PLANNING, not at the group arm:
+    // the refused members ride out on the outcome (`skipped_narrowed`), are NOT
+    // counted as still-pending (`remaining_missing`), and no pending stub
+    // survives for them — a stub is a name on PATH promising exactly the
+    // install the pass just refused. Observed live 2026-08-27: the arm-time
+    // decision announced trust-cg/ir/vc, refused them one line later, left
+    // their stubs behind, and the summary then claimed the set complete.
+    #[test]
+    fn a_narrowed_tuple_is_refused_at_planning_and_reported_on_the_outcome() {
+        let dir = scratch("group-narrowed-plan");
+        write_group_registry(&dir, "stable", true);
+        let layout = temp_layout("group-narrowed-plan");
+        let cfg = crate::config::PackagesConfig {
+            exclude: Some(vec!["tb".into()]),
+            ..Default::default()
+        };
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        let out = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        );
+        assert_eq!(out.failures, 0, "a narrowed tuple is never a failure");
+        assert_eq!(
+            out.skipped_narrowed,
+            vec!["ta".to_string()],
+            "the refused member is reported, not silently dropped"
+        );
+        assert!(
+            out.remaining_missing.is_empty(),
+            "a refused member is not 'still coming': {:?}",
+            out.remaining_missing
+        );
+        assert!(
+            !crate::stub::pending_stub_exists(&layout, "ta"),
+            "no stub may promise the install this pass refused"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The explicit toolset verb clears removal/decline markers BEFORE its pass:
+    // `install_default_set` narrows `wanted` by those very markers, so the old
+    // after-ordering honoured the old mind for exactly the pass that was asked
+    // to change it — a legacy `trust` removal kept trust-cg/ir/vc out of the
+    // explicit toolset install, which then reported the set complete
+    // (2026-08-27, live). A source-shape test in the house style, because the
+    // verb reads the GLOBAL layout and so cannot be driven by a scratch one.
+    #[test]
+    fn the_toolset_verb_changes_its_mind_before_its_pass() {
+        let src = include_str!("cli.rs");
+        let start = src
+            .find("fn cmd_install_default_set")
+            .expect("the toolset verb");
+        let end = src[start..]
+            .find("\nfn ")
+            .map(|i| start + i)
+            .expect("a function after the verb");
+        let body = &src[start..end];
+        let clear = body
+            .find("clear_removed")
+            .expect("the change-of-mind clear");
+        let pass = body.find("= install_default_set(").expect("the pass call");
+        assert!(
+            clear < pass,
+            "removal markers must be cleared BEFORE the pass that narrows by them"
+        );
+        assert!(
+            body.find("clear_decline").expect("the decline clear") < pass,
+            "the decline must be cleared BEFORE the pass that honours it"
+        );
+    }
+
+    // The `*seed*` pending-consent row reconciles against what a clean pass
+    // PROVED: rewritten when the remaining offer moved, retired when nothing
+    // remains, untouched when no row exists. Its only other writer lives on the
+    // seed lane, which hard-skips once the store is non-empty — a 2026-08-12
+    // row was still advertising the legacy toolset layout on 2026-08-27.
+    #[test]
+    fn a_stale_seed_offer_is_reconciled_by_a_clean_pass() {
+        let layout = temp_layout("seed-row-reconcile");
+        // No row: a reconcile writes nothing (no resurrected offers).
+        reconcile_seed_status(&layout, &["na".to_string()]);
+        assert!(
+            crate::status::read(&layout).is_none_or(|s| !s.programs.contains_key("*seed*")),
+            "reconcile must never CREATE an offer row"
+        );
+        record_status(
+            &layout,
+            "*seed*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: "pending-consent: old-a, old-b".into(),
+                tree_root: String::new(),
+            },
+            "ALab toolchain ready: old-a, old-b — Install ALab toolset below".into(),
+        );
+        reconcile_seed_status(&layout, &["na".to_string(), "nb".to_string()]);
+        let status = crate::status::read(&layout).expect("a status record");
+        assert_eq!(
+            status.programs["*seed*"].state, "pending-consent: na, nb",
+            "the recorded offer follows the pass's proof"
+        );
+        assert!(
+            status.outcome.contains("na, nb"),
+            "the outcome sentence names the CURRENT offer: {}",
+            status.outcome
+        );
+        // The update lane records its own verdict BEFORE the reconcile; retiring
+        // the row must not swap that verdict for a sentence about a seed that never
+        // ran (`clear_seed_status` does exactly that — 2026-09-10 audit).
+        record_outcome(&layout, "up to date (index build 21)".into());
+        reconcile_seed_status(&layout, &[]);
+        let status = crate::status::read(&layout).expect("a status record");
+        assert!(
+            !status.programs.contains_key("*seed*"),
+            "nothing left to offer retires the row"
+        );
+        assert_eq!(
+            status.outcome, "up to date (index build 21)",
+            "retiring the row is ROW-ONLY: the pass's own outcome survives"
+        );
+        // And a refresh over a non-offer outcome leaves that outcome alone too.
+        record_status(
+            &layout,
+            "*seed*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: "pending-consent: old".into(),
+                tree_root: String::new(),
+            },
+            "up to date (index build 21)".into(),
+        );
+        reconcile_seed_status(&layout, &["nc".to_string()]);
+        let status = crate::status::read(&layout).expect("a status record");
+        assert_eq!(status.programs["*seed*"].state, "pending-consent: nc");
+        assert_eq!(status.outcome, "up to date (index build 21)");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     // A `[packages.links]` owner/repo override for a program the signed index does NOT
     // name can never install anything (reachability §5 is structural); the bootstrap
     // only says so loudly. Fail-closed: no unsigned installs from slugs.
@@ -12149,33 +13713,69 @@ mod tests {
     #[test]
     fn pending_extra_not_opted_in_never_prompts_without_a_tty() {
         let l = temp_layout("pend-extra-notty");
-        lay_extra_stub(&l, "codex");
-        let lines = pending_state_lines(&l, "codex");
+        lay_extra_stub(&l, "vendorx");
+        let lines = pending_state_lines(&l, "vendorx");
         assert!(
-            lines[0].contains("OpenAI Codex CLI")
-                && lines[0].contains("Apache-2.0")
-                && lines[0].contains("github.com/openai/codex")
-                && lines[0].contains("EXTRA"),
-            "vendor, license, host, and the word for what it is: {lines:?}"
+            lines[0].contains("an extra the signed index lists") && lines[0].contains("EXTRA"),
+            "the honest generic line and the word for what it is: {lines:?}"
         );
         assert!(
-            lines.iter().any(|x| x.contains("aterm pkg install codex")),
+            lines
+                .iter()
+                .any(|x| x.contains("aterm pkg install vendorx")),
             "the opt-in spelling: {lines:?}"
         );
         assert!(
             !lines.iter().any(|x| x.contains("[y/N]")),
             "never a prompt without a TTY: {lines:?}"
         );
-        assert!(!l.optin_exists("codex"), "no consent was given");
+        assert!(!l.optin_exists("vendorx"), "no consent was given");
         assert_eq!(bump_contents(&l), "", "nothing to order: no bump");
-        // No stub laid at all: the compiled roster still answers "extra".
+        // No stub laid at all: the compiled roster answers — and for an AGENT PROGRAM
+        // (owner decision 2026-09-10) the answer is DEFAULT-SET: the vendor line, "not
+        // installed yet", no consent question, no opt-in marker, and a bump (it is
+        // coming, so ordering it is honest).
         let lines = pending_state_lines(&l, "claude");
         assert!(
-            lines[0].contains("Anthropic Claude Code") && lines[0].contains("downloads.claude.ai"),
+            lines[0].contains("Anthropic Claude Code")
+                && lines[0].contains("downloads.claude.ai")
+                && lines[0].contains("not installed yet")
+                && !lines[0].contains("EXTRA"),
             "{lines:?}"
         );
+        assert!(
+            !l.optin_exists("claude"),
+            "no opt-in marker: none is needed"
+        );
+        assert_eq!(bump_contents(&l), "claude\n");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// AN AGENT PROGRAM WITH A STALE CONSENT STUB — laid by a pass that ran before this
+    /// client (index 21 still flags `claude` as an extra) — is never asked about: the
+    /// compiled AGENT_PROGRAMS roster outranks the stub's kind, so typing `claude` gets
+    /// the default-set states (bumped, coming), records no opt-in and asks no question
+    /// even with a terminal to answer it.
+    #[test]
+    fn pending_agent_program_is_never_asked_even_over_a_stale_consent_stub() {
+        let l = temp_layout("pend-agent-stale-stub");
+        lay_extra_stub(&l, "claude");
+        let (lines, prompts, next) = pending_with_answer(&l, "claude", true, false);
+        assert!(
+            prompts.is_empty(),
+            "never `Install claude? [y/N]`: {prompts:?}"
+        );
+        assert_eq!(next, PendingNext::Done);
         assert!(!l.optin_exists("claude"));
-        assert_eq!(bump_contents(&l), "");
+        assert!(
+            lines[0].contains("Anthropic Claude Code") && lines[0].contains("not installed yet"),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|x| x.contains("EXTRA")),
+            "never called an extra: {lines:?}"
+        );
+        assert_eq!(bump_contents(&l), "claude\n");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -12184,17 +13784,17 @@ mod tests {
     #[test]
     fn pending_extra_declined_on_a_tty_records_nothing() {
         let l = temp_layout("pend-extra-no");
-        lay_extra_stub(&l, "codex");
-        let (lines, prompts, next) = pending_with_answer(&l, "codex", false, false);
-        assert_eq!(prompts, vec!["Install codex? [y/N] ".to_string()]);
+        lay_extra_stub(&l, "vendorx");
+        let (lines, prompts, next) = pending_with_answer(&l, "vendorx", false, false);
+        assert_eq!(prompts, vec!["Install vendorx? [y/N] ".to_string()]);
         assert_eq!(next, PendingNext::Done);
         assert!(
             lines
                 .iter()
-                .any(|x| x.contains("not installed") && x.contains("aterm pkg install codex")),
+                .any(|x| x.contains("not installed") && x.contains("aterm pkg install vendorx")),
             "{lines:?}"
         );
-        assert!(!l.optin_exists("codex"));
+        assert!(!l.optin_exists("vendorx"));
         assert_eq!(bump_contents(&l), "");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
@@ -12205,14 +13805,14 @@ mod tests {
     #[test]
     fn pending_extra_consent_records_optin_bumps_and_installs_inline_when_headless() {
         let l = temp_layout("pend-extra-yes");
-        lay_extra_stub(&l, "codex");
-        let (lines, prompts, next) = pending_with_answer(&l, "codex", true, false);
+        lay_extra_stub(&l, "vendorx");
+        let (lines, prompts, next) = pending_with_answer(&l, "vendorx", true, false);
         assert_eq!(prompts.len(), 1, "asked exactly once");
         assert_eq!(next, PendingNext::InstallInline);
-        assert!(l.optin_exists("codex"), "consent is durable");
-        assert_eq!(bump_contents(&l), "codex\n");
+        assert!(l.optin_exists("vendorx"), "consent is durable");
+        assert_eq!(bump_contents(&l), "vendorx\n");
         assert!(
-            lines.iter().any(|x| x.contains("installing codex now")),
+            lines.iter().any(|x| x.contains("installing vendorx now")),
             "{lines:?}"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -12224,16 +13824,16 @@ mod tests {
     #[test]
     fn pending_extra_consent_inside_aterm_hands_the_install_to_the_bump_watch() {
         let l = temp_layout("pend-extra-gui");
-        lay_extra_stub(&l, "claude");
-        let (lines, _, next) = pending_with_answer(&l, "claude", true, true);
+        lay_extra_stub(&l, "vendory");
+        let (lines, _, next) = pending_with_answer(&l, "vendory", true, true);
         assert_eq!(next, PendingNext::Done);
-        assert!(l.optin_exists("claude"));
-        assert_eq!(bump_contents(&l), "claude\n");
+        assert!(l.optin_exists("vendory"));
+        assert_eq!(bump_contents(&l), "vendory\n");
         assert!(
             lines
                 .iter()
-                .any(|x| x.contains("aterm picks claude up")
-                    && x.contains("aterm pkg install claude")),
+                .any(|x| x.contains("aterm picks vendory up")
+                    && x.contains("aterm pkg install vendory")),
             "{lines:?}"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -12245,20 +13845,20 @@ mod tests {
     #[test]
     fn pending_extra_consent_while_a_pass_runs_defers_to_the_next_pass() {
         let l = temp_layout("pend-extra-running");
-        lay_extra_stub(&l, "codex");
+        lay_extra_stub(&l, "vendorx");
         std::fs::write(
             l.progress_file(),
             live_snapshot("{\"trust\":{\"phase\":\"download\"}}", "[\"trust\"]"),
         )
         .unwrap();
-        let (lines, _, next) = pending_with_answer(&l, "codex", true, false);
+        let (lines, _, next) = pending_with_answer(&l, "vendorx", true, false);
         assert_eq!(
             next,
             PendingNext::Done,
             "never inline over a live installer"
         );
-        assert!(l.optin_exists("codex"));
-        assert_eq!(bump_contents(&l), "codex\n");
+        assert!(l.optin_exists("vendorx"));
+        assert_eq!(bump_contents(&l), "vendorx\n");
         assert!(
             lines
                 .iter()
@@ -12274,24 +13874,24 @@ mod tests {
     #[test]
     fn pending_opted_in_extra_follows_the_regular_states() {
         let l = temp_layout("pend-extra-optedin");
-        lay_extra_stub(&l, "codex");
-        l.record_optin("codex").unwrap();
+        lay_extra_stub(&l, "vendorx");
+        l.record_optin("vendorx").unwrap();
         std::fs::write(
             l.progress_file(),
             live_snapshot(
-                "{\"trust\":{\"phase\":\"download\"},\"codex\":{\"phase\":\"queued\"}}",
-                "[\"trust\",\"codex\"]",
+                "{\"trust\":{\"phase\":\"download\"},\"vendorx\":{\"phase\":\"queued\"}}",
+                "[\"trust\",\"vendorx\"]",
             ),
         )
         .unwrap();
-        let (lines, prompts, next) = pending_with_answer(&l, "codex", false, false);
+        let (lines, prompts, next) = pending_with_answer(&l, "vendorx", false, false);
         assert!(
             prompts.is_empty(),
             "opted in: no question, whatever the terminal"
         );
         assert_eq!(next, PendingNext::Done);
         assert!(
-            lines[0].contains("OpenAI Codex CLI") && lines[0].contains("not installed yet"),
+            lines[0].contains("not installed yet") && !lines[0].contains("EXTRA"),
             "{lines:?}"
         );
         assert!(
@@ -12300,7 +13900,7 @@ mod tests {
                 .any(|x| x.contains("BUMPED") && x.contains("after trust finishes")),
             "{lines:?}"
         );
-        assert_eq!(bump_contents(&l), "codex\n");
+        assert_eq!(bump_contents(&l), "vendorx\n");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -12313,35 +13913,35 @@ mod tests {
         let l = temp_layout("pend-extra-requires");
         crate::stub::write_pending_stub_with(
             &l,
-            &crate::store::ToolName::new("codex").unwrap(),
+            &crate::store::ToolName::new("vendorx").unwrap(),
             crate::stub::StubKind::Extra,
             &["clt".to_string(), "brew".to_string()],
         )
         .unwrap();
         // No terminal: the names ride the honest line, no prompt, no opt-in.
-        let lines = pending_state_lines(&l, "codex");
+        let lines = pending_state_lines(&l, "vendorx");
         assert!(
             lines
                 .iter()
-                .any(|x| x.contains("codex also needs: clt, brew")),
+                .any(|x| x.contains("vendorx also needs: clt, brew")),
             "{lines:?}"
         );
-        assert!(!l.optin_exists("codex"));
-        let (_, prompts, next) = pending_with_answer(&l, "codex", true, true);
+        assert!(!l.optin_exists("vendorx"));
+        let (_, prompts, next) = pending_with_answer(&l, "vendorx", true, true);
         assert_eq!(
             prompts,
-            vec!["Install codex? It also needs: clt, brew [y/N] ".to_string()]
+            vec!["Install vendorx? It also needs: clt, brew [y/N] ".to_string()]
         );
         assert_eq!(next, PendingNext::Done);
-        assert!(l.optin_exists("codex"));
+        assert!(l.optin_exists("vendorx"));
         assert!(
             !l.optin_exists("clt") && !l.optin_exists("brew"),
             "a requirement is never opted in on the extra's behalf"
         );
         // A stub with no requires asks the plain question.
-        lay_extra_stub(&l, "claude");
-        let (_, prompts, _) = pending_with_answer(&l, "claude", false, true);
-        assert_eq!(prompts, vec!["Install claude? [y/N] ".to_string()]);
+        lay_extra_stub(&l, "vendory");
+        let (_, prompts, _) = pending_with_answer(&l, "vendory", false, true);
+        assert_eq!(prompts, vec!["Install vendory? [y/N] ".to_string()]);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
