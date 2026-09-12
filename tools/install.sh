@@ -2499,7 +2499,7 @@ place_store_binary() {
 	# argv0 compat aliases beside it (matching the bundle's symlinks), so
 	# in-session \`aterm-ctl …\` scripts and \$ATERM_CTL keep resolving.
 	local alias
-	for alias in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-gui; do
+	for alias in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-link aterm-gui; do
 		ln -sfn aterm "$STORE_DIR/$alias"
 	done
 	# rm first: a leftover REGULAR FILE from a pre-store install must not
