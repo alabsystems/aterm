@@ -251,6 +251,11 @@ impl Terminal {
         // for a band to say.
         let _ = self.grid.take_coordinates_invalidated();
         let _ = self.grid.take_selection_damage();
+        // The band record travels with the flag and is drained with it. The
+        // `invalidate()` below deliberately publishes NO band batch: a reset moves
+        // everything, so a band-translating host must see an unexplained epoch step
+        // and discard — fail-closed by construction, not by a flag it could miss.
+        let _ = self.grid.take_row_band_moves();
         self.content_scroll_state.invalidate();
     }
 }

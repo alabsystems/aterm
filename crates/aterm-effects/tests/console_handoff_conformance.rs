@@ -60,7 +60,10 @@ impl Scene {
         for _ in 0..30 {
             s.tick(100);
         }
-        s.term.process(b"\x1b[3;60H");
+        // A local row hop still exercises legacy landing ownership. A
+        // screen-wide cursor relocation now moves the base home immediately,
+        // so it deliberately cannot strand a long flight across the pane.
+        s.term.process(b"\x1b[9;43H");
         for _ in 0..80 {
             let f = s.tick(16);
             if f.action.airborne() && f.lift > 0.1 && f.alpha > 0 {

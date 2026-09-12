@@ -1917,6 +1917,23 @@ impl App {
                     head,
                 ),
             };
+            // Both ordinary creation and the opaque-swapchain rebuild above
+            // register before installation/first present. A worker spawn failure
+            // takes the existing attach-error fallback, never a synchronous
+            // drawable-acquire fallback on the event loop.
+            let surface_result = surface_result.and_then(|mut surface| {
+                let proxy = self.proxy.clone().ok_or_else(|| {
+                    "GPU surface attach requires an event-loop completion proxy".to_string()
+                })?;
+                let acquire_id = surface.acquire_id();
+                surface.set_acquire_ready_callback(Arc::new(move || {
+                    let _ = proxy.send_event(crate::Wake::GpuSurfaceReady {
+                        window: wid,
+                        surface: acquire_id,
+                    });
+                }))?;
+                Ok(surface)
+            });
             let startup_after_surface_create = Instant::now();
             match surface_result {
                 Ok(surf) => {
@@ -1985,6 +2002,8 @@ impl App {
                         {
                             ws.a11y = a11y_adapter;
                         }
+                        ws.capture_acquire_armed = false;
+                        ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
                         ws.present = Some(PresentTarget::Gpu {
                             gpu_surface: surf,
                             window_gpu,

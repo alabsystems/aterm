@@ -6,15 +6,20 @@
 //!
 //! # Why this exists
 //!
-//! The shipped `aterm` binary on aarch64-apple-darwin resolves 148 third-party
-//! packages carrying ~2.05M lines of Rust that aterm does not own, cannot edit,
-//! and does not verify — 74% more than that on Linux. `.cargo/config.toml`
-//! disables in-compilation verification (`-Ztrust-verify=off`) for exactly that
-//! reason, as an explicitly temporary opt-out.
+//! The shipped `aterm` binary on aarch64-apple-darwin resolves 50 packages
+//! outside `crates/`, carrying ~451k lines of Rust; the Linux cell resolves
+//! 198 such packages and ~2.80M lines. This existing third-party metric includes
+//! the same-owner astream source bundle under `vendor/` (the pinned baselines
+//! are `measured::MAC_ARM` /
+//! `measured::LINUX`, as of 2026-09-10 — quote the constants, not this prose).
+//! `.cargo/config.toml` disables in-compilation verification
+//! (`-Ztrust-verify=off`) for exactly that reason, as an explicitly temporary
+//! opt-out.
 //!
-//! Those two figures, and every other pinned count, are read from `measured`
-//! (`src/measured.rs`) — the single place the baseline lives, so an extraction
-//! that shrinks the surface costs ONE edit rather than fourteen red tests.
+//! Every pinned count is read from `measured` (`src/measured.rs`) — the single
+//! place the baseline lives, so an extraction that shrinks the surface costs
+//! ONE edit rather than fourteen red tests. The figures above are a copy of it
+//! and go stale the way copies do.
 //!
 //! Forge is the instrument for shrinking that surface on a measured, ratcheted,
 //! provenance-carrying basis: it SURVEYS the graph, ATTRIBUTES each package's
@@ -25,8 +30,9 @@
 //!
 //! Carving does not delete `-Ztrust-verify=off`. Those are per-target rustflags
 //! applied to every compiled unit, and `targo trust` marks every build script
-//! off unconditionally — so while a single third-party build script remains (26
-//! do, in the macOS shipped graph), no amount of source deletion retires the
+//! off unconditionally — so while a single third-party build script remains (10
+//! do, in the macOS shipped graph per `measured::MAC_ARM`), no amount of source
+//! deletion retires the
 //! flag. What forge delivers is a smaller, owned, monotonically-decreasing
 //! surface with `-p` handles and ratchet rows. The last mile needs
 //! `-Ztrust-verify-include-dependencies` or a written build-script policy.
@@ -54,6 +60,7 @@ pub mod attest;
 pub mod blame;
 pub mod budget;
 pub mod check;
+mod direct_vendor;
 pub mod dominator;
 pub mod loc;
 /// THE pinned measurement baseline, read by every test that asserts a real
@@ -67,6 +74,7 @@ pub mod mirror_bundle;
 pub mod mirror_config;
 pub mod model;
 pub mod policy;
+pub mod provenance;
 pub mod resolve;
 pub mod survey;
 

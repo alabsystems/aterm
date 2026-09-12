@@ -24,28 +24,76 @@
 //!    binding index arrives from THE PIPELINE TABLE's `BindSpec` column via
 //!    the caller — this module never hardcodes a slot.
 //!
-//! Like the W4 seam, wgpu stays the live present arm: production constructs
-//! none of this until W6's flip. The consumers are the W5 differentials
-//! (`renderer.rs::metal_present_replay_for_test`, this module's tests) — the
-//! same test-reached discipline as `MetalFrameRig`.
+//! This is the production native macOS present arm. Attached GUI surfaces
+//! register a demand-driven drawable worker; standalone differential tests
+//! retain synchronous acquisition without touching the event loop.
 
 use std::sync::Arc;
 
+use super::acquire_worker::{AcquireOutcome, AcquireWorker, result_is_current};
 use super::encoder::{CommandBuffer, RenderPassDesc, StoreAction};
 use super::ffi::{
     self, ClearColor, LoadAction, MtlScissorRect, MtlViewport, Obj, PixelFormat, PrimitiveType,
 };
-use super::loss::LossLatch;
+use super::loss::{CbOutcome, LossLatch};
 use super::resources::SealedTexture;
-use super::swapchain::{Frame, Swapchain, SwapchainConfig};
+use super::swapchain::{
+    AcquiredDrawable, Frame, LayerAcquire, OwnedDrawable, Swapchain, SwapchainConfig,
+};
 use crate::renderer::SurfacePresentFailure;
 
 /// The `GpuSurface` Metal variant's shape: one W1 swapchain + the config it
 /// currently holds, so the per-present reconcile can detect drift without
 /// re-querying the layer axis by axis.
 pub(crate) struct MetalWindowSurface {
-    swapchain: Swapchain,
+    swapchain: SurfaceSwapchain,
     config: SwapchainConfig,
+    wanted: SwapchainConfig,
+    generation: u64,
+    worker: Option<DrawableWorker>,
+    ready: Option<Result<OwnedDrawable, AcquireRefusal>>,
+    completed_wait_ns: Option<u64>,
+}
+
+// The holder permits retirement without changing the borrow-shaped Frame API.
+struct SurfaceSwapchain(Option<Swapchain>);
+impl std::ops::Deref for SurfaceSwapchain {
+    type Target = Swapchain;
+    fn deref(&self) -> &Swapchain {
+        self.0.as_ref().expect("live surface")
+    }
+}
+impl std::ops::DerefMut for SurfaceSwapchain {
+    fn deref_mut(&mut self) -> &mut Swapchain {
+        self.0.as_mut().expect("live surface")
+    }
+}
+
+/// MainThreadBound routes the final unparent/release to the UI thread AFTER
+/// acquisition has ceased. Only the worker can wait for that dispatch; the UI
+/// thread never joins it. The outer pool covers Obj's driver-side dealloc work.
+struct RetiredSwapchain(Option<Swapchain>);
+impl Drop for RetiredSwapchain {
+    fn drop(&mut self) {
+        let _pool = ffi::AutoreleasePool::new();
+        drop(self.0.take());
+    }
+}
+type DrawableWorker =
+    AcquireWorker<LayerAcquire, AcquiredDrawable, aterm_objc::MainThreadBound<RetiredSwapchain>>;
+
+impl Drop for MetalWindowSurface {
+    fn drop(&mut self) {
+        self.ready = None;
+        if let Some(worker) = self.worker.take() {
+            let mt = aterm_objc::MainThread::new().expect("attached surface retires on main");
+            let retirement =
+                aterm_objc::MainThreadBound::new(RetiredSwapchain(self.swapchain.0.take()), mt);
+            // Disconnected means acquisition already ended; the returned
+            // payload can be dropped here. No blocking send or worker join.
+            drop(worker.close(retirement));
+        }
+    }
 }
 
 impl MetalWindowSurface {
@@ -58,8 +106,13 @@ impl MetalWindowSurface {
         latch: Arc<LossLatch>,
     ) -> Result<Self, String> {
         Ok(Self {
-            swapchain: Swapchain::attached(device, parent, &config, latch)?,
+            swapchain: SurfaceSwapchain(Some(Swapchain::attached(device, parent, &config, latch)?)),
             config,
+            wanted: config,
+            generation: 0,
+            worker: None,
+            ready: None,
+            completed_wait_ns: None,
         })
     }
 
@@ -71,9 +124,75 @@ impl MetalWindowSurface {
         latch: Arc<LossLatch>,
     ) -> Result<Self, String> {
         Ok(Self {
-            swapchain: Swapchain::standalone(device, &config, latch)?,
+            swapchain: SurfaceSwapchain(Some(Swapchain::standalone(device, &config, latch)?)),
             config,
+            wanted: config,
+            generation: 0,
+            worker: None,
+            ready: None,
+            completed_wait_ns: None,
         })
+    }
+
+    pub(crate) fn set_acquire_ready_callback(
+        &mut self,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        if self.worker.is_some() {
+            return Err("drawable worker already registered".into());
+        }
+        let _mt = aterm_objc::MainThread::new()
+            .ok_or("attached drawable worker must be registered on main")?;
+        #[cfg(feature = "acquire-conformance")]
+        if super::acquire_probe::synchronous_control() {
+            return Ok(());
+        }
+        self.worker = Some(
+            AcquireWorker::spawn(LayerAcquire::run, notify)
+                .map_err(|error| format!("cannot start drawable worker: {error}"))?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn async_acquire(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Invalidating never touches the layer or waits for the worker. In-flight
+    /// results retain their old epoch, including resize-away-and-back cases.
+    pub(crate) fn discard_pending_acquire(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("surface generation exhausted");
+        self.ready = None;
+        self.collect_acquire();
+    }
+
+    pub(crate) fn take_completed_acquire_wait_ns(&mut self) -> Option<u64> {
+        self.completed_wait_ns.take()
+    }
+
+    fn collect_acquire(&mut self) {
+        let Some(completed) = self.worker.as_mut().and_then(AcquireWorker::try_take) else {
+            return;
+        };
+        match completed.outcome {
+            AcquireOutcome::Ready(output) => {
+                self.completed_wait_ns = Some(output.wait_ns);
+                if result_is_current(completed.generation, self.generation, false) {
+                    self.ready = Some(output.drawable.ok_or_else(|| AcquireRefusal::AcquireNil {
+                        detail: format!(
+                            "nextDrawable returned nil after {:.3}ms on drawable worker",
+                            output.wait_ns as f64 / 1_000_000.0
+                        ),
+                    }));
+                }
+            }
+            AcquireOutcome::Panicked | AcquireOutcome::Disconnected => {
+                self.ready = Some(Err(terminal_worker_refusal(self.swapchain.latch())));
+            }
+        }
     }
 
     /// The config the swapchain currently holds.
@@ -132,6 +251,16 @@ impl MetalWindowSurface {
         device: &ffi::Device,
         want: &SwapchainConfig,
     ) -> Result<bool, String> {
+        if self.wanted != *want {
+            self.wanted = *want;
+            self.discard_pending_acquire();
+        }
+        self.collect_acquire();
+        // nextDrawable and geometry/configuration setters never overlap. The
+        // UI records its latest desires and returns immediately while pending.
+        if self.worker.as_ref().is_some_and(AcquireWorker::is_pending) {
+            return Ok(false);
+        }
         // The layer's `contentsScale` is NOT one of the drift axes above and
         // cannot be: it is not in `SwapchainConfig` at all, it is owned by the
         // parent layer, and it changes with NO resize and no reconfigure when
@@ -179,9 +308,23 @@ impl MetalWindowSurface {
         // window size. The wanted geometry is copied out first so the error
         // arm borrows nothing from the live frame.
         let (want_w, want_h) = (self.config.width, self.config.height);
-        let frame = match self.swapchain.acquire() {
-            Ok(f) => f,
-            Err(detail) => return Err(AcquireRefusal::AcquireNil { detail }),
+        let frame = if let Some(worker) = self.worker.as_mut() {
+            if let Some(ready) = self.ready.take() {
+                self.swapchain
+                    .frame_from_acquired(ready?)
+                    .map_err(AcquireRefusal::LatchLost)?
+            } else {
+                if !worker.is_pending() {
+                    worker
+                        .try_request(self.generation, self.swapchain.acquire_request())
+                        .map_err(|_| terminal_worker_refusal(self.swapchain.latch()))?;
+                }
+                return Err(AcquireRefusal::Pending);
+            }
+        } else {
+            self.swapchain
+                .acquire()
+                .map_err(|detail| AcquireRefusal::AcquireNil { detail })?
         };
         let (tw, th) = (
             ffi::texture_width(frame.texture()),
@@ -202,6 +345,22 @@ impl MetalWindowSurface {
     pub(crate) fn latch(&self) -> Arc<LossLatch> {
         Arc::clone(self.swapchain.latch())
     }
+}
+
+/// A dead acquisition producer makes this backend unusable. Feed the same
+/// permanent-loss route that selects CPU fallback; merely returning Validation
+/// would park a permanently broken worker and retry it on every keystroke.
+fn terminal_worker_refusal(latch: &LossLatch) -> AcquireRefusal {
+    latch.record(&CbOutcome::Lost {
+        code: None,
+        name: "drawable acquisition worker stopped; backend unavailable",
+    });
+    AcquireRefusal::LatchLost(
+        latch
+            .reason()
+            .unwrap_or("drawable worker stopped")
+            .to_owned(),
+    )
 }
 
 /// W6a — the winit view's backing `CALayer`, from a raw-window-handle target:
@@ -228,6 +387,8 @@ pub(crate) fn parent_layer_of<W: raw_window_handle::HasWindowHandle>(target: &W)
 /// [`SurfacePresentFailure`].
 #[derive(Debug)]
 pub(crate) enum AcquireRefusal {
+    /// A demand-driven acquisition is queued or running off the UI thread.
+    Pending,
     /// The process device-loss latch is set (acquire refuses before FFI).
     LatchLost(String),
     /// The drawable's texture geometry no longer matches the retained config
@@ -261,6 +422,7 @@ pub(crate) fn surface_present_failure(
     occluded_hint: bool,
 ) -> SurfacePresentFailure {
     match refusal {
+        AcquireRefusal::Pending => SurfacePresentFailure::AcquirePending,
         AcquireRefusal::LatchLost(_) => SurfacePresentFailure::Validation,
         AcquireRefusal::Drift { .. } => SurfacePresentFailure::Reconfigured,
         AcquireRefusal::AcquireNil { .. } if occluded_hint => SurfacePresentFailure::Occluded,
@@ -668,6 +830,22 @@ mod tests {
         boost: f32,
         headroom: f32,
         _pad: [f32; 2],
+    }
+
+    #[test]
+    fn terminal_worker_failure_enters_permanent_backend_recovery() {
+        let latch = LossLatch::new();
+        assert!(latch.reason().is_none());
+        let refusal = terminal_worker_refusal(&latch);
+        assert!(
+            latch.reason().is_some(),
+            "a Validation-only mutant would park forever"
+        );
+        assert!(matches!(refusal, AcquireRefusal::LatchLost(_)));
+        assert_eq!(
+            surface_present_failure(&refusal, false),
+            SurfacePresentFailure::Validation
+        );
     }
 
     /// W5 — THE FAILURE MAPPING, live where a healthy GPU can produce the

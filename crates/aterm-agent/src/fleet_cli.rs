@@ -5,9 +5,13 @@
 //! sockets into ONE fabric an orchestrator talks to:
 //!
 //!   aterm-fleet events                 federate: subscribe to `events` on every live
-//!                                      instance, merge them, and emit one NDJSON record
-//!                                      per event on stdout — each addressed by an astream
-//!                                      Subject `/fleet/<pid>/events/<sid>`.
+//!                                      instance in the default socket dir, merge them,
+//!                                      and emit one NDJSON record per event on stdout —
+//!                                      each addressed by an astream Subject
+//!                                      `/fleet/<pid>/events/<sid>`. An instance bound to
+//!                                      an explicit $ATERM_CONTROL_SOCK is listed but not
+//!                                      federated: the streamer addresses it by `--pid`,
+//!                                      which resolves only default-dir sockets.
 //!
 //!   aterm-fleet exec                   dispatch: read command lines from stdin, one per
 //!                                      line (`@<sid> <verb> [args…]` — an aterm-ctl verb
@@ -67,8 +71,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 fn usage(code: u8) -> ExitCode {
     let help = "aterm-fleet — federate a fleet of aterm sessions into one fabric.\n\n\
          USAGE:\n\
-         \x20 aterm-fleet events     merge every live instance's `subscribe events` to stdout\n\
-         \x20                        as NDJSON, addressed by astream Subject /fleet/<pid>/events/<sid>\n\
+         \x20 aterm-fleet events     merge the `subscribe events` of every live instance in the\n\
+         \x20                        default socket dir to stdout as NDJSON, addressed by astream\n\
+         \x20                        Subject /fleet/<pid>/events/<sid> (an instance on an explicit\n\
+         \x20                        $ATERM_CONTROL_SOCK is listed by `ls` but not federated)\n\
          \x20 aterm-fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
          \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
          \x20                        retain stdout/stderr and exit_code; exit 1 if any command fails\n\
@@ -86,10 +92,12 @@ fn usage(code: u8) -> ExitCode {
          The events streamers and exec find the aterm-ctl BINARY via $ATERM_CTL,\n\
          then a sibling of this binary, then PATH.\n\n\
          The embedded operator is EXPERIMENTAL (status reports it) and OFF by default.\n\
-         Launch an aterm instance with ATERM_OPERATOR=1 to opt in; it then starts with an\n\
-         empty allowlist, so `manage <sid>` is still required before anything is observed.\n\
-         Without the opt-in (or with $ATERM_NO_OPERATOR set) its verbs answer\n\
-         `ERR operator unavailable`. See docs/OPERATOR-EMBEDDED.md.\n";
+         Launch an aterm instance with ATERM_OPERATOR=1 to opt in. A NEW profile starts\n\
+         with an empty allowlist, so `manage <sid>` is required before anything is\n\
+         observed; a relaunched profile replays the sids it already manages from its\n\
+         durable WAL/checkpoint. Without the opt-in (or with $ATERM_NO_OPERATOR set to\n\
+         anything but empty or `0`) its verbs answer `ERR operator unavailable`.\n\
+         See docs/OPERATOR-EMBEDDED.md.\n";
     if code == 0 {
         print!("{help}");
     } else {

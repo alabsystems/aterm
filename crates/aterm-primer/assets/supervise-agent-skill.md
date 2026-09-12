@@ -49,7 +49,10 @@ Two ways in:
   for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
   SID=$(aterm ctl --sock "$SOCK" ls | awk 'NR==1{print $3}')
   aterm ctl --sock "$SOCK" "@$SID" turn 'cd <workdir> && exec claude'   # launch the worker
+  aterm ctl --sock "$SOCK" "@$SID" status                                # expect detail=claude
   ```
+  On older builds that compound line reads `detail=cd` (the first word, not the segment
+  that runs), so when `detail=` is a shell builtin confirm the worker is up with `text`.
   The worker is anything interactive or long-running — `claude` here, but
   `codex`/`gemini`, a REPL, or `make build` work the same way; substitute the
   launch command. Use a **plain** session — NOT `spawn connected=controller`, which injects
@@ -68,11 +71,14 @@ are a discipline, not a sandbox.
 Keep a durable **notes file** with what a fresh copy of you needs to resume:
 objective, worker sid + socket, the ground-truth command, budget remaining, and
 one line per action taken. That file — not your context window — is your memory
-across restarts.
+across restarts. Point `aterm drive supervise --notes` at the same file: it
+appends one UTC-stamped line per approval or hand-off.
 
 ## The loop
 
-Repeat until **done**, **escalated**, or **budget spent**:
+Repeat until **done**, **escalated**, or **budget spent**. `aterm drive` carries the
+mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm` answers
+`unknown command 'phase'`, and the manual form under each step is the same loop by hand.
 
 1. **SWEEP** — cheapest possible change check.
    ```sh
@@ -81,17 +87,39 @@ Repeat until **done**, **escalated**, or **budget spent**:
    Same `revision` as the last one you acted on → nothing new; go to WAIT. This is
    what keeps you from re-reviewing (and re-billing) an unchanged screen.
 
-2. **CLASSIFY** — from `phase` plus one screen read (`aterm ctl "@$SID" text`):
+2. **CLASSIFY** — one read, one word:
+   ```sh
+   aterm drive phase "@$SID"       # busy | prompt | idle | question — for a prompt the parsed box follows
+   ```
+   After `prompt` come `kind bash|edit|write|read|workflow|other`, `command <line>`,
+   `description <text>`, `classify read-only` or `classify not-read-only <reason>` (Bash
+   only), one `option N <text>` per option, and `cancel esc|none`. `busy` is measured from
+   the spinner row, the `esc to interrupt` footer, `Still working`, a waiting workflow, or
+   a background shell still running — in auto mode the footer says nothing, so the spinner
+   row is the signal — and a prompt wins over busy (a worker blocked on a box cannot
+   proceed however many shells its footer counts). `question` = the last thing it said,
+   above the composer, ends in `?`. Manual form: `aterm ctl "@$SID" text tail=40` (an
+   older build answers `ERR usage` — read the full `text`) and this table:
 
    | you see | do |
    |---|---|
-   | busy indicator still spinning (`esc to interrupt`) | WAIT — not a review point yet |
+   | `busy` — the spinner row, `esc to interrupt`, or a shell still running | WAIT — not a review point yet |
    | the busy indicator that *was* there is now gone | the turn finished → go REVIEW |
-   | an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve (`key enter`, or the number). Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
-   | a prose question, composer idle | answer it with a `turn`, from your notes |
+   | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = the box was already gone and nothing was pressed — re-CLASSIFY. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
+   | Claude Code's permission prompt: the command line, then `Do you want to proceed?` with numbered options — `1.` Yes (this once), `2.` Yes and don't ask again for a SCOPE (`git log *`, `allow reading from <dir>`), one option `switch to auto mode`, the last `No`; footer `Esc to cancel · Tab to amend` | classify the COMMAND LINE, not the box — the `classify` line `phase` printed, or `aterm drive classify '<command>'`. Read-only and the scope on option 2 is a read-only grant → option 2 (it removes a whole class of future prompts; see *Auto-approving reads*). A write or delete → judge that one command; option 1 at most, never the scope grant. **Never pick `switch to auto mode` unless the human said so.** Off-task or unsafe → `key escape` and redirect, or ESCALATE |
+   | `question` — a prose question, composer idle | answer it with a `turn`, from your notes |
+   | `idle` — nothing running, no box, no question | the turn is over → go REVIEW |
    | a non-TUI worker (build/script/REPL) still streaming output (`phase` running) | WAIT — for these, completion is a returned shell prompt or `phase=exited`, at which point go REVIEW via the **exit code + expected artifacts**, not a busy indicator |
    | a shell prompt where an *interactive agent* used to be | that agent exited — check why, relaunch + re-brief, or ESCALATE (a build returning to the prompt is normal completion, see the row above) |
    | anything you cannot confidently read | **NEVER type into an unknown screen** — ESCALATE |
+
+   **The placeholder rule.** Text in the composer with the cursor at column 2 is Claude
+   Code's DIM suggestion, not typed input and not a question — measured: `❯ m7 is
+   reachable as ssh m7, go` was a suggestion, not a human. Typing would have pushed the
+   cursor right of the text. Check `aterm ctl "@$SID" cursor` (`OK <row> 2 …`) or `cell
+   <row> 2` (attrs `dim`). `phase` classifies from the rows above the composer, so a
+   suggestion reads `idle`; `supervise` applies the rule itself before it backspaces a
+   stray digit. Never act on a suggestion as if the worker had said it.
 
 3. **REVIEW** (only once the turn is DONE) — run the ground truth, judge against
    it, then take exactly one action:
@@ -101,24 +129,121 @@ Repeat until **done**, **escalated**, or **budget spent**:
    - **done** — ground truth PROVES completion for THIS objective (tests pass, exit 0, the expected artifact exists — whatever the objective's check actually is) → STOP.
    - **escalate** — unsafe, surprising, or you cannot tell → STOP for a human.
 
-   Drive with ONE verified human turn:
+   Drive with ONE verified human turn, settled on the busy footer LEAVING the screen:
    ```sh
-   aterm ctl "@$SID" turn idle=2500 timeout=600000 '<single-line instruction>'
+   aterm ctl "@$SID" turn settle=gone:esc.to.interrupt timeout=600000 '<single-line instruction>'
    ```
    Keep the instruction to **one line with balanced quotes and parens**. Claude
    Code's composer treats Enter as a newline (not submit) while a bracket is open,
    so a truncated or unbalanced instruction silently piles up in the input box and
-   never runs. Prefer idle-settle over prompt-matching for completion: an
-   interactive worker's composer glyph (Claude Code `❯`, Codex `»`) is on screen
-   the *entire* time it thinks, so matching it returns mid-turn — and Codex's `»`
-   in particular stays visible even while it works, so its presence means nothing.
+   never runs. The `settle=` pattern is **ONE whitespace-free token**: the client
+   joins argv with single spaces and the server re-splits the line on whitespace,
+   so shell quotes do not survive the wire — `settle=gone:'esc to interrupt'` arms
+   the regex `esc` and TYPES `to interrupt timeout=600000 <instruction>` into the
+   worker as the message, with the timeout left at its 240 s default. Write
+   `esc.to.interrupt`; `.` is regex, not the shell's business. Neither idle-settle
+   nor prompt-matching is a completion signal for an interactive worker. Measured:
+   `turn idle=3000` settled after 4.5 s while Claude Code was still thinking — its
+   screen sits static for 3+ s mid-turn. And the composer glyph (Claude Code `❯`,
+   Codex `»`) is on screen the *entire* time it thinks, so matching it returns
+   mid-turn too. The signal that holds is the busy footer DISAPPEARING — `esc to
+   interrupt` in Claude Code; substitute the worker's own footer text.
+   `settle=gone:` first waits (bounded by `submit_window`, default 2000 ms) for the
+   footer to APPEAR after the submit, then for it to LEAVE; a footer never seen in
+   that window silently degrades the turn to idle-settle, so WAIT still confirms
+   with `await gone`. On a build whose `turn` has no `settle=gone:`, drive with
+   `turn idle=2500 …` and treat its return as *submitted*, not *finished*: WAIT
+   decides completion.
 
 4. **WAIT** — block on the one session most likely to move next. Never busy-poll;
    never park more than one waiter (each holds a control lane).
    ```sh
-   aterm ctl "@$SID" await idle 4000 timeout=300000   # settling? exit 124 = still busy = an answer
-   aterm ctl "@$SID" await seq timeout=15000          # idle + nothing new → wait for fresh output
+   aterm drive await-turn "@$SID" --timeout 600000   # block until the phase is not busy, print it like `phase`; exit 124 = still busy
    ```
+   `--timeout` is milliseconds (default: the global `--timeout`, 180000). Inside it is
+   `await gone esc.to.interrupt` as the first wait where the host has it, else `await idle
+   2000` → read → `await seq <seq>` — never a sleep — in 20 s steps against the deadline,
+   returning the moment the screen is `prompt`, `idle` or `question`. Exit 124 is an
+   answer — still busy — not an error. Manual form:
+   ```sh
+   aterm ctl "@$SID" await gone esc.to.interrupt timeout=600000   # OK gone <seq> = turn finished | OK timeout = still busy
+   ```
+   The regex is ONE token (`esc.to.interrupt`): a quoted `'esc to interrupt'` is
+   re-split on the wire, arms `esc`, and drops the rest (`aterm ctl` prints a stderr
+   `note:` first, and still sends it). `await gone` is
+   level-triggered: if the footer is already absent it returns at once, so arm it
+   only after the footer is up (right after your `turn`, or after a read showed
+   it). `OK timeout` (exit 124) is an answer — still busy — not an error. A build
+   with no `gone` answers `ERR usage: await <idle <ms>|seq [<n>]|match <re> …|block|…>`
+   — a grammar with no `gone` in it; fall back to this loop until the footer is
+   absent:
+   ```sh
+   aterm ctl "@$SID" await idle 4000 timeout=300000       # settled? exit 124 = still busy = an answer
+   aterm ctl "@$SID" text | grep -c 'esc to interrupt'    # read the footer: nonzero = NOT done, idle or not
+   aterm ctl "@$SID" await seq timeout=15000              # footer still up + idle → wait for fresh output, re-read
+   ```
+   Do not skip the middle read: idle alone is exactly the false positive measured
+   above.
+
+### Run the loop unattended: `aterm drive supervise`
+
+```sh
+aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes "$NOTES"
+```
+
+WAIT and the read-only half of CLASSIFY in one process: it runs `await-turn`; with
+`--auto-reads`, a Bash prompt whose command classifies read-only is approved with option 1
+— pressed GUARDED, `key if=Do.you.want.to.proceed 1` where the host has it, else read →
+press → re-read and backspace a digit that landed in the composer — one line `approved
+read-only: <command>` goes to `--notes`, and the loop continues. **Anything else stops it
+with exit 0 — your review point**: a write prompt, an Edit/Write/workflow box, a question,
+an idle composer, or a read-only command coming back after it was approved twice (`handed
+to the manager (<why>): <command>` in the notes). It prints the `phase` lines, a `--` line,
+then the prompt box verbatim or the last 28 non-blank rows. `TIMEOUT` / exit 124 after
+`--max-s` (seconds, default 1800) with the worker still busy. `--allow-python GLOB`
+(repeatable) widens the python rule; the default globs are `scripts/*standing*.py`,
+`scripts/*report*.py`, `scripts/*score*.py`. Without `--auto-reads` every prompt is yours.
+It presses option 1 only — never the scope grant, never auto mode — and never types text:
+REVIEW, drive the next `turn`, call it again. Its `--max-s` bounds ONE call's wall clock;
+the drive budget below is still yours to count.
+
+### Auto-approving reads
+
+A permission prompt may be pre-approved WITHOUT a per-prompt judgment only when
+the command line is read-only, and **the classifier is the source of truth**:
+
+```sh
+aterm drive classify 'git status --short && git pull | tail'   # not-read-only git pull   (exit 1)
+aterm drive classify 'git log --oneline -5'                    # read-only                (exit 0)
+```
+
+`read-only` (exit 0) or `not-read-only <reason>` (exit 1) — pure, no host needed; the
+same function `phase` prints as its `classify` line and `supervise --auto-reads` acts
+on. Its rules, each paid for by a misclassification in a real session: quoted strings
+are dropped BEFORE the danger scan (a `>` inside a `git --format` string is not a
+redirect) and the worker's `perl -e 'alarm N; exec @ARGV'` wrapper is stripped; a danger
+token ANYWHERE fails the line — `rm mv cp tee …`, a git write (`push pull commit reset
+checkout …`, `stash`/`worktree` other than `list`), a redirect to anything but
+`/dev/null` or an fd (`2>&1`, `>&2`), `sed -i`, `python3 -c`, `bash|sh|zsh -c`, `perl -e`, a `python3 - <<`
+heredoc, `find -delete`, `find -exec` unless it feeds `du/ls/cat/head/wc/stat/file/grep`,
+`xargs rm|mv|cp`; then every segment's head (split on `;`, `&&`, `||`, `|`, `$( … )`)
+must be a known read-only program — `git` only with a read-only subcommand, `python3`
+only a script on the `--allow-python` globs, an unknown program is not a read. A tie
+breaks toward `not-read-only`. `git log && rm -rf .` opens read-only and is refused; so
+is `cat $(rm -rf x; echo f)`.
+
+**You still judge everything that is not read-only, every time** — `rm`, `mv`, any
+redirect, a git write, builds, package managers, any interpreter with inline code: a
+write no matter what it prints. And you judge what the classifier does not see: whether
+the read is on-task, whether the scope on option 2 is itself read-only (`git log *`,
+`allow reading from <dir>` → option 2; otherwise option 1), and a prompt that is not a
+Bash prompt at all (Edit/Write/workflow). `supervise` takes option 1 only. Without
+`aterm drive classify`, apply the same rules by hand: split every segment, and one
+non-read segment makes the whole line yours.
+
+Log every auto-approval in the notes file — the command line, the option chosen,
+and why it qualified — so the human can audit what you waved through; `supervise
+--notes` writes `approved read-only: <command>` for you.
 
 ## Bounded autonomy — this IS the safety floor, not optional
 
@@ -147,5 +272,6 @@ inspection; only tear down a session you spawned for a one-off.
 
 ## See also
 
-- The `drive-aterm` skill and `aterm ctl --help` — the read/drive verbs this composes.
+- The `drive-aterm` skill, `aterm ctl --help` and `aterm drive --help` (*SUPERVISING A
+  WORKER*) — the read/drive verbs and subcommands this composes.
 - `aterm help`, and (in the aterm source) `docs/OPERATOR.md` — the fuller operator brief.

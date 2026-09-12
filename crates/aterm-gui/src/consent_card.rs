@@ -35,23 +35,27 @@
 //! Not an auto-open of System Settings: the pane opens on a press and never on
 //! detection (§6). Not the warm-up: pressing nothing here touches a protected
 //! folder, so no dialog is raised by the card itself (§3.5 stays fenced to the
-//! Security panel). And not a coverage claim: the copy says FEWER prompts and
-//! names the grant as the one switch macOS offers, and stops there, because
-//! which services a held grant silences is §7 S4's measurement and S4 is unrun.
+//! Security panel). And not a coverage claim: the copy names the access check
+//! and the Full Disk Access setting without promising fewer interruptions.
+//! Which services a held grant silences is §7 S4's measurement and S4 is unrun.
+//! A denied access probe is not proof that the System Settings switch is off:
+//! the owner may already have enabled it. The card names unconfirmed access,
+//! and its Settings follow-up asks the owner to leave an enabled switch on.
 //!
 //! # When it shows — every condition, because each one is a way to be wrong
 //!
 //! [`decide`] is the decision and it is pure. The card is due only when ALL
 //! of these hold, and [`NotDue`] names which one failed so the log says why:
 //!
-//! * `[privacy] enabled` and `[privacy] notice` are on — the same switch that
-//!   gated the pill, so a config that silenced the pill silences the card;
+//! * `[privacy] enabled` and `[privacy] notice` are on — re-read before every
+//!   lifecycle step, so disabling either also retires a pending or visible card;
 //! * the instance has a window — a headless instance holds the inert probe
 //!   arm and could only ever invent a verdict;
 //! * *Not now* is not on record — that answer latches for the life of the
 //!   config directory;
 //! * the probe actually OBSERVED `denied` — `unknown` (the probe refused, or
-//!   the lane is off) is not a denial and earns no card;
+//!   the lane is off) is not a denial and earns no card; a pending worker is
+//!   not a verdict, so its launch-time marker waits for the completed result;
 //! * the running bundle's designated requirement is grant-STABLE
 //!   (`DrClass::Identity`): a grant keyed to an ad-hoc cdhash dies on the next
 //!   build (§2.2), so offering it would offer nothing. That is the whole
@@ -79,19 +83,27 @@
 //! [`CardState`] is the per-process machine the event loop drives from its
 //! park point: the launch-time worker warms the signing identity and reads the
 //! marker OFF the event loop (`codesign` and a disk read, neither of which may
-//! stall the loop), the main thread decides against the CACHED probe, the card
-//! waits for the shared notice slot to be free rather than clobbering an admin
-//! card or an update-ready card, and once raised the instance WATCHES the probe
-//! for the grant — one cached `open()` per `probe_interval_ms`, for at most
-//! [`WATCH_FOR`] — so a switch flipped while the owner is in Settings is
-//! noticed without anyone pressing anything more. Every other producer writes
+//! stall the loop), the main thread decides against a completed CACHED probe,
+//! and the card waits at most [`SLOT_WAIT_FOR`] for the shared notice slot.
+//! While another notice owns the slot, the card schedules only its expiry;
+//! once the slot frees it checks access before offering anything. Once raised,
+//! the instance WATCHES the probe
+//! for the grant, for at most [`WATCH_FOR`]. The prompt-free access probe runs
+//! on a detached worker, with at most one in flight; the event loop never joins
+//! it or calls its `open()`. An active watch has a bounded refresh deadline,
+//! returning focus invalidates the observation, and worker completion wakes
+//! the app. All windows read that same App-owned result. This observes whether
+//! access became effective; it does not read the System Settings switch or
+//! establish the permissions of sessions adopted from another process.
+//! Every other producer writes
 //! the single notice slot unconditionally, so a raised card CAN be displaced
 //! (the admin card lands seconds after it on a fresh Mac); a displaced card
 //! that the owner never pressed goes back to waiting for the slot and is
 //! re-raised when it frees, for as long as its own hold would have run
 //! ([`RERAISE_WITHIN`]). A card that lifts away unanswered is not latched: it
-//! returns at the next launch, exactly like the admin card returns on the next
-//! pass.
+//! returns after a day or at the next launch. Only an actually shown,
+//! unanswered offer gets that daily return; quiet decisions and exhausted
+//! initial attempts stay settled. The new episode resets both slot caps.
 //!
 //! # No protected-folder literal lives here
 //!
@@ -115,14 +127,19 @@ pub(crate) const MAX_MARKER_BYTES: usize = 64;
 
 /// How long, after the card is raised, the instance keeps re-checking the
 /// probe for the grant. Bounded so a process that outlives an unanswered card
-/// does not carry a per-park check forever; the check itself is one cached
-/// `open()` per `[privacy] probe_interval_ms`.
+/// does not carry a per-park check forever; fresh observations are made off the
+/// event loop at the bounded `[privacy] probe_interval_ms` cadence.
 pub(crate) const WATCH_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How long after its FIRST raise a displaced card may be raised again — the
 /// card's own hold (`notice::ADMIN_STEP_TTL`). Past it the card has had its
-/// turn for this process; the next launch asks again.
+/// turn for this episode; an unanswered shown card may return after a day.
 pub(crate) const RERAISE_WITHIN: Duration = crate::notice::ADMIN_STEP_TTL.saturating_mul(2);
+
+/// The first offer gets the same bounded opportunity as a displaced one.
+/// This outlasts the admin card's hold, but a permanently occupied notice slot
+/// cannot keep a never-shown card scheduling access probes forever.
+pub(crate) const SLOT_WAIT_FOR: Duration = RERAISE_WITHIN;
 
 /// How long the launch one-shot waits for its worker's verdict before asking
 /// again. A verdict CAN be lost: an uncommitted incoming handoff drops every
@@ -133,6 +150,14 @@ const DECIDE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many verdicts the one-shot will wait for before giving up for the life
 /// of the process.
 pub(crate) const DECIDE_ATTEMPTS: u8 = 3;
+
+/// How long a card that lifted away UNANSWERED — no marker written, the owner
+/// never pressed it — waits before it is offered again in the same process.
+/// The card was launch-only: an update that landed overnight raised it to an
+/// empty room, it expired, and the owner met the next morning's dialogs with
+/// no card and no pointer to Settings until the next update. A card the owner
+/// answered is never re-offered (the marker decides that, in every process).
+pub(crate) const REOFFER_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The pill that replaces the card once the probe observes the grant. It
 /// names the fact and stops: which services the grant covers and how far it
@@ -154,13 +179,13 @@ pub(crate) const OPENED_SETTINGS_TTL: Duration = Duration::from_secs(90);
 pub(crate) fn opened_settings_caption(opened: bool, route: &str) -> String {
     if opened {
         format!(
-            "\u{2699} Opened System Settings \u{2014} turn on aterm under {route} (add it with + if it \
-             is not listed); aterm re-checks on its own"
+            "\u{2699} Opened System Settings \u{2014} find aterm under {route} (+ adds a missing app); \
+             if already enabled, leave it on; aterm keeps checking access"
         )
     } else {
         format!(
-            "\u{2699} System Settings did not open \u{2014} the switch is at {route} (add aterm with + \
-             if it is not listed)"
+            "\u{2699} System Settings did not open \u{2014} find aterm at {route} (+ adds a missing app); \
+             if already enabled, leave it on"
         )
     }
 }
@@ -342,7 +367,8 @@ pub(crate) enum CardPhase {
     /// until it is shown, so a process that never gets the slot leaves the
     /// acknowledgement to the next one.
     Confirming { since: Instant },
-    /// Nothing more will happen in this process.
+    /// The episode ended. An actually shown but unanswered offer may return
+    /// after REOFFER_AFTER; explicit answers and quiet decisions remain settled.
     Settled,
 }
 
@@ -350,6 +376,8 @@ pub(crate) enum CardPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CardState {
     phase: CardPhase,
+    /// When the first offer became due, before it has ever reached the slot.
+    due_since: Option<Instant>,
     /// When the card was FIRST raised in this process — the anchor for
     /// [`RERAISE_WITHIN`].
     first_raised: Option<Instant>,
@@ -359,13 +387,17 @@ pub(crate) struct CardState {
     /// How many times the launch one-shot has asked its worker for a verdict
     /// ([`DECIDE_ATTEMPTS`]).
     decide_attempts: u8,
+    /// When the card settled unanswered, for [`REOFFER_AFTER`].
+    settled_at: Option<Instant>,
 }
 
 impl CardState {
     pub(crate) const fn new() -> Self {
         Self {
             phase: CardPhase::Idle,
+            due_since: None,
             decide_attempts: 0,
+            settled_at: None,
             first_raised: None,
             owner_acted: false,
         }
@@ -373,6 +405,61 @@ impl CardState {
 
     pub(crate) const fn phase(self) -> CardPhase {
         self.phase
+    }
+
+    /// Every active phase owns an absolute expiry, even with no probe result
+    /// or free notice slot. The host combines this with its refresh deadline,
+    /// so a slow or stuck probe cannot extend a phase's lifetime.
+    pub(crate) fn lifecycle_deadline(self) -> Option<Instant> {
+        match self.phase {
+            CardPhase::Idle => None,
+            CardPhase::Settled => self.settled_at.map(|at| at + REOFFER_AFTER),
+            CardPhase::Deciding { since } => Some(since + DECIDE_TIMEOUT),
+            CardPhase::Due => self
+                .first_raised
+                .map(|since| since + RERAISE_WITHIN)
+                .or_else(|| self.due_since.map(|since| since + SLOT_WAIT_FOR)),
+            CardPhase::Watching { since } | CardPhase::Confirming { since } => {
+                Some(since + WATCH_FOR)
+            }
+        }
+    }
+
+    /// Retire an expired slot wait or grant watch BEFORE asking for another
+    /// observation. Deciding uses its bounded retry path instead; this method
+    /// never consumes a marker that the next process may still acknowledge.
+    pub(crate) fn expire_wait(&mut self, now: Instant) -> bool {
+        if matches!(
+            self.phase,
+            CardPhase::Due | CardPhase::Watching { .. } | CardPhase::Confirming { .. }
+        ) && self
+            .lifecycle_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            let unanswered = self.first_raised.is_some()
+                && !self.owner_acted
+                && !matches!(self.phase, CardPhase::Confirming { .. });
+            self.settle();
+            if unanswered {
+                self.settled_at = Some(now);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Admit one lifecycle step against the CURRENT settings, including a
+    /// pending worker verdict or a displaced card. Turning the notice off is
+    /// an answer for this process: a late worker cannot bring it back. The
+    /// host also removes the card's own notice from the shared window slot.
+    pub(crate) fn admit_current_policy(&mut self, enabled: bool, notice: bool) -> bool {
+        if enabled && notice {
+            true
+        } else {
+            self.settle();
+            false
+        }
     }
 
     /// The one-shot fired: a worker is deciding. Only from [`CardPhase::Idle`].
@@ -398,7 +485,7 @@ impl CardState {
     /// the card silently dead for the life of the process.
     pub(crate) fn reopen_deciding(&mut self) -> bool {
         if self.decide_attempts >= DECIDE_ATTEMPTS {
-            self.phase = CardPhase::Settled;
+            self.settle();
             return false;
         }
         self.phase = CardPhase::Idle;
@@ -413,29 +500,26 @@ impl CardState {
         if !matches!(self.phase, CardPhase::Deciding { .. }) {
             return false;
         }
+        self.settled_at = None;
         self.phase = match verdict {
-            Verdict::Offer => CardPhase::Due,
+            Verdict::Offer => {
+                self.due_since.get_or_insert(now);
+                CardPhase::Due
+            }
             Verdict::Confirm => CardPhase::Confirming { since: now },
             Verdict::Quiet(_) => CardPhase::Settled,
         };
         true
     }
 
-    /// Whether a raise is still allowed at `now`: always for the first one; a
-    /// RE-raise only inside [`RERAISE_WITHIN`] of the first — past it the card
-    /// settles instead, so a card displaced late in its hold cannot come back
-    /// for a whole second hold.
+    /// Whether a raise is still allowed at `now`: the first offer waits at
+    /// most [`SLOT_WAIT_FOR`]; a re-raise gets only [`RERAISE_WITHIN`] from the
+    /// first raise. Neither another notice nor a pending probe extends it.
     pub(crate) fn raise_allowed(&mut self, now: Instant) -> bool {
         if self.phase != CardPhase::Due {
             return false;
         }
-        let within = self
-            .first_raised
-            .is_none_or(|at| now.saturating_duration_since(at) < RERAISE_WITHIN);
-        if !within {
-            self.phase = CardPhase::Settled;
-        }
-        within
+        !self.expire_wait(now)
     }
 
     /// The card went on screen at `now`.
@@ -465,7 +549,7 @@ impl CardState {
             CardPhase::Confirming { since }
                 if now.saturating_duration_since(since) >= WATCH_FOR =>
             {
-                self.phase = CardPhase::Settled;
+                self.settle();
                 true
             }
             _ => false,
@@ -480,13 +564,13 @@ impl CardState {
         }
     }
 
-    /// The owner pressed *Open Settings*: keep watching, restart the watch
-    /// window — they are in Settings right now — and never re-raise.
+    /// The owner pressed *Open Settings* through either UI: start a bounded
+    /// watch even if the automatic card was idle or settled. The host admits
+    /// this explicit gesture against current settings before calling it.
     pub(crate) fn on_opened_settings(&mut self, now: Instant) {
-        if matches!(self.phase, CardPhase::Watching { .. }) {
-            self.phase = CardPhase::Watching { since: now };
-            self.owner_acted = true;
-        }
+        self.phase = CardPhase::Watching { since: now };
+        self.owner_acted = true;
+        self.settled_at = None;
     }
 
     /// The card is no longer on the glass and the owner did not press it:
@@ -513,23 +597,36 @@ impl CardState {
     /// Whether the probe should be re-checked at `now`. True only while
     /// watching and inside [`WATCH_FOR`]; a watch past its window settles.
     pub(crate) fn wants_probe(&mut self, now: Instant) -> bool {
-        match self.phase {
-            CardPhase::Watching { since } => {
-                if now.saturating_duration_since(since) >= WATCH_FOR {
-                    self.phase = CardPhase::Settled;
-                    false
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        }
+        matches!(self.phase, CardPhase::Watching { .. }) && !self.expire_wait(now)
     }
 
     /// Nothing more in this process: *Not now*, the grant observed, or the
     /// decision said no.
     pub(crate) fn settle(&mut self) {
         self.phase = CardPhase::Settled;
+        self.settled_at = None;
+    }
+
+    /// A card that settled UNANSWERED is offered again after
+    /// [`REOFFER_AFTER`]: back to `Idle`, attempts reset, `true`. A card the
+    /// owner pressed is never re-offered here — its marker settles every later
+    /// decision in every process. Only expiry of a shown unanswered card sets
+    /// settled_at; neither quiet decisions nor exhausted retries poll daily.
+    pub(crate) fn reoffer_due(&mut self, now: Instant) -> bool {
+        if self.phase != CardPhase::Settled || self.owner_acted {
+            return false;
+        }
+        if self
+            .settled_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= REOFFER_AFTER)
+        {
+            // Clear both slot caps as well as the retry budget: carrying the
+            // prior day's first_raised would immediately expire the new offer.
+            *self = Self::new();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -543,8 +640,9 @@ impl Default for CardState {
 mod tests {
     use super::{
         CardFacts, CardPhase, CardState, DECIDE_ATTEMPTS, DECIDE_TIMEOUT, GRANTED_CAPTION, MARKER,
-        MAX_MARKER_BYTES, Marker, NotDue, RERAISE_WITHIN, Verdict, WATCH_FOR, clear_opened, decide,
-        marker_path, opened_settings_caption, read_marker, record_marker,
+        MAX_MARKER_BYTES, Marker, NotDue, REOFFER_AFTER, RERAISE_WITHIN, SLOT_WAIT_FOR, Verdict,
+        WATCH_FOR, clear_opened, decide, marker_path, opened_settings_caption, read_marker,
+        record_marker,
     };
     use aterm_containment::consent::{DrClass, FdaState};
     use std::time::{Duration, Instant};
@@ -556,6 +654,271 @@ mod tests {
             fda: FdaState::Denied,
             dr: DrClass::Identity,
         }
+    }
+
+    /// The bounded waiting phases share one expiry contract. The clock step
+    /// represents the host reaching the current phase's absolute deadline;
+    /// it cannot be extended by a pending observation or an occupied slot.
+    /// The historical first-offer omission is the negative control.
+    fn bounded_wait_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            MacosAccessCardBoundedWait {
+                const Buggy = 0;
+                // Due, Watching, Confirming, Settled, matching current_policy.
+                var phase = 2;
+                var expired = 0;
+                action Raise when (phase == 2 && expired == 0) {
+                    phase = 3;
+                }
+                action Grant when (phase > 1 && phase <= 3 && expired == 0) {
+                    phase = 4;
+                }
+                action Displace when (phase == 3 && expired == 0) {
+                    phase = 2;
+                }
+                action Expire when (phase > 1 && phase <= 4 && expired == 0) {
+                    expired = 1;
+                    phase = if Buggy == 1 && phase == 2 { phase } else { 5 };
+                }
+                invariant Bounds: phase > 1 && phase <= 5 && expired <= 1;
+                invariant NoWorkPastCap: expired == 0 || phase == 5;
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_wait_model_proves_and_catches_a_never_shown_card() {
+        let model = bounded_wait_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    /// Tier-1 drives real first-offer, displaced, watching and confirming
+    /// states to just before and exactly at their actual scheduled expiry.
+    /// Repeated pending observations need not arrive for expiry to settle.
+    #[test]
+    fn bounded_wait_conforms_at_each_real_phase_deadline() {
+        let now = Instant::now();
+        let model = bounded_wait_model();
+        let scenarios: &[&[&str]] = &[
+            &[],
+            &["Raise"],
+            &["Grant"],
+            &["Raise", "Grant"],
+            &["Raise", "Displace"],
+            &["Raise", "Displace", "Raise"],
+        ];
+        let mut negative_controls = 0;
+        for actions in scenarios {
+            let mut actual = CardState::new();
+            assert_eq!(actual.lifecycle_deadline(), None);
+            assert!(actual.begin_deciding(now));
+            assert_eq!(actual.lifecycle_deadline(), Some(now + DECIDE_TIMEOUT));
+            assert!(actual.on_decided(&Verdict::Offer, now));
+            assert_eq!(actual.lifecycle_deadline(), Some(now + SLOT_WAIT_FOR));
+            let mut expected = model.init_state();
+            for (step, action) in actions.iter().enumerate() {
+                let at = now + Duration::from_secs(step as u64 + 1);
+                match *action {
+                    "Raise" => actual.on_raised(at),
+                    "Grant" => actual.on_grant_awaiting_slot(at),
+                    "Displace" => assert!(actual.on_displaced(at)),
+                    _ => unreachable!(),
+                }
+                assert!(model.fire(action, &mut expected));
+                let phase = match actual.phase() {
+                    CardPhase::Due => 2,
+                    CardPhase::Watching { .. } => 3,
+                    CardPhase::Confirming { .. } => 4,
+                    _ => panic!("unexpected waiting phase"),
+                };
+                assert_eq!(phase, expected["phase"]);
+            }
+            let deadline = actual.lifecycle_deadline().expect("every wait has a cap");
+            assert!(!actual.expire_wait(deadline - Duration::from_nanos(1)));
+            assert_eq!(actual.lifecycle_deadline(), Some(deadline));
+            let before = expected.clone();
+            assert!(actual.expire_wait(deadline));
+            assert!(model.fire("Expire", &mut expected));
+            assert_eq!(actual.phase(), CardPhase::Settled);
+            assert_eq!(expected["phase"], 5);
+            assert!(model.check_invariant("NoWorkPastCap", &expected));
+            assert_eq!(
+                actual.lifecycle_deadline(),
+                (actual.first_raised.is_some() && before["phase"] != 4)
+                    .then_some(deadline + REOFFER_AFTER),
+                "only a shown unanswered offer schedules a daily return"
+            );
+            assert!(!actual.raise_allowed(deadline));
+            assert!(!actual.wants_probe(deadline));
+            if before["phase"] == 2 {
+                let mut old = expected.clone();
+                old.insert("phase", 2);
+                assert!(!model.check_invariant("NoWorkPastCap", &old));
+                negative_controls += 1;
+            }
+        }
+        assert_eq!(negative_controls, 2, "first-offer and displaced omissions");
+    }
+
+    #[test]
+    fn first_offer_wait_is_bounded_but_outlasts_the_admin_hold() {
+        assert!(SLOT_WAIT_FOR > crate::notice::ADMIN_STEP_TTL);
+        let now = Instant::now();
+        let mut actual = CardState::new();
+        assert!(actual.begin_deciding(now));
+        assert!(actual.on_decided(&Verdict::Offer, now));
+        assert!(actual.raise_allowed(now + crate::notice::ADMIN_STEP_TTL));
+        assert_eq!(actual.lifecycle_deadline(), Some(now + SLOT_WAIT_FOR));
+        assert!(!actual.raise_allowed(now + SLOT_WAIT_FOR));
+        assert_eq!(actual.phase(), CardPhase::Settled);
+    }
+
+    #[test]
+    fn an_initial_observation_that_stays_pending_exhausts_scheduled_attempts() {
+        let mut now = Instant::now();
+        let mut actual = CardState::new();
+        for attempt in 1..=DECIDE_ATTEMPTS {
+            assert!(actual.begin_deciding(now));
+            let deadline = actual
+                .lifecycle_deadline()
+                .expect("decision owns a deadline");
+            assert_eq!(deadline, now + DECIDE_TIMEOUT);
+            assert!(!actual.deciding_lapsed(deadline - Duration::from_nanos(1)));
+            assert!(actual.deciding_lapsed(deadline));
+            assert!(
+                !actual.expire_wait(deadline),
+                "decision uses bounded retries"
+            );
+            assert_eq!(actual.reopen_deciding(), attempt < DECIDE_ATTEMPTS);
+            now = deadline;
+        }
+        assert_eq!(actual.phase(), CardPhase::Settled);
+        assert_eq!(actual.lifecycle_deadline(), None);
+        assert!(!actual.on_decided(&Verdict::Confirm, now));
+        assert!(!actual.on_decided(&Verdict::Offer, now));
+    }
+
+    /// The live settings guard over the existing lifecycle phases. The
+    /// historical guard ran only at launch: disabling a visible or queued
+    /// card left it eligible to return. `Buggy=1` replays that omission.
+    fn current_policy_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            MacosAccessCardCurrentPolicy {
+                const Buggy = 0;
+                var enabled = 1;
+                var notice = 1;
+                // Idle, Deciding, Due, Watching, Confirming, Settled.
+                var phase = 0;
+                action Begin when (phase == 0 && enabled == 1 && notice == 1) {
+                    phase = 1;
+                }
+                action Decide when (phase == 1 && enabled == 1 && notice == 1) {
+                    phase = 2;
+                }
+                action Raise when (phase == 2 && enabled == 1 && notice == 1) {
+                    phase = 3;
+                }
+                action Grant when (phase == 3 && enabled == 1 && notice == 1) {
+                    phase = 4;
+                }
+                action Finish when (phase == 4) {
+                    phase = 5;
+                }
+                action DisableMaster when (enabled == 1) {
+                    enabled = 0;
+                    phase = if Buggy == 1 && phase > 0 { phase } else { 5 };
+                }
+                action DisableNotice when (notice == 1) {
+                    notice = 0;
+                    phase = if Buggy == 1 && phase > 0 { phase } else { 5 };
+                }
+                action EnableBoth when (enabled == 0 || notice == 0) {
+                    enabled = 1;
+                    notice = 1;
+                }
+                invariant Bounds: enabled <= 1 && notice <= 1 && phase <= 5;
+                invariant DisabledSettles: enabled == 1 && notice == 1 || phase == 5;
+            }
+        }
+    }
+
+    #[test]
+    fn current_policy_model_proves_and_catches_a_stale_card() {
+        let model = current_policy_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    /// Tier-1: drive all six shipping phases, then disable either or both
+    /// settings. A late verdict and re-enabling cannot resurrect a settled
+    /// card. The old omitted guard is projected as the negative control.
+    #[test]
+    fn current_policy_conforms_in_every_real_phase() {
+        fn phase_value(state: CardState) -> i64 {
+            match state.phase() {
+                CardPhase::Idle => 0,
+                CardPhase::Deciding { .. } => 1,
+                CardPhase::Due => 2,
+                CardPhase::Watching { .. } => 3,
+                CardPhase::Confirming { .. } => 4,
+                CardPhase::Settled => 5,
+            }
+        }
+
+        let now = Instant::now();
+        let model = current_policy_model();
+        let mut actual = CardState::new();
+        let mut expected = model.init_state();
+        let mut phases = vec![(actual, expected.clone())];
+        for action in ["Begin", "Decide", "Raise", "Grant", "Finish"] {
+            match action {
+                "Begin" => assert!(actual.begin_deciding(now)),
+                "Decide" => assert!(actual.on_decided(&Verdict::Offer, now)),
+                "Raise" => actual.on_raised(now),
+                "Grant" => actual.on_grant_awaiting_slot(now),
+                "Finish" => actual.settle(),
+                _ => unreachable!(),
+            }
+            assert!(model.fire(action, &mut expected));
+            assert_eq!(phase_value(actual), expected["phase"]);
+            phases.push((actual, expected.clone()));
+        }
+        let mut caught_old_guards = 0;
+        for (before, projection) in phases {
+            for (enabled, notice) in [(true, true), (false, true), (true, false), (false, false)] {
+                let mut actual = before;
+                let mut expected = projection.clone();
+                let admitted = actual.admit_current_policy(enabled, notice);
+                assert_eq!(admitted, enabled && notice);
+                if !enabled {
+                    assert!(model.fire("DisableMaster", &mut expected));
+                }
+                if !notice {
+                    assert!(model.fire("DisableNotice", &mut expected));
+                }
+                assert_eq!(phase_value(actual), expected["phase"]);
+                assert!(model.check_invariant("DisabledSettles", &expected));
+                if admitted {
+                    assert_eq!(actual, before, "an enabled policy preserves every phase");
+                } else {
+                    let mut old = expected.clone();
+                    old.insert("phase", phase_value(before));
+                    if !matches!(before.phase(), CardPhase::Idle | CardPhase::Settled) {
+                        assert!(!model.check_invariant("DisabledSettles", &old));
+                        caught_old_guards += 1;
+                    }
+                    assert!(!actual.on_decided(&Verdict::Offer, now));
+                    assert!(!actual.on_decided(&Verdict::Confirm, now));
+                    assert!(actual.admit_current_policy(true, true));
+                    assert!(model.fire("EnableBoth", &mut expected));
+                    assert_eq!(phase_value(actual), expected["phase"]);
+                    assert_eq!(actual.phase(), CardPhase::Settled);
+                }
+            }
+        }
+        assert_eq!(
+            caught_old_guards, 12,
+            "four active phases, three disabled policies"
+        );
     }
 
     /// Every condition is a way to be wrong, and each failure is named. The
@@ -750,6 +1113,8 @@ mod tests {
         for opened in [true, false] {
             let text = opened_settings_caption(opened, route);
             assert!(text.contains(route));
+            assert!(text.contains("if already enabled, leave it on"));
+            assert!(!text.contains("turn on aterm"));
             assert!(
                 text.contains('+'),
                 "the whole route, listing included: {text}"
@@ -761,9 +1126,135 @@ mod tests {
         );
     }
 
-    /// The lifecycle: one decision per process, a stale verdict is ignored,
-    /// the watch is bounded, a displaced card returns within its own hold
-    /// unless the owner pressed it, and every terminal press settles it.
+    fn reoffer_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AccessCardReoffer {
+                const Buggy = 0;
+                var phase = 0;
+                var answered = 0;
+                var armed = 0;
+                var fresh = 1;
+                action Offer when (phase == 0) { phase = 1; }
+                action Quiet when (phase == 0) { phase = 2; }
+                action Answer when (phase == 1) {
+                    phase = 2; answered = 1; armed = 0;
+                }
+                action Expire when (phase == 1) {
+                    phase = 2; armed = if answered == 0 { 1 } else { 0 };
+                }
+                action Return when (phase == 2 && armed == 1) {
+                    phase = 0; answered = 0; armed = 0;
+                    fresh = if Buggy == 1 { 0 } else { 1 };
+                }
+                action Open when (phase <= 2) {
+                    phase = 1; answered = 1; armed = 0; fresh = 1;
+                }
+                invariant FreshReturn: phase > 0 || fresh == 1;
+                invariant AnswerStopsReoffer: armed == 0 || (phase == 2 && answered == 0);
+                invariant Bounds: phase <= 2 && answered <= 1 && armed <= 1 && fresh <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn reoffer_and_settings_watch_conform_to_the_real_card_lifecycle() {
+        use std::collections::BTreeMap;
+        let model = reoffer_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        let project = |s: CardState| {
+            BTreeMap::from([
+                (
+                    "phase",
+                    match s.phase {
+                        CardPhase::Idle => 0,
+                        CardPhase::Watching { .. } => 1,
+                        CardPhase::Settled => 2,
+                        _ => panic!("fixture projects only completed transitions"),
+                    },
+                ),
+                ("answered", i64::from(s.owner_acted)),
+                ("armed", i64::from(s.settled_at.is_some())),
+                (
+                    "fresh",
+                    i64::from(
+                        s.phase != CardPhase::Idle
+                            || (s.first_raised.is_none() && s.due_since.is_none()),
+                    ),
+                ),
+            ])
+        };
+        for actions in [
+            &["Offer", "Expire", "Return", "Offer", "Answer"][..],
+            &["Quiet", "Open", "Expire"][..],
+        ] {
+            let mut card = CardState::new();
+            let mut state = model.init_state();
+            let mut now = Instant::now();
+            for action in actions {
+                match *action {
+                    "Offer" => {
+                        assert!(card.begin_deciding(now));
+                        assert!(card.on_decided(&Verdict::Offer, now));
+                        assert!(card.raise_allowed(now));
+                        card.on_raised(now);
+                    }
+                    "Quiet" => {
+                        assert!(card.begin_deciding(now));
+                        assert!(card.on_decided(&Verdict::Quiet(NotDue::Granted), now));
+                    }
+                    "Answer" => {
+                        card.on_owner_acted();
+                        card.settle();
+                    }
+                    "Expire" => {
+                        now += WATCH_FOR;
+                        assert!(card.expire_wait(now));
+                        assert_eq!(
+                            card.lifecycle_deadline(),
+                            (!card.owner_acted).then_some(now + REOFFER_AFTER)
+                        );
+                    }
+                    "Return" => {
+                        assert!(!card.reoffer_due(now + REOFFER_AFTER - Duration::from_nanos(1)));
+                        now += REOFFER_AFTER;
+                        assert!(card.reoffer_due(now));
+                    }
+                    "Open" => card.on_opened_settings(now),
+                    _ => unreachable!(),
+                }
+                let actual = project(card);
+                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &state,
+                    &actual,
+                    Some(action),
+                    "real access-card reoffer",
+                );
+                assert!(ok, "{action}: {actual:?}: {why}");
+                if *action == "Return" {
+                    let mut stale = card;
+                    stale.first_raised = Some(now - REOFFER_AFTER);
+                    let broken = project(stale);
+                    assert!(!model.check_invariant("FreshReturn", &broken));
+                    assert!(!model.successors(action, &state).contains(&broken));
+                }
+                if *action == "Open" {
+                    let mut old = actual.clone();
+                    old.insert("phase", 2); // old Watching-only gesture lost this request
+                    assert!(!model.successors(action, &state).contains(&old));
+                }
+                state = actual;
+            }
+            assert!(!card.reoffer_due(now + REOFFER_AFTER * 2));
+            assert_eq!(
+                card.lifecycle_deadline(),
+                None,
+                "answered/quiet cards do not poll daily"
+            );
+        }
+    }
+
     /// A VERDICT THAT NEVER ARRIVES DOES NOT KILL THE CARD (2026-09-09). An
     /// uncommitted incoming handoff drops every wake but Commit, so the card's
     /// own verdict can be swallowed. Deciding therefore lapses, asks again, and
@@ -906,8 +1397,17 @@ mod tests {
         assert!(!o.wants_probe(t2 + WATCH_FOR), "the watch is bounded");
         assert_eq!(o.phase(), CardPhase::Settled);
         o.on_opened_settings(t2);
-        o.on_raised(t2);
-        assert_eq!(o.phase(), CardPhase::Settled, "settled stays settled");
+        assert_eq!(
+            o.phase(),
+            CardPhase::Watching { since: t2 },
+            "a new Settings gesture starts a fresh bounded watch"
+        );
+        assert!(!o.wants_probe(t2 + WATCH_FOR));
+        assert_eq!(
+            o.lifecycle_deadline(),
+            None,
+            "an explicit gesture never reoffers the card"
+        );
 
         // A body press: dismissed for now, watch continues, never re-raised.
         let mut b = CardState::new();

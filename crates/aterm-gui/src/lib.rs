@@ -2587,6 +2587,25 @@ struct ScrollGlideState {
     cell_h: i64,
 }
 
+/// One `fx` control-socket operation ([`Wake::FxControl`] payload): the read
+/// face (`Status`) and the one write, `Celebrate` — an ARM, never a light.
+/// Parsed on the control thread (`control_media::cmd_fx`), executed on the
+/// main thread (the sole `App` mutator, [`App::fx_control`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FxCtlOp {
+    /// `fx` / `fx status`: one status line, no mutation.
+    Status,
+    /// `fx celebrate …`: latch a one-shot sing-along on the front session.
+    Celebrate {
+        /// The song signature (`kitty_sing::song_signature` of the key).
+        sig: u32,
+        /// Bars to run, `1..=kitty_sing::CELEBRATE_MAX_BARS`.
+        bars: u8,
+        /// The keystroke-caused edge it fires on.
+        on: aterm_effects::kitty_sing::CelebrateOn,
+    },
+}
+
 /// One `rain` control-socket operation ([`Wake::RainControl`] payload): the
 /// read face (`Status`) and the three per-session override writes. Parsed on
 /// the control thread (`control_media::cmd_rain`), executed on the main thread
@@ -2791,6 +2810,12 @@ enum Wake {
     /// spawned it. A lost poke is survivable: the next park drains, and the
     /// channel's disconnect edge is what ends the stream.
     ConsentObserver,
+    /// A prompt-free access probe completed off the UI thread. Its result is
+    /// held in this instance's cache; this event carries no permission grant.
+    ConsentProbeReady,
+    /// One demanded drawable acquisition completed. Identity prevents a closed
+    /// or replaced surface's delayed completion from waking another target.
+    GpuSurfaceReady { window: WindowId, surface: u64 },
     /// THE macOS ACCESS CARD's worker half finished (`consent_card`, design
     /// §3.4 as amended 2026-09-07): the signing identity is warm (the
     /// `codesign` spawn that must never land on the event loop) and the
@@ -3002,6 +3027,13 @@ enum Wake {
         op: RainCtlOp,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    /// `fx [status|celebrate …]` (control socket): read or ARM the focused
+    /// window's one-shot rainbow-kitty celebration ([`App::fx_control`]). The
+    /// write latches; the light waits for the session's next keyed edge.
+    FxControl {
+        op: FxCtlOp,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     /// `streak [status]` (control socket): read the FRONT window's PRISM WAKE
     /// state — every gate that decides whether program output earns a comet,
     /// plus the live engine facts. Read-only like `tone`: the streak's knobs
@@ -3037,6 +3069,16 @@ enum Wake {
     /// recording. Pure read; costs nothing unasked.
     TrailStatus {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `await momentum` / `turn yield=` (control socket): ONE reading of the
+    /// typing-momentum metric of the window hosting `session` — the raw
+    /// `trail status momentum=` number — stamped with the instant it was read,
+    /// so the control thread can solve the release law's crossing analytically
+    /// ([`App::typing_momentum_of`]). Pure read; a session with no window has
+    /// no ribbon and reads exactly zero.
+    TypingMomentum {
+        session: u64,
+        reply: std::sync::mpsc::Sender<Result<(f32, std::time::Instant), String>>,
     },
     /// `status` (control socket): the target session's SUBJECT + classified
     /// STATUS record ([`App::session_status_record`]). A main-thread hop rather
@@ -3624,6 +3666,26 @@ enum Wake {
     /// `seed-failed:` marker so the "Installing…" notice is retired with the truth
     /// rather than left standing forever. Retryable, unlike [`Wake::PkgSeedUnusable`].
     PkgSeedFailed { detail: String },
+    /// THE POSITIVE TERMINAL — raised from the streamed `seed-done:` marker (atpkg's
+    /// [`atpkg::cli::SEED_DONE_MARKER`], 2026-09-11). An announced pass that ended well
+    /// and has no install roster to name says so in a line of its own, so the reader is
+    /// never left inferring an outcome from the ABSENCE of one. Before it existed the
+    /// contract had failure terminals only, and the absence was read as a failure.
+    /// `detail` is atpkg's own sentence; display only, no authority crosses it.
+    PkgSeedDone { detail: String },
+    /// An announced pass that exited ZERO and left the store EMPTY. Its own variant
+    /// for the reason [`Wake::PkgSeedPartial`] has one: both obvious renderings lie.
+    /// "Install failed" asserts a failure nobody observed — the pass reported success
+    /// — and the success row asserts a toolchain that is demonstrably not on the disk.
+    /// The only honest sentence names the promise and the outcome and nothing else.
+    PkgSeedNothing { detail: String },
+    /// `seed-busy:` — ANOTHER `atpkg` HOLDS THE STORE LOCK, so this pass stood aside
+    /// (2026-09-11). Raised so the refusal branch below does NOT fire: that branch is
+    /// right for an unwritable prefix and right for a bundle whose atpkg cannot exec,
+    /// and it was wrong for the one refusal where the work is being done by somebody
+    /// else — two aterm launches sixteen seconds apart put "install failed" on screen
+    /// while the install was running in the other process. Log only; no card.
+    PkgSeedBusy { detail: String },
     /// Some members installed and some did not — raised from `seed-partial:`. Its own
     /// variant because the two obvious renderings are both lies: the success pill
     /// claims a toolchain the machine does not have, and the failure pill hides the
@@ -7585,12 +7647,16 @@ fn frame_cap_due(
 /// Returning one combined redraw decision keeps request delivery outside this
 /// pure state transition, so the every-wake contract is directly testable.
 fn service_due_presentation_clocks(
+    acquire_pending: bool,
     retry: &mut PresentRetry,
     redraw_pending: &mut bool,
     last_present_at: Option<Instant>,
     pace_floor: Duration,
     now: Instant,
 ) -> bool {
+    if acquire_pending {
+        return false;
+    }
     let retry_due = retry.take_due(now);
     let cap_due = frame_cap_due(*redraw_pending, last_present_at, pace_floor, now);
     if cap_due {
@@ -7655,6 +7721,32 @@ fn rearm_present_and_request(
         request_redraw();
     }
     requested
+}
+
+/// A drawable worker owns the next attempt while this identity is pending.
+/// There is no clock or retry fuel here: only a matching completion can reopen
+/// the same surface, and replacement/CPU targets never inherit its wait.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GpuAcquireWait {
+    pending_surface: Option<u64>,
+}
+
+impl GpuAcquireWait {
+    fn begin(&mut self, surface: u64) {
+        self.pending_surface = Some(surface);
+    }
+
+    fn waiting_for(&self, current_surface: Option<u64>) -> bool {
+        current_surface.is_some() && self.pending_surface == current_surface
+    }
+
+    fn complete(&mut self, current_surface: Option<u64>, reported_surface: u64) -> bool {
+        if current_surface != Some(reported_surface) || !self.waiting_for(current_surface) {
+            return false;
+        }
+        self.pending_surface = None;
+        true
+    }
 }
 
 /// Per-window view state: everything that belonged to one window when `App` was
@@ -8710,6 +8802,9 @@ struct WindowState {
     /// immediate redraw: retryable failures arm an exponential deadline;
     /// persistent/occluded/invalid surfaces park until external activity.
     present_retry: PresentRetry,
+    /// Demand-only asynchronous acquisition; no failure accounting or timer.
+    gpu_acquire_wait: GpuAcquireWait,
+    capture_acquire_armed: bool,
     /// One per-window permit for the fresh-CAMetalLayer occlusion seam. The
     /// pristine first `GpuOccluded` drop consumes it; any successful present
     /// closes it. External stimuli never replenish it, so a genuinely occluded
@@ -8791,6 +8886,21 @@ struct WindowState {
     /// between the old probe/extract locks from pairing A effects with B cells,
     /// without adding a steady-state allocation.
     composed_focus_scratch: RenderInput,
+    /// THE CAPTURE'S CONSOLE FACTS, read under the SAME terminal lock as the
+    /// cells the capture just extracted, and consumed by the decoration pass
+    /// that ticks the resident pet.
+    ///
+    /// Without it the capture path ticked the pet brain having never called
+    /// `observe_console`, so every console-layer verdict — the resident, its
+    /// attention, its perch, the clear-space veto on its body — was computed
+    /// against a world the capture had never looked at (a stale one on a
+    /// windowed instance, and NO world at all on a headless one, where the
+    /// capture is the only thing that ticks the brain). That is why `image`,
+    /// `window` and `trail status` were structurally blind to this entire
+    /// layer, and why no automated check could ever see a defect in it.
+    /// `None` when the resident pet does not own the trail — the off path
+    /// must not build console perception.
+    pub(crate) capture_pet_world: Option<aterm_effects::pet_world::PetWorldFacts>,
     /// One PERSISTENT snapshot buffer per UNFOCUSED visible pane, keyed by its
     /// pane index in the frame's canonical order. A session may have multiple
     /// visible views, so session identity alone cannot own a snapshot. The
@@ -9315,6 +9425,64 @@ impl WindowState {
         self.last_present = None;
     }
 
+    fn current_gpu_acquire_id(&self) -> Option<u64> {
+        match self.present.as_ref() {
+            Some(PresentTarget::Gpu { gpu_surface, .. }) => Some(gpu_surface.acquire_id()),
+            _ => None,
+        }
+    }
+
+    fn gpu_acquire_pending(&self) -> bool {
+        self.gpu_acquire_wait
+            .waiting_for(self.current_gpu_acquire_id())
+    }
+
+    fn on_gpu_acquire_pending(&mut self, surface: u64) {
+        self.gpu_acquire_wait.begin(surface);
+        // Composition already made an optimistic stamp. Keep every dirty/input
+        // level until a real commit, and make the completion recompose current
+        // content even if its key has not changed in the meantime.
+        self.last_present = None;
+    }
+
+    fn finish_gpu_acquire_wait(
+        &mut self,
+        current_surface: Option<u64>,
+        reported_surface: u64,
+        presentable: bool,
+        request_redraw: impl FnOnce(),
+    ) -> bool {
+        if !self
+            .gpu_acquire_wait
+            .complete(current_surface, reported_surface)
+        {
+            return false;
+        }
+        self.last_present = None;
+        if presentable {
+            request_redraw();
+        } else {
+            // The drawable must be released without a presentation or a retry
+            // train. Existing expose/input lifecycle rearming opens this gate.
+            // This is not a failed acquisition and consumes no retry fuel.
+            self.present_retry.deadline = None;
+            self.present_retry.parked = true;
+            self.present_retry.recovery_redraw_outstanding = false;
+        }
+        true
+    }
+
+    fn service_presentation_clocks(&mut self, pace_floor: Duration, now: Instant) -> bool {
+        service_due_presentation_clocks(
+            self.gpu_acquire_pending(),
+            &mut self.present_retry,
+            &mut self.redraw_pending,
+            self.last_present_at,
+            pace_floor,
+            now,
+        )
+    }
+
     /// CONTENT DISPLAY — the real-present fall-through for a frame that carried
     /// terminal content. Stamp only the content-pacing clock and clear the
     /// keystroke-echo bypass. Successful effect-only, native, and heterogeneous
@@ -9388,6 +9556,7 @@ impl WindowState {
     /// a retry episode and authorize a fresh OS-window capture. Kept separate
     /// from [`Self::on_content_presented`], whose pacing clock is content-gated.
     fn on_present_succeeded(&mut self) {
+        self.gpu_acquire_wait = GpuAcquireWait::default();
         self.present_retry.on_presented();
         self.bootstrap_present_retry_available = false;
         self.capture_present_serial = self.capture_present_serial.wrapping_add(1);
@@ -9658,6 +9827,7 @@ impl WindowState {
             has_glass,
             false,
             10.0,
+            true,
         )
     }
 
@@ -9668,6 +9838,7 @@ impl WindowState {
         has_glass: bool,
         recording_watcher: bool,
         output_streak_idle_secs: f32,
+        celebration_allowed: bool,
     ) -> Option<Instant> {
         // M2 stream fade shares the frame-paced wake: while any ink is still
         // drying (or the LAST present painted a tint that must be settled to
@@ -9736,8 +9907,31 @@ impl WindowState {
             && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher))
             .then(|| self.cursor_pet.next_change_deadline(now))
             .flatten();
+        // External celebrations have no repeating key to wake them. Their
+        // engine offers only unconsumed bar/outro/settle edges, including the
+        // initial bar when an on=green arm fires after the render's song pass.
+        // Static pets never acquire continuous frame cadence from this offer.
+        let celebration_deadline = (has_glass
+            && celebration_allowed
+            && self.front_terminal().is_some()
+            && !self.overlay_open()
+            && self.tab_menu.is_none()
+            && (self.focused || self.cursor_fx_typed_wake(now) || recording_watcher))
+            .then(|| self.kitty_sing.next_external_deadline(now))
+            .flatten()
+            // A due event can remain unconsumed when DEC-2026 defers the
+            // render. Retry at the existing effect cap, never at `now` in a
+            // busy loop. The held slot below preserves an already-armed edge.
+            .map(|deadline| {
+                if deadline <= now {
+                    now + effect_present_interval(self.frame_interval)
+                } else {
+                    deadline
+                }
+            });
         let frame_lane = (has_glass
             && (deco_wake
+                || celebration_deadline.is_some()
                 || pet_deadline.is_some()
                 || self.terminal_effect_frame_active_with_recording(
                     now,
@@ -9775,6 +9969,10 @@ impl WindowState {
             ) {
                 (Some(glow), Some(pet)) => Some(glow.min(pet)),
                 (glow, pet) => glow.or(pet),
+            };
+            let glow_deadline = match (glow_deadline, celebration_deadline) {
+                (Some(glow), Some(song)) => Some(glow.min(song)),
+                (glow, song) => glow.or(song),
             };
             let needs_frame_cadence = others_need_cadence || self.cursor_glow.needs_frame_cadence();
             (aurora_interval, glow_deadline, needs_frame_cadence)
@@ -9881,6 +10079,9 @@ impl WindowState {
     /// this judgment to `ResumeTimeReached` would then leave a passed instant
     /// armed and turn ordinary typing/output traffic into a hot wake loop.
     fn service_due_terminal_effect_tick(&mut self, now: Instant) -> bool {
+        if self.gpu_acquire_pending() {
+            return false;
+        }
         crate::app_render::take_due_trail_tick(
             &mut self.next_trail_tick,
             &mut self.last_trail_fire,
@@ -10495,6 +10696,8 @@ impl WindowState {
             pending_deco_birth: None,
             redraw_pending: false,
             present_retry: PresentRetry::default(),
+            gpu_acquire_wait: GpuAcquireWait::default(),
+            capture_acquire_armed: false,
             bootstrap_present_retry_available: true,
             input_hot: false,
             input_hot_until: None,
@@ -10510,6 +10713,7 @@ impl WindowState {
             pred_row_scratch: Vec::new(),
             pane_scratch: RenderInput::empty(),
             composed_focus_scratch: RenderInput::empty(),
+            capture_pet_world: None,
             unfocused_pane_scratch: std::collections::BTreeMap::new(),
             composed_pane_stage_meta: Vec::new(),
             composed_retain: crate::app_render::ComposedRetain::default(),
@@ -12428,6 +12632,9 @@ struct App {
     /// free notice slot, and the bounded watch for the grant. Driven from the
     /// park point (`App::tick_macos_access_card`); pure state.
     consent_card: consent_card::CardState,
+    /// The launch marker has arrived, but the access probe is still pending.
+    /// Outer None means no deferred decision; inner None means no marker file.
+    consent_card_pending_marker: Option<Option<consent_card::Marker>>,
     /// Where the card's marker lives — the `aterm.toml` whose directory
     /// holds it — resolved ONCE at construction. `None` on the headless /
     /// unit-test instance, so a test that presses the card can never write
@@ -12437,6 +12644,11 @@ struct App {
     /// Shared queue of control-socket `image` requests, drained on
     /// [`Wake::Control`] (the control thread cannot touch the renderer).
     image_queue: control::ImageQueue,
+    /// Owned control captures waiting for one surface's drawable completion.
+    /// Capacity is bounded; original cancellation/retention permits travel with it.
+    deferred_gpu_captures: std::collections::VecDeque<app_introspect::DeferredGpuCapture>,
+    replaying_gpu_capture: Option<WindowId>,
+    capture_present_budget: app_introspect::CapturePresentBudget,
     /// Bounded, non-blocking sender to the single PNG encode/write worker
     /// ([`app_introspect::EncodeJob`]), spawned lazily on the first
     /// `image`/`window` capture — a Retina-sized PNG deflate is a 50–150 ms
@@ -13293,8 +13505,8 @@ impl App {
     /// `consent_card::CardState`; this is the glue that touches `App`.
     ///
     /// * `Idle` → spawn the worker ONCE (identity warm-up + marker read, off
-    ///   this thread). The `[privacy]` switch is read here, once: a config that
-    ///   silences the card at launch silences it for the process.
+    ///   this thread). Current `[privacy]` switches gate every phase, including
+    ///   a card already on screen or waiting for another notice to leave.
     /// * `Due` → re-read the CACHED probe first (a grant made while the slot
     ///   was busy — from the Security page's own button, say — must not raise
     ///   a card that says otherwise), then raise the card the first time the
@@ -13312,6 +13524,49 @@ impl App {
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
+        if !self.consent_card.admit_current_policy(
+            self.config.privacy_probe_gate().permits(),
+            self.config.privacy_notice(),
+        ) {
+            self.consent_card_pending_marker = None;
+            if self
+                .notice
+                .as_ref()
+                .is_some_and(|n| n.is_macos_access_owned())
+            {
+                self.notice = None;
+                self.request_redraw_all_windows();
+            }
+            return;
+        }
+        if self.consent_card.expire_wait(now) {
+            self.consent_card_pending_marker = None;
+            return;
+        }
+        if self.consent_card.deciding_lapsed(now) {
+            self.consent_card_pending_marker = None;
+            if !self.consent_card.reopen_deciding() {
+                aterm_log::warn!(
+                    "macOS access card: no verdict arrived after {} attempts; not offered this launch",
+                    consent_card::DECIDE_ATTEMPTS
+                );
+            }
+        }
+        if self.consent_card.reoffer_due(now) {
+            aterm_log::info!(
+                "macOS access card: offered again — the last offer lifted away unanswered"
+            );
+        }
+        if matches!(
+            self.consent_card.phase(),
+            consent_card::CardPhase::Deciding { .. }
+        ) {
+            if let Some(marker) = self.consent_card_pending_marker.take() {
+                self.decide_macos_access_card(marker);
+            }
+        } else {
+            self.consent_card_pending_marker = None;
+        }
         match self.consent_card.phase() {
             consent_card::CardPhase::Idle => {
                 // NOT WHILE AN INCOMING HANDOFF IS UNCOMMITTED. Until Commit,
@@ -13323,10 +13578,6 @@ impl App {
                 // ARRIVES by updating itself, that is the common case, not a
                 // corner. Ask at the first park after Commit instead.
                 if self.incoming_handoff_pending {
-                    return;
-                }
-                if !(self.config.privacy_enabled() && self.config.privacy_notice()) {
-                    self.consent_card.settle();
                     return;
                 }
                 let Some(proxy) = self.proxy.clone() else {
@@ -13343,18 +13594,9 @@ impl App {
                     self.consent_card.settle();
                 }
             }
-            consent_card::CardPhase::Settled => {}
-            // A VERDICT THAT NEVER CAME. Deciding is not terminal: ask again,
-            // and say so once when the attempts are spent.
-            consent_card::CardPhase::Deciding { .. } => {
-                if self.consent_card.deciding_lapsed(now) && !self.consent_card.reopen_deciding() {
-                    aterm_log::warn!(
-                        "macOS access card: no verdict arrived after {} attempts; \
-                         not offered this launch",
-                        consent_card::DECIDE_ATTEMPTS
-                    );
-                }
-            }
+            // Retry/reoffer transitions happen before this match, so the same
+            // wake starts the next decision instead of stranding an Idle card.
+            consent_card::CardPhase::Settled | consent_card::CardPhase::Deciding { .. } => {}
             // The grant was observed while another card held the slot: the ✓
             // waits for the slot exactly as the card does, and gives up only
             // after its patience — leaving the `opened` marker for the next
@@ -13367,14 +13609,39 @@ impl App {
                     );
                     return;
                 }
+                let panel = self.consent_panel_facts();
+                if panel.probe == aterm_containment::consent::ProbeLabel::Pending {
+                    return;
+                }
+                if panel.fda != aterm_containment::consent::FdaState::Granted {
+                    self.consent_card.settle();
+                    return;
+                }
                 if self.show_macos_access_granted(now) {
                     self.clear_macos_access_opened_marker();
                     self.consent_card.settle();
                 }
             }
             consent_card::CardPhase::Due => {
-                if self.macos_access_probe_reads_granted() {
+                // No polling while another producer owns the slot. Its own
+                // expiry or another event lets us recheck access before raising.
+                if self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|n| !n.yields_to_disclosure(now))
+                {
+                    return;
+                }
+                let panel = self.consent_panel_facts();
+                if panel.fda == aterm_containment::consent::FdaState::Granted {
                     self.note_macos_access_granted(now);
+                    return;
+                }
+                if panel.probe == aterm_containment::consent::ProbeLabel::Pending {
+                    return;
+                }
+                if panel.fda != aterm_containment::consent::FdaState::Denied {
+                    self.consent_card.settle();
                     return;
                 }
                 if !self.consent_card.raise_allowed(now) {
@@ -13389,22 +13656,24 @@ impl App {
                     self.notice = Some(notice::TransientNotice::macos_access(now));
                     self.consent_card.on_raised(now);
                     aterm_log::info!(
-                        "macOS access card: offered (full disk access denied for this bundle)"
+                        "macOS access card: offered (current process access probe denied; Settings switch unknown)"
                     );
                     self.request_redraw_all_windows();
                 }
             }
             consent_card::CardPhase::Watching { .. } => {
+                // A newly observed grant wins over displacement: another tab's
+                // notice must not send this card back through its raise path.
+                if self.consent_card.wants_probe(now) && self.macos_access_probe_reads_granted() {
+                    self.note_macos_access_granted(now);
+                    return;
+                }
                 let ours_on_glass = self
                     .notice
                     .as_ref()
                     .is_some_and(|n| n.is_macos_access_owned());
                 if !ours_on_glass && self.consent_card.on_displaced(now) {
                     aterm_log::info!("macOS access card: displaced; waiting for the slot again");
-                    return;
-                }
-                if self.consent_card.wants_probe(now) && self.macos_access_probe_reads_granted() {
-                    self.note_macos_access_granted(now);
                 }
             }
         }
@@ -13416,15 +13685,72 @@ impl App {
         self.consent_panel_facts().fda == aterm_containment::consent::FdaState::Granted
     }
 
+    /// Keep the bounded grant watch alive even when every terminal is idle.
+    /// The cache supplies a future deadline; a pending worker is never joined.
+    fn next_macos_access_card_deadline(&self, now: Instant) -> Option<Instant> {
+        if !cfg!(target_os = "macos")
+            || self.headless
+            || !self.config.privacy_probe_gate().permits()
+            || !self.config.privacy_notice()
+            || self.consent_card.phase() == consent_card::CardPhase::Idle
+        {
+            return None;
+        }
+        let cap = self.consent_card.lifecycle_deadline();
+        if self.consent_card.phase() == consent_card::CardPhase::Settled {
+            return cap; // at most one daily reoffer, never a background probe
+        }
+        if self.consent_card.phase() == consent_card::CardPhase::Due
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|n| !n.yields_to_disclosure(now))
+        {
+            return cap;
+        }
+        match (cap, self.next_consent_probe_deadline(now)) {
+            (Some(cap), Some(refresh)) => Some(cap.min(refresh)),
+            (cap, refresh) => cap.or(refresh),
+        }
+    }
+
     /// The worker's facts arrived ([`Wake::MacosAccessCardDecided`]): decide
     /// on this thread, against the cached probe — the same state the Security
     /// page renders — and log every reason not to show, by name. A `Confirm`
     /// verdict (the owner opened Settings from an earlier process, and the
     /// grant is now held) shows the ✓ pill once and clears the marker.
     fn decide_macos_access_card(&mut self, marker: Option<consent_card::Marker>) {
+        if !self.consent_card.admit_current_policy(
+            self.config.privacy_probe_gate().permits(),
+            self.config.privacy_notice(),
+        ) {
+            self.consent_card_pending_marker = None;
+            return;
+        }
+        if !matches!(
+            self.consent_card.phase(),
+            consent_card::CardPhase::Deciding { .. }
+        ) {
+            return;
+        }
         let panel = self.consent_panel_facts();
+        if panel.probe == aterm_containment::consent::ProbeLabel::Pending
+            && self.config.privacy_probe_gate().permits()
+            && self.config.privacy_notice()
+            && !self.headless
+            && matches!(
+                self.consent_card.phase(),
+                consent_card::CardPhase::Deciding { .. }
+            )
+        {
+            // Cold/expired data is not a verdict. Retain the marker until the
+            // worker publishes, without issuing another filesystem operation.
+            self.consent_card_pending_marker = Some(marker);
+            return;
+        }
+        self.consent_card_pending_marker = None;
         let facts = consent_card::CardFacts {
-            offered: self.config.privacy_enabled() && self.config.privacy_notice(),
+            offered: self.config.privacy_probe_gate().permits() && self.config.privacy_notice(),
             headless: self.headless,
             fda: panel.fda,
             dr: panel.dr,
@@ -13548,8 +13874,24 @@ impl App {
             now,
         ));
         self.request_redraw_all_windows();
+        self.note_macos_access_settings_opened(now);
+    }
+
+    /// Shared completion of the card and Security-page Settings gestures.
+    /// An old cached grant cannot acknowledge a newly opened Settings pane;
+    /// the bounded worker must publish a fresh observation first.
+    pub(crate) fn note_macos_access_settings_opened(&mut self, now: Instant) {
         self.record_macos_access_marker(consent_card::Marker::Opened);
-        self.consent_card.on_opened_settings(now);
+        self.consent_card_pending_marker = None;
+        self.consent.invalidate();
+        if !self.headless
+            && self.consent_card.admit_current_policy(
+                self.config.privacy_probe_gate().permits(),
+                self.config.privacy_notice(),
+            )
+        {
+            self.consent_card.on_opened_settings(now);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -15413,8 +15755,12 @@ impl App {
             consent_attention: consent_observer::AttentionGate::new(),
             consent_observer_started: false,
             consent_card: consent_card::CardState::new(),
+            consent_card_pending_marker: None,
             consent_card_config: None,
             image_queue,
+            deferred_gpu_captures: std::collections::VecDeque::new(),
+            replaying_gpu_capture: None,
+            capture_present_budget: app_introspect::CapturePresentBudget::default(),
             encode_tx: None,
             trace_latency: false,
             lat_epoch: Instant::now(),
@@ -17986,14 +18332,7 @@ impl ApplicationHandler<Wake> for App {
         let app_frame_interval = self.frame_interval;
         for ws in self.windows.values_mut() {
             let pace_floor = ws.content_pace_floor(app_frame_interval);
-            let last_present_at = ws.last_present_at;
-            let due = service_due_presentation_clocks(
-                &mut ws.present_retry,
-                &mut ws.redraw_pending,
-                last_present_at,
-                pace_floor,
-                present_now,
-            );
+            let due = ws.service_presentation_clocks(pace_floor, present_now);
             if due && let Some(window) = ws.os_window.as_ref() {
                 window.request_redraw();
             }
@@ -18316,6 +18655,7 @@ impl ApplicationHandler<Wake> for App {
         // Park point: the loop finished this iteration and is about to sleep in the
         // OS event wait, so the watchdog's heartbeat legitimately freezes here.
         crate::watchdog::beat(crate::watchdog::Breadcrumb::AboutToWait);
+        self.prune_deferred_gpu_captures();
         // Windows end-session persistence: keep a fresh layout snapshot published
         // for the WM_QUERYENDSESSION wndproc chain (`platform_win`), which cannot
         // read `App` (it re-enters while `run_app` holds the `&mut` borrow) and so
@@ -18414,6 +18754,18 @@ impl ApplicationHandler<Wake> for App {
                 Instant::now(),
             );
         }
+        // THE macOS ACCESS POSTURE, published on the way to every wait. The
+        // Security page's whole point is to answer "what does aterm actually
+        // have, and what can I do about it", and its block exists only while a
+        // posture has been published into that view. Until now the only
+        // publishers were a native-view ACTION and the Smart-Titles health sync,
+        // so a Settings ▸ Security opened any other way (the control verb, a
+        // deep link, a restored tab) showed the six permission toggles and NO
+        // posture at all — measured on glass 2026-09-10, minutes after opening.
+        // `sync_settings_consent_posture` returns immediately unless that page
+        // is actually open, and the probe behind it is interval-cached, so the
+        // cost off that page is one iteration over the open native views.
+        self.sync_settings_consent_posture();
         // THE ROW COUNT CONVERGES ON THE WAY TO EVERY WAIT. A refused apply
         // retires the row it added without a sync of its own
         // (`retire_update_installing`), and its outcome may add none — so the
@@ -18659,6 +19011,12 @@ impl ApplicationHandler<Wake> for App {
             .rain
             .map(|c| Duration::from_millis(1000 / u64::from(c.fps)));
         let output_streak_idle_secs = self.config.output_streak_idle_secs_or_default();
+        let celebration_allowed = {
+            let glow = self.glow_config();
+            glow.enabled
+                && matches!(glow.style, crate::cursor_glow::GlowStyle::RainbowKitty)
+                && serious_policy.allows(crate::motion::SeriousEffect::CursorCat)
+        };
         let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
         // R4 (owner, 2026-09-08, twice): *"I don't like the blinking cursor"*.
         // THE RAINBOW OWNS THE CARET: whenever the `rainbow kitty` block body
@@ -18693,7 +19051,8 @@ impl ApplicationHandler<Wake> for App {
             if !serious_policy.allows(crate::motion::SeriousEffect::CursorGlow) {
                 ws.drain_serious_effects();
             }
-            let surface_attempt_allowed = ws.present_retry.present_attempt_allowed();
+            let surface_attempt_allowed =
+                !ws.gpu_acquire_pending() && ws.present_retry.present_attempt_allowed();
             if let Some(candidate) = ws.pending_reveal {
                 fold_owned_deadline(
                     &mut deadline,
@@ -18937,6 +19296,7 @@ impl ApplicationHandler<Wake> for App {
                 has_glass,
                 native_preview_recording_window == Some(*id),
                 output_streak_idle_secs,
+                celebration_allowed && surface_attempt_allowed,
             ) {
                 fold_owned_deadline(
                     &mut deadline,
@@ -19410,6 +19770,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::TitleSummary,
             );
         }
+        if let Some(wake) = self.next_macos_access_card_deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                wake,
+                metrics::DeadlineOwner::ConsentCard,
+            );
+        }
         // TAB SUBJECT & STATUS: a pane that stops printing owes a transition no
         // byte will ever trigger — a finished build must retire its busy dot
         // even though nothing writes to the PTY again. Sweep FIRST so the
@@ -19696,7 +20064,10 @@ impl ApplicationHandler<Wake> for App {
                 Wake::Ready { .. } | Wake::Output { .. } | Wake::Exit { .. } | Wake::Bell { .. }
             );
         if self.incoming_handoff_pending
-            && !matches!(&ev, Wake::ActivateCommittedHandoff { .. })
+            && !matches!(
+                &ev,
+                Wake::ActivateCommittedHandoff { .. } | Wake::GpuSurfaceReady { .. }
+            )
             && !committed_reader_wake
         {
             // Readerless incoming child is a painted candidate, not yet an
@@ -19885,6 +20256,13 @@ impl ApplicationHandler<Wake> for App {
                     // rate; sustained spew without input still coalesces). Paced by THIS
                     // window's monitor refresh when known.
                     ws.content_pending = true;
+                    if ws.gpu_acquire_pending() {
+                        // Coalesce new content into the demanded frame without
+                        // spending one futile OS redraw per PTY chunk. The ready
+                        // wake will recompose the latest terminal state.
+                        ws.redraw_pending = true;
+                        continue;
+                    }
                     // The typing bypass is HALF-INTERVAL bounded (touch-to-glass
                     // audit): unbounded input_hot presents outpace vsync under a
                     // TUI repaint storm, exhaust the FIFO drawable pool (Metal has
@@ -20311,6 +20689,55 @@ impl ApplicationHandler<Wake> for App {
             Wake::ConsentObserver => {
                 self.consent_observer.drain(Instant::now());
                 self.announce_observed_consent_prompts();
+            }
+            Wake::GpuSurfaceReady { window, surface } => {
+                let captures_waiting = self.has_deferred_gpu_capture(window);
+                let mut redraw_hidden = false;
+                let mut service_captures = false;
+                if let Some(ws) = self.windows.get_mut(&window) {
+                    let current = ws.current_gpu_acquire_id();
+                    let os_window = ws.os_window.clone();
+                    let deferred_reveal = ws.pending_reveal.is_some();
+                    let presentable = os_window.is_some()
+                        && ws.win_px.is_none_or(|size| size.width > 0 && size.height > 0)
+                        // Hidden handoff windows need their first submission
+                        // before reveal; an occlusion hint cannot block it.
+                        && matches!(ws.present.as_ref(), Some(PresentTarget::Gpu { window_gpu, .. }) if deferred_reveal || !window_gpu.occluded_hint());
+                    let accepted =
+                        ws.finish_gpu_acquire_wait(current, surface, presentable, || {
+                            if !deferred_reveal
+                                && !captures_waiting
+                                && let Some(window) = os_window
+                            {
+                                window.request_redraw();
+                            }
+                        });
+                    service_captures = accepted && presentable && captures_waiting;
+                    redraw_hidden = accepted && presentable && deferred_reveal;
+                    if accepted
+                        && !presentable
+                        && let Some(PresentTarget::Gpu { gpu_surface, .. }) = ws.present.as_mut()
+                    {
+                        gpu_surface.discard_pending_acquire();
+                    }
+                }
+                let capture_serviced =
+                    service_captures && self.resume_deferred_gpu_captures(window, surface);
+                if !capture_serviced && (redraw_hidden || service_captures) {
+                    // Hidden AppKit windows can suppress request_redraw. As in
+                    // resumed's handoff paint, consume this one completion
+                    // directly. Cancelled captures also leave a useful drawable.
+                    self.redraw_window(window);
+                }
+                self.prune_deferred_gpu_captures();
+            }
+            Wake::ConsentProbeReady => {
+                self.tick_macos_access_card(Instant::now());
+                // Card changes request their own repaint. Ordinary cached
+                // refreshes only need paint when the access panel is visible.
+                if self.native_settings_view_target().is_some() {
+                    self.request_redraw_all_windows();
+                }
             }
             // The access card's worker finished: decide, on this thread, against
             // the cached probe. Every reason NOT to show is logged by name so a
@@ -20906,6 +21333,34 @@ impl ApplicationHandler<Wake> for App {
                     .toolchain_failed("install failed — see Settings ▸ Packages", Instant::now());
                 self.sync_status_bars();
             }
+            // THE POSITIVE TERMINAL (2026-09-11). An announcement that ended well now
+            // has a row of its own, so the held "Installing…" card is retired by a
+            // statement instead of by the reader's guess at a silence. It claims no
+            // roster: the lanes that install a roster say so with `seed-installed:` /
+            // `net-installed:`, and this row exists for the ones that have none to name.
+            Wake::PkgSeedDone { detail } => {
+                aterm_log::info!("atpkg seed done: {detail}");
+                self.status_bars.toolchain_ended(&detail, Instant::now());
+                self.sync_status_bars();
+            }
+            // Exit 0, announced, and nothing on the disk. Neither "failed" (no failure
+            // was observed) nor a tick (no toolchain is there) — so it says exactly
+            // that, and points at the page that holds each program's reason.
+            // Another atpkg is doing this work. The log gets it; the screen does not.
+            // A warning a user cannot act on, about a condition that resolves itself
+            // seconds later, is worse than silence — and this one appeared on a
+            // machine whose toolchain was being installed correctly at that moment.
+            Wake::PkgSeedBusy { detail } => {
+                aterm_log::info!("atpkg stood aside: {detail}");
+            }
+            Wake::PkgSeedNothing { detail } => {
+                aterm_log::warn!("atpkg pass installed nothing: {detail}");
+                self.status_bars.toolchain_failed(
+                    "the pass finished without installing anything — see Settings ▸ Packages",
+                    Instant::now(),
+                );
+                self.sync_status_bars();
+            }
             Wake::PkgSeedUnusable { detail } => {
                 aterm_log::info!("atpkg seed unusable: {detail}");
                 self.status_bars.toolchain_failed(
@@ -21141,6 +21596,9 @@ impl ApplicationHandler<Wake> for App {
             Wake::RainControl { op, reply } => {
                 let _ = reply.send(self.rain_control(op));
             }
+            Wake::FxControl { op, reply } => {
+                let _ = reply.send(self.fx_control(op));
+            }
             Wake::StreakStatus { reply } => {
                 let _ = reply.send(self.streak_status());
             }
@@ -21152,6 +21610,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::TrailStatus { reply } => {
                 let _ = reply.send(self.trail_status());
+            }
+            Wake::TypingMomentum { session, reply } => {
+                let _ = reply.send(self.typing_momentum_of(session));
             }
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
@@ -21465,6 +21926,10 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::Moved(_) => self.refresh_frame_interval(wid),
             WindowEvent::Focused(f) => {
                 if f {
+                    if cfg!(target_os = "macos") && !self.headless {
+                        self.consent.invalidate();
+                        let _ = self.consent_panel_facts();
+                    }
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         let window = ws.os_window.clone();
                         let _ = rearm_present_and_request(&mut ws.present_retry, false, || {
@@ -22073,9 +22538,21 @@ fn read_pkg_progress_snapshot(
     layout: &atpkg::store::Layout,
     child_pid: u32,
     child_alive: bool,
+    since_unix: u64,
     probe: &mut ForeignProbe,
 ) -> Option<PkgProgressSnapshot> {
     let file = atpkg::progress::read_progress(layout)?;
+    // A PASS THAT ENDED BEFORE THIS CHILD EXISTED IS NOT THIS CHILD'S PASS. The file
+    // is rewritten (truncated) when a pass BEGINS, so until the child reaches
+    // `begin_pass` the bytes on disk describe the previous run — and a child that is
+    // refused at atpkg's dispatch edge (store-lock contention, an unwritable prefix)
+    // never reaches it at all, leaving the last good run's snapshot standing. The
+    // tailer then painted a finished, 100%, "all N installed" row out of a file that
+    // was, on the owner's machine, 27 hours old (2026-09-11). Staleness is knowable
+    // here — `ended_unix` is in the file — so it is checked rather than rendered.
+    if file.ended_unix.is_some_and(|ended| ended < since_unix) {
+        return None;
+    }
     let now_unix = pkg_unix_now();
     let running = pkg_progress_running(&file, child_pid, child_alive, now_unix, |pid| {
         probe.alive(&file, pid, now_unix)
@@ -22109,13 +22586,19 @@ impl PkgProgressTailer {
             .spawn(move || {
                 let mut probe = ForeignProbe::default();
                 let mut last_posted: Option<PkgProgressSnapshot> = None;
+                // The clock this tailer's freshness test is against, read BEFORE the
+                // first poll: anything the file says ended before now belongs to a
+                // pass that finished before this child was even spawned.
+                let since_unix = pkg_unix_now();
                 loop {
                     // Read the flag BEFORE the read, so the post-`finish` final
                     // iteration observes the child's exit: its snapshot is
                     // classified with `child_alive = false`, which is what retires
                     // a still-warm heartbeat from our own dead child truthfully.
                     let stopping = flag.load(Ordering::Acquire);
-                    match read_pkg_progress_snapshot(&layout, child_pid, !stopping, &mut probe) {
+                    match read_pkg_progress_snapshot(
+                        &layout, child_pid, !stopping, since_unix, &mut probe,
+                    ) {
                         Some(snap) => {
                             if last_posted.as_ref() != Some(&snap) {
                                 post(Some(Box::new(snap.clone())));
@@ -22329,19 +22812,61 @@ mod pkg_progress_tests {
         };
         let mut probe = ForeignProbe::default();
         assert!(
-            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            read_pkg_progress_snapshot(&layout, 1, true, 0, &mut probe).is_none(),
             "absent file reads as no data"
         );
         std::fs::write(layout.progress_file(), b"{not json").unwrap();
         assert!(
-            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            read_pkg_progress_snapshot(&layout, 1, true, 0, &mut probe).is_none(),
             "malformed reads as no data"
         );
         let oversized = " ".repeat(300 * 1024);
         std::fs::write(layout.progress_file(), oversized).unwrap();
         assert!(
-            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            read_pkg_progress_snapshot(&layout, 1, true, 0, &mut probe).is_none(),
             "oversized reads as no data — never partially parsed"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// THE STALE PASS. The owner's `progress.json` on 2026-09-11 described a clean,
+    /// complete, 2-of-2, 100% run — from the PREVIOUS DAY. That launch's atpkg child
+    /// was refused at the dispatch edge (store-lock contention) and never began a pass
+    /// of its own, so the file was never rewritten and the tailer read the old run's
+    /// bytes as if they were this child's. Painting them produced a finished, full
+    /// meter that the failure row then inherited: "install failed", at 100%.
+    ///
+    /// `ended_unix` makes the staleness KNOWABLE, so it is checked rather than
+    /// rendered.
+    #[test]
+    fn a_pass_that_ended_before_this_child_is_not_this_childs_pass() {
+        let prefix =
+            std::env::temp_dir().join(format!("aterm-pkg-progress-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        // The owner's file, in shape: a finished pass with its pid cleared.
+        std::fs::write(
+            layout.progress_file(),
+            br#"{"v":1,"pid":null,"pass":"net","started_unix":1789065336,
+                 "heartbeat_unix":1789065347,
+                 "overall":{"programs_done":2,"programs_total":2,
+                 "bytes_done":312816252,"bytes_total":312816252},
+                 "queue":[],"programs":{},"ended_unix":1789065347}"#,
+        )
+        .unwrap();
+        let mut probe = ForeignProbe::default();
+        // A tailer that started a day later must see nothing…
+        assert!(
+            read_pkg_progress_snapshot(&layout, 1, true, 1_789_161_957, &mut probe).is_none(),
+            "a pass that ended 27 hours ago is not this child's pass"
+        );
+        // …while the same file read by the tailer of the child that WROTE it still
+        // renders: the guard is about ordering, not about finished passes.
+        assert!(
+            read_pkg_progress_snapshot(&layout, 1, true, 1_789_065_000, &mut probe).is_some(),
+            "a pass that ended after this tailer began is this child's own"
         );
         let _ = std::fs::remove_dir_all(&prefix);
     }
@@ -22533,8 +23058,9 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // (`aterm_update_core::seal_guard`) — which guards a user-run
             // `atpkg seed` exactly like this spawn, and deleted the five
             // rounds of begin/note/end patches this block used to carry.
-            let mut saw_marker = false;
-            let mut saw_start = false;
+            // What the child's stdout said about the marker contract: whether it
+            // announced, and whether anything answered.
+            let mut seen = SeedMarkers::default();
             // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
             // dispatch edge — store-lock contention, an unwritable or symlinked
             // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
@@ -22592,25 +23118,14 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         })
                     });
                     if let Some(out) = child.stdout.take() {
-                        use std::io::BufRead as _;
-                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                            if let Some(event) = parse_seed_line(&line) {
-                                // ONLY A TERMINAL MARKER COUNTS. `seed-starting:` OPENS the
-                                // announcement; treating it as an answer meant a child that
-                                // died after printing it logged nothing and left the held
-                                // card up for its full 20 minutes — the two failures this
-                                // pair of fixes exists to prevent, defeated by their own
-                                // bookkeeping (2026-08-20 round-9 audit).
-                                if matches!(event, Wake::PkgSeedStarted { .. }) {
-                                    // The announcement was OPENED. Only then is there a
-                                    // held card that needs retiring below.
-                                    saw_start = true;
-                                } else {
-                                    saw_marker = true;
-                                }
-                                let _ = proxy.send_event(event);
-                            }
-                        }
+                        // ONLY A TERMINAL MARKER COUNTS (2026-08-20 round-9 audit), and
+                        // the rule now lives in ONE place both passes read:
+                        // `read_seed_markers`. The seed and update lanes carried two
+                        // byte-identical copies of this loop and one of them was fixed
+                        // twice without the other.
+                        seen = read_seed_markers(std::io::BufReader::new(out), |event| {
+                            let _ = proxy.send_event(event);
+                        });
                     }
                     drain.and_then(|h| h.join().ok()).unwrap_or_default()
                 });
@@ -22624,15 +23139,16 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // here (worker thread) and a `needs admin` set that "Not now" has not
                 // dismissed raises its one card.
                 post_admin_step(layout.as_ref(), &proxy);
-                // RETIRE ONLY A CARD THAT WAS ACTUALLY RAISED. `saw_start` is the
-                // whole condition: `atpkg seed` exits quietly and MARKERLESSLY on
-                // every ordinary launch of a provisioned Mac — the seal is reclaimed
-                // after the first success, so the steady state prints a plain
-                // sentence and exits 0 — and firing the failure event there put
-                // "⚠ ALab toolchain install failed" on screen at every single launch
-                // of a perfectly healthy machine. Same for a declined toolset, a
-                // disabled manager, and `seed_install = false`
-                // (2026-08-20 round-10 audit).
+                // RETIRE ONLY A CARD THAT WAS ACTUALLY RAISED. `atpkg seed` exits
+                // quietly and MARKERLESSLY on every ordinary launch of a provisioned
+                // Mac — the seal is reclaimed after the first success, so the steady
+                // state prints a plain sentence and exits 0 — and firing the failure
+                // event there put "⚠ ALab toolchain install failed" on screen at every
+                // single launch of a perfectly healthy machine. Same for a declined
+                // toolset, a disabled manager, and `seed_install = false`
+                // (2026-08-20 round-10 audit). That rule is now the FIRST line of
+                // `seed_retire`, where the update pass reads it too, and it is pinned
+                // by `the_quiet_steady_state_raises_nothing`.
                 let detail_of = |said: &str| {
                     if said.trim().is_empty() {
                         "atpkg ended without saying what happened".to_string()
@@ -22640,13 +23156,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         said.trim().to_string()
                     }
                 };
-                let announced = saw_start && !saw_marker;
-                if announced {
-                    // The announcement is held for 20 minutes and nothing else would
-                    // take it down, so answer it however the child ended.
-                    let _ = proxy.send_event(Wake::PkgSeedFailed {
-                        detail: detail_of(&said),
-                    });
+                // ANSWER THE ANNOUNCEMENT WITH THE CHILD'S OWN VERDICT, not with the
+                // fact that we failed to read one. `ok` was computed above and this
+                // branch ignored it: the comment said "answer it however the child
+                // ended" while the code sent `PkgSeedFailed` however it ended, and
+                // since the contract's markers were ALL failure markers, a pass that
+                // announced itself, did the work, succeeded and exited 0 was reported
+                // as "⚠ ALab toolchain install failed" (owner report, 2026-09-11).
+                // Both earlier audits are guards inside `seed_retire`, not here.
+                let verdict = seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
+                let announced = verdict != SeedRetire::Nothing;
+                if let Some(event) = seed_retire_event(verdict, &said) {
+                    let _ = proxy.send_event(event);
                 }
                 // The LOG is a different question from the pill: a non-zero exit with
                 // no marker is the CLI-edge refusal (store-lock contention, an
@@ -22656,7 +23177,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // The seed pass's stderr reaches the log whatever the exit
                 // (2026-09-10), like the update pass's below; the refusal
                 // branch keeps its own sentence.
-                if !(!ok && !saw_marker) && !said.trim().is_empty() {
+                if !(!ok && !seen.saw_terminal) && !said.trim().is_empty() {
                     let why: String = said.trim().chars().take(2000).collect();
                     if ok {
                         aterm_log::info!("atpkg seed said: {why}");
@@ -22664,7 +23185,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         aterm_log::warn!("atpkg seed said: {why}");
                     }
                 }
-                if !ok && !saw_marker {
+                if !ok && !seen.saw_terminal {
                     let why = said.trim();
                     aterm_log::warn!(
                         "the ALab toolchain install did not run: {}",
@@ -22768,8 +23289,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         // PkgSeedStarted arm), and a child that dies after
                         // opening it must still answer it — or the bar sits
                         // for its full hold with the failure recorded nowhere.
-                        let mut saw_start = false;
-                        let mut saw_marker = false;
+                        let mut seen = SeedMarkers::default();
                         // Concurrent stderr drain — the seed lane's rule, for
                         // the seed lane's reason (the two-pipe wedge).
                         let said = std::thread::scope(|scope| {
@@ -22782,19 +23302,9 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                 })
                             });
                             if let Some(out) = child.stdout.take() {
-                                use std::io::BufRead as _;
-                                for line in
-                                    std::io::BufReader::new(out).lines().map_while(Result::ok)
-                                {
-                                    if let Some(event) = parse_seed_line(&line) {
-                                        if matches!(event, Wake::PkgSeedStarted { .. }) {
-                                            saw_start = true;
-                                        } else {
-                                            saw_marker = true;
-                                        }
-                                        let _ = proxy.send_event(event);
-                                    }
-                                }
+                                seen = read_seed_markers(std::io::BufReader::new(out), |event| {
+                                    let _ = proxy.send_event(event);
+                                });
                             }
                             drain.and_then(|h| h.join().ok()).unwrap_or_default()
                         });
@@ -22807,14 +23317,19 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         // appear. Same rule, same marker: a set already declined
                         // raises nothing, and the six-hourly tick stays silent.
                         post_admin_step(layout.as_ref(), &proxy);
-                        if saw_start && !saw_marker {
-                            let _ = proxy.send_event(Wake::PkgSeedFailed {
-                                detail: if said.trim().is_empty() {
-                                    "atpkg ended without saying what happened".to_string()
-                                } else {
-                                    said.trim().to_string()
-                                },
-                            });
+                        // THE SAME DEFECT LIVED HERE TOO, verbatim: `atpkg update`'s
+                        // network set-completion announces `net-starting:` before it
+                        // moves gigabytes on an adopted machine, and `ok` was computed
+                        // two lines above and never consulted — an announced network
+                        // install that succeeded and exited 0 reported itself as a
+                        // failed install. This lane is the more exposed of the two:
+                        // `atpkg seed` runs once at launch, while this one runs every
+                        // six hours for the life of the process. Same seam, same guards
+                        // (2026-09-11).
+                        let verdict =
+                            seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
+                        if let Some(event) = seed_retire_event(verdict, &said) {
+                            let _ = proxy.send_event(event);
                         }
                         // A markerless non-zero exit is the CLI-edge refusal —
                         // the quiet steady state ("everything up to date",
@@ -22827,7 +23342,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         // the outcome atpkg recorded, so "did the check run,
                         // and when?" has an answer beside status.toml.
                         let why = said.trim();
-                        if !ok && !saw_marker {
+                        if !ok && !seen.saw_terminal {
                             aterm_log::warn!(
                                 "the ALab toolchain update pass did not run: {}",
                                 if why.is_empty() {
@@ -22956,7 +23471,7 @@ fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
     (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
 }
 
-/// The two R6 markers (2026-09-10), the stdout contract beside atpkg's nine
+/// The two R6 markers (2026-09-10), the stdout contract beside atpkg's eleven
 /// `seed-*`/`net-*` markers: `managed-current: <name> <version> (build <N>); …`
 /// lists every AGENT program installed AND at the index pin, and
 /// `machine-settings: <item>; …` lists only what a pass CHANGED per doctor
@@ -22985,6 +23500,154 @@ fn r6_marker_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
 /// in is the point: `seed-starting:` fires before the multi-GB extraction so the notice
 /// is on screen while it runs, and `seed-installed:`/`seed-pending:` land when it is
 /// done. Anything else the child prints is diagnostics for `status.toml`, not UI.
+/// Whether a parsed marker event is a TERMINAL ANSWER to an announcement.
+///
+/// ROUND 9 (2026-08-20) settled the rule this encodes: `seed-starting:` OPENS the
+/// held "Installing the ALab toolchain…" card and must never count as an answer,
+/// because a child that dies straight after printing it would then have "answered"
+/// and left the card up for its full 20-minute hold with the failure recorded
+/// nowhere.
+///
+/// The list is spelled out rather than written as `_ => true` for the other half of
+/// that rule. `managed-current:` and `machine-settings:` are INFORMATIONAL rows (R6,
+/// 2026-09-10): atpkg prints them at the end of every pass, announced or not, so a
+/// catch-all counted one as the answer to a card the pass had not finished with —
+/// round 9's rule read backwards. A marker variant added later is not an answer
+/// until it is named here.
+fn seed_event_is_terminal(event: &Wake) -> bool {
+    matches!(
+        event,
+        Wake::PkgSeed { .. }
+            | Wake::PkgSeedDone { .. }
+            | Wake::PkgSeedPartial { .. }
+            | Wake::PkgSeedFailed { .. }
+            | Wake::PkgSeedUnusable { .. }
+            // `seed-busy:` ends this pass as surely as any other terminal — it just
+            // ends it with "somebody else is doing it". It is printed at the dispatch
+            // edge, BEFORE any verb can announce, so it never leaves a card standing.
+            | Wake::PkgSeedBusy { .. }
+    )
+}
+
+/// What an `atpkg` child's stdout said about the marker contract: whether it OPENED
+/// an announcement, and whether anything ANSWERED it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SeedMarkers {
+    saw_start: bool,
+    saw_terminal: bool,
+}
+
+/// Read an `atpkg` child's stdout for the marker contract, posting each marker event
+/// as it arrives (the announcement must land WHILE the extraction runs, not after)
+/// and reporting what the stream contained.
+///
+/// Shared by the seed pass and the update pass because they had two byte-identical
+/// copies of this loop and one of them was fixed twice without the other.
+fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) -> SeedMarkers {
+    let mut seen = SeedMarkers::default();
+    for line in out.lines().map_while(Result::ok) {
+        if let Some(event) = parse_seed_line(&line) {
+            if matches!(event, Wake::PkgSeedStarted { .. }) {
+                // The announcement was OPENED. Only then is there a held card that
+                // needs retiring.
+                seen.saw_start = true;
+            } else if seed_event_is_terminal(&event) {
+                seen.saw_terminal = true;
+            }
+            post(event);
+        }
+    }
+    seen
+}
+
+/// How an announcement that reached no terminal marker must be retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedRetire {
+    /// Nothing to retire: no announcement was opened (ROUND 10), or a terminal
+    /// marker already answered it (ROUND 9).
+    Nothing,
+    /// The child exited NON-ZERO: a real failure, whatever it did or did not print.
+    Failed,
+    /// The child exited ZERO and the store holds programs.
+    Finished,
+    /// The child exited ZERO and the store is still empty.
+    FinishedEmpty,
+}
+
+/// THE VERDICT FOR AN ANNOUNCED PASS, from facts rather than from an absence.
+///
+/// THE DEFECT THIS REPLACES (2026-09-11). The old form was `saw_start && !saw_marker`
+/// ⇒ `PkgSeedFailed`, with the child's exit status computed one line above and never
+/// consulted. Its comment said "answer it however the child ended" while the code
+/// answered FAILED however it ended, and since every marker in the contract was a
+/// FAILURE marker, an announced pass that did the work, succeeded and exited 0 was
+/// reported to the user as "⚠ ALab toolchain install failed". That is the house
+/// defect class: a bound on what the code KNOWS ("I did not see a terminal line")
+/// returned as a fact about the world, in the negative ("the install failed").
+///
+/// BOTH EARLIER AUDITS SURVIVE, and they are the two guards on the way in:
+///
+/// * ROUND 9 — only a TERMINAL marker answers, so a child that dies after printing
+///   `seed-starting:` is still an unanswered announcement and still gets a verdict
+///   here (`Failed`, because its exit says so).
+/// * ROUND 10 — only a card that was actually RAISED is retired. `atpkg seed` exits
+///   quietly, markerlessly and ZERO on every launch of a provisioned Mac, and firing
+///   a failure there put the warning on screen at every launch of a healthy machine.
+///   No `saw_start`, no verdict, whatever the exit.
+///
+/// THE THIRD CASE, decided rather than left to fall into the nearest branch: exit 0,
+/// announced, markerless, and the store shows nothing installed. It is NOT `Failed` —
+/// the pass said it succeeded and we have no evidence against that beyond our own
+/// failure to read an answer. It is not a success either: the announcement PROMISED
+/// an install, and an empty store is a positive fact that the promise was not kept.
+/// So it gets its own words, which say what is true (nothing is installed) without
+/// claiming a failure nobody observed. The store is consulted precisely because it is
+/// the one POSITIVE authority available here; the marker stream's silence is not.
+fn seed_retire(seen: SeedMarkers, ok: bool, store_holds_programs: bool) -> SeedRetire {
+    if !seen.saw_start || seen.saw_terminal {
+        return SeedRetire::Nothing;
+    }
+    if !ok {
+        return SeedRetire::Failed;
+    }
+    if store_holds_programs {
+        SeedRetire::Finished
+    } else {
+        SeedRetire::FinishedEmpty
+    }
+}
+
+/// Whether the managed store holds any program at all — the positive authority
+/// [`seed_retire`] consults. No layout (no store configured) counts as "nothing
+/// held": a pass that announced an install into a store that does not exist has
+/// nothing to show for itself either.
+fn pkg_store_holds_programs(layout: Option<&atpkg::store::Layout>) -> bool {
+    layout.is_some_and(|l| !atpkg::active_builds(l).is_empty())
+}
+
+/// The event that retires an announcement, or `None` when nothing must be said.
+fn seed_retire_event(verdict: SeedRetire, said: &str) -> Option<Wake> {
+    let detail = if said.trim().is_empty() {
+        "atpkg ended without saying what happened".to_string()
+    } else {
+        said.trim().to_string()
+    };
+    match verdict {
+        SeedRetire::Nothing => None,
+        SeedRetire::Failed => Some(Wake::PkgSeedFailed { detail }),
+        // Exit 0 with a stocked store: the pass ended well. The sentence deliberately
+        // does NOT name a roster — this branch runs only when the pass printed no
+        // install list, so claiming one would fabricate exactly the kind of fact this
+        // whole change exists to stop.
+        SeedRetire::Finished => Some(Wake::PkgSeedDone {
+            detail: "the toolchain pass finished".to_string(),
+        }),
+        // Exit 0 and an empty store. Its own words: "failed" would assert a failure
+        // nobody saw, and a tick would assert a toolchain that is not there.
+        SeedRetire::FinishedEmpty => Some(Wake::PkgSeedNothing { detail }),
+    }
+}
+
 fn parse_seed_line(line: &str) -> Option<Wake> {
     // The prefixes come from atpkg itself, so a rename is a COMPILE error on both
     // sides. They used to be literals duplicated here, which made this contract's
@@ -23007,6 +23670,15 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     }
     if let Some(detail) = marked(atpkg::cli::SEED_UNUSABLE_MARKER) {
         return Some(Wake::PkgSeedUnusable { detail });
+    }
+    // THE POSITIVE TERMINAL. Every other marker here reports a problem, so a pass
+    // that ended well and installed no new roster printed nothing at all — and the
+    // caller below had to read that silence. It now has a line to read instead.
+    if let Some(detail) = marked(atpkg::cli::SEED_DONE_MARKER) {
+        return Some(Wake::PkgSeedDone { detail });
+    }
+    if let Some(detail) = marked(atpkg::cli::SEED_BUSY_MARKER) {
+        return Some(Wake::PkgSeedBusy { detail });
     }
     // The network lane's ANNOUNCEMENT and failure TERMINAL ride the seed
     // lane's card semantics — to the user they are the same events (an install
@@ -23152,6 +23824,210 @@ fn seed_pill_text(
         Some(Si::Prepared) | None => {
             format!("✓ ALab toolchain installed: {names} — open a new tab to use them")
         }
+    }
+}
+
+/// THE OWNER'S BANNER, 2026-09-11: "⚠ ALab toolchain install failed — see Settings ▸
+/// Packages" on a machine whose toolchain is fine.
+///
+/// Driven the way the brief asked: a REAL child that prints the announcement, does its
+/// (imaginary) work, prints no terminal marker and exits ZERO — the exact shape of a
+/// lane that announces and has no install roster to name. The old code computed the
+/// child's exit status one line above the branch and never consulted it, so every such
+/// pass was reported as a failed install.
+#[cfg(test)]
+mod seed_announcement_verdict_tests {
+    use super::{SeedMarkers, SeedRetire, Wake, read_seed_markers, seed_retire, seed_retire_event};
+
+    /// Run a real child under the marker loop and report what the stream said plus how
+    /// the child ended — the two inputs the verdict is built from.
+    fn drive(script: &str) -> (SeedMarkers, bool, Vec<Wake>) {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the fake atpkg child spawns");
+        let mut posted = Vec::new();
+        let seen = read_seed_markers(
+            std::io::BufReader::new(child.stdout.take().expect("piped stdout")),
+            |event| posted.push(event),
+        );
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        (seen, ok, posted)
+    }
+
+    /// THE PIN. Announced, worked, exited 0, printed no terminal marker — and the user
+    /// was told the install failed.
+    #[test]
+    fn an_announced_pass_that_exits_zero_is_not_a_failure() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: seed-starting: installing 2 ALab program(s) from the bundled \
+             registry (~4.1 GiB on disk when finished)'; exit 0",
+        );
+        assert!(seen.saw_start, "the announcement must be seen");
+        assert!(!seen.saw_terminal, "this child prints no terminal marker");
+        assert!(ok, "the child exited 0");
+        assert!(
+            matches!(posted.as_slice(), [Wake::PkgSeedStarted { .. }]),
+            "the stream itself raises only the announcement: {posted:?}"
+        );
+        // The store is stocked — this machine's toolchain is fine, which is the whole
+        // point of the owner's report.
+        let verdict = seed_retire(seen, ok, true);
+        assert_eq!(
+            verdict,
+            SeedRetire::Finished,
+            "an announced pass that exited ZERO over a stocked store did not fail"
+        );
+        assert!(
+            !matches!(
+                seed_retire_event(verdict, ""),
+                Some(Wake::PkgSeedFailed { .. })
+            ),
+            "the banner must not say the install failed"
+        );
+    }
+
+    /// ROUND 9 (2026-08-20) SURVIVES: a child that dies straight after announcing has
+    /// NOT answered its announcement, and its non-zero exit is what names the outcome.
+    #[test]
+    fn a_child_that_dies_after_announcing_still_reports_a_failure() {
+        let (seen, ok, _) =
+            drive("echo 'atpkg: seed-starting: installing 9 ALab program(s)'; exit 7");
+        assert!(seen.saw_start && !seen.saw_terminal);
+        assert!(!ok);
+        assert_eq!(seed_retire(seen, ok, true), SeedRetire::Failed);
+        assert!(matches!(
+            seed_retire_event(seed_retire(seen, ok, true), "atpkg: the store lock is held"),
+            Some(Wake::PkgSeedFailed { .. })
+        ));
+    }
+
+    /// ROUND 10 (2026-08-20) SURVIVES, and this is the regression the owner would
+    /// notice first: the STEADY STATE. A provisioned Mac's `atpkg seed` prints a plain
+    /// sentence, announces nothing and exits 0 — and nothing may go on screen.
+    #[test]
+    fn the_quiet_steady_state_raises_nothing() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: the store already holds the ALab toolset — nothing to seed'; exit 0",
+        );
+        assert!(!seen.saw_start && !seen.saw_terminal);
+        assert!(ok);
+        assert!(
+            posted.is_empty(),
+            "a plain sentence is not a marker: {posted:?}"
+        );
+        for stocked in [true, false] {
+            assert_eq!(
+                seed_retire(seen, ok, stocked),
+                SeedRetire::Nothing,
+                "no announcement, no card — whatever the store holds"
+            );
+            assert!(seed_retire_event(seed_retire(seen, ok, stocked), "").is_none());
+        }
+    }
+
+    /// A pass that announced AND answered is already retired by its own marker; the
+    /// verdict must add nothing, or the card would be answered twice.
+    #[test]
+    fn a_terminal_marker_answers_the_announcement_by_itself() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: net-starting: installing 2 program(s) over the network: claude, codex'; \
+             echo 'atpkg: net-installed: claude, codex'; exit 0",
+        );
+        assert!(seen.saw_start && seen.saw_terminal);
+        assert!(ok);
+        assert_eq!(posted.len(), 2, "{posted:?}");
+        assert_eq!(seed_retire(seen, ok, true), SeedRetire::Nothing);
+    }
+
+    /// THE POSITIVE TERMINAL, end to end: atpkg's `seed-done:` line retires the
+    /// announcement on its own, so the GUI never reaches the inference at all.
+    #[test]
+    fn the_positive_terminal_answers_the_announcement() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: seed-starting: installing 2 ALab program(s)'; \
+             echo 'atpkg: seed-done: the pass finished; 12 ALab program(s) are installed'; exit 0",
+        );
+        assert!(seen.saw_start, "the announcement opened");
+        assert!(
+            seen.saw_terminal,
+            "`seed-done:` is a TERMINAL — the absence the GUI used to read is gone"
+        );
+        assert!(matches!(
+            posted.as_slice(),
+            [Wake::PkgSeedStarted { .. }, Wake::PkgSeedDone { .. }]
+        ));
+        assert_eq!(seed_retire(seen, ok, true), SeedRetire::Nothing);
+    }
+
+    /// THE R6 ROWS ARE NOT ANSWERS. `managed-current:` / `machine-settings:` are printed
+    /// at the end of every pass, announced or not — counting one as a terminal let an
+    /// informational row retire a card the pass had not finished with, which is round
+    /// 9's rule read backwards. The announcement stays open and the EXIT decides.
+    #[test]
+    fn an_informational_row_does_not_answer_an_announcement() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: net-starting: installing 2 program(s) over the network: claude, codex'; \
+             echo 'atpkg: managed-current: claude 2.1.267 (build 2026091001)'; exit 0",
+        );
+        assert!(seen.saw_start);
+        assert!(
+            !seen.saw_terminal,
+            "an R6 row says what the machine HAS, not how the pass ended"
+        );
+        assert_eq!(posted.len(), 2, "{posted:?}");
+        assert_eq!(seed_retire(seen, ok, true), SeedRetire::Finished);
+    }
+
+    /// THE REFUSAL THE OWNER ACTUALLY SAW. Two aterm processes launched sixteen
+    /// seconds apart; the second one's children lost the store lock to the first
+    /// one's, exited non-zero and printed nothing, and the refusal branch put
+    /// "⚠ ALab toolchain install failed" on screen while the install was RUNNING in
+    /// the other process. `seed-busy:` is that pass saying it stood aside.
+    #[test]
+    fn a_contended_pass_is_not_a_failed_install() {
+        let (seen, ok, posted) = drive(
+            "echo 'atpkg: seed-busy: another atpkg process holds the store lock \
+             — that pass is doing this work and this one stood aside'; exit 1",
+        );
+        assert!(!ok, "the contended child still exits non-zero");
+        assert!(
+            seen.saw_terminal,
+            "`seed-busy:` ENDS the pass — and it is the flag the refusal branch reads"
+        );
+        assert!(
+            matches!(posted.as_slice(), [Wake::PkgSeedBusy { .. }]),
+            "{posted:?}"
+        );
+        // The refusal branch's own condition, verbatim from both lanes: with a
+        // terminal seen it does not fire, so no card is raised.
+        assert!(
+            !(!ok && !seen.saw_terminal),
+            "a contended pass must not reach the refusal card"
+        );
+        // …while a refusal with NO marker — an unwritable prefix, a bundle whose
+        // atpkg cannot exec — still does. That branch is not being weakened.
+        let (bare, bare_ok, _) = drive("echo 'atpkg: the prefix is not writable' >&2; exit 1");
+        assert!(
+            !bare_ok && !bare.saw_terminal,
+            "a real refusal still reaches the card"
+        );
+    }
+
+    /// THE THIRD CASE, decided rather than defaulted: exit 0, announced, markerless,
+    /// and nothing on the disk. Not a failure (none was observed) and not a success
+    /// (there is no toolchain) — its own words.
+    #[test]
+    fn an_announced_pass_that_installs_nothing_says_so() {
+        let (seen, ok, _) = drive("echo 'atpkg: net-starting: installing 2 program(s)'; exit 0");
+        assert_eq!(seed_retire(seen, ok, false), SeedRetire::FinishedEmpty);
+        assert!(matches!(
+            seed_retire_event(SeedRetire::FinishedEmpty, ""),
+            Some(Wake::PkgSeedNothing { .. })
+        ));
     }
 }
 
@@ -25657,12 +26533,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         consent_attention: consent_observer::AttentionGate::new(),
         consent_observer_started: false,
         consent_card: consent_card::CardState::new(),
+        consent_card_pending_marker: None,
         consent_card_config: if headless {
             None
         } else {
             app_config::config_path()
         },
         image_queue,
+        deferred_gpu_captures: std::collections::VecDeque::new(),
+        replaying_gpu_capture: None,
+        capture_present_budget: app_introspect::CapturePresentBudget::default(),
         // The PNG encode worker is spawned on the first `image`/`window` capture.
         encode_tx: None,
         trace_latency,
@@ -25798,6 +26678,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // `ApplicationHandler` roots call `watchdog::beat` so a future wedge is pinned to
     // a named main-loop root even in a stripped release.
     watchdog::start();
+    let consent_proxy = proxy.clone();
+    app.consent.set_completion_wake(Arc::new(move || {
+        let _ = consent_proxy.send_event(Wake::ConsentProbeReady);
+    }));
     metrics::mark_gui_ready_for_winit();
     event_loop.run_app(&mut app).expect("run");
     // The control listener can outlive the event loop through the remaining
@@ -27299,6 +28183,12 @@ mod overlap_handoff_tests {
         let windowed = || {
             let mut app = App::headless_for_test();
             app.headless = false;
+            app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+                aterm_containment::consent::FdaProbe {
+                    state: aterm_containment::consent::FdaState::Denied,
+                    label: aterm_containment::consent::ProbeLabel::OpenEperm,
+                },
+            );
             app
         };
         let raised = |app: &mut App, now: Instant| {
@@ -27470,6 +28360,12 @@ mod overlap_handoff_tests {
         raised(&mut app, t0);
         app.notice = Some(TransientNotice::admin_step(vec!["clt".to_string()], t0));
         let t1 = t0 + Duration::from_secs(30);
+        app.consent = crate::control_privacy::ConsentState::with_cached_probe_for_test(
+            aterm_containment::consent::FdaProbe {
+                state: aterm_containment::consent::FdaState::Granted,
+                label: aterm_containment::consent::ProbeLabel::OpenOk,
+            },
+        );
         app.note_macos_access_granted(t1);
         assert_eq!(
             app.consent_card.phase(),
@@ -27496,6 +28392,49 @@ mod overlap_handoff_tests {
         app.tick_macos_access_card(t1 + super::consent_card::WATCH_FOR);
         assert_eq!(app.consent_card.phase(), CardPhase::Settled);
         assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
+    }
+
+    /// Disabling notices from any tab retracts the shared access card,
+    /// including a queued or displaced one. Other producers keep their slot.
+    #[test]
+    fn macos_access_card_honors_live_policy_without_dismissing_other_notices() {
+        use super::consent_card::{CardPhase, Verdict};
+        use super::notice::TransientNotice;
+        use std::time::Instant;
+
+        let now = Instant::now();
+        for master_off in [false, true] {
+            for raised in [false, true] {
+                for other_notice in [false, true] {
+                    let mut app = App::headless_for_test();
+                    app.headless = false; // probes and gestures stay inert
+                    assert!(app.consent_card.begin_deciding(now));
+                    assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+                    if raised {
+                        app.consent_card.on_raised(now);
+                        app.notice = Some(TransientNotice::macos_access(now));
+                    }
+                    if other_notice {
+                        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+                    }
+                    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+                        enabled: Some(!master_off),
+                        notice: Some(master_off),
+                        ..Default::default()
+                    });
+                    app.tick_macos_access_card(now);
+                    assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+                    assert_eq!(app.notice.is_some(), other_notice);
+                    if other_notice {
+                        assert!(app.notice.as_ref().unwrap().admin_step_names().is_some());
+                    }
+                    // A delayed worker cannot resurrect an opted-out card.
+                    app.decide_macos_access_card(None);
+                    assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+                    assert_eq!(app.notice.is_some(), other_notice);
+                }
+            }
+        }
     }
 
     /// THE OBSERVER SHIPS OFF (design §3.6). A headless instance with the
@@ -31997,6 +32936,7 @@ mod present_retry_tests {
 
         assert!(
             !service_due_presentation_clocks(
+                false,
                 &mut retry,
                 &mut pending,
                 Some(presented),
@@ -32010,6 +32950,7 @@ mod present_retry_tests {
         // The production caller invokes this transition before inspecting
         // StartCause, so this is the WaitCancelled/proxy-pressure path too.
         assert!(service_due_presentation_clocks(
+            false,
             &mut retry,
             &mut pending,
             Some(presented),
@@ -32029,6 +32970,7 @@ mod present_retry_tests {
         let mut pending = false;
 
         assert!(service_due_presentation_clocks(
+            false,
             &mut retry,
             &mut pending,
             None,
@@ -32930,7 +33872,7 @@ mod early_out_tests {
     /// observe the damage epoch, the selection, and the supplied visual-only
     /// state. Returns the key; the caller decides whether to "present" (which in
     /// `redraw()` consumes the damage via `take_damage`).
-    fn frame_key(
+    pub(super) fn frame_key(
         term: &mut Terminal,
         blink_phase: bool,
         invert: bool,
@@ -37893,7 +38835,7 @@ mod spec_xref_gate {
         // ConsoleLifeEpisode and ConsoleResidentHandoff add two distinct
         // machines; the uniqueness assertion above must remain before this pin.
         assert_eq!(
-            total, 151,
+            total, 152,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -43107,5 +44049,613 @@ pub fn run_ship(rest: &[String]) -> i32 {
             crate::logging::stderr_line!("aterm ship: could not run {}: {e}", tool.display());
             1
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_access_refresh_tests {
+    use super::App;
+    use super::consent_card::{CardPhase, GRANTED_CAPTION, Marker, Verdict, WATCH_FOR};
+    use super::control_privacy::ConsentState;
+    use super::notice::TransientNotice;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    use std::time::{Duration, Instant};
+
+    /// Real App/card glue with synthetic published observations. The cache's
+    /// own concurrent publication and invalidation are checked in
+    /// control_privacy; these fixtures can never invoke a live OS probe.
+    fn windowed(probe: FdaProbe) -> App {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.consent = ConsentState::with_cached_probe_for_test(probe);
+        app
+    }
+
+    fn granted() -> FdaProbe {
+        FdaProbe {
+            state: FdaState::Granted,
+            label: ProbeLabel::OpenOk,
+        }
+    }
+
+    fn denied() -> FdaProbe {
+        FdaProbe {
+            state: FdaState::Denied,
+            label: ProbeLabel::OpenEperm,
+        }
+    }
+
+    #[test]
+    fn pending_launch_retains_the_opened_marker_until_access_is_observed() {
+        let now = Instant::now();
+        let mut app = windowed(FdaProbe::refused(ProbeLabel::Pending));
+        assert!(app.consent_card.begin_deciding(now));
+        app.decide_macos_access_card(Some(Marker::Opened));
+        assert_eq!(app.consent_card.phase(), CardPhase::Deciding { since: now });
+        assert_eq!(app.consent_card_pending_marker, Some(Some(Marker::Opened)));
+        assert!(
+            app.notice.is_none(),
+            "pending is neither an offer nor a confirmation"
+        );
+
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card_pending_marker, Some(Some(Marker::Opened)));
+        assert!(app.notice.is_none());
+        app.consent = ConsentState::with_cached_probe_for_test(granted());
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card_pending_marker, None);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        assert_eq!(app.next_macos_access_card_deadline(now), None);
+    }
+
+    #[test]
+    fn pending_and_withdrawn_access_never_publish_an_old_confirmation() {
+        let now = Instant::now();
+        let mut app = windowed(granted());
+        assert!(app.consent_card.begin_deciding(now));
+        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+        app.consent_card.on_raised(now);
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+        app.tick_macos_access_card(now);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Confirming { since: now }
+        );
+        assert!(app.notice.as_ref().unwrap().is_admin_step());
+
+        app.consent =
+            ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::Pending));
+        app.notice = None;
+        app.tick_macos_access_card(now);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Confirming { since: now }
+        );
+        assert!(
+            app.notice.is_none(),
+            "expired evidence cannot confirm access"
+        );
+
+        app.consent = ConsentState::with_cached_probe_for_test(denied());
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(
+            app.notice.is_none(),
+            "a withdrawn grant cannot become a success pill"
+        );
+    }
+
+    #[test]
+    fn a_queued_card_waits_for_pending_access_and_retires_an_unknown_result() {
+        let now = Instant::now();
+        let mut app = windowed(FdaProbe::refused(ProbeLabel::Pending));
+        assert!(app.consent_card.begin_deciding(now));
+        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Due);
+        assert!(app.notice.as_ref().unwrap().is_admin_step());
+
+        app.consent =
+            ConsentState::with_cached_probe_for_test(FdaProbe::refused(ProbeLabel::RefusedNoHome));
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Due);
+        assert!(
+            app.notice.as_ref().unwrap().is_admin_step(),
+            "another notice keeps its slot"
+        );
+        app.notice = None;
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(
+            app.notice.is_none(),
+            "unknown access cannot raise the waiting card"
+        );
+    }
+
+    #[test]
+    fn disabling_checks_clears_a_pending_answer_and_its_shared_route() {
+        let now = Instant::now();
+        let mut app = windowed(FdaProbe::refused(ProbeLabel::Pending));
+        assert!(app.consent_card.begin_deciding(now));
+        app.decide_macos_access_card(Some(Marker::Opened));
+        app.notice = Some(TransientNotice::macos_access_route(
+            "route".into(),
+            Duration::from_secs(90),
+            now,
+        ));
+        app.config.privacy = Some(super::app_config::PrivacyConfig {
+            check: Some(false),
+            ..Default::default()
+        });
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card_pending_marker, None);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+        app.decide_macos_access_card(Some(Marker::Opened));
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+        assert_eq!(app.next_macos_access_card_deadline(now), None);
+    }
+
+    #[test]
+    fn refresh_deadlines_are_future_only_and_stop_when_the_watch_settles() {
+        let mut app = windowed(denied());
+        let now = Instant::now();
+        assert!(app.consent_card.begin_deciding(now));
+        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+        app.consent_card.on_raised(now);
+        app.notice = Some(TransientNotice::macos_access(now));
+        for interval in [0, 250, 5000] {
+            app.config.privacy = Some(super::app_config::PrivacyConfig {
+                probe_interval_ms: Some(interval),
+                ..Default::default()
+            });
+            for elapsed in [Duration::ZERO, Duration::from_secs(20)] {
+                let sample = now + elapsed;
+                let deadline = app
+                    .next_macos_access_card_deadline(sample)
+                    .expect("active watch wakes");
+                assert!(
+                    deadline > sample,
+                    "a stale entry must not schedule a past deadline"
+                );
+                assert!(deadline <= sample + Duration::from_secs(5));
+            }
+        }
+        app.tick_macos_access_card(now + WATCH_FOR);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(
+            app.next_macos_access_card_deadline(now + WATCH_FOR),
+            Some(now + WATCH_FOR + super::consent_card::REOFFER_AFTER),
+            "the expired unanswered offer gets one daily return, no probe cadence"
+        );
+    }
+
+    #[test]
+    fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
+        let now = Instant::now();
+        let mut app = windowed(granted());
+        app.consent_card.settle();
+        app.consent_card_pending_marker = Some(Some(Marker::Opened));
+        app.note_macos_access_settings_opened(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });
+        assert_eq!(app.consent_card_pending_marker, None);
+        assert_ne!(
+            app.consent_panel_facts().fda,
+            FdaState::Granted,
+            "the prior cached grant cannot acknowledge the new Settings gesture"
+        );
+        assert!(app.next_macos_access_card_deadline(now).is_some());
+        // Publish a fresh observation through the cache's real reader seam.
+        app.consent = ConsentState::with_cached_probe_for_test(granted());
+        app.tick_macos_access_card(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.notice.as_ref().unwrap().text(), GRANTED_CAPTION);
+        assert_eq!(app.next_macos_access_card_deadline(now), None);
+
+        // The same explicit door still respects the current notice switch.
+        app.config.privacy = Some(super::app_config::PrivacyConfig {
+            notice: Some(false),
+            ..Default::default()
+        });
+        app.note_macos_access_settings_opened(now);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.next_macos_access_card_deadline(now), None);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_access_lifetime_tests {
+    use super::App;
+    use super::consent_card::{CardPhase, Marker, SLOT_WAIT_FOR, Verdict, WATCH_FOR};
+    use super::control_privacy::ConsentState;
+    use super::notice::TransientNotice;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    use std::time::{Duration, Instant};
+
+    fn windowed(probe: FdaProbe) -> App {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.consent = ConsentState::with_cached_probe_for_test(probe);
+        app
+    }
+
+    #[test]
+    fn occupied_notice_slot_schedules_only_the_first_offer_expiry() {
+        let now = Instant::now();
+        let mut app = windowed(FdaProbe {
+            state: FdaState::Denied,
+            label: ProbeLabel::OpenEperm,
+        });
+        assert!(app.consent_card.begin_deciding(now));
+        assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+        app.notice = Some(TransientNotice::admin_step(vec!["clt".into()], now));
+        for elapsed in [Duration::ZERO, Duration::from_secs(60)] {
+            let sample = now + elapsed;
+            app.tick_macos_access_card(sample);
+            assert_eq!(app.consent_card.phase(), CardPhase::Due);
+            assert!(app.notice.as_ref().unwrap().is_admin_step());
+            assert_eq!(
+                app.next_macos_access_card_deadline(sample),
+                Some(now + SLOT_WAIT_FOR),
+                "an occupied slot does not schedule periodic access probes"
+            );
+        }
+        // Even if the slot becomes free at this event, the expired offer gets
+        // no fresh lifetime. The next process may offer it again.
+        app.notice = None;
+        app.tick_macos_access_card(now + SLOT_WAIT_FOR);
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert!(app.notice.is_none());
+        assert_eq!(
+            app.next_macos_access_card_deadline(now + SLOT_WAIT_FOR),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_access_cannot_extend_any_waiting_phase() {
+        let now = Instant::now();
+        for phase in ["due", "watching", "confirming"] {
+            let mut app = windowed(FdaProbe::pending());
+            assert!(app.consent_card.begin_deciding(now));
+            assert!(app.consent_card.on_decided(&Verdict::Offer, now));
+            let cap = match phase {
+                "due" => SLOT_WAIT_FOR,
+                "watching" => {
+                    app.consent_card.on_raised(now);
+                    WATCH_FOR
+                }
+                "confirming" => {
+                    app.consent_card.on_grant_awaiting_slot(now);
+                    WATCH_FOR
+                }
+                _ => unreachable!(),
+            };
+            app.tick_macos_access_card(now + cap);
+            assert_eq!(app.consent_card.phase(), CardPhase::Settled, "{phase}");
+            assert!(
+                app.notice.is_none(),
+                "an expired phase cannot offer or confirm"
+            );
+            assert_eq!(
+                app.next_macos_access_card_deadline(now + cap),
+                (phase == "watching").then_some(now + cap + super::consent_card::REOFFER_AFTER),
+                "only a previously shown unanswered offer returns"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_out_initial_probe_drops_its_deferred_marker_before_retry() {
+        let now = Instant::now();
+        let mut app = windowed(FdaProbe::pending());
+        assert!(app.consent_card.begin_deciding(now));
+        app.decide_macos_access_card(Some(Marker::Opened));
+        assert_eq!(app.consent_card_pending_marker, Some(Some(Marker::Opened)));
+        let deadline = app.consent_card.lifecycle_deadline().unwrap();
+        assert!(app.next_macos_access_card_deadline(now).unwrap() <= deadline);
+        app.tick_macos_access_card(deadline);
+        assert_eq!(
+            app.consent_card.phase(),
+            CardPhase::Settled,
+            "the retry starts on this wake and settles because this fixture has no worker proxy"
+        );
+        assert_eq!(app.consent_card_pending_marker, None);
+        assert!(app.notice.is_none());
+        // A worker from the expired attempt cannot turn the retained marker
+        // into a success pill while no decision is active.
+        app.consent = ConsentState::with_cached_probe_for_test(FdaProbe {
+            state: FdaState::Granted,
+            label: ProbeLabel::OpenOk,
+        });
+        app.decide_macos_access_card(Some(Marker::Opened));
+        assert_eq!(app.consent_card.phase(), CardPhase::Settled);
+        assert_eq!(app.consent_card_pending_marker, None);
+        assert!(app.notice.is_none());
+    }
+}
+
+#[cfg(test)]
+mod gpu_acquire_wait_tests {
+    use super::{App, GpuAcquireWait, PresentRetry, WindowId, service_due_presentation_clocks};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::{Duration, Instant};
+
+    fn acquire_wait_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            GpuAcquireWaitIdentity {
+                const Buggy = 0;
+                var current = 1;
+                var pending = 0;
+                var requested = 0;
+                var matching = 0;
+                action Begin when (current > 0) {
+                    pending = current;
+                    requested = 0;
+                    matching = 0;
+                }
+                action Replace {
+                    current = if current == 1 { 2 } else { 1 };
+                    requested = 0;
+                    matching = 0;
+                }
+                action Cpu {
+                    current = 0;
+                    requested = 0;
+                    matching = 0;
+                }
+                action ReadyFirst {
+                    matching = if current == 1 && pending == 1 { 1 } else { 0 };
+                    requested = if Buggy == 1 { 1 } else {
+                        if current == 1 && pending == 1 { 1 } else { 0 }
+                    };
+                    pending = if Buggy == 1 || (current == 1 && pending == 1) { 0 } else { pending };
+                }
+                action ReadySecond {
+                    matching = if current == 2 && pending == 2 { 1 } else { 0 };
+                    requested = if Buggy == 1 { 1 } else {
+                        if current == 2 && pending == 2 { 1 } else { 0 }
+                    };
+                    pending = if Buggy == 1 || (current == 2 && pending == 2) { 0 } else { pending };
+                }
+                invariant Bounds: current <= 2 && pending <= 2 && requested <= 1 && matching <= 1;
+                invariant OnlyMatchingDemandWakes: requested <= matching;
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_acquire_wait_model_proves_and_catches_stale_completion() {
+        let model = acquire_wait_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn gpu_acquire_wait_real_transitions_conform_exhaustively() {
+        let model = acquire_wait_model();
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![model.init_state()];
+        let mut checked = 0;
+        while let Some(before) = todo.pop() {
+            if !seen.insert(before.clone()) {
+                continue;
+            }
+            for action in ["Begin", "Replace", "Cpu", "ReadyFirst", "ReadySecond"] {
+                if !model.action_enabled(action, &before) {
+                    continue;
+                }
+                let mut current = u64::try_from(before["current"]).unwrap();
+                let pending = u64::try_from(before["pending"]).unwrap();
+                let mut real = GpuAcquireWait {
+                    pending_surface: (pending > 0).then_some(pending),
+                };
+                let mut requested = false;
+                let mut matching = false;
+                match action {
+                    "Begin" => real.begin(current),
+                    "Replace" => current = if current == 1 { 2 } else { 1 },
+                    "Cpu" => current = 0,
+                    "ReadyFirst" | "ReadySecond" => {
+                        let reported = if action == "ReadyFirst" { 1 } else { 2 };
+                        matching = current == reported && pending == reported;
+                        requested = real.complete((current > 0).then_some(current), reported);
+                    }
+                    _ => unreachable!(),
+                }
+                let after: BTreeMap<_, _> = [
+                    ("current", i64::try_from(current).unwrap()),
+                    (
+                        "pending",
+                        i64::try_from(real.pending_surface.unwrap_or(0)).unwrap(),
+                    ),
+                    ("requested", i64::from(requested)),
+                    ("matching", i64::from(matching)),
+                ]
+                .into_iter()
+                .collect();
+                assert!(
+                    model.successors(action, &before).contains(&after),
+                    "{action}: {before:?} -> {after:?}"
+                );
+                assert!(model.check_invariant("OnlyMatchingDemandWakes", &after));
+                todo.push(after);
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 50,
+            "exercise every reachable identity/ready combination"
+        );
+        let mut stale = model.init_state();
+        stale.insert("requested", 1);
+        assert!(
+            !model.check_invariant("OnlyMatchingDemandWakes", &stale),
+            "negative control: an unsolicited wake must fail"
+        );
+    }
+
+    #[test]
+    fn gpu_acquire_pending_preserves_dirty_levels_without_timer_retries() {
+        let now = Instant::now();
+        let floor = Duration::from_millis(8);
+        let mut retry = PresentRetry::default();
+        let mut dirty = true;
+        let mut acquire = GpuAcquireWait::default();
+        acquire.begin(17);
+        for step in 1..=100 {
+            acquire.begin(17);
+            assert!(!service_due_presentation_clocks(
+                acquire.waiting_for(Some(17)),
+                &mut retry,
+                &mut dirty,
+                Some(now),
+                floor,
+                now + floor * step,
+            ));
+            assert!(dirty, "a pending acquire cannot consume frame-cap demand");
+            assert_eq!(
+                retry,
+                PresentRetry::default(),
+                "no retries, deadlines, or failure fuel"
+            );
+        }
+        // Negative control: the very same expired content clock is due once
+        // the matching result arrives. It must neither spin nor be forgotten.
+        assert!(!acquire.complete(Some(18), 17));
+        assert!(!acquire.complete(None, 17));
+        assert!(acquire.complete(Some(17), 17));
+        assert!(
+            !acquire.complete(Some(17), 17),
+            "duplicate completion owns no demand"
+        );
+        assert!(service_due_presentation_clocks(
+            acquire.waiting_for(Some(17)),
+            &mut retry,
+            &mut dirty,
+            Some(now),
+            floor,
+            now + floor * 100,
+        ));
+        assert!(!dirty);
+    }
+
+    #[test]
+    fn gpu_acquire_window_completion_keeps_input_until_real_present() {
+        let mut app = App::headless_for_test();
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        let key = {
+            let mut term = ws.front_terminal().unwrap().term.lock().unwrap();
+            super::early_out_tests::frame_key(&mut term, true, false, None)
+        };
+        let now = Instant::now();
+        ws.last_present_at = Some(now);
+        ws.content_pending = true;
+        ws.redraw_pending = true;
+        ws.input_hot = true;
+        ws.input_hot_until = Some(now + Duration::from_secs(1));
+        ws.stamp_present_decision(key);
+        assert!(ws.last_present.is_some());
+        let serial = ws.capture_present_serial;
+        ws.on_gpu_acquire_pending(17);
+        assert!(ws.last_present.is_none());
+        let mut requests = 0;
+        assert!(!ws.finish_gpu_acquire_wait(None, 17, true, || requests += 1));
+        assert!(!ws.finish_gpu_acquire_wait(Some(18), 17, true, || requests += 1));
+        assert_eq!(
+            requests, 0,
+            "CPU/replaced targets ignore the old completion"
+        );
+        assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || requests += 1));
+        assert_eq!(requests, 1);
+        assert!(!ws.finish_gpu_acquire_wait(Some(17), 17, true, || requests += 1));
+        assert_eq!(requests, 1);
+        assert!(ws.content_pending && ws.redraw_pending && ws.input_hot);
+        assert_eq!(ws.last_present_at, Some(now));
+        assert_eq!(
+            ws.capture_present_serial, serial,
+            "ready did not present pixels"
+        );
+        assert_eq!(ws.present_retry, PresentRetry::default());
+        ws.on_present_succeeded();
+        ws.on_content_presented(now + Duration::from_millis(1));
+        assert_eq!(ws.capture_present_serial, serial + 1);
+        assert!(
+            ws.input_hot,
+            "an unrelated first present cannot retire a hot echo"
+        );
+        // A later content burst starts another independent acquisition episode.
+        ws.content_pending = true;
+        ws.on_gpu_acquire_pending(17);
+        assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || requests += 1));
+        assert_eq!(requests, 2);
+        assert!(ws.content_pending && ws.input_hot);
+    }
+
+    #[test]
+    fn gpu_acquire_wait_survives_real_input_rearming_and_later_input() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let press = || InputEvent::Key {
+            key: Key::Character('x'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .on_gpu_acquire_pending(17);
+        let _ = app.input(wid, press(), Source::Human);
+        let ws = app.windows.get_mut(&wid).unwrap();
+        assert!(
+            ws.gpu_acquire_wait.waiting_for(Some(17)),
+            "input may rearm failures, but cannot take a worker's pending drawable"
+        );
+        assert!(
+            ws.input_hot,
+            "real key egress arms echo priority while acquisition waits"
+        );
+        assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || {}));
+        ws.on_present_succeeded();
+        let _ = app.input(wid, press(), Source::Human);
+        let ws = app.windows.get_mut(&wid).unwrap();
+        assert!(ws.input_hot);
+        ws.on_gpu_acquire_pending(17);
+        assert!(ws.finish_gpu_acquire_wait(Some(17), 17, true, || {}));
+        assert!(
+            ws.input_hot,
+            "the second completion still is not the echo's presentation"
+        );
+    }
+
+    #[test]
+    fn gpu_acquire_occluded_completion_parks_without_failure_fuel() {
+        let mut app = App::headless_for_test();
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.content_pending = true;
+        ws.redraw_pending = true;
+        ws.on_gpu_acquire_pending(17);
+        let mut requests = 0;
+        assert!(ws.finish_gpu_acquire_wait(Some(17), 17, false, || requests += 1));
+        assert_eq!(requests, 0);
+        assert!(ws.present_retry.parked);
+        assert_eq!(ws.present_retry.autonomous_retries, 0);
+        assert_eq!(ws.present_retry.deadline, None);
+        assert!(ws.content_pending && ws.redraw_pending);
+        assert!(!ws.gpu_acquire_wait.waiting_for(Some(17)));
+        // The real expose/input rearm reopens the same finite surface gate.
+        assert!(super::rearm_present_and_request(
+            &mut ws.present_retry,
+            true,
+            || requests += 1
+        ));
+        assert_eq!(requests, 1);
+        assert!(ws.present_retry.present_attempt_allowed());
     }
 }

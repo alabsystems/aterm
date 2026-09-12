@@ -3,12 +3,21 @@
 
 //! The cursor emitters' shared render kit — ONE copy of the per-cell-row quad
 //! pushers, the colour ramps, and the 4-point twinkle star that the `cursor_*`
-//! modules each carried privately. Two rect pushers exist ON PURPOSE and are
-//! NOT interchangeable: [`push_grid_rect`] takes GRID-RELATIVE px and clamps to
-//! the grid interior with `y / ch` row tags, while [`push_fx_rect`] takes
+//! modules each carried privately. Two pushers exist ON PURPOSE and are NOT
+//! interchangeable: [`push_grid_quad`] takes GRID-RELATIVE px and clamps to the
+//! grid interior with `y / ch` row tags, while [`push_fx_rect`] takes
 //! WINDOW-ABSOLUTE px and clamps to the effects box with origin-anchored row
 //! tags — routing an emitter through the wrong one moves its light and mistags
 //! its damage rows.
+//!
+//! **EVERY CARET-ANCHORED EMITTER IS WINDOW-ABSOLUTE**, and as of 2026-09-10
+//! there is no grid-relative RECT pusher left for one to be routed through by
+//! accident: `push_grid_rect` — a thin additive wrapper over
+//! [`push_grid_quad`] — was the trap that put the momentum halo, the comet's
+//! coma, the droplet's bead and the fireball's ball 84 px above and 24 px left
+//! of the caret in a real window, and it is deleted. The grid form survives
+//! only as [`push_grid_quad`], whose one caller is `output_streak` — light
+//! anchored to a TEXT RUN and not to the caret.
 
 use aterm_render::{GlowQuad, premul_rgb};
 
@@ -16,27 +25,18 @@ use crate::cursor_glow::Geom;
 
 /// Clamp a GRID-RELATIVE pixel rect to the grid interior and split it into
 /// per-cell-row [`GlowQuad`]s (the renderer row-gate + CPU/GPU parity
-/// invariant). Callers pass grid px — no `geom.origin_*` applied — and rows tag
-/// `y / ch`: the contract of the grid-anchored emitters (comet, fireball,
-/// droplet). Window-absolute emitters use [`push_fx_rect`] instead.
-pub(crate) fn push_grid_rect(
-    out: &mut Vec<GlowQuad>,
-    geom: Geom,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    premul: u32,
-) {
-    // ADDITIVE light — the historical contract of every grid-anchored emitter
-    // (see [`GlowQuad::alpha`]); `push_grid_quad` carries the same splitting
-    // logic for the one emitter that also needs source-over.
-    push_grid_quad(out, geom, x, y, w, h, premul, 0);
-}
-
-/// [`push_grid_rect`] with the blend mode left to the caller: `alpha == 0` is
-/// the additive light every legacy grid emitter pushes (and this function is
-/// then byte-identical to it), while `alpha > 0` selects premultiplied
+/// invariant), with the blend mode left to the caller. Callers pass grid px —
+/// no `geom.origin_*` applied — and rows tag `y / ch`.
+///
+/// **A CARET-ANCHORED EMITTER MUST NOT USE THIS**; it uses [`push_fx_rect`].
+/// The caret's own light lands in the `cursor_glow_add` stream, whose quads are
+/// window px, so a grid-relative producer there is byte-identical at origin
+/// (0,0) — every unit test's geometry — and displaced by exactly
+/// `(origin_x, origin_y)` in a real window. That is what this function's
+/// deleted additive wrapper `push_grid_rect` did to four emitters in a row.
+/// Its one caller is `output_streak`, which anchors to a text run.
+///
+/// `alpha == 0` is additive light, while `alpha > 0` selects premultiplied
 /// source-over (`src + dst·(1 − a)`) — the mode a light-theme emitter needs,
 /// because additive light can only BRIGHTEN and so cannot darken a pale ground.
 /// Split out rather than duplicated so the per-cell-row band walk (the renderer
@@ -91,7 +91,7 @@ pub(crate) fn push_grid_quad(
 /// into per-cell-row [`GlowQuad`]s with origin-anchored row DAMAGE tags (the
 /// renderer row-gate + CPU/GPU parity invariant). Callers pass window px
 /// (`geom.origin_*` already applied); grid-relative emitters use
-/// [`push_grid_rect`] instead.
+/// [`push_grid_quad`] instead.
 pub(crate) fn push_fx_rect(
     out: &mut Vec<GlowQuad>,
     geom: Geom,

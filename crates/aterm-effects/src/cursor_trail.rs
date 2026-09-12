@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use aterm_render::TrailCell;
 
-use crate::cursor_glow::TypedStamps;
+use crate::cursor_glow::{TypedStamps, band_row};
 
 /// Coverage of the comet HEAD (the cell nearest the cursor) at a GENTLE move — the
 /// "just a few keys / slow typing" baseline the user asked to keep subtle.
@@ -506,6 +506,36 @@ impl CursorTrail {
             .and_then(|((row, col), at)| row.checked_sub(rows).map(|row| ((row, col), at)));
         self.sparks
             .retain_mut(|spark| match spark.row.checked_sub(rows) {
+                Some(row) => {
+                    spark.row = row;
+                    true
+                }
+                None => false,
+            });
+    }
+
+    /// Row-band translation — the lockstep twin of
+    /// `CursorGlow::note_band_move` (see `crate::cursor_glow::band_row` for
+    /// the law): screen rows `top..=bottom` moved by `delta`, so every live
+    /// terminal-coordinate member on those rows — the classifier anchors and
+    /// the visible comet cells alike — now sits `delta` rows away, a member
+    /// outside the band stays where it is, and one carried past the band's
+    /// edge is retired rather than clamped there (the edge row is a real cell
+    /// that does not own that light or that source anchor). The two engines
+    /// must agree on the same host replay, or a move the glow judges from the
+    /// moved cell the trail would judge from the stale one.
+    pub fn note_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        self.last = self
+            .last
+            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        self.last_visible = self.last_visible.and_then(|((row, col), at)| {
+            band_row(row, top, bottom, delta).map(|row| ((row, col), at))
+        });
+        self.sparks
+            .retain_mut(|spark| match band_row(spark.row, top, bottom, delta) {
                 Some(row) => {
                     spark.row = row;
                     true
@@ -1206,6 +1236,57 @@ mod tests {
             off.is_empty() && !trail.is_active(),
             "the accessibility/master hard-zero path still retires the comet"
         );
+    }
+
+    /// The band twin of the scroll test below, in lockstep with
+    /// `CursorGlow::note_band_move`: Codex's viewport `[8..20]` riding down
+    /// one row carries the anchors and the comet cell inside it by exactly
+    /// one row, leaves the cell on row 1 (outside the band) alone, and drops
+    /// the cell on the band's bottom row rather than parking it on the edge.
+    /// A degenerate band is a no-op.
+    #[test]
+    fn a_band_move_translates_the_trail_inside_the_band_and_drops_what_leaves() {
+        let now = Instant::now();
+        let mut trail = CursorTrail {
+            last: Some((10, 4)),
+            last_visible: Some(((10, 4), now)),
+            ..CursorTrail::default()
+        };
+        for row in [10u16, 1, 20] {
+            trail.sparks.push(Spark {
+                row,
+                col: 3,
+                born_alpha: 42,
+                born: now,
+                life_ms: 500,
+            });
+        }
+        trail.note_band_move(8, 20, 1);
+        assert_eq!(
+            trail.last,
+            Some((11, 4)),
+            "classifier anchor rides its band"
+        );
+        assert_eq!(
+            trail.last_visible.map(|(cell, _)| cell),
+            Some((11, 4)),
+            "hide-bridge anchor rides its band"
+        );
+        let rows: Vec<u16> = trail.sparks.iter().map(|s| s.row).collect();
+        assert_eq!(
+            rows,
+            vec![11, 1],
+            "inside moved, outside untouched, past the edge gone"
+        );
+        trail.note_band_move(0, 5, 0);
+        trail.note_band_move(9, 8, -1);
+        assert_eq!(trail.last, Some((11, 4)));
+        trail.note_band_move(11, 11, -1);
+        assert_eq!(
+            trail.last, None,
+            "an anchor carried out of its band has no honest cell"
+        );
+        assert_eq!(trail.sparks.len(), 1);
     }
 
     /// PTY scrolls carry the classic terminal-cell trail just like the glow

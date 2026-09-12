@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+# Reviewed 2026-09-10 against the named upstream commit: all 18 Rust files
+# are byte-identical; the four manifests are adapted as README documents.
+# These hashes pin that review. They are not an upstream signature.
+[upstream]
+repository = "https://github.com/alabsystems/astream"
+revision = "bb98d610894afebdbe0ab741a7ad155b942a4375"
+license = "Apache-2.0"
+
+[files]
+"LICENSE" = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+"README.md" = "82d4dbb0d661544e0dafbb1187791f2916f24e65c8f9ecb06ac98a48343d4fdb"
+"crates/astream-aead/Cargo.toml" = "007e22ff3813a37faf8cd740df8426e57bfa1a131a0ccb8ae73a136c040a0d80"
+"crates/astream-aead/src/handshake.rs" = "28bb99e056c81c28fdda8f2e6f21e0e7d1e41f8223d18e4202cd236d5cfbaca1"
+"crates/astream-aead/src/identity.rs" = "bd006429092b42711131d4cb96a8ede4e58939399e0760298268fd52a1d110eb"
+"crates/astream-aead/src/lib.rs" = "d13ea52d9de09e0cacf5f8ebede9819348827575d07307b996f7f9896e459898"
+"crates/astream-aead/src/stream.rs" = "009b6895c9bf639509d84270f1cb3b159119d11e345a5126429ee430a2d0ac95"
+"crates/astream-broker/Cargo.toml" = "0994085dc5e8f0ee3e0be15045bac1cd8474ca8db7fbd4c6b5b5d8565e34934d"
+"crates/astream-broker/src/brecord.rs" = "2c150a5ae9bb55326170048487ad1684cd64af60bff5f1d9a8267fc20ca17049"
+"crates/astream-broker/src/broker.rs" = "db4f868f8d3524787dd0015ffebeae6be178132fda8e0c019ae716e6040000f1"
+"crates/astream-broker/src/client.rs" = "7dfb1fbd7298ba6f595c07cd29818341dbf514f8af30108fb45fddb67307e944"
+"crates/astream-broker/src/lib.rs" = "8abefe63e56c896294bae40bcd62529b1850876af5ac6e41d5935ea879071288"
+"crates/astream-broker/src/proto.rs" = "8dd1dc24d17d7c57ca56683ba905e21d293816fb5bdc58b816831dc3f1f67982"
+"crates/astream-broker/src/sharded.rs" = "d6635273098835cd75c56372eb56ae97ec38d8c7d893cb2dd2940737be7b9ade"
+"crates/astream-broker/src/store.rs" = "24799630bc5e3fb6cca168d56a38f85b6b9e2b485772a5ac3461626819b485cf"
+"crates/astream-cap/Cargo.toml" = "8f403ccb23a94c56c328e555e3c7214471127ee59f712fd2efc8fd8a3dd07d41"
+"crates/astream-cap/src/lib.rs" = "6bdcf3e29889c0c12928086faa8928d85aa828eadbe3045aed3bfe0937f4f091"
+"crates/astream-wire/Cargo.toml" = "bfdef19c0447190146b09f6b1ff4b0f7f7b16feb8af0d708d6890729bb1e663b"
+"crates/astream-wire/src/frame.rs" = "e29812065f806219383d44657393f6cc6ee3da57f25388df829071fc59dfb2ee"
+"crates/astream-wire/src/hash.rs" = "9e580f229dcdabc53ea4506e97b0f82e8941e2aa6391bdf0c995c73b07ba03be"
+"crates/astream-wire/src/lib.rs" = "6a6a8e273fc9a2ea93b72197326695eaf26e0fb398621a86d65d724d31f5a997"
+"crates/astream-wire/src/offset.rs" = "1c0e84d88166e362df68d8e2a28af3991b19c49789dbb37fe0a45a106cf726ef"
+"crates/astream-wire/src/partition.rs" = "f7dc77deeeea59ac526e3b662eb351005ca2cc06608cf744ab7a8f537a1029b8"
+"crates/astream-wire/src/subject.rs" = "2606fcc9c24ef9d2bb28e32d90cc1a68c9ce8c0d1a245c308a4aec873b27a245"

@@ -700,6 +700,58 @@ fn ready_text_accepts(text: &str, running: &str) -> bool {
     }
 }
 
+/// What this process could learn about whether `path` is there — THREE answers,
+/// because there are three.
+///
+/// [`Path::exists`] has only two, and it spends them badly: it is
+/// `fs::metadata(..).is_ok()`, so every reason a stat can fail — EACCES on a parent
+/// directory, EPERM from macOS privacy consent, EIO, ELOOP, ENAMETOOLONG — is spent
+/// on `false`, the same answer it gives for a path that genuinely is not there. That
+/// collapses a bound on what THIS PROCESS MAY KNOW into a fact about THE WORLD, and
+/// atpkg's consumers read it as a fact: a live program dropped out of
+/// [`crate::ops::active_builds`], doctor printed `FAIL — broken bin shim` over a shim
+/// that runs, and [`caller_can_use_prefix`] abandoned the shared store it exists to
+/// keep. Each of those implies the same remedy — reinstall — and each repairs nothing,
+/// which is the most expensive kind of wrong a package manager can be about its own
+/// store.
+///
+/// [`Presence::Unknown`] carries the error so a diagnostic can SAY why it cannot tell,
+/// rather than picking a verdict and calling it a measurement. `Absent` is reserved
+/// for the one answer a stat actually proves.
+#[derive(Debug)]
+pub enum Presence {
+    /// Stat succeeded: something is there.
+    Present,
+    /// Stat said `NotFound`, the only error that is evidence about the path itself.
+    Absent,
+    /// Stat failed for a reason that says nothing about the path.
+    Unknown(std::io::Error),
+}
+
+impl Presence {
+    /// True ONLY when the path is provably not there. An `Unknown` answers `false`
+    /// here on purpose: a caller asking "may I act as though this is gone?" must be
+    /// told no when nobody looked.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+/// Ask the filesystem about `path`, keeping the three answers apart.
+///
+/// Follows symlinks, exactly as [`Path::exists`] does, so a dangling link is `Absent`
+/// (its target is what was asked about) and every existing caller keeps the behaviour
+/// it was written for on the two paths a stat can actually decide.
+#[must_use]
+pub fn presence(path: &Path) -> Presence {
+    match std::fs::metadata(path) {
+        Ok(_) => Presence::Present,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Presence::Absent,
+        Err(e) => Presence::Unknown(e),
+    }
+}
+
 /// Whether `build_dir` holds a COMPLETE install **for the running slice**: its sibling
 /// completeness marker exists, and the platform that marker records (if any) is ours.
 ///
@@ -1160,9 +1212,15 @@ fn caller_can_use_prefix(p: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(p.join("bin")) else {
         return false;
     };
-    entries
-        .flatten()
-        .any(|e| crate::platform::resolve_shim(&e.path()).is_some_and(|t| t.exists()))
+    //
+    // "Not PROVABLY gone", not "stat succeeded". The machine this branch serves is the
+    // one whose store it may traverse and exec but not read, and `t.exists()` answered
+    // `false` for exactly those tools — abandoning the shared prefix, printing "not
+    // writable by this user", and installing the whole toolchain a second time into a
+    // private default. Only a `NotFound` is evidence that a tool is not there.
+    entries.flatten().any(|e| {
+        crate::platform::resolve_shim(&e.path()).is_some_and(|t| !presence(&t).is_absent())
+    })
 }
 
 fn system_chain_trusted(p: &Path) -> bool {
@@ -1726,6 +1784,59 @@ mod tests {
             "a trusted-but-unwritable system prefix must degrade to the default"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE SHARED-PREFIX USER THIS CHECK EXISTS FOR, CUT OFF BY THE CHECK ITSELF.
+    ///
+    /// A prefix the caller cannot write is still usable when its shims SERVE — that is
+    /// the whole second half of `caller_can_use_prefix`, and it is the admin-installed
+    /// multi-user store the comment above it describes. But the serving test was
+    /// `t.exists()`, which is `fs::metadata(..).is_ok()`: on the very machine shape it
+    /// protects — a store an admin laid down and a user may execute but not stat — it
+    /// answers `false` for tools that run perfectly. `vet_prefix` then prints "not
+    /// writable by this user", silently redirects the whole store to a private default,
+    /// and installs the entire toolchain a second time. Losing the shared store is the
+    /// exact outcome this branch was written to prevent.
+    ///
+    /// Only the permission to LOOK is withdrawn here; the shim and its target are
+    /// untouched and would still exec.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_prefix_whose_shims_cannot_be_stat_ed_is_still_usable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if crate::platform::our_uid() == 0 {
+            return; // root reads and writes through mode 0; the case does not exist.
+        }
+        let prefix = std::env::temp_dir().join(format!("atpkg-shared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&prefix);
+        let holder = prefix.join("store/ay/17/bin");
+        std::fs::create_dir_all(&holder).unwrap();
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        let ay = ToolName::new("ay").unwrap();
+        std::fs::write(holder.join(ay.exe_file()), b"#!/bin/true\n").unwrap();
+        crate::platform::install_shim(&holder, &ay, &prefix.join("bin").join(ay.shim_file()))
+            .unwrap();
+        assert!(
+            caller_can_use_prefix(&prefix),
+            "precondition: a writable prefix serving a real shim is usable"
+        );
+        // The admin-installed shape: the user may traverse and exec, not write or stat.
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let target = prefix.join("store/ay/17/bin").join(ay.exe_file());
+        let armed = std::fs::metadata(&target).is_err();
+        let usable = caller_can_use_prefix(&prefix);
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&prefix);
+        assert!(
+            armed,
+            "the fixture must make the stat fail, or it proves nothing"
+        );
+        assert!(
+            usable,
+            "a shared prefix whose tools we may run but not stat must not be abandoned"
+        );
     }
 
     /// The negative half: a writable directory outside `$HOME` must still be usable,

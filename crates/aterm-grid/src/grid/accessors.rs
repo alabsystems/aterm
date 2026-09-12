@@ -123,6 +123,9 @@ impl Grid {
     pub fn force_selection_invalidation(&mut self) {
         self.storage.content_scroll_delta = i32::MAX;
         self.storage.coordinates_invalidated = true;
+        // A wholesale coordinate change is not a row-band translation: poison the
+        // band record so no host replays the batch's bands as if they explained it.
+        self.storage.presentation.poison_row_band_moves();
         // SELECTION CUSTODY Phase 4: also record it on the lattice. `All` is the
         // honest answer for the callers that keep this: the whole coordinate space
         // is gone (ED 3, `clear_scrollback`, RIS, a Kitty unscroll that renumbers
@@ -148,6 +151,9 @@ impl Grid {
     #[inline]
     pub fn invalidate_host_coordinates(&mut self) {
         self.storage.coordinates_invalidated = true;
+        // A buffer swap replaces every coordinate; the bands recorded so far (on
+        // the OUTGOING grid) explain none of it.
+        self.storage.presentation.poison_row_band_moves();
     }
 
     /// Record that RETAINED HISTORY was discarded wholesale — the third half of
@@ -204,10 +210,35 @@ impl Grid {
     pub(crate) fn damage_selection_scroll_region(&mut self) {
         // A line/column edit MOVES rows, so host coordinate caches must drop.
         self.storage.coordinates_invalidated = true;
+        // ...and a margined IL/DL or a column op (DECIC/DECDC/SL/SR/DECBI/DECFI)
+        // moves a RECTANGLE or cells within rows, which no row-band translation
+        // describes: poison the band record so the batch fails closed for hosts that
+        // translate bands. The full-width IL/DL use
+        // [`Self::damage_selection_scroll_region_as_band`] instead.
+        self.storage.presentation.poison_row_band_moves();
         let (top, bottom) = (
             self.storage.scroll_region.top,
             self.storage.scroll_region.bottom,
         );
+        self.damage_selection_visible_rows(top, bottom);
+    }
+
+    /// The row-band twin of [`Self::damage_selection_scroll_region`] for the
+    /// full-width IL/DL: the coordinate flag and the region damage are recorded
+    /// exactly as there, and ADDITIONALLY the move is recorded with numbers — rows
+    /// `top..=bottom` (the cursor row through the region bottom) moved by `delta`
+    /// (see [`crate::RowBandMove`]), so a host that translates bands keeps its marks
+    /// on the lines they belong to instead of discarding them.
+    pub(crate) fn damage_selection_scroll_region_as_band(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        delta: i16,
+    ) {
+        self.storage.coordinates_invalidated = true;
+        self.storage
+            .presentation
+            .record_row_band_move(top, bottom, delta);
         self.damage_selection_visible_rows(top, bottom);
     }
 
@@ -221,6 +252,14 @@ impl Grid {
     /// Drain this batch's host-coordinate invalidation flag.
     pub fn take_coordinates_invalidated(&mut self) -> bool {
         self.storage.take_coordinates_invalidated()
+    }
+
+    /// Drain this batch's row-band move record (see [`crate::RowBandMoves`]) —
+    /// the numbers behind `take_coordinates_invalidated`. Read it in the same
+    /// post-processing step as the flag: a batch whose record is non-empty and not
+    /// `inexact` moved rows ONLY as the listed bands say.
+    pub fn take_row_band_moves(&mut self) -> crate::RowBandMoves {
+        self.storage.presentation.take_row_band_moves()
     }
 
     /// Drain the most recent resize's revealed-history row shift (see

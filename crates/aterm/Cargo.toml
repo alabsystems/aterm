@@ -20,6 +20,14 @@ aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless e
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
+# `aterm link` — the fabric bridge. A LIBRARY like every other verb, so the one
+# Mach-O carries it: before 2026-09-10 this crate lived outside the workspace
+# and path-depended on a sibling astream checkout, so no release ever shipped
+# the bridge and turning the fabric on meant building two repositories by hand.
+# Its astream crates are vendored under vendor/astream (see that README); the
+# sealed cross-host transport is behind its off-by-default `sealed` feature, so
+# this adds no cipher tree to the shipped binary.
+aterm-link = { path = "../aterm-link" }
 # The headless update lane: `aterm update status|check` and the session-mode
 # background check/stage loop (round-11 — a terminal-only Mac used to run NONE
 # of the updater, while install.sh promised automatic updates).

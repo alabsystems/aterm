@@ -42,9 +42,18 @@
 //!
 //! # The obligations
 //!
-//! * `[OB-1]`  patch ↔ `vendor/` agreement, both directions, cross-checked
-//!   against [`aterm_census::scan_set::REVIEWED_VENDORED_CRATES`] — plus the
-//!   partition itself: every patch path is under `vendor/` or `crates/`, and
+//! * `[OB-1]`  patch ↔ `vendor/` agreement, both directions: every vendored patch
+//!   key resolves to a real `vendor/<dir>` with sources, and every directory
+//!   under `vendor/` is claimed by one of the THREE shapes — a patch entry (a
+//!   redistributed fork), a row on [`crate::provenance::FIRST_PARTY_VENDORED`]
+//!   (aterm's own code vendored so a clean clone builds, held to being REACHED
+//!   by a member's `path = …` since no patch entry could ever name it), or the
+//!   explicitly reviewed astream direct-path bundle (tracked inventory,
+//!   reviewed byte hashes, supplied license text and actual Cargo metadata
+//!   source paths). The FORK arm is cross-checked against
+//!   [`aterm_census::scan_set::REVIEWED_VENDORED_CRATES`] in both directions,
+//!   and a review row inside a first-party vendored root is itself a failure —
+//!   plus the partition: every patch path is under `vendor/` or `crates/`, and
 //!   a first-party target is a real directory with sources.
 //! * `[OB-2]`  version equality — a patched version outside the requirement
 //!   the workspace states makes the patch SILENTLY UN-USED (cargo warns and
@@ -69,11 +78,14 @@
 //!
 //! # What this module does NOT do
 //!
-//! `[OB-7]` detects modified files by aterm's own MARKERS, not by diffing
-//! against pristine upstream. A file edited without leaving a marker is
-//! invisible here. The pristine-diff (fetch the `.crate`, compare against the
-//! `.cargo_vcs_info.json` sha) is a later work unit; the log says so on every
-//! run rather than implying a diff happened.
+//! `[OB-7]` byte-diffs Apache-only forks against an available pristine copy and
+//! checks modification notices. Without that copy it reports UNVERIFIED. The
+//! astream direct bundle has a separate reviewed inventory, not a crates.io
+//! pristine copy; its pinned hashes establish review consistency, not an
+//! authenticated upstream signature. Nor are they what makes those crates
+//! aterm's own: [`crate::provenance::FIRST_PARTY_VENDORED`] is the reviewed
+//! claim that does that, and it is what keeps the astream crates out of forge's
+//! third-party counts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -689,11 +701,13 @@ pub fn report(root: &Path) -> (bool, String) {
     let dirs = vendor_dirs(root);
     let _ = writeln!(
         log,
-        "    forks: {} vendored from [patch.crates-io]; {} director(y/ies) under vendor/; \
-         {} FIRST-PARTY patch target(s) under crates/ (aterm's own code — provenance \
-         obligations do not apply, and [OB-1]/[OB-2] say so by name)",
+        "    forks: {} vendored from [patch.crates-io]; {} director(y/ies) under vendor/, of \
+         which {} are FIRST-PARTY vendored path dependencies; {} FIRST-PARTY patch target(s) \
+         under crates/ (aterm's own code — provenance obligations do not apply, and \
+         [OB-1]/[OB-2] say so by name)",
         forks.len(),
         dirs.len(),
+        crate::provenance::roster_len(root),
         first_party_forks.len()
     );
 
@@ -734,9 +748,9 @@ pub fn report(root: &Path) -> (bool, String) {
 }
 
 /// `[OB-1]` Every VENDORED patch key resolves to a real `vendor/<dir>` with
-/// sources, and every `vendor/<dir>` is claimed by a patch key. Cross-checked
-/// against the census registry when this root IS the workspace that registry
-/// describes.
+/// sources. Every vendor directory is claimed by such a patch or by the
+/// separately verified direct-bundle record. Patch forks are cross-checked
+/// against the census registry when this root IS the workspace it describes.
 ///
 /// FIRST-PARTY patch targets are checked here too, against the only two things
 /// that can be wrong about them — the directory must exist and must have
@@ -754,6 +768,27 @@ fn ob1_patch_vendor_agreement(
     log: &mut String,
 ) -> usize {
     let mut fails = 0;
+    let direct_bundle = match crate::direct_vendor::review(root) {
+        Ok(true) => {
+            let _ = writeln!(
+                log,
+                "    [OB-1] vendor/astream is the REVIEWED DIRECT-PATH bundle: tracked inventory \
+                 and byte hashes, supplied Apache-2.0 text, package manifests and Cargo metadata \
+                 source/dependency paths agree. Its inventory pins a reviewed upstream copy, \
+                 not an upstream signature. It does NOT decide provenance: what takes these \
+                 crates out of forge's third-party totals is the reviewed roster \
+                 aterm_forge::provenance::FIRST_PARTY_VENDORED, and this notary infers no \
+                 crates.io patch and no general vendor-directory exemption."
+            );
+            true
+        }
+        Ok(false) => false,
+        Err(why) => {
+            let _ = writeln!(log, "  ✗ FAIL [OB-1] reviewed direct-path bundle: {why}");
+            fails += 1;
+            false
+        }
+    };
     for fp in first_party {
         if !fp.dir.is_dir() {
             let _ = writeln!(
@@ -821,16 +856,109 @@ fn ob1_patch_vendor_agreement(
             fails += 1;
         }
     }
+    // THE ROSTER IS SCOPED, and the scoping is stated rather than silent — the
+    // same reason the REVIEWED_VENDORED_CRATES cross-check below is scoped.
+    // FIRST_PARTY_VENDORED is compiled in and describes THIS workspace; applied
+    // to an arbitrary root it invents findings, and it did: attest's own
+    // fixtures build miniature workspaces in a temp directory, and the
+    // staleness sweep reported `vendor/astream` MISSING in every one of them.
+    let roster_applies = crate::provenance::applies_to(root);
+    if !roster_applies {
+        let _ = writeln!(
+            log,
+            "  • NOTE [OB-1] the FIRST_PARTY_VENDORED roster was NOT applied: that constant \
+             describes the aterm workspace and this root is not it. Every vendor/ directory \
+             here is held to patch ↔ vendor/ agreement alone."
+        );
+    }
+    // A ROSTER ROW WHOSE DIRECTORY IS GONE grants an exemption to nothing and
+    // goes on granting it forever, so it is checked before the sweep that reads
+    // the roster — the same stale-review discipline REVIEWED_VENDORED_CRATES
+    // carries in the other direction.
+    for row in crate::provenance::stale_rows(root) {
+        if !roster_applies {
+            break;
+        }
+        let _ = writeln!(
+            log,
+            "  ✗ FAIL [OB-1] aterm_forge::provenance::FIRST_PARTY_VENDORED registers `{}` but \
+             that directory does not exist — the review is stale. Drop the row, or restore the \
+             directory.",
+            row.dir
+        );
+        fails += 1;
+    }
     for dir in dirs {
-        if !forks.iter().any(|f| f.rel == format!("vendor/{dir}")) {
+        let rel = format!("vendor/{dir}");
+        if forks.iter().any(|f| f.rel == rel) {
+            continue;
+        }
+        // THE THIRD SHAPE (2026-09-10). A vendor/ directory can also be a
+        // FIRST-PARTY PATH DEPENDENCY: aterm's own code, vendored so a clean
+        // clone builds, reached by `path = …` rather than by [patch.crates-io].
+        // No patch entry could ever name it — a patch entry replaces a REGISTRY
+        // package, and these crates are not published — so demanding one is
+        // demanding an impossible artifact, which is the exact failure mode the
+        // first-party carve-out above was written to end.
+        if let Some(row) = crate::provenance::roster_row(&rel).filter(|_| roster_applies) {
+            if let Some(fork) = forks.iter().find(|f| f.rel == rel) {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-1] `{rel}` is on the FIRST_PARTY_VENDORED roster AND is \
+                     patched in as `{}` — a directory cannot be both aterm's own code and a \
+                     redistributed fork. Drop one.",
+                    fork.name
+                );
+                fails += 1;
+                continue;
+            }
+            let dependants = crate::provenance::path_dependants(root, &rel);
+            if dependants.is_empty() {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-1] `{rel}` is a FIRST-PARTY vendored path dependency on the \
+                     roster, but NO workspace member under crates/ carries a `path = …` that \
+                     resolves inside it — so it is exactly the dead weight this obligation \
+                     refuses, first-party or not. Add the edge back, or delete the directory \
+                     and its roster row."
+                );
+                fails += 1;
+                continue;
+            }
             let _ = writeln!(
                 log,
-                "  ✗ FAIL [OB-1] `vendor/{dir}` is not named by any [patch.crates-io] entry — \
-                 it is dead weight that ships in the source distribution. Add the patch entry \
-                 or delete the directory."
+                "    [OB-1] `{rel}` is a FIRST-PARTY VENDORED PATH DEPENDENCY (upstream {}), \
+                 reached by path from: {}. It is not a redistribution, so [OB-3]..[OB-10] — \
+                 the [workspace] stub, .cargo_vcs_info.json/Cargo.toml.orig, a retained \
+                 upstream LICENSE, a NOTICE row, the Apache §4(b) pristine diff, the \
+                 fork-marker census, the SPDX allowlist and the vendor/ ignore sweep — do NOT \
+                 apply to it, for the same reason they do not apply to crates/. {}",
+                row.upstream,
+                dependants.join(", "),
+                row.why
             );
-            fails += 1;
+            continue;
         }
+        // THE REVIEWED DIRECT-PATH BUNDLE is the classification that survives
+        // on a root the roster does NOT describe — attest's own fixtures build
+        // miniature workspaces in a temp directory, where `roster_applies` is
+        // false by construction. On THIS workspace the roster branch above
+        // already took `vendor/astream`; the notary still ran, and its byte
+        // inventory is reported there.
+        if direct_bundle && dir == crate::direct_vendor::DIRECTORY {
+            continue;
+        }
+        let _ = writeln!(
+            log,
+            "  ✗ FAIL [OB-1] `{rel}` is not named by any [patch.crates-io] entry, is not \
+             on aterm_forge::provenance::FIRST_PARTY_VENDORED, and did not pass the reviewed \
+             direct-path bundle notary — it has no reviewed source classification and is dead \
+             weight that ships in the source distribution. Add the patch entry (a redistributed \
+             fork), add the roster row (aterm's own code, vendored so a clean clone builds), or \
+             delete the directory. A direct-path bundle must not be given a fictitious \
+             crates.io patch."
+        );
+        fails += 1;
     }
 
     // The compiled-in census registry describes THIS workspace. Applying it to
@@ -873,10 +1001,31 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
             }
         }
+        // THE MIRROR-IMAGE MIS-REGISTRATION. REVIEWED_VENDORED_CRATES exists to
+        // track THIRD-PARTY code this repository must keep re-reviewing; a row
+        // for a directory the provenance roster calls aterm's own is the same
+        // category error as a review row for a crates/ patch target, and it
+        // would quietly re-impose every obligation the roster just lifted.
+        for entry in registry {
+            if let Some(row) = crate::provenance::roster_row(entry.path).filter(|_| roster_applies)
+            {
+                let _ = writeln!(
+                    log,
+                    "  ✗ FAIL [OB-1] REVIEWED_VENDORED_CRATES registers `{}` at `{}`, which is \
+                     inside the FIRST-PARTY vendored root `{}`. A review row is for \
+                     third-party code; drop one of the two registrations.",
+                    entry.package, entry.path, row.dir
+                );
+                fails += 1;
+            }
+        }
         let _ = writeln!(
             log,
-            "    [OB-1] cross-checked against REVIEWED_VENDORED_CRATES ({} reviewed entries).",
-            registry.len()
+            "    [OB-1] cross-checked against REVIEWED_VENDORED_CRATES ({} reviewed entries) \
+             and aterm_forge::provenance::FIRST_PARTY_VENDORED ({} first-party vendored \
+             root(s)).",
+            registry.len(),
+            crate::provenance::roster_len(root)
         );
     } else {
         let _ = writeln!(
@@ -890,9 +1039,11 @@ fn ob1_patch_vendor_agreement(
         let _ = writeln!(
             log,
             "  ✓ [OB-1] patch ↔ vendor/ agreement holds in both directions ({} vendored \
-             fork(s); {} first-party target(s) present with sources).",
+             fork(s); {} first-party target(s) present with sources; {} first-party vendored \
+             root(s), each reached by a workspace member's path dependency).",
             forks.len(),
-            first_party.len()
+            first_party.len(),
+            crate::provenance::roster_len(root)
         );
     }
     fails
@@ -1352,9 +1503,14 @@ struct Divergence {
 /// `smol_str 0.2.2` are absent from BOTH `registry/src` and `registry/cache`,
 /// while `indexmap 2.14.0`, `libm 0.2.16` and `pkg-config` are present — so
 /// [OB-7] is UNVERIFIED here for winit and green on the machine that recorded
-/// the ledger. `crate::loc::package_dir` has the same dependency on the same
-/// missing artifact and does NOT fail loudly: it silently measures the fork
-/// instead, which is worth 713 lines of `third_party_loc` in every cell.
+/// the ledger. [`crate::loc::package_dir`] USED TO have the same dependency on
+/// the same missing artifact and did not fail loudly — it silently measured the
+/// fork instead, which was worth 713 lines of `third_party_loc` in every cell.
+/// That is fixed the other way round: a `[patch.crates-io]` target now resolves
+/// to the path that COMPILES before the registry is consulted, so `loc` reads
+/// the fork deliberately on every machine. This obligation still needs the
+/// pristine copy, because a §4(b) diff has nothing to compare against without
+/// it, and it still says UNVERIFIED rather than passing when it is absent.
 fn pristine_dir(root: &Path, name: &str, version: &str) -> Option<PathBuf> {
     // A repo-local pristine tree wins over the registry. This is the
     // `vendor/.forge/<name>/pristine/` slot of the fork ledger layout: a fork
@@ -1983,6 +2139,27 @@ mod tests {
         let (ok, log) = report(&fixture.0);
         assert!(ok, "a complete fork must attest clean:\n{log}");
         assert!(log.contains("PASS — 10 obligations held"), "{log}");
+    }
+
+    #[test]
+    fn an_unreviewed_vendor_directory_still_fails_the_direct_bundle_notary() {
+        let fixture = good_fixture("unreviewed-bundle");
+        std::fs::create_dir_all(fixture.0.join("vendor/another-bus/src")).unwrap();
+        let (ok, log) = report(&fixture.0);
+        assert!(!ok);
+        assert!(
+            log.contains("vendor/another-bus") && log.contains("no reviewed source classification"),
+            "{log}"
+        );
+        // Naming a directory astream is insufficient: it needs the pinned
+        // inventory and genuine metadata paths, rather than a name exemption.
+        std::fs::create_dir_all(fixture.0.join("vendor/astream/src")).unwrap();
+        let (ok, log) = report(&fixture.0);
+        assert!(!ok);
+        assert!(
+            log.contains("reviewed direct-path bundle") && log.contains("UPSTREAM.toml"),
+            "{log}"
+        );
     }
 
     #[test]

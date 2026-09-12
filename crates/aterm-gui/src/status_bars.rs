@@ -1078,11 +1078,47 @@ impl StatusBars {
         });
     }
 
+    /// `seed-done:` — THE POSITIVE TERMINAL: an announced pass that ended well and
+    /// has no install roster to name. Distinct from [`Self::toolchain_installed`],
+    /// which claims a roster; this one retires the announcement and claims nothing
+    /// beyond the sentence atpkg itself printed.
+    pub(crate) fn toolchain_ended(&mut self, detail: &str, now: Instant) {
+        self.toolchain = Some(Bar {
+            text: BarText {
+                glyph: '\u{2713}',
+                title: "ALab toolchain".to_string(),
+                detail: sanitize_for_tty(detail, 160),
+                stats: String::new(),
+                tone: Tone::Success,
+            },
+            fill: Some(1.0),
+            fold_at: Some(now + HOLD_OK),
+            stale_at: None,
+            pass_id: None,
+            staged_build: None,
+            health: false,
+        });
+    }
+
     /// A bad terminal outcome for the toolchain lane (`seed-partial:` /
     /// `seed-failed:` / `net-failed:` / `seed-unusable:` / the synthetic
     /// "child died after announcing"). `what` is the whole sentence.
     pub(crate) fn toolchain_failed(&mut self, what: &str, now: Instant) {
-        let fill = self.toolchain.as_ref().and_then(|b| b.fill);
+        // A FAILURE ROW NEVER INHERITS A FINISHED METER. Carrying the fill over is
+        // honest while the bar being replaced is this pass's LIVE meter — the reader
+        // sees how far it got before it broke. It was not honest when the bar being
+        // replaced was itself a TERMINAL row, because a terminal row's meter is
+        // always full: the owner's 2026-09-11 screenshot showed "⚠ ALab toolchain
+        // install failed" beside a 100% bar, and the 100% came from a completed-pass
+        // row the tailer had just built out of a 27-hour-old `progress.json` while
+        // the verdict came from the live child. Two passes, one bar, and a reading
+        // ("finished, and failed") that is a contradiction on its face even when the
+        // failure is real.
+        let fill = self
+            .toolchain
+            .as_ref()
+            .filter(|b| !b.terminal())
+            .and_then(|b| b.fill);
         self.toolchain = Some(Bar {
             text: BarText {
                 glyph: '\u{26a0}',
@@ -2267,6 +2303,60 @@ mod tests {
         Instant::now()
     }
 
+    /// THE OWNER'S SCREENSHOT, 2026-09-11: "⚠ ALab toolchain install failed — see
+    /// Settings ▸ Packages" beside a FULL progress bar.
+    ///
+    /// The two come from different sources and the bar fused them. The verdict is the
+    /// live child's; the meter was inherited from whatever bar the failure replaced —
+    /// and on that launch the bar it replaced was a COMPLETED-pass row the tailer had
+    /// just built out of a 27-hour-old `progress.json`, because the child was refused
+    /// at atpkg's dispatch edge and never wrote a pass of its own. "Finished, and
+    /// failed" is a contradiction on its face even when the failure is real.
+    #[test]
+    fn a_failure_row_does_not_inherit_a_finished_pass_meter() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        // A terminal SUCCESS row: full meter, by construction.
+        bars.toolchain_ended("the pass finished; 12 ALab program(s) are installed", now);
+        assert_eq!(
+            bars.toolchain.as_ref().and_then(|b| b.fill),
+            Some(1.0),
+            "the success row is the one that carries a full meter"
+        );
+        // …and then a real failure lands on the same lane.
+        bars.toolchain_failed("install failed — see Settings ▸ Packages", now);
+        assert_eq!(
+            bars.toolchain.as_ref().and_then(|b| b.fill),
+            None,
+            "a failure must not be painted at 100% — the meter belonged to another pass"
+        );
+    }
+
+    /// …while the inheritance that EARNED its place survives: a failure arriving over
+    /// this pass's own LIVE meter keeps it, so the reader sees how far the pass got
+    /// before it broke.
+    #[test]
+    fn a_failure_row_keeps_the_live_meter_of_the_pass_it_reports() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        let snap = crate::PkgProgressSnapshot {
+            file: file(Some(4242), "net"),
+            running: true,
+        };
+        bars.toolchain_snapshot(Some(&snap), now);
+        let live = bars.toolchain.as_ref().and_then(|b| b.fill);
+        assert!(
+            live.is_some_and(|f| f > 0.0 && f < 1.0),
+            "a live partial meter: {live:?}"
+        );
+        bars.toolchain_failed("install failed — see Settings ▸ Packages", now);
+        assert_eq!(
+            bars.toolchain.as_ref().and_then(|b| b.fill),
+            live,
+            "the pass's own progress is the one honest thing to keep"
+        );
+    }
+
     fn file(running_pid: Option<u32>, pass: &str) -> atpkg::progress::ProgressFile {
         atpkg::progress::ProgressFile {
             v: PROGRESS_VERSION,
@@ -2707,9 +2797,9 @@ mod tests {
             )
         );
         assert!(
-            bar.text
-                .detail
-                .ends_with("defaults -currentHost delete com.apple.universalcontrol Disable"),
+            bar.text.detail.ends_with(
+                "defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
+            ),
             "the revert is byte-identical to atpkg's: {}",
             bar.text.detail
         );
@@ -2937,11 +3027,13 @@ mod tests {
         assert_eq!(
             undo.detail,
             "undo: `aterm pkg doctor` prints the revert \u{00b7} \
-             defaults -currentHost delete com.apple.universalcontrol Disable"
+             defaults -currentHost delete com.apple.universalcontrol Disable; \
+             defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
         );
         assert_eq!(
             atpkg::machine::UNIVERSAL_CONTROL_REVERT,
-            "defaults -currentHost delete com.apple.universalcontrol Disable"
+            "defaults -currentHost delete com.apple.universalcontrol Disable; \
+             defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
         );
 
         // A machine row arriving on an EMPTY lane goes up at once; a second
@@ -3837,13 +3929,13 @@ mod tests {
             assert!(d.contains("`aterm pkg doctor`"), "cols {cols}: {d}");
             assert!(col + d.chars().count() <= cols - MARGIN, "cols {cols}: {d}");
         }
-        // 28 cells of head, 107 of detail: whole from 139 cols.
-        let l = layout(&undo, None, 150);
+        // 28 cells of head, 183 of detail (both deletes): whole from 212 cols.
+        let l = layout(&undo, None, 240);
         assert!(
             l.detail
                 .unwrap()
                 .1
-                .ends_with("com.apple.universalcontrol Disable"),
+                .ends_with("com.apple.universalcontrol DisableMagicEdges"),
             "wide enough, the revert is whole"
         );
         // A plain detail still truncates from the right.

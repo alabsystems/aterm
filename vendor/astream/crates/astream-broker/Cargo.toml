@@ -1,0 +1,41 @@
+[package]
+name = "astream-broker"
+description = "astream servable broker: durable exactly-once pub/sub, Filter-routed subscribe, resume-from-offset (replay-subscription), durable consumer groups and atomic read-process-write, served over a Unix-domain socket, plaintext TCP, or (feature `aead`) an XChaCha20-Poly1305-sealed TCP transport; capability enforcement on attach behind feature `cap`. std-only concurrency (threads + Mutex/Condvar), zero third-party deps by default, forbid(unsafe)."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+rust-version = "1.89"
+
+# Zero third-party dependencies — std only (threads, sync, UnixListener) plus the
+# in-tree wire vocabulary. The broker is a substrate crate, so forbid(unsafe).
+[features]
+# Off by default: enforce capabilities on the accept path. Pulls astream-cap
+# (and its vetted sha2), so the default broker stays zero-third-party.
+cap = ["dep:astream-cap"]
+# Off by default, and NOTHING IN A DEFAULT ATERM BUILD TURNS IT ON: the sealed
+# TCP transport (serve_tcp_sealed / Client::connect_tcp_sealed). aterm-link
+# re-exports it as its own off-by-default `sealed` feature, which its cross-host
+# test enables. `handshake`, `identity`, `at-rest` and `anti-rollback` are NOT
+# vendored — each adds a curve and nothing on aterm's side reaches them.
+aead = ["dep:astream-aead"]
+# Declared because the SOURCE references them in `cfg(feature = ...)`; nothing in
+# aterm enables any of them, and each would add a curve. Kept verbatim from
+# upstream so a re-sync is a copy, not a reconciliation.
+handshake = ["aead", "astream-aead/handshake"]
+identity = ["handshake", "astream-aead/identity"]
+at-rest = ["aead"]
+anti-rollback = ["at-rest"]
+# Off by default: retention (Broker::retain_before / BrokerLog::retain_before) —
+# compact the log by dropping records below a floor offset, keeping surviving
+# offsets absolute. std-only; works on plaintext and encrypted logs.
+retention = []
+
+[dependencies]
+astream-wire = { path = "../astream-wire" }
+astream-cap = { path = "../astream-cap", optional = true }
+astream-aead = { path = "../astream-aead", optional = true }
+
+# Dev-only, and IN-TREE (not third-party): the cognition-routing test publishes a
+# REAL astream-agent CogRecord through the bus. astream-agent's own lib graph is
+# zero-third-party, so `cargo test` still pulls no crates.io dependency.

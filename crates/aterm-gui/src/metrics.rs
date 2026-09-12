@@ -264,7 +264,7 @@ static PAST_DEADLINE_ARMS: AtomicU64 = AtomicU64::new(0);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 36;
+const DEADLINE_OWNER_SLOTS: usize = 37;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -484,6 +484,10 @@ pub(crate) enum DeadlineOwner {
     /// The program cat's tenure gate (`app_kitty::KittyTenure`): one wake at
     /// the instant a pending claim earns or releases the cursor.
     KittyTenure = 33,
+    /// The macOS access card's watch (`consent_card::CardState::next_wake`):
+    /// the probe cadence while the owner may be in System Settings, the
+    /// decide timeout while a verdict is awaited.
+    ConsentCard = 36,
     /// The status bars (`crate::status_bars`): ONE wake per bar, at the fold of
     /// a bar holding a terminal outcome. A live bar folds nothing (its paints
     /// ride `Wake::PkgProgress` / `Wake::UpdateProgress`), and no bar folds
@@ -535,6 +539,7 @@ impl DeadlineOwner {
             31 => Self::SessionChrome,
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
+            36 => Self::ConsentCard,
             34 => Self::StatusBars,
             35 => Self::SessionStatus,
             _ => Self::None,
@@ -578,6 +583,7 @@ impl DeadlineOwner {
             Self::SessionChrome => "session_chrome",
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
+            Self::ConsentCard => "consent_card",
             Self::StatusBars => "status_bars",
             Self::SessionStatus => "session_status",
         }
@@ -1652,8 +1658,9 @@ pub fn acquire_wait_last_max_ns() -> (u64, u64) {
     )
 }
 
-/// Record one present's swapchain-acquire wait. Cheap (one histogram bucket
-/// increment); called on every successful present.
+/// Record one swapchain-acquire attempt's wait, including refused acquisitions.
+/// Cheap (one histogram bucket increment); the shared GPU present seam consumes
+/// each sample once, before either success or failure routing.
 pub fn note_acquire_wait(ns: u64) {
     H_ACQUIRE_WAIT.record(ns);
     LAST_ACQUIRE_WAIT_NS.store(ns, Ordering::Relaxed);

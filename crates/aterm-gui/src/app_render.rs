@@ -13,7 +13,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aterm_core::terminal::{ContentScrollState, CursorStyle, RenderCell, Terminal};
+use aterm_core::terminal::{
+    ContentScrollDelta, ContentScrollState, CursorStyle, RenderCell, Terminal,
+};
 use aterm_render::{DamageOutcome, Frame, RenderInput, Theme};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -107,12 +109,19 @@ pub(crate) const CURSOR_FX_TYPED_WAKE: std::time::Duration = std::time::Duration
 /// snapshots. `translated_rows` carries the exact cumulative distance (up to
 /// the engine's `u16` coordinate contract); a larger value retires wholesale.
 /// Capping at the viewport height is unsound for pixel pools with a one-cell
-/// sky allowance. `invalidated` marks a
+/// sky allowance. `band_moves` counts the exact per-row-band translations
+/// applied instead — an inline viewport (Codex, and any DECSTBM region, IL or
+/// DL) slides part of the screen without moving the rest, so there is no single
+/// whole-plane distance to report. `invalidated` marks a
 /// non-uniform/ambiguous content movement where translating the whole effect
 /// plane would attach light to the wrong text.
+///
+/// All three are "the coordinates under the retained light changed": every
+/// consumer asks [`Self::changed`], never one field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CursorEffectScrollChange {
     pub(crate) translated_rows: u16,
+    pub(crate) band_moves: u8,
     pub(crate) invalidated: bool,
 }
 
@@ -121,6 +130,13 @@ enum CursorEffectScrollDecision {
     Baseline,
     Unchanged,
     Translate(u16),
+    /// Every invalidating batch since the last snapshot was explained by the
+    /// `count` row-band moves `bands[first_seq..first_seq + count]`, replayed
+    /// OLDEST FIRST.
+    Bands {
+        first_seq: u64,
+        count: u8,
+    },
     Invalidate,
 }
 
@@ -1642,32 +1658,31 @@ mod cursor_fx_generation_fence_tests {
 /// Pure per-consumer projection of two cumulative snapshots. Kept separate
 /// from engine mutation so the host decision has a direct Tier-1 bind to the
 /// derived scroll-signal model.
+///
+/// The table itself lives in `aterm-core`
+/// ([`ContentScrollState::delta_since`]) — ONE decision, read by this window
+/// and by `aterm-effects`' embedder pipeline, so the native and web halves can
+/// never answer the same snapshot pair differently. This function is the rename
+/// into the host's enum and nothing else.
 fn cursor_effect_scroll_decision(
     previous: Option<ContentScrollState>,
     current: ContentScrollState,
 ) -> CursorEffectScrollDecision {
-    let Some(previous) = previous else {
-        return CursorEffectScrollDecision::Baseline;
-    };
-    if current.invalidation_epoch != previous.invalidation_epoch
-        || current.uniform_up_rows < previous.uniform_up_rows
-    {
-        return CursorEffectScrollDecision::Invalidate;
-    }
-    let delta = current.uniform_up_rows - previous.uniform_up_rows;
-    if delta == 0 {
-        CursorEffectScrollDecision::Unchanged
-    } else if let Ok(delta) = u16::try_from(delta) {
-        CursorEffectScrollDecision::Translate(delta)
-    } else {
-        CursorEffectScrollDecision::Invalidate
+    match ContentScrollState::delta_since(previous, current) {
+        ContentScrollDelta::Baseline => CursorEffectScrollDecision::Baseline,
+        ContentScrollDelta::Unchanged => CursorEffectScrollDecision::Unchanged,
+        ContentScrollDelta::Translate(rows) => CursorEffectScrollDecision::Translate(rows),
+        ContentScrollDelta::Bands { first_seq, count } => {
+            CursorEffectScrollDecision::Bands { first_seq, count }
+        }
+        ContentScrollDelta::Invalidate => CursorEffectScrollDecision::Invalidate,
     }
 }
 
 impl CursorEffectScrollChange {
     #[inline]
     pub(crate) fn changed(self) -> bool {
-        self.translated_rows > 0 || self.invalidated
+        self.translated_rows > 0 || self.invalidated || self.band_moves > 0
     }
 }
 
@@ -1679,6 +1694,13 @@ impl CursorEffectScrollChange {
 /// epoch change wins over any simultaneous increase in `uniform_up_rows`, so a
 /// region/down/splice mutation followed by ordinary output between frames can
 /// never be laundered into a whole-grid translation.
+///
+/// When EVERY epoch step since the last snapshot was a row-band batch the
+/// engines are translated band by band instead of being reset — the inline
+/// viewport case the owner reported on 2026-09-10 ("the cursor jumping around …
+/// in codex in particular"), where one streamed transcript line is one region
+/// scroll and the old wholesale reset threw the whole earned ribbon away once
+/// per line.
 pub(crate) fn sync_cursor_effect_scroll(
     window: &mut WindowState,
     current: ContentScrollState,
@@ -1698,7 +1720,25 @@ pub(crate) fn sync_cursor_effect_scroll(
             window.cursor_glow.drop_row_probe();
             CursorEffectScrollChange {
                 translated_rows,
-                invalidated: false,
+                ..CursorEffectScrollChange::default()
+            }
+        }
+        CursorEffectScrollDecision::Bands { first_seq, count } => {
+            // OLDEST FIRST: the moves compose in the order the program made
+            // them, and a later move's band is stated in the coordinates the
+            // earlier one left behind.
+            for i in 0..u64::from(count) {
+                let m = current.band(first_seq + i);
+                window.cursor_glow.note_band_move(m.top, m.bottom, m.delta);
+                window.cursor_trail.note_band_move(m.top, m.bottom, m.delta);
+            }
+            // Row identity changed INSIDE the band, exactly as it does under a
+            // whole-plane translation, so the row probe is fenced for the same
+            // reason it is there.
+            window.cursor_glow.drop_row_probe();
+            CursorEffectScrollChange {
+                band_moves: count,
+                ..CursorEffectScrollChange::default()
             }
         }
         CursorEffectScrollDecision::Invalidate => {
@@ -1736,6 +1776,19 @@ mod cursor_scroll_signal_tests {
                 projected.insert("uniform_rows", i64::from(delta));
                 projected.insert("decision", 1);
                 projected.insert("survivor_y", 1);
+                projected.insert("proof_alive", 0);
+            }
+            CursorEffectScrollDecision::Bands { count, .. } => {
+                assert_eq!(count, 1, "model fixture uses the one-band batch");
+                // The epoch STILL steps; `band_batches` records that this one
+                // step was fully explained, and the marks inside the band ride
+                // DOWN with their text (StartY 3 + Delta 2), which is the
+                // direction a reverse index at a region top moves them.
+                projected.insert("epoch", 1);
+                projected.insert("band_batches", 1);
+                projected.insert("decision", 3);
+                projected.insert("survivor_y", 5);
+                projected.insert("geometry_alive", 1);
                 projected.insert("proof_alive", 0);
             }
             CursorEffectScrollDecision::Invalidate => {
@@ -1812,11 +1865,44 @@ mod cursor_scroll_signal_tests {
 
     #[test]
     fn exact_alt_scroll_translates_while_region_reset_and_restore_invalidate() {
+        // An interior DECSTBM region scroll is an EXPLAINED band move from
+        // 2026-09-10: the epoch still steps, and the whole row motion of that
+        // step is `{1, 2, -1}`, so the host translates rows 1..=2 instead of
+        // retiring the plane. This is the primitive every inline viewport rides.
         let mut region = Terminal::new(4, 12);
         let before = region.content_scroll_state();
         region.process(b"\x1b[2;3r\x1b[3;1H\n");
-        let decision = cursor_effect_scroll_decision(Some(before), region.content_scroll_state());
+        let after = region.content_scroll_state();
+        let decision = cursor_effect_scroll_decision(Some(before), after);
+        assert_eq!(
+            decision,
+            CursorEffectScrollDecision::Bands {
+                first_seq: before.band_seq,
+                count: 1,
+            }
+        );
+        assert_eq!(
+            after.invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "the epoch still bumps for every consumer that cannot translate bands"
+        );
+        validate_model_action("RegionBandMove", 6, decision);
+
+        // A MARGINED (DECLRMM) scroll up moves a RECTANGLE, not a row band: the
+        // grid poisons its band record and the host must still retire the plane.
+        // This is the vacuity control for the arm above — without it the test
+        // would pass on a host that had simply stopped invalidating.
+        let mut margined = Terminal::new(8, 12);
+        margined.process(b"\x1b[3;1Hsome text");
+        let before = margined.content_scroll_state();
+        margined.process(b"\x1b[?69h\x1b[2;6s\x1b[2;5r\x1b[3;1H\x1b[S");
+        let after = margined.content_scroll_state();
+        let decision = cursor_effect_scroll_decision(Some(before), after);
         assert_eq!(decision, CursorEffectScrollDecision::Invalidate);
+        assert_eq!(
+            after.band_batches, before.band_batches,
+            "a rectangle scroll is never an explained row-band batch"
+        );
         validate_model_action("RegionInvalidation", 2, decision);
 
         let mut alt = Terminal::new(3, 12);
@@ -1849,10 +1935,12 @@ mod cursor_scroll_signal_tests {
         let previous = ContentScrollState {
             uniform_up_rows: 10,
             invalidation_epoch: 4,
+            ..Default::default()
         };
         let mixed_later = ContentScrollState {
             uniform_up_rows: 13,
             invalidation_epoch: 5,
+            ..Default::default()
         };
         assert_eq!(
             cursor_effect_scroll_decision(Some(previous), mixed_later),
@@ -1862,6 +1950,7 @@ mod cursor_scroll_signal_tests {
         let too_large = ContentScrollState {
             uniform_up_rows: previous.uniform_up_rows + u64::from(u16::MAX) + 1,
             invalidation_epoch: previous.invalidation_epoch,
+            ..Default::default()
         };
         assert_eq!(
             cursor_effect_scroll_decision(Some(previous), too_large),
@@ -1959,14 +2048,50 @@ mod cursor_scroll_signal_tests {
             );
         }
 
-        // VACUITY CONTROL: a partial-region scroll really does move rows, and it
-        // must still invalidate — otherwise this test would pass on an engine
-        // that had simply stopped listening.
+        // A partial-region scroll really does move rows — and since 2026-09-10 it
+        // moves them EXACTLY: the band `{1, 2, -1}` is replayed onto both
+        // engines, the earned ribbon lives on row 0 which is OUTSIDE the band,
+        // and nothing is retired.
+        let before_band = ws.cursor_scroll_state.expect("the take has a baseline");
         term.process(b"\x1b[2;3r\x1b[3;1H\n");
         assert_eq!(
             cursor_effect_scroll_decision(ws.cursor_scroll_state, term.content_scroll_state()),
+            CursorEffectScrollDecision::Bands {
+                first_seq: before_band.band_seq,
+                count: 1,
+            },
+            "a region scroll is an exact row-band translate"
+        );
+        let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+        assert!(!change.invalidated, "an explained band never retires");
+        assert_eq!(change.band_moves, 1);
+        assert!(change.changed(), "the coordinates under the light did move");
+        // Band translation retires the derived paint plan. Rebuild it at the
+        // same fixture instant before asking the last-frame visibility metric;
+        // an empty plan between frames does not mean the earned cells died.
+        ws.cursor_glow.tick(
+            Some((0, 9)),
+            t0 + Duration::from_millis(364),
+            &cfg,
+            geom,
+            &mut out,
+        );
+        assert_eq!(
+            ws.cursor_glow.ribbon_segments(),
+            earned,
+            "row 0 is outside the band [1..=2]: the typed ribbon is untouched"
+        );
+
+        // VACUITY CONTROL: a MIXED batch — a whole-screen line feed AND a region
+        // scroll in one parser batch — is not one transform, and the reset that
+        // stops a phantom comet must still fire. Without this the test would pass
+        // on a host that had simply stopped listening.
+        term.process(b"\x1b[r\x1b[10;1H\n\x1b[2;3r\x1b[3;1H\n");
+        assert_eq!(
+            cursor_effect_scroll_decision(ws.cursor_scroll_state, term.content_scroll_state()),
             CursorEffectScrollDecision::Invalidate,
-            "a region scroll moves rows and must still retire the effects"
+            "uniform rows beside an epoch step cannot be laundered into either \
+             exact transform"
         );
         let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
         assert!(change.invalidated);
@@ -1974,6 +2099,381 @@ mod cursor_scroll_signal_tests {
             ws.cursor_glow.ribbon_segments(),
             0,
             "the reset that stops a phantom comet is intact"
+        );
+    }
+
+    /// **SEVENTEEN band moves between two presents is one too many.** The ring
+    /// holds [`CONTENT_SCROLL_BAND_RING`](aterm_core::terminal::CONTENT_SCROLL_BAND_RING)
+    /// = 16 moves, chosen from two measured numbers: the fastest gap between two
+    /// streamed Codex transcript lines in the real capture is 9.1 ms, and the
+    /// GUI's synchronized-output hold is capped at `SYNC_HOLD_CAP` = 150 ms, so
+    /// 16 moves at that floor (~145 ms) are one hold cap. A host that presents at
+    /// least once per hold never wraps; a present stall LONGER than a hold (a
+    /// minimized window, a debugger stopped at a breakpoint) overflows it, and
+    /// the answer is the wholesale retirement this host did for every region
+    /// scroll before 2026-09-10 — never worse than today, and never a replay of
+    /// moves whose slots have been overwritten.
+    #[test]
+    fn seventeen_band_moves_between_presents_fall_back_to_invalidate() {
+        let mut app = App::headless_for_test();
+        let mut cfg = app.glow_config();
+        cfg.enabled = true;
+        cfg.style = crate::cursor_glow::GlowStyle::RainbowKitty;
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 20,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 320,
+            head: 0,
+        };
+        let t0 = Instant::now();
+
+        // One interior-region line feed per parser batch: 16 of them, with the
+        // host never presenting in between.
+        let mut term = Terminal::new(20, 40);
+        term.process(b"the quick brown fox");
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        ws.cursor_scroll_state = Some(term.content_scroll_state());
+        let before = term.content_scroll_state();
+        let mut out = Vec::new();
+        ws.cursor_glow.tick(Some((0, 0)), t0, &cfg, geom, &mut out);
+        for i in 1..=9u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 40);
+            ws.cursor_glow.note_synthetic_typed(at, 1);
+            ws.cursor_glow.tick(
+                Some((0, i)),
+                at + Duration::from_millis(4),
+                &cfg,
+                geom,
+                &mut out,
+            );
+        }
+        let earned = ws.cursor_glow.ribbon_segments();
+        assert!(earned > 0, "the take must start with a ribbon to lose");
+
+        for _ in 0..16 {
+            term.process(b"\x1b[10;19r\x1b[19;1H\n");
+        }
+        let sixteen = term.content_scroll_state();
+        assert_eq!(sixteen.band_seq, before.band_seq + 16);
+        assert_eq!(
+            cursor_effect_scroll_decision(Some(before), sixteen),
+            CursorEffectScrollDecision::Bands {
+                first_seq: before.band_seq,
+                count: 16,
+            },
+            "a full ring is still exact"
+        );
+
+        // The seventeenth move overwrote the slot the first move lives in, so
+        // there is no longer an oldest-first replay to make.
+        term.process(b"\x1b[10;19r\x1b[19;1H\n");
+        let seventeen = term.content_scroll_state();
+        assert_eq!(seventeen.band_seq, before.band_seq + 17);
+        assert_eq!(
+            seventeen.band_batches,
+            before.band_batches + 17,
+            "every one of them WAS explained; only the ring is too small"
+        );
+        let decision = cursor_effect_scroll_decision(Some(before), seventeen);
+        assert_eq!(decision, CursorEffectScrollDecision::Invalidate);
+
+        let change = sync_cursor_effect_scroll(ws, seventeen);
+        assert!(change.invalidated);
+        assert_eq!(change.band_moves, 0);
+        assert_eq!(
+            ws.cursor_glow.ribbon_segments(),
+            0,
+            "the overflow takes today's wholesale retirement, not a stale replay"
+        );
+    }
+
+    /// **THE OWNER'S CODEX, BYTE FOR BYTE** (2026-09-10: "it needs more edge case
+    /// handling for when the cursor is jumping around and in codex in
+    /// particular").
+    ///
+    /// Every pty write the real `codex` binary made while it streamed a ~40-line
+    /// answer, replayed from `scratchpad/codex-bytes.bin` records 642–746 with
+    /// the capture's own microsecond timestamps (109 842 B captured on a 57×151
+    /// window; the stamps are MICROseconds, which is how the two `RI` blocks the
+    /// codex-on-glass map read as "38 ms apart" are really 8.77 s and two
+    /// different turns). Both phases of the choreography are in this range:
+    ///
+    /// * **Phase A** (records 642–717, viewport not yet at the screen bottom):
+    ///   `ESC[{vt};57r ESC[{vt};1H RI ESC[r ESC[1;{vt}r …` — a reverse index at an
+    ///   interior region top. Nothing is archived, no splice is recorded, and the
+    ///   band `{vt-1, 56, +1}` carries the composer and its earned ribbon one
+    ///   row DOWN with the text. Momentum keeps decaying; unpaid echo credits
+    ///   retire at the coordinate fence. 28 moves, region tops 25 through 52.
+    /// * **Phase B** (records 720–746, viewport pinned at the bottom):
+    ///   `ESC[1;52r ESC[52;1H \r\n` — a top-anchored archival scroll. The band is
+    ///   `{0, 51, -1}`: the transcript's light leaves through row 0 while the
+    ///   composer, parked at row 54, is OUTSIDE the band and does not move at all.
+    ///
+    /// Before this round every one of those 39 batches was an `Invalidate` and
+    /// reset both engines, so the rainbow died once per streamed line — the
+    /// owner's report. Here the decision is `Bands` every time: earned cells
+    /// age exactly like an unmoved ribbon, without an early reset or renewed
+    /// lifetime. The resident pet's persistence is tested separately.
+    ///
+    /// Two honest details about replaying a real capture: record 739 ends mid
+    /// block (its `\r\n` arrived in record 740), so that record carries no row
+    /// motion at all — 39 moves over 105 records, not one per record. And the
+    /// capture contains the human's own keystrokes (records 646, 652, 659, …);
+    /// they are fed as bytes with no key-time licence, so they are program moves
+    /// here and must mint nothing, which is the T1 clause this test also pins.
+    #[test]
+    fn a_codex_shaped_terminal_keeps_its_ribbon_through_both_phases() {
+        /// `(milliseconds after record 642, the bytes of that record)`.
+        const CODEX_STREAM: &[(u64, &[u8])] = &[
+        (0, b"\x1b[?2026h\x1b[25;57r\x1b[25;1H\x1bM\x1b[r\x1b[1;25r\x1b[24;1H\r\n"),
+        (0, b"\x1b[39;49m\x1b[K  2\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[27;10H\x1b[39m\x1b[49m\x1b[0m\x1b[26;1H\x1b[0 q\x1b[26;1H \x1b[39m\x1b[49m\x1b[0m\x1b[28;10H\x1b[?25h"),
+        (0, b"\x1b[?2026l"),
+        (56, b"\x1b]0;\xe2\xa0\xb4 aterm\x07"),
+        (56, b"\x1b[?2026h\x1b[28;10H\x1b[39;48;2;45;47;51mo\x1b[39m\x1b[49m\x1b[0m\x1b[26;1H\x1b[0 q\x1b[26;1H \x1b[39m\x1b[49m\x1b[0m\x1b[28;11H\x1b[?25h\x1b[?2026l"),
+        (113, b"\x1b]0;\xe2\xa0\xa6 aterm\x07"),
+        (113, b"\x1b[?2026h\x1b[26;57r\x1b[26;1H\x1bM\x1b[r\x1b[1;26r\x1b[25;1H\r\n"),
+        (113, b"\x1b[39;49m\x1b[K  3\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[28;11H\x1b[39m\x1b[49m\x1b[0m\x1b[27;1H\x1b[0 q\x1b[27;1H \x1b[39m\x1b[49m\x1b[0m\x1b[29;11H\x1b[?25h\x1b[?2026l"),
+        (124, b"\x1b[?2026h\x1b[27;57r\x1b[27;1H\x1bM\x1b[r\x1b[1;27r\x1b[26;1H\r\n"),
+        (124, b"\x1b[39;49m\x1b[K  4\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[29;11H\x1b[39m\x1b[49m\x1b[0m\x1b[28;1H\x1b[0 q\x1b[28;1H \x1b[39m\x1b[49m\x1b[0m\x1b[30;11H\x1b[?25h\x1b[?2026l"),
+        (181, b"\x1b[?2026h\x1b[30;11H\x1b[39;48;2;45;47;51mr\x1b[39m\x1b[49m\x1b[0m\x1b[28;1H\x1b[0 q\x1b[28;1H \x1b[39m\x1b[49m\x1b[0m\x1b[30;12H\x1b[?25h\x1b[?2026l"),
+        (216, b"\x1b]0;\xe2\xa0\xa7 aterm\x07"),
+        (216, b"\x1b[?2026h\x1b[28;57r\x1b[28;1H\x1bM\x1b[r\x1b[1;28r\x1b[27;1H\r\n"),
+        (216, b"\x1b[39;49m\x1b[K  5\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[30;12H\x1b[39m\x1b[49m\x1b[0m\x1b[29;1H\x1b[0 q\x1b[29;1H \x1b[39m\x1b[49m\x1b[0m\x1b[31;12H\x1b[?25h\x1b[?2026l"),
+        (238, b"\x1b[?2026h\x1b[29;57r\x1b[29;1H\x1bM\x1b[r\x1b[1;29r\x1b[28;1H\r\n"),
+        (238, b"\x1b[39;49m\x1b[K  6\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[31;12H\x1b[39m\x1b[49m\x1b[0m\x1b[30;1H\x1b[0 q\x1b[30;1H \x1b[39m\x1b[49m\x1b[0m\x1b[32;12H\x1b[?25h\x1b[?2026l"),
+        (306, b"\x1b]0;\xe2\xa0\x87 aterm\x07"),
+        (306, b"\x1b[?2026h\x1b[32;12H\x1b[39;48;2;45;47;51ml\x1b[39m\x1b[49m\x1b[0m\x1b[30;1H\x1b[0 q\x1b[30;1H \x1b[39m\x1b[49m\x1b[0m\x1b[32;13H\x1b[?25h\x1b[?2026l"),
+        (324, b"\x1b[?2026h\x1b[30;57r\x1b[30;1H\x1bM\x1b[r\x1b[1;30r\x1b[29;1H\r\n"),
+        (324, b"\x1b[39;49m\x1b[K  7\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[32;13H\x1b[39m\x1b[49m\x1b[0m\x1b[31;1H\x1b[0 q\x1b[31;1H \x1b[39m\x1b[49m\x1b[0m\x1b[33;13H\x1b[?25h\x1b[?2026l"),
+        (426, b"\x1b]0;\xe2\xa0\x8f aterm\x07"),
+        (433, b"\x1b[?2026h\x1b[33;13H\x1b[39;48;2;45;47;51md\x1b[39m\x1b[49m\x1b[0m\x1b[31;1H\x1b[0 q\x1b[31;1H \x1b[39m\x1b[49m\x1b[0m\x1b[33;14H\x1b[?25h\x1b[?2026l"),
+        (447, b"\x1b[?2026h\x1b[31;57r\x1b[31;1H\x1bM\x1b[r\x1b[1;31r\x1b[30;1H\r\n"),
+        (447, b"\x1b[39;49m\x1b[K  8\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[33;14H\x1b[39m\x1b[49m\x1b[0m\x1b[32;1H\x1b[0 q\x1b[32;1H \x1b[39m\x1b[49m\x1b[0m\x1b[34;14H\x1b[?25h\x1b[?2026l"),
+        (527, b"\x1b]0;\xe2\xa0\x8b aterm\x07"),
+        (527, b"\x1b[?2026h\x1b[32;57r\x1b[32;1H\x1bM\x1b[r\x1b[1;32r\x1b[31;1H\r\n"),
+        (527, b"\x1b[39;49m\x1b[K  9\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[34;14H\x1b[39m\x1b[49m\x1b[0m\x1b[33;1H\x1b[0 q\x1b[33;1H \x1b[39m\x1b[49m\x1b[0m\x1b[35;14H\x1b[?25h"),
+        (527, b"\x1b[?2026l"),
+        (537, b"\x1b[?2026h\x1b[33;57r\x1b[33;1H\x1bM\x1b[r\x1b[1;33r\x1b[32;1H\r\n"),
+        (537, b"\x1b[39;49m\x1b[K  10\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[35;14H\x1b[39m\x1b[49m\x1b[0m\x1b[34;1H"),
+        (537, b"\x1b[0 q\x1b[34;1H \x1b[39m\x1b[49m\x1b[0m\x1b[36;14H\x1b[?25h\x1b[?2026l"),
+        (599, b"\x1b[?2026h\x1b[34;57r\x1b[34;1H\x1bM\x1b[r\x1b[1;34r\x1b[33;1H\r\n"),
+        (599, b"\x1b[39;49m\x1b[K  11\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[36;14H\x1b[39m\x1b[49m\x1b[0m\x1b[35;1H\x1b[0 q\x1b[35;1H \x1b[39m\x1b[49m\x1b[0m\x1b[37;14H\x1b[?25h\x1b[?2026l"),
+        (608, b"\x1b]0;\xe2\xa0\x99 aterm\x07"),
+        (608, b"\x1b[?2026h\x1b[35;57r\x1b[35;1H\x1bM\x1b[r\x1b[1;35r\x1b[34;1H\r\n"),
+        (608, b"\x1b[39;49m\x1b[K  12\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[37;14H\x1b[39m\x1b[49m\x1b[0m\x1b[36;1H\x1b[0 q\x1b[36;1H \x1b[39m\x1b[49m\x1b[0m\x1b[38;14H\x1b[?25h\x1b[?2026l"),
+        (710, b"\x1b]0;\xe2\xa0\xb9 aterm\x07"),
+        (718, b"\x1b[?2026h\x1b[36;57r\x1b[36;1H\x1bM\x1b[r\x1b[1;36r\x1b[35;1H\r\n"),
+        (718, b"\x1b[39;49m\x1b[K  13\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[38;14H\x1b[39m\x1b[49m\x1b[0m\x1b[37;1H\x1b[0 q\x1b[37;1H \x1b[39m\x1b[49m\x1b[0m\x1b[39;14H\x1b[?25h\x1b[?2026l"),
+        (729, b"\x1b[?2026h\x1b[37;57r\x1b[37;1H\x1bM\x1b[r\x1b[1;37r\x1b[36;1H\r\n"),
+        (729, b"\x1b[39;49m\x1b[K  14\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[39;14H\x1b[39m\x1b[49m\x1b[0m\x1b[38;1H\x1b[0 q\x1b[38;1H \x1b[39m\x1b[49m\x1b[0m\x1b[40;14H\x1b[?25h\x1b[?2026l"),
+        (791, b"\x1b[?2026h\x1b[38;57r\x1b[38;1H\x1bM\x1b[r\x1b[1;38r\x1b[37;1H\r\n"),
+        (791, b"\x1b[39;49m\x1b[K  15\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[40;14H\x1b[39m\x1b[49m\x1b[0m\x1b[39;1H\x1b[0 q\x1b[39;1H \x1b[39m\x1b[49m\x1b[0m\x1b[41;14H\x1b[?25h\x1b[?2026l"),
+        (845, b"\x1b]0;\xe2\xa0\xb8 aterm\x07"),
+        (845, b"\x1b[?2026h\x1b[39;57r\x1b[39;1H\x1bM\x1b[r\x1b[1;39r\x1b[38;1H\r\n"),
+        (845, b"\x1b[39;49m\x1b[K  16\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[41;14H\x1b[39m\x1b[49m\x1b[0m\x1b[40;1H\x1b[0 q\x1b[40;1H \x1b[39m\x1b[49m\x1b[0m\x1b[42;14H\x1b[?25h\x1b[?2026l"),
+        (887, b"\x1b[?2026h\x1b[40;57r\x1b[40;1H\x1bM\x1b[r\x1b[1;40r\x1b[39;1H\r\n"),
+        (887, b"\x1b[39;49m\x1b[K  17\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[42;14H\x1b[39m\x1b[49m\x1b[0m\x1b[41;1H\x1b[0 q\x1b[41;1H \x1b[39m\x1b[49m\x1b[0m\x1b[43;14H\x1b[?25h\x1b[?2026l"),
+        (989, b"\x1b]0;\xe2\xa0\xbc aterm\x07"),
+        (1090, b"\x1b]0;\xe2\xa0\xb4 aterm\x07"),
+        (1120, b"\x1b]0;\xe2\xa0\xa6 aterm\x07"),
+        (1120, b"\x1b[?2026h\x1b[41;57r\x1b[41;1H\x1bM\x1b[r\x1b[1;41r\x1b[40;1H\r\n"),
+        (1120, b"\x1b[39;49m\x1b[K  18\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[43;14H\x1b[39m\x1b[49m\x1b[0m\x1b[42;1H\x1b[0 q\x1b[42;1H \x1b[39m\x1b[49m\x1b[0m\x1b[44;14H\x1b[?25h\x1b[?2026l"),
+        (1129, b"\x1b[?2026h\x1b[42;57r\x1b[42;1H\x1bM\x1b[r\x1b[1;42r\x1b[41;1H\r\n"),
+        (1129, b"\x1b[39;49m\x1b[K  19\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[44;14H\x1b[39m\x1b[49m\x1b[0m\x1b[43;1H\x1b[0 q\x1b[43;1H \x1b[39m\x1b[49m\x1b[0m\x1b[45;14H\x1b[?25h\x1b[?2026l"),
+        (1138, b"\x1b[?2026h\x1b[43;57r\x1b[43;1H\x1bM\x1b[r\x1b[1;43r\x1b[42;1H\r\n"),
+        (1138, b"\x1b[39;49m\x1b[K  20\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[45;14H\x1b[39m\x1b[49m\x1b[0m\x1b[44;1H\x1b[0 q\x1b[44;1H \x1b[39m\x1b[49m\x1b[0m\x1b[46;14H\x1b[?25h\x1b[?2026l"),
+        (1183, b"\x1b[?2026h\x1b[44;57r\x1b[44;1H\x1bM\x1b[r\x1b[1;44r\x1b[43;1H\r\n"),
+        (1183, b"\x1b[39;49m\x1b[K  21\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[46;14H\x1b[39m\x1b[49m\x1b[0m\x1b[45;1H\x1b[0 q\x1b[45;1H \x1b[39m\x1b[49m\x1b[0m\x1b[47;14H\x1b[?25h\x1b[?2026l"),
+        (1284, b"\x1b]0;\xe2\xa0\xa7 aterm\x07"),
+        (1293, b"\x1b[?2026h\x1b[45;57r\x1b[45;1H\x1bM\x1b[r\x1b[1;45r\x1b[44;1H\r\n"),
+        (1293, b"\x1b[39;49m\x1b[K  22\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[47;14H\x1b[39m\x1b[49m\x1b[0m\x1b[46;1H\x1b[0 q\x1b[46;1H \x1b[39m\x1b[49m\x1b[0m\x1b[48;14H\x1b[?25h\x1b[?2026l"),
+        (1303, b"\x1b[?2026h\x1b[46;57r\x1b[46;1H\x1bM\x1b[r\x1b[1;46r\x1b[45;1H\r\n"),
+        (1303, b"\x1b[39;49m\x1b[K  23\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[48;14H\x1b[39m\x1b[49m\x1b[0m\x1b[47;1H\x1b[0 q\x1b[47;1H \x1b[39m\x1b[49m\x1b[0m\x1b[49;14H\x1b[?25h\x1b[?2026l"),
+        (1330, b"\x1b]0;\xe2\xa0\x87 aterm\x07\x1b[?2026h\x1b[47;57r\x1b[47;1H\x1bM\x1b[r\x1b[1;47r\x1b[46;1H\r\n"),
+        (1330, b"\x1b[39;49m\x1b[K  24\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[49;14H\x1b[39m\x1b[49m\x1b[0m\x1b[48;1H\x1b[0 q\x1b[48;1H \x1b[39m\x1b[49m\x1b[0m\x1b[50;14H\x1b[?25h\x1b[?2026l"),
+        (1417, b"\x1b]0;\xe2\xa0\x8f aterm\x07\x1b[?2026h\x1b[48;57r\x1b[48;1H\x1bM\x1b[r\x1b[1;48r\x1b[47;1H\r\n"),
+        (1417, b"\x1b[39;49m\x1b[K  25\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[50;14H\x1b[39m\x1b[49m\x1b[0m\x1b[49;1H\x1b[0 q\x1b[49;1H \x1b[39m\x1b[49m\x1b[0m\x1b[51;14H\x1b[?25h\x1b[?2026l"),
+        (1473, b"\x1b[?2026h\x1b[49;57r\x1b[49;1H\x1bM\x1b[r\x1b[1;49r\x1b[48;1H\r\n"),
+        (1473, b"\x1b[39;49m\x1b[K  26\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[51;14H\x1b[39m\x1b[49m\x1b[0m\x1b[50;1H\x1b[0 q\x1b[50;1H \x1b[39m\x1b[49m\x1b[0m\x1b[52;14H\x1b[?25h\x1b[?2026l"),
+        (1527, b"\x1b]0;\xe2\xa0\x8b aterm\x07\x1b[?2026h\x1b[50;57r\x1b[50;1H\x1bM\x1b[r\x1b[1;50r\x1b[49;1H\r\n"),
+        (1527, b"\x1b[39;49m\x1b[K  27\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[52;14H\x1b[39m\x1b[49m\x1b[0m\x1b[51;1H\x1b[0 q\x1b[51;1H \x1b[39m\x1b[49m\x1b[0m\x1b[53;14H\x1b[?25h\x1b[?2026l"),
+        (1575, b"\x1b[?2026h\x1b[51;57r\x1b[51;1H\x1bM\x1b[r\x1b[1;51r\x1b[50;1H\r\n"),
+        (1575, b"\x1b[39;49m\x1b[K  28\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[53;14H\x1b[39m\x1b[49m\x1b[0m\x1b[52;1H\x1b[0 q\x1b[52;1H \x1b[39m\x1b[49m\x1b[0m\x1b[54;14H\x1b[?25h\x1b[?2026l"),
+        (1608, b"\x1b]0;\xe2\xa0\x99 aterm\x07"),
+        (1608, b"\x1b[?2026h\x1b[52;57r\x1b[52;1H\x1bM\x1b[r\x1b[1;52r\x1b[51;1H\r\n"),
+        (1608, b"\x1b[39;49m\x1b[K  29\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[54;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (1710, b"\x1b]0;\xe2\xa0\xb9 aterm\x07"),
+        (1738, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (1738, b"\x1b[39;49m\x1b[K  30\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (1747, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (1747, b"\x1b[39;49m\x1b[K  31\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (1812, b"\x1b]0;\xe2\xa0\xb8 aterm\x07\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (1812, b"\x1b[39;49m\x1b[K  32\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (1864, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (1864, b"\x1b[39;49m\x1b[K  33\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (1939, b"\x1b]0;\xe2\xa0\xbc aterm\x07"),
+        (1939, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (1939, b"\x1b[39;49m\x1b[K  34\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2014, b"\x1b]0;\xe2\xa0\xb4 aterm\x07"),
+        (2014, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (2014, b"\x1b[39;49m\x1b[K  35\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2046, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (2046, b"\x1b[39;49m\x1b[K  36\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2148, b"\x1b]0;\xe2\xa0\xa6 aterm\x07"),
+        (2198, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (2198, b"\x1b[39;49m\x1b[K  37\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2212, b"\x1b]0;\xe2\xa0\xa7 aterm\x07\x1b[?2026h\x1b[1;52r\x1b[52;1H"),
+        (2212, b"\r\n"),
+        (2212, b"\x1b[39;49m\x1b[K  38\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2245, b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (2245, b"\x1b[39;49m\x1b[K  39\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        (2347, b"\x1b]0;\xe2\xa0\x87 aterm\x07"),
+        (2409, b"\x1b]0;\xe2\xa0\x8f aterm\x07\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\n"),
+        (2409, b"\x1b[39;49m\x1b[K  40\x1b[39m\x1b[49m\x1b[0m\x1b[r\x1b[55;14H\x1b[39m\x1b[49m\x1b[0m\x1b[53;1H\x1b[0 q\x1b[53;1H \x1b[39m\x1b[49m\x1b[0m\x1b[55;14H\x1b[?25h\x1b[?2026l"),
+        ];
+
+        let mut app = App::headless_for_test();
+        let mut cfg = app.glow_config();
+        cfg.enabled = true;
+        cfg.style = crate::cursor_glow::GlowStyle::RainbowKitty;
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 57,
+            cols: 151,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 1208,
+            win_h: 912,
+            head: 0,
+        };
+        let t0 = Instant::now();
+
+        // The window the capture was taken on, with history: phase B's archival
+        // scroll only takes the top-anchored path when the ring can hold a line.
+        let mut term = TerminalBuilder::new()
+            .size(57, 151)
+            .ring_buffer_size(1000)
+            .build();
+        // The composer as the capture left it right before record 642: the caret
+        // on row 26 (0-based), column 9, which is 1-based `ESC[27;10H`.
+        term.process(b"\x1b[27;10H");
+        let ws = app.windows.get_mut(&WindowId(0)).expect("test window");
+        ws.cursor_scroll_state = Some(term.content_scroll_state());
+        let mut out = Vec::new();
+        let mut unmoved = crate::cursor_glow::CursorGlow::default();
+        let mut unmoved_out = Vec::new();
+        ws.cursor_glow.tick(Some((26, 1)), t0, &cfg, geom, &mut out);
+        unmoved.tick(Some((26, 1)), t0, &cfg, geom, &mut unmoved_out);
+        for i in 2..=9u16 {
+            let at = t0 + Duration::from_millis(u64::from(i) * 120);
+            ws.cursor_glow.note_synthetic_typed(at, 1);
+            unmoved.note_synthetic_typed(at, 1);
+            unmoved.tick(
+                Some((26, i)),
+                at + Duration::from_millis(4),
+                &cfg,
+                geom,
+                &mut unmoved_out,
+            );
+            ws.cursor_glow.tick(
+                Some((26, i)),
+                at + Duration::from_millis(4),
+                &cfg,
+                geom,
+                &mut out,
+            );
+        }
+        let earned = ws.cursor_glow.ribbon_segments();
+        assert!(earned > 0, "fixture: the composer is lit before the answer");
+        let spawns = ws.cursor_glow.spawns();
+        let t_stream = t0 + Duration::from_millis(9 * 120 + 40);
+        let mut momentum = ws.cursor_glow.typing_momentum(t_stream);
+
+        let mut bands = 0u64;
+        let mut caret = term.cursor();
+        for (k, (dt_ms, bytes)) in CODEX_STREAM.iter().enumerate() {
+            let at = t_stream + Duration::from_millis(*dt_ms);
+            term.process(bytes);
+            let change = sync_cursor_effect_scroll(ws, term.content_scroll_state());
+            assert!(
+                !change.invalidated,
+                "record {k}: a real Codex write retired the cursor effects"
+            );
+            assert!(
+                change.band_moves <= 1,
+                "record {k}: one pty write is at most one band move"
+            );
+            bands += u64::from(change.band_moves);
+            caret = term.cursor();
+            ws.cursor_glow
+                .tick(Some((caret.row, caret.col)), at, &cfg, geom, &mut out);
+
+            assert_eq!(
+                ws.cursor_glow.v2_status().map(|s| s.meteors),
+                Some(0),
+                "record {k}: program output flew a meteor"
+            );
+            assert_eq!(
+                ws.cursor_glow.spawns(),
+                spawns,
+                "record {k}: program output minted light (T1)"
+            );
+            // The same earned ribbon, held still, is the ageing reference.
+            // A 2.4-second answer may outlive its light; a band must neither
+            // kill it early nor renew it. This catches a reset on record zero,
+            // while preserving the authored lifetime after typing stops.
+            unmoved.tick(Some((26, 9)), at, &cfg, geom, &mut unmoved_out);
+            let reference_cells = unmoved.v2_status().expect("reference engaged").cells;
+            if k == 0 {
+                assert!(reference_cells > 0, "the reset control must be observable");
+            }
+            assert_eq!(
+                ws.cursor_glow
+                    .v2_status()
+                    .expect("moving ribbon engaged")
+                    .cells,
+                reference_cells,
+                "record {k}: a band changed the earned cells' lifetime"
+            );
+            if unmoved.ribbon_segments() > 0 {
+                assert!(
+                    ws.cursor_glow.ribbon_segments() > 0,
+                    "record {k}: the moved ribbon went dark before its stationary twin"
+                );
+            }
+            let now = ws.cursor_glow.typing_momentum(at);
+            assert!(
+                now <= momentum + 1e-6,
+                "record {k}: momentum restarted ({momentum} -> {now}) instead of decaying"
+            );
+            momentum = now;
+        }
+
+        assert_eq!(
+            bands, 39,
+            "28 phase-A reverse indexes + 11 phase-B archival line feeds"
+        );
+        assert_eq!(
+            ws.cursor_glow.band_moves(),
+            39,
+            "the glow was handed every one of them"
+        );
+        // 26 + 28 phase-A rows: the composer rode its band all the way down and
+        // phase B, whose band is [0..=51], then left it exactly where it was.
+        assert_eq!(caret.row, 54, "the composer's row at the end of the answer");
+        assert_eq!(
+            ws.cursor_glow
+                .v2_status()
+                .expect("moving ribbon engaged")
+                .cells,
+            unmoved.v2_status().expect("reference engaged").cells,
+            "the answer preserves exactly the cells their authored lifetime allows"
         );
     }
 
@@ -2006,6 +2506,7 @@ mod cursor_scroll_signal_tests {
             ContentScrollState {
                 uniform_up_rows: 0,
                 invalidation_epoch: 1,
+                ..Default::default()
             },
         );
         assert!(change.invalidated);
@@ -6841,7 +7342,7 @@ pub(crate) fn flying_head_footprint_px(
 /// Pure geometry: prediction expiry/reconciliation remains on its existing
 /// paint path. The current find match is already a terminal selection; both
 /// possible find-bar bands are reserved because its late placement can flip.
-fn pet_console_exclusions(
+pub(crate) fn pet_console_exclusions(
     input: &aterm_core::render::RenderInput,
     preedit: bool,
     predictions: Option<(usize, usize, usize, usize)>,
@@ -7770,6 +8271,104 @@ mod resident_pet_presentation_tests {
     use std::time::Instant;
 
     #[test]
+    fn resident_pet_under_load_keeps_full_body_cursor_home_and_no_frame_debt() {
+        use aterm_effects::rainbow_kitty::companion::HostSense;
+        use std::time::Duration;
+        let mut app = crate::App::headless_for_test();
+        let cfg = app.glow_config();
+        let geom = aterm_effects::word_decorations::EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 30,
+            cols: 80,
+        };
+        let ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
+        let start = Instant::now();
+        let mut tick = 0;
+        // Partial fade-out, exact zero, and partial recovery all keep a
+        // static full resident. Move the caret between episodes to prove the
+        // stationary posture still follows actual input on the next frame.
+        for (episode, envelope) in [0.75f32, 0.25, 0.0, 0.5].into_iter().enumerate() {
+            let caret = (4, [12_u16, 60, 8, 48][episode]);
+            let visible = super::resident_pet_surface_presentable(true, true, true, true, false);
+            let reduced = super::resident_pet_reduced_motion(false, envelope == 0.0, envelope);
+            assert!(visible && reduced);
+            let mut previous = None;
+            for _ in 0..20 {
+                let now = start + Duration::from_millis(tick * 16);
+                tick += 1;
+                ws.cursor_pet.set_console_presentable(visible);
+                let frame = ws.cursor_pet.tick(super::companion_pet_sense(
+                    now,
+                    geom,
+                    &cfg,
+                    reduced,
+                    HostSense {
+                        caret: Some(caret),
+                        ..HostSense::default()
+                    },
+                ));
+                assert_eq!(frame.alpha, 255, "pressure must not fade the resident");
+                let body = frame
+                    .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+                    .unwrap();
+                assert!(body.1 - body.0 >= 5 * i32::from(geom.cell_w));
+                assert!(body.3 - body.2 >= i32::from(geom.cell_h));
+                let cursor_x = i32::from(caret.1) * i32::from(geom.cell_w);
+                assert!(
+                    (body.0 - cursor_x).max(cursor_x - body.1).max(0)
+                        <= 10 * i32::from(geom.cell_w)
+                );
+                assert!(
+                    !ws.cursor_pet.needs_frames(),
+                    "a retained static body owes no idle animation"
+                );
+                if let Some(previous) = previous {
+                    assert_eq!(frame.fp(), previous, "idle frames remain byte-stable");
+                }
+                previous = Some(frame.fp());
+                assert!(super::pet_hit_rect_for_frame(true, 1.0, &frame, geom, (0, 0)).is_some());
+                ws.free_scratch.clear();
+                ws.word_decos.begin_host_frame();
+                let head = ws.cursor_cat.static_frame(now);
+                let fp = super::emit_single_cursor_companion(
+                    ws,
+                    geom,
+                    Some(caret),
+                    true,
+                    false,
+                    frame,
+                    head,
+                    0,
+                    now,
+                    reduced,
+                    0x0010_1010,
+                    0x00FF_FFFF,
+                    0x0050_FA7B,
+                );
+                assert_ne!(fp, 0);
+                assert_eq!(
+                    ws.free_scratch.len(),
+                    1,
+                    "the static posture emits only its full body"
+                );
+                assert!(ws.free_scratch[0].w >= 5 * geom.cell_w);
+            }
+        }
+        // Genuine ownership loss remains an immediate negative control.
+        for denied in [
+            super::resident_pet_surface_presentable(false, true, true, true, false),
+            super::resident_pet_surface_presentable(true, false, true, true, false),
+            super::resident_pet_surface_presentable(true, true, false, true, false),
+            super::resident_pet_surface_presentable(true, true, true, false, false),
+        ] {
+            assert!(!denied);
+        }
+        super::retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut ws.cursor_pet);
+        assert!(!ws.cursor_pet.is_active() && !ws.cursor_pet.needs_frames());
+    }
+
+    #[test]
     fn resident_pet_does_not_depend_on_flying_kitty_animation() {
         assert!(resident_pet_presentation_enabled(
             true,
@@ -7788,11 +8387,11 @@ mod resident_pet_presentation_tests {
     }
 
     #[test]
-    fn single_and_composed_companions_share_continuous_shed_admission_and_alpha() {
+    fn flying_heads_keep_continuous_shed_admission_and_alpha() {
         for (envelope, expected) in [(1.0, 200), (0.75, 150), (0.5, 100), (0.25, 50)] {
             assert!(
                 shed_companion_presentable(true, envelope),
-                "both render paths retain companion custody at {envelope}"
+                "both render paths retain flying-head custody at {envelope}"
             );
             assert_eq!(shed_companion_alpha(200, envelope), expected);
         }
@@ -11296,7 +11895,7 @@ pub(crate) fn pet_hit_rect_win(
 /// than four scalars: they are one thing (this surface's grid), the emitter that
 /// must agree with this rect already speaks that type, and four positional `u16`s
 /// in a row are exactly the shape a `cols`/`rows` swap hides in.
-fn pet_hit_rect_for_frame(
+pub(crate) fn pet_hit_rect_for_frame(
     pet_visible: bool,
     sing: f32,
     frame: &aterm_effects::kitty_pet::PetFrame,
@@ -11359,6 +11958,25 @@ pub(crate) fn verdict_armed(
     true
 }
 
+/// Spend one keyed completion in either layout and feed an explicitly armed
+/// celebration on success. The return value is the existing verdict admission,
+/// so its sound and the celebration share one Enter rather than separate latches.
+/// Failed commands consume the boundary too; a later unkeyed success cannot use it.
+fn keyed_celebration_completion(
+    sing: &mut aterm_effects::kitty_sing::KittySing,
+    spent: &mut Option<(u64, std::time::Instant)>,
+    session: u64,
+    boundary: Option<std::time::Instant>,
+    now: std::time::Instant,
+    code: i32,
+) -> bool {
+    let keyed = verdict_armed(spent, session, boundary);
+    if keyed && code == 0 {
+        sing.note_green_block(now, session);
+    }
+    keyed
+}
+
 /// What THE VERDICT does with one `D`, as a pure function of the three facts
 /// the shell handed over — so the law is testable without a terminal, a
 /// window, or a synth.
@@ -11394,6 +12012,84 @@ pub(crate) fn pet_output_burst(
     live_bottom: bool,
 ) -> bool {
     (scrolled || seq_advanced) && shell_executing && live_bottom
+}
+
+/// **THE ROOM'S FACTS** (Rainbow Kitty v2 panel #9) — what the resident pet
+/// is told about the session it lives in, on a frame the host is ALREADY
+/// drawing, through the sanctioned `note_*` idiom: never a light, never a
+/// wake. One projection for both render arms (the single-pane present and
+/// the composed one), fed just ahead of `note_executing` at the two sites
+/// that already hold the pet and the session, so a split can never tell
+/// the pet a different room than a single pane does.
+///
+/// * **(a) the lease** — `SessionCtx::turn_lease` live at `now_us`
+///   ([`crate::Lease::is_live`]: a `turn` in flight, or a cooperative
+///   `lease acquire` inside its TTL) — the same seam `who` and the
+///   connection map read, and no allocation (`driving_token` formats a
+///   String; the level needs only the bool);
+/// * **(b) quiet** — the status observer's published phase for the session
+///   ([`crate::session_status::Phase::Quiet`]: a foreground job, nothing
+///   printing recently), the chrome's own verdict restated;
+/// * **(c) the turn** — the newest [`crate::turn_ledger::TurnRecord`]'s id
+///   and settle verdict; the pet diffs the id itself;
+/// * **(d) the sibling** — the caret of a sibling pane genuinely streaming
+///   this frame, in the pet's pane cells (`None` in a single pane, and on
+///   every frame no sibling talks); the pet diffs the level itself;
+/// * **(e) the inbox** — [`crate::fabric::SessionFabric::room_facts`]: the
+///   newest unread row, a passed deadline, a standing hold.
+///
+/// Every read is a short leaf lock taken with LOCK A already released (the
+/// probes above these sites are done), the same locks the control thread's
+/// `who`/`turns`/`inbox` verbs take standalone, so no new lock edge is
+/// introduced. A session the pool no longer holds tells the pet nothing but
+/// "nobody is driving".
+fn note_room_facts(
+    pet: &mut aterm_effects::kitty_pet::PetBrain,
+    session: Option<&crate::Session>,
+    status: Option<&crate::session_status::Status>,
+    now: Instant,
+    sibling: Option<(f32, f32)>,
+) {
+    pet.note_room_quiet(status.is_some_and(|s| s.phase == crate::session_status::Phase::Quiet));
+    pet.note_room_sibling(now, sibling);
+    let Some(session) = session else {
+        pet.note_room_lease(false);
+        return;
+    };
+    let ctx = &session.ctx;
+    let now_us = crate::metrics::now_us();
+    let lease = ctx
+        .turn_lease
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|l| l.is_live(now_us));
+    pet.note_room_lease(lease);
+    let (turn_id, settled) = {
+        let turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
+        match turns.high_id() {
+            // `since(id − 1)` is the suffix at `id` exactly (ids are unique
+            // and strictly increasing), i.e. the newest record.
+            Some(id) => (
+                id,
+                turns
+                    .since(Some(id.saturating_sub(1)))
+                    .next()
+                    .is_some_and(|r| r.status == "settled"),
+            ),
+            None => (0, false),
+        }
+    };
+    pet.note_room_turn(now, turn_id, settled);
+    let (unseen, overdue, hold) = ctx.fabric.room_facts(crate::turn_ledger::now_ms());
+    pet.note_room_inbox(
+        now,
+        aterm_effects::kitty_pet::RoomInbox {
+            unseen,
+            overdue,
+            hold,
+        },
+    );
 }
 
 /// THE WRAP FACT (kitty-motion §4.1): one edge-detect over the emulator's
@@ -11655,54 +12351,35 @@ fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound:
     }
 }
 
-/// The SINGING FACE is LIVE: the sing drive at/above the S115 face-swap
-/// threshold (0.33 — `CatFrame::render_look` swaps to the authored open-mouth
-/// meow head there). ONE predicate for both FULL-MOTION render paths' pet
-/// caret feeds: while the face is live the pet's caret is withheld, so the pet
-/// fades out HOLDING POSITION and the singing face takes the caret; the moment
-/// the drive drops back below the threshold the caret re-feeds, and the pet's
-/// return is a fresh sighting at its keep-ahead station — never a flinch.
-/// Reduced motion uses [`pet_caret_admitted`]'s always-fed hidden resident.
-/// A non-finite drive reads as "not live" so a poisoned detector can never
-/// starve the pet of its caret.
-pub(crate) fn sing_face_live(drive: f32) -> bool {
-    drive >= 0.33
+/// THE OUTRO's sound event (§27): the armed celebration's ending in the run's
+/// own key — pushed once, on the last bar line, under the riff's own gain law
+/// ([`sing_riff_gain`]), so a quieted riff has a quiet ending.
+fn sing_outro_event(gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
+    aterm_effects::trail_sound::SoundEvent {
+        kind: aterm_effects::trail_sound::SoundGesture::Celebration(
+            aterm_effects::trail_sound::CelebrationGesture::outro(sig),
+        ),
+        ..sing_riff_event(0, gain, sig)
+    }
 }
 
-/// Whether the resident pet may track the caret while a song winds down.
-///
-/// Full-motion presentation starts the pet's return at the authored 0.33 face
-/// swap. Reduced motion has a stepped singer, so it keeps the pet caret-fed for
-/// the ENTIRE song while pixel custody remains exclusively with the singer.
-/// An already-visible resident therefore stays opaque, and a new resident can
-/// finish its 0.30 s fade-in behind the still. Most importantly, a late render
-/// may sample drive 1.0 -> 0.0 directly without depending on intermediate
-/// wind-down ticks: the cutoff reveals a ready pet instead of a blank frame.
+/// The resident always receives its caret while its surface is presentable.
+/// A song changes the surrounding effects, not the animal's home or identity.
+/// Keep the existing signature so both live paths and capture share one gate.
 pub(crate) fn pet_caret_admitted(pet_visible: bool, drive: f32, reduced_motion: bool) -> bool {
-    pet_visible
-        && if reduced_motion {
-            true
-        } else {
-            !sing_face_live(drive)
-        }
+    aterm_effects::companion::pet_caret_admitted(pet_visible, drive, reduced_motion)
 }
 
-/// THE SONG'S CUSTODY LAW: may the FLYING companion be drawn this frame?
-/// Outside pet mode an earned flight always may. In pet mode the resident pet
-/// owns the caret, and the flying kitty — the singing face — is admitted ONLY
-/// while the sing-along holds the frame (`sing > 0`: the armed hold plus the
-/// whole wind-down crossfade). Admission ends exactly when the drive drains
-/// to 0. In full motion the pet is already padding back because its caret
-/// re-fed at the 0.33 face swap ([`sing_face_live`]); reduced motion keeps the
-/// hidden resident caret-fed for the entire song ([`pet_caret_admitted`]).
+/// The flying companion belongs to classic mode. Pet mode keeps its full-body
+/// resident through the entire song, including a delayed or skipped tail frame.
 pub(crate) fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
-    !pet_mode || sing > 0.0
+    aterm_effects::companion::flying_kitty_admitted(pet_mode, sing)
 }
 
-/// The pet half of [`flying_kitty_admitted`]: exactly one companion owns a
-/// pet-mode frame, including the song's wind-down.
+/// Exactly one companion owns pet mode: the full resident, independent of song
+/// drive. A song must neither hide it nor replace it with a floating head.
 pub(crate) fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
-    pet_visible && !flying_kitty_admitted(true, sing)
+    aterm_effects::companion::pet_companion_admitted(pet_visible, sing)
 }
 
 /// WHICH companion — at most ONE, always — puts a body in this frame.
@@ -11718,9 +12395,9 @@ pub(crate) fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
 /// the other animal's.
 ///
 /// THE PET WINS A TIE. It is the resident; the flying head is the earned
-/// flypast, and in pet mode it is admitted only for the sing-along, exactly
-/// when `pet_companion_admitted` is false. A tie is therefore already
-/// impossible upstream — this makes it impossible downstream too.
+/// flypast from classic mode. A song never grants a second companion in pet
+/// mode. The shared gates forbid a tie; this final choice also resolves one
+/// safely if a future caller hands it inconsistent alphas.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompanionDuty {
     /// No companion body this frame.
@@ -11756,14 +12433,45 @@ fn cursor_companion_presentable(decoration_presentable: bool, live_viewport: boo
     decoration_presentable && live_viewport
 }
 
+/// The resident keeps its body and caret while performance pressure reduces
+/// animation. Stable accessibility/focus policy still wins, and an in-progress
+/// shed fade stays static until full amplitude has returned. This changes no
+/// flying-head or trail policy; their existing alpha envelope remains separate.
+#[inline]
+pub(crate) fn resident_pet_reduced_motion(
+    policy_reduced: bool,
+    shed_active: bool,
+    envelope: f32,
+) -> bool {
+    aterm_effects::companion::resident_pet_reduced_motion(policy_reduced, shed_active, envelope)
+}
+
+/// Actual surface custody for the full resident. Load shedding is deliberately
+/// absent: it changes the motion posture above, never ownership of the body.
+#[inline]
+pub(crate) fn resident_pet_surface_presentable(
+    focused: bool,
+    companions_allowed: bool,
+    unobscured: bool,
+    live_viewport: bool,
+    reading_interest: bool,
+) -> bool {
+    aterm_effects::companion::resident_pet_surface_presentable(
+        focused,
+        companions_allowed,
+        unobscured,
+        live_viewport,
+        reading_interest,
+    )
+}
+
 #[inline]
 fn shed_companion_presentable(base_presentable: bool, envelope: f32) -> bool {
     base_presentable && envelope.is_finite() && envelope > 0.0
 }
 
-/// Apply the adaptive load-shed envelope at the final companion presentation
-/// seam. The companion brains retain their unscaled state; only the copied
-/// frame handed to the renderer is attenuated.
+/// Apply the adaptive load-shed envelope to the flying head. The full resident
+/// keeps its opacity and uses a static posture while pressure persists.
 #[inline]
 fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
     let envelope = if envelope.is_finite() {
@@ -11789,14 +12497,9 @@ fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
     }
 }
 
-/// Pin a PET-MODE episode's exit flourish to Plain, on the frame copy the
-/// host is about to draw (the state machine's roll becomes presentation-dead;
-/// no engine state changes). In pet mode the flying companion exists solely
-/// for the sing-along, and its admission ([`flying_kitty_admitted`]) ends the
-/// instant the drive drains — a rolled heart/star would either play over the
-/// pet's return or be chopped mid-flourish when admission cuts `kitty_alpha`
-/// to 0 (the exit emitter gates on it). The song's goodbye is the pet padding
-/// back, not a firework.
+/// A stale classic episode cannot paint a detached exit flourish over the
+/// resident. Pet mode keeps the full body during singing and never admits the
+/// flying head; pinning the copied exit also keeps that policy explicit here.
 fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
     if pet_mode {
         frame.exit = crate::kitty_cursor::CatExit::Plain;
@@ -11809,7 +12512,6 @@ mod pet_sing_swap_tests {
         CursorFxInputs, cursor_companion_presentable, flying_kitty_admitted,
         forward_kitty_cursor_motion, pet_caret_admitted, pet_companion_admitted,
         pet_hit_rect_for_frame, pin_pet_mode_exit, retire_kitty_cursor_without_owner,
-        sing_face_live,
     };
     use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
     use crate::{App, WindowId};
@@ -11828,19 +12530,6 @@ mod pet_sing_swap_tests {
             rows: 30,
             cols: 80,
         }
-    }
-
-    /// The pet yields exactly at the S115 face-swap threshold — below it the
-    /// pet keeps the caret, at/above it the singing face owns it — and a
-    /// poisoned (NaN) drive must read "not live" so the pet never starves.
-    #[test]
-    fn face_goes_live_at_the_swap_threshold() {
-        assert!(!sing_face_live(0.0));
-        assert!(!sing_face_live(0.3299));
-        assert!(sing_face_live(0.33));
-        assert!(sing_face_live(0.34));
-        assert!(sing_face_live(1.0));
-        assert!(!sing_face_live(f32::NAN));
     }
 
     #[test]
@@ -11868,8 +12557,8 @@ mod pet_sing_swap_tests {
 
         let ws = app.windows.get_mut(&wid).expect("window");
         assert!(
-            ws.cursor_pet.needs_frames(),
-            "negative control: the ordinary full-motion settle window is charged"
+            !ws.cursor_pet.needs_frames(),
+            "the static placement itself has no unfinished motion"
         );
         assert!(
             !ws.cursor_dependents_need_frame_cadence(now, false),
@@ -11880,10 +12569,24 @@ mod pet_sing_swap_tests {
             None,
             "an opaque reduced still owes no follow-up frame train"
         );
+        // The same brain must report actual motion again when it is enabled.
+        let _ = ws.cursor_pet.tick(PetSense {
+            now: now + Duration::from_millis(16),
+            caret: Some((4, 50)),
+            rows: 24,
+            cols: 80,
+            cell_w: 10,
+            cell_h: 20,
+            reduced_motion: false,
+            output_burst: false,
+            pointer: None,
+            wrapped: false,
+        });
+        assert!(ws.cursor_pet.needs_frames(), "real resumed motion is owed");
     }
 
     #[test]
-    fn reduced_song_keeps_pet_ready_under_singer_and_late_cutoffs_never_blank() {
+    fn reduced_song_keeps_the_full_pet_visible_and_late_cutoffs_never_blank() {
         let t0 = Instant::now();
         let sense = |now, caret| PetSense {
             now,
@@ -11900,8 +12603,7 @@ mod pet_sing_swap_tests {
         let mut pet = PetBrain::default();
         let mut now = t0;
 
-        // The ordinary resident is fully present before the song earns its
-        // opaque still singer.
+        // The ordinary resident is fully present before the song starts.
         for _ in 0..30 {
             now += Duration::from_millis(16);
             let _ = pet.tick(sense(now, Some((4, 12))));
@@ -11928,10 +12630,10 @@ mod pet_sing_swap_tests {
         );
         let held = singer.static_frame(now);
         assert_eq!(held.alpha, 255);
-        assert!(flying_kitty_admitted(true, held.sing));
-        assert!(!pet_companion_admitted(true, held.sing));
-        // Caret custody and pixel custody are deliberately separate: keeping
-        // the resident fed under the still never puts two bodies on glass.
+        assert!(!flying_kitty_admitted(true, held.sing));
+        assert!(pet_companion_admitted(true, held.sing));
+        // The singer still has an engine frame, but only the full resident
+        // is admitted to the renderer and receives the live caret.
         pet_frame = pet.tick(sense(now, Some((4, 12))));
         assert_eq!(pet_frame.alpha, 255);
 
@@ -11963,7 +12665,7 @@ mod pet_sing_swap_tests {
         let started = bind_handoff(
             &handoff_model.init_state(),
             "StartReducedSong",
-            held.alpha > 0,
+            flying_kitty_admitted(true, held.sing) && held.alpha > 0,
             pet_frame.alpha == 255 && pet_caret_admitted(true, 1.0, true),
             pet_companion_admitted(true, held.sing) && pet_frame.alpha > 0,
         );
@@ -12070,50 +12772,156 @@ mod pet_sing_swap_tests {
             now += Duration::from_millis(16);
             let frame = cold_pet.tick(sense(now, Some((4, 12))));
             assert!(pet_caret_admitted(true, 1.0, true));
-            assert!(!pet_companion_admitted(true, 1.0));
+            assert!(pet_companion_admitted(true, 1.0));
             assert_eq!(frame.alpha, 255, "the reduced still stays opaque");
             pet_frame = frame;
         }
-        assert_eq!(pet_frame.alpha, 255, "pet remains ready under singer");
+        assert_eq!(
+            pet_frame.alpha, 255,
+            "the full pet remains visible through singing"
+        );
 
-        // Full motion deliberately keeps the authored 0.33 caret swap.
-        assert!(!pet_caret_admitted(true, 0.4, false));
+        // Full motion keeps the same resident and caret through every phase.
+        assert!(pet_caret_admitted(true, 0.4, false));
         assert!(pet_caret_admitted(true, 0.329, false));
         assert!(pet_caret_admitted(true, f32::NAN, true));
     }
 
-    /// The swap, end to end at the gate level: an armed song in pet mode
-    /// admits the flying kitty's alpha and withholds the pet's caret; a
-    /// drained song (drive 0) cuts admission and restores the caret in the
-    /// same frame; outside pet mode nothing changes.
+    /// Both motion policies and every phase keep the resident on the caret;
+    /// the classic flying-head mode retains its own presentation policy.
     #[test]
-    fn armed_song_swaps_the_companions_and_the_drain_swaps_back() {
-        let (pet_mode, kitty_enabled, cat_alpha) = (true, true, 200u8);
-        // Armed (drive 1): the singing face is the companion.
-        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 1.0) {
-            cat_alpha
-        } else {
-            0
-        };
-        assert!(kitty_alpha > 0, "armed drive must admit the singing face");
-        assert!(
-            sing_face_live(1.0),
-            "armed drive must withhold the pet caret (fed None)"
-        );
-        // Drained (drive 0): admission ends, the pet's caret is restored.
-        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 0.0) {
-            cat_alpha
-        } else {
-            0
-        };
-        assert_eq!(kitty_alpha, 0, "drained drive must cut admission");
-        assert!(
-            !sing_face_live(0.0),
-            "drained drive must re-feed the pet caret"
-        );
-        // Outside pet mode the earned flight is untouched by the song.
-        assert!(flying_kitty_admitted(false, 0.0));
-        assert!(flying_kitty_admitted(false, 1.0));
+    fn a_song_keeps_full_pet_custody_and_never_admits_a_second_head() {
+        for reduced in [false, true] {
+            for drive in [0.0, 0.1, 0.329, 0.33, 0.49, 1.0, f32::NAN, f32::INFINITY] {
+                assert!(pet_caret_admitted(true, drive, reduced));
+                assert!(pet_companion_admitted(true, drive));
+                assert!(!flying_kitty_admitted(true, drive));
+                assert!(!pet_caret_admitted(false, drive, reduced));
+                assert!(!pet_companion_admitted(false, drive));
+                assert!(flying_kitty_admitted(false, drive));
+                assert_eq!(
+                    super::cursor_companion_duty(true, 255, Some((4, 12))),
+                    super::CompanionDuty::Pet,
+                    "a stale singing-head alpha cannot replace or double the resident"
+                );
+            }
+        }
+    }
+
+    /// Real pet ticks and the shipping sprite emitter, with a moving caret
+    /// during the held song and its tail. The former caret-withholding gate
+    /// made this animal fade out; a head cannot satisfy the full-body check.
+    #[test]
+    fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
+        let geom = hit_geom();
+        for reduced in [false, true] {
+            let mut app = App::headless_for_test();
+            let ws = app.windows.get_mut(&WindowId(0)).expect("window");
+            let mut now = Instant::now();
+            let mut col = 12;
+            for drive in [0.0, 1.0, 0.49, 0.33, 0.1, 0.0] {
+                for tick in 0..45 {
+                    now += Duration::from_millis(16);
+                    if tick == 20 {
+                        col += 2;
+                    }
+                    let caret = (4, col);
+                    let frame = ws.cursor_pet.tick(PetSense {
+                        now,
+                        caret: pet_caret_admitted(true, drive, reduced).then_some(caret),
+                        rows: geom.rows,
+                        cols: geom.cols,
+                        cell_w: geom.cell_w,
+                        cell_h: geom.cell_h,
+                        reduced_motion: reduced,
+                        output_burst: false,
+                        pointer: None,
+                        wrapped: false,
+                    });
+                    if drive == 0.0 && col == 12 && tick < 20 {
+                        continue; // only the initial appearance ramp
+                    }
+                    let body = frame
+                        .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+                        .expect("the full pet persists through every song phase");
+                    assert!(frame.alpha > 0);
+                    assert!(body.1 - body.0 >= 5 * i32::from(geom.cell_w));
+                    assert!(body.3 - body.2 >= i32::from(geom.cell_h));
+                    let cursor_x = i32::from(col) * i32::from(geom.cell_w);
+                    let horizontal_gap = (body.0 - cursor_x).max(cursor_x - body.1).max(0);
+                    assert!(horizontal_gap <= 10 * i32::from(geom.cell_w));
+                    assert!(
+                        (body.3 - 5 * i32::from(geom.cell_h)).abs() <= 5 * i32::from(geom.cell_h)
+                    );
+                    assert!(pet_hit_rect_for_frame(true, drive, &frame, geom, (0, 0)).is_some());
+                    let mut head = ws.cursor_cat.static_frame(now);
+                    head.sing = drive;
+                    head.alpha = 211; // a stale head must lose the final custody tie
+                    ws.free_scratch.clear();
+                    ws.word_decos.begin_host_frame();
+                    let fp = super::emit_single_cursor_companion(
+                        ws,
+                        geom,
+                        Some(caret),
+                        pet_companion_admitted(true, drive),
+                        false,
+                        frame,
+                        head,
+                        211,
+                        now,
+                        reduced,
+                        0x0010_1010,
+                        0x00FF_FFFF,
+                        0x0050_FA7B,
+                    );
+                    assert_ne!(fp, 0, "the production emitter drew the full resident");
+                    let sprite = ws
+                        .free_scratch
+                        .last()
+                        .expect("the resident body is emitted last");
+                    assert_eq!(
+                        (
+                            sprite.x,
+                            sprite.x + i32::from(sprite.w),
+                            sprite.y,
+                            sprite.y + i32::from(sprite.h)
+                        ),
+                        body
+                    );
+                    assert!(sprite.w >= 5 * geom.cell_w && sprite.h >= geom.cell_h);
+                    let attachments = frame.motes.iter().flatten().count()
+                        + frame.departures.iter().flatten().count();
+                    assert!(
+                        ws.free_scratch.len() <= 1 + attachments,
+                        "only the full resident and its declared attachments may be emitted"
+                    );
+                    let owned = ws.free_scratch.clone();
+                    let rejected_head = super::emit_single_cursor_companion(
+                        ws,
+                        geom,
+                        Some(caret),
+                        false,
+                        false,
+                        frame,
+                        head,
+                        211,
+                        now,
+                        reduced,
+                        0x0010_1010,
+                        0x00FF_FFFF,
+                        0x0050_FA7B,
+                    );
+                    assert_eq!(
+                        rejected_head, 0,
+                        "the production emitter refuses a second companion claim"
+                    );
+                    assert_eq!(
+                        ws.free_scratch, owned,
+                        "a stale head adds no pixels after the full body"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -19307,6 +20115,9 @@ pub(crate) struct TerminalCaptureFocus {
     pub(crate) alternate_screen: bool,
     pub(crate) live_viewport: bool,
     pub(crate) cursor: Option<(u16, u16)>,
+    /// Bounded console facts paired with these exact captured cells. The pet
+    /// must never refresh ownership or scroll history by re-locking later.
+    pub(crate) pet_world: aterm_effects::pet_world::PetWorldFacts,
     /// The advancing headless capture consumed the exact damage session while
     /// it still held the authorized extraction lock. A later decoration pass
     /// must never relock and accidentally consume a newer partial session.
@@ -20972,6 +21783,7 @@ mod motion_policy_tests {
                 true,
                 true,
                 10.0,
+                true,
             )
             .is_some(),
             "the motion-focus watcher owns a matching frame clock"
@@ -20984,6 +21796,7 @@ mod motion_policy_tests {
                 true,
                 false,
                 10.0,
+                true,
             ),
             None,
             "without OS focus, typed wake, or recording watcher no new clock is minted"
@@ -21294,54 +22107,20 @@ mod motion_policy_tests {
         );
     }
 
-    /// A PERFORMANCE SHED MAY NOT REWRITE THE RESIDENT'S MOTION MODEL.
-    ///
-    /// `PetBrain`'s reduced-motion arm is a hard PIN: under that flag the pet
-    /// does not travel to its station, it simply IS there, every frame, by
-    /// contract (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`
-    /// in aterm-effects). That is correct for a STABLE accessibility
-    /// preference and catastrophic for a flag that toggles under load: both
-    /// `PetSense` feeds used to pass `!animate_cat`, i.e.
-    /// `!(policy.animate(CursorGlow) && shed_envelope > 0.0)`, so a heavy
-    /// paste or a build log welded a walking, visible cat to the caret and
-    /// teleported it the width of the grid on the next keystroke — then handed
-    /// it back when the load passed. That is the owner's "slides, snaps, or
-    /// teleports", on a path the launch-speed law cannot see because it is not
-    /// a flight at all.
-    ///
-    /// A shed is a request to spend less time DRAWING. It still fades the
-    /// companion (`shed_companion_alpha`) and still freezes the flying cat's
-    /// frame (`animate_cat`); it may not change what the animal IS.
     #[test]
-    fn a_performance_shed_never_puts_the_pet_into_reduced_motion() {
-        // The resolved policy for an ordinary focused window with no system
-        // reduce-motion preference — the shape the owner runs.
-        let policy =
-            crate::motion::MotionPolicy::resolve(crate::motion::MotionMode::Full, false, true);
-
-        // The shed's own envelope is the term under test: whatever it does,
-        // the pet's reduced-motion input must depend on the POLICY alone.
-        for shed_envelope in [0.0f32, 0.25, 1.0] {
-            let animate_cat =
-                policy.animate(crate::motion::MotionEffect::CursorGlow) && shed_envelope > 0.0;
-            let pet_reduced = !policy.animate(crate::motion::MotionEffect::CursorGlow);
-
+    fn a_performance_shed_keeps_the_pet_static_and_preserves_head_policy() {
+        for envelope in [0.0f32, 0.25, 0.75, 1.0] {
+            assert!(super::resident_pet_reduced_motion(false, true, envelope));
             assert_eq!(
-                pet_reduced,
-                !policy.animate(crate::motion::MotionEffect::CursorGlow),
-                "the pet's motion model is the policy's alone"
+                super::resident_pet_reduced_motion(false, false, envelope),
+                envelope < 1.0,
+                "the resident remains static until the fade has fully recovered",
             );
-            if shed_envelope == 0.0 {
-                assert!(
-                    !animate_cat,
-                    "fixture: a fully shed frame does freeze the flying cat"
-                );
-                assert!(
-                    !pet_reduced,
-                    "…but must NOT pin the resident pet: a shed that flips \
-                     reduced motion teleports a visible walking body"
-                );
-            }
+            assert!(super::resident_pet_reduced_motion(true, false, envelope));
+            assert_eq!(
+                super::shed_companion_alpha(200, envelope),
+                (200.0 * envelope).round() as u8
+            );
         }
     }
 
@@ -23327,6 +24106,21 @@ impl App {
     ///
     /// `Err` when there is no focused window — an honest refusal, never a
     /// fabricated idle row.
+    /// The raw typing-momentum metric (`trail status momentum=`, the number
+    /// [`aterm_effects::cursor_glow::CursorGlow::typing_momentum`] reports) of
+    /// the window hosting `session`, stamped with the instant it was read —
+    /// the reading `await momentum` and `turn yield=` solve the release law
+    /// from. A session no window hosts has no ribbon: it reads exactly zero,
+    /// so a yield against it returns at once rather than waiting on nothing.
+    pub(crate) fn typing_momentum_of(&self, session: u64) -> Result<(f32, Instant), String> {
+        let now = Instant::now();
+        let v = self
+            .window_of_session(session)
+            .and_then(|wid| self.windows.get(&wid))
+            .map_or(0.0, |ws| ws.cursor_glow.typing_momentum(now));
+        Ok((v, now))
+    }
+
     pub(crate) fn trail_status(&self) -> Result<String, String> {
         let Some(id) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -26748,7 +27542,8 @@ impl App {
         let startup_pre_present = (!self.first_present_done).then(Instant::now);
         let present_result = self.present_input_scratch(id, visuals.invert, visuals.overlay);
         let (raster_submit_ns, startup_timing) = match present_result {
-            Ok(work_ns) => (
+            Ok(None) => return,
+            Ok(Some(work_ns)) => (
                 work_ns,
                 metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
             ),
@@ -26810,7 +27605,8 @@ impl App {
         let startup_pre_present = (!self.first_present_done).then(Instant::now);
         let present_result = self.present_input_scratch(id, visuals.invert, visuals.overlay);
         let (raster_submit_ns, startup_timing) = match present_result {
-            Ok(work_ns) => (
+            Ok(None) => return,
+            Ok(Some(work_ns)) => (
                 work_ns,
                 metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
             ),
@@ -26878,6 +27674,7 @@ impl App {
         // animation timers may still request redraws, but can never recreate the
         // failed-present -> full-grid-extraction CPU loop.
         match self.windows.get(&id) {
+            Some(ws) if ws.gpu_acquire_pending() => return,
             Some(ws) if !ws.present_retry.present_attempt_allowed() => {
                 metrics::note_redraw_retry_gated();
                 return;
@@ -28005,6 +28802,26 @@ impl App {
                         ));
                     }
                 }
+                // THE BAR FAN (§27): one fan per bar, on the frame that first
+                // sees the bar — armed run or held key alike — thrown at the
+                // caret through the glow's party seam (v2 only).
+                if let Some(fan) = ws.kitty_sing.take_bar_fan(frame_started) {
+                    ws.cursor_glow.party(frame_started, fan.n, fan.ring);
+                }
+                // THE OUTRO (§27): once, on the armed run's last bar line —
+                // the drop fan, and the ending on do under the riff's own
+                // sound law (gain resolved AFTER the visual, like the bars).
+                if let Some(outro) = ws.kitty_sing.take_outro(frame_started) {
+                    ws.cursor_glow.party(frame_started, outro.drop, false);
+                    if let Some(gain) = sing_riff_gain(
+                        ws.focused,
+                        self.config.trail_sounds_or_default(),
+                        self.config.trail_sound_riff_or_default(),
+                        self.config.trail_sound_volume(),
+                    ) {
+                        self.trail_audio.push(sing_outro_event(gain, outro.sig));
+                    }
+                }
             } else {
                 // Drained: settle the detector to byte-identical rest and
                 // re-open the bar latch for the next celebration.
@@ -28039,6 +28856,8 @@ impl App {
             // fire from nowhere over the pet's return. The song's goodbye is
             // the pet padding back.
             pin_pet_mode_exit(pet_mode, &mut cat_frame);
+            // External runs use exact bar/outro/settle deadlines. The held-key
+            // fallback below keeps its existing drain cadence.
             // Reduced motion: the STATIC CELEBRATION has no frame cadence of
             // its own (the state machine's 60 fps rearm rides `animate_cat`),
             // so keep frame-paced wakes flowing while any sing drive
@@ -28053,7 +28872,11 @@ impl App {
             // The cadence is unchanged from what the coalesced macOS
             // `request_redraw` delivered — one wake per panel refresh — so the
             // reduced-motion drain settles in exactly as many frames as before.
-            if !animate_cat && sing_drive > 0.0 && ws.os_window.is_some() {
+            if !animate_cat
+                && sing_drive > 0.0
+                && !ws.kitty_sing.external_live()
+                && ws.os_window.is_some()
+            {
                 ws.note_deco_animating(frame_started);
             }
             // Presentation follows the cursor-trail owner directly. Sparkle
@@ -28082,16 +28905,8 @@ impl App {
             // exactly the "invisible-cat wake train" the comment above warns
             // against. Gate everything on what can be drawn.
             //
-            // ONE EXCEPTION, through [`flying_kitty_admitted`] (owner: "bring
-            // back the singing kitty face"): while the sing-along holds the
-            // frame (`cat_frame.sing > 0` — the armed hold plus the whole
-            // wind-down crossfade) the pet steps aside and the SINGING FACE
-            // is the companion, so pet mode admits the flying kitty for
-            // exactly that span. Everything that reads `kitty_alpha` — the
-            // exit-flourish emitter, the `glow_fp` fold, the one-cat-per-caret
-            // gate, the MusicNotes emission — turns on and off with the same
-            // admission, and the pet-mode exit is pinned Plain above so the
-            // cut at drive 0 can never chop a heart/star mid-flourish.
+            // Pet mode keeps the full resident throughout singing. The
+            // shared custody gate also suppresses the head's hit/ink claims.
             let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
@@ -28125,13 +28940,13 @@ impl App {
             }
             // Reading owns a certified content surface, never a fabricated
             // caret. The flying head retains its live-viewport-only gate.
-            let pet_presentable = !ws.overlay_open()
-                && ws.tab_menu.is_none()
-                && (cursor_companion_presentable
-                    || (shed_companion_presentable(
-                        cursor_companions_allowed && win_focused,
-                        shed_envelope,
-                    ) && ws.cursor_pet.has_reading_interest()));
+            let pet_presentable = resident_pet_surface_presentable(
+                win_focused,
+                cursor_companions_allowed,
+                !ws.overlay_open() && ws.tab_menu.is_none(),
+                display_offset == 0,
+                ws.cursor_pet.has_reading_interest(),
+            );
             let pet_visible = resident_pet_presentation_enabled(
                 pet_mode,
                 pet_presentable,
@@ -28161,13 +28976,8 @@ impl App {
             // truth (there is no caret it could be chasing on this surface):
             // it fades out, settles, and releases the lane on its own.
             //
-            // THE SONG'S CARET LAW ([`pet_caret_admitted`]): full motion
-            // withholds the caret through the 0.33 face swap, so the pet fades
-            // out holding position and returns as a fresh sighting. Reduced
-            // motion keeps the resident caret-fed behind the opaque static
-            // singer, so a stepped or late cutoff always reveals an opaque pet.
-            // [`pet_companion_admitted`] remains the separate pixel-custody
-            // gate: caret-fed never means two companions are on glass.
+            // Singing never withdraws the resident's caret or pixels. The
+            // same admission helpers are used by the split and capture paths.
             //
             // EXIT-CODE EMPATHY (wave 1): the pet is the SECOND consumer of
             // the LOCK-A completion probe, keyed (session, seq) with its OWN
@@ -28200,10 +29010,13 @@ impl App {
                         // THE ARM ([`verdict_armed`]), spent whatever it says
                         // — including by a command too quick to be worth a
                         // word. One Enter, one command, one verdict.
-                        if verdict_armed(
+                        if keyed_celebration_completion(
+                            &mut ws.kitty_sing,
                             &mut ws.verdict_spent,
                             front_terminal.session,
                             output_echo.last_boundary_at,
+                            frame_started,
+                            code,
                         ) {
                             let failed = code != 0;
                             verdict_cue = verdict_voice(failed, cmd_dur_ms);
@@ -28223,6 +29036,16 @@ impl App {
                     }
                 }
             }
+            // THE ROOM (panel #9): the session's facts, on this frame the
+            // host is already drawing — see [`note_room_facts`]. No sibling
+            // in a single pane.
+            note_room_facts(
+                &mut ws.cursor_pet,
+                self.pool.get(front_terminal.session),
+                self.session_status.status(front_terminal.session),
+                frame_started,
+                None,
+            );
             // THE VIGIL'S LEVEL (THE VERDICT, sense 1): the OSC 133/633
             // EXECUTE phase, forwarded every composed frame. The host read it
             // under LOCK A for the perk-and-watch conjunction long before the
@@ -28295,11 +29118,9 @@ impl App {
             // ([`companion_pet_sense`]) for BOTH render arms, from the four
             // host facts only the host holds; the geometry and posture ride
             // the same `glow_geom` / motion policy this frame already resolved.
-            ws.cursor_pet.set_console_presentable(
-                pet_companion_admitted(pet_visible, cat_frame.sing)
-                    && shed_companion_alpha(255, shed_envelope) > 0,
-            );
-            let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
+            ws.cursor_pet
+                .set_console_presentable(pet_companion_admitted(pet_visible, cat_frame.sing));
+            let pet_frame = ws.cursor_pet.tick(companion_pet_sense(
                 frame_started,
                 aterm_effects::word_decorations::EffectGeom {
                     cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
@@ -28308,26 +29129,11 @@ impl App {
                     cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
                 },
                 &glow_cfg,
-                // THE MOTION POLICY ONLY — never the performance shed.
-                //
-                // This took `!animate_cat`, which is
-                // `!(policy.animate(CursorGlow) && shed_envelope > 0.0)`. The
-                // policy half is right: one motion policy must not animate one
-                // companion and freeze the other. The SHED half was a category
-                // error. `PetBrain`'s reduced-motion arm is a hard PIN — under
-                // that flag the pet does not travel to its station, it simply
-                // IS there, every frame, by contract
-                // (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`).
-                // Raising it on a VISIBLE, WALKING cat therefore welds the body
-                // to the caret and teleports it the full width of the grid on
-                // the next keystroke — then hands it back when the load passes.
-                //
-                // A shed is a request to spend LESS TIME DRAWING, not to change
-                // what the animal is. The shed still fades the companion out
-                // through `shed_companion_alpha` below and still freezes the
-                // flying cat's frame via `animate_cat`; what it may no longer
-                // do is rewrite the resident's position model mid-walk.
-                !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                resident_pet_reduced_motion(
+                    !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                    load_shed,
+                    shed_envelope,
+                ),
                 aterm_effects::rainbow_kitty::companion::HostSense {
                     caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat) {
                         cur
@@ -28336,12 +29142,10 @@ impl App {
                     },
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
-                    // The caret may prewarm an invisible resident behind the
-                    // singer. Pointer contact requires its last drawn body
-                    // and the current frame's pixel custody instead.
+                    // Pointer contact requires the last drawn body and current
+                    // surface custody, including while the resident is static.
                     pointer: if ws.pet_hit_rect.is_some()
                         && pet_companion_admitted(pet_visible, cat_frame.sing)
-                        && shed_companion_alpha(255, shed_envelope) > 0
                     {
                         pet_pointer
                     } else {
@@ -28349,13 +29153,11 @@ impl App {
                     },
                 },
             ));
-            pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
             // RAINBOW KITTY v2's OFFER TO THE RESIDENT ([`route_v2_pet_offer`],
             // panel #10) — after the pet's own tick, on the frame it just
             // published, and BEFORE `emit_single_cursor_companion` drains the
-            // impulse slot the perk edge lives in. The shed alpha is already
-            // folded in above, so the sky is offered the cat that is actually
-            // on the glass. Single pane: the pet's world IS the window grid.
+            // impulse slot the perk edge lives in. The resident keeps its own
+            // opacity under load. Single pane: its world is the window grid.
             route_v2_pet_offer(ws, &pet_frame, glow_geom, (0, 0), frame_started);
             // The brain can begin returning below the face-swap threshold,
             // but only one companion is put on glass.
@@ -30164,7 +30966,8 @@ impl App {
         let startup_pre_present = (!self.first_present_done).then(Instant::now);
         let present_result = self.present_input_scratch(id, invert, overlay);
         let (raster_submit_ns, startup_timing) = match present_result {
-            Ok(work_ns) => (
+            Ok(None) => return,
+            Ok(Some(work_ns)) => (
                 work_ns,
                 metrics::StartupPresentTiming::finish(frame_started, startup_pre_present),
             ),
@@ -30177,13 +30980,6 @@ impl App {
                 return;
             }
         };
-        // The drawable-park slice, now measured rather than inferred: it sits between
-        // `note_pre_present` and the renderer's post-acquire work timer, so before this
-        // it existed only as a noisy subtraction out of `redraw_total`. On macOS it is
-        // the single largest known typing-stall mechanism (a blocked `nextDrawable`
-        // parks the winit thread and queues keyDowns behind it).
-        let acquire_wait_ns = self.last_acquire_wait_ns(id);
-        metrics::note_acquire_wait(acquire_wait_ns);
         // Swapchain acquire is excluded from the load-shed signal up to ONE frame
         // interval (that much is deliberate pacing); the EXCESS past a full interval is
         // charged, because a pool that stays exhausted longer than a refresh is the GPU
@@ -30450,6 +31246,8 @@ impl App {
         }
         if let Some(ws) = self.windows.get_mut(&id) {
             ws.present = None;
+            ws.capture_acquire_armed = false;
+            ws.gpu_acquire_wait = crate::GpuAcquireWait::default();
             ws.last_present = None;
         }
         let surface = crate::present::CpuSurface::new(window)
@@ -30800,7 +31598,7 @@ impl App {
         id: WindowId,
         invert: bool,
         overlay: Option<OverlayGlow>,
-    ) -> Result<u64, metrics::PresentDropReason> {
+    ) -> Result<Option<u64>, metrics::PresentDropReason> {
         let tray_floor_y = self.config_notice_tray_floor_y(id);
         // Disjoint borrows: the renderer (`self.backend`) and the target window's
         // present target + input snapshot are SEPARATE fields of `self`, so
@@ -30885,6 +31683,7 @@ impl App {
                 0
             };
             let input = &ws.input_scratch;
+            let mut pending_surface = None;
             let presented = match (backend.gpu_mut(), ws.present.as_mut()) {
                 (
                     Some(gpu),
@@ -30892,8 +31691,8 @@ impl App {
                         gpu_surface,
                         window_gpu,
                     }),
-                ) => gpu
-                    .present_input_cropped_with_effects_transport(
+                ) => {
+                    let result = gpu.present_input_cropped_with_effects_transport(
                         window_gpu,
                         gpu_surface,
                         input,
@@ -30902,22 +31701,20 @@ impl App {
                         tray_arg,
                         present_crop,
                         effects_transport_shift_y,
-                    )
-                    .map_err(|reason| match reason {
-                        aterm_gpu::SurfacePresentFailure::Reconfigured => {
-                            metrics::PresentDropReason::GpuReconfigured
-                        }
-                        aterm_gpu::SurfacePresentFailure::Timeout => {
-                            metrics::PresentDropReason::GpuTimeout
-                        }
-                        aterm_gpu::SurfacePresentFailure::Occluded => {
-                            metrics::PresentDropReason::GpuOccluded
-                        }
-                        aterm_gpu::SurfacePresentFailure::Validation => {
-                            metrics::PresentDropReason::GpuValidation
-                        }
-                    })
-                    .map(|()| window_gpu.last_present_work_ns()),
+                    );
+                    // Publish before inspecting success/failure or replacing a
+                    // lost GPU target. Every real acquire gets one sample;
+                    // an early refusal that never acquired gets none.
+                    let reported = report_gpu_surface_present(
+                        result,
+                        window_gpu.take_acquire_wait_sample_ns(),
+                        metrics::note_acquire_wait,
+                    );
+                    if matches!(reported, Ok(None)) {
+                        pending_surface = Some(gpu_surface.acquire_id());
+                    }
+                    reported.map(|presented| presented.map(|()| window_gpu.last_present_work_ns()))
+                }
                 // HEADLESS PRESENT-REAL: the glass-less recording target — the
                 // SAME compose-and-blit seam presented into the persistent
                 // virtual texture (tap copy included), no `present()`. Cannot
@@ -30936,7 +31733,7 @@ impl App {
                             u32::try_from(visible_height).unwrap_or(u32::MAX),
                         ),
                     ) {
-                        Ok(window_gpu.last_present_work_ns())
+                        Ok(Some(window_gpu.last_present_work_ns()))
                     } else {
                         Err(metrics::PresentDropReason::Virtual)
                     }
@@ -30950,8 +31747,10 @@ impl App {
                 );
                 debug_assert!(restored, "valid effect shift must be reversible");
             }
-            let work_ns = presented?;
-            Ok(work_ns)
+            if let Some(surface) = pending_surface {
+                ws.on_gpu_acquire_pending(surface);
+            }
+            presented
         } else {
             // CPU present: rasterize via the renderer's damage-tracked cache and
             // take a BORROW of the framebuffer (`render_input_cached`) rather than
@@ -31195,7 +31994,7 @@ impl App {
             } else {
                 ws.cpu_cache.invalidate();
             }
-            presented_work_ns
+            presented_work_ns.map(Some)
         }
     }
 
@@ -31205,7 +32004,7 @@ impl App {
         id: WindowId,
         invert: bool,
         overlay: Option<OverlayGlow>,
-    ) -> Result<u64, metrics::PresentDropReason> {
+    ) -> Result<Option<u64>, metrics::PresentDropReason> {
         self.present_input_scratch(id, invert, overlay)
     }
 
@@ -31494,6 +32293,24 @@ impl App {
             return None;
         };
         self.prepare_layout_coordinate_space_from_plan(wid, route, &plan);
+        // THE CAPTURE OBSERVES THE CONSOLE TOO. Read here, above the `ws`
+        // borrow, for exactly the reason the glass path reads it above its
+        // own: the off path must not allocate or rebuild console perception.
+        // The facts themselves are taken under the SAME terminal lock as the
+        // cells below, and parked on the window for the decoration pass that
+        // ticks the pet — a capture that ticks the brain without observing
+        // the console is a capture that cannot see this layer at all.
+        let capture_pet_console_owned = {
+            let pet_glow = self.glow_config();
+            resident_pet_owner_present(
+                self.trail_presentation().pet_species.is_some(),
+                pet_glow.enabled
+                    && self
+                        .serious_mode_policy()
+                        .allows(crate::motion::SeriousEffect::CursorCat),
+                pet_glow.style,
+            )
+        };
         let (rows, cols, composed) = {
             let ws = self.windows.get(&wid)?;
             (usize::from(ws.rows), usize::from(ws.cols), composed)
@@ -31613,6 +32430,8 @@ impl App {
             let (focus, cursor_fx_sample) = {
                 let ws = self.windows.get_mut(&wid)?;
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+                ws.capture_pet_world = capture_pet_console_owned
+                    .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, *session));
                 let content_seq = ws.input_scratch.content_seq;
                 let dbg = if term.modes().reverse_video() {
                     term.default_foreground()
@@ -31641,6 +32460,7 @@ impl App {
                     live_viewport,
                     cursor: (term.cursor_visible() && live_viewport)
                         .then_some((cursor.row, cursor.col)),
+                    pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, *session),
                     damage_consumed: advance_cursor_fx,
                 };
                 let (row_probe, row_above_probe, row_below_probe) = if advance_cursor_fx {
@@ -31790,6 +32610,8 @@ impl App {
             // authorized by this same DEC fence.
             if focused {
                 ws.composed_focus_scratch.clone_from(&ws.pane_scratch);
+                ws.capture_pet_world = capture_pet_console_owned
+                    .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, session));
             } else {
                 ws.unfocused_pane_scratch
                     .entry(pane_index)
@@ -31817,6 +32639,7 @@ impl App {
                         let cursor = term.cursor();
                         (cursor.row, cursor.col)
                     }),
+                    pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, session),
                     damage_consumed: advance_cursor_fx,
                 });
                 if capture_cursor_fx {
@@ -33146,6 +33969,11 @@ impl App {
         // split twin, read where the focus pane's scroll translation/reset is
         // already applied.
         let mut focus_scrolled_rows = 0usize;
+        // THE ROOM (panel #9(d)): a SIBLING pane genuinely streaming this
+        // frame — its caret in WINDOW cells, translated to the focused
+        // pane's at the pet site (the focused pane's offset is not known
+        // until its own, last, iteration).
+        let mut sibling_talking: Option<(u16, u16)> = None;
         let mut focus_alt = false;
         let mut focus_d_off = 0usize;
         let mut focus_sel_clone = aterm_core::selection::TextSelection::new();
@@ -33420,7 +34248,8 @@ impl App {
                                 )
                             });
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
-                        + usize::from(scroll_change.invalidated);
+                        + usize::from(scroll_change.invalidated)
+                        + usize::from(scroll_change.band_moves);
                     // VI-1: the pane-local vi cursor (see the declaration) —
                     // `None` when vi is off or scrolled off-viewport.
                     focus_vi_screen = term
@@ -33519,12 +34348,36 @@ impl App {
                 }
             } else if let Some(ws) = self.windows.get_mut(&wid) {
                 let staged = ws.unfocused_pane_scratch.entry(pane_index).or_default();
+                // THE ROOM (panel #9(d)): the sibling's content clock as of
+                // the LAST composed frame, read before this frame's refill
+                // stamps it — the `pet_content_seq` latch's shape, on the
+                // staged scratch the pane already owns, so no new state.
+                let staged_seq = staged.content_seq;
                 let refill = term.cell_frame_damage_scoped_into(
                     staged,
                     usize::from(r.rows),
                     usize::from(r.cols),
                 );
                 metrics::note_frame_refill(refill);
+                // The focused pane's burst conjunction, applied to a
+                // sibling: content advanced AND the shell is in its Execute
+                // phase AND the viewport is at the live bottom. A scratch
+                // never stamped (`0`, its first frame) is a baseline, not a
+                // burst.
+                if staged_seq != 0
+                    && pet_output_burst(
+                        false,
+                        staged.content_seq > staged_seq,
+                        term.shell_state() == aterm_core::terminal::ShellState::Executing,
+                        term.grid().display_offset() == 0,
+                    )
+                {
+                    let cp = term.cursor();
+                    sibling_talking = Some((
+                        cp.row.saturating_add(r.row_off),
+                        cp.col.saturating_add(r.col_off),
+                    ));
+                }
                 ws.composed_pane_stage_meta[pane_index] =
                     Some((term.title_arc(), terminal_blank_cell(&term)));
             }
@@ -33802,12 +34655,15 @@ impl App {
         } else {
             false
         };
-        let pet_presentable = self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none())
-            && (cursor_companion_presentable
-                || (cursor_companions_allowed && decoration_presentable && reading_presentable));
+        let pet_presentable = resident_pet_surface_presentable(
+            focused,
+            cursor_companions_allowed,
+            self.windows
+                .get(&wid)
+                .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none()),
+            !focus_scrolled,
+            reading_presentable,
+        );
         let pet_visible = resident_pet_presentation_enabled(
             pet_mode,
             pet_presentable,
@@ -33845,7 +34701,7 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, pet_frame) = {
+        let (cat_frame, kitty_alpha, riff, outro, pet_frame) = {
             let ws = self.windows.get_mut(&wid)?;
             // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
             // through the same one verdict (favourite > program with tenure
@@ -33887,6 +34743,7 @@ impl App {
                 0.0
             };
             let mut riff: Option<(u64, f32, u32)> = None;
+            let mut outro: Option<(f32, u32)> = None;
             if sing_drive > 0.0 {
                 ws.cursor_glow.celebrate(now, sing_drive);
                 if let Some(bar) = ws.kitty_sing.bar(now)
@@ -33899,6 +34756,16 @@ impl App {
                     // it mid-celebration would replay a stale bar.
                     riff = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
                         .map(|gain| (bar, gain, ws.kitty_sing.signature()));
+                }
+                // THE BAR FAN and THE OUTRO (§27) — the single-pane seam's
+                // split twins, on the same latches.
+                if let Some(fan) = ws.kitty_sing.take_bar_fan(now) {
+                    ws.cursor_glow.party(now, fan.n, fan.ring);
+                }
+                if let Some(o) = ws.kitty_sing.take_outro(now) {
+                    ws.cursor_glow.party(now, o.drop, false);
+                    outro = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
+                        .map(|gain| (gain, o.sig));
                 }
             } else {
                 ws.kitty_sing.settle(now);
@@ -33925,7 +34792,11 @@ impl App {
             };
             // Reduced-motion songs still need bounded follow-up presents so
             // the static face crosses its release threshold and is erased.
-            if !animate_cat && sing_drive > 0.0 && ws.os_window.is_some() {
+            if !animate_cat
+                && sing_drive > 0.0
+                && !ws.kitty_sing.external_live()
+                && ws.os_window.is_some()
+            {
                 ws.note_deco_animating(now);
             }
             // PET-MODE EPISODES EXIT PLAIN — the single-pane twin's law
@@ -33943,10 +34814,8 @@ impl App {
             // `!pet_mode` for the same reason as the single-pane path: an
             // un-drawable flying kitty must not fire an exit flourish, move
             // the RepaintKey, or claim the caret cell from a word-cat.
-            // Same sing-along exception too ([`flying_kitty_admitted`]):
-            // while the song holds the frame the SINGING FACE is the
-            // companion and the pet steps aside — admission spans the
-            // armed hold plus the wind-down, then ends at drive 0.
+            // The shared gate keeps the full resident through every song
+            // phase and gives no pixel custody to a replacement head.
             let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
@@ -33962,11 +34831,8 @@ impl App {
             // hard way). A pet that cannot be drawn is fed `caret: None`, so
             // it fades out and releases the lane honestly.
             //
-            // THE SONG'S CARET LAW — the single-pane twin through
-            // [`pet_caret_admitted`]. Full motion withholds through the 0.33
-            // face swap; reduced motion keeps the resident fed but hidden
-            // behind the opaque still, ready for any stepped/late cutoff. The
-            // custody gate below still admits exactly one body to glass.
+            // Song-independent caret custody, shared with the single-pane
+            // path: the resident tracks the focused pane during the song.
             let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
             // EXIT-CODE EMPATHY (wave 1) — the single-pane dedupe's
             // split twin, on the pet's OWN (session, seq) latch: a
@@ -33984,6 +34850,24 @@ impl App {
                     if same_session && let Some((_, code)) = focus_cmd_done {
                         ws.cursor_pet
                             .note_command_done(now, code != 0, focus_cmd_dur_ms);
+                        // The same keyed completion edge as a single pane.
+                        // The song arm belongs to the focused session; a pane
+                        // switch only re-baselines and cannot replay history.
+                        let focus_boundary = self.pool.get(focus).and_then(|session| {
+                            session
+                                .ctx
+                                .output_echo
+                                .sample(&session.ctx.sink, now)
+                                .last_boundary_at
+                        });
+                        keyed_celebration_completion(
+                            &mut ws.kitty_sing,
+                            &mut ws.verdict_spent,
+                            focus,
+                            focus_boundary,
+                            now,
+                            code,
+                        );
                     }
                 }
             }
@@ -33995,6 +34879,21 @@ impl App {
             // GUARD has to replace (the composed path pushes each pane's pip
             // from `compose_output_streak`, where no single episode is "the"
             // one a focused command ended).
+            // THE ROOM (panel #9) — the single-pane site's split twin, with
+            // the one fact only a split has: the talking sibling's caret,
+            // translated from window cells into the focused pane's.
+            note_room_facts(
+                &mut ws.cursor_pet,
+                self.pool.get(focus),
+                self.session_status.status(focus),
+                now,
+                sibling_talking.map(|(row, col)| {
+                    (
+                        f32::from(col) - f32::from(focus_off.1),
+                        f32::from(row) - f32::from(focus_off.0),
+                    )
+                }),
+            );
             ws.cursor_pet.note_executing(now, focus_shell_exec);
             // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
             // split twin: the focused pane's scroll delta, content
@@ -34056,11 +34955,9 @@ impl App {
             }
             // The single-pane twin's projection ([`companion_pet_sense`]) at
             // the focused PANE's geometry — one router, both arms.
-            ws.cursor_pet.set_console_presentable(
-                pet_companion_admitted(pet_visible, cat_frame.sing)
-                    && shed_companion_alpha(255, shed_envelope) > 0,
-            );
-            let mut pet_frame = ws.cursor_pet.tick(companion_pet_sense(
+            ws.cursor_pet
+                .set_console_presentable(pet_companion_admitted(pet_visible, cat_frame.sing));
+            let pet_frame = ws.cursor_pet.tick(companion_pet_sense(
                 now,
                 aterm_effects::word_decorations::EffectGeom {
                     cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
@@ -34069,11 +34966,11 @@ impl App {
                     cols: pane_cols,
                 },
                 &glow_cfg,
-                // The motion policy ONLY — never the performance shed; the
-                // split path owes the resident the same law as the single-grid
-                // path, or the teleport survives in exactly the layout that is
-                // hardest to notice it in. See the sibling site's note.
-                !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                resident_pet_reduced_motion(
+                    !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
+                    load_shed,
+                    shed_envelope,
+                ),
                 aterm_effects::rainbow_kitty::companion::HostSense {
                     caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat)
                         && focus_pane_dims.is_some()
@@ -34085,10 +34982,9 @@ impl App {
                     wrapped: pet_wrapped,
                     output_burst: pet_burst,
                     // The focused split pane obeys the same touch custody as
-                    // the single-pane resident, including a dark shed.
+                    // the single-pane resident, including a static shed.
                     pointer: if ws.pet_hit_rect.is_some()
                         && pet_companion_admitted(pet_visible, cat_frame.sing)
-                        && shed_companion_alpha(255, shed_envelope) > 0
                     {
                         pet_pointer
                     } else {
@@ -34096,7 +34992,6 @@ impl App {
                     },
                 },
             ));
-            pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, shed_envelope);
             // RAINBOW KITTY v2's OFFER TO THE RESIDENT — the single-pane
             // seam's twin, through the same one function
             // ([`route_v2_pet_offer`]), before `compose_cursor_companion`
@@ -34119,10 +35014,13 @@ impl App {
                 },
                 pet_origin,
             );
-            (cat_frame, alpha, riff, pet_frame)
+            (cat_frame, alpha, riff, outro, pet_frame)
         };
         if let Some((bar, gain, sig)) = riff {
             self.trail_audio.push(sing_riff_event(bar, gain, sig));
+        }
+        if let Some((gain, sig)) = outro {
+            self.trail_audio.push(sing_outro_event(gain, sig));
         }
         // The brain tick used the base gate; presentation uses the custody gate.
         let pet_visible = pet_companion_admitted(pet_visible, cat_frame.sing);
@@ -43333,6 +44231,73 @@ mod key_time_click_tests {
         );
     }
 
+    /// **A CAPS-LOCK CAPITAL IS A SHIFTED CLICK** (2026-09-10): the keyed
+    /// seam's `click_shifted` agrees with `typed_class_for`, which asks the
+    /// GLYPH — so `A` typed with no SHIFT bit (Caps Lock) reaches the synth
+    /// as a shifted `Typed` and rings and sparkles like a Shift capital;
+    /// `a` and `7` do not; `a` under SHIFT does (the encoder shifts it). The
+    /// VISUAL flag is not under test here — `note_typed_glyph` still reads
+    /// the modifier — and a Caps-Lock capital gets no pickup, because Caps
+    /// Lock mints no Shift cue (`a_bare_shift_reaches_the_audio_host_as_the_lift`).
+    #[test]
+    fn a_caps_lock_capital_is_a_shifted_click() {
+        use crate::input::{InputEvent, Source};
+        use aterm_effects::trail_sound::{SoundGesture, SoundKind};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut app = crate::App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        let wid = crate::WindowId(0);
+        app.tick_cursor_fx(
+            wid,
+            super::CursorFxInputs::sample_for_test(std::time::Instant::now()),
+        )
+        .expect("the fixture window ticks");
+        let _ = app.trail_audio.take_captured_for_test();
+
+        let mut shifted_of = |ch: char, mods: Modifiers| -> bool {
+            let _ = app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(ch),
+                    mods,
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+            let spoken = app.trail_audio.take_captured_for_test();
+            let typed = spoken
+                .iter()
+                .find(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed)))
+                .unwrap_or_else(|| panic!("`{ch}` ({mods:?}) must click at the key"));
+            assert!(
+                !spoken
+                    .iter()
+                    .any(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Shift))),
+                "`{ch}` ({mods:?}): a glyph key never mints the bare Shift's pickup"
+            );
+            typed.shifted
+        };
+        assert!(
+            shifted_of('A', Modifiers::empty()),
+            "a Caps-Lock capital is a shifted click — the glyph is asked, not the modifier"
+        );
+        assert!(
+            !shifted_of('a', Modifiers::empty()),
+            "a lowercase letter is not shifted"
+        );
+        assert!(
+            !shifted_of('7', Modifiers::empty()),
+            "a digit is not shifted"
+        );
+        assert!(
+            shifted_of('a', Modifiers::SHIFT),
+            "`a` under Shift is the capital it always was"
+        );
+    }
+
     /// EACH ECHO-BORN CUE IS STAMPED AT ITS OWN INSTANT (THE PRISM §3.4 b,
     /// build step 2). Three cues drained in ONE frame reach the host with
     /// three DISTINCT, strictly increasing, non-zero `at_ms` — never the one
@@ -46693,8 +47658,276 @@ mod link_target_caption_tests {
 /// `D` is allowed to speak at all, tested as the pure functions they are.
 #[cfg(test)]
 mod trail_verdict {
-    use super::{verdict_armed, verdict_voice};
+    use super::{keyed_celebration_completion, verdict_armed, verdict_voice};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn external_celebration_wakes_initial_green_then_only_bars_outro_and_settle() {
+        use aterm_effects::kitty_sing::{
+            CelebrateOn, SING_BAR_SECONDS, SING_WIND_DOWN, song_signature,
+        };
+        let mut app = crate::App::headless_for_test();
+        let ws = app.windows.get_mut(&crate::WindowId(0)).unwrap();
+        ws.focused = true;
+        let start = Instant::now();
+        let sid = ws.front_terminal().unwrap().session;
+        ws.kitty_sing
+            .arm_external(start, sid, song_signature('C'), 2, CelebrateOn::Green)
+            .unwrap();
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(start, false, true, false, 10.0, true),
+            None
+        );
+        assert!(keyed_celebration_completion(
+            &mut ws.kitty_sing,
+            &mut ws.verdict_spent,
+            sid,
+            Some(start),
+            start,
+            0,
+        ));
+        // Real policy gates win even when an external run has an event due.
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(start, false, true, false, 10.0, false),
+            None
+        );
+        ws.focused = false;
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(start, false, true, false, 10.0, true),
+            None
+        );
+        ws.focused = true;
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(start, false, false, false, 10.0, true),
+            None
+        );
+        let interval = crate::effect_present_interval(ws.frame_interval);
+        let mut now = start + interval;
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(start, false, true, false, 10.0, true),
+            Some(now),
+            "on=green owns an initial followup at the existing frame cap"
+        );
+        // A synchronized-output hold can consume the scheduler slot while
+        // deferring the song pass. Its still-due event must rearm in the future.
+        assert!(ws.service_due_terminal_effect_tick(now));
+        assert_eq!(ws.kitty_sing.next_external_deadline(now), Some(now));
+        assert_eq!(
+            ws.plan_terminal_effect_lane_with_recording(now, false, true, false, 10.0, true),
+            Some(now + interval),
+            "deferred consumption cannot spin on a deadline at now"
+        );
+        assert!(!ws.service_due_terminal_effect_tick(now));
+        now += interval;
+        for phase in 0..=3 {
+            assert_eq!(
+                ws.plan_terminal_effect_lane_with_recording(now, false, true, false, 10.0, true),
+                Some(now),
+                "an already-armed due edge retains its exact deadline"
+            );
+            assert!(ws.service_due_terminal_effect_tick(now));
+            if phase < 2 {
+                ws.sing_riff_bar = ws.kitty_sing.bar(now);
+                assert_eq!(ws.sing_riff_bar, Some(phase));
+                assert_eq!(ws.kitty_sing.take_bar_fan(now).unwrap().bar, phase);
+            } else if phase == 2 {
+                assert!(ws.kitty_sing.take_outro(now).is_some());
+            } else {
+                ws.kitty_sing.settle(now);
+            }
+            let next =
+                ws.plan_terminal_effect_lane_with_recording(now, false, true, false, 10.0, true);
+            assert!(
+                !ws.deco_anim_frame_active(now),
+                "external scheduling grants no frame train"
+            );
+            assert!(
+                !ws.cursor_pet.needs_frames(),
+                "a song does not grant a static pet frame debt"
+            );
+            if phase < 3 {
+                let exact = if phase < 2 {
+                    start + Duration::from_secs_f32((phase + 1) as f32 * SING_BAR_SECONDS)
+                } else {
+                    start
+                        + Duration::from_secs_f32(2.0 * SING_BAR_SECONDS)
+                        + Duration::from_secs_f32(SING_WIND_DOWN)
+                };
+                assert_eq!(next, Some(exact));
+                assert_eq!(
+                    ws.plan_terminal_effect_lane_with_recording(
+                        now + Duration::from_millis(1),
+                        false,
+                        true,
+                        false,
+                        10.0,
+                        true
+                    ),
+                    Some(exact),
+                    "unrelated event-loop turns keep the same coarse deadline"
+                );
+                now = exact;
+            } else {
+                assert_eq!(next, None);
+                assert!(
+                    ws.next_trail_tick.is_none(),
+                    "settlement parks the real scheduler"
+                );
+            }
+        }
+    }
+
+    fn keyed_celebration_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            KeyedCelebrationCompletion {
+                const Buggy = 0;
+                var credit = 0;
+                var live = 0;
+                var authorized = 0;
+                action Enter when (live == 0 && credit == 0) {
+                    credit = 1;
+                }
+                action Fail when (live == 0 && credit == 1) {
+                    credit = 0;
+                }
+                action Green when (live == 0 && (credit == 1 || Buggy == 1)) {
+                    authorized = credit;
+                    credit = 0;
+                    live = 1;
+                }
+                invariant ARunNeedsItsOwnKeyedSuccess: live == 0 || authorized == 1;
+                invariant Bounds: credit <= 1 && live <= 1 && authorized <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn fx_celebration_model_proves_and_catches_reused_enter_credit() {
+        let model = keyed_celebration_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn fx_celebration_completion_guard_conforms_to_real_detector() {
+        use aterm_effects::kitty_sing::{CelebrateOn, KittySing, song_signature};
+        let model = keyed_celebration_model();
+        let now = Instant::now();
+        let sid = 7;
+        for credit in [false, true] {
+            for failed in [false, true] {
+                let mut sing = KittySing::default();
+                sing.arm_external(now, sid, song_signature('C'), 2, CelebrateOn::Green)
+                    .expect("explicit arm admitted");
+                let mut spent = (!credit).then_some((sid, now));
+                let mut expected = model.init_state();
+                if credit {
+                    assert!(model.fire("Enter", &mut expected));
+                }
+                let action = if failed { "Fail" } else { "Green" };
+                let enabled = model.action_enabled(action, &expected);
+                let admitted = keyed_celebration_completion(
+                    &mut sing,
+                    &mut spent,
+                    sid,
+                    Some(now),
+                    now,
+                    i32::from(failed),
+                );
+                assert_eq!(
+                    admitted, enabled,
+                    "shipping boundary guard follows the model"
+                );
+                if enabled {
+                    assert!(model.fire(action, &mut expected));
+                }
+                let mut actual = expected.clone();
+                actual.insert("live", i64::from(sing.external_live()));
+                assert_eq!(
+                    actual, expected,
+                    "the real detector fires only on the licensed success"
+                );
+                // A deliberately unlicensed live run is the historical guard
+                // omission, not another healthy state that could pass vacuously.
+                if !credit && !failed {
+                    actual.insert("live", 1);
+                    assert!(!model.check_invariant("ARunNeedsItsOwnKeyedSuccess", &actual));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fx_celebration_green_requires_one_fresh_successful_keyed_completion() {
+        use aterm_effects::kitty_sing::{CelebrateOn, KittySing, song_signature};
+        let now = Instant::now();
+        let sid = 7;
+        let mut sing = KittySing::default();
+        sing.arm_external(now, sid, song_signature('C'), 2, CelebrateOn::Green)
+            .expect("the explicit arm is admitted");
+        let mut spent = None;
+        // Unkeyed marks and another pane's completion leave this arm intact.
+        assert!(!keyed_celebration_completion(
+            &mut sing, &mut spent, sid, None, now, 0
+        ));
+        assert!(keyed_celebration_completion(
+            &mut sing,
+            &mut spent,
+            sid + 1,
+            Some(now),
+            now,
+            0
+        ));
+        assert!(!sing.external_live());
+        assert!(sing.armed_external().is_some());
+        // A failed command spends its Enter. A second, successful mark for
+        // that same Enter must not retroactively celebrate the failure.
+        assert!(keyed_celebration_completion(
+            &mut sing,
+            &mut spent,
+            sid,
+            Some(now),
+            now,
+            1
+        ));
+        assert!(!keyed_celebration_completion(
+            &mut sing,
+            &mut spent,
+            sid,
+            Some(now),
+            now,
+            0
+        ));
+        assert!(!sing.external_live());
+        let next = now + Duration::from_secs(1);
+        assert!(keyed_celebration_completion(
+            &mut sing,
+            &mut spent,
+            sid,
+            Some(next),
+            next,
+            0
+        ));
+        assert!(
+            sing.external_live(),
+            "positive control reaches the real detector"
+        );
+        assert!(sing.armed_external().is_none());
+        assert_eq!(sing.bar(next), Some(0));
+        let later = next + Duration::from_secs(2);
+        assert!(!keyed_celebration_completion(
+            &mut sing,
+            &mut spent,
+            sid,
+            Some(next),
+            later,
+            0
+        ));
+        assert_eq!(
+            sing.bar(later),
+            Some(1),
+            "a repeated mark cannot re-anchor the song"
+        );
+    }
 
     /// **A `D` WITH NO ARMED ENTER IS SILENT.** THE LAWS: every light has a
     /// keystroke behind it, and program output alone does not count. A shell
@@ -46791,6 +48024,100 @@ mod trail_verdict {
             verdict_voice(true, Some(600_000)),
             Some((true, false)),
             "…including a ten-minute one: the bell is the green cadence's"
+        );
+    }
+}
+
+/// Complete the shared GPU present observation before the route-specific
+/// success/failure funnels run. The callback is the failure-injection test seam;
+/// production supplies the real acquire histogram recorder.
+fn report_gpu_surface_present(
+    result: Result<(), aterm_gpu::SurfacePresentFailure>,
+    acquire_wait_ns: Option<u64>,
+    record: impl FnOnce(u64),
+) -> Result<Option<()>, metrics::PresentDropReason> {
+    if let Some(wait_ns) = acquire_wait_ns {
+        record(wait_ns);
+    }
+    match result {
+        Ok(()) => Ok(Some(())),
+        Err(aterm_gpu::SurfacePresentFailure::AcquirePending) => Ok(None),
+        Err(aterm_gpu::SurfacePresentFailure::Reconfigured) => {
+            Err(metrics::PresentDropReason::GpuReconfigured)
+        }
+        Err(aterm_gpu::SurfacePresentFailure::Timeout) => {
+            Err(metrics::PresentDropReason::GpuTimeout)
+        }
+        Err(aterm_gpu::SurfacePresentFailure::Occluded) => {
+            Err(metrics::PresentDropReason::GpuOccluded)
+        }
+        Err(aterm_gpu::SurfacePresentFailure::Validation) => {
+            Err(metrics::PresentDropReason::GpuValidation)
+        }
+    }
+}
+
+#[cfg(test)]
+mod acquire_wait_publication_tests {
+    use super::{metrics, report_gpu_surface_present};
+    use aterm_gpu::SurfacePresentFailure;
+
+    #[test]
+    fn pending_acquisition_is_neither_a_present_nor_a_failure_sample() {
+        let mut samples = Vec::new();
+        for _ in 0..8 {
+            assert_eq!(
+                report_gpu_surface_present(
+                    Err(SurfacePresentFailure::AcquirePending),
+                    None,
+                    |ns| samples.push(ns)
+                ),
+                Ok(None),
+            );
+        }
+        assert!(
+            samples.is_empty(),
+            "pending is not a completed wait measurement"
+        );
+        // Negative control: actual timeout must still enter failure handling.
+        assert_eq!(
+            report_gpu_surface_present(Err(SurfacePresentFailure::Timeout), Some(1), |ns| samples
+                .push(ns)),
+            Err(metrics::PresentDropReason::GpuTimeout),
+        );
+        assert_eq!(samples, [1]);
+    }
+
+    #[test]
+    fn failed_acquisition_is_reported_before_failure_routing_once() {
+        let mut samples = Vec::new();
+        let mut acquired = Some(542_000_000);
+        let result = report_gpu_surface_present(
+            Err(SurfacePresentFailure::Timeout),
+            acquired.take(),
+            |ns| samples.push(ns),
+        );
+        assert_eq!(result, Err(metrics::PresentDropReason::GpuTimeout));
+        assert_eq!(samples, [542_000_000], "the failed wait must not disappear");
+        let result = report_gpu_surface_present(
+            Err(SurfacePresentFailure::Validation),
+            acquired.take(),
+            |ns| samples.push(ns),
+        );
+        assert_eq!(result, Err(metrics::PresentDropReason::GpuValidation));
+        assert_eq!(
+            samples,
+            [542_000_000],
+            "an early refusal has no stale sample"
+        );
+        assert_eq!(
+            report_gpu_surface_present(Ok(()), Some(80_000), |ns| samples.push(ns)),
+            Ok(Some(()))
+        );
+        assert_eq!(
+            samples,
+            [542_000_000, 80_000],
+            "successful acquisition shares the same recorder"
         );
     }
 }

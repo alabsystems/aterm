@@ -1,0 +1,12 @@
+[package]
+name = "astream-wire"
+description = "astream pure vocabulary: frame codec, Subject/Filter, partitioning, offsets. Zero I/O, zero deps."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+rust-version = "1.89"
+
+# astream-wire has NO normal dependencies, on purpose. It is the one crate
+# everything else builds on, so it must be trivially auditable and panic-free.
+[dependencies]

@@ -33,7 +33,17 @@ use aterm_time::Instant;
 use aterm_render::{GlowQuad, premul_rgb};
 
 use crate::cursor_glow::Geom;
-use crate::effect_util::{push_grid_rect as push_rect, water_ramp};
+use crate::effect_util::water_ramp;
+// WINDOW-ABSOLUTE on purpose. This light lands in `cursor_glow_add`, whose
+// quads are window px (`GlowQuad`'s INVARIANTS: the producer folds in the grid
+// origin, the renderer adds NO offset) — the same stream `cursor_momentum`,
+// `cursor_beam`, `cursor_phaser` and `cursor_glow` push into. Until 2026-09-10
+// this went through `push_grid_rect` with a grid-relative centre, which is
+// byte-identical at origin (0,0) — every unit test's geometry — and displaced
+// by exactly (origin_x, origin_y) in a real window. Captured on glass at
+// pad 24 / head 80: the bead, its glint, its drips and its
+// ripple rings all sat 84 px above and 24 px left of the caret.
+use crate::effect_util::push_fx_rect as push_rect;
 
 /// Slosh rate in turns/second: a glassy sway at rest, a churning slosh at full
 /// surge. The phase only advances when frames render, so a settled bead sways
@@ -229,8 +239,10 @@ impl CursorDroplet {
         let (cw, ch) = (geom.cw as f32, geom.ch as f32);
         // Bead centre: mid-cell, floated slightly high so the drips and the
         // waterline have headroom below the glyph row.
-        let cx = (cc as f32 + 0.5) * cw;
-        let cy = (cr as f32 + 0.46) * ch;
+        // WINDOW px: the grid origin is folded in HERE, once. The 0.46 (rather
+        // than 0.5) row offset is the bead's own float and is untouched.
+        let cx = f32::from(geom.origin_x) + (cc as f32 + 0.5) * cw;
+        let cy = f32::from(geom.origin_y) + (cr as f32 + 0.46) * ch;
         let radius = (RADIUS_IDLE + (RADIUS_MAX - RADIUS_IDLE) * e) * ch;
         let cov_core =
             (COV_IDLE + (COV_MAX - COV_IDLE) * e) * cfg.intensity * (0.84 + 0.16 * shimmer);
@@ -710,5 +722,103 @@ mod tests {
             "bounded droplet geometry, got {}",
             out.len()
         );
+    }
+
+    /// **THE BEAD SURROUNDS THE CARET IN A REAL WINDOW** — the
+    /// window-absolute law `cursor_momentum` learned on 2026-09-08 and this
+    /// emitter did not, until 2026-09-10.
+    ///
+    /// The quads land in `cursor_glow_add`, whose contract is WINDOW px: the
+    /// producer folds in the grid origin and the renderer adds no offset. A
+    /// grid-relative producer is byte-identical at origin (0,0) — which every
+    /// other test in this file uses — and displaced by exactly
+    /// `(origin_x, origin_y)` everywhere else. This geometry is a REAL one
+    /// (pad 24, head 80 + pad_top 4), so it can tell the two apart; nothing at
+    /// the origin can.
+    ///
+    /// Captured on glass (2026-09-10, an isolated instance at this exact
+    /// geometry): the bead, its specular glint, its drips and its ripple rings
+    /// all sat 84 px above and 24 px left of the caret.
+    #[test]
+    fn bead_surrounds_the_caret_in_a_padded_headed_window() {
+        let t0 = Instant::now();
+        let real = Geom {
+            cw: 15,
+            ch: 28,
+            rows: 30,
+            cols: 100,
+            origin_x: 24,
+            origin_y: 84,
+            win_w: 1548,
+            win_h: 948,
+            head: 80,
+        };
+        let (cr, cc) = (12u16, 47u16);
+        let mut e = CursorDroplet::default();
+        let mut out = Vec::new();
+        e.tick(Some((cr, cc)), t0, 1.0, real, &cfg(), &mut out);
+        assert!(!out.is_empty(), "the emitter drew nothing to place");
+        // The caret cell in window px, from the one anchor every emitter shares.
+        let (x0c, y0c) = (
+            i32::from(real.origin_x) + i32::from(cc) * real.cw as i32,
+            i32::from(real.origin_y) + i32::from(cr) * real.ch as i32,
+        );
+        let (x1c, y1c) = (x0c + real.cw as i32, y0c + real.ch as i32);
+        let x0 = out.iter().map(|q| i32::from(q.x)).min().unwrap();
+        let x1 = out.iter().map(|q| i32::from(q.x + q.w)).max().unwrap();
+        let y0 = out.iter().map(|q| i32::from(q.y)).min().unwrap();
+        let y1 = out.iter().map(|q| i32::from(q.y + q.h)).max().unwrap();
+        assert!(
+            x0 < x0c && x1 > x1c && y0 < y0c && y1 > y1c,
+            "bbox x {x0}..{x1} y {y0}..{y1} does not surround the caret cell \
+             x {x0c}..{x1c} y {y0c}..{y1c} — a grid-relative emitter lands at \
+             x {}..  y {}.., short by (origin_x, origin_y) = ({}, {})",
+            x0 + i32::from(real.origin_x),
+            y0 + i32::from(real.origin_y),
+            real.origin_x,
+            real.origin_y
+        );
+        // Every quad inside the effects box (the grid plus the head band).
+        for q in &out {
+            assert!(
+                i32::from(q.x) >= real.fx_left() && i32::from(q.x + q.w) <= real.fx_right(),
+                "quad x {}..{} outside the effects box",
+                q.x,
+                q.x + q.w
+            );
+            assert!(
+                i32::from(q.y) >= real.fx_top() && i32::from(q.y + q.h) <= real.fx_bot(),
+                "quad y {}..{} outside the effects box",
+                q.y,
+                q.y + q.h
+            );
+        }
+        // THE IDENTITY LAW: at origin (0,0) the window form IS the grid form,
+        // so nothing measured at the origin — which is every other test here —
+        // moves by a byte.
+        let mut at_origin = Vec::new();
+        let mut f = CursorDroplet::default();
+        f.tick(Some((3, 10)), t0, 1.0, geom(), &cfg(), &mut at_origin);
+        let mut shifted = Vec::new();
+        let mut g = CursorDroplet::default();
+        let mut o = geom();
+        o.origin_x = 24;
+        o.origin_y = 84;
+        o.win_w += 48;
+        o.win_h += 84;
+        o.head = 84;
+        g.tick(Some((3, 10)), t0, 1.0, o, &cfg(), &mut shifted);
+        assert_eq!(
+            at_origin.len(),
+            shifted.len(),
+            "the origin changed the quad COUNT"
+        );
+        for (a, b) in at_origin.iter().zip(&shifted) {
+            assert_eq!(
+                (i32::from(a.x) + 24, i32::from(a.y) + 84, a.w, a.h, a.color),
+                (i32::from(b.x), i32::from(b.y), b.w, b.h, b.color),
+                "a quad is not the grid form translated by the origin"
+            );
+        }
     }
 }

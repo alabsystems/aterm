@@ -99,19 +99,14 @@ pub struct HostFrameInput {
     /// Native: the one `frame_started` read; web: `t0 + Σ advance(dt)`.
     pub now: Instant,
     pub visibility: Visibility,
-    /// THE MOTION POLICY ONLY — the STABLE preference × focus (the native
-    /// `MotionPolicy::resolve`), never the load-shed latch. `PetBrain`'s
-    /// reduced-motion arm is a hard station PIN; raising it on a visible,
-    /// walking cat welds the body to the caret and teleports it on the next
-    /// keystroke. A shed is a request to spend less time DRAWING (that is
-    /// [`Self::shed_envelope`]), not to change what the animal is.
+    /// Stable accessibility/focus policy. The resident also uses a static
+    /// posture while the effective load-shed envelope is below full strength.
     pub reduced_motion: bool,
     /// The serious-mode master: the glass belongs to the work, every toy is
     /// retired outright.
     pub serious: bool,
-    /// The adaptive load-shed envelope `0..=1`, applied POST-tick to
-    /// presentation alphas only. The companion brains keep their unscaled
-    /// state; only the copied frame handed to the renderer is attenuated.
+    /// The adaptive load-shed envelope `0..=1`. It attenuates trails and
+    /// flying heads; the full resident retains its alpha and becomes static.
     pub shed_envelope: f32,
     pub chrome: ChromeGeom,
     /// The pointer in FRAME px; `None` = it left the surface — or, for a host

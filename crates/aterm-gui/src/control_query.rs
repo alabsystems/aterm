@@ -66,30 +66,115 @@ pub(crate) fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
         .unwrap_or(0)
 }
 
-/// The `text` / `text --json` argument tail: empty for the whole grid, `trim` to
-/// drop the trailing blank rows. ANYTHING else is `ERR usage: text [--json] [trim]`
-/// — the
-/// dispatch used to drop this tail on the floor, so an agent guessing a modifier
-/// (`text trim`, `text compact`) got the full grid back with no signal that it had
-/// guessed wrong (F4's sub-finding). The usage line is the `Err` so both arms answer
-/// with the same bytes.
 /// The `text` grammar, as the wire states it on a usage error.
 ///
 /// It NAMES `--json`, because the verb takes it (`control.rs` routes
-/// `text --json [trim]` to the JSON emitter and strips the flag before this
-/// parser runs). The line used to read `ERR usage: text [trim]`, which is the
-/// answer to `aterm ctl text --help` and therefore the first thing a reader sees
-/// about the grammar — it denied a flag the same catalog entry documents two
-/// lines further on (audit D-9). One `const`, so the two arms and the catalog
-/// cannot drift apart again.
-pub(crate) const TEXT_USAGE: &str = "ERR usage: text [--json] [trim]\n";
+/// `text --json …` to the JSON emitter and strips the flag before [`text_args`]
+/// runs). The line used to read `ERR usage: text [trim]`, which is the answer to
+/// `aterm ctl text --help` and therefore the first thing a reader sees about the
+/// grammar — it denied a flag the same catalog entry documents two lines further
+/// on (audit D-9). One `const`, so the two arms and the catalog cannot drift apart
+/// again.
+pub(crate) const TEXT_USAGE: &str = "ERR usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>]\n";
 
-pub(crate) fn text_trim_arg(rest: &str) -> Result<bool, String> {
-    match rest.trim() {
-        "" => Ok(false),
-        "trim" => Ok(true),
-        _ => Err(TEXT_USAGE.to_string()),
+/// The answer to a `rows=<a>-<b>` span that selects NO row: `b < a`, or `a` past
+/// the last row of the grid. Distinct from the usage line because the grammar was
+/// right — it is the numbers that name nothing.
+pub(crate) const TEXT_BAD_ROWS: &str = "ERR bad rows\n";
+
+/// Which rows of the visible grid a `text` read returns.
+///
+/// The whole grid is the bare verb. The two shaped forms exist for the
+/// bottom-pinned TUI: Claude Code keeps its composer on the LAST row of a 63-row
+/// grid, so `trim` drops nothing and every look costs the whole grid (~5 KB; a
+/// supervisor that read 1,518 times in one session moved 8.1 MB when it needed the
+/// last ~20 rows each time). `tail=<n>` is that read; `rows=<a>-<b>` is the same
+/// economy for a region that is not the bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextShape {
+    /// The whole grid.
+    #[default]
+    All,
+    /// `tail=<n>`: the last `n` rows (`n >= 1`; more than the grid has is the grid).
+    Tail(usize),
+    /// `rows=<a>-<b>`: the inclusive 0-based span `a..=b` (`a <= b`), clamped to
+    /// the grid when it is selected ([`TextShape::select`]).
+    Rows(usize, usize),
+}
+
+impl TextShape {
+    /// The half-open row range `first..end` this shape selects on a grid of
+    /// `grid_rows` rows. `Tail` and `Rows` clamp to the grid; a `Rows` span with no
+    /// row on it is [`TEXT_BAD_ROWS`] — the caller asked for rows that do not exist,
+    /// which an empty `OK 0` would hide.
+    pub(crate) fn select(self, grid_rows: usize) -> Result<(usize, usize), String> {
+        match self {
+            TextShape::All => Ok((0, grid_rows)),
+            TextShape::Tail(n) => Ok((grid_rows.saturating_sub(n), grid_rows)),
+            TextShape::Rows(a, b) => {
+                if a >= grid_rows {
+                    return Err(TEXT_BAD_ROWS.to_string());
+                }
+                Ok((a, b.saturating_add(1).min(grid_rows)))
+            }
+        }
     }
+}
+
+/// What a `text` / `text --json` read asks for, parsed from its argument tail by
+/// [`text_args`]: the rows ([`TextShape`]) and whether the trailing blank rows of
+/// THAT slice are dropped (`trim`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TextArgs {
+    pub(crate) trim: bool,
+    pub(crate) shape: TextShape,
+}
+
+/// The `text` / `text --json` argument tail: `trim`, and at most ONE of `tail=<n>`
+/// / `rows=<a>-<b>`, in any order; empty for the whole grid. ANYTHING else is
+/// [`TEXT_USAGE`] — `text 20`, a doubled option, `tail=0`, a malformed span — because
+/// the dispatch used to drop this tail on the floor, so an agent guessing a modifier
+/// (`text compact`) got the full grid back with no signal that it had guessed wrong
+/// (F4's sub-finding). A well-formed span that names no row (`rows=5-2`) is
+/// [`TEXT_BAD_ROWS`]. The reply line is the `Err` so both arms answer with the same
+/// bytes.
+pub(crate) fn text_args(rest: &str) -> Result<TextArgs, String> {
+    let usage = || Err(TEXT_USAGE.to_string());
+    let mut args = TextArgs::default();
+    let mut shaped = false;
+    for tok in rest.split_whitespace() {
+        if tok == "trim" {
+            if args.trim {
+                return usage();
+            }
+            args.trim = true;
+            continue;
+        }
+        if shaped {
+            return usage();
+        }
+        args.shape = if let Some(n) = tok.strip_prefix("tail=") {
+            match n.parse::<usize>() {
+                Ok(n) if n > 0 => TextShape::Tail(n),
+                _ => return usage(),
+            }
+        } else if let Some(span) = tok.strip_prefix("rows=") {
+            let Some((a, b)) = span.split_once('-') else {
+                return usage();
+            };
+            let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) else {
+                return usage();
+            };
+            if a > b {
+                return Err(TEXT_BAD_ROWS.to_string());
+            }
+            TextShape::Rows(a, b)
+        } else {
+            return usage();
+        };
+        shaped = true;
+    }
+    Ok(args)
 }
 
 /// Split a trailing `trim` token off a positional grammar's argument tail:
@@ -161,11 +246,20 @@ pub(crate) fn trim_lines_reply(reply: &str) -> String {
 /// under the terminal lock) as a line-framed reply: `OK <n>[ <verdict>]\n` + all
 /// `rows` rows, or with `trim`, `OK <sent>[ <verdict>] trimmed=<k>\n` + the first
 /// `sent` rows ([`trimmed_len`]). `verdict` is `turn`'s `turn submitted=… hash=…`
-/// run (empty for `text`); `trimmed=` always closes the header, so a client that
-/// keys on the `turn` token at position two, or reads the count at position one,
-/// sees exactly what it did before. Off by default: an untrimmed reply is
+/// run (empty for `text`); `trimmed=` follows it, so a client that keys on the
+/// `turn` token at position two, or reads the count at position one, sees exactly
+/// what it did before. `first` is the screen row `body` starts at: when it is not
+/// 0 (a `text tail=`/`rows=` slice) the header closes with ` first=<row>`, so a
+/// reader can still map reply line i to screen row `first+i` — additive, and LAST,
+/// like every field before it. Off by default: an untrimmed whole-grid reply is
 /// byte-identical to the pre-`trim` wire, because scripts count rows.
-pub(crate) fn frame_rows_reply(body: &str, rows: usize, verdict: &str, trim: bool) -> String {
+pub(crate) fn frame_rows_reply(
+    body: &str,
+    rows: usize,
+    verdict: &str,
+    trim: bool,
+    first: usize,
+) -> String {
     let sent = if trim {
         trimmed_len(body.lines())
     } else {
@@ -180,6 +274,9 @@ pub(crate) fn frame_rows_reply(body: &str, rows: usize, verdict: &str, trim: boo
         }
         if trim {
             let _ = write!(out, " trimmed={}", rows.saturating_sub(sent));
+        }
+        if first > 0 {
+            let _ = write!(out, " first={first}");
         }
         out.push('\n');
     }
@@ -209,33 +306,41 @@ pub(crate) fn frame_rows_reply(body: &str, rows: usize, verdict: &str, trim: boo
 /// the fidelity tests read the whole grid by this name and nothing in the lib does.
 #[cfg(test)]
 pub(crate) fn cmd_text(term: &Arc<Mutex<Terminal>>) -> String {
-    cmd_text_opt(term, false)
+    cmd_text_opt(term, TextArgs::default())
 }
 
-/// `text [trim]` -> `OK <n>[ trimmed=<k>]\n` then `<n>` visible rows. Bare, `n` is
-/// the grid's row count. With `trim`, the rows after the last non-blank one are
-/// dropped ([`trimmed_len`]), `n` is the count ACTUALLY SENT and `trimmed=<k>` says
-/// how many went — the header stays honest for a client that frames the body by its
-/// count, and every reader in the workspace takes only the first token (`aterm-ctl`'s
-/// `stream_count`, `aterm-agent`'s `read_text`, nest's reader), so the marker is
-/// additive. The rows themselves are the same [`visible_row`] text as ever.
-pub(crate) fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> String {
+/// `text [trim] [tail=<n>|rows=<a>-<b>]` -> `OK <n>[ trimmed=<k>][ first=<row>]\n`
+/// then `<n>` visible rows. Bare, `n` is the grid's row count. With `trim`, the rows
+/// after the last non-blank one are dropped ([`trimmed_len`]), `n` is the count
+/// ACTUALLY SENT and `trimmed=<k>` says how many went — the header stays honest for
+/// a client that frames the body by its count, and every reader in the workspace
+/// takes only the first token (`aterm-ctl`'s `stream_count`, `aterm-agent`'s
+/// `read_text`, nest's reader), so the marker is additive. A shape
+/// ([`TextShape::select`]) picks the rows BEFORE they are read, so a `tail=20` on
+/// a 63-row grid extracts 20 rows, not 63 and then a cut; `trim` measures that
+/// slice, and `first=<row>` says where it starts whenever that is not row 0. The
+/// rows themselves are the same [`visible_row`] text as ever.
+pub(crate) fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
     // The body is gathered into ONE buffer sized up front (one full row + newline
     // each) so the row loop never reallocates-and-copies the accumulated screen
     // while holding the terminal lock. The header is written AFTER the lock is
     // released — a trimmed count is only known once every row has been read — and
     // the one memcpy that costs is paid with the PTY reader unblocked.
-    let (rows, body) = {
+    let (first, rows, body) = {
         let t = term_lock(term);
-        let rows = t.rows() as usize;
+        let (first, end) = match args.shape.select(t.rows() as usize) {
+            Ok(span) => span,
+            Err(err) => return err,
+        };
+        let rows = end - first;
         let mut body = String::with_capacity(rows * (t.cols() as usize + 1));
-        for r in 0..rows {
+        for r in first..end {
             body.push_str(&visible_row(&t, r));
             body.push('\n');
         }
-        (rows, body)
+        (first, rows, body)
     };
-    frame_rows_reply(&body, rows, "", trim)
+    frame_rows_reply(&body, rows, "", args.trim, first)
 }
 
 /// `cursor` -> `OK <row> <col> <visible:0|1> <style>\n` (0-based). `<style>`
@@ -263,7 +368,11 @@ pub(crate) fn cmd_cursor(term: &Arc<Mutex<Terminal>>) -> String {
 /// wide-continuation cell yields an empty token (`%20`-free → ``). `<fg>`/`<bg>`
 /// are the fully-resolved `RRGGBB` colors the renderer would paint; `<attrs>` is
 /// a comma-separated list (or `none`) of the cell's active text attributes —
-/// `bold,dim,italic,underline,blink,inverse,strike,hidden`.
+/// `bold,dim,italic,underline,blink,inverse,strike,hidden` — followed by the
+/// width marker `wide` (the lead cell of a double-width glyph) or `wide_cont`
+/// (its blank right-half spacer) when the cell is one; the marker joins the
+/// list, replacing a bare `none`, so a parser's vocabulary is ten tokens
+/// (pinned by `cell_attrs_carry_the_width_markers`).
 pub(crate) fn cmd_cell(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let mut it = rest.split_whitespace();
     let (Some(rs), Some(cs)) = (it.next(), it.next()) else {
@@ -1137,7 +1246,9 @@ fn cell_pipeline_object(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_
 
 /// Structured twin of [`cmd_metrics`]. All scheduler/redraw counters and typed
 /// owner/reason labels are present so automation never has to scrape the text
-/// line. `reset` and `percentiles` retain the text verb's semantics.
+/// line. `reset` and `percentiles` retain the text verb's semantics, with one
+/// known gap: the JSON `percentiles` body does not yet carry the text form's
+/// `n_reflow`/`reflow_p50_ms`/`reflow_p95_ms`/`reflow_p99_ms` quartet.
 pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &str) -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     if command.trim() == "percentiles" {
@@ -3015,11 +3126,16 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
     )
 }
 
-/// `modes` -> `OK\n` then one `key=value` line per introspected mode:
-/// `alt_screen`, `cursor_visible`, `app_cursor_keys` (DECCKM),
-/// `app_keypad` (DECPAM), `bracketed_paste` (2004), `mouse_mode`
-/// (`none|normal|button|any|x10`), and `mouse_encoding`
-/// (`x10|utf8|sgr|urxvt|sgr_pixel`).
+/// `modes` -> `OK <n>\n` then `n` `key=value` lines, one per introspected mode —
+/// twelve today, in this order, and the count is in the header so a client
+/// streams the body (the `text`/`search` shape): `alt_screen`, `cursor_visible`,
+/// `app_cursor_keys` (DECCKM), `app_keypad` (DECPAM), `bracketed_paste` (2004),
+/// `mouse_mode` (`none|normal|button|any|x10`), `mouse_encoding`
+/// (`x10|utf8|sgr|urxvt|sgr_pixel`), `insert_mode` (IRM), `auto_wrap` (DECAWM),
+/// `origin_mode` (DECOM), `kitty_keyboard` (the active progressive-enhancement
+/// flags, a csv drawn from `disambiguate`, `report_events`, `report_alternates`,
+/// `report_all_keys`, `report_text`, or `none`) and `modify_other_keys` (the
+/// xterm level, `0|1|2`). Pinned by `modes_frames_its_count_and_twelve_keys`.
 pub(crate) fn cmd_modes(term: &Arc<Mutex<Terminal>>) -> String {
     use aterm_types::mouse::{MouseEncoding, MouseMode};
     let t = term_lock(term);
@@ -3180,25 +3296,33 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// `json_ok_sites_match_the_json_capable_verbs` scrape still binds `text`).
 #[cfg(test)]
 pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
-    cmd_text_json_opt(term, false)
+    cmd_text_json_opt(term, TextArgs::default())
 }
 
-/// `text --json [trim]`: [`cmd_text_json`], and with `trim` the `rows` array stops
-/// after the last non-blank row ([`trimmed_len`]) and the object closes with
-/// `"trimmed":k` — the JSON twin of the text header's `trimmed=<k>`. `dims.rows`
-/// stays the GRID's row count, so `rows.len()` says what was sent and `dims` what
-/// the screen is; the field is only written when trimming was asked for, keeping
-/// the bare reply byte-identical.
-pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> String {
+/// `text --json [trim] [tail=<n>|rows=<a>-<b>]`: [`cmd_text_json`], and with `trim`
+/// the `rows` array stops after the last non-blank row ([`trimmed_len`]) and the
+/// object closes with `"trimmed":k` — the JSON twin of the text header's
+/// `trimmed=<k>`. A shape ([`TextShape::select`]) picks which grid rows fill the
+/// array, `trim` measures that slice, and when it does not start at row 0 the
+/// object ends with `"first":<row>` (the twin of ` first=<row>`; after `trimmed`,
+/// new fields go LAST). `dims.rows` stays the GRID's row count, so `rows.len()`
+/// says what was sent, `first` where it starts and `dims` what the screen is; each
+/// field is only written when its option was asked for, keeping the bare reply
+/// byte-identical.
+pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> String {
     // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
     // styled frame already uses. Every field is read inside the single hold, so the
     // reply still describes one instant; the escaping and JSON assembly are pure
     // string work over owned data, and doing them under the mutex made the PTY
     // reader's `process()` and the frame snapshot queue behind a screen read.
-    let (rows_text, c, vis, style, rows, cols, seq) = {
+    let (rows_text, c, vis, style, rows, cols, seq, first) = {
         let t = term_lock(term);
         let rows = t.rows() as usize;
-        let rows_text: Vec<String> = (0..rows).map(|r| visible_row(&t, r)).collect();
+        let (first, end) = match args.shape.select(rows) {
+            Ok(span) => span,
+            Err(err) => return err,
+        };
+        let rows_text: Vec<String> = (first..end).map(|r| visible_row(&t, r)).collect();
         (
             rows_text,
             t.cursor(),
@@ -3207,6 +3331,7 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> Stri
             rows,
             t.cols(),
             t.content_seq(),
+            first,
         )
     };
     // ONE buffer, written straight through. The retired shape allocated a quoting
@@ -3214,12 +3339,13 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> Stri
     // times (the `join`, the outer `format!`, and `json_ok`'s own `format!`).
     // Byte-identical: `json_escape` is `json_escape_into` into a fresh String, and
     // `json_ok` is exactly this `"OK 1\n"` prefix + `"\n"` suffix.
-    let sent = if trim {
+    let selected = rows_text.len();
+    let sent = if args.trim {
         trimmed_len(rows_text.iter().map(String::as_str))
     } else {
-        rows
+        selected
     };
-    let mut out = String::with_capacity(rows * (cols as usize + 8) + 128);
+    let mut out = String::with_capacity(selected * (cols as usize + 8) + 128);
     out.push_str("OK 1\n");
     out.push_str("{\"rows\":[");
     for (i, row) in rows_text.iter().take(sent).enumerate() {
@@ -3240,8 +3366,11 @@ pub(crate) fn cmd_text_json_opt(term: &Arc<Mutex<Terminal>>, trim: bool) -> Stri
             c.col,
             json_str_field("style", style),
         );
-        if trim {
-            let _ = write!(out, ",\"trimmed\":{}", rows.saturating_sub(sent));
+        if args.trim {
+            let _ = write!(out, ",\"trimmed\":{}", selected.saturating_sub(sent));
+        }
+        if first > 0 {
+            let _ = write!(out, ",\"first\":{first}");
         }
         out.push('}');
     }
@@ -4379,6 +4508,55 @@ mod tests {
             term.lock().unwrap().process(format!("{l}\r\n").as_bytes());
         }
         term
+    }
+
+    /// The `modes` doc names the frame and the keys; this pins both, so the
+    /// header count and the twelve-key roster cannot drift from the prose again
+    /// (the doc read `OK` and seven keys while the handler sent `OK 12`).
+    #[test]
+    fn modes_frames_its_count_and_twelve_keys() {
+        let term = term_with(&[]);
+        let out = super::cmd_modes(&term);
+        let mut lines = out.lines();
+        assert_eq!(lines.next(), Some("OK 12"), "{out}");
+        let keys: Vec<&str> = lines
+            .map(|l| l.split_once('=').map_or(l, |(k, _)| k))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "alt_screen",
+                "cursor_visible",
+                "app_cursor_keys",
+                "app_keypad",
+                "bracketed_paste",
+                "mouse_mode",
+                "mouse_encoding",
+                "insert_mode",
+                "auto_wrap",
+                "origin_mode",
+                "kitty_keyboard",
+                "modify_other_keys",
+            ],
+            "{out}"
+        );
+        assert!(out.ends_with('\n'), "{out}");
+    }
+
+    /// The `cell` doc's attrs vocabulary includes the two width markers; this
+    /// pins that a CJK lead cell answers `wide`, its spacer `wide_cont`, and the
+    /// ASCII neighbour a bare `none`. Positional split: the spacer's grapheme is
+    /// the empty token, which a whitespace split would swallow.
+    #[test]
+    fn cell_attrs_carry_the_width_markers() {
+        let term = term_with(&["\u{6f22}a"]);
+        let attrs = |reply: String| reply.trim_end().split(' ').nth(4).map(str::to_owned);
+        let lead = super::cmd_cell(&term, "0 0");
+        let cont = super::cmd_cell(&term, "0 1");
+        let ascii = super::cmd_cell(&term, "0 2");
+        assert_eq!(attrs(lead.clone()).as_deref(), Some("wide"), "{lead}");
+        assert_eq!(attrs(cont.clone()).as_deref(), Some("wide_cont"), "{cont}");
+        assert_eq!(attrs(ascii.clone()).as_deref(), Some("none"), "{ascii}");
     }
 
     /// Sparse tail cells must report the same effective defaults as a
@@ -5927,9 +6105,21 @@ mod trim_tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        TEXT_USAGE, cmd_blocktext_args, cmd_text, cmd_text_json, cmd_text_json_opt, cmd_text_opt,
-        frame_rows_reply, split_trim_tail, text_trim_arg, trim_lines_reply, trimmed_len,
+        TEXT_BAD_ROWS, TEXT_USAGE, TextArgs, TextShape, cmd_blocktext_args, cmd_text,
+        cmd_text_json, cmd_text_json_opt, cmd_text_opt, frame_rows_reply, split_trim_tail,
+        text_args, trim_lines_reply, trimmed_len,
     };
+
+    /// `text trim`: the whole grid, minus its blank tail.
+    const TRIM: TextArgs = TextArgs {
+        trim: true,
+        shape: TextShape::All,
+    };
+
+    /// The parsed form of one argument tail, for a tail the test knows is valid.
+    fn args(rest: &str) -> TextArgs {
+        text_args(rest).unwrap_or_else(|e| panic!("{rest:?} parses: {e}"))
+    }
 
     /// `trimmed_len` is `last non-blank index + 1`: all blank → 0; no blank → n;
     /// interior blanks are preserved because only the TAIL is measured.
@@ -5947,20 +6137,120 @@ mod trim_tests {
         assert_eq!(trimmed_len(["", "x"].into_iter()), 2, "leading blank kept");
     }
 
-    /// The `text` tail: empty and `trim` parse; anything else is the usage line.
+    /// The `text` tail: empty, `trim`, and at most one of `tail=<n>` / `rows=<a>-<b>`
+    /// parse, in any order; anything else is the usage line — a bare number, a
+    /// doubled option, `tail=0`, a malformed span. A well-formed span that is empty
+    /// on ANY grid (`rows=5-2`) is `ERR bad rows`, not a usage error: the grammar was
+    /// right, the numbers name nothing.
     #[test]
-    fn text_trim_arg_accepts_only_trim() {
-        assert_eq!(text_trim_arg(""), Ok(false));
-        assert_eq!(text_trim_arg("  "), Ok(false));
-        assert_eq!(text_trim_arg("trim"), Ok(true));
-        assert_eq!(text_trim_arg(" trim "), Ok(true));
-        for bad in ["foo", "trim extra", "TRIM", "trim=1", "--trim"] {
+    fn text_args_accepts_trim_and_one_shape_in_any_order() {
+        let all = TextArgs::default();
+        assert_eq!(text_args(""), Ok(all));
+        assert_eq!(text_args("  "), Ok(all));
+        assert_eq!(text_args("trim"), Ok(TRIM));
+        assert_eq!(text_args(" trim "), Ok(TRIM));
+        let tail5 = TextArgs {
+            trim: false,
+            shape: TextShape::Tail(5),
+        };
+        assert_eq!(text_args("tail=5"), Ok(tail5));
+        assert_eq!(
+            text_args("tail=5 trim"),
+            Ok(TextArgs {
+                trim: true,
+                ..tail5
+            })
+        );
+        assert_eq!(
+            text_args("trim tail=5"),
+            Ok(TextArgs {
+                trim: true,
+                ..tail5
+            }),
+            "any order"
+        );
+        assert_eq!(
+            text_args("rows=20-23"),
+            Ok(TextArgs {
+                trim: false,
+                shape: TextShape::Rows(20, 23),
+            })
+        );
+        assert_eq!(
+            text_args("rows=7-7 trim"),
+            Ok(TextArgs {
+                trim: true,
+                shape: TextShape::Rows(7, 7),
+            }),
+            "a one-row span is a span"
+        );
+        for bad in [
+            "foo",
+            "20",
+            "trim extra",
+            "TRIM",
+            "trim=1",
+            "--trim",
+            "trim trim",
+            "tail=0",
+            "tail=",
+            "tail=x",
+            "tail=-1",
+            "tail",
+            "tail=5 tail=6",
+            "tail=5 rows=1-2",
+            "rows=5",
+            "rows=a-b",
+            "rows=5-",
+            "rows=-5",
+            "rows=1-2-3",
+            "rows",
+        ] {
             assert_eq!(
-                text_trim_arg(bad),
+                text_args(bad),
                 Err(TEXT_USAGE.to_string()),
                 "{bad:?} is rejected, never silently ignored"
             );
         }
+        assert_eq!(
+            text_args("rows=5-2"),
+            Err(TEXT_BAD_ROWS.to_string()),
+            "well-formed, but names no row on any grid"
+        );
+    }
+
+    /// The shape resolves against the grid: `tail` clamps to the whole grid, a
+    /// `rows` span clamps its end and refuses a start past the last row.
+    #[test]
+    fn text_shape_select_clamps_to_the_grid() {
+        assert_eq!(TextShape::All.select(24), Ok((0, 24)));
+        assert_eq!(TextShape::Tail(5).select(24), Ok((19, 24)));
+        assert_eq!(TextShape::Tail(24).select(24), Ok((0, 24)));
+        assert_eq!(
+            TextShape::Tail(99).select(24),
+            Ok((0, 24)),
+            "more than the grid = the grid"
+        );
+        assert_eq!(TextShape::Rows(20, 23).select(24), Ok((20, 24)));
+        assert_eq!(
+            TextShape::Rows(23, 99).select(24),
+            Ok((23, 24)),
+            "end clamped"
+        );
+        assert_eq!(
+            TextShape::Rows(0, usize::MAX).select(24),
+            Ok((0, 24)),
+            "no overflow"
+        );
+        assert_eq!(
+            TextShape::Rows(24, 30).select(24),
+            Err(TEXT_BAD_ROWS.to_string()),
+            "start past the last row"
+        );
+        assert_eq!(
+            TextShape::Rows(0, 0).select(0),
+            Err(TEXT_BAD_ROWS.to_string())
+        );
     }
 
     /// The wire's usage line and the help catalog state ONE grammar.
@@ -6027,18 +6317,18 @@ mod trim_tests {
         assert_eq!(bare, "OK 6\none\n\nthree\n\n\n\n", "bare = the grid");
         assert_eq!(
             bare,
-            cmd_text_opt(&term, false),
+            cmd_text_opt(&term, TextArgs::default()),
             "cmd_text is the untrimmed form"
         );
         assert_eq!(
-            cmd_text_opt(&term, true),
+            cmd_text_opt(&term, TRIM),
             "OK 3 trimmed=3\none\n\nthree\n",
             "trimmed = rows sent, interior blank kept, k = rows dropped"
         );
         // An all-blank screen trims to nothing and says so.
         let blank = term_with(3, b"");
-        assert_eq!(cmd_text_opt(&blank, true), "OK 0 trimmed=3\n");
-        assert_eq!(cmd_text_opt(&blank, false), "OK 3\n\n\n\n");
+        assert_eq!(cmd_text_opt(&blank, TRIM), "OK 0 trimmed=3\n");
+        assert_eq!(cmd_text_opt(&blank, TextArgs::default()), "OK 3\n\n\n\n");
     }
 
     /// `text --json trim`: `rows` stops at the last non-blank row and the object
@@ -6052,8 +6342,8 @@ mod trim_tests {
             !bare.contains("trimmed"),
             "bare JSON carries no trimmed field"
         );
-        assert_eq!(bare, cmd_text_json_opt(&term, false));
-        let trimmed = cmd_text_json_opt(&term, true);
+        assert_eq!(bare, cmd_text_json_opt(&term, TextArgs::default()));
+        let trimmed = cmd_text_json_opt(&term, TRIM);
         assert!(
             trimmed.starts_with("OK 1\n{\"rows\":[\"one\",\"\",\"three\"],"),
             "{trimmed}"
@@ -6072,24 +6362,171 @@ mod trim_tests {
     #[test]
     fn frame_rows_reply_places_the_verdict_then_trimmed() {
         let body = "a\n\nb\n\n\n";
-        assert_eq!(frame_rows_reply(body, 5, "", false), "OK 5\na\n\nb\n\n\n");
         assert_eq!(
-            frame_rows_reply(body, 5, "", true),
+            frame_rows_reply(body, 5, "", false, 0),
+            "OK 5\na\n\nb\n\n\n"
+        );
+        assert_eq!(
+            frame_rows_reply(body, 5, "", true, 0),
             "OK 3 trimmed=2\na\n\nb\n"
         );
         let v = "turn submitted=1 status=settled seq=9 id=2 dur_ms=3 hash=00000000000000ab";
         assert_eq!(
-            frame_rows_reply(body, 5, v, false),
+            frame_rows_reply(body, 5, v, false, 0),
             format!("OK 5 {v}\na\n\nb\n\n\n")
         );
         assert_eq!(
-            frame_rows_reply(body, 5, v, true),
+            frame_rows_reply(body, 5, v, true, 0),
             format!("OK 3 {v} trimmed=2\na\n\nb\n")
         );
         assert_eq!(
-            frame_rows_reply("\n\n", 2, v, true),
+            frame_rows_reply("\n\n", 2, v, true, 0),
             format!("OK 0 {v} trimmed=2\n")
         );
+        // `first=` is the LAST token, after the verdict and after `trimmed=`; row 0
+        // is the bare wire.
+        assert_eq!(
+            frame_rows_reply(body, 5, "", false, 19),
+            "OK 5 first=19\na\n\nb\n\n\n"
+        );
+        assert_eq!(
+            frame_rows_reply(body, 5, "", true, 19),
+            "OK 3 trimmed=2 first=19\na\n\nb\n"
+        );
+        assert_eq!(
+            frame_rows_reply(body, 5, v, true, 3),
+            format!("OK 3 {v} trimmed=2 first=3\na\n\nb\n")
+        );
+    }
+
+    /// `r0`..`r<n-1>`, one per row, with no trailing newline so a grid of exactly
+    /// `n` rows never scrolls.
+    fn numbered(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| format!("r{i}"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+            .into_bytes()
+    }
+
+    /// `tail=<n>` / `rows=<a>-<b>` send only the selected rows and say where they
+    /// start; a selection that is the whole grid is the bare wire (no `first=`).
+    #[test]
+    fn text_tail_and_rows_send_a_slice_and_say_where_it_starts() {
+        let term = term_with(24, &numbered(24));
+        let whole = cmd_text_opt(&term, TextArgs::default());
+        assert!(whole.starts_with("OK 24\nr0\nr1\n"), "{whole}");
+        assert_eq!(
+            cmd_text_opt(&term, args("tail=5")),
+            "OK 5 first=19\nr19\nr20\nr21\nr22\nr23\n"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=20-23")),
+            "OK 4 first=20\nr20\nr21\nr22\nr23\n"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=23-99")),
+            "OK 1 first=23\nr23\n",
+            "the span's end is clamped to the grid"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=0-0")),
+            "OK 1\nr0\n",
+            "row 0 carries no first="
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=99-100")),
+            TEXT_BAD_ROWS,
+            "no row of the span is on the grid"
+        );
+        // A tail larger than the grid is the grid, byte-identical to the bare read.
+        assert_eq!(cmd_text_opt(&term, args("tail=99")), whole);
+        assert_eq!(cmd_text_opt(&term, args("tail=24")), whole);
+        assert_eq!(cmd_text_opt(&term, args("rows=0-99")), whole);
+        assert!(!whole.contains("first="));
+    }
+
+    /// `trim` composes with a shape and measures the SLICE: the blank tail of the
+    /// selected rows is dropped, `trimmed=` counts those, `first=` still says where
+    /// the slice began — and the header order is `trimmed=` then `first=`.
+    #[test]
+    fn text_trim_composes_with_the_shape_and_trims_the_slice() {
+        // 22 numbered rows on a 24-row grid: rows 22 and 23 are blank.
+        let term = term_with(24, &numbered(22));
+        assert_eq!(
+            cmd_text_opt(&term, TRIM),
+            {
+                let mut want = String::from("OK 22 trimmed=2\n");
+                for i in 0..22 {
+                    want.push_str(&format!("r{i}\n"));
+                }
+                want
+            },
+            "whole-grid trim is unchanged"
+        );
+        let want = "OK 3 trimmed=2 first=19\nr19\nr20\nr21\n";
+        assert_eq!(cmd_text_opt(&term, args("tail=5 trim")), want);
+        assert_eq!(cmd_text_opt(&term, args("trim tail=5")), want, "any order");
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=19-23 trim")),
+            want,
+            "the same slice by span"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=22-23 trim")),
+            "OK 0 trimmed=2 first=22\n",
+            "an all-blank slice trims to nothing and still says where it was"
+        );
+        assert_eq!(
+            cmd_text_opt(&term, args("rows=0-4 trim")),
+            "OK 5 trimmed=0\nr0\nr1\nr2\nr3\nr4\n",
+            "a slice with no blank tail trims nothing; row 0 carries no first="
+        );
+    }
+
+    /// `text --json` with a shape: `rows` is the slice, `dims.rows` stays the grid,
+    /// and `"first":<row>` closes the object (after `"trimmed"`) whenever the slice
+    /// does not start at row 0.
+    #[test]
+    fn text_json_carries_first_for_a_shaped_read() {
+        let term = term_with(24, &numbered(22));
+        let json = cmd_text_json_opt(&term, args("tail=5"));
+        assert!(
+            json.starts_with("OK 1\n{\"rows\":[\"r19\",\"r20\",\"r21\",\"\",\"\"],"),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"dims\":{\"rows\":24,\"cols\":40}"),
+            "dims stay the grid: {json}"
+        );
+        assert!(json.ends_with(",\"first\":19}\n"), "{json}");
+        assert!(!json.contains("trimmed"), "{json}");
+        let trimmed = cmd_text_json_opt(&term, args("tail=5 trim"));
+        assert!(
+            trimmed.starts_with("OK 1\n{\"rows\":[\"r19\",\"r20\",\"r21\"],"),
+            "{trimmed}"
+        );
+        assert!(
+            trimmed.ends_with(",\"trimmed\":2,\"first\":19}\n"),
+            "{trimmed}"
+        );
+        assert_eq!(cmd_text_json_opt(&term, args("rows=20-21")), {
+            let bare = cmd_text_json_opt(&term, args("rows=20-21"));
+            assert!(
+                bare.starts_with("OK 1\n{\"rows\":[\"r20\",\"r21\"],"),
+                "{bare}"
+            );
+            assert!(bare.ends_with(",\"first\":20}\n"), "{bare}");
+            bare
+        });
+        assert_eq!(cmd_text_json_opt(&term, args("rows=99-100")), TEXT_BAD_ROWS);
+        let whole = cmd_text_json_opt(&term, args("tail=99"));
+        assert_eq!(
+            whole,
+            cmd_text_json(&term),
+            "a tail larger than the grid is the bare JSON"
+        );
+        assert!(!whole.contains("\"first\""), "{whole}");
     }
 
     /// `blocktext <id> [trim]`: the id alone reaches the emitter; `trim` re-frames

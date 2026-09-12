@@ -103,14 +103,16 @@ use std::time::Duration;
 
 use aterm_render::{BeamVertex, GlowQuad, RainHalo};
 
-use crate::cursor_glow::{Geom, GlowConfig, SoundCue};
+use crate::cursor_glow::{Geom, GlowConfig, SoundCue, band_pos, band_row};
 use crate::spectrum::spectrum_snap;
 use crate::trail_sound::SoundKind;
 use meteor::{Meteors, Spawn};
 use ribbon::Ribbon;
 use spine::Spine;
 use stardust::{GlyphProbe, StarBudget, Stardust};
-use timing::{JUMP_MIN_CELLS, SPRING_SNAP_RESPONSE_S, half_life};
+use timing::{
+    ECHO_LEDGER_DEPTH, ECHO_PATIENCE_S, JUMP_MIN_CELLS, SPRING_SNAP_RESPONSE_S, half_life,
+};
 
 /// Life of the caret's LANDING RE-LIGHT ([`Engine::caret_paint`]): a hold of
 /// one [`SPRING_SNAP_RESPONSE_S`] — the flare's own relax, so the re-light
@@ -206,8 +208,10 @@ pub enum Licence {
 pub enum TypedClass {
     /// An ordinary printable glyph.
     Glyph,
-    /// A shifted capital — earns an m1 at the glyph's cell (§5.8) and, at the
-    /// synth, an octave echo at +25 ms, −8 dB (§8.2).
+    /// A capital — by Shift or by Caps Lock: the GLYPH is asked — earns an
+    /// m1 at the glyph's cell (§5.8) and, at the synth, the octave RING at
+    /// +60 ms, −6 dB, and the ×4 sparkle (§10.4, re-ruled 2026-09-10; the
+    /// keyed seam's `click_shifted` agrees with this classification).
     Capital,
     /// `!` — earns an m1 (§5.8).
     Bang,
@@ -268,7 +272,11 @@ pub enum Event {
     /// that can mint a meteor, and T1 is exactly the statement that geometry
     /// is born here and nowhere else.
     Move {
-        /// `(row, col)` the caret left.
+        /// `(row, col)` the caret left — the host's LAST OBSERVED cell,
+        /// licensed or not. The engine's own mirror advances only on licensed
+        /// moves, and [`Engine::echo_bridge`] reads the hop between the two,
+        /// so a producer that hands over anything but the observed origin
+        /// would be inventing holes (paid for by nothing, so laid as nothing).
         from: (u16, u16),
         /// `(row, col)` the caret was observed at — the LANDING, and `t = 0`.
         to: (u16, u16),
@@ -305,6 +313,12 @@ pub enum Event {
     /// `col0..col1` that no live cell owns, as typing, born at the echo;
     /// the keys' own cells are untouched. Nothing else reads it: no spine
     /// advance (the keys did that), no star, no meteor, no cue.
+    ///
+    /// The engine mints one of these itself for a LATE echo — a key's glyph
+    /// cells the seam refused to license because the echo came after its
+    /// `0.25 s` window — from the mirror to the landing of the next licensed
+    /// typed move, paid for press by press from the [`EchoLedger`]
+    /// ([`Engine::echo_bridge`], 2026-09-10).
     Sweep {
         /// The echoed row.
         row: u16,
@@ -581,6 +595,13 @@ pub struct Status {
     pub meteors: u32,
     /// Live ribbon cells.
     pub cells: u32,
+    /// `v2_bridged=` — cells the echo ledger has laid since the engine was
+    /// engaged that the host's own sweeps did not: a refused late echo's
+    /// glyphs, relit by the next licensed one ([`Engine::echo_bridge`]). The
+    /// admission ring keeps reading `declined no-fresh-hint` for the late
+    /// move itself — the gate is untouched — so this is the row that says a
+    /// hole was repaired. Cumulative, like the host's `spawns`.
+    pub bridged: u32,
     /// The eased spine.
     pub disp: f32,
     /// **THE FLOW ROW** — `flow=` / `combo=` / `combo_best=`. The number a
@@ -726,6 +747,163 @@ pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
 }
 
 // ===========================================================================
+// The echo ledger
+// ===========================================================================
+
+/// **THE ECHO LEDGER** — typed presses whose caret advance the engine has not
+/// seen yet, oldest first, each `(press, cells)`.
+///
+/// One press is one cell of ribbon and nothing more: a licensed typed move
+/// SPENDS the ledger, oldest first, for every cell it lays or the host lays
+/// for it ([`Engine::echo_bridge`]), and a press the caret never answers
+/// inside [`ECHO_PATIENCE_S`] is dropped as swallowed. Fixed-size and
+/// `Copy`, like the host's own `TypedStamps`: the steady frame path allocates
+/// nothing (§18), and [`ECHO_LEDGER_DEPTH`] is the most presses one move could
+/// ever pair with, so a fuller ledger would be presses no move can spend.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EchoLedger {
+    /// Packed oldest-first: every `Some` precedes every `None`.
+    slots: [Option<(Instant, u16)>; ECHO_LEDGER_DEPTH],
+    /// The Tier-1 projection of `EchoLedgerBridge`'s tallies — test-only, so
+    /// the shipping frame path carries nothing for it.
+    #[cfg(test)]
+    tally: LedgerTally,
+}
+
+/// Cells the ledger has banked, spent, forfeited and expired since it was
+/// made: the four dispositions `EchoLedgerBridge`'s `OnePressOneCell`
+/// conserves, read off the REAL ledger by
+/// `tests::the_real_engine_conforms_to_the_echo_ledger_model`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct LedgerTally {
+    banked: u32,
+    spent: u32,
+    forfeited: u32,
+    expired: u32,
+}
+
+impl EchoLedger {
+    /// Bank one press worth `cells` (a wide glyph is two, an IME commit its
+    /// sum — the host prices that at the key). When full, the OLDEST press is
+    /// dropped: the newest presses are the ones an echo can still be for.
+    fn bank(&mut self, at: Instant, cells: u16) {
+        if cells == 0 {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.tally.banked += u32::from(cells);
+        }
+        if let Some(free) = self.slots.iter().position(Option::is_none) {
+            self.slots[free] = Some((at, cells));
+        } else {
+            #[cfg(test)]
+            {
+                self.tally.forfeited += self.slots[0].map_or(0, |(_, c)| u32::from(c));
+            }
+            self.slots.copy_within(1.., 0);
+            self.slots[ECHO_LEDGER_DEPTH - 1] = Some((at, cells));
+        }
+    }
+
+    /// Drop every press older than [`ECHO_PATIENCE_S`]: swallowed, not late.
+    /// Packing is kept — presses are banked oldest-first, so the stale prefix
+    /// goes and the rest shifts down.
+    fn expire(&mut self, now: Instant) {
+        let mut kept = [None; ECHO_LEDGER_DEPTH];
+        let mut n = 0;
+        for (at, cells) in self.slots.into_iter().flatten() {
+            if now.saturating_duration_since(at).as_secs_f32() <= ECHO_PATIENCE_S {
+                kept[n] = Some((at, cells));
+                n += 1;
+            } else {
+                #[cfg(test)]
+                {
+                    self.tally.expired += u32::from(cells);
+                }
+            }
+        }
+        self.slots = kept;
+    }
+
+    /// Cells the banked presses can still pay for.
+    fn total(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|&(_, cells)| usize::from(cells))
+            .sum()
+    }
+
+    /// Cells of the presses banked strictly BEFORE `key` — the ones whose
+    /// echoes could lie to the left of that key's own cell.
+    fn older_than(&self, key: Instant) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|&&(at, _)| at < key)
+            .map(|&(_, cells)| usize::from(cells))
+            .sum()
+    }
+
+    /// Spend `cells` oldest-first — the presses that produced an echo are the
+    /// ones it consumes, so one press can never fund a second cell.
+    fn spend(&mut self, mut cells: usize) {
+        for slot in &mut self.slots {
+            if cells == 0 {
+                break;
+            }
+            let Some((at, have)) = *slot else { break };
+            let take = usize::from(have).min(cells);
+            cells -= take;
+            #[cfg(test)]
+            {
+                self.tally.spent += take as u32;
+            }
+            let left = have - take as u16;
+            *slot = (left > 0).then_some((at, left));
+        }
+        // Re-pack: a spent slot in the middle would hide the presses behind it.
+        let mut kept = [None; ECHO_LEDGER_DEPTH];
+        for (n, entry) in self.slots.into_iter().flatten().enumerate() {
+            kept[n] = Some(entry);
+        }
+        self.slots = kept;
+    }
+
+    /// Forget every press.
+    fn clear(&mut self) {
+        #[cfg(test)]
+        {
+            self.tally.forfeited += self.total() as u32;
+        }
+        self.slots = [None; ECHO_LEDGER_DEPTH];
+    }
+
+    /// The ledger as `EchoLedgerBridge` sees it at `now`, partitioned by the
+    /// licensing `key`: `(older, younger, stale)` cells — presses banked
+    /// before the key, the key and the presses behind it, and presses past
+    /// [`ECHO_PATIENCE_S`] that the next move will drop. Test-only: the
+    /// Tier-1 projection reads the real ledger through it.
+    #[cfg(test)]
+    fn partition(&self, key: Instant, now: Instant) -> (usize, usize, usize) {
+        let (mut older, mut younger, mut stale) = (0, 0, 0);
+        for &(at, cells) in self.slots.iter().flatten() {
+            let cells = usize::from(cells);
+            if now.saturating_duration_since(at).as_secs_f32() > ECHO_PATIENCE_S {
+                stale += cells;
+            } else if at < key {
+                older += cells;
+            } else {
+                younger += cells;
+            }
+        }
+        (older, younger, stale)
+    }
+}
+
+// ===========================================================================
 // The engine
 // ===========================================================================
 
@@ -754,6 +932,22 @@ pub struct Engine {
     caret_seam: CaretSeam,
     /// The caret cell as last observed.
     caret: (u16, u16),
+    /// Whether [`Engine::caret`] has been learned from an observed move since
+    /// the last [`Engine::reset`]. The echo ledger measures every hop
+    /// against the mirror, and a mirror nobody has set is not a position to
+    /// measure from.
+    caret_known: bool,
+    /// **THE ECHO LEDGER** — typed presses whose caret advance the engine has
+    /// not seen yet (see [`EchoLedger`]).
+    echo: EchoLedger,
+    /// Cells the ledger has laid that the host did not sweep — [`Status::bridged`].
+    bridged: u32,
+    /// The clock of the host's own sweep for the last observed move — the
+    /// licensing key the ledger partitioned by — or `None` when the host
+    /// sent none. Test-only: the Tier-1 twin asserts it IS the key's clock
+    /// on every move, so the partition it projects is the engine's own.
+    #[cfg(test)]
+    last_host_sweep_at: Option<Instant>,
     /// The cell the last Backspace emptied — the caret as of that erase's
     /// tick (the ribbon's and the sky's own reading of it) — published as
     /// [`Mend::row`] / [`Mend::col`] when a fix key mends the run.
@@ -786,6 +980,11 @@ pub struct Engine {
     pending_cues: Vec<SoundCue>,
     /// The impulse awaiting [`Engine::take_companion_impulse`].
     companion: Option<CompanionImpulse>,
+    /// A bar fan or drop fan the host asked for this frame (§27) —
+    /// `(edge, stars, ring)` — dealt to the meteor pool on the next
+    /// [`Engine::tick`] against that frame's `Ctx`. Like `earned`, it is
+    /// not a cursor event.
+    party: Option<(Instant, u8, bool)>,
     /// The last CREDITED LANDING the caret's re-light floors its paint from
     /// (§7.1, [`CaretSeam::paint`]). Never a typed echo — typing paint is the
     /// spine's — and `None` once the re-light has run its
@@ -826,6 +1025,11 @@ impl Engine {
             meteor: Meteors::default(),
             caret_seam: CaretSeam::default(),
             caret: (0, 0),
+            caret_known: false,
+            echo: EchoLedger::default(),
+            bridged: 0,
+            #[cfg(test)]
+            last_host_sweep_at: None,
             erased: (0, 0),
             mend: None,
             pane: None,
@@ -837,6 +1041,7 @@ impl Engine {
             fp: 0,
             status: Status::default(),
             brisk: false,
+            party: None,
         }
     }
 
@@ -902,29 +1107,210 @@ impl Engine {
             return;
         }
         match ev {
-            Event::Typed { .. } => {
+            Event::Typed { cells, .. } => {
                 let mend = self.spine.mend(now);
                 self.spine.advance(now);
                 if mend.is_some() {
                     self.mend = mend;
                 }
+                self.echo.bank(now, cells);
             }
             Event::Erase => {
                 self.spine.drain_delete(now);
+                // Stale presses were swallowed before the erase and are
+                // dropped as expired; the fresh ones are forfeited. Either
+                // way none survive — the split is the ledger's book-keeping.
+                self.echo.expire(now);
+                self.echo.clear();
                 self.offer(CompanionImpulse::Wince);
             }
             Event::Kill { .. } => {
                 self.spine.drain_kill(now);
+                self.echo.expire(now);
+                self.echo.clear();
                 self.offer(CompanionImpulse::Wince);
             }
-            Event::Move { to, .. } => self.caret = to,
+            Event::Move {
+                from, to, licence, ..
+            } => {
+                // The ledger reads the mirror BEFORE the move lands on it —
+                // the hop between the two is what it exists to explain. Its
+                // sweep goes to the FRONT of the frame's events: the key's own
+                // `Typed` (replayed at the landing) and the host's sweep both
+                // lay cells to the RIGHT of the hole, and a cell laid past a
+                // cohort's end mints a new cohort — the seam and the feather
+                // this sweep exists to prevent. Laid first, the hole's cells
+                // join the cohort and every later lay joins them.
+                // The host's own sweep for this move, if it sent one, is the
+                // event just before the move. It covers `from..to` on the
+                // KEY's clock — the press that licensed the move — so a move
+                // with no hole before it needs nothing more (the per-key path
+                // stays byte-identical), and a hole takes the same clock, so
+                // the frame that echoes the key shows the whole run lit.
+                let host_sweep = match self.events.last() {
+                    Some(&(
+                        Event::Sweep {
+                            row,
+                            col0: c0,
+                            col1,
+                        },
+                        at,
+                    )) if row == to.0 && c0 == from.1 && col1 == to.1 => Some(at),
+                    _ => None,
+                };
+                #[cfg(test)]
+                {
+                    self.last_host_sweep_at = host_sweep;
+                }
+                if let Some(col0) = self.echo_bridge(from, to, licence, host_sweep, now)
+                    && (col0 < from.1 || host_sweep.is_none())
+                {
+                    let host_end = if host_sweep.is_some() { from.1 } else { to.1 };
+                    self.bridged = self.bridged.saturating_add(u32::from(host_end - col0));
+                    self.events.insert(
+                        0,
+                        (
+                            Event::Sweep {
+                                row: to.0,
+                                col0,
+                                col1: to.1,
+                            },
+                            host_sweep.unwrap_or(now),
+                        ),
+                    );
+                }
+                self.caret = to;
+                self.caret_known = true;
+            }
             Event::ReducedMotion(on) => self.reduced_motion = on,
+            Event::Focus(false) => {
+                self.echo.expire(now);
+                self.echo.clear();
+            }
             // Focus is the ribbon's and the sky's to act on (they ember and
             // die in their own `on_event`); a Return is the KEY, and inert;
             // a Sweep is the ribbon's alone.
-            Event::Focus(_) | Event::Return | Event::Sweep { .. } => {}
+            Event::Focus(true) | Event::Return | Event::Sweep { .. } => {}
         }
         self.events.push((ev, now));
+    }
+
+    /// **THE LATE ECHO'S CELLS** (2026-09-10, the "black gap" report) — what
+    /// a licensed typed move owes the presses that came before it.
+    ///
+    /// The host licenses a caret move only within `0.25 s` of a keypress.
+    /// A TUI whose render stalled echoes the key later than that; the seam
+    /// refuses the move (`no-fresh-hint`, correctly — it cannot tell a late
+    /// echo from program output), nothing reaches this engine, the mirror
+    /// stays where the caret WAS, and the key's glyph cell is never laid.
+    /// The next key's echo is licensed, sweeps only its own cell, and the
+    /// ribbon restarts one cell to the right as a new cohort with a
+    /// feathered edge: a dark cell inside the rainbow, permanent. Three keys
+    /// typed into a stall leave three.
+    ///
+    /// This engine can tell the two apart, because it holds what the seam
+    /// does not: every [`Event::Typed`] is a real press, banked on the
+    /// [`EchoLedger`] until a caret advance pays for it, and every licensed
+    /// move carries the host's `from` — the caret's LAST OBSERVED cell —
+    /// beside the engine's own mirror, the last LICENSED one. When a licensed
+    /// typed move lands on the mirror's row, forward, and `from` sits past
+    /// the mirror, the caret advanced through an unlicensed hop; when the
+    /// hop plus the move's own advance is paid for, cell by cell, by presses
+    /// on the ledger, those cells are the presses' own glyphs and are laid —
+    /// as one [`Event::Sweep`] from the mirror to the landing, on the
+    /// licensed move's own clock (T2), joining the cohort they belong to so
+    /// the walk continues with no seam and no feather. The same sweep covers
+    /// a licensed multi-cell echo the host did not sweep itself — a
+    /// non-coalesced re-anchor, or a batch its press credits (which age out
+    /// at `2 s`, `CursorGlow::RAINBOW_COALESCE_CREDIT_LIFE`, the same two
+    /// seconds as [`timing::ECHO_PATIENCE_S`]) could not pay for; the
+    /// refusal is logged `licensed`.
+    ///
+    /// **What it may never do.** T1 holds: geometry is born only on this
+    /// observed, licensed move. The anti-stray law holds: a cell is laid only
+    /// against a press, one for one, and only against a press that could
+    /// have PRODUCED it. The host's sweep for the move rides on the clock of
+    /// the press that licensed it (`typed_at`, the stamp the classifier
+    /// popped); presses YOUNGER than that key are still in flight and their
+    /// glyphs lie to the RIGHT of its cell, so the hole to its left may be
+    /// paid only by presses OLDER than the key — and exactly, cell for cell.
+    /// (Without that partition a program nudge followed by a fast burst
+    /// would light the nudge's cell with the burst's presses: three presses,
+    /// four cells.) A hop the older presses do not explain exactly — vim's
+    /// `w`, a mouse click, program output that moved the caret, a swallowed
+    /// key beside a real hole — buys nothing and FORGETS the ledger, so a
+    /// swallowed press can never roll forward as a phantom credit either: the
+    /// next ordinary echo finds it older than its key, unexplained, and drops
+    /// it. A move the host did not sweep — a licensed batch its credits could
+    /// not pay for — is laid from the oldest presses when it starts AT the
+    /// mirror (a hop before it cannot be partitioned without a key clock, and
+    /// is refused). The bound is the host's own coalesce cap
+    /// ([`timing::ECHO_LEDGER_DEPTH`]). A press older than
+    /// [`timing::ECHO_PATIENCE_S`] was swallowed, not delayed, and buys
+    /// nothing. A non-typed licence, an erase or kill, a focus loss, a row
+    /// change, a scroll and a reset all clear the ledger: the presses it held
+    /// no longer describe the row under the hand.
+    ///
+    /// `key_at` is the host sweep's clock — the licensing press — when the
+    /// host swept this move. Returns the first cell of a sweep that runs from
+    /// there to the landing when the ledger paid for the move, or `None`. The
+    /// sweep may cover the host's own (`from..to`) as well: the ribbon lays
+    /// only what no live cell owns, so nothing is laid twice, and one sweep
+    /// laid oldest column first is what keeps the cells in ONE cohort.
+    fn echo_bridge(
+        &mut self,
+        from: (u16, u16),
+        to: (u16, u16),
+        licence: Licence,
+        key_at: Option<Instant>,
+        now: Instant,
+    ) -> Option<u16> {
+        self.echo.expire(now);
+        let (mrow, mcol) = self.caret;
+        let known = self.caret_known;
+        if licence != Licence::Typed || !known || from.0 != mrow || to.0 != mrow {
+            self.echo.clear();
+            return None;
+        }
+        if to.1 <= from.1 {
+            // A retreat, a re-anchor, a rewrite landing left of its launch:
+            // not an echo's shape. The presses keep waiting.
+            return None;
+        }
+        let Some(gap) = from.1.checked_sub(mcol) else {
+            // The caret went BACK without a licensed move and came forward
+            // again: the hop is not the presses'. Forget them.
+            self.echo.clear();
+            return None;
+        };
+        let advance = usize::from(to.1 - from.1);
+        let gap = usize::from(gap);
+        if gap + advance > ECHO_LEDGER_DEPTH {
+            self.echo.clear();
+            return None;
+        }
+        let paid = match key_at {
+            // The host swept `from..to` for the key at `key_at`: the hole
+            // before it is the older presses', exactly, and the sweep's own
+            // cells are the key's and the ones after it.
+            Some(key) => self.echo.older_than(key) == gap && advance <= self.echo.total() - gap,
+            // No sweep, no key clock: only a move starting at the mirror can
+            // be attributed, to the oldest presses.
+            None => gap == 0 && advance <= self.echo.total(),
+        };
+        if !paid {
+            self.echo.clear();
+            return None;
+        }
+        self.echo.spend(gap + advance);
+        Some(mcol)
+    }
+
+    /// The clock of the host's sweep for the last observed move, when it
+    /// sent one — the licensing key the ledger partitioned by.
+    #[cfg(test)]
+    fn last_host_sweep_at(&self) -> Option<Instant> {
+        self.last_host_sweep_at
     }
 
     /// The focused pane's `(first column, width)`, or `None` for the whole
@@ -986,6 +1372,20 @@ impl Engine {
             return;
         }
         self.spine.drive(now, floor);
+    }
+
+    /// **THE PARTY** (§27): the host reports a sing-along bar (or the armed
+    /// celebration's drop) — `n` stars fanned ROYGBIV from the caret, with
+    /// the shockwave `ring` on every fourth bar — and the next tick mints it
+    /// at the caret ([`meteor::Meteors::party`]). Not a cursor event, so not
+    /// an [`Event`]; one per frame (a later call this frame wins); inert
+    /// unless engaged. The light behind it is the keystroke that armed the
+    /// sing-along — the held key, or the Enter that ran the green block.
+    pub fn party(&mut self, now: Instant, n: u8, ring: bool) {
+        if !self.engaged {
+            return;
+        }
+        self.party = Some((now, n, ring));
     }
 
     /// Offer a pose impulse for the frame. A pending
@@ -1230,6 +1630,7 @@ impl Engine {
             stars: self.stardust.live() as u32,
             meteors: self.meteor.live() as u32,
             cells: self.ribbon.live_cells() as u32,
+            bridged: self.bridged,
             disp: self.spine.disp(),
             flow: ctx.flow,
             tokens: self.stardust.budget.tokens(),
@@ -1627,6 +2028,9 @@ impl Engine {
         // The caret is learned from the next observed move; a key before it
         // lays nowhere rather than at a cell the reset forgot the meaning of.
         self.caret = (0, 0);
+        self.caret_known = false;
+        self.echo.clear();
+        self.bridged = 0;
         self.erased = (0, 0);
         self.mend = None;
         self.events.clear();
@@ -1660,8 +2064,64 @@ impl Engine {
         self.meteor.translate_scroll(rows, cell_h);
         self.stardust.translate_scroll(rows, cell_h);
         // The caret is a POSITION, not a mark: it cannot be dropped, and the
-        // host observes it again on its next move.
+        // host observes it again on its next move. The presses waiting for
+        // their echo were on a row that just moved: forgotten, not shifted.
         self.caret.0 = self.caret.0.saturating_sub(rows);
+        self.echo.clear();
+    }
+
+    /// **SEAM POINT 12** (`translate_band_state`) — the band twin of
+    /// [`Engine::translate_scroll`]: screen rows `top..=bottom` moved by
+    /// `delta` (the [`crate::cursor_glow::band_row`] law), so every live mark
+    /// on those rows moves with its text — the ribbon's cells, cohorts and
+    /// field index; the meteors, their landings and the sown fans; the stars
+    /// and the veils — while a mark outside the band stands still and one
+    /// carried past the band's edge is dropped, not clamped. The caret and
+    /// the erased cell are POSITIONS ([`crate::cursor_glow::band_pos`]):
+    /// saturated at the edge, re-observed by the host's next move. The
+    /// earned-cell list is carried under the mark law (a hero owed on a row
+    /// that left is owed nowhere).
+    ///
+    /// **The spine is untouched.** This is the whole point of the band path
+    /// over the reset it replaces: Codex prints a line every 10–230 ms while
+    /// the hand types into the composer that line slides, and the measured
+    /// session restarted the momentum from zero on every line (`disp` 0.99
+    /// → 0 → …). The hand did not stop; the program moved the paper. The
+    /// buffered events are untouched too — only coordinate-free events
+    /// (`Typed`, `Erase`, the nav tick) survive between presents by
+    /// construction, and a `Move` is always dealt on the tick that observed
+    /// it (T2). The glyph probe is dropped by the sky's half exactly as on a
+    /// scroll: the host re-probes the caret's rows before the next deal.
+    pub fn translate_band(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        delta: i16,
+        cell_h: u16,
+        origin_y: u16,
+    ) {
+        if !self.engaged || delta == 0 || top > bottom {
+            return;
+        }
+        // Banked presses have no row identity, so they cannot be translated
+        // with this band. Retire them exactly as on a whole-view scroll;
+        // located light, buffered keys and the spine keep their own state.
+        self.echo.clear();
+        self.ribbon.translate_band(top, bottom, delta);
+        self.meteor
+            .translate_band(top, bottom, delta, cell_h, origin_y);
+        self.stardust
+            .translate_band(top, bottom, delta, cell_h, origin_y);
+        self.caret.0 = band_pos(self.caret.0, top, bottom, delta);
+        self.erased.0 = band_pos(self.erased.0, top, bottom, delta);
+        self.earned
+            .retain_mut(|(cell, _)| match band_row(cell.0, top, bottom, delta) {
+                Some(row) => {
+                    cell.0 = row;
+                    true
+                }
+                None => false,
+            });
     }
 
     /// **SEAM POINT 12** (`trail_status`) — the `v2_quads=` / `v2_halos=` /
@@ -1904,6 +2364,1375 @@ mod tests {
                 i32::from(to.0) - i32::from(from.0),
             ),
         }
+    }
+
+    /// One frame at `t`, discarding what it drew.
+    fn tick_at(eng: &mut Engine, t: Instant) {
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &config(), &mut fr);
+    }
+
+    /// One key typed the ordinary way at `col` on row 3 with the caret
+    /// standing on it: the press and its frame, then — 8 ms later, the shape
+    /// every host echo takes — the host's sweep of the glyph cell and the
+    /// licensed one-cell move, and their frame.
+    fn type_key_at(eng: &mut Engine, t: Instant, col: u16) -> Instant {
+        eng.on_event(typed(1), t);
+        tick_at(eng, t);
+        let echo = t + Duration::from_millis(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: col,
+                col1: col + 1,
+            },
+            t,
+        );
+        eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), echo);
+        tick_at(eng, echo);
+        echo
+    }
+
+    /// An engaged engine whose caret landed at `(3, 2)` by a licensed move and
+    /// then typed the three cells `2..5` at a 100 ms cadence, so the caret
+    /// stands at `(3, 5)` on a live three-cell cohort. Returns the clock
+    /// after the last echo.
+    fn three_typed_cells(eng: &mut Engine, t0: Instant) -> Instant {
+        blank_row(eng, 2);
+        eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
+        tick_at(eng, t0);
+        let mut t = t0;
+        for col in 2..5u16 {
+            t += Duration::from_millis(100);
+            t = type_key_at(eng, t, col);
+        }
+        t
+    }
+
+    /// The field at `(3, col)`, or a panic naming the dark cell.
+    fn lit(eng: &Engine, col: u16) -> f32 {
+        eng.field_at(3, col)
+            .unwrap_or_else(|| panic!("cell (3, {col}) is dark"))
+    }
+
+    fn echo_band_fence_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            EchoBandFence {
+                const Buggy = 0;
+                var pending = 1;
+                var translated = 0;
+                var done = 0;
+                action Noop when (done == 0) { done = 1; }
+                action Translate when (done == 0) {
+                    done = 1;
+                    translated = 1;
+                    pending = if Buggy == 0 { 0 } else { pending };
+                }
+                invariant NoCreditAcrossBand: translated == 0 || pending == 0;
+                invariant Bounds: pending <= 1 && translated <= 1 && done <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn echo_band_fence_model_proves_and_catches_an_omitted_retirement() {
+        let model = echo_band_fence_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    /// Bind the small retirement contract to the genuine typed-press ledger
+    /// and band transform. Geometry and earned momentum survive; unlocated
+    /// pre-scroll credits cannot fund a later program nudge. The negative
+    /// control restores only that old ledger after the SAME real transform.
+    #[test]
+    fn real_band_transforms_retire_echo_credits_without_resetting_earned_light() {
+        let model = echo_band_fence_model();
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut negative_controls = 0;
+        for (top, bottom, delta) in [
+            (2, 10, 1),  // Codex composer moves down.
+            (2, 10, -1), // Transcript moves up.
+            (8, 10, 1),  // Composer is outside the changed band.
+            (3, 3, 1),   // Old marks leave; the caret position saturates.
+            (2, 10, 0),  // No movement: no fence.
+            (10, 2, 1),  // Invalid band: no fence.
+        ] {
+            let valid = delta != 0 && top <= bottom;
+            for restore_stale_credit in [false, true] {
+                if restore_stale_credit && !valid {
+                    continue;
+                }
+                let mut eng = engaged();
+                let at = three_typed_cells(&mut eng, t0) + ms(100);
+                assert_eq!(eng.echo.total(), 0, "the earlier keys were acknowledged");
+                eng.on_event(typed(1), at);
+                tick_at(&mut eng, at);
+                assert_eq!(
+                    eng.echo.total(),
+                    1,
+                    "one press is still waiting for its echo"
+                );
+                let stale = eng.echo;
+                let momentum = eng.spine.momentum(at);
+                let display = eng.momentum_display();
+                assert!(momentum > 0.0 && display > 0.0, "earned light must be live");
+                let field = eng.field_at(3, 4).expect("the acknowledged cohort is lit");
+
+                eng.translate_band(top, bottom, delta, geom().ch as u16, 0);
+                let action = if valid { "Translate" } else { "Noop" };
+                let post = std::collections::BTreeMap::from([
+                    ("pending", i64::from(eng.echo.total() > 0)),
+                    ("translated", i64::from(valid)),
+                    ("done", 1),
+                ]);
+                assert!(
+                    model
+                        .successors(action, &model.init_state())
+                        .contains(&post)
+                );
+                assert!(model.check_invariant("NoCreditAcrossBand", &post));
+                assert_eq!(
+                    eng.spine.momentum(at),
+                    momentum,
+                    "scroll is not a key reset"
+                );
+                assert_eq!(
+                    eng.momentum_display(),
+                    display,
+                    "the transform advances no clock"
+                );
+                let row = if valid {
+                    band_pos(3, top, bottom, delta)
+                } else {
+                    3
+                };
+                assert_eq!(eng.caret, (row, 5));
+                let mark = if valid {
+                    band_row(3, top, bottom, delta)
+                } else {
+                    Some(3)
+                };
+                if let Some(mark_row) = mark {
+                    assert_eq!(
+                        eng.field_at(mark_row, 4),
+                        Some(field),
+                        "earned field moves with text"
+                    );
+                } else {
+                    assert_eq!(
+                        eng.field_at(3, 4),
+                        None,
+                        "departed light must not clamp to the edge"
+                    );
+                }
+                if !valid {
+                    continue;
+                }
+                if restore_stale_credit {
+                    eng.echo = stale;
+                    let mut omitted = post.clone();
+                    omitted.insert("pending", i64::from(eng.echo.total() > 0));
+                    assert!(
+                        !model
+                            .successors(action, &model.init_state())
+                            .contains(&omitted)
+                    );
+                    assert!(!model.check_invariant("NoCreditAcrossBand", &omitted));
+                    negative_controls += 1;
+                }
+
+                // The program nudged 5 -> 6 without a press. A NEW key at 6
+                // has a genuine host sweep and advances 6 -> 7. An old credit
+                // would wrongly fill column 5 as a late echo of the old row.
+                let press = at + ms(300);
+                eng.on_event(typed(1), press);
+                tick_at(&mut eng, press);
+                eng.on_event(
+                    Event::Sweep {
+                        row,
+                        col0: 6,
+                        col1: 7,
+                    },
+                    press,
+                );
+                eng.on_event(mv((row, 6), (row, 7), Licence::Typed), press + ms(8));
+                tick_at(&mut eng, press + ms(8));
+                assert_eq!(
+                    eng.field_at(row, 5).is_some(),
+                    restore_stale_credit,
+                    "only the missing-fence control can paint the program's gap"
+                );
+                assert!(
+                    eng.field_at(row, 6).is_some(),
+                    "the new licensed key still paints"
+                );
+                assert_eq!(eng.status().bridged, u32::from(restore_stale_credit));
+            }
+        }
+        assert_eq!(negative_controls, 4);
+    }
+
+    /// **A KEY WHOSE ECHO THE SEAM REFUSED IS RELIT BY THE NEXT LICENSED
+    /// ECHO** ([`Engine::echo_bridge`], 2026-09-10 — the "black gap" report).
+    /// Measured on the shipped binary: a key echoed 297 ms or more after its
+    /// press is refused (`no-fresh-hint`), nothing reaches the engine, and
+    /// its glyph cell was exactly the ground colour for good while the next
+    /// key restarted the ribbon one cell right with a feathered edge. The
+    /// next licensed echo carries `from` one past the engine's mirror; the
+    /// press on the ledger pays for that one cell, and it joins the cohort it
+    /// belongs to — the walk continues a sixteenth per cell straight through.
+    /// The control is the same hop with no press behind it: program output
+    /// moved the caret, and the ledger lays nothing for it (T1, anti-stray).
+    #[test]
+    fn a_key_whose_echo_the_seam_refused_is_relit_by_the_next_licensed_echo() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let drive = |pressed: bool| -> Engine {
+            let mut eng = engaged();
+            let t = three_typed_cells(&mut eng, t0);
+            // Key #4 at col 5: its echo never comes back licensed. (In the
+            // control nobody pressed it; the caret still moves.)
+            let t = t + ms(100);
+            if pressed {
+                eng.on_event(typed(1), t);
+                tick_at(&mut eng, t);
+            }
+            // Key #5 at col 6, 400 ms later; its echo is licensed 50 ms after
+            // that, sweeping its own glyph, with `from` one past the mirror.
+            let t = t + ms(400);
+            eng.on_event(typed(1), t);
+            tick_at(&mut eng, t);
+            let echo = t + ms(50);
+            eng.on_event(
+                Event::Sweep {
+                    row: 3,
+                    col0: 6,
+                    col1: 7,
+                },
+                t,
+            );
+            eng.on_event(mv((3, 6), (3, 7), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+            eng
+        };
+        let relit = drive(true);
+        let (t4, t5, t6) = (lit(&relit, 4), lit(&relit, 5), lit(&relit, 6));
+        let step = 1.0 / ribbon::WALK_FAST_CELLS;
+        assert!(
+            (t5 - t4 - step).abs() < 1e-5 && (t6 - t5 - step).abs() < 1e-5,
+            "the relit cell continues its cohort's walk: t4 {t4} t5 {t5} t6 {t6}"
+        );
+        assert_eq!(
+            relit.status().bridged,
+            1,
+            "one cell relit, counted for `trail status`"
+        );
+        let control = drive(false);
+        assert!(
+            control.field_at(3, 5).is_none(),
+            "a hop no press explains lays nothing — program output is not typing"
+        );
+        assert_eq!(
+            control.status().bridged,
+            0,
+            "…and nothing was counted as repaired"
+        );
+        assert!(
+            control.field_at(3, 6).is_some(),
+            "…while the licensed key's own glyph is lit by the host's sweep"
+        );
+    }
+
+    /// **THREE KEYS TYPED INTO A STALL ARE RELIT TOGETHER.** The shipped
+    /// binary's measured shape: keys pressed 49 and 77 ms after a stalled
+    /// key were echoed with it in ONE observed move, refused as a whole, and
+    /// left a three-cell hole. The next licensed echo's `from` sits three
+    /// past the mirror; three presses pay for three cells.
+    #[test]
+    fn three_keys_typed_into_a_stall_are_relit_together() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let t = t + ms(100);
+        for k in 0..3u64 {
+            eng.on_event(typed(1), t + ms(40 * k));
+            tick_at(&mut eng, t + ms(40 * k));
+        }
+        // Their batched echo (5 → 8) was refused: nothing arrives. Key #4.
+        let t = t + ms(400);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(50);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 8,
+                col1: 9,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 8), (3, 9), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        let step = 1.0 / ribbon::WALK_FAST_CELLS;
+        let mut prev = lit(&eng, 4);
+        for col in 5..9u16 {
+            let t = lit(&eng, col);
+            assert!(
+                (t - prev - step).abs() < 1e-5,
+                "col {col} carries t {t}, not one step past col {}'s {prev}",
+                col - 1
+            );
+            prev = t;
+        }
+        assert_eq!(
+            eng.status().bridged,
+            3,
+            "three cells relit, counted for `trail status`"
+        );
+    }
+
+    /// **A LICENSED ECHO THE HOST DID NOT SWEEP IS LAID FROM ITS PRESSES.**
+    /// A two-cell echo the host licensed but did not sweep — a non-coalesced
+    /// re-anchor, or a batch its press credits (2 s,
+    /// `RAINBOW_COALESCE_CREDIT_LIFE`) could not pay for — is logged
+    /// `licensed`, two dark cells. The engine's ledger keeps both presses for
+    /// its own two seconds and lays both cells.
+    #[test]
+    fn a_licensed_echo_the_host_did_not_sweep_is_laid_from_its_presses() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let t = t + ms(700);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(50);
+        eng.on_event(mv((3, 5), (3, 7), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        assert!(
+            eng.field_at(3, 5).is_some() && eng.field_at(3, 6).is_some(),
+            "both glyphs of the unswept echo are ribbon cells"
+        );
+        assert!(
+            eng.field_at(3, 7).is_none(),
+            "the landing's own cell is the caret's, not a glyph's"
+        );
+        assert_eq!(
+            eng.status().bridged,
+            2,
+            "both unswept cells counted for `trail status`"
+        );
+    }
+
+    /// **A STALE PRESS CANNOT FUND A LATER STRAY HOP** — the anti-stray law
+    /// on the ledger. A refused press survives on the ledger, then the caret
+    /// hops five cells with no press behind it (vim's `w`, a click): the hop
+    /// is not the press's, buys nothing, and FORGETS the press. Later,
+    /// program output nudges the caret one cell and the next key's echo
+    /// lands one past the mirror: that one cell would be paid for by the
+    /// stale press if it were still banked — it is not, and the cell stays
+    /// dark.
+    #[test]
+    fn a_stale_press_cannot_fund_a_later_stray_hop() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // The refused press at col 5.
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        // The unexplained hop 6 → 10, then a key at col 10.
+        let t = t + ms(300);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 10,
+                col1: 11,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 10), (3, 11), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        for col in 5..10u16 {
+            assert!(
+                eng.field_at(3, col).is_none(),
+                "col {col} of the skimmed span must stay dark"
+            );
+        }
+        assert!(eng.field_at(3, 10).is_some(), "the key's own glyph is lit");
+        // Program output moves the caret 11 → 12 (unlicensed); a key at 12.
+        let t = echo + ms(300);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 12,
+                col1: 13,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 12), (3, 13), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        assert!(
+            eng.field_at(3, 11).is_none(),
+            "the program's cell must not be paid for by a press the hop already orphaned"
+        );
+        assert!(eng.field_at(3, 12).is_some());
+    }
+
+    /// **A PRESS OLDER THAN THE ECHO PATIENCE BUYS NO CELL** — a key the
+    /// program swallowed is not a key whose echo is late.
+    #[test]
+    fn a_press_older_than_the_echo_patience_buys_no_cell() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let t = t + Duration::from_secs_f32(ECHO_PATIENCE_S) + ms(500);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(50);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 6,
+                col1: 7,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 6), (3, 7), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        assert!(
+            eng.field_at(3, 5).is_none(),
+            "a swallowed key's cell is not relit two and a half seconds later"
+        );
+        assert!(eng.field_at(3, 6).is_some());
+    }
+
+    /// **A NAVIGATION LICENCE, A ROW CHANGE AND A RESET FORGET THE PRESSES.**
+    /// Each is a move the presses no longer describe; after it, a one-cell
+    /// unlicensed nudge followed by a licensed key must not be paid for by
+    /// the press that was waiting before.
+    #[test]
+    fn a_navigation_licence_a_row_change_and_a_reset_forget_the_presses() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let after = |eng: &mut Engine, t: Instant, col: u16| {
+            // The waiting press's cell (col − 1) went dark and the caret was
+            // nudged there keylessly; the next key lands at `col`.
+            eng.on_event(typed(1), t);
+            tick_at(eng, t);
+            let echo = t + ms(8);
+            eng.on_event(
+                Event::Sweep {
+                    row: 3,
+                    col0: col,
+                    col1: col + 1,
+                },
+                t,
+            );
+            eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), echo);
+            tick_at(eng, echo);
+            assert_eq!(
+                eng.status().bridged,
+                0,
+                "col {} must not be funded by a forgotten press",
+                col - 1
+            );
+            assert!(eng.field_at(3, col).is_some());
+        };
+        // Navigation: press at 5 refused, an arrow hop 6 → 8 licensed Nav.
+        // (The hop lays its own wake over the corridor it crossed — R5 —
+        // so the dark-cell check belongs to the two arms below; here the
+        // ledger's counter is the witness.)
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0) + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        eng.on_event(mv((3, 6), (3, 8), Licence::Nav), t + ms(300));
+        tick_at(&mut eng, t + ms(300));
+        after(&mut eng, t + ms(600), 9);
+        // A row change: the same press, then a typed move onto row 4.
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0) + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        eng.on_event(mv((3, 6), (4, 2), Licence::Typed), t + ms(300));
+        tick_at(&mut eng, t + ms(300));
+        eng.on_event(typed(1), t + ms(600));
+        tick_at(&mut eng, t + ms(600));
+        let echo = t + ms(608);
+        eng.on_event(
+            Event::Sweep {
+                row: 4,
+                col0: 3,
+                col1: 4,
+            },
+            t + ms(600),
+        );
+        eng.on_event(mv((4, 3), (4, 4), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        assert!(
+            eng.field_at(4, 2).is_none(),
+            "a press banked on row 3 buys nothing on row 4"
+        );
+        // A reset: the press, then `reset`, then the caret learned afresh.
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0) + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        eng.reset();
+        eng.on_event(mv((3, 0), (3, 6), Licence::Typed), t + ms(300));
+        tick_at(&mut eng, t + ms(300));
+        after(&mut eng, t + ms(600), 7);
+        assert!(
+            eng.field_at(3, 6).is_none(),
+            "the nudge's cell after a reset stays dark"
+        );
+    }
+
+    /// **PRESSES YOUNGER THAN THE LICENSING KEY NEVER PAY FOR A CELL TO ITS
+    /// LEFT** — the adversary's break of the first ledger. Program output
+    /// nudges the caret one cell (unlicensed, no press), then the user types
+    /// three keys fast. The first key's echo lands one past the mirror with
+    /// two presses still in flight behind it; those presses' glyphs are to
+    /// the RIGHT, and counting them would light the program's cell — three
+    /// presses, four cells. The host's sweep carries the licensing press's
+    /// clock; only presses older than it may pay, and there are none.
+    #[test]
+    fn presses_younger_than_the_licensing_key_never_pay_for_a_cell_to_its_left() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // The nudge 5 → 6 is refused at the seam: nothing arrives here.
+        // Three keys at +0, +40, +80 ms, each echoed 8 ms after its press
+        // at cols 6, 7, 8.
+        let t = t + ms(300);
+        for k in 0..3u64 {
+            eng.on_event(typed(1), t + ms(40 * k));
+            tick_at(&mut eng, t + ms(40 * k));
+        }
+        for k in 0..3u16 {
+            let press = t + ms(40 * u64::from(k));
+            let echo = press + ms(8);
+            let col = 6 + k;
+            eng.on_event(
+                Event::Sweep {
+                    row: 3,
+                    col0: col,
+                    col1: col + 1,
+                },
+                press,
+            );
+            eng.on_event(mv((3, col), (3, col + 1), Licence::Typed), echo);
+            tick_at(&mut eng, echo);
+        }
+        assert!(
+            eng.field_at(3, 5).is_none(),
+            "the program's cell must not be paid for by presses whose glyphs lie to its right"
+        );
+        for col in 6..9u16 {
+            assert!(eng.field_at(3, col).is_some(), "col {col} is the keys' own");
+        }
+    }
+
+    /// **A SWALLOWED PRESS NEVER ROLLS FORWARD AS A PHANTOM CREDIT.** A key
+    /// the program swallowed leaves a press on the ledger; if every ordinary
+    /// echo spent the OLDEST press, the phantom would ride along behind the
+    /// hand for as long as the user typed, ready to pay for the first program
+    /// nudge. Instead the next ordinary echo finds a press older than its own
+    /// key with no hole to explain, and forgets it.
+    #[test]
+    fn a_swallowed_press_never_rolls_forward_as_a_phantom_credit() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // The swallowed key: pressed, never echoed by anything.
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        // An ordinary key at col 5 — on time, swept by the host.
+        let t = type_key_at(&mut eng, t + ms(200), 5);
+        // Program output nudges the caret 6 → 7 (refused at the seam), then
+        // a key at col 7 echoes one past the mirror.
+        let t = t + ms(200);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 7,
+                col1: 8,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 7), (3, 8), Licence::Typed), t + ms(8));
+        tick_at(&mut eng, t + ms(8));
+        assert!(
+            eng.field_at(3, 6).is_none(),
+            "the swallowed press was dropped at the ordinary echo; the nudge's cell stays dark"
+        );
+        assert!(eng.field_at(3, 7).is_some());
+    }
+
+    /// TIER 1 for the echo ledger: the REAL `Engine`, driven through the
+    /// shapes `EchoLedgerBridge` names — a press, the echo the seam refused,
+    /// the next key relighting it under the host's sweep on the PRESS's clock,
+    /// the program-nudge-then-burst break, the swallowed-press phantom, the
+    /// unswept batch, the fresh and the stale retreat, the navigation hop,
+    /// vim's `w` (a typed re-anchor the host does not sweep), the patience
+    /// whole and per press, and the three in-place clears — with every
+    /// observed step validated as a transition of the model, and a forged
+    /// step at each law the model must refuse.
+    ///
+    /// Tier 0 proves the law over the whole bounded space; this is the half
+    /// that says the law is about THIS ENGINE. Every projected term is READ
+    /// off the engine: the ledger's live buckets through its own partition by
+    /// the licensing key's clock, its four tallies, its mirror against the
+    /// host's caret (the hole), `Status::bridged`, and — asserted on every
+    /// move — the clock the engine itself partitioned by
+    /// (`last_host_sweep_at`), which must be the key's. The model's snapshot
+    /// of the LAST move (`bridged_delta`, `laid_hole`, `last_older`,
+    /// `just_refused`) is read across that move: `bridged_delta` is the
+    /// engine's bridged delta, `laid_hole` is that delta less the cells an
+    /// unswept move laid at and past `from` (the key's own, not the hole's),
+    /// `last_older` the older bucket before the move. `stale_gone` is
+    /// `expired + stale` by definition, so its STATE check is definitional;
+    /// the law it carries (`ExpiredPressesBuyNothing`) is enforced PER
+    /// TRANSITION — every bind requires the step to be the named action's,
+    /// and a stale press spent rather than dropped is a successor no action
+    /// admits (the forged stale-press-pays control below).
+    #[test]
+    fn the_real_engine_conforms_to_the_echo_ledger_model() {
+        let model = aterm_spec::derive::echo_ledger_bridge_model();
+        let ms = Duration::from_millis;
+        let patience = Duration::from_secs_f32(ECHO_PATIENCE_S);
+        type State = aterm_spec::interp::State;
+
+        /// The model's snapshot of the last licensed move.
+        #[derive(Clone, Copy, Default)]
+        struct Last {
+            laid_hole: i64,
+            bridged_delta: i64,
+            last_older: i64,
+            just_refused: i64,
+        }
+        let n = |v: usize| i64::try_from(v).expect("bounded ledger");
+        let project = |eng: &Engine, now: Instant, key: Instant, host_col: u16, last: Last| {
+            let (older, younger, stale) = eng.echo.partition(key, now);
+            let tally = eng.echo.tally;
+            let mut st = model.init_state();
+            st.insert("older", n(older));
+            st.insert("younger", n(younger));
+            st.insert("stale", n(stale));
+            // The hole: the host's caret against the engine's mirror.
+            st.insert("hole", i64::from(host_col - eng.caret.1));
+            st.insert("banked", i64::from(tally.banked));
+            st.insert("spent", i64::from(tally.spent));
+            st.insert("forfeited", i64::from(tally.forfeited));
+            st.insert("expired", i64::from(tally.expired));
+            st.insert("stale_gone", i64::from(tally.expired) + n(stale));
+            st.insert("bridged", i64::from(eng.status().bridged));
+            st.insert("laid_hole", last.laid_hole);
+            st.insert("bridged_delta", last.bridged_delta);
+            st.insert("last_older", last.last_older);
+            st.insert("just_refused", last.just_refused);
+            st
+        };
+        let bind = |prev: &State, next: &State, action: &str, label: &str| {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                prev,
+                next,
+                Some(action),
+                label,
+            );
+            assert!(ok, "{label}: real engine step rejected by the model: {why}");
+        };
+        let refuse = |prev: &State, next: &State, action: &str, label: &str| {
+            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                prev,
+                next,
+                Some(action),
+                label,
+            );
+            assert!(!ok, "{label}: the model must refuse this step");
+        };
+        // An engine whose mirror was learned at `(3, col)` by a licensed move
+        // — the seed is not a step, exactly as the licence twin's seed tick.
+        let seeded = |t0: Instant, col: u16| -> Engine {
+            let mut eng = engaged();
+            eng.on_event(mv((3, 0), (3, col), Licence::Typed), t0);
+            tick_at(&mut eng, t0);
+            eng
+        };
+        let press = |eng: &mut Engine, t: Instant| {
+            eng.on_event(typed(1), t);
+            tick_at(eng, t);
+        };
+        // A licensed move at `at` — under the host's sweep of `from..to` on
+        // the KEY's clock when `key` is `Some`, unswept otherwise — read
+        // across the engine: the clock it partitioned by must be the key's,
+        // its bridged delta is the move's, and the hole part of that delta
+        // (everything left of `from`) is what the model calls `laid_hole`.
+        // `just_refused` is the step's shape, named like the action it binds.
+        let moved = |eng: &mut Engine,
+                     from: (u16, u16),
+                     to: (u16, u16),
+                     licence: Licence,
+                     key: Option<Instant>,
+                     at: Instant,
+                     prev: &State,
+                     just_refused: i64|
+         -> Last {
+            let before = eng.status().bridged;
+            if let Some(key) = key {
+                eng.on_event(
+                    Event::Sweep {
+                        row: to.0,
+                        col0: from.1,
+                        col1: to.1,
+                    },
+                    key,
+                );
+            }
+            eng.on_event(mv(from, to, licence), at);
+            tick_at(eng, at);
+            assert_eq!(
+                eng.last_host_sweep_at(),
+                key,
+                "the engine partitions by the host's sweep clock, the key's"
+            );
+            let delta = eng.status().bridged - before;
+            let past_from = if key.is_some() {
+                0
+            } else {
+                u32::from(to.1.saturating_sub(from.1))
+            };
+            Last {
+                laid_hole: i64::from(delta.saturating_sub(past_from)),
+                bridged_delta: i64::from(delta),
+                last_older: prev["older"],
+                just_refused,
+            }
+        };
+        // An in-place clear at `at`: not a move, so the last move's snapshot
+        // stands except for what the engine bridged across it (nothing).
+        let cleared = |eng: &mut Engine, ev: Event, at: Instant, last: Last| -> Last {
+            let before = eng.status().bridged;
+            eng.on_event(ev, at);
+            tick_at(eng, at);
+            let delta = i64::from(eng.status().bridged - before);
+            Last {
+                laid_hole: delta,
+                bridged_delta: delta,
+                ..last
+            }
+        };
+
+        // ---- THE SCREENSHOT: press, echo, a refused echo, and the relight ----
+        let t0 = Instant::now();
+        let mut eng = seeded(t0, 2);
+        let mut last = Last::default();
+        let s0 = project(&eng, t0, t0, 2, last);
+        assert_eq!(
+            s0,
+            model.init_state(),
+            "a seeded engine is the model's init"
+        );
+
+        // A press; the host will clock its sweep at it.
+        let t1 = t0 + ms(100);
+        press(&mut eng, t1);
+        let s1 = project(&eng, t1, t1, 2, last);
+        assert_eq!((s1["older"], s1["younger"], s1["banked"]), (0, 1, 1));
+        bind(&s0, &s1, "KeyPressed", "Engine press");
+        // T1: a keydown never pre-draws its cell.
+        let mut predrawn = s1.clone();
+        predrawn.insert("bridged", 1);
+        refuse(
+            &s0,
+            &predrawn,
+            "KeyPressed",
+            "Engine keydown pre-draw control",
+        );
+
+        // Its echo, on time: the host sweeps the glyph, the ledger spends the
+        // press, nothing is bridged (the per-key path is byte-identical).
+        let e1 = t1 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 2),
+            (3, 3),
+            Licence::Typed,
+            Some(t1),
+            e1,
+            &s1,
+            0,
+        );
+        let s2 = project(&eng, e1, t1, 3, last);
+        assert_eq!((s2["spent"], s2["bridged"], s2["younger"]), (1, 0, 0));
+        assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+        bind(&s1, &s2, "SweptMovePays", "Engine on-time echo");
+        let mut reused = s2.clone();
+        reused.insert("younger", 1);
+        refuse(
+            &s1,
+            &reused,
+            "SweptMovePays",
+            "Engine one-press-one-cell control",
+        );
+
+        // The stalled key: pressed, echoed 300 ms later — refused at the seam,
+        // nothing arrives here, and the caret stands one past the mirror.
+        let t2 = e1 + ms(300);
+        press(&mut eng, t2);
+        let s3 = project(&eng, t2, t2, 3, last);
+        bind(&s2, &s3, "KeyPressed", "Engine stalled press");
+        let s4 = project(&eng, t2 + ms(300), t2, 4, last);
+        assert_eq!(s4["hole"], 1, "the caret advanced with no licensed move");
+        bind(&s3, &s4, "UnlicensedAdvance", "Engine refused echo");
+
+        // The next key: the stalled press is now OLDER than the licensing key.
+        let t3 = t2 + ms(400);
+        press(&mut eng, t3);
+        let s5 = project(&eng, t3, t3, 4, last);
+        assert_eq!((s5["older"], s5["younger"], s5["hole"]), (1, 1, 1));
+        bind(&s4, &s5, "KeyPressed", "Engine next key");
+
+        // Its licensed echo, swept by the host on the key's clock: the hole
+        // is exactly the older press's, laid and counted.
+        let e3 = t3 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 4),
+            (3, 5),
+            Licence::Typed,
+            Some(t3),
+            e3,
+            &s5,
+            0,
+        );
+        let s6 = project(&eng, e3, t3, 5, last);
+        assert_eq!(s6["bridged"], 1, "the refused key's cell is relit");
+        assert!(eng.field_at(3, 3).is_some(), "…and is a ribbon cell");
+        assert_eq!(
+            (last.laid_hole, last.bridged_delta, last.last_older),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (s6["spent"], s6["older"] + s6["younger"], s6["hole"]),
+            (3, 0, 0)
+        );
+        bind(&s5, &s6, "SweptMovePays", "Engine relight");
+        let mut overlaid = s6.clone();
+        overlaid.insert("bridged", 2);
+        overlaid.insert("bridged_delta", 2);
+        overlaid.insert("laid_hole", 2);
+        refuse(
+            &s5,
+            &overlaid,
+            "SweptMovePays",
+            "Engine one-older-press-two-cells control",
+        );
+
+        // ---- THE ADVERSARY'S BREAK: a program nudge, then a fast burst ----
+        let u0 = Instant::now();
+        let mut eng = seeded(u0, 5);
+        let mut last = Last::default();
+        let b0 = project(&eng, u0, u0, 5, last);
+        // The nudge 5 -> 6, refused at the seam.
+        let b1 = project(&eng, u0 + ms(100), u0, 6, last);
+        bind(&b0, &b1, "UnlicensedAdvance", "Engine program nudge");
+        // Two keys 40 ms apart; the first is the licensing key of the first
+        // echo, the second is still in flight behind it.
+        let u1 = u0 + ms(300);
+        press(&mut eng, u1);
+        let b2 = project(&eng, u1, u1, 6, last);
+        bind(&b1, &b2, "KeyPressed", "Engine burst key 1");
+        let u2 = u1 + ms(40);
+        press(&mut eng, u2);
+        let b3 = project(&eng, u2, u1, 6, last);
+        assert_eq!((b3["older"], b3["younger"], b3["hole"]), (0, 2, 1));
+        bind(&b2, &b3, "PressInFlight", "Engine burst key 2");
+        // Key 1's echo lands one past the mirror: no press older than the key
+        // explains the nudge, so nothing is laid and both presses are
+        // forgotten — three presses never light four cells.
+        let e1 = u2 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 6),
+            (3, 7),
+            Licence::Typed,
+            Some(u1),
+            e1,
+            &b3,
+            1,
+        );
+        let b4 = project(&eng, e1, u1, 7, last);
+        assert_eq!(b4["bridged"], 0, "the nudge's cell is not the burst's");
+        assert!(eng.field_at(3, 5).is_none(), "…and stays dark");
+        assert_eq!((b4["forfeited"], b4["older"] + b4["younger"]), (2, 0));
+        assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+        bind(&b3, &b4, "SweptMoveRefuses", "Engine burst refusal");
+        let mut kept = b4.clone();
+        kept.insert("younger", 2);
+        kept.insert("forfeited", 0);
+        refuse(
+            &b3,
+            &kept,
+            "SweptMoveRefuses",
+            "Engine forfeited-credits control",
+        );
+        // …and a refusal that lays the hop's cell anyway.
+        let mut laid_anyway = b4.clone();
+        laid_anyway.insert("bridged", 1);
+        laid_anyway.insert("bridged_delta", 1);
+        refuse(
+            &b3,
+            &laid_anyway,
+            "SweptMoveRefuses",
+            "Engine no-bridge-on-a-refusal control",
+        );
+        // Key 2's echo: the ledger is empty, the host lit its own cell.
+        let e2 = e1 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 7),
+            (3, 8),
+            Licence::Typed,
+            Some(u2),
+            e2,
+            &b4,
+            1,
+        );
+        let b5 = project(&eng, e2, u2, 8, last);
+        assert_eq!(b5["bridged"], 0);
+        assert!(
+            eng.field_at(3, 7).is_some(),
+            "the key's own glyph is the host's"
+        );
+        bind(&b4, &b5, "SweptMoveRefuses", "Engine burst key 2 echo");
+
+        // ---- THE PHANTOM: a swallowed press, an ordinary key, a nudge ----
+        let v0 = Instant::now();
+        let mut eng = seeded(v0, 5);
+        let mut last = Last::default();
+        let p0 = project(&eng, v0, v0, 5, last);
+        let v1 = v0 + ms(100);
+        press(&mut eng, v1);
+        let p1 = project(&eng, v1, v1, 5, last);
+        bind(&p0, &p1, "KeyPressed", "Engine swallowed press");
+        // The ordinary key: the swallowed press is older than it, with no
+        // hole to explain — the ordinary echo forgets it.
+        let v2 = v1 + ms(200);
+        press(&mut eng, v2);
+        let p2 = project(&eng, v2, v2, 5, last);
+        assert_eq!((p2["older"], p2["younger"], p2["hole"]), (1, 1, 0));
+        bind(&p1, &p2, "KeyPressed", "Engine ordinary key");
+        let e2 = v2 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 5),
+            (3, 6),
+            Licence::Typed,
+            Some(v2),
+            e2,
+            &p2,
+            1,
+        );
+        let p3 = project(&eng, e2, v2, 6, last);
+        assert_eq!((p3["forfeited"], p3["older"] + p3["younger"]), (2, 0));
+        bind(&p2, &p3, "SweptMoveRefuses", "Engine phantom dropped");
+        // The nudge 6 -> 7 and a key at 7: nothing is left to pay for it.
+        let p4 = project(&eng, e2 + ms(100), v2, 7, last);
+        bind(
+            &p3,
+            &p4,
+            "UnlicensedAdvance",
+            "Engine nudge after the phantom",
+        );
+        let v3 = e2 + ms(200);
+        press(&mut eng, v3);
+        // A press banked after the refusal: the ledger may hold it.
+        last.just_refused = 0;
+        let p5 = project(&eng, v3, v3, 7, last);
+        bind(&p4, &p5, "KeyPressed", "Engine key after the nudge");
+        let e3 = v3 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 7),
+            (3, 8),
+            Licence::Typed,
+            Some(v3),
+            e3,
+            &p5,
+            1,
+        );
+        let p6 = project(&eng, e3, v3, 8, last);
+        assert_eq!(p6["bridged"], 0, "the phantom credit never rolled forward");
+        assert!(eng.field_at(3, 6).is_none());
+        bind(&p5, &p6, "SweptMoveRefuses", "Engine phantom cannot pay");
+
+        // ---- THE RETREATS, THE NAVIGATION HOP AND THE IN-PLACE CLEARS ----
+        let w0 = Instant::now();
+        let mut eng = seeded(w0, 5);
+        let mut last = Last::default();
+        let r0 = project(&eng, w0, w0, 5, last);
+        let w1 = w0 + ms(100);
+        press(&mut eng, w1);
+        let r1 = project(&eng, w1, w1, 5, last);
+        bind(&r0, &r1, "KeyPressed", "Engine press before a retreat");
+        let r2 = project(&eng, w1 + ms(100), w1, 6, last);
+        bind(&r1, &r2, "UnlicensedAdvance", "Engine hop before a retreat");
+        // A backward typed move re-anchors the mirror; the fresh press keeps
+        // waiting.
+        let w2 = w1 + ms(200);
+        last = moved(&mut eng, (3, 6), (3, 4), Licence::Typed, None, w2, &r2, 0);
+        let r3 = project(&eng, w2, w1, 4, last);
+        assert_eq!((r3["younger"], r3["hole"], r3["forfeited"]), (1, 0, 0));
+        bind(&r2, &r3, "RetreatKeepsPresses", "Engine fresh retreat");
+        // An arrow / Home / End hop: a navigation licence. The press no
+        // longer describes the row under the hand; it is forgotten.
+        let w3 = w2 + ms(200);
+        last = moved(&mut eng, (3, 4), (3, 9), Licence::Nav, None, w3, &r3, 0);
+        let r4 = project(&eng, w3, w1, 9, last);
+        assert_eq!((r4["older"] + r4["younger"], r4["forfeited"]), (0, 1));
+        bind(&r3, &r4, "LedgerForgotten", "Engine nav hop");
+        // A press that goes stale, then a backward typed move: the engine
+        // expires BEFORE it looks at the shape, so the retreat drops it.
+        let w4 = w3 + ms(100);
+        press(&mut eng, w4);
+        let r5 = project(&eng, w4, w4, 9, last);
+        bind(
+            &r4,
+            &r5,
+            "KeyPressed",
+            "Engine press before a stale retreat",
+        );
+        let w5 = w4 + patience + ms(100);
+        let r6 = project(&eng, w5, w4, 9, last);
+        assert_eq!((r6["stale"], r6["younger"]), (1, 0));
+        bind(&r5, &r6, "TimePasses", "Engine patience before a retreat");
+        last = moved(&mut eng, (3, 9), (3, 8), Licence::Typed, None, w5, &r6, 0);
+        let r7 = project(&eng, w5, w4, 8, last);
+        assert_eq!(
+            (r7["stale"], r7["expired"], r7["younger"], r7["hole"]),
+            (0, 1, 0, 0)
+        );
+        bind(&r6, &r7, "RetreatKeepsPresses", "Engine stale retreat");
+
+        // ---- THE IN-PLACE CLEARS: erase, kill, focus loss ----
+        // Each expires BEFORE it clears (a stale press is dropped as
+        // expired, a fresh one forfeited) and moves nothing: the mirror, and
+        // so the hole, stand where they were.
+        let d0 = Instant::now();
+        let mut eng = seeded(d0, 8);
+        let mut last = Last::default();
+        let a0 = project(&eng, d0, d0, 8, last);
+        let d1 = d0 + ms(100);
+        press(&mut eng, d1);
+        let a1 = project(&eng, d1, d1, 8, last);
+        bind(&a0, &a1, "KeyPressed", "Engine press before an erase");
+        let d2 = d1 + patience + ms(100);
+        let a2 = project(&eng, d2, d1, 8, last);
+        bind(&a1, &a2, "TimePasses", "Engine patience before an erase");
+        last = cleared(&mut eng, Event::Erase, d2, last);
+        let a3 = project(&eng, d2, d1, 8, last);
+        assert_eq!((a3["stale"], a3["expired"], a3["forfeited"]), (0, 1, 0));
+        bind(
+            &a2,
+            &a3,
+            "LedgerClearedInPlace",
+            "Engine erase over a stale press",
+        );
+        // A kill over a fresh press beside a hole: the press is forfeited and
+        // the hole is UNTOUCHED — nothing moved the mirror.
+        let d3 = d2 + ms(100);
+        press(&mut eng, d3);
+        let a4 = project(&eng, d3, d3, 8, last);
+        bind(&a3, &a4, "KeyPressed", "Engine press before a kill");
+        let a5 = project(&eng, d3 + ms(50), d3, 9, last);
+        bind(&a4, &a5, "UnlicensedAdvance", "Engine hop before a kill");
+        let d4 = d3 + ms(100);
+        last = cleared(
+            &mut eng,
+            Event::Kill {
+                cells: 1,
+                scope: KillScope::Word,
+            },
+            d4,
+            last,
+        );
+        let a6 = project(&eng, d4, d3, 9, last);
+        assert_eq!((a6["younger"], a6["forfeited"], a6["hole"]), (0, 1, 1));
+        bind(
+            &a5,
+            &a6,
+            "LedgerClearedInPlace",
+            "Engine kill beside a hole",
+        );
+        // A focus loss over a fresh press: forfeited, the hole still standing.
+        let d5 = d4 + ms(100);
+        press(&mut eng, d5);
+        let a7 = project(&eng, d5, d5, 9, last);
+        bind(&a6, &a7, "KeyPressed", "Engine press before a focus loss");
+        let d6 = d5 + ms(100);
+        last = cleared(&mut eng, Event::Focus(false), d6, last);
+        let a8 = project(&eng, d6, d5, 9, last);
+        assert_eq!((a8["forfeited"], a8["hole"]), (2, 1));
+        bind(&a7, &a8, "LedgerClearedInPlace", "Engine focus loss");
+
+        // ---- vim's `w`: a typed re-anchor the host does not sweep ----
+        // In the real host a printable key beside a >2-cell same-row hop is a
+        // typed re-anchor: it reaches the engine as `Licence::Typed` with NO
+        // host sweep. One press cannot explain a three-cell hop; refused,
+        // and the press is forfeited.
+        let z0 = Instant::now();
+        let mut eng = seeded(z0, 5);
+        let mut last = Last::default();
+        let c0 = project(&eng, z0, z0, 5, last);
+        let z1 = z0 + ms(100);
+        press(&mut eng, z1);
+        let c1 = project(&eng, z1, z1, 5, last);
+        bind(&c0, &c1, "KeyPressed", "Engine press before vim's w");
+        let z2 = z1 + ms(50);
+        last = moved(&mut eng, (3, 5), (3, 8), Licence::Typed, None, z2, &c1, 1);
+        let c2 = project(&eng, z2, z1, 8, last);
+        assert_eq!(
+            (c2["forfeited"], c2["bridged"], c2["older"] + c2["younger"]),
+            (1, 0, 0)
+        );
+        assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+        bind(&c1, &c2, "UnsweptMoveRefuses", "Engine vim's w");
+
+        // ---- THE PATIENCE: a press the program swallowed goes stale ----
+        let x0 = Instant::now();
+        let mut eng = seeded(x0, 5);
+        let mut last = Last::default();
+        let q0 = project(&eng, x0, x0, 5, last);
+        let x1 = x0 + ms(100);
+        press(&mut eng, x1);
+        let q1 = project(&eng, x1, x1, 5, last);
+        bind(&q0, &q1, "KeyPressed", "Engine press before the patience");
+        let x2 = x1 + patience + ms(500);
+        let q2 = project(&eng, x2, x1, 5, last);
+        assert_eq!((q2["stale"], q2["younger"], q2["stale_gone"]), (1, 0, 1));
+        bind(&q1, &q2, "TimePasses", "Engine patience elapses");
+        let q3 = project(&eng, x2, x1, 6, last);
+        bind(
+            &q2,
+            &q3,
+            "UnlicensedAdvance",
+            "Engine hop after the patience",
+        );
+        press(&mut eng, x2);
+        let q4 = project(&eng, x2, x2, 6, last);
+        assert_eq!((q4["older"], q4["younger"], q4["stale"]), (0, 1, 1));
+        bind(&q3, &q4, "KeyPressed", "Engine key after the patience");
+        // The echo: the stale press is dropped, not spent; nothing older than
+        // the key explains the hole; the key is forfeited with the refusal.
+        let e2 = x2 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 6),
+            (3, 7),
+            Licence::Typed,
+            Some(x2),
+            e2,
+            &q4,
+            1,
+        );
+        let q5 = project(&eng, e2, x2, 7, last);
+        assert_eq!((q5["expired"], q5["forfeited"], q5["bridged"]), (1, 1, 0));
+        assert!(eng.field_at(3, 5).is_none(), "a swallowed key buys no cell");
+        bind(&q4, &q5, "SweptMoveRefuses", "Engine expired press");
+
+        // ---- THE PARTIAL EXPIRY: the older press stale, the key fresh ----
+        let f0 = Instant::now();
+        let mut eng = seeded(f0, 5);
+        let mut last = Last::default();
+        let g0 = project(&eng, f0, f0, 5, last);
+        let f1 = f0 + ms(100);
+        press(&mut eng, f1);
+        let g1 = project(&eng, f1, f1, 5, last);
+        bind(
+            &g0,
+            &g1,
+            "KeyPressed",
+            "Engine press before a partial expiry",
+        );
+        let f2 = f1 + ms(1500);
+        press(&mut eng, f2);
+        let g2 = project(&eng, f2, f2, 5, last);
+        assert_eq!((g2["older"], g2["younger"], g2["stale"]), (1, 1, 0));
+        bind(&g1, &g2, "KeyPressed", "Engine key before a partial expiry");
+        // 2.1 s after the first press: it is stale, the key is not.
+        let f3 = f1 + patience + ms(100);
+        let g3 = project(&eng, f3, f2, 5, last);
+        assert_eq!((g3["older"], g3["younger"], g3["stale"]), (0, 1, 1));
+        bind(
+            &g2,
+            &g3,
+            "OnePressGoesStale",
+            "Engine oldest press goes stale",
+        );
+        // The key's echo, swept on its clock: the stale press is dropped and
+        // the key pays its own cell.
+        last = moved(
+            &mut eng,
+            (3, 5),
+            (3, 6),
+            Licence::Typed,
+            Some(f2),
+            f3,
+            &g3,
+            0,
+        );
+        let g4 = project(&eng, f3, f2, 6, last);
+        assert_eq!(
+            (
+                g4["expired"],
+                g4["stale"],
+                g4["younger"],
+                g4["spent"],
+                g4["bridged"]
+            ),
+            (1, 0, 0, 1, 0)
+        );
+        bind(
+            &g3,
+            &g4,
+            "SweptMovePays",
+            "Engine echo after a partial expiry",
+        );
+
+        // ---- THE STALE PRESS THAT MUST NOT PAY ----
+        // After a press has gone stale, a key with no hop: the swept echo's
+        // honest successor drops the stale press and spends the key. The
+        // forged successor spends the stale press and keeps the key waiting.
+        let h0 = Instant::now();
+        let mut eng = seeded(h0, 5);
+        let mut last = Last::default();
+        let k0 = project(&eng, h0, h0, 5, last);
+        let h1 = h0 + ms(100);
+        press(&mut eng, h1);
+        let k1 = project(&eng, h1, h1, 5, last);
+        bind(&k0, &k1, "KeyPressed", "Engine press that will go stale");
+        let h2 = h1 + patience + ms(100);
+        let k2 = project(&eng, h2, h1, 5, last);
+        bind(&k1, &k2, "TimePasses", "Engine press gone stale");
+        press(&mut eng, h2);
+        let k3 = project(&eng, h2, h2, 5, last);
+        assert_eq!(
+            (k3["older"], k3["younger"], k3["stale"], k3["hole"]),
+            (0, 1, 1, 0)
+        );
+        bind(&k2, &k3, "KeyPressed", "Engine key beside a stale press");
+        let e3 = h2 + ms(8);
+        last = moved(
+            &mut eng,
+            (3, 5),
+            (3, 6),
+            Licence::Typed,
+            Some(h2),
+            e3,
+            &k3,
+            0,
+        );
+        let k4 = project(&eng, e3, h2, 6, last);
+        assert_eq!(
+            (k4["expired"], k4["stale"], k4["younger"], k4["spent"]),
+            (1, 0, 0, 1)
+        );
+        bind(
+            &k3,
+            &k4,
+            "SweptMovePays",
+            "Engine key pays beside a stale press",
+        );
+        let mut stale_paid = k4.clone();
+        stale_paid.insert("expired", 0);
+        stale_paid.insert("younger", 1);
+        stale_paid.insert("spent", 1);
+        refuse(
+            &k3,
+            &stale_paid,
+            "SweptMovePays",
+            "Engine stale-press-pays control",
+        );
+
+        // ---- THE UNSWEPT BATCH: two presses, a two-cell licensed echo ----
+        let y0 = Instant::now();
+        let mut eng = seeded(y0, 5);
+        let mut last = Last::default();
+        let m0 = project(&eng, y0, y0, 5, last);
+        let y1 = y0 + ms(100);
+        press(&mut eng, y1);
+        let m1 = project(&eng, y1, y1, 5, last);
+        bind(&m0, &m1, "KeyPressed", "Engine batch press 1");
+        press(&mut eng, y1 + ms(700));
+        let m2 = project(&eng, y1 + ms(700), y1, 5, last);
+        bind(&m1, &m2, "PressInFlight", "Engine batch press 2");
+        // The host licensed the echo but did not sweep it (a non-coalesced
+        // re-anchor, or a batch its credits could not pay for): the engine
+        // lays both cells from the presses.
+        let y2 = y1 + ms(750);
+        last = moved(&mut eng, (3, 5), (3, 7), Licence::Typed, None, y2, &m2, 0);
+        let m3 = project(&eng, y2, y1, 7, last);
+        assert_eq!(
+            (m3["bridged"], m3["spent"], m3["older"] + m3["younger"]),
+            (2, 2, 0)
+        );
+        assert_eq!(
+            (last.laid_hole, last.bridged_delta),
+            (0, 2),
+            "both cells are the key's and the one behind it, none the hole's"
+        );
+        assert!(eng.field_at(3, 5).is_some() && eng.field_at(3, 6).is_some());
+        bind(&m2, &m3, "UnsweptMovePays", "Engine unswept batch");
+        // The same batch after a hop: no key clock to partition by — refused.
+        let y3 = y2 + ms(200);
+        press(&mut eng, y3);
+        let m4 = project(&eng, y3, y3, 7, last);
+        bind(&m3, &m4, "KeyPressed", "Engine batch press 3");
+        press(&mut eng, y3 + ms(100));
+        let m5 = project(&eng, y3 + ms(100), y3, 7, last);
+        bind(&m4, &m5, "PressInFlight", "Engine batch press 4");
+        let m6 = project(&eng, y3 + ms(120), y3, 8, last);
+        bind(&m5, &m6, "UnlicensedAdvance", "Engine hop before a batch");
+        let y4 = y3 + ms(150);
+        last = moved(&mut eng, (3, 8), (3, 10), Licence::Typed, None, y4, &m6, 1);
+        let m7 = project(&eng, y4, y3, 10, last);
+        assert_eq!((m7["bridged"], m7["forfeited"]), (2, 2));
+        assert_eq!((last.laid_hole, last.bridged_delta), (0, 0));
+        assert!(eng.field_at(3, 7).is_none(), "the hop's cell stays dark");
+        bind(
+            &m6,
+            &m7,
+            "UnsweptMoveRefuses",
+            "Engine unswept batch after a hop",
+        );
     }
 
     /// §12, §8.1 no. 1 and §6.7 at the seam: a licensed nav jump mints
@@ -2972,6 +4801,117 @@ mod tests {
     /// leaves the grid rather than clamping it to row 0. Each theme's own
     /// stream is asserted NON-EMPTY first: a comparison over nothing is green
     /// with the stars standing still.
+    /// **SEAM POINT 12, the band path** — a band move is a COORDINATE
+    /// TRANSFORM and never a reset: six cells typed on row 3 and the caret
+    /// at (3, 6) ride Codex's viewport `[2..10]` down to row 4 with the field
+    /// intact (`field_at(4, 5)` answers what `field_at(3, 5)` did, and the
+    /// vacated cell answers nothing), the erased cell and the earned heroes
+    /// move with their rows, and THE SPINE IS UNTOUCHED: the next frame reads
+    /// the momentum the hand earned, not a restart — the measured Codex
+    /// session read `disp 0.99 → 0` on every streamed line under the reset
+    /// this replaces, and the control below is that reset. A band outside
+    /// the caret's row leaves everything alone; a band the caret's row
+    /// leaves saturates the caret at its edge and drops the light.
+    #[test]
+    fn a_band_move_moves_the_caret_with_its_band_and_keeps_the_spine() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let g = geom();
+        let ch = g.ch as u16;
+        let ms = Duration::from_millis;
+        let lay = |eng: &mut Engine| {
+            for row in 2..=4 {
+                blank_row(eng, row);
+            }
+            let mut sc = Scratch::default();
+            // Six keys at 12 cps, so the spine has something to keep.
+            for k in 0..6u16 {
+                let at = t0 + ms(80 * u64::from(k));
+                eng.on_event(mv((3, k), (3, k + 1), Licence::Typed), at);
+                eng.on_event(typed(1), at);
+                let mut fr = sc.frame();
+                eng.tick(at, g, &cfg, &mut fr);
+            }
+        };
+        let mut eng = engaged();
+        lay(&mut eng);
+        let t_last = t0 + ms(400);
+        let disp_before = eng.status().disp;
+        assert!(disp_before > 0.0, "fixture: the hand earned momentum");
+        let field_before = eng.field_at(3, 5).expect("fixture: the cell is laid");
+        assert_eq!(eng.caret, (3, 6));
+        eng.erased = (3, 2);
+        eng.earned.push(((3, 4), t_last));
+        eng.earned.push(((10, 4), t_last));
+        eng.earned.push(((20, 4), t_last));
+
+        eng.translate_band(2, 10, 1, ch, 0);
+
+        assert_eq!(eng.caret, (4, 6), "the caret rides its band");
+        assert_eq!(eng.erased, (4, 2), "so does the erased cell");
+        assert_eq!(
+            eng.earned.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+            vec![(4, 4), (20, 4)],
+            "a hero owed inside the band moves, one outside it stays, one pushed past the edge is owed nowhere"
+        );
+        assert_eq!(
+            eng.field_at(4, 5),
+            Some(field_before),
+            "the field moved with its cell"
+        );
+        assert_eq!(eng.field_at(3, 5), None, "the vacated cell answers nothing");
+        assert_eq!(eng.status().disp, disp_before, "a transform ticks nothing");
+        let t1 = t_last + ms(8);
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        eng.tick(t1, g, &cfg, &mut fr);
+        let disp_after = eng.status().disp;
+        assert!(
+            disp_after > 0.0 && (disp_after - disp_before).abs() < 0.05,
+            "the spine kept going across the band move: {disp_before} → {disp_after}"
+        );
+        assert!(
+            eng.ribbon_segments() >= 1,
+            "the ribbon is lit on the moved row"
+        );
+
+        // CONTROL: the reset this path replaces restarts the momentum.
+        let mut reset = engaged();
+        lay(&mut reset);
+        reset.reset();
+        let mut sc = Scratch::default();
+        let mut fr = sc.frame();
+        reset.tick(t1, g, &cfg, &mut fr);
+        assert_eq!(
+            reset.status().disp,
+            0.0,
+            "the reset is what the owner saw: 0.99 → 0"
+        );
+
+        // A band elsewhere on the screen touches nothing.
+        eng.translate_band(20, 30, 1, ch, 0);
+        assert_eq!(eng.caret, (4, 6));
+        assert_eq!(eng.field_at(4, 5), Some(field_before));
+        // A band the caret's row LEAVES: the position saturates at the edge,
+        // the light is gone.
+        eng.translate_band(2, 4, 1, ch, 0);
+        assert_eq!(
+            eng.caret,
+            (4, 6),
+            "a position saturates; it cannot be dropped"
+        );
+        assert_eq!(eng.field_at(4, 5), None);
+        assert_eq!(eng.field_at(5, 5), None, "nothing is parked past the edge");
+        // Disengaged or degenerate: a no-op.
+        let mut idle = Engine::new();
+        idle.caret = (3, 3);
+        idle.translate_band(2, 10, 1, ch, 0);
+        assert_eq!(idle.caret, (3, 3));
+        eng.translate_band(5, 4, 1, ch, 0);
+        eng.translate_band(2, 10, 0, ch, 0);
+        assert_eq!(eng.caret, (4, 6));
+    }
+
     #[test]
     fn a_scroll_moves_every_live_star_and_the_caret_with_the_viewport() {
         for dark_theme in [true, false] {
@@ -3231,6 +5171,7 @@ mod tests {
             row,
             settled,
             purr,
+            contented: false,
         }
     }
 
@@ -4097,22 +6038,33 @@ mod tests {
     /// and nothing behind it. With the sweep every glyph cell is a ribbon
     /// cell, and the per-key path is untouched (the sweep is never sent for
     /// a one-cell echo).
+    ///
+    /// **Since the echo ledger (2026-09-10) the hole is closed twice.** The
+    /// same keys and move WITHOUT the host's sweep now light every glyph
+    /// cell too — the presses are on the ledger and the licensed move pays
+    /// them out ([`Engine::echo_bridge`]) — so the control that shows the
+    /// frame this law is about is the batch with NO presses behind it:
+    /// program output that moved the caret three cells, which lays nothing.
     #[test]
     fn a_batched_echo_sweeps_every_glyph_cell_it_skipped() {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let cfg = config();
         let g = geom();
-        let drive = |sweep: bool| -> Engine {
+        let drive = |sweep: bool, pressed: bool| -> Engine {
             let mut eng = engaged();
             blank_row(&mut eng, 2);
             eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
-            eng.on_event(typed(1), t0);
+            if pressed {
+                eng.on_event(typed(1), t0);
+            }
             let mut sc = Scratch::default();
             let mut fr = sc.frame();
             eng.tick(t0, g, &cfg, &mut fr);
-            for k in 1..=3u64 {
-                eng.on_event(typed(1), t0 + ms(k));
+            if pressed {
+                for k in 1..=3u64 {
+                    eng.on_event(typed(1), t0 + ms(k));
+                }
             }
             let echo = t0 + ms(10);
             if sweep {
@@ -4131,7 +6083,7 @@ mod tests {
             eng.tick(echo, g, &cfg, &mut fr);
             eng
         };
-        let swept = drive(true);
+        let swept = drive(true, true);
         for col in 1..=4u16 {
             assert!(
                 swept.field_at(3, col).is_some(),
@@ -4142,16 +6094,21 @@ mod tests {
             swept.field_at(3, 5).is_none(),
             "the landing's own cell is the caret's, not a glyph's"
         );
-        let holed = drive(false);
-        assert!(
-            holed.field_at(3, 4).is_some(),
-            "the keys lay the landing's glyph"
-        );
-        assert!(
-            holed.field_at(3, 2).is_none() && holed.field_at(3, 3).is_none(),
-            "the control: without the sweep the batch leaves two dark cells — \
-             the frame this law is about"
-        );
+        let unswept = drive(false, true);
+        for col in 1..=4u16 {
+            assert!(
+                unswept.field_at(3, col).is_some(),
+                "glyph cell {col}: the presses on the ledger pay for the batch the host did not sweep"
+            );
+        }
+        let cold = drive(false, false);
+        for col in 1..=4u16 {
+            assert!(
+                cold.field_at(3, col).is_none(),
+                "the control: a batch no press explains leaves cell {col} dark — \
+                 the frame this law is about"
+            );
+        }
     }
 
     /// **A TYPED FOLD WRAPS AT THE PANE'S EDGE, NOT THE GRID'S** (2026-09-06,
@@ -4211,22 +6168,31 @@ mod tests {
     /// the last letter of every line, dark for good. The control below is
     /// that frame. With the sweep the echo's move lights the cell, and a key
     /// whose echo shares its tick is untouched (the owner check).
+    ///
+    /// **Since the echo ledger (2026-09-10) the hole is closed twice**: the
+    /// press is on the ledger and the licensed move pays it out even without
+    /// the host's sweep, so the frame this law is about is now shown by a
+    /// one-cell move with NO press behind it.
     #[test]
     fn a_key_whose_echo_lands_a_frame_late_still_lights_its_glyph() {
         let ms = Duration::from_millis;
         let t0 = Instant::now();
         let cfg = config();
         let g = geom();
-        let drive = |sweep: bool| -> Engine {
+        let drive = |sweep: bool, pressed: bool| -> Engine {
             let mut eng = engaged();
             blank_row(&mut eng, 2);
             eng.on_event(mv((3, 0), (3, 2), Licence::Typed), t0);
-            eng.on_event(typed(1), t0);
+            if pressed {
+                eng.on_event(typed(1), t0);
+            }
             let mut sc = Scratch::default();
             let mut fr = sc.frame();
             eng.tick(t0, g, &cfg, &mut fr);
             // The key, echoed a frame later.
-            eng.on_event(typed(1), t0 + ms(8));
+            if pressed {
+                eng.on_event(typed(1), t0 + ms(8));
+            }
             let mut sc = Scratch::default();
             let mut fr = sc.frame();
             eng.tick(t0 + ms(8), g, &cfg, &mut fr);
@@ -4247,7 +6213,7 @@ mod tests {
             eng.tick(echo, g, &cfg, &mut fr);
             eng
         };
-        let swept = drive(true);
+        let swept = drive(true, true);
         assert!(
             swept.field_at(3, 2).is_some(),
             "the late-echoed glyph is a ribbon cell"
@@ -4256,10 +6222,15 @@ mod tests {
             swept.field_at(3, 1).is_some(),
             "…and the first one still is"
         );
-        let dark = drive(false);
+        let unswept = drive(false, true);
         assert!(
-            dark.field_at(3, 2).is_none(),
-            "the control: without the sweep the late-echoed glyph stays dark — \
+            unswept.field_at(3, 2).is_some(),
+            "without the host's sweep the press on the ledger still pays for its glyph"
+        );
+        let cold = drive(false, false);
+        assert!(
+            cold.field_at(3, 2).is_none() && cold.field_at(3, 1).is_none(),
+            "the control: moves no press explains lay nothing — \
              the frame this law is about"
         );
     }

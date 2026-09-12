@@ -8,9 +8,10 @@
 //! `$TRUST_STAGE2_BIN` to a physical path, putting it first on PATH, and printing
 //! the flag-spelling-skew diagnostic. Everything after that is here.
 //!
-//! stdout is the ladder and nothing else, so a run can be diffed, piped or pasted
-//! into a review. Progress goes to stderr, and only when stderr is a terminal —
-//! a captured log is a record of decisions, not of waiting.
+//! stdout is what `aterm_verify::run` writes and nothing else — the toolchain
+//! header, the ladder, the verdict; its doc lists every line — so a run can be
+//! diffed, piped or pasted into a review. Progress goes to stderr, and only when
+//! stderr is a terminal — a captured log is a record of decisions, not of waiting.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};

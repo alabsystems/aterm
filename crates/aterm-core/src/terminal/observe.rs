@@ -12,15 +12,16 @@
 //! transiently-true condition can never be lost to a coalesced wake. Live deltas,
 //! idle-quiescence, and semantic row matching all become *the same mechanism
 //! armed with a different predicate* — never a poll loop, never a text-hash
-//! scrape. Three of the four predicates (`SeqAdvanced`, `IdleFor`, `RowMatches`)
-//! are OSC-133-independent — the property that makes turn-detection work for an
-//! alt-screen agent TUI like Claude; `BlockComplete` is the deliberate exception,
-//! exposing shell-integration block state (OSC 133/633) as a fourth predicate.
+//! scrape. Five of the six predicates (`SeqAdvanced`, `IdleFor`, `RowMatches`,
+//! `RowsClear`, `MomentumBelow`) are OSC-133-independent — the property that makes turn-detection
+//! work for an alt-screen agent TUI like Claude; `BlockComplete` is the deliberate
+//! exception, exposing shell-integration block state (OSC 133/633) as a sixth
+//! predicate.
 //!
 //! ## One list, one path
 //!
 //! Every armed observer is a [`Watcher`] in ONE list, distinguished only by its
-//! [`WatcherSpec`]. [`WatcherSet::observe`] evaluates all four predicate kinds in
+//! [`WatcherSpec`]. [`WatcherSet::observe`] evaluates all six predicate kinds in
 //! one match at the seam; `IdleFor` additionally fires from [`WatcherSet::expire`]
 //! at a host-supplied instant. The kernel carries no vocabulary — the regex
 //! behind [`WatcherSpec::RowMatches`] is an opaque [`RowMatch`] built one crate up
@@ -79,7 +80,13 @@ pub trait RowMatch: Send + Sync + std::fmt::Debug {
 pub enum RowRange {
     /// Every visible row (`0..rows`).
     All,
-    /// The inclusive visible-row span `start..=end` (clamped to the grid).
+    /// The inclusive visible-row span `start..=end`. NOT clamped: the scan simply
+    /// never visits a row the grid does not have, so a span that reaches past the
+    /// grid is intersected with it, and one that covers NO visible row (`start`
+    /// beyond the grid, or `start > end`) is EMPTY. An empty span is not a
+    /// surface: `RowMatches` never latches on it and `RowsClear` refuses to (see
+    /// [`covers_any`](Self::covers_any)), so a typo'd `rows <a> <b>` cannot read
+    /// as "clear" — and the verb layer names the typo up front (`ERR bad rows`).
     Span {
         /// First visible row index (inclusive).
         start: usize,
@@ -95,6 +102,19 @@ impl RowRange {
         match self {
             RowRange::All => true,
             RowRange::Span { start, end } => idx >= start && idx <= end,
+        }
+    }
+
+    /// Whether this range covers at least one of `visible_rows` grid rows
+    /// (`0..visible_rows`). `false` means the range is EMPTY on this grid: a
+    /// `RowsClear` over it scans nothing, and nothing-scanned is never evidence
+    /// of a clear surface, so the kernel will not latch it; the verb layer
+    /// refuses to arm either row predicate on it.
+    #[must_use]
+    pub fn covers_any(self, visible_rows: usize) -> bool {
+        match self {
+            RowRange::All => visible_rows > 0,
+            RowRange::Span { start, end } => start <= end && start < visible_rows,
         }
     }
 }
@@ -124,21 +144,55 @@ pub enum WatcherSpec {
         /// Which visible rows to scan.
         rows: RowRange,
     },
+    /// Latch at a FIXED, caller-computed instant: the analytic crossing of a
+    /// decaying quantity below `floor` — the typing-momentum release law
+    /// (`v·e^(−t/τ)`, solved once by the host at arm; the kernel never reads
+    /// the quantity and carries no τ). The `await momentum` / `turn yield=`
+    /// predicate: an agent parks until the human's ribbon has exhaled.
+    ///
+    /// Deadline-triggered like [`IdleFor`](WatcherSpec::IdleFor) but, unlike
+    /// it, NEVER reset by content activity: the crossing is a fact about the
+    /// reading taken at arm, and a keystroke that lifts the quantity is
+    /// invisible here. The verb that armed it re-reads the quantity when the
+    /// watcher fires and re-arms on the new crossing — so every wake is an
+    /// analytic crossing of a real reading, and none is a poll.
+    MomentumBelow {
+        /// The floor the quantity must have decayed to (documentary here; the
+        /// host solved the crossing from it).
+        floor: f32,
+        /// The instant the quantity reaches `floor` under the release law.
+        crossing: Instant,
+    },
+    /// Latch when NO visible row in `rows` satisfies `matcher` — the inverse of
+    /// [`RowMatches`](Self::RowMatches), for a surface whose "done" signal is a
+    /// row LEAVING (a busy footer such as `esc to interrupt`) rather than one
+    /// arriving. Level-triggered like `RowMatches`: a surface with no matching
+    /// row at arm latches at arm.
+    RowsClear {
+        /// The opaque pre-compiled matcher (regex lives in `aterm-observe`).
+        matcher: Arc<dyn RowMatch>,
+        /// Which visible rows to scan.
+        rows: RowRange,
+    },
 }
 
 impl WatcherSpec {
     #[inline]
     fn is_row(&self) -> bool {
-        matches!(self, WatcherSpec::RowMatches { .. })
+        matches!(
+            self,
+            WatcherSpec::RowMatches { .. } | WatcherSpec::RowsClear { .. }
+        )
     }
 
     /// Whether the predicate must be evaluated ONCE AT ARM, not only on the next
     /// batch — i.e. whether it is **level**- rather than edge-triggered.
     ///
-    /// Both kinds here are statements about the surface as it ALREADY IS, so an
+    /// These kinds are statements about the surface as it ALREADY IS, so an
     /// arm-only-then-wait evaluation answers "no" while the answer is plainly
-    /// "yes": an already-matching row for `RowMatches`, and an ALREADY-ADVANCED
-    /// `content_seq` for `SeqAdvanced`. The latter is the exact shape of a
+    /// "yes": an already-matching row for `RowMatches`, an already-clear range
+    /// for `RowsClear`, and an ALREADY-ADVANCED `content_seq` for `SeqAdvanced`.
+    /// The latter is the exact shape of a
     /// turn-based agent's dirty check — "did anything change since the seq I
     /// recorded last turn?" — which must be answerable without waiting for the
     /// *next* unrelated batch to arrive (and, on a quiet session, forever).
@@ -150,7 +204,9 @@ impl WatcherSpec {
     fn needs_arm_eval(&self) -> bool {
         matches!(
             self,
-            WatcherSpec::RowMatches { .. } | WatcherSpec::SeqAdvanced { .. }
+            WatcherSpec::RowMatches { .. }
+                | WatcherSpec::RowsClear { .. }
+                | WatcherSpec::SeqAdvanced { .. }
         )
     }
 }
@@ -163,8 +219,8 @@ pub struct Satisfaction {
     /// The `content_seq` in force when the predicate became true.
     pub seq: u64,
     /// The instant the predicate became true: the processed-batch instant for
-    /// `SeqAdvanced`/`BlockComplete`/`RowMatches`, the computed deadline for
-    /// `IdleFor`.
+    /// `SeqAdvanced`/`BlockComplete`/`RowMatches`/`RowsClear`, the computed
+    /// deadline for `IdleFor`/`MomentumBelow`.
     pub at: Instant,
 }
 
@@ -200,6 +256,17 @@ pub fn first_matching_row(
         .find(|&i| range.contains(i) && source.row_text(i).is_some_and(|t| matcher.matches(&t)))
 }
 
+/// Whether any pre-collected visible row in `range` satisfies `matcher` — the
+/// one scan both row predicates share (`RowMatches` latches on `true`,
+/// `RowsClear` on `false`). Reads the row text by reference; stops at the first
+/// hit.
+#[must_use]
+fn any_row_matches(rows: &[Option<String>], matcher: &dyn RowMatch, range: RowRange) -> bool {
+    rows.iter().enumerate().any(|(idx, cell)| {
+        range.contains(idx) && cell.as_deref().is_some_and(|t| matcher.matches(t))
+    })
+}
+
 /// The activity clock: the last `content_seq` seen to advance and the injected
 /// instant at which it advanced. Never reads the wall clock.
 #[derive(Clone, Copy, Debug, Default)]
@@ -229,9 +296,9 @@ struct Watcher {
     deadline: Option<Instant>,
     /// `Some` once the predicate has held; sticky while armed.
     latched: Option<Satisfaction>,
-    /// A freshly-armed `RowMatches` watcher is scanned once even without a content
-    /// advance, so an ALREADY-matching row latches at arm. Cleared after the first
-    /// `observe`.
+    /// A freshly-armed row watcher (`RowMatches`/`RowsClear`) is scanned once even
+    /// without a content advance, so an ALREADY-matching row (or an already-clear
+    /// range) latches at arm. Cleared after the first `observe`.
     fresh: bool,
     /// Which GRID this watcher was armed against. `WatcherSpec::SeqAdvanced`'s
     /// `after` is a per-grid `content_gen`, so it is only comparable against a
@@ -307,9 +374,9 @@ impl WatcherSet {
         self.clock.alt
     }
 
-    /// Whether a row scan would do work this batch: some un-latched `RowMatches`
-    /// watcher is either fresh (just armed) or content advanced. The Terminal glue
-    /// collects row text only when this holds.
+    /// Whether a row scan would do work this batch: some un-latched row watcher
+    /// (`RowMatches`/`RowsClear`) is either fresh (just armed) or content
+    /// advanced. The Terminal glue collects row text only when this holds.
     #[must_use]
     pub fn wants_row_scan(&self, advanced: bool) -> bool {
         self.watchers
@@ -335,6 +402,9 @@ impl WatcherSet {
         // resets on later activity) rather than firing on stale pre-arm idleness.
         let deadline = match &spec {
             WatcherSpec::IdleFor { dur } => Some(now + *dur),
+            // A fixed deadline: the crossing was solved by the host from the
+            // reading at arm, and no later activity moves it.
+            WatcherSpec::MomentumBelow { crossing, .. } => Some(*crossing),
             _ => None,
         };
         let fresh = spec.is_row();
@@ -398,7 +468,7 @@ impl WatcherSet {
             .any(|w| w.latched.is_none() && matches!(w.spec, WatcherSpec::BlockComplete))
     }
 
-    /// The soonest pending `IdleFor` deadline. The L1 `await`/`ready` verb that
+    /// The soonest pending `IdleFor` / `MomentumBelow` deadline. The L1 `await`/`ready` verb that
     /// armed it bounds its `Subscription::wait` park by this instant, so the kernel
     /// fires the idle predicate exactly on time without a GUI-loop timer. `None`
     /// when no un-latched idle watcher is armed.
@@ -412,13 +482,16 @@ impl WatcherSet {
     }
 
     /// **The seam call** — run from `post_process` after every batch (and once at
-    /// arm for a level-triggered spec: a fresh `RowMatches` or `SeqAdvanced`),
-    /// with `now == transient.process_now`
+    /// arm for a level-triggered spec: a fresh `RowMatches`/`RowsClear` or
+    /// `SeqAdvanced`), with `now == transient.process_now`
     /// (injected, never read here). Stamps activity if `content_seq` advanced and
-    /// latches any predicate that holds, evaluating all four kinds in ONE pass.
-    /// Surface-read-only: `rows[idx]` supplies visible-row text for `RowMatches`
-    /// (the caller gates the costly collection on `wants_row_scan` and passes the
-    /// rows by reference, so a matched row is read — never re-cloned — here).
+    /// latches any predicate that holds, evaluating every kind in ONE pass.
+    /// Surface-read-only: `rows[idx]` supplies visible-row text for the row
+    /// predicates (the caller gates the costly collection on `wants_row_scan` and
+    /// passes the rows by reference, so a matched row is read — never re-cloned —
+    /// here). The gate is what makes `RowsClear` sound: it is only evaluated on
+    /// a batch the caller collected rows for, so an empty `rows` can never be
+    /// mistaken for a clear surface.
     /// Returns `true` if anything latched.
     pub fn observe(
         &mut self,
@@ -486,26 +559,41 @@ impl WatcherSet {
                         });
                     }
                 }
+                // Content activity is not this predicate's business: the
+                // deadline was fixed at arm and fires from `expire` alone.
+                WatcherSpec::MomentumBelow { .. } => {}
                 WatcherSpec::RowMatches {
                     matcher,
                     rows: range,
                 } => {
                     // Dirty-row gate: scan only on advance or a fresh arm. Reads
                     // the pre-collected row text by reference — no re-allocation.
-                    if advanced || w.fresh {
-                        for (idx, cell) in rows.iter().enumerate() {
-                            if range.contains(idx) {
-                                if let Some(t) = cell {
-                                    if matcher.matches(t) {
-                                        new_latch = Some(Satisfaction {
-                                            seq: content_seq,
-                                            at: now,
-                                        });
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                    if (advanced || w.fresh) && any_row_matches(rows, &**matcher, *range) {
+                        new_latch = Some(Satisfaction {
+                            seq: content_seq,
+                            at: now,
+                        });
+                    }
+                }
+                WatcherSpec::RowsClear {
+                    matcher,
+                    rows: range,
+                } => {
+                    // The same gate, the inverse verdict: latch on a scan that
+                    // finds NO matching row in range. Only ever evaluated on a
+                    // batch the caller collected rows for (see `wants_row_scan`),
+                    // and only when the range meets at least one collected row:
+                    // a range that covers no visible row (a typo'd `rows <a> <b>`,
+                    // or a grid that shrank under an armed span) scans nothing,
+                    // and scanning nothing is not evidence of a clear surface.
+                    if (advanced || w.fresh)
+                        && range.covers_any(rows.len())
+                        && !any_row_matches(rows, &**matcher, *range)
+                    {
+                        new_latch = Some(Satisfaction {
+                            seq: content_seq,
+                            at: now,
+                        });
                     }
                 }
             }
@@ -523,7 +611,7 @@ impl WatcherSet {
 
     /// **The idle-fire call** — run by the host when its armed `WaitUntil` wake
     /// reaches `now` (and once at a replay target). Latches every un-latched
-    /// `IdleFor` whose deadline has passed, recording `at = deadline` (NOT `now`)
+    /// `IdleFor` / `MomentumBelow` whose deadline has passed, recording `at = deadline` (NOT `now`)
     /// so the latched value is independent of *when* the host woke. Returns `true`
     /// if anything latched.
     pub fn expire(&mut self, now: Instant) -> bool {
@@ -533,7 +621,10 @@ impl WatcherSet {
             if w.latched.is_some() {
                 continue;
             }
-            if matches!(w.spec, WatcherSpec::IdleFor { .. }) {
+            if matches!(
+                w.spec,
+                WatcherSpec::IdleFor { .. } | WatcherSpec::MomentumBelow { .. }
+            ) {
                 if let Some(deadline) = w.deadline {
                     if now >= deadline {
                         w.latched = Some(Satisfaction {
@@ -610,9 +701,10 @@ impl super::Terminal {
     /// Arm a surface watcher (the L1 `await`/`subscribe` verbs call this). `now`
     /// is the host's arming instant. Returns `None` (fail-closed) if the
     /// per-session watcher budget is full. A level-triggered spec
-    /// ([`WatcherSpec::needs_arm_eval`] — `RowMatches` and `SeqAdvanced`) is
-    /// evaluated immediately, so an already-matching row or an already-advanced
-    /// `content_seq` latches at arm instead of waiting for the next batch.
+    /// ([`WatcherSpec::needs_arm_eval`] — `RowMatches`, `RowsClear` and
+    /// `SeqAdvanced`) is evaluated immediately, so an already-matching row, an
+    /// already-clear range or an already-advanced `content_seq` latches at arm
+    /// instead of waiting for the next batch.
     #[must_use]
     pub fn watch(&mut self, spec: WatcherSpec, now: Instant) -> Option<WatchId> {
         let arm_eval = spec.needs_arm_eval();
@@ -645,6 +737,19 @@ impl super::Terminal {
         now: Instant,
     ) -> Option<WatchId> {
         self.watch(WatcherSpec::RowMatches { matcher, rows }, now)
+    }
+
+    /// The inverse of [`watch_rows`](Self::watch_rows): latch when NO visible row
+    /// in `rows` matches `matcher` (the `await gone` predicate). Level-triggered —
+    /// a surface that already shows no matching row latches at arm.
+    #[must_use]
+    pub fn watch_rows_gone(
+        &mut self,
+        matcher: Arc<dyn RowMatch>,
+        rows: RowRange,
+        now: Instant,
+    ) -> Option<WatchId> {
+        self.watch(WatcherSpec::RowsClear { matcher, rows }, now)
     }
 
     /// Non-blocking: has watcher `id` latched? `None` if pending or unknown.
@@ -728,6 +833,30 @@ mod tests {
     fn needs_arm_eval_is_exactly_the_level_triggered_predicates() {
         // Statements about the surface as it ALREADY is -> must latch at arm.
         assert!(WatcherSpec::SeqAdvanced { after: 0 }.needs_arm_eval());
+        #[derive(Debug)]
+        struct Never;
+        impl RowMatch for Never {
+            fn matches(&self, _: &str) -> bool {
+                false
+            }
+        }
+        // Both row predicates: "a row matches now" and "no row matches now" are
+        // each a fact about the present surface, so both are evaluated at arm.
+        assert!(
+            WatcherSpec::RowMatches {
+                matcher: Arc::new(Never),
+                rows: RowRange::All,
+            }
+            .needs_arm_eval()
+        );
+        assert!(
+            WatcherSpec::RowsClear {
+                matcher: Arc::new(Never),
+                rows: RowRange::All,
+            }
+            .needs_arm_eval(),
+            "RowsClear is level-triggered: an already-clear surface latches at arm"
+        );
         // ...and this is the assertion the old `is_row()` wiring failed.
         assert!(
             WatcherSpec::SeqAdvanced { after: 7 }.needs_arm_eval(),
@@ -743,6 +872,62 @@ mod tests {
             .needs_arm_eval()
         );
         assert!(!WatcherSpec::BlockComplete.needs_arm_eval());
+    }
+
+    /// THE YIELD PREDICATE'S KERNEL HALF (`await momentum` / `turn yield=`):
+    /// a `MomentumBelow` watcher latches at exactly the crossing it was armed
+    /// with — `at = crossing`, whatever late instant the host woke at — and
+    /// content activity in the meantime neither resets nor advances it (an
+    /// `IdleFor` armed beside it IS reset by the same activity: the vacuity
+    /// control). Does not compile on the tree before (no such variant).
+    #[test]
+    fn a_momentum_watcher_latches_at_its_crossing_and_content_activity_does_not_move_it() {
+        let base = t0();
+        let mut set = WatcherSet::default();
+        let crossing = base + Duration::from_millis(500);
+        let id = set
+            .arm(
+                WatcherSpec::MomentumBelow {
+                    floor: 0.25,
+                    crossing,
+                },
+                base,
+            )
+            .expect("budget");
+        let idle = set
+            .arm(
+                WatcherSpec::IdleFor {
+                    dur: Duration::from_millis(500),
+                },
+                base,
+            )
+            .expect("budget");
+        assert_eq!(set.next_deadline(), Some(crossing));
+
+        // The human types: content advances at +300 ms. The idle watcher's
+        // deadline moves to +800 ms; the crossing does not move at all.
+        let typed = base + Duration::from_millis(300);
+        assert!(!set.observe(7, false, typed, NO_ROWS));
+        assert_eq!(
+            set.next_deadline(),
+            Some(crossing),
+            "a keystroke must not move the analytic crossing"
+        );
+        assert!(!set.expire(typed), "nothing has crossed yet");
+        assert!(set.poll(id).is_none());
+
+        // A late wake (+900 ms): the latch records the crossing, not the wake.
+        let late = base + Duration::from_millis(900);
+        assert!(set.expire(late));
+        let sat = set.poll(id).expect("crossed");
+        assert_eq!(sat.at, crossing, "latched at the deadline, not at `now`");
+        assert_eq!(sat.seq, 7, "the seq the clock last saw");
+        // The idle one latched too — at ITS moved deadline (+800 ms), which is
+        // the reset this predicate deliberately does not take.
+        assert_eq!(
+            set.poll(idle).map(|s| s.at),
+            Some(typed + Duration::from_millis(500))
+        );
     }
 
     #[test]
@@ -932,6 +1117,159 @@ mod tests {
         let rows2 = [Some("done".to_string()), Some("READY ❯".to_string())];
         w.observe(2, false, base, &rows2);
         assert_eq!(w.poll(id).unwrap().seq, 2);
+    }
+
+    /// The shared row matcher for the `RowsClear` tests below.
+    #[derive(Debug)]
+    struct Busy;
+    impl RowMatch for Busy {
+        fn matches(&self, row: &str) -> bool {
+            row.contains("esc to interrupt")
+        }
+    }
+
+    fn rows_clear(range: RowRange) -> WatcherSpec {
+        WatcherSpec::RowsClear {
+            matcher: Arc::new(Busy),
+            rows: range,
+        }
+    }
+
+    /// LEVEL-TRIGGERED, like `RowMatches`: a surface that already shows no
+    /// matching row latches on the arm-time scan (`fresh`), with NO content
+    /// advance. An agent asking "is the busy footer gone?" of a session that
+    /// finished its turn a minute ago must be told yes now, not on the next
+    /// unrelated batch.
+    #[test]
+    fn rows_clear_latches_at_arm_when_nothing_matches() {
+        let base = t0();
+        let mut w = WatcherSet::default();
+        // The kernel clock is already at 7: the arm-time scan sees no advance.
+        w.seed_seq(7);
+        let id = w.arm(rows_clear(RowRange::All), base).unwrap();
+        let rows = [Some("done".to_string()), Some("❯ ".to_string())];
+        w.observe(7, false, base, &rows);
+        assert_eq!(
+            w.poll(id).unwrap().seq,
+            7,
+            "no matching row at arm => latched on the fresh scan, same seq"
+        );
+    }
+
+    /// The inverse of `row_matches_latches_in_the_one_list_on_content_advance`:
+    /// a matching row HOLDS the watcher pending, a quiet frame (gate closed, no
+    /// rows collected) must not be misread as a clear surface, and the content
+    /// advance that removes the row is what latches.
+    #[test]
+    fn rows_clear_holds_while_a_row_matches_then_latches_when_it_leaves() {
+        let base = t0();
+        let mut w = WatcherSet::default();
+        let id = w.arm(rows_clear(RowRange::All), base).unwrap();
+        let busy = [
+            Some("thinking…".to_string()),
+            Some("esc to interrupt".to_string()),
+        ];
+        w.observe(1, false, base, &busy);
+        assert!(w.poll(id).is_none(), "a matching row keeps `gone` pending");
+        // The footer is still there on the next repaint.
+        let still_busy = [
+            Some("still thinking…".to_string()),
+            Some("(3s · esc to interrupt)".to_string()),
+        ];
+        w.observe(2, false, base, &still_busy);
+        assert!(w.poll(id).is_none(), "still matching => still pending");
+        // Quiescent frame: no advance, the row-scan gate is CLOSED and the caller
+        // hands over no rows. That must never read as "nothing matches".
+        w.observe(2, false, base, NO_ROWS);
+        assert!(
+            w.poll(id).is_none(),
+            "an un-scanned frame is not a clear surface"
+        );
+        // The advance that takes the footer away latches, at that seq.
+        let clear = [Some("Done.".to_string()), Some("❯ ".to_string())];
+        w.observe(3, false, base, &clear);
+        assert_eq!(w.poll(id).unwrap().seq, 3);
+    }
+
+    /// `rows <a> <b>` scopes the scan: a match OUTSIDE the range does not hold
+    /// the watcher, and the same surface with the range placed over the match
+    /// stays pending.
+    #[test]
+    fn rows_clear_range_ignores_a_match_outside_the_range() {
+        let base = t0();
+        let mut w = WatcherSet::default();
+        let rows = [
+            Some("esc to interrupt".to_string()),
+            Some("body".to_string()),
+            Some("footer".to_string()),
+        ];
+        let outside = w
+            .arm(rows_clear(RowRange::Span { start: 1, end: 2 }), base)
+            .unwrap();
+        let covering = w
+            .arm(rows_clear(RowRange::Span { start: 0, end: 1 }), base)
+            .unwrap();
+        w.observe(1, false, base, &rows);
+        assert_eq!(
+            w.poll(outside).unwrap().seq,
+            1,
+            "the match on row 0 is outside rows 1..=2 => clear => latched"
+        );
+        assert!(
+            w.poll(covering).is_none(),
+            "the same match inside rows 0..=1 holds that watcher pending"
+        );
+    }
+
+    /// A range that covers NO visible row scans nothing, and scanning nothing is
+    /// not evidence of a clear surface: `RowsClear` over such a range stays
+    /// pending — at arm and on every later advance — whether the span starts
+    /// past the grid or is inverted. It is not a vacuous truth, it is the absence
+    /// of a reading. A span that merely REACHES past the grid is intersected
+    /// with it and behaves normally.
+    #[test]
+    fn rows_clear_never_latches_on_a_range_that_covers_no_visible_row() {
+        let base = t0();
+        let mut w = WatcherSet::default();
+        let past_the_grid = w
+            .arm(rows_clear(RowRange::Span { start: 40, end: 50 }), base)
+            .unwrap();
+        let inverted = w
+            .arm(rows_clear(RowRange::Span { start: 2, end: 1 }), base)
+            .unwrap();
+        // A 3-row grid with nothing matching anywhere.
+        let clear = [
+            Some("Done.".to_string()),
+            Some("❯ ".to_string()),
+            Some(String::new()),
+        ];
+        w.observe(1, false, base, &clear);
+        w.observe(2, false, base, &clear);
+        assert!(
+            w.poll(past_the_grid).is_none(),
+            "rows 40..=50 on a 3-row grid meets no row: no vacuous latch"
+        );
+        assert!(
+            w.poll(inverted).is_none(),
+            "rows 2..=1 is inverted, so empty: no vacuous latch"
+        );
+        // The same clear surface under a span that DOES meet a row (2..=50 covers
+        // row 2 and is intersected with the grid beyond it) latches at once.
+        let covering = w
+            .arm(rows_clear(RowRange::Span { start: 2, end: 50 }), base)
+            .unwrap();
+        w.observe(2, false, base, &clear);
+        assert_eq!(
+            w.poll(covering).unwrap().seq,
+            2,
+            "a span reaching past the grid is intersected with it, not emptied"
+        );
+        // The predicate the verb layer gates on, on a 24-row grid.
+        assert!(!RowRange::Span { start: 40, end: 50 }.covers_any(24));
+        assert!(!RowRange::Span { start: 2, end: 1 }.covers_any(24));
+        assert!(RowRange::Span { start: 23, end: 99 }.covers_any(24));
+        assert!(RowRange::All.covers_any(1));
+        assert!(!RowRange::All.covers_any(0));
     }
 
     #[test]

@@ -92,11 +92,12 @@ WHEN TO REACH FOR IT
   or drive a RUNNING instance from the outside.
 
 GOTCHAS
-  * `aterm <tool>` resolves through the managed STORE, never $PATH — a tool that is not
-    installed falls through to a usage error. (`aterm pkg` is atpkg linked INTO this one
-    binary, not a sibling executable: there is nothing to co-locate and nothing to be
-    missing.) Historic note: pre-one-binary builds exited 127 when the sibling
-    binary, never $PATH). Missing ⇒ `aterm pkg` exits 127; an unknown tool is a usage error.
+  * `aterm <tool>` resolves through the managed STORE, never $PATH — a name the store
+    does not hold falls through to the ordinary unknown-operand usage error, and a tool
+    whose install is still pending prints its live state and exits 127. `aterm pkg` is
+    atpkg linked INTO this one binary, not a sibling executable: nothing to co-locate,
+    nothing to be missing, and an unknown pkg verb is a usage error. (Historic note:
+    pre-one-binary builds exited 127 when the sibling `atpkg` binary was missing.)
   * Containment precedence: explicit flag > $ATERM_CONTAINMENT_MODE > default `user`;
     a malformed mode fails CLOSED to `containment`. The OS sandbox is actuated on macOS
     only; elsewhere it is rlimits + capability gate, and aterm says so on stderr.
@@ -191,12 +192,16 @@ WHAT IT IS
   the block tells the agent to ignore itself, so installing it is harmless everywhere.
 
   It ALSO installs the bundled SKILLS: whole files aterm ships and owns, written into
-  the agent's own skills directory (today, for Claude Code:
-  `~/.claude/skills/drive-aterm/SKILL.md` — how to drive/observe ONE other aterm
-  session over the control socket — and `~/.claude/skills/supervise-agent/SKILL.md` —
-  the SUPERVISION loop on top: run a worker agent, review each turn against ground
-  truth, escalate, resume). The skill content is compiled into the binary, so it
-  updates with aterm and there is no second copy to drift.
+  the agent's own skills or commands directory. Claude Code gets four, under
+  `~/.claude/skills/<name>/SKILL.md`: `drive-aterm` (drive/observe ONE other aterm
+  session over the control socket), `supervise-agent` (the SUPERVISION loop on top:
+  run a worker agent, review each turn against ground truth, escalate, resume),
+  `rust-in-aterm` (Rust here means the Trust toolchain, and what each refusal means)
+  and `aterm-fabric` (peer messaging: inbox, post, trust, the halt, the file mirror).
+  The other agents get `aterm-fabric` alone, as a user command in their own format:
+  `~/.codex/prompts/aterm-fabric.md`, `~/.gemini/commands/aterm-fabric.toml`,
+  `~/.config/opencode/command/aterm-fabric.md`. The content is compiled into the
+  binary, so it updates with aterm and there is no second copy to drift.
 
 KEY USAGE
   aterm agents               status: each agent, its context file + skills,
@@ -231,8 +236,12 @@ GOTCHAS
     marker instead. A file at that path WITHOUT the marker is yours: aterm reports it
     `foreign` and never writes or deletes it. Deleting the marker line is therefore the
     supported way to fork a shipped skill and keep your version.
-  * Only Claude Code defines a skills convention today, so only `claude` gets one; the
-    other agents receive the primer alone (aterm never fabricates a skills dir)."#,
+  * Every DETECTED agent gets a managed doc at the path its vendor documents — but only
+    Claude's skills are AUTO-DISCOVERED (the model pulls one in when its description
+    matches). Codex, Gemini CLI and OpenCode load theirs only when someone types
+    `/aterm-fabric`, which is why the fabric FACT rides in the primer block and only
+    its depth lives in the doc. aterm invents no convention of its own: a doc goes
+    only where the vendor already defines a place for it."#,
         ),
     },
     Topic {
@@ -422,7 +431,12 @@ GOTCHAS (in the order they bite)
   * PATH: ~/.aterm/shell.d/00-atpkg.* puts <prefix>/agents FIRST (it carries ONLY the
     claude and codex shims, so the aterm-managed agent is what those names run — the one
     exception, owner decision 2026-09-10) and the managed bin/ LAST (never shadowing
-    system sudo/ssh/git). The hook is sourced inside every aterm session and from the
+    system sudo/ssh/git). FIRST means moved there: the hook removes every earlier
+    mention of <prefix>/agents before prepending it, because a macOS login shell's
+    path_helper and a `~/.local/bin` line in ~/.zshrc otherwise leave /opt/homebrew/bin
+    and ~/.local/bin ahead of it, and inside an aterm session the shell integration
+    re-asserts it beside the reroute directory after your rc files ran. The hook is
+    sourced inside every aterm session and from the
     marker block atpkg writes into an existing ~/.zshrc / ~/.bashrc / config.fish (see
     WHEN TO REACH FOR IT); in a shell neither reaches — a CI image, an rc that never
     existed — use `aterm <tool>`, or copy the export line `aterm pkg doctor` prints.
@@ -466,8 +480,9 @@ GOTCHAS (in the order they bite)
     `--fix`, `--strict` and `--porcelain` on `doctor` until 2026-09-01; `doctor`
     parses no arguments, so all three were silently ignored — and `--fix` was named
     as THE cure for a missing toolchain.)
-  * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
-    test-pinned to the dispatch table — it never advertises a verb that does not run."#,
+  * The channel is `[packages].channel` in the config (default "stable"), and the
+    roster `aterm pkg --help` prints is test-pinned to the dispatch table — it never
+    advertises a verb that does not run."#,
         ),
     },
     Topic {
@@ -887,6 +902,9 @@ fn overview_page() -> String {
                 "opt-in durable attention queue + guarded turns; legacy federation"
             }
             crate::Verb::Drive => "the agent drive CLI (prompt / read / await / shot)",
+            crate::Verb::Link => {
+                "the fabric bridge: carry this instance's inbox/post traffic to the bus"
+            }
             crate::Verb::Ship => {
                 "publish aterm: provision a signing machine, cut a release (source checkout only)"
             }
@@ -1027,8 +1045,10 @@ WHY IT EXISTS
   The windowed app updates itself silently. This is the lane a terminal-only
   machine uses to learn it is stale: it needs no window and no control socket.
 
-  macOS ONLY. Auto-update is compiled for macOS; elsewhere `aterm update status`
-  answers "auto-update is macOS-only; nothing to report on this platform", and
+  macOS ONLY. Auto-update is compiled for macOS; elsewhere (and on a Mac whose
+  HOME is unset or whose updater staging directory cannot be made) `aterm update
+  status` answers "aterm update: nothing to report — auto-update runs on macOS
+  only, and only where the updater's staging directory under HOME resolves";
   everything below applies to macOS.
 
 WHEN IT REPORTS THAT IT CANNOT UPDATE
@@ -1088,9 +1108,33 @@ COMMANDS
   await <cond>       block until a condition, then print the verdict:
                        idle <ms>      surface unchanged for <ms> (turn done)
                        match <regex>  a visible row matches
+                       gone <regex>   NO visible row matches (a busy footer such
+                                      as 'esc to interrupt' left the screen)
                        seq            the next content change lands
                        block          a shell command completes (OSC-133)
-  shot [path]        save a pixel-true PNG of the terminal content
+  shot [name.png]    save a pixel-true PNG of the terminal content (bare name, into images/)
+
+SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls`)
+  classify [--allow-python GLOB]... <cmd...>
+                     is this shell line read-only, the way the supervisor judges
+                     it? prints `read-only` (exit 0) or `not-read-only <reason>`
+                     (exit 1); quoted strings are not scanned (except the programs
+                     handed to awk and sed), every danger token anywhere fails it,
+                     every segment — a wrapper like xargs/env seen through, a `&`
+                     splitting like `;` — must start a known read
+  phase [@sid]       one read, one word: busy | prompt | idle | question — for a
+                     prompt, the parsed box follows (kind, command, options)
+  await-turn [@sid] [--timeout MS]
+                     block until the phase is no longer busy (the spinner row,
+                     the busy footer and any background shell all gone), then
+                     print it like `phase`; exit 124 on the timeout
+  supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+                     the loop: await-turn; with --auto-reads a Bash prompt whose
+                     command is read-only is approved (option 1, guarded: a
+                     skipped guard is not an approval, and the box must leave
+                     before the next look) and noted; anything else — a write, a
+                     workflow, a question, an idle composer — is printed and the
+                     tool exits 0 for YOUR review; TIMEOUT / exit 124 after --max-s
 
   aterm drive --help       every flag
   aterm help introspection the control protocol underneath
@@ -1190,12 +1234,15 @@ const FLEET_PAGE: &str = r#"fleet — federate many aterm sessions into one fabr
   aterm fleet <command>
 
 The embedded operator is EXPERIMENTAL and OFF by default. Launch an instance with
-$ATERM_OPERATOR=1 to opt in; it then starts with an empty allowlist, so nothing is
-observed until you `manage` a session. $ATERM_NO_OPERATOR overrides the opt-in.
+$ATERM_OPERATOR=1 to opt in. A new profile starts with an empty allowlist, so nothing
+is observed until you `manage` a session; a relaunched profile replays the sids it
+already manages. $ATERM_NO_OPERATOR (set, not empty or 0) overrides the opt-in.
 
 STREAMS (no operator needed)
-  aterm fleet events         merge every live instance's `subscribe events` to stdout as
-                             NDJSON, addressed /fleet/<pid>/events/<sid>
+  aterm fleet events         merge the `subscribe events` of every live instance in the
+                             default socket dir to stdout as NDJSON, addressed
+                             /fleet/<pid>/events/<sid> (an explicit-$ATERM_CONTROL_SOCK
+                             instance is listed but not federated)
   aterm fleet exec           read `@<sid> <verb> [args…]` lines on stdin, dispatch each to
                              the fleet, emit one NDJSON result per line
 
@@ -1561,10 +1608,10 @@ THE MOVES (an AI's loop is see -> decide -> drive -> observe)
   SEE     aterm ctl @sid text | screen | image f.png | cast frames count=8
   DRIVE   aterm ctl @sid turn 'message'   (verified type -> submit -> settle -> reply)
           aterm ctl @sid send '...' | key enter | paste | resize <r> <c>
-  OBSERVE aterm ctl @sid await idle <ms> | await match <re> | ready | wait
+  OBSERVE aterm ctl @sid await idle <ms> | await match <re> | await gone <re> | ready | wait
   WATCH   aterm ctl subscribe @a,@b,@c events     (the whole fleet on ONE fd, low-rate)
   FLEET   aterm ctl ls        (every session of every instance: pid sid state)
-          aterm fleet status | manage <sid> | next   (durable operator; empty allowlist)
+          aterm fleet status | manage <sid> | next   (durable; empty allowlist on a new profile)
           aterm fleet propose < proposal.json        (Owner-only guarded interactive turn)
           aterm fleet events | exec                  (legacy NDJSON federation/dispatch)
           EXPERIMENTAL and OFF by default; ATERM_OPERATOR=1 opts in (docs/OPERATOR-EMBEDDED.md)
@@ -1628,7 +1675,8 @@ fn agent_page(sid: Option<&str>) -> String {
         let _ = write!(
             s,
             "\n\n  Your session: {id}\n  \
-             See yourself:   aterm ctl @{id} text trim   (trim drops the trailing blank rows)\n  \
+             See yourself:   aterm ctl @{id} text trim   (trim drops the trailing blank rows;\n  \
+                             tail=<n> reads only the last n rows, header first=<row>)\n  \
              Drive yourself: aterm ctl @{id} turn 'message'   (rarely needed — you ARE the shell)\n  \
              Find peers:     aterm ctl windows  AND  aterm ctl ls\n  \
              \x20               windows: one row per window, which sids sit on its active tab;\n  \
@@ -1640,11 +1688,14 @@ fn agent_page(sid: Option<&str>) -> String {
         "\n\nHOW TO SEE, DRIVE, AND COORDINATE (the introspection control protocol)\n  \
          The loop is see -> decide -> drive -> observe. Read a peer with `@sid text` or a real\n  \
          frame with `@sid image`; drive it with `@sid turn 'msg'` (verified submit + settle +\n  \
-         reply); wait without polling via `@sid await idle <ms>` / `await match <re>`; watch a\n  \
-         whole fleet on one descriptor with `subscribe @a,@b events`. Humans can interject at\n  \
-         any time — the input path is the human's, and a per-session turn lease arbitrates so\n  \
-         two drivers never clobber each other. Full detail: `aterm help introspection`.\n  \
-         Cheaper reads: `text trim` / `turn trim=1` drop the trailing blank rows (`OK <n>\n  \
+         reply); wait without polling via `@sid await idle <ms>` / `await match <re>` / `await\n  \
+         gone <re>` (a busy footer LEAVING is the turn-over signal for an agent whose screen\n  \
+         can sit static mid-turn); watch a whole fleet on one descriptor with `subscribe\n  \
+         @a,@b events`. Humans can interject at any time — the input path is the human's,\n  \
+         and a per-session turn lease arbitrates so two drivers never clobber each other.\n  \
+         Full detail: `aterm help introspection`.\n  \
+         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (header `first=<row>`, the\n  \
+  cure for a bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows (`OK <n>\n  \
          trimmed=<k>`). Place work: `spawn window=<id>` opens a tab in that window WITHOUT\n  \
          raising it (ids from `windows`); `@<sid> spawn` means the window hosting <sid>.\n  \
          A vanished session: `exits [since=<id>]` says when it went, why, and by whom.\n  \
@@ -1781,10 +1832,17 @@ TRUST — THE FIELD, AND THE RULE
   body at all — and labels the rest.
 
 THE HALT
-  `hold=1` in `inbox`'s header (and `status`) means a human stopped the drivers. Every
-  PTY-reaching verb answers `ERR halted <reason>` from any scope. Reads, `post`, `inbox
-  seen` and `meta set` keep working, and the physical keyboard is untouched. It is a
-  stop, not a failure — report it, do not retry around it.
+  `hold=1` in `inbox`'s header (and `status`) means the drivers were stopped, and `ERR
+  halted reason=<r> origin=<fleet|local>` says from where. `fleet` is a human's halt
+  through the bridge (or a lost bridge, `reason=fabric-lost`), and only a reconnecting
+  bridge lifts it. `local` was set with the Owner token — the local human's credential,
+  which is also the scope every in-session client holds — by `aterm ctl hold <sid> on|off
+  [reason=<r>]`; it is the owner's stop signal to the drivers, not a containment wall: any
+  Owner client can lift it, the halted session's own agent included, and an Owner act
+  never touches a fleet hold. Every PTY-reaching verb answers `ERR halted <reason>` from
+  any scope. Reads, `post`, `inbox seen` and `meta set` keep working, and the physical
+  keyboard is untouched. It is a stop, not a failure — report it, do not retry around it,
+  and do not lift a local hold on yourself.
 
 IS IT ON HERE?
   aterm ctl @self status        ... fabric=<connected|disconnected|absent>
@@ -1793,14 +1851,52 @@ IS IT ON HERE?
   disconnected  the bridge this instance had is gone, and its sessions are held
 
 TURNING IT ON (the operator does this once)
-  1. Build the bridge and the broker CLI: aterm-link and asb (astream's `cap` feature).
-  2. Mint the node's capability file, then run the broker: `asb serve <sock> <log>`.
-  3. Point aterm at the bridge, in ~/.config/aterm/aterm.toml:
+  Every piece is in the one aterm binary, under `aterm link` (the `aterm-link` argv0 alias
+  is the same code). The supported one-shot is tools/fabric-enable.sh --enable, in the
+  aterm source checkout — an installed binary does not carry it. It does all of the
+  below, keeps the broker alive under launchd, and `--status` shows each piece. These are
+  the steps it takes, so you can see what it touched — or do them by hand.
+  1. Run the broker:  aterm link broker <sock> [<log>]
+     It checks nothing on attach — no capability, and no peer uid either — so the 0700
+     directory around <sock> is the whole boundary: same-uid, on a single-user machine.
+     The path must fit sun_path: under 104 bytes on macOS. Measured: a deep
+     /private/tmp/... path was too long where the same directory spelled /tmp/... worked.
+  2. Provision the node id: one line, e.g. n-<16 hex>, written to <state>/node. It is
+     provisioned, not minted, and every grant below bakes it in — so keep it; a new id
+     abandons this node's mail lane.
+  3. Mint the cap file, one grant per call. The mint secret is 32 raw bytes in a 0600
+     file and is given ONLY as --secret-file — never on argv, where `ps` shows it for
+     the life of the call. Quote the grant: it holds > and *.
+         aterm link mint '<grant>' --secret-file <secret> >> <cap>
+     Eight grants, for node <N> on fleet <F>:
+         rw,p=<N>:/f/<F>/pub/<N>/>      ro:/f/<F>/pub/>       ro:/f/<F>/fleet/>
+         rw,p=<N>:/f/<F>/in/*/*/<N>/*   ro:/f/<F>/in/<N>/>    rw,p=<N>:/f/<F>/cur/<N>/>
+         ro:/f/<F>/term/<N>/>           rw,p=<N>:/f/<F>/term/<N>/*/screen
+  4. Point aterm at the bridge, in ~/.config/aterm/aterm.toml. `command` is ONE string;
+     TOML's """ lets it wrap here, the line-ending \ joining the two lines:
          [fabric]
-         command = "aterm-link serve --fleet <F> --broker <sock> --cap-file <cap> --state <dir>"
+         command = """aterm link serve --fleet <F> --broker <sock> --cap-file <cap> \
+                      --state <state> --accept-from <N>"""
      `ATERM_FABRIC_COMMAND` overrides it. The string is split on whitespace, never
-     through a shell, so a path with spaces needs a symlink.
-  4. A bridge is launched once per instance, at startup, so this applies next launch.
+     through a shell, so a path with spaces needs a symlink. `--accept-from <N>` is not
+     decoration: without it a `task` between two sessions of this same node arrives
+     demoted, as `kind=note demoted=task`, which `await inbox` skips by default.
+  5. Arm the instance that is running now. A bridge is launched once per instance, and
+     `[fabric] command` is recorded once, at launch: an instance launched before step 4
+     does not see what step 4 wrote, and a bare `aterm ctl fabric attach` answers
+     `ERR fabric no command` there. So give it the argv — the config string's own words:
+         aterm ctl fabric attach aterm link serve --fleet <F> --broker <sock> \
+             --cap-file <cap> --state <state> --accept-from <N>
+     That arms the supervisor startup would have, now, without the relaunch; the words
+     are split on whitespace like the config string, never through a shell. Bare, the
+     verb re-uses the command the instance WAS launched with — for one that had step 4
+     at launch and whose startup attach was refused. The program is checked before
+     anything is armed (`ERR fabric not executable program=<pct> reason=<token>` arms
+     nothing: fix it and attach again), and the latch is once per process: a second
+     attach is `ERR fabric already supervised`. `aterm ctl fabric status` answers state=
+     supervised= command= — supervised= is the latch `post` reads to say queued=1 rather
+     than no-bridge=1. Owner token only; an edge token and the bridge connection itself
+     are `ERR denied`.
   Off by default, deliberately: no bridge, no bus, no cross-host anything.
 
 BEING WOKEN — WHAT EXISTS, PER AGENT, HONESTLY
@@ -1857,7 +1953,10 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         "new-tab" | "new-window" | "split-pane" => "windowing",
         "settings" => "config",
         // The three words an agent actually types when it has mail.
-        "inbox" | "post" | "mail" => "fabric",
+        // `link` is the VERB that runs the bridge; the fabric page is what a
+        // reader of it needs, and `every_front_door_verb_resolves` requires
+        // every front-door verb to land on a page rather than exit 2.
+        "inbox" | "post" | "mail" | "link" => "fabric",
         other => other,
     });
     match topic {
@@ -2714,6 +2813,37 @@ mod tests {
         assert!(!page.contains("Once per machine"), "{page}");
     }
 
+    /// The `agents` topic names every managed doc `aterm agents install` writes,
+    /// per agent, at the path aterm-primer's `skills_for` actually uses. Until
+    /// 2026-09-10 it listed two of Claude's four skills as the whole set and said
+    /// the other agents "receive the primer alone" — false since the fabric doc
+    /// went to Codex, Gemini CLI and OpenCode as a user command in each one's
+    /// own format.
+    #[test]
+    fn agents_topic_names_every_managed_doc_per_agent() {
+        let (page, code) = render(Some("agents"), None);
+        assert_eq!(code, 0);
+        for needle in [
+            "`drive-aterm`",
+            "`supervise-agent`",
+            "`rust-in-aterm`",
+            "`aterm-fabric`",
+            "~/.claude/skills/<name>/SKILL.md",
+            "~/.codex/prompts/aterm-fabric.md",
+            "~/.gemini/commands/aterm-fabric.toml",
+            "~/.config/opencode/command/aterm-fabric.md",
+        ] {
+            assert!(
+                page.contains(needle),
+                "agents page must name {needle}:\n{page}"
+            );
+        }
+        assert!(
+            !page.contains("only `claude` gets one") && !page.contains("primer alone"),
+            "the Claude-only claim is stale: {page}"
+        );
+    }
+
     /// `aterm help fabric` is the vendor-neutral half of the fabric answer: the
     /// primer paragraph is one sentence per agent, this is the depth, and it must
     /// be reachable under the words an agent actually types when it has mail.
@@ -2741,12 +2871,32 @@ mod tests {
             "aterm-link mirror",
             "outbox.ndjson",
             "[fabric]",
+            // TURNING IT ON names the verbs the one shipped binary carries. Until
+            // 2026-09-10 it sent the operator to build `asb`, astream's separate
+            // CLI, which `aterm link broker` / `aterm link mint` replaced.
+            "aterm link broker <sock> [<log>]",
+            "aterm link mint '<grant>' --secret-file <secret>",
+            // The running-instance path. TURNING IT ON used to end with "this
+            // applies next launch", prescribing the relaunch `fabric attach`
+            // exists to remove; the page must name the verb, its status twin,
+            // and the pre-flight refusal that leaves the slot open.
+            "aterm ctl fabric attach",
+            "aterm ctl fabric status",
+            "ERR fabric not executable",
         ] {
             assert!(
                 page.contains(needle),
                 "the fabric page must name `{needle}`"
             );
         }
+        assert!(
+            !page.contains("asb"),
+            "the fabric page must not send an operator to build astream's `asb`"
+        );
+        assert!(
+            !page.contains("applies next launch"),
+            "the page must not prescribe a relaunch the verb makes unnecessary"
+        );
         // The honesty rows: one agent has a wake path, the others are told so.
         assert!(
             page.contains("aterm-link hook install claude"),
@@ -2765,6 +2915,140 @@ mod tests {
         assert!(
             miss.contains("fabric"),
             "the unknown-topic listing must offer `fabric`"
+        );
+    }
+
+    /// TURNING IT ON names the SHIPPED commands. Since 38f61d5be the broker and
+    /// the mint are `aterm link broker` / `aterm link mint`, inside the one
+    /// binary the updater replaces; the page used to send an operator off to
+    /// build `asb` out of astream — a CLI no release carries — and named no mint
+    /// command at all. It also pins what turning the fabric on end to end
+    /// measured on 2026-09-10: the node id is PROVISIONED into `<state>/node`
+    /// (written, not minted), eight grants go into the cap file, the mint
+    /// secret travels only as `--secret-file`, `--accept-from` is what keeps
+    /// same-node task/control undemoted, and a broker socket path has to fit
+    /// `sun_path`. And its last step is the running-instance path, in the ARGV
+    /// form: `[fabric] command` is recorded once, at launch
+    /// (`fabric_launch::Supervisor::configured`), so the instance an operator
+    /// has open while following the page — launched before step 4 wrote the
+    /// config — answers a bare `fabric attach` with `ERR fabric no command`;
+    /// the page must hand over the argv, and it must be the config string's
+    /// own words. The test joins the `\`-continued lines the way TOML (the
+    /// config) and the shell (the attach) both do and compares the two.
+    #[test]
+    fn fabric_topic_turns_it_on_with_the_shipped_binary() {
+        let (page, _) = render(Some("fabric"), None);
+        let on = page
+            .split("TURNING IT ON")
+            .nth(1)
+            .expect("the fabric page has a TURNING IT ON section");
+        let on = on.split("BEING WOKEN").next().unwrap();
+        for needle in [
+            "aterm link broker <sock>",
+            "aterm link mint '<grant>' --secret-file <secret>",
+            "<state>/node",
+            "provisioned, not minted",
+            "Eight grants",
+            "--accept-from <N>",
+            "demoted=task",
+            "sun_path",
+            "104 bytes",
+            "tools/fabric-enable.sh --enable",
+            // ...which is in the checkout, not the installed binary.
+            "source checkout",
+            "ATERM_FABRIC_COMMAND",
+            // The broker does no peer-uid check; the 0700 directory is the
+            // boundary, and the page must not credit the broker with it.
+            "no peer uid",
+            "aterm ctl fabric attach",
+            "aterm ctl fabric status",
+            // The running-instance step: why bare fails here, and the argv.
+            "recorded once, at launch",
+            "`ERR fabric no command`",
+            "aterm ctl fabric attach aterm link serve --fleet <F> --broker <sock> \\",
+        ] {
+            assert!(
+                on.contains(needle),
+                "TURNING IT ON must name `{needle}`:\n{on}"
+            );
+        }
+        // The hedge that stood here — "on a build with `fabric attach`" — was
+        // wrong on the side where the verb exists: the bare verb does not pick
+        // up a config written after launch.
+        assert!(
+            !on.contains("on a build with"),
+            "no hedging about whether `fabric attach` exists:\n{on}"
+        );
+        // Step 5's argv IS step 4's config string. Join the continued lines the
+        // way both consumers do — the `\`, the newline and the next line's
+        // indent go — then compare the TOML value to the attach's rest-of-line.
+        let flat = {
+            let mut out = String::new();
+            let mut rest = on;
+            while let Some(i) = rest.find("\\\n") {
+                out.push_str(&rest[..i]);
+                rest = rest[i + 2..].trim_start_matches(' ');
+            }
+            out.push_str(rest);
+            out
+        };
+        let config = flat
+            .split("command = \"\"\"")
+            .nth(1)
+            .and_then(|s| s.split("\"\"\"").next())
+            .expect("step 4 shows `command = \"\"\"...\"\"\"`");
+        let attach = flat
+            .split("aterm ctl fabric attach aterm")
+            .nth(1)
+            .and_then(|s| s.lines().next())
+            .map(|s| format!("aterm{s}"))
+            .expect("step 5 shows `aterm ctl fabric attach aterm ...`");
+        assert_eq!(
+            config.trim(),
+            attach.trim(),
+            "the attach argv must be the config string, word for word"
+        );
+        assert!(
+            config.contains("--accept-from <N>") && config.starts_with("aterm link serve "),
+            "{config}"
+        );
+        // Nothing in the page wraps in a 100-column terminal: the widest line
+        // used to be the 116-column config string, which broke copy-paste.
+        for line in page.lines() {
+            assert!(
+                line.chars().count() <= 92,
+                "{} columns is wider than any help page body: {line}",
+                line.chars().count()
+            );
+        }
+        // The eight grants tools/fabric-enable.sh mints, each spelled exactly once.
+        for grant in [
+            "rw,p=<N>:/f/<F>/pub/<N>/>",
+            "ro:/f/<F>/pub/>",
+            "ro:/f/<F>/fleet/>",
+            "rw,p=<N>:/f/<F>/in/*/*/<N>/*",
+            "ro:/f/<F>/in/<N>/>",
+            "rw,p=<N>:/f/<F>/cur/<N>/>",
+            "ro:/f/<F>/term/<N>/>",
+            "rw,p=<N>:/f/<F>/term/<N>/*/screen",
+        ] {
+            assert_eq!(
+                on.matches(grant).count(),
+                1,
+                "the grant `{grant}` must appear exactly once:\n{on}"
+            );
+        }
+        // The stale instructions: a separate CLI nobody ships, and a build step.
+        assert!(
+            !page.contains("asb"),
+            "no `asb` anywhere — the broker is `aterm link broker`:\n{page}"
+        );
+        assert!(!page.contains("Build the bridge"), "{page}");
+        // The secret is a FILE. `--secret <bytes>` on argv would be visible in
+        // `ps` for the life of the call, and the verb does not take it.
+        assert!(
+            !on.contains("--secret "),
+            "the mint secret is only ever `--secret-file`:\n{on}"
         );
     }
 }

@@ -212,7 +212,8 @@ fn ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet(
         (before.col, before.row, before.lift),
         "history removal does not relocate the pet"
     );
-    assert!(world.clear(body(after), 0.10));
+    assert!(world.under_text_clear(body(after), 0.0));
+    assert!(after.under_ink || world.clear(body(after), 0.0));
     assert_ne!(s.brain.console_attention(), PetAttention::Contact);
 }
 

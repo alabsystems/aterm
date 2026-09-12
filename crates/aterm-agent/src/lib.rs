@@ -123,8 +123,10 @@ impl SelfGovernor {
     }
 }
 
-/// The Claude-prompt-ready signal: the bottom rows show the input box (`❯`) with
-/// no in-flight spinner. These patterns are Claude-specific and live ONLY here.
+/// The Claude-prompt-ready signal: an input caret (`❯`) on some row. It is a
+/// row match and says NOTHING about a spinner — the glyph stays on screen while
+/// Claude thinks, which is why [`DRIVE_HELP`] recommends `await gone` on the
+/// busy footer. These patterns are Claude-specific and live ONLY here.
 #[must_use]
 pub fn claude_prompt_ready_pattern() -> &'static str {
     // The input caret at the start of a row; tolerant of the box border glyphs.
@@ -198,8 +200,9 @@ impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
             TurnError::Governed => write!(
                 f,
                 "self-reflection governor refused the write. This session is \
-                 driving ITSELF and the feedback floor tripped or self-writes are \
-                 off. Fix: enable self-writes deliberately (SelfGovernor::\
+                 driving ITSELF and self-writes are off, the write budget (token \
+                 bucket) is spent, or the churn breaker tripped. Fix: enable \
+                 self-writes deliberately (SelfGovernor::\
                  enable_self_write) and pace the loop — act only on a settled turn, \
                  never on every output burst."
             ),
@@ -221,11 +224,14 @@ impl<E: std::fmt::Display> std::fmt::Display for TurnError<E> {
 
 /// The `aterm drive` CLI (binary-era `aterm-drive`), callable in-process.
 pub mod drive_cli;
-/// Re-export so callers can match on a compile failure without depending on
-/// `regex` directly (it is validated through `aterm-observe`).
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
 pub mod fleet_cli;
+/// The supervisor: read-only classification, prompt parsing, the worker's phase,
+/// and the `await-turn` / `supervise` loop behind `aterm drive`.
+pub mod supervise;
 
+/// Re-export so callers can match on a compile failure without depending on
+/// `regex` directly (it is validated through `aterm-observe`).
 pub mod regex_error {
     pub use ::aterm_observe::regex_compile_error::Error;
 }
@@ -284,6 +290,19 @@ impl CtlClient {
 
     /// Run `aterm-ctl [--sock S] <args...>`, returning stdout or a trimmed stderr.
     pub fn run(&self, args: &[&str]) -> Result<String, String> {
+        let reply = self.run_raw(args)?;
+        if reply.code == 0 {
+            Ok(reply.stdout)
+        } else {
+            Err(reply.stderr.trim().to_string())
+        }
+    }
+
+    /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both
+    /// streams — the supervisor loop needs to tell a `124` timeout and an `ERR
+    /// usage` (an older host) apart from a failure. `Err` only when the client
+    /// could not be launched at all.
+    pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
         let mut cmd = std::process::Command::new(&self.ctl);
         if let Some(s) = &self.socket {
             cmd.arg("--sock").arg(s);
@@ -292,11 +311,11 @@ impl CtlClient {
         let out = cmd
             .output()
             .map_err(|e| format!("could not run {}: {e}", self.ctl.display()))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        Ok(supervise::CtlReply {
+            code: out.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
     }
 }
 
@@ -563,6 +582,9 @@ MENTAL MODEL
 USAGE
     aterm-drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX]
                 <command> [text...]
+    aterm-drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
+              | await-turn [@sid] [--timeout MS]
+              | supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -572,15 +594,81 @@ COMMANDS
     await <cond>       Block until a condition, then print the kernel's verdict:
                          idle <ms>        surface unchanged for <ms> (turn done)
                          match <regex>    a visible row matches <regex>
+                         gone <regex>     NO visible row matches <regex> (a busy
+                                          footer such as 'esc to interrupt' left)
                          seq              the next content change lands
                          block            a shell command completes (OSC-133)
-    shot [path]        Save a pixel-true PNG of the terminal content view (the
-                       rendered cells; OS chrome/titlebar are NOT captured).
+    shot [name.png]    Save a pixel-true PNG of the terminal content view (the
+                       rendered cells; OS chrome/titlebar are NOT captured). The
+                       name is a BARE filename: captures land in the host's
+                       Application Support images/ dir (a '/' is refused) and
+                       the reply prints the full written path; auto-named when
+                       omitted.
     help               Show this text.
+
+SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm ctl ls`)
+    classify [--allow-python GLOB]... <cmd...>
+                       Is this shell line READ-ONLY, the way the supervisor judges
+                       it? Prints `read-only` (exit 0) or `not-read-only <reason>`
+                       (exit 1). The flags come first; from the command's first
+                       word on, every word is the command's (`classify git log
+                       --oneline` works unquoted; `--` also ends the flags). Quoted
+                       strings are dropped before the danger scan, every danger
+                       token anywhere fails it (rm mv cp tee … git push/reset/
+                       commit … a redirect to a file, sed -i, python3 -c, sort -o,
+                       uniq IN OUT, find -fprint), and every segment's head must be
+                       a known read-only program — a wrapper is seen through
+                       (`xargs touch`, `env FOO=1 ./x.sh` are touch and x.sh), a
+                       `&` ends a segment like `;`, git needs a read-only
+                       subcommand and form (`git branch NAME` creates), python3
+                       only a script on the --allow-python globs (default
+                       scripts/*standing*.py, scripts/*report*.py,
+                       scripts/*score*.py — all under scripts/; no `..`).
+                       The programs handed to awk and sed are read from the raw
+                       words: `system(`, a redirect or a pipe in awk, a `w`/`e`
+                       command or `s///w` flag in sed, a `-f` program file, all
+                       refuse. A tie breaks toward not-read-only.
+    phase [@sid]       One read, one word: busy | prompt | idle | question. For a
+                       prompt the parsed box follows: `kind`, `command`,
+                       `description`, `classify` (a Bash box), one `option N …`
+                       per option, then `cancel esc` or `cancel none`.
+                       Busy is measured from the spinner row, the `esc to interrupt`
+                       footer, `Still working`, a waiting workflow, or a background
+                       shell still running — in auto mode the footer says nothing,
+                       so the spinner row is the signal.
+    await-turn [@sid] [--timeout MS]
+                       Block until the phase is no longer busy, then print it like
+                       `phase`. The loop is `await idle 2000` → read → `await seq`
+                       (never a sleep); where the host knows `await gone`, the busy
+                       footer LEAVING is the first wait. Exit 124 on --timeout
+                       (default: the global --timeout) with the worker still busy.
+    supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+                       The loop: await-turn; with --auto-reads, a Bash prompt whose
+                       command classifies read-only is approved (option 1, pressed
+                       GUARDED: `key if=Do.you.want.to.proceed 1` on a host that has
+                       it — `OK seq=<n>` is the press, `OK skipped seq=<n>` means
+                       NOTHING was pressed or approved: the box had left (the loop
+                       goes on), or the seq is the screen just parsed and the
+                       guard matched no row (that box is handed to you); a host
+                       without the guard answers a usage line or a bare `ERR` and
+                       the press falls back to read → confirm → press → re-read,
+                       backspacing a digit that landed in the composer; `ERR busy
+                       sink` is retried, any other `ERR` stops the loop), one line
+                       appended to --notes, then `await seq` until the box has LEFT
+                       before the next look (an unchanged screen is never pressed
+                       twice; one that does not move after the press is handed to
+                       you), and the loop continues. The same read coming back
+                       after two approvals is handed over too. ANYTHING ELSE — a
+                       write prompt, a workflow, a question, an idle composer —
+                       prints the compact result (the phase lines, then the prompt
+                       box or the last 28 non-blank rows) and exits 0: that is YOUR
+                       review point. Prints TIMEOUT and exits 124 after --max-s
+                       (default 1800).
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to
-                    $ATERM_CONTROL_SOCK, else the newest local instance.
+                    $ATERM_CONTROL_SOCK, else the instance hosting this
+                    terminal, else the newest local instance.
     --dial NAME     Drive a REMOTE aterm: relay to the saved connection NAME via the
                     local host's `dial` verb, then run `prompt` there — byte-identical
                     to a local turn, with predicates evaluated on the remote host. The
@@ -588,7 +676,8 @@ OPTIONS
                     $ATERM_CONTROL_TOKEN. Example: aterm-drive --dial work prompt '...'
     --idle MS       Quiescence window that counts as 'turn complete' (default 600).
                     Bigger = more certain the turn ended; smaller = snappier.
-    --timeout MS    Give up after this long (default 180000).
+    --timeout MS    Give up after this long (default 180000; the host caps any
+                    single await at 600000, so larger values end there).
     --ready REGEX   The prompt-ready row pattern for the BEST-EFFORT settle confirm
                     after idle. Default matches a Claude input caret, which is only
                     right when the driven program IS Claude — point it at your own
@@ -597,8 +686,16 @@ OPTIONS
                     costs a bounded extra wait, never a failed turn.
 
 WHICH `await` TO USE
-    * Driving Claude / a TUI with an animated spinner → `prompt` (idle works: the
-      spinner keeps the screen changing until the turn ends).
+    * A TUI with an animated spinner → `prompt` (idle works: the spinner keeps the
+      screen changing until the turn ends).
+    * Driving Claude Code / an agent whose screen sits STATIC for seconds mid-turn
+      (its prompt glyph stays on screen while it thinks, so matching it returns
+      mid-turn too) → `prompt` can settle early; the signal that holds is its busy
+      footer LEAVING: `await gone esc.to.interrupt` right after the prompt,
+      while the footer is up (gone is level-triggered: a footer that is already
+      absent answers at once). A regex is ONE whitespace-free token — the wire
+      joins argv with spaces and never quotes, so a quoted 'esc to interrupt'
+      arrives as three words and arms `esc` alone.
     * A command that pauses SILENTLY mid-run (e.g. `sleep`) → don't trust idle
       alone; use `await match <regex>` on a known output marker instead.
     * A plain shell command → `await block` (waits for the command to finish).
@@ -607,9 +704,19 @@ EXAMPLES
     # one driven turn against Claude Code:
     aterm-drive prompt 'Refactor utils.rs to drop the unwrap() calls.'
     # wait for a specific marker rather than idle:
-    aterm-drive await match 'BUILD SUCCESSFUL'
-    # capture the terminal content as rendered pixels:
-    aterm-drive shot /tmp/screen.png
+    aterm-drive await match BUILD.SUCCESSFUL
+    # the turn is over when Claude Code's busy footer leaves the screen:
+    aterm-drive await gone esc.to.interrupt
+    # capture the terminal content as rendered pixels (the reply names the path):
+    aterm-drive shot screen.png
+    # is this line a read? (exit 0/1; the reason names the rule)
+    aterm-drive classify 'git status --short && git pull | tail'
+    # what is the worker doing right now?
+    aterm-drive phase @s-1e918c46
+    # block until its turn ends (or 10 min), then say what it needs:
+    aterm-drive await-turn @s-1e918c46 --timeout 600000
+    # keep it moving through its reads; stop at the first thing that needs you:
+    aterm-drive supervise @s-1e918c46 --auto-reads --max-s 1800 --notes notes.txt
 
 GOTCHA
     Submit with a real Enter keypress (this tool uses `key enter`), never a raw

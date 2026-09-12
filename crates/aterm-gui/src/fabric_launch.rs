@@ -63,6 +63,7 @@
 //! the supervisor's opinion.
 
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The env override for `[fabric] command`. Precedence is env > config, the same
@@ -110,32 +111,237 @@ pub(crate) fn configured_command(config: &crate::app_config::Config) -> Option<V
     (!argv.is_empty()).then_some(argv)
 }
 
+/// THE SUPERVISOR RECORD — one per process, and its `armed` half is ONE-WAY.
+///
+/// scope-waiver: the phrase describes the `static SUPERVISOR` below, and a
+/// `static` is one per process by the language rather than by a discipline an
+/// instance count could check — there is no field whose replication would
+/// falsify it. The half that IS falsifiable is behavioural (one supervisor
+/// THREAD, not one record) and it is enforced in code, not in this prose:
+/// [`arm`] checks `armed` and sets it under ONE hold of that static's lock,
+/// and `supervisor` is registered in the lock-order census's `GUARD_HELPERS`
+/// so its callers' invisible holds are placed in the graph.
+///
+/// [`supervise`] loops forever with no stop handle, so a second supervisor would
+/// be a second relaunch loop over the same instance: two bridge children racing
+/// to be served against one `BRIDGE_CONTEXT`, each one's exit halting every
+/// session the other governed, and no way to take either back. [`arm`] therefore
+/// checks and sets under ONE lock, and `fabric attach` on an armed instance is
+/// refused rather than stacked.
+///
+/// `configured` is what the instance was LAUNCHED with — `[fabric] command` or
+/// `$ATERM_FABRIC_COMMAND` as [`spawn_supervisor`] read them at startup —
+/// recorded so a bare `fabric attach` and `fabric status` can name it without
+/// the control thread re-reading the config file (the process-wide config
+/// service owns that read; see the note on `control::spawn`'s `network_config`).
+/// A command added to the config AFTER launch is therefore not seen here: the
+/// verb takes it as `fabric attach <argv...>`, which is the case the verb exists
+/// for.
+struct Supervisor {
+    /// The argv the supervisor thread was armed with — `Some` exactly once per
+    /// process, and never `None` again.
+    armed: Option<Vec<String>>,
+    /// The command the instance was launched with, if any.
+    configured: Option<Vec<String>>,
+}
+
+static SUPERVISOR: Mutex<Supervisor> = Mutex::new(Supervisor {
+    armed: None,
+    configured: None,
+});
+
+fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {
+    SUPERVISOR.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Why [`arm`] did not start a supervisor.
+#[derive(Debug)]
+pub(crate) enum ArmError {
+    /// The argv was empty. Nothing is armed.
+    NoCommand,
+    /// `argv[0]` cannot be executed — see [`preflight`] for `reason`. Refused
+    /// BEFORE the latch closes: nothing is armed, and an `attach` with the
+    /// corrected command is allowed.
+    NotExecutable {
+        program: String,
+        reason: &'static str,
+    },
+    /// One is already running, with THIS argv. The request's argv was NOT
+    /// applied — the latch is one-way, which is the whole reason this is an
+    /// error and not an `OK already`: a caller who passed a different command
+    /// must learn that it did not take.
+    AlreadySupervised(Vec<String>),
+    /// The thread could not be spawned. Nothing is armed; a retry is allowed.
+    Thread(std::io::Error),
+}
+
+/// What `fabric status` reports about the supervisor: the argv it runs when one
+/// is armed, and the command the instance was launched with.
+pub(crate) struct SupervisorStatus {
+    pub(crate) armed: Option<Vec<String>>,
+    pub(crate) configured: Option<Vec<String>>,
+}
+
+/// A snapshot of the [`Supervisor`] record.
+pub(crate) fn status() -> SupervisorStatus {
+    let g = supervisor();
+    SupervisorStatus {
+        armed: g.armed.clone(),
+        configured: g.configured.clone(),
+    }
+}
+
 /// Launch and SUPERVISE the bridge, if one is configured. Returns whether a
 /// supervisor thread started — `false` means the fabric is off or a thread could
 /// not be spawned, never a half-attached bridge.
 ///
 /// Called once, from the control server, after the socket is bound and
 /// `BRIDGE_CONTEXT` is published: a bridge that attached earlier would find a
-/// half-built process.
+/// half-built process. It is ALSO the one place the configured command is
+/// recorded for `fabric status` and a bare `fabric attach` — so an instance
+/// launched with no `[fabric] command` records `None`, which is what a later
+/// bare `attach` answers `ERR fabric no command` from.
 pub(crate) fn spawn_supervisor(config: &crate::app_config::Config) -> bool {
-    let Some(argv) = configured_command(config) else {
+    let configured = configured_command(config);
+    supervisor().configured = configured.clone();
+    let Some(argv) = configured else {
         return false;
     };
-    let started = std::thread::Builder::new()
-        .name("aterm-fabric-launch".to_string())
-        .spawn(move || supervise(&argv))
-        .is_ok();
-    if started {
-        // TELL THE ENDPOINT A BRIDGE IS COMING. `fabric=absent` means both "the
-        // first bridge has not attached yet" and "no bridge will ever attach",
-        // and a `post --wait` parked in those two states is owed opposite advice:
-        // wait, versus stop waiting — this instance has no fabric. Recorded here
-        // rather than inferred from the config at the far end, because THIS is
-        // the one place that knows a supervisor really started (a config with a
-        // `[fabric] command` whose thread failed to spawn is the `false` case).
-        crate::fabric::note_bridge_supervised();
+    match arm(argv) {
+        Ok(()) => true,
+        // Startup runs once and before the socket serves a request, so this arm
+        // cannot lose to a `fabric attach`; if it ever did, a supervisor IS
+        // running, which is what the `bool` answers.
+        Err(ArmError::AlreadySupervised(_)) => true,
+        // The configured command cannot run. It stays RECORDED (`fabric status`
+        // names it; a bare `fabric attach` re-tries it), it is NOT armed — the
+        // supervisor used to retry a typo for ever from here — and the latch
+        // stays open, so `fabric attach <corrected...>` is the remedy, not a
+        // relaunch.
+        Err(ArmError::NotExecutable { program, reason }) => {
+            aterm_log::warn!(
+                "fabric bridge supervisor not started: `{program}` is {reason}; \
+                 `aterm ctl fabric attach <command...>` arms it once the command is fixed"
+            );
+            false
+        }
+        Err(e) => {
+            aterm_log::warn!("fabric bridge supervisor could not start: {e:?}");
+            false
+        }
     }
-    started
+}
+
+/// Arm the supervisor with `argv` — the ONE seam that starts a `supervise`
+/// thread, shared by the startup path ([`spawn_supervisor`]) and the running
+/// instance's `fabric attach`. Exactly once per process: the check and the set
+/// happen under the record's lock, so two concurrent attaches cannot both
+/// spawn.
+///
+/// `argv` is executed directly, never through a shell — the caller has already
+/// split it on whitespace exactly as [`configured_command`] splits the config
+/// string, so a metacharacter is one more argument and not a second command.
+pub(crate) fn arm(argv: Vec<String>) -> Result<(), ArmError> {
+    if argv.is_empty() {
+        return Err(ArmError::NoCommand);
+    }
+    let mut guard = supervisor();
+    if let Some(running) = &guard.armed {
+        return Err(ArmError::AlreadySupervised(running.clone()));
+    }
+    // BEFORE THE LATCH CLOSES, and under its lock so the check-and-set stays
+    // one step: a program that cannot run arms nothing, and the slot stays
+    // open for the corrected command. (After the `armed` check on purpose: a
+    // caller on an armed instance is owed "already supervised", the answer to
+    // what it asked, whatever it typed.)
+    if let Err(reason) = preflight(&argv[0], std::env::var_os("PATH").as_deref()) {
+        return Err(ArmError::NotExecutable {
+            program: argv[0].clone(),
+            reason,
+        });
+    }
+    let thread_argv = argv.clone();
+    std::thread::Builder::new()
+        .name("aterm-fabric-launch".to_string())
+        .spawn(move || supervise(&thread_argv))
+        .map_err(ArmError::Thread)?;
+    guard.armed = Some(argv);
+    // TELL THE ENDPOINT A BRIDGE IS COMING. `fabric=absent` means both "the
+    // first bridge has not attached yet" and "no bridge will ever attach",
+    // and a `post --wait` parked in those two states is owed opposite advice:
+    // wait, versus stop waiting — this instance has no fabric. Recorded here
+    // rather than inferred from the config at the far end, because THIS is
+    // the one place that knows a supervisor really started (a config with a
+    // `[fabric] command` whose thread failed to spawn is the `Err` case), and
+    // it is the same place for `fabric attach` as for startup, so the two
+    // cannot flip the latch at different moments.
+    crate::fabric::note_bridge_supervised();
+    Ok(())
+}
+
+/// PRE-FLIGHT: whether `argv[0]` can be executed at all, checked BEFORE the
+/// one-way latch closes. `Err` is the `reason=` token the verb reports.
+///
+/// Measured before this existed: `fabric attach /typo` answered `OK attached`,
+/// the supervisor retried the bad argv for ever (back-off to [`RELAUNCH_MAX`]),
+/// and the instance's only attach slot was wedged for its lifetime — the one
+/// remedy being the relaunch the verb exists to avoid. The same typo in
+/// `[fabric] command` did the same from startup.
+///
+/// The name is resolved the way `Command::spawn` will resolve it: a word with a
+/// `/` is a path (relative to this process's cwd, which the child inherits); a
+/// bare word is searched on `PATH` — THIS process's `PATH`, which is the child's
+/// too, since [`filter_child_env`] passes it through — the way `execvp` searches
+/// it, so a candidate that exists but is not executable is skipped, not
+/// reported, and an unset `PATH` falls back to `execvp`'s own default. What is
+/// checked is exactly what a spawn refuses synchronously: existence (`ENOENT`),
+/// and the execute bit on a regular file (`EACCES`). A program that passes and
+/// still fails to start — a script whose interpreter is missing, an ACL the mode
+/// bits do not show — is the supervisor's to retry, logged, which is what every
+/// attach did before this check; a program this refuses is one no retry would
+/// ever have started.
+///
+/// Pure over `(program, path)` so the resolution is tested without mutating the
+/// process environment.
+fn preflight(program: &str, path: Option<&std::ffi::OsStr>) -> Result<(), &'static str> {
+    if program.contains('/') {
+        return match std::fs::metadata(program) {
+            Err(_) => Err("not-found"),
+            Ok(md) if !md.is_file() => Err("not-a-file"),
+            Ok(md) if !is_executable(&md) => Err("no-exec-bit"),
+            Ok(_) => Ok(()),
+        };
+    }
+    // `_PATH_DEFPATH`: what `execvp` searches when `PATH` is unset. macOS spells
+    // it `/usr/bin:/bin`, glibc `/bin:/usr/bin`; the same two directories.
+    let default = std::ffi::OsStr::new("/usr/bin:/bin");
+    let found = std::env::split_paths(path.unwrap_or(default)).any(|dir| {
+        std::fs::metadata(dir.join(program)).is_ok_and(|md| md.is_file() && is_executable(&md))
+    });
+    if found { Ok(()) } else { Err("not-on-path") }
+}
+
+/// Any execute bit. What `execve` requires of the mode; the uid-specific
+/// refinement (`access(2)`) is deliberately not attempted here — a wrong pass
+/// falls back to the supervisor's logged retry, a wrong refusal would block a
+/// program that runs.
+fn is_executable(md: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o111 != 0
+}
+
+/// Clear the record so a test section starts from "nothing armed, nothing
+/// configured". Called from `fabric::with_link_reset`, which serializes every
+/// test that touches the process-wide link — the `armed` half is a one-way
+/// latch in production and only a test may re-open it. A supervisor thread a
+/// previous section armed keeps running; it cannot reach the link (no
+/// `BRIDGE_CONTEXT` is published in a test process, so `attach_fabric_bridge`
+/// serves nothing), it only retries its argv with the back-off above.
+#[cfg(test)]
+pub(crate) fn reset_for_tests() {
+    let mut g = supervisor();
+    g.armed = None;
+    g.configured = None;
 }
 
 /// Launch, wait, back off, launch again — forever, because the fabric is a
@@ -268,6 +474,78 @@ mod tests {
             }),
             ..Config::default()
         }
+    }
+
+    /// A tiny real bridge: a program that exits at once. Enough to pass the
+    /// pre-flight and prove a supervisor thread started; the thread outlives
+    /// the test and only re-spawns `true` under the back-off.
+    fn true_program() -> String {
+        ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("a `true` binary")
+            .to_string()
+    }
+
+    /// THE PRE-FLIGHT RESOLVES `argv[0]` THE WAY THE SPAWN WILL. A path is a
+    /// path; a bare name walks `PATH` like `execvp` — a directory that holds a
+    /// non-executable file of that name is skipped, not reported — and an unset
+    /// `PATH` is the libc default, not "nowhere". Pure over the `PATH` value,
+    /// so nothing here touches the process environment.
+    #[test]
+    fn the_pre_flight_resolves_argv0_the_way_spawn_will() {
+        use std::ffi::OsStr;
+        let truth = true_program();
+        let bin_dir = std::path::Path::new(&truth).parent().unwrap();
+
+        assert_eq!(preflight(&truth, None), Ok(()));
+        assert_eq!(preflight("/nonexistent/aterm-link", None), Err("not-found"));
+        assert_eq!(
+            preflight(bin_dir.to_str().unwrap(), None),
+            Err("not-a-file")
+        );
+
+        // A bare name: found on the given PATH, not found on a PATH without it,
+        // and found on the default when PATH is unset (`true` lives there).
+        assert_eq!(
+            preflight("true", Some(OsStr::new("/nonexistent:/usr/bin:/bin"))),
+            Ok(())
+        );
+        assert_eq!(
+            preflight("true", Some(OsStr::new("/nonexistent"))),
+            Err("not-on-path")
+        );
+        assert_eq!(preflight("true", None), Ok(()));
+
+        // execvp semantics: the first PATH entry holds a `true` that is NOT
+        // executable; the search moves on to the one that is.
+        let dir = std::env::temp_dir().join(format!("aterm-fabric-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("true"), b"not a program\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("true"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .unwrap();
+        let mut path = dir.clone().into_os_string();
+        path.push(":");
+        path.push(bin_dir.as_os_str());
+        assert_eq!(
+            preflight("true", Some(&path)),
+            Ok(()),
+            "a non-executable candidate is skipped"
+        );
+        assert_eq!(
+            preflight("true", Some(dir.as_os_str())),
+            Err("not-on-path"),
+            "and alone it is no match at all"
+        );
+        assert_eq!(
+            preflight(dir.join("true").to_str().unwrap(), None),
+            Err("no-exec-bit"),
+            "named by path, the same file is refused for its mode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DEFAULT OFF. An instance with no `[fabric]` table and no env var launches
@@ -504,5 +782,159 @@ use std::process::",
             !aterm_types::domain::is_ai_env_var("ATERM_LINK_FAULT"),
             "the e2e harness relies on the child inheriting this"
         );
+    }
+
+    /// THE SUPERVISOR IS ARMED ONCE PER PROCESS, AND THE LATCH IS ONE-WAY.
+    ///
+    /// `supervise` loops forever with no stop handle, so a second `arm` would be
+    /// a second relaunch loop over the same instance. The check-and-set is under
+    /// one lock, the endpoint's `supervised` latch flips at the same moment, and
+    /// an empty argv arms nothing — `launch_once` indexes `argv[0]`, and a
+    /// thread panicking on it would have "armed" a supervisor that runs nothing.
+    ///
+    /// The argv names a program that does not exist, ON PURPOSE: `Command::spawn`
+    /// fails at once, so the thread this leaks into the test process spawns no
+    /// child and only sleeps out its back-off (to the 30 s ceiling).
+    #[test]
+    fn the_supervisor_arms_once_and_records_what_it_runs() {
+        crate::fabric::with_link_reset(|| {
+            let fresh = status();
+            assert!(fresh.armed.is_none() && fresh.configured.is_none());
+            assert!(!crate::fabric::bridge_supervised());
+            assert!(matches!(arm(Vec::new()), Err(ArmError::NoCommand)));
+            assert!(
+                !crate::fabric::bridge_supervised(),
+                "an empty argv must not flip the endpoint's latch"
+            );
+
+            // THE PRE-FLIGHT: a program that cannot run is refused BEFORE the
+            // latch closes — nothing armed, nothing flipped — so the slot is
+            // not wedged by a typo. Measured before it existed: `/nonexistent`
+            // was `Ok`, and the only remedy was a relaunch.
+            for (argv0, reason) in [
+                ("/nonexistent/aterm-link", "not-found"),
+                ("/", "not-a-file"),
+                ("aterm-link-no-such-program-4f2c", "not-on-path"),
+            ] {
+                match arm(vec![argv0.to_string(), "serve".to_string()]) {
+                    Err(ArmError::NotExecutable {
+                        program,
+                        reason: got,
+                    }) => {
+                        assert_eq!(program, argv0);
+                        assert_eq!(got, reason, "{argv0}");
+                    }
+                    other => panic!("{argv0} must be refused as not executable: {other:?}"),
+                }
+                assert!(status().armed.is_none(), "{argv0} must arm nothing");
+                assert!(
+                    !crate::fabric::bridge_supervised(),
+                    "{argv0} must not flip the endpoint's latch"
+                );
+            }
+            // A regular file with no execute bit — the shape a path to a config
+            // file, or a script never `chmod +x`ed, hits.
+            let dir =
+                std::env::temp_dir().join(format!("aterm-fabric-preflight-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let plain = dir.join("not-a-program");
+            std::fs::write(&plain, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(
+                &plain,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+            )
+            .unwrap();
+            let plain_str = plain.to_string_lossy().into_owned();
+            assert!(matches!(
+                arm(vec![plain_str.clone()]),
+                Err(ArmError::NotExecutable {
+                    reason: "no-exec-bit",
+                    ..
+                })
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(status().armed.is_none() && !crate::fabric::bridge_supervised());
+
+            // AND THE SLOT IS STILL OPEN: the corrected command arms.
+            let argv = vec![true_program(), "serve".to_string()];
+            assert!(
+                arm(argv.clone()).is_ok(),
+                "the refused attempts left the latch open"
+            );
+            assert!(crate::fabric::bridge_supervised(), "arming IS the latch");
+            assert_eq!(status().armed.as_deref(), Some(argv.as_slice()));
+
+            // The second arm is refused and names what is running — the
+            // request's argv did NOT take, and a caller must be told so. The
+            // latch check comes BEFORE the pre-flight (this argv would fail
+            // it): "already supervised" is the answer to what was asked.
+            let second = vec!["/nonexistent/other".to_string()];
+            match arm(second) {
+                Err(ArmError::AlreadySupervised(running)) => assert_eq!(running, argv),
+                other => panic!("a second arm must be refused: {other:?}"),
+            }
+            assert_eq!(
+                status().armed.as_deref(),
+                Some(argv.as_slice()),
+                "the first argv stays"
+            );
+        });
+    }
+
+    /// THE STARTUP PATH RECORDS THE CONFIGURED COMMAND EVEN WHEN IT ARMS NOTHING.
+    ///
+    /// `fabric status` and a bare `fabric attach` read it, and an instance
+    /// launched with no `[fabric] command` must record `None` — that is the
+    /// `ERR fabric no command` a later bare attach answers from — while one
+    /// launched WITH a command records it and arms through the same seam the
+    /// verb uses, so the two cannot flip the endpoint's latch at different
+    /// moments.
+    #[test]
+    fn the_startup_path_records_the_configured_command_and_arms_through_the_one_seam() {
+        aterm_log::env::scoped_unset(FABRIC_COMMAND_ENV, || {
+            crate::fabric::with_link_reset(|| {
+                assert!(!spawn_supervisor(&Config::default()));
+                let s = status();
+                assert!(s.armed.is_none() && s.configured.is_none());
+                assert!(!crate::fabric::bridge_supervised());
+            });
+            // A configured command that cannot run: RECORDED — `fabric status`
+            // names it and a bare `attach` re-tries it — but NOT armed, where the
+            // supervisor used to retry the typo for ever, and the latch says so
+            // (`post` answers `no-bridge=1`, which is the truth).
+            crate::fabric::with_link_reset(|| {
+                assert!(!spawn_supervisor(&with_command(Some(
+                    "/nonexistent/aterm-link serve --fleet lab"
+                ))));
+                let s = status();
+                assert_eq!(
+                    s.configured,
+                    Some(vec![
+                        "/nonexistent/aterm-link".to_string(),
+                        "serve".to_string(),
+                        "--fleet".to_string(),
+                        "lab".to_string(),
+                    ])
+                );
+                assert!(s.armed.is_none(), "a command that cannot run arms nothing");
+                assert!(!crate::fabric::bridge_supervised());
+            });
+            crate::fabric::with_link_reset(|| {
+                let program = true_program();
+                assert!(spawn_supervisor(&with_command(Some(&format!(
+                    "{program} serve --fleet lab"
+                )))));
+                let want = vec![
+                    program,
+                    "serve".to_string(),
+                    "--fleet".to_string(),
+                    "lab".to_string(),
+                ];
+                let s = status();
+                assert_eq!(s.configured, Some(want.clone()));
+                assert_eq!(s.armed, Some(want));
+                assert!(crate::fabric::bridge_supervised());
+            });
+        });
     }
 }

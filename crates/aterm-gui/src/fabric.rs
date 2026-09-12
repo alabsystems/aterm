@@ -21,15 +21,31 @@
 //! * `LINK` — the INSTANCE's view of its bridge: connected, disconnected, or
 //!   never launched, plus the set of sessions that bridge has ever touched.
 //!
-//! ## Why the two bridge verbs are not Owner verbs
+//! ## Why `deliver` is not an Owner verb, and which half of `hold` is
 //!
 //! `deliver` stamps `from=` and `trust=` on a row an agent reads as an attested
-//! human order; `hold` lifts a fleet halt. Owner scope is what every in-session
-//! client already holds (`aterm-ctl @self` is Owner), so an Owner classification
-//! would put both inside the blast radius of one prompt injection. They are
+//! human order. Owner scope is what every in-session client already holds
+//! (`aterm-ctl @self` is Owner), so an Owner classification would put it inside
+//! the blast radius of one prompt injection. It is
 //! [`aterm_types::control_verbs::Access::BridgeOnly`] instead: the only caller is
 //! the connection the instance handed its own child, and there is no token that
 //! opens it. See `Scope::Bridge`.
+//!
+//! `hold` has TWO ORIGINS and the connection chooses ([`HoldIssuer`]). The
+//! FLEET hold (`origin=fleet`) is the bridge's: set, replaced or lifted only
+//! from the bridge connection, for the reason above — a fleet halt an injected
+//! agent could lift locally would be no halt at all. The LOCAL hold
+//! (`origin=local`) is the instance Owner's: the Owner token is the local
+//! human's own credential, `hold=1` was always described as a human's halt, and
+//! a human at the glass who cannot stop the drivers on their own machine has
+//! been given less than the fleet has. So `hold` is `Access::OwnerOnly` and
+//! [`cmd_hold`] refuses an Owner-issued act, `on` or `off`, against a standing
+//! fleet hold, and refuses `origin=fleet` from Owner outright. The check runs
+//! under the fabric lock ([`apply_hold`]), so a fleet hold landing between an
+//! Owner's read and its write is still the one that stands. And the local hold
+//! is the owner's STOP SIGNAL, not a containment stop: Owner is the scope every
+//! in-session client holds, so the halted session's own agent can lift it —
+//! which is exactly why the fleet hold is a different origin it cannot touch.
 //!
 //! ## Fail closed on a dead bridge
 //!
@@ -39,16 +55,17 @@
 //! session that bridge ever delivered to or held. Killing the bridge therefore
 //! HALTS the sessions it was governing; it does not free them.
 //!
-//! THE ONLY LIFT IS A RECONNECTING BRIDGE, and that is a narrower promise than
-//! this header used to make. [`apply_hold`] has exactly two production callers —
-//! [`cmd_hold`], which is `Access::BridgeOnly`, and [`bridge_lost`] — and there
-//! is no menu item, key binding, palette action, Owner verb or config path that
-//! clears a hold. DESIGN §11.2 and an earlier version of this header both said
-//! "a human lifts it at the GUI"; no such path exists, so the sentence is
-//! WITHDRAWN rather than left standing as a promise the code does not keep. An
-//! operator whose bridge cannot come back (a deleted cap file, a `[fabric]
-//! command` that exits at startup) has exactly one recovery, and it is
-//! restarting `aterm-gui`. That is a real gap, recorded as one: building the
+//! THE ONLY LIFT OF A FLEET HOLD IS A RECONNECTING BRIDGE, and that is a
+//! narrower promise than this header used to make. [`apply_hold`] has exactly
+//! two production callers — [`cmd_hold`] and [`bridge_lost`] — and there is no
+//! menu item, key binding, palette action or config path that clears a hold. The
+//! Owner token's `hold off` lifts a LOCAL hold and nothing else: against
+//! `origin=fleet` it is `ERR denied`. DESIGN §11.2 and an earlier version of
+//! this header both said "a human lifts it at the GUI"; no such path exists, so
+//! the sentence is WITHDRAWN rather than left standing as a promise the code
+//! does not keep. An operator whose bridge cannot come back (a deleted cap file,
+//! a `[fabric] command` that exits at startup) has exactly one recovery, and it
+//! is restarting `aterm-gui`. That is a real gap, recorded as one: building the
 //! lift is a change to the GUI modules, not to this one.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -341,7 +358,10 @@ pub(crate) struct PostRow {
 pub(crate) struct Hold {
     /// Pct-encoded reason, or `-`.
     pub reason: String,
-    /// `fleet` (a human's halt, or a lost bridge) or `local`.
+    /// `fleet` (a human's halt through the bridge, or a lost bridge) or `local`
+    /// (the instance Owner's own halt, over the local control socket). The origin
+    /// is what [`cmd_hold`] gates an Owner-issued act on: a `fleet` hold is not
+    /// the owner's to replace or lift.
     pub origin: String,
 }
 
@@ -513,6 +533,29 @@ impl SessionFabric {
     pub(crate) fn hold(&self) -> Option<Hold> {
         self.lock().hold.clone()
     }
+
+    /// **THE ROOM'S READ** (the resident pet, `kitty_pet` panel #9(e)) —
+    /// `(unseen, overdue, hold)`: the newest row above the HANDLED watermark
+    /// by id (`0` when every row is handled), whether any such row's advisory
+    /// deadline has passed (`dl=` is milliseconds from the row's arrival
+    /// `t_ms`, on [`now_ms`]'s clock — advisory, so a passed one is a fact
+    /// about the mail, never a verdict on anyone), and whether a hold stands.
+    /// A short leaf-lock read with no allocation, taken by the render thread
+    /// on frames it already draws; the ring is bounded by [`RING_CAP`], so
+    /// the scan is too.
+    pub(crate) fn room_facts(&self, now_ms: u64) -> (u64, bool, bool) {
+        let inbox = self.lock();
+        let seen = inbox.seen;
+        let unseen = inbox
+            .rows
+            .back()
+            .map_or(0, |r| if r.id > seen { r.id } else { 0 });
+        let overdue = inbox
+            .rows
+            .iter()
+            .any(|r| r.id > seen && r.dl.is_some_and(|dl| now_ms > r.t_ms.saturating_add(dl)));
+        (unseen, overdue, inbox.hold.is_some())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -539,8 +582,9 @@ struct FabricLink {
     /// window this field exists to close.
     generation: Mutex<u64>,
     /// Sids the bridge has delivered to or held. This is the set [`bridge_lost`]
-    /// halts, and it grows only through the `BridgeOnly` verbs, so a session the
-    /// bridge never governed is never halted by its death.
+    /// halts, and it grows only through BRIDGE-issued verbs (`deliver`, `outbox
+    /// sent`, and a `hold` from the bridge connection — never an Owner's local
+    /// one), so a session the bridge never governed is never halted by its death.
     ///
     /// A `BTreeSet` AND PRUNED, because neither half of the old justification
     /// held. It was a `Vec` scanned linearly, argued as "a handful of sids on a
@@ -668,6 +712,14 @@ pub(crate) fn note_bridge_supervised() {
     LINK.supervised.store(true, Ordering::Relaxed);
 }
 
+/// Whether a bridge SUPERVISOR is running in this process — the latch
+/// [`note_bridge_supervised`] sets, read back for `fabric status`'s
+/// `supervised=` token. This is the SAME bit [`fabric_wait_refusal`] reads, so
+/// `supervised=1` and `post`'s `queued=1` cannot disagree.
+pub(crate) fn bridge_supervised() -> bool {
+    LINK.supervised.load(Ordering::Relaxed)
+}
+
 /// Whether any bridge can EVER attach to this instance: a supervisor is running,
 /// or one already has and the link is merely down.
 fn bridge_reachable() -> bool {
@@ -717,10 +769,13 @@ pub(crate) fn bridge_attached(generation: BridgeGeneration) {
 /// Record that the bridge has governed this session — the membership test
 /// [`bridge_lost`] halts on.
 ///
-/// THREE CALL SITES, ACROSS FOUR `BridgeOnly` VERBS: `deliver` (both forms),
-/// `hold` and `outbox sent`. `outbox` is deliberately NOT one — a PEEK governs
-/// nothing, and a bridge that only ever read a session's queue has not taken
-/// responsibility for halting it.
+/// THREE CALL SITES: `deliver` (both forms), the BRIDGE-issued `hold`, and
+/// `outbox sent`. `outbox` is deliberately NOT one — a PEEK governs nothing,
+/// and a bridge that only ever read a session's queue has not taken
+/// responsibility for halting it. An OWNER-issued `hold` is deliberately not one
+/// either: the local owner halting its own drivers says nothing about the
+/// bridge, and recording it here would let a bridge's later death halt a
+/// session that bridge never touched, on the strength of an act it never made.
 ///
 /// PRUNES ITSELF. Past [`TOUCHED_PRUNE_AT`] entries the set is intersected with
 /// the live registry, so sids whose sessions have exited stop being carried for
@@ -823,6 +878,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
                     reason: "fabric-lost".to_string(),
                     origin: "fleet".to_string(),
                 }),
+                HoldIssuer::Bridge,
             );
             held += 1;
         }
@@ -1195,12 +1251,55 @@ fn reason_token(raw: &str) -> String {
 
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
 
+/// The refusal an Owner-issued `hold` gets for a fleet-origin act: the same
+/// `ERR denied` every scope gate answers, so a caller learns nothing it could
+/// not learn from `status hold=`. Named so the dispatch can audit-log exactly
+/// this refusal without matching prose.
+pub(crate) const HOLD_DENIED: &str = "ERR denied\n";
+
+/// Who is issuing a `hold` — the whole of what the two owner-class scopes that
+/// may run it differ in. The dispatch maps `Scope::Bridge` to [`Self::Bridge`]
+/// and `Scope::Owner` to [`Self::Owner`]; an edge token never reaches the
+/// handler — `dispatch_hold_verb` refuses it first, audit-logged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HoldIssuer {
+    /// The inherited bridge connection: the fleet's hand. `origin=fleet` by
+    /// default, either origin accepted, and `off` lifts whatever stands — the
+    /// rule the code had before the local halt, kept as it was.
+    Bridge,
+    /// The instance Owner token over the local control socket: `origin=local`
+    /// only, and no act at all — `on` or `off` — against a standing fleet hold.
+    Owner,
+}
+
+/// What [`apply_hold`] did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Applied {
+    /// The hold flag or its record moved, and the event was recorded.
+    Changed,
+    /// The requested state already stood; nothing recorded.
+    Unchanged,
+    /// An Owner-issued act met a standing `origin=fleet` hold and was refused
+    /// without touching it. Never answered to [`HoldIssuer::Bridge`].
+    FleetHeld,
+}
+
 /// Apply (or lift) a hold and record the transition. Records the timeline event
 /// WHILE holding the fabric guard — the sanctioned fabric → timeline nesting —
 /// so a watcher's `EVENT hold` order can never invert against the stored flag.
 /// Signals the condvar so a parked `await inbox … kinds=hold` wakes at once.
-fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>) -> bool {
+///
+/// THE FLEET FENCE IS DECIDED UNDER THE SAME LOCK. An Owner-issued act is
+/// refused while a fleet hold stands, and the standing hold is read inside the
+/// guard the write takes, so a `hold on origin=fleet` from the bridge that lands
+/// between an Owner's check and its write cannot be replaced or lifted by that
+/// write: whichever hold is there when the guard is taken is the one the rule
+/// sees.
+fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>, issuer: HoldIssuer) -> Applied {
     let mut inbox = ctx.fabric.lock();
+    if issuer == HoldIssuer::Owner && inbox.hold.as_ref().is_some_and(|h| h.origin != "local") {
+        return Applied::FleetHeld;
+    }
     let changed = inbox.hold != hold;
     if changed {
         let (flag, reason, origin) = match &hold {
@@ -1216,8 +1315,10 @@ fn apply_hold(ctx: &SessionCtx, hold: Option<Hold>) -> bool {
     drop(inbox);
     if changed {
         ctx.fabric.changed.notify_all();
+        Applied::Changed
+    } else {
+        Applied::Unchanged
     }
-    changed
 }
 
 /// Run `f` with the process-wide bridge link RESET to "never launched", and reset
@@ -1240,6 +1341,11 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // The launcher's supervisor record is the other half of `supervised`:
+        // `fabric_launch::arm` sets both under its own lock, so a section that
+        // arms one must hand the next section a record that says nothing is.
+        #[cfg(unix)]
+        crate::fabric_launch::reset_for_tests();
     }
 
     /// ONE GUARD, so the order cannot be written wrongly.
@@ -1301,14 +1407,37 @@ pub(crate) fn touched_contains(sid: &str) -> bool {
 
 /// [`apply_hold`] for a caller that already holds the ctx — the `status` test's
 /// door into the same state the bridge writes, without a registry round trip.
+/// Bridge-issued, so it is never refused; `true` when the state moved.
 #[cfg(test)]
 pub(crate) fn apply_hold_for_test(ctx: &SessionCtx, hold: Option<Hold>) -> bool {
-    apply_hold(ctx, hold)
+    apply_hold(ctx, hold, HoldIssuer::Bridge) == Applied::Changed
 }
 
-/// `hold <sid> on|off [reason=<pct>] [origin=fleet|local]` — the fleet drive
-/// halt, BRIDGE-ONLY (the dispatch gates the scope; this is the handler).
-pub(crate) fn cmd_hold(store: &Store, rest: &str) -> String {
+/// `hold <sid> on|off [reason=<pct>] [origin=fleet|local]` — the drive halt,
+/// local or fleet. `Access::OwnerOnly` gates the scope (Owner-class in, edge
+/// out, selector rejected); this is the handler, and [`HoldIssuer`] is the one
+/// thing it needs from the dispatch that the table cannot say.
+///
+/// THE ORIGIN RULE, ALL OF IT:
+///
+/// * A bridge-issued act is what it always was — `origin=fleet` unless the line
+///   says otherwise, and `off` lifts whatever stands. The code never modelled
+///   "a fleet hold needs a fleet off" for the bridge, and this change does not
+///   invent it: the bridge is the fleet's hand and lifting a local hold is
+///   within its power exactly as it was the day before.
+/// * An Owner-issued act is `origin=local` — the default, and the only value
+///   accepted: `origin=fleet` from Owner is [`HOLD_DENIED`] before any session
+///   is looked up. And it may not touch a standing fleet hold at all: `on`
+///   would replace it with one the owner could then lift, `off` would lift it,
+///   and both are the "lift a fleet halt locally" a prompt-injected agent
+///   holding Owner must never be able to do. [`apply_hold`] answers
+///   [`Applied::FleetHeld`] for either, under the lock, and this returns
+///   [`HOLD_DENIED`]. `off` with nothing standing is `OK hold=0`, as for the
+///   bridge — there is nothing to refuse.
+///
+/// An Owner-issued act does NOT mark the session bridge-governed
+/// ([`note_bridge_touched`]): see that function for why.
+pub(crate) fn cmd_hold(store: &Store, rest: &str, issuer: HoldIssuer) -> String {
     let mut toks = rest.split_whitespace();
     let (Some(sid), Some(state)) = (toks.next(), toks.next()) else {
         return HOLD_USAGE.to_string();
@@ -1319,7 +1448,11 @@ pub(crate) fn cmd_hold(store: &Store, rest: &str) -> String {
         _ => return HOLD_USAGE.to_string(),
     };
     let mut reason = String::new();
-    let mut origin = "fleet".to_string();
+    let mut origin = match issuer {
+        HoldIssuer::Bridge => "fleet",
+        HoldIssuer::Owner => "local",
+    }
+    .to_string();
     for tok in toks {
         if let Some(v) = kv(tok, "reason") {
             reason = v.to_string();
@@ -1332,6 +1465,9 @@ pub(crate) fn cmd_hold(store: &Store, rest: &str) -> String {
             return HOLD_USAGE.to_string();
         }
     }
+    if issuer == HoldIssuer::Owner && origin != "local" {
+        return HOLD_DENIED.to_string();
+    }
     let ctx = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
         match g.by_sid(&SessionId::new(sid)) {
@@ -1341,13 +1477,18 @@ pub(crate) fn cmd_hold(store: &Store, rest: &str) -> String {
     };
     // The session is now governed by the bridge whichever way this went: a `hold
     // off` is as much an act of governance as a `hold on`, and losing the bridge
-    // right after one must fail closed too.
-    note_bridge_touched(store, sid);
+    // right after one must fail closed too. The Owner's local act is NOT
+    // governance by the bridge and records nothing here.
+    if issuer == HoldIssuer::Bridge {
+        note_bridge_touched(store, sid);
+    }
     let hold = on.then(|| Hold {
         reason: reason_token(&reason),
         origin,
     });
-    apply_hold(&ctx, hold);
+    if apply_hold(&ctx, hold, issuer) == Applied::FleetHeld {
+        return HOLD_DENIED.to_string();
+    }
     format!("OK hold={}\n", u8::from(on))
 }
 
@@ -2568,6 +2709,17 @@ mod inbox_hold {
         )
     }
 
+    /// `cmd_hold` as the BRIDGE issues it — the form every pre-local-halt test
+    /// here drives, and the one whose rule the local halt left untouched.
+    fn bridge_hold(store: &Store, rest: &str) -> String {
+        cmd_hold(store, rest, HoldIssuer::Bridge)
+    }
+
+    /// `cmd_hold` as the local OWNER token issues it.
+    fn owner_hold(store: &Store, rest: &str) -> String {
+        cmd_hold(store, rest, HoldIssuer::Owner)
+    }
+
     /// ONE PRINCIPAL GRAMMAR, AND IT IS §3.2's.
     ///
     /// §3.2 fixes it at a class prefix plus `[a-z0-9-]{1,32}`; `aterm-link`'s
@@ -3120,8 +3272,8 @@ mod inbox_hold {
     /// The hold gate, as the dispatch reads it: the §5.3 verb set is refused and
     /// everything else is not. SCOPE-BLIND by construction — `halt_refusal` has no
     /// scope parameter to check — because a halt only the unprivileged obey is
-    /// decoration, and the point of putting `hold` behind the bridge is that the
-    /// halted party is not the one who lifts it.
+    /// decoration, and the point of keeping the FLEET hold behind the bridge is
+    /// that the halted party is not the one who lifts it.
     #[test]
     fn the_halt_refuses_the_pty_verbs_and_nothing_else() {
         with_link(the_halt_refuses_the_pty_verbs_and_nothing_else_body);
@@ -3134,7 +3286,7 @@ mod inbox_hold {
             assert!(halt_refusal(&ctx, verb).is_none(), "{verb} before the halt");
         }
         assert_eq!(
-            cmd_hold(
+            bridge_hold(
                 &store,
                 &format!("{sid} on reason=main%20broken origin=fleet")
             ),
@@ -3243,14 +3395,14 @@ mod inbox_hold {
         assert_eq!(cmd_inbox_seen(&ctx, "1 deferred"), "OK seen=1\n");
         assert!(cmd_inbox(&ctx, "--peek").contains(" hold=1 "));
 
-        assert_eq!(cmd_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+        assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
         assert!(halt_refusal(&ctx, "turn").is_none(), "the halt lifted");
-        assert_eq!(cmd_hold(&store, &format!("{sid} sideways")), HOLD_USAGE);
+        assert_eq!(bridge_hold(&store, &format!("{sid} sideways")), HOLD_USAGE);
         assert_eq!(
-            cmd_hold(&store, &format!("{sid} on origin=nowhere")),
+            bridge_hold(&store, &format!("{sid} on origin=nowhere")),
             HOLD_USAGE
         );
-        assert_eq!(cmd_hold(&store, "s-nope on"), "ERR no such session\n");
+        assert_eq!(bridge_hold(&store, "s-nope on"), "ERR no such session\n");
     }
 
     /// A halt reason reaches three wire surfaces verbatim, so it is rebuilt from
@@ -3330,9 +3482,160 @@ mod inbox_hold {
             let (sid, ctx) = registered(&store);
             let generation = next_bridge_generation();
             bridge_attached(generation);
-            assert_eq!(cmd_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
             assert_eq!(bridge_lost(&store, generation), 1);
             assert!(halt_refusal(&ctx, "turn").is_some());
+        });
+    }
+
+    /// THE LOCAL HALT. The Owner token is the local human's own credential, and
+    /// `hold=1` has always been described to agents as a human's halt — so the
+    /// owner can set one: `origin=local` by default, `ERR halted reason=<r>
+    /// origin=local` on every PTY-reaching verb from any scope, `hold=1` in the
+    /// `inbox` header, and the owner's own `hold off` lifts it. The `holder=`
+    /// token beside `hold=` is who holds the KEYBOARD (`who`/`lease`), which the
+    /// halt does not change: nobody is driving, so it stays `-`. And the local
+    /// act is not bridge governance — the session is not in the touched set, so
+    /// a bridge dying later halts what IT touched, not what the owner did.
+    #[test]
+    fn the_local_owner_halts_and_lifts_its_own_session() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+            for verb in ["key", "turn"] {
+                assert!(halt_refusal(&ctx, verb).is_none(), "{verb} before the halt");
+            }
+
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=demo")),
+                "OK hold=1\n"
+            );
+            for verb in ["key", "turn", "send", "close"] {
+                assert_eq!(
+                    halt_refusal(&ctx, verb).as_deref(),
+                    Some("ERR halted reason=demo origin=local\n"),
+                    "{verb} under a local halt"
+                );
+            }
+            assert_eq!(
+                ctx.fabric.hold(),
+                Some(Hold {
+                    reason: "demo".to_string(),
+                    origin: "local".to_string(),
+                })
+            );
+            assert!(
+                cmd_inbox(&ctx, "--peek").starts_with("OK 0 hold=1 holder=- "),
+                "the inbox header carries the halt; `holder=` is the keyboard holder, \
+                 untouched by a hold: {}",
+                cmd_inbox(&ctx, "--peek")
+            );
+            assert!(
+                !touched_contains(&sid),
+                "an owner's local halt does not make the session bridge-governed"
+            );
+            // The explicit spelling is the default spelling.
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=demo origin=local")),
+                "OK hold=1\n"
+            );
+
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            for verb in ["key", "turn"] {
+                assert!(halt_refusal(&ctx, verb).is_none(), "{verb} after the lift");
+            }
+            assert!(cmd_inbox(&ctx, "--peek").starts_with("OK 0 hold=0 holder=- "));
+            // Lifting nothing is nothing, not a refusal.
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            // The usage errors are the same errors from either issuer.
+            assert_eq!(owner_hold(&store, &format!("{sid} sideways")), HOLD_USAGE);
+            assert_eq!(owner_hold(&store, "s-nope on"), "ERR no such session\n");
+        });
+    }
+
+    /// THE FLEET HOLD STAYS THE BRIDGE'S. Owner scope is what every in-session
+    /// client already holds, so an Owner-issued act that could lift or replace a
+    /// fleet hold would be the "lift a fleet halt locally" the bridge-only gate
+    /// existed to prevent. So: `origin=fleet` from Owner is refused before any
+    /// session is named; `off` against a standing fleet hold is refused and the
+    /// hold stands; `on` against it is refused too (a replacement would be a
+    /// local hold the owner could then lift); and the bridge's own rule is what
+    /// it was — its `off` lifts whatever stands, a local hold included, because
+    /// the code never modelled "a fleet off for a fleet hold" and this change
+    /// does not invent it.
+    #[test]
+    fn an_owner_act_never_touches_a_fleet_hold() {
+        with_link(|| {
+            let store = new_store();
+            let (sid, ctx) = registered(&store);
+
+            // No hold standing: the fleet ORIGIN is still not the owner's to
+            // claim, on or off.
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on origin=fleet")),
+                HOLD_DENIED
+            );
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} off origin=fleet")),
+                HOLD_DENIED
+            );
+            assert!(halt_refusal(&ctx, "turn").is_none(), "nothing was applied");
+
+            let fleet = Some(Hold {
+                reason: "main%20broken".to_string(),
+                origin: "fleet".to_string(),
+            });
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} on reason=main%20broken")),
+                "OK hold=1\n"
+            );
+            assert_eq!(ctx.fabric.hold(), fleet);
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), HOLD_DENIED);
+            assert_eq!(ctx.fabric.hold(), fleet, "the fleet hold stands");
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                HOLD_DENIED
+            );
+            assert_eq!(ctx.fabric.hold(), fleet, "and was not replaced");
+            assert_eq!(
+                halt_refusal(&ctx, "turn").as_deref(),
+                Some("ERR halted reason=main%20broken origin=fleet\n")
+            );
+            // The one refusal `apply_hold` answers to the Owner, stated as itself.
+            assert_eq!(
+                apply_hold(&ctx, None, HoldIssuer::Owner),
+                Applied::FleetHeld
+            );
+
+            // The bridge lifts it; then the owner's local hold; then the BRIDGE
+            // lifts that too — the rule the code had, kept.
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                halt_refusal(&ctx, "turn").as_deref(),
+                Some("ERR halted reason=mine origin=local\n")
+            );
+            assert_eq!(bridge_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+            assert!(halt_refusal(&ctx, "turn").is_none());
+
+            // A bridge `on` over a standing LOCAL hold is a replacement, and the
+            // fleet hold then stands against the owner exactly as above.
+            assert_eq!(
+                owner_hold(&store, &format!("{sid} on reason=mine")),
+                "OK hold=1\n"
+            );
+            assert_eq!(
+                bridge_hold(&store, &format!("{sid} on reason=fabric-lost")),
+                "OK hold=1\n"
+            );
+            assert_eq!(owner_hold(&store, &format!("{sid} off")), HOLD_DENIED);
+            assert_eq!(
+                halt_refusal(&ctx, "turn").as_deref(),
+                Some("ERR halted reason=fabric-lost origin=fleet\n")
+            );
         });
     }
 
@@ -3374,7 +3677,7 @@ mod inbox_hold {
         // was already standing does not latch — a wait is for news, and the caller
         // could have read `status hold=` before parking.
         assert_eq!(
-            cmd_hold(&store, &format!("{sid} on reason=x")),
+            bridge_hold(&store, &format!("{sid} on reason=x")),
             "OK hold=1\n"
         );
         assert_eq!(
@@ -3394,7 +3697,7 @@ mod inbox_hold {
         let mut on = true;
         while !waiter.is_finished() {
             let arg = if on { "on reason=x" } else { "off" };
-            cmd_hold(&store, &format!("{sid} {arg}"));
+            bridge_hold(&store, &format!("{sid} {arg}"));
             on = !on;
             std::thread::yield_now();
         }
@@ -3403,7 +3706,7 @@ mod inbox_hold {
             latched == "OK inbox hold=1\n" || latched == "OK inbox hold=0\n",
             "a hold TRANSITION latches the wait, not the timeout: {latched}"
         );
-        cmd_hold(&store, &format!("{sid} off"));
+        bridge_hold(&store, &format!("{sid} off"));
         assert_eq!(
             cmd_await_inbox(&ctx, &["since=3", "kinds=task"], 5),
             "OK timeout\n"
@@ -3569,7 +3872,7 @@ mod inbox_hold {
             cmd_inbox_seen(&ctx, "1 handled");
             cmd_post(&ctx, &format!("to=h-a kind=note {secret}"), None);
             cmd_deliver(&store, &format!("{sid} landed=1 off=90"));
-            cmd_hold(&store, &format!("{sid} on reason=main%20broken"));
+            bridge_hold(&store, &format!("{sid} on reason=main%20broken"));
 
             let events: Vec<(String, String)> = ctx
                 .timeline
@@ -4856,6 +5159,11 @@ mod inbox_hold {
                  no bytes on a PTY and retires no session",
             ),
             ("rain", "a visual effect on the window"),
+            (
+                "fx",
+                "arms or reports a window effect; puts no bytes on a PTY and cannot \
+                 synthesize the key or command completion that fires it",
+            ),
             ("hover", "toggles the drop-target highlight"),
             (
                 "appnotice",
@@ -4893,6 +5201,14 @@ mod inbox_hold {
                 "operator",
                 "queues, claims and acknowledges operator work. The ACTUATION that \
                  reaches a PTY is `operator-propose-bin`, which IS in the set",
+            ),
+            (
+                "fabric",
+                "arms the bridge SUPERVISOR — the process that CARRIES a halt to \
+                 this instance. It puts no bytes on a PTY and retires no session, \
+                 and a held instance with no bridge is exactly the one that needs a \
+                 bridge to hear `hold off`; `fabric status` is a read in Owner \
+                 clothing",
             ),
             ("sessions", "the roster; a read in Owner clothing"),
             ("exits", "the exit ledger; a read in Owner clothing"),
@@ -5155,12 +5471,14 @@ mod inbox_hold {
     /// the code delivers.
     ///
     /// * A `fabric-lost` hold has NO OPERATOR UNDO. `apply_hold` has exactly two
-    ///   production callers — `cmd_hold` (`Access::BridgeOnly`, refused to Owner
-    ///   and every edge) and `bridge_lost` — and nothing in the GUI reaches it. So
-    ///   the only lift is a bridge that reconnects and issues `hold off`, and an
+    ///   production callers — `cmd_hold` (`Access::OwnerOnly`, and its handler
+    ///   refuses an Owner-issued act against any `origin=fleet` hold) and
+    ///   `bridge_lost` — and nothing in the GUI reaches it. So the only lift of a
+    ///   FLEET hold is a bridge that reconnects and issues `hold off`, and an
     ///   operator whose bridge cannot come back has one recovery: restart the
     ///   instance. This module and DESIGN §11.2 both said "a human lifts it at the
-    ///   GUI". No such path exists.
+    ///   GUI". No such path exists. (The owner's `hold off` lifts the owner's own
+    ///   LOCAL hold, which is a different claim and a narrower one.)
     /// * `InboxRow::from` said the sender is rendered "never from anything in the
     ///   body" and then listed `s-<sid>@n-<node>`, the one form whose `s-<sid>@`
     ///   prefix `Bridge::render_from` reads off the record BODY's `from=` token.
@@ -5199,7 +5517,7 @@ mod inbox_hold {
         // not negative ones: the withdrawal itself has to QUOTE the sentence it
         // withdraws, so "the phrase is absent" is not a test that can hold.
         assert!(
-            production.contains("THE ONLY LIFT IS A RECONNECTING BRIDGE"),
+            production.contains("THE ONLY LIFT OF A FLEET HOLD IS A RECONNECTING BRIDGE"),
             "the module header must state the narrow truth, not the GUI lift"
         );
         assert!(

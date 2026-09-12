@@ -1,0 +1,6 @@
+# The oracle's precedent (astream-oracle/.gitignore), and for the same reason:
+# this workspace's only path dependency outside the repo is a SIBLING checkout
+# most clones do not have, so a committed lock would pin resolutions nobody here
+# can reproduce and would go stale the moment astream moves.
+target/
+Cargo.lock

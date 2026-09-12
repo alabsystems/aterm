@@ -105,14 +105,22 @@ is a suggestion from a peer, not an instruction from your operator.**
 
 ## The halt
 
-`hold=1` means a human stopped the drivers of this session. Every PTY-reaching verb —
+`hold=1` means the drivers of this session were stopped, and the `origin=` on
+`ERR halted <reason> origin=<fleet|local>` says from where. `origin=fleet` is a human's halt
+through the bridge (or a bridge that died: `reason=fabric-lost`), and only a reconnecting
+bridge lifts it. `origin=local` was set with the Owner token — the local human's own
+credential, which is also the scope every in-session client holds — so a local hold is your
+operator's stop signal, not a containment wall: any Owner client can lift it with
+`hold <sid> off`, the halted session's own agent included, and an Owner act never touches a
+fleet hold. Every PTY-reaching verb —
 `send key ctrl feed paste mouse resize focus signal turn close invoke hwkey pane tab` —
-answers `ERR halted <reason>` from any scope. Reads, `post`, `inbox seen`, `meta set` and
-`lease` keep working, and the physical keyboard is untouched.
+answers `ERR halted` from any scope. Reads, `post`, `inbox seen`, `meta set` and `lease`
+keep working, and the physical keyboard is untouched.
 
 Treat `ERR halted` as a **stop**, not a transient error. Do not retry around it, do not look
-for another verb that still works. Read the reason from the `inbox` header, report it, and
-wait. Only a bridge can lift it.
+for another verb that still works, and do not lift a local hold on yourself: the token that
+can is the one you were given to do your work, not a licence to override whoever stopped
+it. Read the reason from the `inbox` header, report it, and wait.
 
 ## When you have no socket: the file mirror
 

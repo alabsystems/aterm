@@ -31,6 +31,320 @@ use crate::platform::AppRt;
 use crate::term_lock;
 use crate::{App, accessibility, control_auth, snapshot_path};
 
+const DEFERRED_GPU_CAPTURE_LIMIT: usize = 8;
+const GPU_CAPTURE_PENDING: &str = "capture pending: waiting for the requested GPU drawable";
+
+/// The original request owns its deadline cancellation and artifact permit for
+/// the entire wait. No caller reply is sent until this same request completes.
+pub(crate) struct DeferredGpuCapture {
+    window: WindowId,
+    surface: u64,
+    exact_tap: bool,
+    budget: CapturePresentBudget,
+    request: DeferredGpuCaptureRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CapturePresentBudget {
+    remaining: u8,
+}
+
+impl Default for CapturePresentBudget {
+    fn default() -> Self {
+        Self {
+            remaining: crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT,
+        }
+    }
+}
+
+impl CapturePresentBudget {
+    fn record_attempt(&mut self, pending: bool, presented: bool, failed: bool) {
+        if !pending && !presented && failed {
+            self.remaining = self.remaining.saturating_sub(1);
+        }
+    }
+}
+
+pub(crate) enum DeferredGpuCaptureRequest {
+    Image(ImageReq),
+    Snapshot {
+        path: String,
+    },
+    #[cfg(any(target_os = "macos", windows))]
+    Window {
+        target: control_auth::ConfinedImage,
+        cancel: crate::control::CaptureCancellation,
+        reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
+        handoff: crate::control::ReplyRetentionPermit,
+    },
+}
+
+impl DeferredGpuCaptureRequest {
+    fn cancelled(&self) -> bool {
+        match self {
+            Self::Image(request) => request.cancel.is_cancelled(),
+            Self::Snapshot { .. } => false,
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window { cancel, .. } => cancel.is_cancelled(),
+        }
+    }
+
+    fn reject(self, error: &str) {
+        match self {
+            Self::Image(request) => {
+                let _ = request.reply.send(Err(error.to_string()));
+            }
+            Self::Snapshot { .. } => {
+                crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
+            }
+            #[cfg(any(target_os = "macos", windows))]
+            Self::Window { reply, .. } => {
+                let _ = reply.send(Err(error.to_string()));
+            }
+        }
+    }
+}
+
+fn deferred_capture_identity_matches(expected: u64, current: Option<u64>, cancelled: bool) -> bool {
+    !cancelled && current == Some(expected)
+}
+
+fn deferred_capture_owns_current_tap(exact_tap: bool, expected: u64, current: Option<u64>) -> bool {
+    exact_tap && current == Some(expected)
+}
+
+/// A ready drawable still needs its ordinary repaint if capture rejected
+/// before submitting, starting another acquire, or scheduling a real failure.
+fn capture_resume_owns_next_frame(
+    before: u64,
+    after: u64,
+    pending: bool,
+    retry_open: bool,
+) -> bool {
+    after != before || pending || !retry_open
+}
+
+/// The bounded ownership transfer used by every deferred request. Rejection
+/// returns the same owned request so its reply and artifact permit cannot vanish.
+fn enqueue_deferred_gpu_capture(
+    queue: &mut std::collections::VecDeque<DeferredGpuCapture>,
+    capture: DeferredGpuCapture,
+    first: bool,
+) -> Result<(), Box<DeferredGpuCapture>> {
+    if queue.len() >= DEFERRED_GPU_CAPTURE_LIMIT {
+        return Err(Box::new(capture));
+    }
+    if first {
+        queue.push_front(capture);
+    } else {
+        queue.push_back(capture);
+    }
+    Ok(())
+}
+
+impl App {
+    pub(crate) fn has_deferred_gpu_capture(&self, window: WindowId) -> bool {
+        self.deferred_gpu_captures
+            .iter()
+            .any(|capture| capture.window == window)
+    }
+
+    fn queue_gpu_capture(
+        &mut self,
+        window: WindowId,
+        request: DeferredGpuCaptureRequest,
+        first: bool,
+    ) {
+        self.prune_deferred_gpu_captures();
+        let surface = self
+            .windows
+            .get(&window)
+            .and_then(|state| state.current_gpu_acquire_id());
+        let Some(surface) = surface else {
+            request.reject("capture lost its GPU surface while waiting");
+            return;
+        };
+        let exact_tap = first
+            && !matches!(request, DeferredGpuCaptureRequest::Image(_))
+            && self
+                .windows
+                .get(&window)
+                .is_some_and(|state| state.capture_acquire_armed);
+        let capture = DeferredGpuCapture {
+            window,
+            surface,
+            exact_tap,
+            budget: if first {
+                self.capture_present_budget
+            } else {
+                CapturePresentBudget::default()
+            },
+            request,
+        };
+        if let Err(capture) =
+            enqueue_deferred_gpu_capture(&mut self.deferred_gpu_captures, capture, first)
+        {
+            if capture.exact_tap {
+                self.discard_presented_client_capture(capture.window);
+            }
+            capture
+                .request
+                .reject("capture queue is full while waiting for GPU acquisition");
+        }
+    }
+
+    pub(crate) fn prune_deferred_gpu_captures(&mut self) {
+        let mut index = 0;
+        while index < self.deferred_gpu_captures.len() {
+            let capture = &self.deferred_gpu_captures[index];
+            let current = self
+                .windows
+                .get(&capture.window)
+                .and_then(|window| window.current_gpu_acquire_id());
+            let parked = self
+                .windows
+                .get(&capture.window)
+                .is_some_and(|window| window.present_retry.parked);
+            if !parked
+                && deferred_capture_identity_matches(
+                    capture.surface,
+                    current,
+                    capture.request.cancelled(),
+                )
+            {
+                index += 1;
+                continue;
+            }
+            let capture = self
+                .deferred_gpu_captures
+                .remove(index)
+                .expect("indexed queued capture");
+            if deferred_capture_owns_current_tap(capture.exact_tap, capture.surface, current) {
+                self.discard_presented_client_capture(capture.window);
+            }
+            capture.request.reject(
+                "capture cancelled, window closed, or surface became unavailable while waiting",
+            );
+        }
+    }
+
+    /// Consume waiting control demand before an ordinary ready redraw can take
+    /// its drawable. At most the entry queue length is serviced in one turn;
+    /// another Pending yields immediately to the worker's next completion.
+    pub(crate) fn resume_deferred_gpu_captures(&mut self, window: WindowId, surface: u64) -> bool {
+        let budget = self.deferred_gpu_captures.len();
+        let mut serviced = false;
+        for _ in 0..budget {
+            let Some(index) = self
+                .deferred_gpu_captures
+                .iter()
+                .position(|capture| capture.window == window && capture.surface == surface)
+            else {
+                break;
+            };
+            let capture = self
+                .deferred_gpu_captures
+                .remove(index)
+                .expect("selected queued capture");
+            let current = self
+                .windows
+                .get(&window)
+                .and_then(|state| state.current_gpu_acquire_id());
+            if !deferred_capture_identity_matches(surface, current, capture.request.cancelled()) {
+                if deferred_capture_owns_current_tap(capture.exact_tap, surface, current) {
+                    self.discard_presented_client_capture(window);
+                }
+                capture
+                    .request
+                    .reject("capture cancelled or GPU surface changed while waiting");
+                continue;
+            }
+            self.replaying_gpu_capture = Some(window);
+            self.capture_present_budget = capture.budget;
+            let before = self
+                .windows
+                .get(&window)
+                .map_or(0, |state| state.capture_present_serial);
+            match capture.request {
+                DeferredGpuCaptureRequest::Image(request) => {
+                    let resolved = match request.session {
+                        Some(session) => self.windows_displaying(session).next(),
+                        None => self.frontmost_window,
+                    };
+                    if resolved == Some(window) {
+                        self.render_image(request);
+                    } else {
+                        DeferredGpuCaptureRequest::Image(request)
+                            .reject("image target changed while waiting for GPU acquisition");
+                    }
+                }
+                DeferredGpuCaptureRequest::Snapshot { path } => {
+                    if self.frontmost_window == Some(window) {
+                        self.snapshot_at_path(path);
+                    } else {
+                        DeferredGpuCaptureRequest::Snapshot { path }
+                            .reject("snapshot target changed while waiting for GPU acquisition");
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                DeferredGpuCaptureRequest::Window {
+                    handoff,
+                    target,
+                    cancel,
+                    reply,
+                } => {
+                    self.capture_window_of(Some(window), handoff, target, cancel, reply);
+                }
+                #[cfg(windows)]
+                DeferredGpuCaptureRequest::Window {
+                    handoff,
+                    target,
+                    cancel,
+                    reply,
+                } => {
+                    if self.frontmost_window == Some(window) {
+                        self.capture_window(handoff, target, cancel, reply);
+                    } else {
+                        let _ = reply.send(Err(
+                            "window capture target changed while waiting".to_string()
+                        ));
+                    }
+                }
+            }
+            self.replaying_gpu_capture = None;
+            // The replay either consumed its tap or requeued that same owner.
+            // Cancellation/target rejection can happen between dequeue and the
+            // capture entry; followers never inherit an abandoned exact tap.
+            if capture.exact_tap
+                && !self.deferred_gpu_captures.iter().any(|queued| {
+                    queued.window == window && queued.surface == surface && queued.exact_tap
+                })
+                && self.windows.get(&window).is_some_and(|state| {
+                    state.current_gpu_acquire_id() == Some(surface) && state.capture_acquire_armed
+                })
+            {
+                self.discard_presented_client_capture(window);
+            }
+            serviced |= self.windows.get(&window).is_some_and(|state| {
+                capture_resume_owns_next_frame(
+                    before,
+                    state.capture_present_serial,
+                    state.gpu_acquire_pending(),
+                    state.present_retry.present_attempt_allowed(),
+                )
+            });
+            if self
+                .windows
+                .get(&window)
+                .is_some_and(|state| state.gpu_acquire_pending())
+            {
+                break;
+            }
+        }
+        serviced
+    }
+}
+
 /// Headless capture may arrive long after the output wake that created a word.
 /// Ten seconds is the effects engine's episode-retention horizon: older stamps
 /// are equivalent for every bounded one-shot, and clamping avoids carrying an
@@ -1733,6 +2047,89 @@ fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> 
     !has_os_window && !recording_this_window
 }
 
+/// Match publication to a genuinely emitted full-body sprite. Drawing under
+/// terminal ink changes z-order, not the resident's identity. A claimed box
+/// without matching atlas-backed pixels must fail these capture regressions.
+#[cfg(test)]
+fn captured_resident_body_for_test(app: &App, wid: WindowId) -> &aterm_core::render::FreeSprite {
+    let ws = &app.windows[&wid];
+    let (cw, ch) = app.win_cell_size(wid);
+    let (ox, oy, _, _, _) =
+        app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
+    let published = ws
+        .pet_hit_rect
+        .expect("capture publishes the resident body");
+    let mut matching = ws.input_scratch.free_sprites.iter().filter(|sprite| {
+        let x = sprite.x + i32::from(ox);
+        let y = sprite.y + i32::from(oy);
+        (x, x + i32::from(sprite.w), y, y + i32::from(sprite.h)) == published
+    });
+    let body = matching
+        .next()
+        .expect("publication identifies an emitted body");
+    assert!(
+        matching.next().is_none(),
+        "one resident owns the published rectangle"
+    );
+    assert!(ws.input_scratch.free_atlas.is_some());
+    assert!(body.alpha > 0 && body.w > 0 && body.h > 0);
+    assert!(
+        usize::from(body.aw) >= 5 * cw && usize::from(body.ah) >= ch,
+        "the emitted sprite addresses full-body art, not a head or attachment"
+    );
+    body
+}
+
+/// THE CAPTURE OBSERVES THE CONSOLE. Bind the resident to the cell plane and
+/// bounded facts from the authorized extraction. This runs only when capture
+/// owns the effect tick; it never re-locks the terminal or refreshes metadata
+/// from a newer DEC-2026 episode.
+///
+/// This is the gap that made a whole class of defect invisible, and both
+/// 2026-09-10 lanes found it independently. The capture path already ticks
+/// the resident brain — it is the ONLY thing that ticks it on a headless
+/// instance ([`capture_ticks_cursor_fx`]) — but it never looked at the
+/// console, so `PetBrain::begin_console_tick` ran against a world nobody had
+/// observed: stale on a windowed instance, and absent entirely on a headless
+/// one, where `console.world` stayed `None` forever and every console verdict
+/// was pinned at "not resident". `image`, `window` and `trail status` were
+/// therefore structurally blind to the placement, the attention and the
+/// visibility verdict that decide whether the pet is on glass at all.
+///
+/// `composed` selects the same buffer the matching present arm observes: the
+/// FOCUSED PANE's own grid on a split, the window grid on a single pane —
+/// never the composite, because the pet's world (and so its body box) is that
+/// pane's grid.
+///
+/// The ownership latch is NOT set here — `set_console_presentable` is called
+/// unconditionally on both arms immediately before the tick, because that
+/// latch is not a function of whether a world was read, and leaving a stale
+/// `true` behind would let a retired pet keep a resident.
+fn observe_capture_pet_world(
+    ws: &mut crate::WindowState,
+    exact_focus: &crate::app_render::TerminalCaptureFocus,
+    composed: bool,
+) {
+    use aterm_effects::pet_world::PetPane;
+    let input = if composed {
+        &ws.composed_focus_scratch
+    } else {
+        &ws.input_scratch
+    };
+    let (exclusions, count) = crate::app_render::pet_console_exclusions(
+        input,
+        !ws.preedit.is_empty(),
+        ws.predictor.pending_bounds(),
+        ws.search.is_some(),
+    );
+    ws.cursor_pet.observe_console_with_exclusions(
+        input,
+        &exact_focus.pet_world,
+        PetPane::full(input),
+        &exclusions[..count],
+    );
+}
+
 /// Advance the visual half of the sing-along only when the explicit capture
 /// owns this window's cursor-effect clock. Application-present performs this
 /// same detector → cat sync on both live render paths; a glass-less still has
@@ -1829,9 +2226,9 @@ fn capture_flying_companion_enabled(
 
 /// Resolve the ONE cursor companion for an introspection frame through the
 /// same custody law as application-present. The middle verdict is the pet
-/// brain's caret feed (0.33 full-motion swap; always fed but hidden under the
-/// reduced-motion singer); the last is the resident pet's actual draw
-/// admission (held until the singing kitty releases pixel custody).
+/// brain's caret feed; the last is the resident pet's actual draw admission.
+/// In pet mode both stay live throughout a song, and the replacement head
+/// is suppressed exactly as it is on the live presentation paths.
 fn capture_companion_custody(
     pet_mode: bool,
     kitty_enabled: bool,
@@ -2451,6 +2848,11 @@ impl App {
         // same policy the glass painted (gauntlet F3 parity).
         let capture_focused = self.cursor_fx_focus(wid, raw_focused, now);
         let motion = self.motion_policy(capture_focused);
+        let pet_reduced_motion = crate::app_render::resident_pet_reduced_motion(
+            !motion.animate(crate::motion::MotionEffect::CursorGlow),
+            self.load_shed_active(),
+            self.effective_shed_envelope(self.config.motion_mode(), now),
+        );
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let trail_presentation = self.trail_presentation();
@@ -2474,17 +2876,28 @@ impl App {
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
-        if exact_focus.session != focus {
+        if exact_focus.session != focus || !exact_focus.damage_consumed {
             return;
         }
         let focus_live_viewport = exact_focus.live_viewport;
         let focus_cursor = exact_focus.cursor;
         let focus_coordinate_space = Some((exact_focus.terminal_id, exact_focus.alternate_screen));
+        let Some((rows, cols)) = self
+            .windows
+            .get(&wid)
+            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols)))
+        else {
+            return;
+        };
+        let (origin_x, origin_y, _, _, _) = self.effects_origin_win(wid, rows, cols, cell_h);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         if let Some((terminal_id, alternate_screen)) = focus_coordinate_space {
             sync_cursor_effect_coordinate_space(ws, terminal_id, alternate_screen);
+        }
+        if pet_mode {
+            observe_capture_pet_world(ws, &exact_focus, true);
         }
         let (win_rows, win_cols) = (ws.rows, ws.cols);
         ws.cursor_cat.set_look(companion_look);
@@ -2539,7 +2952,13 @@ impl App {
         // companion the user actually selected.
         let pet_visible = crate::app_render::resident_pet_presentation_enabled(
             pet_mode,
-            cursor_companion_presentable,
+            crate::app_render::resident_pet_surface_presentable(
+                capture_focused,
+                cursor_companions_allowed,
+                !ws.overlay_open() && ws.tab_menu.is_none(),
+                focus_live_viewport,
+                ws.cursor_pet.has_reading_interest(),
+            ),
             glow_cfg.enabled && cursor_companions_allowed,
             glow_cfg.style,
         );
@@ -2579,7 +2998,7 @@ impl App {
             cols: pane_cols,
             cell_w: cell_w.min(usize::from(u16::MAX)) as u16,
             cell_h: cell_h.min(usize::from(u16::MAX)) as u16,
-            reduced_motion: !animate_cat,
+            reduced_motion: pet_reduced_motion,
             // A capture is one isolated frame: the burst probe is a
             // frame-over-frame diff the windowed presents own, and a capture
             // must never charge the watch (or steal the diff's baseline).
@@ -2599,11 +3018,30 @@ impl App {
             glow_cfg.style,
             &mut ws.cursor_pet,
         );
+        ws.cursor_pet.set_console_presentable(pet_on_glass);
         let pet = if windowless {
             ws.cursor_pet.tick_static_capture(pet_sense)
         } else {
             ws.cursor_pet.tick(pet_sense)
         };
+        // This capture owns the tick, so publish the same full-body rectangle
+        // as application-present. The existing non-owning still path never
+        // reaches here and cannot replace the live window's hit target.
+        ws.pet_hit_rect = crate::app_render::pet_hit_rect_for_frame(
+            pet_visible,
+            cat_frame.sing,
+            &pet,
+            crate::word_decorations::EffectGeom {
+                cell_w: pet_sense.cell_w,
+                cell_h: pet_sense.cell_h,
+                rows: pane_rows,
+                cols: pane_cols,
+            },
+            (
+                i32::from(origin_x) + pane_origin.0,
+                i32::from(origin_y) + pane_origin.1,
+            ),
+        );
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
@@ -2768,6 +3206,11 @@ impl App {
             now,
         );
         let motion = self.motion_policy(capture_focused);
+        let pet_reduced_motion = crate::app_render::resident_pet_reduced_motion(
+            !motion.animate(crate::motion::MotionEffect::CursorGlow),
+            self.load_shed_active(),
+            self.effective_shed_envelope(self.config.motion_mode(), now),
+        );
         let sparkle = sparkle.map(|(mut cfg, lexicon)| {
             if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
                 cfg.reduced_motion = true;
@@ -2825,6 +3268,14 @@ impl App {
             .get(exact_focus.session)
             .map(|session| session.ctx.output_echo.sample(&session.ctx.sink, now))
             .unwrap_or_default();
+        let Some((rows, cols)) = self
+            .windows
+            .get(&wid)
+            .map(|ws| (usize::from(ws.rows), usize::from(ws.cols)))
+        else {
+            return;
+        };
+        let (origin_x, origin_y, _, _, _) = self.effects_origin_win(wid, rows, cols, cell_h);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -2839,6 +3290,9 @@ impl App {
             exact_focus.terminal_id,
             exact_focus.alternate_screen,
         );
+        if pet_mode {
+            observe_capture_pet_world(ws, &exact_focus, false);
+        }
         // Capture consumes the same admitted catalog Arc as application-present. Asset
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
@@ -2902,11 +3356,16 @@ impl App {
         );
         // The PET companion, resolved the same way the composed capture arm
         // does: a capture is a presentation boundary. The shared custody law
-        // admits the flying singing face during pet mode's authored handoff,
-        // then returns the caret and pixels to the resident pet.
+        // retains the full resident and its caret through singing and load.
         let pet_visible = crate::app_render::resident_pet_presentation_enabled(
             pet_mode,
-            cursor_companion_presentable,
+            crate::app_render::resident_pet_surface_presentable(
+                capture_focused,
+                cursor_companions_allowed,
+                !ws.overlay_open() && ws.tab_menu.is_none(),
+                live_viewport,
+                ws.cursor_pet.has_reading_interest(),
+            ),
             glow_cfg.enabled && cursor_companions_allowed,
             glow_cfg.style,
         );
@@ -2933,46 +3392,22 @@ impl App {
         }
         prepare_resident_pet_tick(&mut ws.word_decos, &mut ws.cursor_pet, pet_species, None);
         // The ownership switch precedes every presentation fork, including
-        // load shedding's cleared early return. Load shedding is a temporary
-        // visibility freeze; it cannot immortalize a brain/mote cadence whose
-        // trail or style owner was removed on this capture.
+        // load shedding's static resident branch. Pressure cannot immortalize
+        // a brain/mote cadence whose trail or style owner was removed.
         crate::app_render::retire_pet_without_owner(
             pet_mode,
             glow_cfg.enabled && cursor_companions_allowed,
             glow_cfg.style,
             &mut ws.cursor_pet,
         );
+        ws.cursor_pet.set_console_presentable(pet_on_glass);
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
-        if load_shed {
-            // Load shedding owns the complete decorative surface. Undo the
-            // companion presentation opportunity sampled above at the same
-            // instant, so a one-shot collection hello cannot age out behind
-            // this cleared early return.
-            ws.cursor_cat.set_collection_presentable(now, false);
-            // v3 §1.1 reset table: BOTH suspension causes are freeze/thaw, not
-            // resets — mirrors app_render's `deco_suspend` arm exactly, so a
-            // capture mid-suspension preserves every episode (the engine's own
-            // frozen guards additionally no-op any rescan/tick) and recovery
-            // resumes each animation where it paused instead of mass-replaying.
-            ws.word_decos.freeze(now);
-            ws.free_scratch.clear();
-            ws.nova_scratch.clear();
-            ws.input_scratch.word_decorations.clear();
-            ws.input_scratch.ink.clear();
-            ws.input_scratch.cat_quads.clear();
-            ws.input_scratch.cat_atlas = None;
-            ws.input_scratch.free_sprites.clear();
-            ws.input_scratch.free_atlas = None;
-            ws.input_scratch.nova_add.clear();
-            return;
-        }
-        if words_suspended || sparkle.is_none() {
-            // Sparkle Words and the cursor companion share bakers/atlas, not
-            // ownership. An explicit feature disable resets word episodes;
-            // alt-screen suppression freezes them exactly like live glass.
-            // Either way, keep building the independent pet or authenticated
-            // flying kitty into the same free-sprite channel.
-            if words_suspended {
+        if load_shed || words_suspended || sparkle.is_none() {
+            // The word field freezes under load or alternate-screen suppression;
+            // an explicit feature disable resets it. The full resident retains
+            // its independent surface and static posture. The flying head's
+            // existing load gate already denies its pixels and pauses its hello.
+            if load_shed || words_suspended {
                 ws.word_decos.freeze(now);
             } else {
                 ws.word_decos.hard_reset_words();
@@ -2994,7 +3429,7 @@ impl App {
                 cols: effect_geom.cols,
                 cell_w: effect_geom.cell_w,
                 cell_h: effect_geom.cell_h,
-                reduced_motion: !animate_cat,
+                reduced_motion: pet_reduced_motion,
                 output_burst: false,
                 pointer: None,
                 // Present-owned frame-over-frame diffs (burst, wrap fact)
@@ -3006,6 +3441,13 @@ impl App {
             } else {
                 ws.cursor_pet.tick(pet_sense)
             };
+            ws.pet_hit_rect = crate::app_render::pet_hit_rect_for_frame(
+                pet_visible,
+                cat_frame.sing,
+                &pet,
+                effect_geom,
+                (i32::from(origin_x), i32::from(origin_y)),
+            );
             let default_bg = ws.input_scratch.default_bg;
             let cursor_color = ws.input_scratch.cursor_color;
             let _ = crate::app_render::emit_single_cursor_companion(
@@ -3083,7 +3525,7 @@ impl App {
             cols: effect_geom.cols,
             cell_w: effect_geom.cell_w,
             cell_h: effect_geom.cell_h,
-            reduced_motion: !animate_cat,
+            reduced_motion: pet_reduced_motion,
             // A capture is one isolated frame — see the windowed capture arm.
             output_burst: false,
             pointer: None,
@@ -3094,6 +3536,13 @@ impl App {
         } else {
             ws.cursor_pet.tick(pet_sense)
         };
+        ws.pet_hit_rect = crate::app_render::pet_hit_rect_for_frame(
+            pet_visible,
+            cat_frame.sing,
+            &pet,
+            effect_geom,
+            (i32::from(origin_x), i32::from(origin_y)),
+        );
         let pet_on_glass = pet_on_glass && pet.alpha > 0;
         // ONE CAT PER CARET: exactly the predicate the companion emission below
         // draws under. Told which cell the companion occupies, the engine drops
@@ -3940,8 +4389,12 @@ impl App {
         }
 
         let mut captured = None;
+        let mut acquire_pending = false;
         let presented =
-            crate::run_capture_present_barrier(crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, || {
+            crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
+                if acquire_pending {
+                    return false;
+                }
                 let before = self
                     .windows
                     .get(&wid)
@@ -3952,9 +4405,23 @@ impl App {
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
                 self.redraw_capture_frame(wid, frame_layout);
+                acquire_pending = self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|window| window.gpu_acquire_pending());
+                if let Some(window) = self.windows.get(&wid) {
+                    self.capture_present_budget.record_attempt(
+                        acquire_pending,
+                        window.capture_present_serial != before,
+                        !window.present_retry.present_attempt_allowed(),
+                    );
+                }
                 captured = self.presented_frame_capture_after(wid, before);
                 captured.is_some()
             });
+        if acquire_pending {
+            return Err(GPU_CAPTURE_PENDING.to_string());
+        }
         if presented {
             Ok(captured)
         } else {
@@ -3985,8 +4452,12 @@ impl App {
         }
 
         let mut captured = None;
+        let mut acquire_pending = false;
         let presented =
-            crate::run_capture_present_barrier(crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, || {
+            crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
+                if acquire_pending {
+                    return false;
+                }
                 let before = self
                     .windows
                     .get(&wid)
@@ -3997,10 +4468,24 @@ impl App {
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
                 self.redraw_capture_frame(wid, frame_layout);
+                acquire_pending = self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|window| window.gpu_acquire_pending());
+                if let Some(window) = self.windows.get(&wid) {
+                    self.capture_present_budget.record_attempt(
+                        acquire_pending,
+                        window.capture_present_serial != before,
+                        !window.present_retry.present_attempt_allowed(),
+                    );
+                }
 
                 captured = self.presented_terminal_capture_after(wid, before, frame_layout);
                 captured.is_some()
             });
+        if acquire_pending {
+            return Err(GPU_CAPTURE_PENDING.to_string());
+        }
         if presented {
             Ok(captured)
         } else {
@@ -4300,6 +4785,21 @@ impl App {
         let Some(path) = snapshot_path::resolve() else {
             return; // refusal already logged by resolve()
         };
+        self.snapshot_at_path(path);
+    }
+
+    fn snapshot_at_path(&mut self, path: String) {
+        self.prune_deferred_gpu_captures();
+        if let Some(window) = self.frontmost_window
+            && self.replaying_gpu_capture != Some(window)
+            && self.has_deferred_gpu_capture(window)
+        {
+            self.queue_gpu_capture(window, DeferredGpuCaptureRequest::Snapshot { path }, false);
+            return;
+        }
+        if self.replaying_gpu_capture != self.frontmost_window || self.frontmost_window.is_none() {
+            self.capture_present_budget = CapturePresentBudget::default();
+        }
         let transaction = match begin_snapshot_generation(std::path::Path::new(&path)) {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -4381,7 +4881,15 @@ impl App {
             ) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
-                    crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
+                    if error == GPU_CAPTURE_PENDING {
+                        self.queue_gpu_capture(
+                            front,
+                            DeferredGpuCaptureRequest::Snapshot { path },
+                            true,
+                        );
+                    } else {
+                        crate::logging::stderr_line!("aterm-gui: snapshot refused: {error}");
+                    }
                     return;
                 }
             }
@@ -5411,6 +5919,21 @@ impl App {
     /// control writer revalidates file replies and retains them through response
     /// ACK/quarantine; inline PNG memory is retained through write and flush.
     pub(crate) fn render_image(&mut self, req: ImageReq) {
+        self.prune_deferred_gpu_captures();
+        let requested_window = match req.session {
+            Some(session) => self.windows_displaying(session).next(),
+            None => self.frontmost_window,
+        };
+        if let Some(window) = requested_window
+            && self.replaying_gpu_capture != Some(window)
+            && self.has_deferred_gpu_capture(window)
+        {
+            self.queue_gpu_capture(window, DeferredGpuCaptureRequest::Image(req), false);
+            return;
+        }
+        if self.replaying_gpu_capture != requested_window || requested_window.is_none() {
+            self.capture_present_budget = CapturePresentBudget::default();
+        }
         let ImageReq {
             handoff,
             target,
@@ -5499,7 +6022,25 @@ impl App {
             ) {
                 Ok(presented) => presented,
                 Err(error) => {
-                    let _ = reply.send(Err(error));
+                    if error == GPU_CAPTURE_PENDING {
+                        self.queue_gpu_capture(
+                            front,
+                            DeferredGpuCaptureRequest::Image(ImageReq {
+                                handoff,
+                                target,
+                                clean,
+                                session,
+                                want_bytes,
+                                want_metadata,
+                                frame_metadata,
+                                cancel,
+                                reply,
+                            }),
+                            true,
+                        );
+                    } else {
+                        let _ = reply.send(Err(error));
+                    }
                     return;
                 }
             };
@@ -5550,7 +6091,25 @@ impl App {
         ) {
             Ok(presented) => presented,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                if error == GPU_CAPTURE_PENDING {
+                    self.queue_gpu_capture(
+                        front,
+                        DeferredGpuCaptureRequest::Image(ImageReq {
+                            handoff,
+                            target,
+                            clean,
+                            session,
+                            want_bytes,
+                            want_metadata,
+                            frame_metadata,
+                            cancel,
+                            reply,
+                        }),
+                        true,
+                    );
+                } else {
+                    let _ = reply.send(Err(error));
+                }
                 return;
             }
         };
@@ -6174,6 +6733,7 @@ impl App {
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
+        self.prune_deferred_gpu_captures();
         if cancel.is_cancelled() {
             let _ = reply.send(Err(
                 "window capture request cancelled before photograph".to_string()
@@ -6194,11 +6754,43 @@ impl App {
                 return;
             }
         }
+        if let Some(window) = wid
+            && self.replaying_gpu_capture != Some(window)
+            && self.has_deferred_gpu_capture(window)
+        {
+            self.queue_gpu_capture(
+                window,
+                DeferredGpuCaptureRequest::Window {
+                    handoff,
+                    target,
+                    cancel,
+                    reply,
+                },
+                false,
+            );
+            return;
+        }
+        if self.replaying_gpu_capture != wid || wid.is_none() {
+            self.capture_present_budget = CapturePresentBudget::default();
+        }
         let presented = match wid {
             Some(wid) => match self.present_before_window_capture(wid, None) {
                 Ok(presented) => Some(presented),
                 Err(error) => {
-                    let _ = reply.send(Err(error));
+                    if error == GPU_CAPTURE_PENDING {
+                        self.queue_gpu_capture(
+                            wid,
+                            DeferredGpuCaptureRequest::Window {
+                                handoff,
+                                target,
+                                cancel,
+                                reply,
+                            },
+                            true,
+                        );
+                    } else {
+                        let _ = reply.send(Err(error));
+                    }
                     return;
                 }
             },
@@ -6241,8 +6833,9 @@ impl App {
     /// serial advances after redrawing the CURRENT composite. The serial belongs to
     /// the whole window rather than one focused native leaf, so this remains correct
     /// for heterogeneous terminal/native splits and native leaves with sub-viewports.
-    /// Retry a bounded three times, then fail closed instead of returning pixels from
-    /// the wrong route or setting generation.
+    /// Actual drops retry at most three times. Async acquisition yields the
+    /// original owned request to the bounded completion queue immediately,
+    /// preserving its tap and cancellation deadline across the wait.
     fn present_before_window_capture(
         &mut self,
         wid: WindowId,
@@ -6257,15 +6850,25 @@ impl App {
         }
 
         let mut captured = None;
+        let mut acquire_pending = false;
         let mut last_capture_error = None;
         let presented =
-            crate::run_capture_present_barrier(crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, || {
-                self.discard_presented_client_capture(wid);
+            crate::run_capture_present_barrier(self.capture_present_budget.remaining, || {
+                if acquire_pending {
+                    return false;
+                }
+                let resumed_tap = self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|window| window.capture_acquire_armed);
+                if !resumed_tap {
+                    self.discard_presented_client_capture(wid);
+                }
                 let before = self
                     .windows
                     .get(&wid)
                     .map_or(0, |window| window.capture_present_serial);
-                if let Err(error) = self.arm_presented_client_capture(wid) {
+                if !resumed_tap && let Err(error) = self.arm_presented_client_capture(wid) {
                     last_capture_error = Some(error);
                     return false;
                 }
@@ -6280,6 +6883,23 @@ impl App {
                 let _ = window.present_retry.on_external_stimulus();
                 window.last_present = None;
                 self.redraw_capture_frame(wid, frame_layout);
+                acquire_pending = self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|window| window.gpu_acquire_pending());
+                if let Some(window) = self.windows.get(&wid) {
+                    self.capture_present_budget.record_attempt(
+                        acquire_pending,
+                        window.capture_present_serial != before,
+                        !window.present_retry.present_attempt_allowed(),
+                    );
+                }
+                if acquire_pending {
+                    if let Some(window) = self.windows.get_mut(&wid) {
+                        window.capture_acquire_armed = true;
+                    }
+                    return false;
+                }
                 let serial = self
                     .windows
                     .get(&wid)
@@ -6315,6 +6935,9 @@ impl App {
                     }
                 }
             });
+        if acquire_pending {
+            return Err(GPU_CAPTURE_PENDING.to_string());
+        }
         if presented {
             captured.ok_or_else(|| {
                 "window capture barrier succeeded without a presented client frame".to_string()
@@ -6374,6 +6997,7 @@ impl App {
         let window = windows
             .get_mut(&wid)
             .ok_or_else(|| "window capture lost its window".to_string())?;
+        window.capture_acquire_armed = false;
         match window.present.as_mut() {
             Some(crate::PresentTarget::Cpu { .. }) => {
                 window.capture_client_requested = false;
@@ -6410,6 +7034,7 @@ impl App {
         let Some(window) = windows.get_mut(&wid) else {
             return;
         };
+        window.capture_acquire_armed = false;
         window.capture_client_requested = false;
         window.capture_present_client = None;
         if let Some(crate::PresentTarget::Gpu { window_gpu, .. }) = window.present.as_mut()
@@ -6895,6 +7520,7 @@ impl App {
         cancel: crate::control::CaptureCancellation,
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
+        self.prune_deferred_gpu_captures();
         if cancel.is_cancelled() {
             let _ = reply.send(Err(
                 "window capture request cancelled before photograph".to_string()
@@ -6911,10 +7537,39 @@ impl App {
             let _ = reply.send(Err("no window to capture (headless)".to_string()));
             return;
         };
+        if self.replaying_gpu_capture != Some(wid) && self.has_deferred_gpu_capture(wid) {
+            self.queue_gpu_capture(
+                wid,
+                DeferredGpuCaptureRequest::Window {
+                    handoff,
+                    target,
+                    cancel,
+                    reply,
+                },
+                false,
+            );
+            return;
+        }
+        if self.replaying_gpu_capture != Some(wid) {
+            self.capture_present_budget = CapturePresentBudget::default();
+        }
         let presented = match self.present_before_window_capture(wid, None) {
             Ok(presented) => presented,
             Err(error) => {
-                let _ = reply.send(Err(error));
+                if error == GPU_CAPTURE_PENDING {
+                    self.queue_gpu_capture(
+                        wid,
+                        DeferredGpuCaptureRequest::Window {
+                            handoff,
+                            target,
+                            cancel,
+                            reply,
+                        },
+                        true,
+                    );
+                } else {
+                    let _ = reply.send(Err(error));
+                }
                 return;
             }
         };
@@ -8364,12 +9019,111 @@ mod dims_snapshot_tests {
 }
 
 #[cfg(test)]
+mod capture_console_observation_tests {
+    //! THE CAPTURE OBSERVES THE CONSOLE IT TICKS THE PET AGAINST.
+    //!
+    //! A headless capture is the ONLY thing that ticks the resident brain
+    //! ([`super::capture_ticks_cursor_fx`]), and it used to tick it having
+    //! never called `observe_console`: `console.world` stayed `None` forever,
+    //! so every console verdict — the resident, its attention, its perch, the
+    //! clear-space veto on its body — was pinned at "nothing here", and
+    //! `image`, `window` and `trail status` were structurally blind to the
+    //! whole layer. That is why no automated check could ever see a defect in
+    //! it. A HELD SELECTION is the oracle: `has_reading_interest` is a pure
+    //! read of the observed world, so it is true exactly when the capture
+    //! looked at the terminal it is drawing.
+
+    use crate::{App, WindowId, term_lock};
+    use aterm_core::selection::{SelectionSide, SelectionType};
+    use std::time::Instant;
+
+    fn pet_capture_app() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // Asked for, never inherited: the absent-key default is platform-split.
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.config.motion = Some("full".into());
+        (app, wid)
+    }
+
+    fn select_a_phrase(app: &App, session: u64) {
+        let term = app.pool.get(session).expect("session").term.clone();
+        let mut t = term_lock(&term);
+        t.process(b"\x1b]11;#000000\x07\x1b[3;3Hread this\x1b[6;1H");
+        t.text_selection_mut()
+            .start_selection(2, 2, SelectionSide::Left, SelectionType::Simple);
+        t.text_selection_mut()
+            .update_selection(2, 10, SelectionSide::Right);
+    }
+
+    #[test]
+    fn a_single_pane_headless_capture_observes_the_console() {
+        let (mut app, wid) = pet_capture_app();
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        let session = app.focused_session_id(wid).expect("front session");
+        select_a_phrase(&app, session);
+        app.splice_word_decorations(wid, Instant::now());
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_pet.has_reading_interest(),
+            "the capture must observe the console it ticks the pet against"
+        );
+        assert_eq!(ws.cursor_pet.console_attention().name(), "reading");
+        assert_eq!(ws.cursor_pet.console_reason(), "selection");
+    }
+
+    #[test]
+    fn a_composed_headless_capture_observes_the_focused_pane_console() {
+        let (mut app, wid) = pet_capture_app();
+        let focus = app.split_active_stub_tab(wid);
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        select_a_phrase(&app, focus);
+        app.splice_word_decorations(wid, Instant::now());
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_pet.has_reading_interest(),
+            "the composed capture observes the FOCUSED PANE's own grid, like its present"
+        );
+        assert_eq!(ws.cursor_pet.console_attention().name(), "reading");
+    }
+}
+
+#[cfg(test)]
 mod split_capture_tests {
     //! INTROSPECTION IS SACRED: a split capture must show what the glass
     //! shows. The glass now decorates every visible pane, so the capture does.
 
+    use super::captured_resident_body_for_test;
     use crate::{App, WindowId, term_lock};
     use std::time::{Duration, Instant};
+
+    /// THE CLEAR-SPACE PRECONDITION, exactly as the composed PRESENT's own
+    /// pet fixtures state it (`app_render::split_sparkle_tests::
+    /// configure_pane_backgrounds`, added by the console-life commit itself):
+    /// `PetWorld` reads a cell as clear only when its background is the
+    /// renderer's, so a pane left on the terminal's default background is a
+    /// pane with no clear space anywhere and no resident can be drawn on it.
+    ///
+    /// These capture fixtures never needed it before because the capture path
+    /// never observed the console at all — they were green because the
+    /// capture was blind. Now that it looks, they must state the same real
+    /// precondition their present twins do.
+    fn configure_pane_backgrounds(app: &App, sid: u64) {
+        let bg = aterm_render::Theme::default().bg;
+        for session in [0, sid] {
+            let term = &app.pool.get(session).expect("pane session").term;
+            term_lock(term).set_default_background(aterm_core::terminal::Rgb {
+                r: (bg >> 16) as u8,
+                g: (bg >> 8) as u8,
+                b: bg as u8,
+            });
+        }
+    }
 
     #[test]
     fn first_headless_split_capture_keeps_the_pet_without_sparkle_words() {
@@ -8378,7 +9132,8 @@ mod split_capture_tests {
         // The trail is asked for, not inherited — its absent-key default is
         // platform-split and this fixture measures the SPLIT-capture pet, on every host.
         app.config.cursor_trail = Some(true);
-        app.split_active_stub_tab(wid);
+        let focus = app.split_active_stub_tab(wid);
+        configure_pane_backgrounds(&app, focus);
         app.recompute_sparkle();
         app.sparkle = None;
         app.windows.get_mut(&wid).expect("window").focused = true;
@@ -8400,7 +9155,8 @@ mod split_capture_tests {
         let capture = |style: &str| {
             let mut app = App::headless_for_test();
             let wid = WindowId(0);
-            app.split_active_stub_tab(wid);
+            let focus = app.split_active_stub_tab(wid);
+            configure_pane_backgrounds(&app, focus);
             app.config.cursor_trail = Some(true);
             app.config.cursor_trail_style = Some(style.into());
             app.config.motion = Some("full".into());
@@ -8593,7 +9349,7 @@ mod split_capture_tests {
 
     /// The composed capture shares the split glass pass, including its
     /// visibility-correct companion custody. A DECTCEM-off program relocation
-    /// may not lend the fading resident pet a new word claim at a cursor the
+    /// may not lend the retained resident pet a new word claim at a cursor the
     /// capture does not draw.
     #[test]
     fn split_capture_hidden_pet_fade_does_not_claim_program_relocated_word() {
@@ -8607,6 +9363,8 @@ mod split_capture_tests {
         // `cursor_trail`'s default is platform-split since `bda06044`, so an unseeded
         // fixture measured the platform and went red on Windows.
         app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        configure_pane_backgrounds(&app, focus);
         app.recompute_sparkle();
         app.windows.get_mut(&wid).expect("window").focused = true;
 
@@ -8615,15 +9373,30 @@ mod split_capture_tests {
         term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
         app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
         app.splice_word_decorations(wid, t0 + Duration::from_millis(616));
-        let ambient_before = app.windows[&wid]
-            .input_scratch
-            .free_sprites
-            .iter()
-            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
-            .count();
+        let ambient = |app: &App| {
+            let resident = captured_resident_body_for_test(app, wid);
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .filter(|sprite| {
+                    matches!(sprite.z, aterm_core::render::FreeZ::UnderText)
+                        && !std::ptr::eq(*sprite, resident)
+                })
+                .map(|sprite| (sprite.x, sprite.y, sprite.w, sprite.h))
+                .collect::<Vec<_>>()
+        };
+        let ambient_before = ambient(&app);
         assert_eq!(
-            ambient_before, 1,
+            ambient_before.len(),
+            1,
             "negative control: the isolated far word has one settled ambient kitty"
+        );
+        let (cw, _) = app.win_cell_size(wid);
+        assert!(
+            ambient_before[0].0 + i32::from(ambient_before[0].2) + 10 * (cw as i32)
+                < captured_resident_body_for_test(&app, wid).x,
+            "the ambient word is geographically distinct from the cursor resident"
         );
 
         term_lock(&term).process(b"\x1b[?25l\x1b[11;3H");
@@ -8634,25 +9407,20 @@ mod split_capture_tests {
             assert_eq!((term.cursor().row, term.cursor().col), (10, 2));
         }
         let ws = &app.windows[&wid];
-        let ambient_after = ws
-            .input_scratch
-            .free_sprites
-            .iter()
-            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::UnderText))
-            .count();
-        let resident_after = ws
-            .input_scratch
-            .free_sprites
-            .iter()
-            .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
-            .count();
+        let ambient_after = ambient(&app);
         assert!(
-            resident_after >= 1 && ws.cursor_pet.is_active(),
-            "the capture genuinely contains the hidden-caret resident fade"
+            captured_resident_body_for_test(&app, wid).alpha > 0 && ws.cursor_pet.is_active(),
+            "the capture genuinely contains the hidden-caret resident"
         );
         assert_eq!(
-            ambient_after, ambient_before,
+            ambient_after.len(),
+            ambient_before.len(),
             "capture must not suppress a word-cat at the invisible relocated cursor"
+        );
+        assert_eq!(
+            (ambient_after[0].0, ambient_after[0].2),
+            (ambient_before[0].0, ambient_before[0].2),
+            "the retained ambient cat still belongs to the same far word"
         );
     }
 
@@ -8665,6 +9433,7 @@ mod split_capture_tests {
         app.config.cursor_trail = Some(true);
         app.config.cursor_trail_style = Some("rainbow kitty pet".into());
         app.config.motion = Some("full".into());
+        configure_pane_backgrounds(&app, focus);
         app.recompute_sparkle();
         app.sparkle = None;
         app.windows.get_mut(&wid).expect("window").focused = true;
@@ -8705,19 +9474,17 @@ mod split_capture_tests {
 
         let term = app.pool.get(focus).expect("focused pane").term.clone();
         let captured_body = |app: &App| {
-            let sprite = app.windows[&wid]
-                .input_scratch
-                .free_sprites
-                .iter()
-                .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
-                .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
-                .expect("capture contains the resident body");
+            let sprite = captured_resident_body_for_test(app, wid);
             (sprite.x, sprite.y, sprite.w, sprite.h)
         };
         term_lock(&term).process(b"\x1b[3;25H\x1b[?25h");
         let visible_at = flight_at + Duration::from_millis(16);
         app.splice_word_decorations(wid, visible_at);
         let before = captured_body(&app);
+        assert!(
+            app.windows[&wid].cursor_pet.console_legacy_motion_pending(),
+            "the actual visible capture still carries the earned flight"
+        );
 
         term_lock(&term).process(b"\x1b[?25l");
         let hidden_at = visible_at + Duration::from_millis(16);
@@ -8731,14 +9498,7 @@ mod split_capture_tests {
             ((hidden.1 + i32::from(hidden.3)) - (before.1 + i32::from(before.3))).abs() <= 1,
             "hidden capture dropped the fading body's feet: {before:?} -> {hidden:?}"
         );
-        assert!(
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
-                .iter()
-                .any(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText)),
-            "the inspected hidden capture really contains the resident body"
-        );
+        assert!(app.windows[&wid].cursor_pet.is_active());
 
         term_lock(&term).process(b"\x1b[?25h");
         let returned_at = hidden_at + Duration::from_millis(16);
@@ -12946,6 +13706,9 @@ mod encode_worker_tests {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
         let t0 = Instant::now();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.recompute_sparkle();
         {
             let terminal = app
                 .front_terminal(wid)
@@ -12968,15 +13731,22 @@ mod encode_worker_tests {
                 .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
             ws.cursor_cat.set_collection_presentable(t0, false);
         }
-        // Load-shed latch: captures during the suspension freeze the engine
-        // and emit cleared channels (mirrors app_render's deco_suspend arm).
+        // Load-shed latch: freeze the ambient engine and clear its channels,
+        // while retaining the approved static full resident.
         app.perf_reduced = true;
         app.splice_word_decorations(wid, t0 + Duration::from_millis(100));
         {
             let ws = &app.windows[&wid];
             assert!(ws.input_scratch.word_decorations.is_empty());
             assert!(ws.input_scratch.ink.is_empty());
-            assert!(ws.input_scratch.free_sprites.is_empty());
+            let body = captured_resident_body_for_test(&app, wid);
+            assert_eq!(body.alpha, 255);
+            assert_eq!(
+                ws.input_scratch.free_sprites.len(),
+                1,
+                "only the resident survives shedding"
+            );
+            assert!(!ws.cursor_pet.needs_frames());
             assert!(ws.input_scratch.nova_add.is_empty());
             assert_eq!(
                 ws.cursor_cat
@@ -13000,6 +13770,9 @@ mod encode_worker_tests {
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
         app.splice_word_decorations(wid, t0 + Duration::from_secs(20));
+        assert_eq!(captured_resident_body_for_test(&app, wid).alpha, 255);
+        assert_eq!(app.windows[&wid].input_scratch.free_sprites.len(), 1);
+        assert!(!app.windows[&wid].cursor_pet.needs_frames());
         assert!(
             app.windows[&wid].input_scratch.word_decorations.is_empty(),
             "still suspended: cleared channels"
@@ -13027,10 +13800,9 @@ mod encode_worker_tests {
                 .input_scratch
                 .free_sprites
                 .iter()
-                .any(|sprite| sprite.z == aterm_core::render::FreeZ::UnderText),
-            "the first drawable capture still presents the paused collection hello \
-             (UnderText since c92dcf56: a text-scale cat tucks behind the line's \
-             ink rather than standing on it)"
+                .any(|sprite| sprite.z == aterm_core::render::FreeZ::UnderText
+                    && !std::ptr::eq(sprite, captured_resident_body_for_test(&app, wid))),
+            "the resumed ambient episode emits its own cat; the resident cannot buy this pass"
         );
     }
 
@@ -13057,9 +13829,11 @@ mod encode_worker_tests {
         app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
         assert!(
             app.windows[&wid].cursor_pet.is_active(),
-            "load shedding alone freezes presentation without revoking ownership"
+            "load shedding keeps the full resident without revoking ownership"
         );
-        assert!(app.windows[&wid].input_scratch.free_sprites.is_empty());
+        assert_eq!(captured_resident_body_for_test(&app, wid).alpha, 255);
+        assert_eq!(app.windows[&wid].input_scratch.free_sprites.len(), 1);
+        assert!(!app.windows[&wid].cursor_pet.needs_frames());
 
         app.config.cursor_trail = Some(false);
         assert!(
@@ -13077,6 +13851,10 @@ mod encode_worker_tests {
                 && ws.input_scratch.free_sprites.is_empty()
                 && ws.input_scratch.free_atlas.is_none(),
             "the retired capture publishes no companion projection"
+        );
+        assert_eq!(
+            ws.pet_hit_rect, None,
+            "owner removal clears body publication too"
         );
     }
 
@@ -13399,7 +14177,7 @@ mod headless_cursor_fx_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn capture_companion_custody_matches_live_pet_song_handoff() {
+    fn capture_companion_custody_keeps_the_full_pet_during_the_song() {
         assert_eq!(
             capture_companion_custody(true, true, 211, 0.0, 0.0, true, false),
             (0, true, true),
@@ -13407,8 +14185,8 @@ mod headless_cursor_fx_tests {
         );
         assert_eq!(
             capture_companion_custody(true, true, 211, 1.0, 1.0, true, true),
-            (211, true, false),
-            "the reduced-motion singer exclusively owns pixels while the hidden pet keeps its caret"
+            (0, true, true),
+            "the full resident keeps both pixels and caret during a reduced-motion song"
         );
         assert_eq!(
             capture_companion_custody(false, true, 211, 0.0, 0.0, false, false),
@@ -13417,13 +14195,13 @@ mod headless_cursor_fx_tests {
         );
         assert_eq!(
             capture_companion_custody(true, true, 211, 0.49, 0.49, true, true),
-            (211, true, false),
-            "a late 1.0→0.49 reduced sample retains the opaque singer while preloading the pet"
+            (0, true, true),
+            "a late song sample retains the same resident without a head handoff"
         );
         assert_eq!(
             capture_companion_custody(true, false, 211, 0.0, 0.329, true, true),
             (0, true, true),
-            "below the static face swap, capture returns both caret and pixel custody to the resident pet"
+            "a drained song keeps the resident's uninterrupted custody"
         );
     }
 
@@ -13531,7 +14309,356 @@ mod headless_cursor_fx_tests {
     }
 
     #[test]
-    fn production_headless_image_shows_one_reduced_motion_singing_companion() {
+    fn single_and_split_capture_retain_the_pet_watching_selected_history() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        for split in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+            app.config.motion = Some("reduced".into());
+            app.recompute_sparkle();
+            app.sparkle = None;
+            if split {
+                app.split_active_stub_tab(wid);
+            }
+            app.windows.get_mut(&wid).unwrap().focused = true;
+            let start = Instant::now();
+            let sid = app.focused_session_id(wid).unwrap();
+            let term = app.pool.get(sid).unwrap().term.clone();
+            let plan = app.active_visible_leaf_plan(wid).unwrap();
+            let leaf = plan.leaves.iter().find(|leaf| leaf.focused).unwrap();
+            let rows = leaf.rect.size.height.round() as usize;
+            {
+                let mut terminal = term_lock(&term);
+                for _ in 0..rows + 20 {
+                    terminal.process(b"line\r\n");
+                }
+            }
+            // Establish the resident from a genuine live caret before the
+            // viewport moves into history. No input or caret is fabricated.
+            app.splice_word_decorations(wid, start);
+            assert!(app.windows[&wid].cursor_pet.is_active());
+            term_lock(&term).scroll_display(10);
+
+            for (step, selected) in [true, false].into_iter().enumerate() {
+                {
+                    let mut terminal = term_lock(&term);
+                    let selection = terminal.text_selection_mut();
+                    if selected {
+                        selection.start_selection(
+                            -4,
+                            10,
+                            SelectionSide::Left,
+                            SelectionType::Simple,
+                        );
+                        selection.update_selection(-3, 16, SelectionSide::Right);
+                    } else {
+                        selection.clear();
+                    }
+                }
+                let now = start + Duration::from_millis((step as u64 + 1) * 16);
+                let capture = app
+                    .prepare_terminal_capture_grid_with_cursor_fx(
+                        wid,
+                        crate::app_render::ComposedCursorFxClock::Advance(now),
+                    )
+                    .expect("real terminal capture extraction");
+                let focus = capture.focus.unwrap();
+                assert_eq!(capture.composed, split);
+                assert!(!focus.live_viewport && focus.cursor.is_none());
+                app.splice_word_decorations_sampled(wid, now, focus);
+                assert_eq!(
+                    app.windows[&wid].cursor_pet.has_reading_interest(),
+                    selected
+                );
+                let (cw, ch) = app.win_cell_size(wid);
+                let sprites = &app.windows[&wid].input_scratch.free_sprites;
+                if selected {
+                    assert_eq!(sprites.len(), 1, "one full reading pet, split={split}");
+                    assert!(usize::from(sprites[0].w) >= 5 * cw);
+                    assert!(usize::from(sprites[0].h) >= ch);
+                    assert_eq!(sprites[0].alpha, 255);
+                } else {
+                    assert!(
+                        sprites.is_empty(),
+                        "history without reading interest remains nonpresentable"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Only shipping extraction and capture ticks establish ownership. The
+    /// historical path passed visible-caret tests through the legacy fallback
+    /// but had no console home once DECTCEM hid the caret.
+    #[test]
+    fn headless_capture_retains_hidden_caret_home_and_clears_real_reset() {
+        use aterm_core::terminal::{ContentScrollDelta, ContentScrollState};
+
+        for split in [false, true] {
+            for pressure in [false, true] {
+                let mut app = App::headless_for_test();
+                let wid = WindowId(0);
+                app.config.cursor_trail = Some(true);
+                app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+                app.config.motion = Some(if pressure { "auto" } else { "reduced" }.into());
+                app.config.load_adaptive_motion = Some(true);
+                app.recompute_sparkle();
+                app.sparkle = None;
+                if split {
+                    app.split_active_stub_tab(wid);
+                }
+                app.windows.get_mut(&wid).unwrap().focused = true;
+                let start = Instant::now();
+                if pressure {
+                    for frame in 0..3 {
+                        app.note_present_cost(
+                            30_000_000,
+                            Duration::from_millis(16),
+                            start - Duration::from_secs(2) + Duration::from_millis(frame * 16),
+                        );
+                    }
+                    assert!(app.load_shed_active());
+                }
+                let sid = app.focused_session_id(wid).unwrap();
+                let term = app.pool.get(sid).unwrap().term.clone();
+                let rows = {
+                    let mut terminal = term_lock(&term);
+                    assert!(terminal.grid().rows() >= 8 && terminal.grid().cols() >= 24);
+                    terminal.process(b"\x1b[6;12H");
+                    terminal.grid().rows()
+                };
+                app.splice_word_decorations(wid, start);
+                let (cw, ch) = app.win_cell_size(wid);
+                let full_body = |app: &App| {
+                    let ws = &app.windows[&wid];
+                    let sprites = &ws.input_scratch.free_sprites;
+                    assert_eq!(
+                        sprites.len(),
+                        1,
+                        "one resident, split={split}, pressure={pressure}"
+                    );
+                    let body = &sprites[0];
+                    assert!(usize::from(body.w) >= 5 * cw && usize::from(body.h) >= ch);
+                    assert_eq!(body.alpha, 255);
+                    let (ox, oy, _, _, _) =
+                        app.effects_origin_win(wid, usize::from(ws.rows), usize::from(ws.cols), ch);
+                    // The emitted split sprite already includes its pane
+                    // offset. The published hit rectangle adds the same grid
+                    // origin as the rasterizer's padding/chrome placement.
+                    let x = body.x + i32::from(ox);
+                    let y = body.y + i32::from(oy);
+                    assert_eq!(
+                        ws.pet_hit_rect,
+                        Some((x, x + i32::from(body.w), y, y + i32::from(body.h))),
+                        "the published body must identify the actual emitted sprite"
+                    );
+                    (body.x, body.y, body.w, body.h)
+                };
+                let home = full_body(&app);
+                let input_seq = app.windows[&wid].cursor_pet.console_input_seq();
+                term_lock(&term).process(b"\x1b[?25l");
+                for (step, elapsed_ms) in [16, 600, 2000].into_iter().enumerate() {
+                    if step == 1 {
+                        let mut terminal = term_lock(&term);
+                        let before = terminal.content_scroll_state();
+                        terminal.process(
+                            format!("\x1b7\x1b[1;{}r\x1b[{};1H\n\x1b[r\x1b8", rows - 2, rows - 2)
+                                .as_bytes(),
+                        );
+                        assert!(matches!(
+                            ContentScrollState::delta_since(
+                                Some(before),
+                                terminal.content_scroll_state()
+                            ),
+                            ContentScrollDelta::Bands { .. }
+                        ));
+                    }
+                    app.splice_word_decorations(wid, start + Duration::from_millis(elapsed_ms));
+                    assert_eq!(full_body(&app), home, "a hidden home remains screen-local");
+                    assert!(!app.windows[&wid].cursor_pet.needs_frames());
+                    assert_eq!(app.windows[&wid].cursor_pet.console_input_seq(), input_seq);
+                }
+                // Reset AFTER the authorized extraction, in the former lock
+                // gap. This capture still owns its old cells and scroll facts;
+                // re-locking for PetWorld would mix two terminal episodes.
+                let captured_at = start + Duration::from_millis(2016);
+                let capture = app
+                    .prepare_terminal_capture_grid_with_cursor_fx_interleaved(
+                        wid,
+                        crate::app_render::ComposedCursorFxClock::Advance(captured_at),
+                        || term_lock(&term).process(b"\x1bc\x1b[?25l"),
+                    )
+                    .expect("the already-authorized snapshot survives a later reset");
+                let focus = capture.focus.unwrap();
+                assert_ne!(
+                    focus.pet_world.stamp.surface.scroll_invalidation,
+                    term_lock(&term).content_scroll_state().invalidation_epoch,
+                    "the control must change the real terminal after extraction"
+                );
+                app.splice_word_decorations_sampled(wid, captured_at, focus);
+                assert_eq!(
+                    full_body(&app),
+                    home,
+                    "capture must consume only its owned snapshot"
+                );
+
+                // The NEXT extraction sees the real unknown/reset motion: a
+                // hidden caret cannot retain ownership across that boundary.
+                for step in 0..20 {
+                    app.splice_word_decorations(
+                        wid,
+                        start + Duration::from_millis(2100 + step * 100),
+                    );
+                }
+                assert!(
+                    app.windows[&wid].input_scratch.free_sprites.is_empty(),
+                    "reset must clear the former home, split={split}, pressure={pressure}"
+                );
+                assert_eq!(app.windows[&wid].pet_hit_rect, None);
+                assert_eq!(app.windows[&wid].cursor_pet.console_input_seq(), input_seq);
+
+                // Fresh visible bodies make both denial controls non-vacuous.
+                // Hiding the surface or removing its owner must immediately
+                // clear publication even if the old brain still has alpha.
+                term_lock(&term).process(b"\x1b[?25h\x1b[6;12H");
+                for (control, owner_removed) in [false, true].into_iter().enumerate() {
+                    app.windows.get_mut(&wid).unwrap().focused = true;
+                    app.config.cursor_trail = Some(true);
+                    let now = start + Duration::from_millis(5000 + control as u64 * 1000);
+                    app.splice_word_decorations(wid, now);
+                    full_body(&app);
+                    if owner_removed {
+                        app.config.cursor_trail = Some(false);
+                    } else {
+                        app.windows.get_mut(&wid).unwrap().focused = false;
+                    }
+                    app.splice_word_decorations(wid, now + Duration::from_millis(16));
+                    assert!(app.windows[&wid].input_scratch.free_sprites.is_empty());
+                    assert_eq!(app.windows[&wid].pet_hit_rect, None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_and_capture_keep_the_full_pet_under_load_without_idle_frames() {
+        for split in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+            app.config.motion = Some("auto".into());
+            app.config.load_adaptive_motion = Some(true);
+            app.recompute_sparkle();
+            app.sparkle = None;
+            if split {
+                app.split_active_stub_tab(wid);
+            }
+            app.windows.get_mut(&wid).unwrap().focused = true;
+            let now = Instant::now();
+            for frame in 0..3 {
+                app.note_present_cost(
+                    30_000_000,
+                    Duration::from_millis(16),
+                    now - Duration::from_secs(2) + Duration::from_millis(frame * 16),
+                );
+            }
+            assert!(
+                app.load_shed_active(),
+                "real present-cost samples engage the policy"
+            );
+            assert_eq!(
+                app.effective_shed_envelope(app.config.motion_mode(), now),
+                0.0
+            );
+            // The real native composed path runs without a platform window.
+            // Its zero-envelope result must agree with the capture route.
+            if split {
+                let ws = &app.windows[&wid];
+                let (rows, cols) = (usize::from(ws.rows), usize::from(ws.cols));
+                assert!(
+                    app.redraw_compose(wid, rows, cols, false, false, None, 0, now)
+                        .is_some()
+                );
+                let ws = &app.windows[&wid];
+                assert!(
+                    ws.pet_hit_rect.is_some(),
+                    "native split retains the full body's hit target"
+                );
+                assert!(ws.cursor_pet.is_active());
+                assert!(
+                    !ws.cursor_pet.needs_frames(),
+                    "native static resident owes no idle frames"
+                );
+            }
+            assert!(
+                app.load_shed_active(),
+                "capture must exercise the load-suspended branch"
+            );
+            let dir = std::env::temp_dir().join(format!(
+                "aterm-pet-under-load-{}-{split}",
+                std::process::id(),
+            ));
+            control_auth::ensure_private_dir(&dir).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.render_image(crate::control::ImageReq {
+                handoff: crate::control::ReplyRetentionPermit::unmetered_for_test(),
+                target: control_auth::ConfinedImage::for_test(&dir, "pet.png"),
+                clean: false,
+                session: None,
+                want_bytes: false,
+                want_metadata: false,
+                frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+                cancel: crate::control::CaptureCancellation::new(),
+                reply: tx,
+            });
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("image worker reply")
+                .expect("capture under load succeeds");
+            assert!(
+                app.load_shed_active(),
+                "the capture did not escape the pressure fixture"
+            );
+            let (cw, ch) = app.win_cell_size(wid);
+            let ws = &app.windows[&wid];
+            let bodies: Vec<_> = ws
+                .input_scratch
+                .free_sprites
+                .iter()
+                .filter(|sprite| usize::from(sprite.w) >= 5 * cw && usize::from(sprite.h) >= ch)
+                .collect();
+            assert_eq!(
+                bodies.len(),
+                1,
+                "capture retains one full pet under load, split={split}"
+            );
+            assert_eq!(bodies[0].alpha, 255);
+            assert_eq!(
+                ws.input_scratch.free_sprites.len(),
+                1,
+                "no head or animated attachment under load"
+            );
+            assert!(
+                ws.input_scratch.word_decorations.is_empty()
+                    && ws.input_scratch.ink.is_empty()
+                    && ws.input_scratch.nova_add.is_empty(),
+                "decorations remain shed"
+            );
+
+            assert!(ws.cursor_pet.is_active());
+            assert!(
+                !ws.cursor_pet.needs_frames(),
+                "capture shares the static posture"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn production_headless_image_keeps_one_full_pet_during_reduced_motion_singing() {
         use aterm_effects::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
         use aterm_effects::kitty_sing::SING_ARM_REPEATS;
 
@@ -13602,6 +14729,7 @@ mod headless_cursor_fx_tests {
             .expect("image worker reply")
             .expect("headless singer image succeeds");
 
+        let (cell_w, cell_h) = app.win_cell_size(wid);
         let ws = app.windows.get_mut(&wid).expect("headless window 0");
         assert!(
             ws.cursor_cat.is_active(),
@@ -13609,14 +14737,19 @@ mod headless_cursor_fx_tests {
         );
         assert!(
             ws.cursor_pet.is_active(),
-            "reduced motion keeps the resident pet caret-fed behind the opaque singer"
+            "reduced motion keeps the full resident visible and caret-fed during the song"
         );
         assert_eq!(
             ws.input_scratch.free_sprites.len(),
             1,
-            "the production still contains one singing kitty, never a missing or doubled companion"
+            "the production still contains one full resident, never a replacement or second head"
         );
         assert!(ws.input_scratch.free_atlas.is_some());
+        let body = &ws.input_scratch.free_sprites[0];
+        assert!(
+            usize::from(body.w) >= 5 * cell_w && usize::from(body.h) >= cell_h,
+            "capture must show the full animal, not a replacement head"
+        );
         assert_eq!(ws.cursor_cat.static_frame(Instant::now()).sing, 1.0);
         assert!(
             ws.input_scratch.word_decorations.is_empty()
@@ -14001,5 +15134,391 @@ mod headless_cursor_fx_tests {
             !capture_ticks_cursor_fx(true, true),
             "OS window plus recording: still never tick at capture time"
         );
+    }
+}
+
+#[cfg(test)]
+mod deferred_gpu_capture_tests {
+    use super::{
+        App, DEFERRED_GPU_CAPTURE_LIMIT, DeferredGpuCapture, DeferredGpuCaptureRequest,
+        deferred_capture_identity_matches, enqueue_deferred_gpu_capture,
+    };
+    use crate::control::{CaptureCancellation, ImageReq, ReplyRetentionPermit};
+    use crate::{WindowId, control_auth};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, OnceLock, mpsc};
+
+    fn capture(
+        surface: u64,
+    ) -> (
+        DeferredGpuCapture,
+        mpsc::Receiver<crate::control::ImageReply>,
+        CaptureCancellation,
+    ) {
+        let (reply, receiver) = mpsc::channel();
+        let cancel = CaptureCancellation::new();
+        (
+            DeferredGpuCapture {
+                window: WindowId(0),
+                surface,
+                exact_tap: false,
+                budget: super::CapturePresentBudget::default(),
+                request: DeferredGpuCaptureRequest::Image(ImageReq {
+                    target: control_auth::ConfinedImage::in_memory(),
+                    clean: false,
+                    session: None,
+                    want_bytes: true,
+                    want_metadata: false,
+                    frame_metadata: Arc::new(OnceLock::new()),
+                    cancel: cancel.clone(),
+                    reply,
+                    handoff: ReplyRetentionPermit::unmetered_for_test(),
+                }),
+            },
+            receiver,
+            cancel,
+        )
+    }
+
+    fn capture_queue_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            DeferredGpuCaptureQueue {
+                const Buggy = 0;
+                const Cap = 8;
+                var queued = 0;
+                var current = 1;
+                var cancelled = 0;
+                var resumed = 0;
+                action Push when (queued <= Cap) {
+                    queued = if queued <= Cap - 1 || Buggy == 1 { queued + 1 } else { queued };
+                }
+                action Close { current = 0; resumed = 0; }
+                action Replace { current = 2; resumed = 0; }
+                action Restore { current = 1; cancelled = 0; resumed = 0; }
+                action Cancel { cancelled = 1; resumed = 0; }
+                action Resume when (queued > 0 && (Buggy == 1 || (current == 1 && cancelled == 0))) {
+                    queued = queued - 1;
+                    resumed = 1;
+                }
+                invariant BoundedOwnership: queued <= Cap;
+                invariant ResumeNeedsCurrentLiveRequest: resumed == 0 || (current == 1 && cancelled == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_gpu_capture_model_proves_and_catches_overflow_or_stale_resume() {
+        let model = capture_queue_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn deferred_gpu_capture_queue_real_admission_and_identity_conform() {
+        let model = capture_queue_model();
+        let mut state = model.init_state();
+        let mut queue = VecDeque::new();
+        let mut receivers = Vec::new();
+        for surface in 1..=DEFERRED_GPU_CAPTURE_LIMIT + 1 {
+            let (request, receiver, _) = capture(surface as u64);
+            let admitted = enqueue_deferred_gpu_capture(&mut queue, request, false);
+            assert!(model.fire("Push", &mut state));
+            assert_eq!(queue.len() as i64, state["queued"]);
+            assert!(model.check_invariant("BoundedOwnership", &state));
+            if surface <= DEFERRED_GPU_CAPTURE_LIMIT {
+                assert!(admitted.is_ok());
+                assert!(
+                    matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                    "pending retains the original reply without answering early"
+                );
+                receivers.push(receiver);
+            } else {
+                let rejected = match admitted {
+                    Err(request) => request,
+                    Ok(()) => panic!("overflow was admitted"),
+                };
+                rejected.request.reject("queue full");
+                assert_eq!(receiver.recv().unwrap().unwrap_err(), "queue full");
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(mpsc::TryRecvError::Disconnected)
+                ));
+            }
+        }
+        // Actual ownership order, including a head request that yields again.
+        let head = queue.pop_front().unwrap();
+        assert_eq!(head.surface, 1);
+        assert!(enqueue_deferred_gpu_capture(&mut queue, head, true).is_ok());
+        for (index, receiver) in receivers.into_iter().enumerate() {
+            let request = queue.pop_front().unwrap();
+            assert_eq!(
+                request.surface,
+                (index + 1) as u64,
+                "later requests cannot overtake a resumed head"
+            );
+            request.request.reject("finished once");
+            assert_eq!(receiver.recv().unwrap().unwrap_err(), "finished once");
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+        for current in [None, Some(1), Some(2)] {
+            for cancelled in [false, true] {
+                let mut observed = model.init_state();
+                observed.insert("queued", 1);
+                observed.insert("current", current.unwrap_or(0) as i64);
+                observed.insert("cancelled", i64::from(cancelled));
+                assert_eq!(
+                    deferred_capture_identity_matches(1, current, cancelled),
+                    model.action_enabled("Resume", &observed),
+                );
+            }
+        }
+        let mut bad = model.init_state();
+        bad.insert("queued", DEFERRED_GPU_CAPTURE_LIMIT as i64 + 1);
+        assert!(
+            !model.check_invariant("BoundedOwnership", &bad),
+            "negative control: an unbounded queue must fail"
+        );
+        bad.insert("queued", 1);
+        bad.insert("current", 2);
+        bad.insert("resumed", 1);
+        assert!(
+            !model.check_invariant("ResumeNeedsCurrentLiveRequest", &bad),
+            "negative control: completion on a replaced surface must fail"
+        );
+    }
+
+    fn capture_resume_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            CaptureReadyRedrawOwnership {
+                const Buggy = 0;
+                var submitted = 0;
+                var pending = 0;
+                var retry_open = 1;
+                var decided = 0;
+                var redraw = 0;
+                action Reject { submitted = 0; pending = 0; retry_open = 1; decided = 0; }
+                action Present { submitted = 1; pending = 0; retry_open = 1; decided = 0; }
+                action Wait { submitted = 0; pending = 1; retry_open = 1; decided = 0; }
+                action Fail { submitted = 0; pending = 0; retry_open = 0; decided = 0; }
+                action Decide {
+                    decided = 1;
+                    redraw = if Buggy == 1 { 0 } else {
+                        if submitted == 0 && pending == 0 && retry_open == 1 { 1 } else { 0 }
+                    };
+                }
+                invariant RejectionCannotStrandReadyFrame:
+                    decided == 0 || submitted == 1 || pending == 1 || retry_open == 0 || redraw == 1;
+            }
+        }
+    }
+
+    #[test]
+    fn capture_resume_rejection_redraw_guard_conforms_and_catches_stranding() {
+        let model = capture_resume_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        for (action, after, pending, retry_open) in [
+            ("Reject", 10, false, true),
+            ("Present", 11, false, true),
+            ("Wait", 10, true, true),
+            ("Fail", 10, false, false),
+        ] {
+            let mut state = model.init_state();
+            assert!(model.fire(action, &mut state));
+            assert!(model.fire("Decide", &mut state));
+            let redraw = !super::capture_resume_owns_next_frame(10, after, pending, retry_open);
+            assert_eq!(i64::from(redraw), state["redraw"], "{action}");
+        }
+        let mut rejected = model.init_state();
+        assert!(model.fire("Reject", &mut rejected));
+        assert!(model.fire("Decide", &mut rejected));
+        rejected.insert("redraw", 0);
+        assert!(
+            !model.check_invariant("RejectionCannotStrandReadyFrame", &rejected),
+            "negative control: merely calling a rejected capture is not presentation progress"
+        );
+    }
+
+    fn capture_failure_budget_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            CaptureCompletedFailureBudget {
+                const Buggy = 0;
+                var remaining = 3;
+                var failures = 0;
+                var waiting = 0;
+                var done = 0;
+                action Demand when (remaining > 0 && waiting == 0 && done == 0) {
+                    remaining = if Buggy == 1 { 3 } else { remaining };
+                    waiting = 1;
+                }
+                action Timeout when (waiting == 1) {
+                    remaining = remaining - 1;
+                    failures = failures + 1;
+                    waiting = 0;
+                    done = if remaining <= 1 { 1 } else { 0 };
+                }
+                action Success when (waiting == 1) { waiting = 0; done = 1; }
+                invariant OriginalBudgetConserved: remaining + failures == 3;
+                invariant CompletedFailuresBounded: failures <= 3;
+                invariant ExhaustionTerminates: remaining > 0 || done == 1;
+            }
+        }
+    }
+
+    #[test]
+    fn original_capture_failure_budget_survives_pending_and_requeue() {
+        let model = capture_failure_budget_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        let mut state = model.init_state();
+        let mut queue = VecDeque::new();
+        let (mut original, original_reply, _) = capture(17);
+        let (follower, follower_reply, _) = capture(18);
+        queue.push_back(follower);
+        for completed in 1..=crate::NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT {
+            assert!(model.fire("Demand", &mut state));
+            // Pending may carry a stale failure flag from earlier retry state;
+            // it still is not a completed attempt and must cost zero.
+            let budget_before = original.budget;
+            original.budget.record_attempt(true, false, true);
+            assert_eq!(original.budget, budget_before);
+            assert!(enqueue_deferred_gpu_capture(&mut queue, original, true).is_ok());
+            original = queue.pop_front().unwrap();
+            assert_eq!(
+                original.surface, 17,
+                "replaying head retains its ownership before followers"
+            );
+            assert_eq!(i64::from(original.budget.remaining), state["remaining"]);
+            assert!(
+                matches!(original_reply.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "the same caller still awaits this acquisition"
+            );
+
+            original.budget.record_attempt(false, false, true);
+            assert!(model.fire("Timeout", &mut state));
+            assert_eq!(i64::from(original.budget.remaining), state["remaining"]);
+            assert_eq!(i64::from(completed), state["failures"]);
+            assert!(model.check_invariant("OriginalBudgetConserved", &state));
+        }
+        assert_eq!(original.budget.remaining, 0);
+        assert!(
+            !crate::run_capture_present_barrier(original.budget.remaining, || {
+                panic!("exhausted original request attempted another acquisition")
+            }),
+            "the real capture barrier must not execute at budget zero"
+        );
+        assert!(
+            !model.action_enabled("Demand", &state),
+            "snapshot has no caller timer: the exhausted original budget itself must stop retries"
+        );
+        original
+            .request
+            .reject("capture exhausted its completed present attempts");
+        assert!(original_reply.recv().unwrap().is_err());
+        assert!(matches!(
+            original_reply.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert_eq!(
+            queue.front().unwrap().surface,
+            18,
+            "exhausted head no longer starves its live follower"
+        );
+        assert!(matches!(
+            follower_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let mut bad = state.clone();
+        bad.insert("remaining", 3);
+        assert!(
+            !model.check_invariant("OriginalBudgetConserved", &bad),
+            "negative control: resetting the budget on replay recreates unlimited timeouts"
+        );
+        let mut success = super::CapturePresentBudget::default();
+        success.record_attempt(false, true, true);
+        assert_eq!(
+            success,
+            super::CapturePresentBudget::default(),
+            "a successful serial is never charged as failure"
+        );
+    }
+
+    #[test]
+    fn deferred_gpu_capture_original_timeout_and_closed_window_reply_once() {
+        let mut app = App::headless_for_test();
+        let (request, receiver, cancellation) = capture(17);
+        assert!(
+            enqueue_deferred_gpu_capture(&mut app.deferred_gpu_captures, request, false).is_ok()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(cancellation.cancel());
+        assert!(
+            app.deferred_gpu_captures[0].request.cancelled(),
+            "the original caller cancellation remains attached"
+        );
+        app.prune_deferred_gpu_captures();
+        assert!(receiver.recv().unwrap().is_err());
+        app.prune_deferred_gpu_captures();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        assert!(app.deferred_gpu_captures.is_empty());
+
+        let (request, receiver, _) = capture(17);
+        app.deferred_gpu_captures.push_back(request);
+        app.windows.remove(&WindowId(0));
+        app.prune_deferred_gpu_captures();
+        assert!(receiver.recv().unwrap().is_err());
+        assert!(app.deferred_gpu_captures.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_queued_follower_preserves_the_heads_exact_tap() {
+        let mut app = App::headless_for_test();
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.capture_acquire_armed = true;
+        ws.capture_client_requested = true;
+        let (follower, receiver, cancellation) = capture(17);
+        assert!(!follower.exact_tap);
+        assert!(cancellation.cancel());
+        app.deferred_gpu_captures.push_back(follower);
+        app.prune_deferred_gpu_captures();
+        assert!(receiver.recv().unwrap().is_err());
+        assert!(app.windows[&WindowId(0)].capture_acquire_armed);
+        assert!(app.windows[&WindowId(0)].capture_client_requested);
+        // A stale owning continuation also cannot release a replacement's
+        // tap. This fixture has no GPU target, so the queued identity is stale.
+        let (mut owner, receiver, cancellation) = capture(17);
+        owner.exact_tap = true;
+        assert!(cancellation.cancel());
+        app.deferred_gpu_captures.push_back(owner);
+        app.prune_deferred_gpu_captures();
+        assert!(receiver.recv().unwrap().is_err());
+        assert!(app.windows[&WindowId(0)].capture_acquire_armed);
+        assert!(app.windows[&WindowId(0)].capture_client_requested);
+        // Positive control binds the real owner/identity guard to the real tap
+        // teardown without constructing an OS surface in a unit test.
+        assert!(!super::deferred_capture_owns_current_tap(
+            false,
+            17,
+            Some(17)
+        ));
+        assert!(!super::deferred_capture_owns_current_tap(
+            true,
+            17,
+            Some(18)
+        ));
+        assert!(!super::deferred_capture_owns_current_tap(true, 17, None));
+        assert!(super::deferred_capture_owns_current_tap(true, 17, Some(17)));
+        if super::deferred_capture_owns_current_tap(true, 17, Some(17)) {
+            app.discard_presented_client_capture(WindowId(0));
+        }
+        assert!(!app.windows[&WindowId(0)].capture_acquire_armed);
+        assert!(!app.windows[&WindowId(0)].capture_client_requested);
     }
 }

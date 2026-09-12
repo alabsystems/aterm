@@ -244,7 +244,7 @@ struct CgRect {
 /// Everything one swapchain configure sets — the module header's table, as
 /// data. Built by [`Self::aterm_present`] for the shipped values; tests build
 /// non-default values by hand to prove every setter is live.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
     /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (the SDR present)
     /// or [`PixelFormat::Rgba16Float`] (EDR). Everything else is rejected —
@@ -322,6 +322,10 @@ impl SwapchainConfig {
 pub(crate) struct Swapchain {
     /// The +1 layer. Owned; released on drop.
     layer: Obj,
+    /// Keep the attachment parent alive through deferred retirement, even when
+    /// NSView releases its layer during close. This is a lifetime guarantee,
+    /// not a promise that AppKit cannot explicitly change the hierarchy.
+    parent: Option<Obj>,
     /// Whether [`Self::attached`] parented the layer, and drop must unparent.
     is_attached: bool,
     /// Change gate for [`Self::sync_layer_geometry`]: the
@@ -351,6 +355,7 @@ impl Swapchain {
         Self::configure(&layer, device, config)?;
         Ok(Self {
             layer,
+            parent: None,
             is_attached: false,
             applied_geometry: None,
             format: config.format,
@@ -382,6 +387,7 @@ impl Swapchain {
         }
         let mut sc = Self {
             layer,
+            parent: Some(parent.clone_retained()),
             is_attached: true,
             applied_geometry: None,
             format: config.format,
@@ -720,18 +726,29 @@ impl Swapchain {
     /// the exhaustion test uses this directly BECAUSE the public type shape
     /// makes holding two drawables inexpressible.
     fn raw_next_drawable(&self) -> Option<(Obj, Obj)> {
-        let _pool = AutoreleasePool::new();
-        // SAFETY: `nextDrawable` and `texture` both return objects owned by
-        // the pool above (+0); `Obj::retain` lifts each to an owned +1 before
-        // the pool pops. A nil drawable short-circuits to None; a drawable
-        // with a nil texture cannot happen per the protocol, but the `?`
-        // treats it as an acquire failure rather than trusting it.
-        unsafe {
-            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
-            let drawable = Obj::retain(get(self.layer.id(), sel(c"nextDrawable")))?;
-            let texture = Obj::retain(get(drawable.id(), sel(c"texture")))?;
-            Some((drawable, texture))
+        acquire_drawable(&self.layer).map(OwnedDrawable::into_parts)
+    }
+
+    /// Retain only the layer needed by the worker, never the attached surface.
+    pub(crate) fn acquire_request(&self) -> LayerAcquire {
+        LayerAcquire {
+            layer: Some(self.layer.clone_retained()),
         }
+    }
+
+    pub(crate) fn frame_from_acquired(
+        &mut self,
+        acquired: OwnedDrawable,
+    ) -> Result<Frame<'_>, String> {
+        if acquired.source_layer.as_ref().map(Obj::id) != Some(self.layer.id()) {
+            return Err("drawable belongs to a different layer/loss domain".into());
+        }
+        let (drawable, texture) = acquired.into_parts();
+        Ok(Frame {
+            drawable,
+            texture,
+            swapchain: self,
+        })
     }
 
     // -- readback getters ---------------------------------------------------
@@ -882,6 +899,86 @@ impl Drop for Swapchain {
                 f(self.layer.id(), sel(c"removeFromSuperlayer"));
             }
         }
+        // The child has been explicitly detached; release the retained parent
+        // on this same retirement thread, inside a pool for driver dealloc work.
+        let _pool = AutoreleasePool::new();
+        drop(self.parent.take());
+    }
+}
+
+/// A retained CAMetalLayer used ONLY for nextDrawable. The owner defers every
+/// layer setter, geometry synchronization, and unparent until this request has
+/// completed. No NSView/NSWindow or mutable Swapchain crosses threads.
+pub(crate) struct LayerAcquire {
+    layer: Option<Obj>,
+}
+
+// SAFETY: this is specifically a retained CAMetalLayer, whose nextDrawable may
+// run on a rendering thread. Single request admission excludes another acquire
+// or layer mutation. Obj and Swapchain themselves remain !Send/!Sync.
+unsafe impl Send for LayerAcquire {}
+
+impl LayerAcquire {
+    pub(crate) fn run(self) -> AcquiredDrawable {
+        let started = aterm_time::Instant::now();
+        let drawable = acquire_drawable(self.layer.as_ref().expect("live acquisition layer"));
+        let wait_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        AcquiredDrawable { drawable, wait_ns }
+    }
+}
+
+impl Drop for LayerAcquire {
+    fn drop(&mut self) {
+        let _pool = AutoreleasePool::new();
+        drop(self.layer.take());
+    }
+}
+
+pub(crate) struct AcquiredDrawable {
+    pub(crate) drawable: Option<OwnedDrawable>,
+    pub(crate) wait_ns: u64,
+}
+
+/// Exclusive +1 ownership, released in a pool even for stale/closed results.
+pub(crate) struct OwnedDrawable {
+    // Retaining the origin prevents address reuse from defeating the domain check.
+    source_layer: Option<Obj>,
+    objects: Option<(Obj, Obj)>,
+}
+
+// SAFETY: Metal drawable/texture references support handoff between rendering
+// threads. Ownership moves once; neither reference is accessed concurrently.
+unsafe impl Send for OwnedDrawable {}
+
+impl OwnedDrawable {
+    fn into_parts(mut self) -> (Obj, Obj) {
+        self.objects.take().expect("owned drawable consumed once")
+    }
+}
+
+impl Drop for OwnedDrawable {
+    fn drop(&mut self) {
+        let _pool = AutoreleasePool::new();
+        drop(self.objects.take());
+        drop(self.source_layer.take());
+    }
+}
+
+fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
+    let _pool = AutoreleasePool::new();
+    #[cfg(feature = "acquire-conformance")]
+    super::acquire_probe::before_acquire();
+    // SAFETY: layer is a retained CAMetalLayer. Retain both +0 returns before
+    // the pool drains; nil safely refuses acquisition. The caller serializes
+    // this call with layer mutations and other acquisitions.
+    unsafe {
+        let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+        let drawable = Obj::retain(get(layer.id(), sel(c"nextDrawable")))?;
+        let texture = Obj::retain(get(drawable.id(), sel(c"texture")))?;
+        Some(OwnedDrawable {
+            source_layer: Some(layer.clone_retained()),
+            objects: Some((drawable, texture)),
+        })
     }
 }
 
@@ -3344,5 +3441,90 @@ mod tests {
             );
         }
         assert!(!latch.is_lost());
+    }
+
+    #[test]
+    fn attachment_parent_survives_its_callers_release_until_retirement() {
+        let Some(dev) = device() else { return };
+        let _test_pool = AutoreleasePool::new();
+        let config = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
+        let (sc, parent_id) = {
+            let _pool = AutoreleasePool::new();
+            let parent = plain_calayer();
+            let sc = Swapchain::attached(&dev, &parent, &config, Arc::new(loss::LossLatch::new()))
+                .expect("attached swapchain");
+            (sc, parent.id())
+        };
+        let child = sc.layer.clone_retained();
+        // SAFETY: a scalar object-property read on the independently retained
+        // child. The result is compared, never dereferenced or released here.
+        let parent_of = || unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> Id = msg();
+            get(child.id(), sel(c"superlayer"))
+        };
+        assert_eq!(
+            parent_of(),
+            parent_id,
+            "dropping the parent retain is the negative mutant"
+        );
+        drop(sc);
+        assert!(parent_of().is_null(), "retirement must detach the child");
+    }
+
+    #[test]
+    fn worker_handoff_accepts_its_origin_and_rejects_same_size_foreign_layers() {
+        let Some(dev) = device() else { return };
+        let _test_pool = AutoreleasePool::new();
+        let config = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
+        let latch = Arc::new(loss::LossLatch::new());
+        let mut destination = Swapchain::standalone(&dev, &config, Arc::clone(&latch))
+            .expect("destination swapchain");
+        let destination_id = destination.layer_ptr();
+
+        // Positive control: drive the very same retained-layer request/output
+        // handoff as the worker, then recover the exclusive Frame boundary.
+        let own = destination
+            .acquire_request()
+            .run()
+            .drawable
+            .expect("same-layer drawable");
+        let frame = destination
+            .frame_from_acquired(own)
+            .expect("the matching layer must remain admissible");
+        assert_eq!(frame.drawable_layer_ptr(), destination_id);
+        assert!(Arc::ptr_eq(frame.swapchain().latch(), &latch));
+        drop(frame);
+
+        // Equal size, format and device must not disguise a foreign origin.
+        // Check both shared and distinct loss domains: pointer identity is the
+        // boundary, not geometry equality or an accidentally shared latch.
+        for share_latch in [true, false] {
+            let origin_latch = if share_latch {
+                Arc::clone(&latch)
+            } else {
+                Arc::new(loss::LossLatch::new())
+            };
+            let origin = Swapchain::standalone(&dev, &config, origin_latch)
+                .expect("foreign swapchain with identical configuration");
+            let origin_id = origin.layer_ptr();
+            assert_ne!(origin_id, destination_id);
+            let foreign = origin
+                .acquire_request()
+                .run()
+                .drawable
+                .expect("foreign drawable");
+            assert_eq!(foreign.source_layer.as_ref().map(Obj::id), Some(origin_id));
+            // The packet must retain its origin even after the source owner
+            // disappears. It cannot be rebound to the surviving destination.
+            drop(origin);
+            let error = destination
+                .frame_from_acquired(foreign)
+                .expect_err("removing the origin guard must fail this negative control");
+            assert!(error.contains("different layer/loss domain"), "{error}");
+        }
+        assert!(
+            !latch.is_lost(),
+            "rejection must not poison a healthy device"
+        );
     }
 }

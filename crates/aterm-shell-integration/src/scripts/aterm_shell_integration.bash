@@ -147,7 +147,7 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
-# ─── The reroute directory, FIRST ───
+# ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
 # $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
 # stubs for the upstream Rust names (`aterm help reroute`), which the seam already
@@ -167,22 +167,43 @@ fi
 # adjacent copies (the first pass consumes the colon between them); and an EMPTY
 # entry ("here", to a POSIX shell) — the user's — survives because exactly the one
 # framing colon is stripped from each end.
+#
+# $ATPKG_AGENTS — exported by the atpkg shell.d hook sourced just above — names
+# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
+# (owner decision 2026-09-10). It fails the same way: measured 2026-09-10 on m27 at
+# PATH position 14, behind /opt/homebrew/bin and ~/.local/bin, so `codex` ran a brew
+# cask that could run no command and `claude` an older native install. It is moved
+# to the front first, then the reroute directory, so PATH reads reroute, agents, …
+# — the spawn seam's own order.
+__aterm_path_front() {
+    local __aterm_dir="$1" __aterm_p=":$PATH:" __aterm_q
+    # Fixpoint by POSIX equality, not by `[[ == pattern ]]`: under
+    # `shopt -s nocasematch` (a user's .bashrc runs before this file) the
+    # pattern test is case-insensitive while the replacement is not, and a
+    # case-variant spelling of the directory made the old loop spin forever
+    # before the prompt (2026-09-07 review).
+    while :; do
+        __aterm_q="${__aterm_p//":$__aterm_dir:"/:}"
+        [ "$__aterm_q" = "$__aterm_p" ] && break
+        __aterm_p="$__aterm_q"
+    done
+    # Only a framed remainder of exactly `:` means nothing is left; deciding on
+    # the stripped string dropped a sole empty entry (review finding 2026-09-10).
+    case "$__aterm_p" in
+        :) export PATH="$__aterm_dir" ;;
+        *)
+            __aterm_p="${__aterm_p#:}"
+            __aterm_p="${__aterm_p%:}"
+            export PATH="$__aterm_dir:$__aterm_p"
+            ;;
+    esac
+}
 __aterm_reroute_path_front() {
+    if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        __aterm_path_front "$ATPKG_AGENTS"
+    fi
     if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
-        local __aterm_p=":$PATH:" __aterm_q
-        # Fixpoint by POSIX equality, not by `[[ == pattern ]]`: under
-        # `shopt -s nocasematch` (a user's .bashrc runs before this file) the
-        # pattern test is case-insensitive while the replacement is not, and a
-        # case-variant spelling of the directory made the old loop spin forever
-        # before the prompt (2026-09-07 review).
-        while :; do
-            __aterm_q="${__aterm_p//":$ATERM_REROUTE_DIR:"/:}"
-            [ "$__aterm_q" = "$__aterm_p" ] && break
-            __aterm_p="$__aterm_q"
-        done
-        __aterm_p="${__aterm_p#:}"
-        __aterm_p="${__aterm_p%:}"
-        export PATH="$ATERM_REROUTE_DIR${__aterm_p:+:$__aterm_p}"
+        __aterm_path_front "$ATERM_REROUTE_DIR"
     fi
 }
 __aterm_reroute_path_front

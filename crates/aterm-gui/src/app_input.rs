@@ -748,20 +748,22 @@ pub(crate) fn typed_class_for(typed: Option<char>) -> aterm_effects::rainbow_kit
 }
 
 /// The SYNTH'S glyph class ([`aterm_effects::trail_sound::EventMeta::glyph_class`],
-/// `RAINBOW-KITTY-V2.md` §16 row 8): `0` letter/unknown, `1` `?`, `2` `!`,
-/// `3` digit, `4` punctuation. Filled at the keyed seam ONLY — an echo-born
-/// cue has no key behind it and carries `0`, exactly as it carries
-/// `shifted: false`. ASCII digits and punctuation, deliberately: the grafts
-/// this reads are keyboard-shaped taste, not Unicode categories.
+/// `RAINBOW-KITTY-V2.md` §16 row 8) — the twelve-way keyboard table
+/// ([`aterm_effects::trail_sound::glyph_class`]: letter, `?`, `!`, digit,
+/// stop, open, close, quote, line, rise, math, sigil). Filled at the keyed
+/// seam ONLY — an echo-born cue has no key behind it and carries `0`, exactly
+/// as it carries `shifted: false`.
+///
+/// The table itself lives with the field it fills
+/// ([`aterm_effects::trail_sound::typed_glyph_class`]) rather than here, for
+/// the same reason [`typed_glyph_rank`] does: three consumers read it — this
+/// seam, the offline `keyboard_song_ab` bench and the engine's own tests —
+/// and a voice chosen from two disagreeing copies of the table is not the
+/// voice the host asked for. This is the host's name for it, at the seam the
+/// design names.
 #[inline]
 pub(crate) fn typed_glyph_class(typed: Option<char>) -> u8 {
-    match typed {
-        Some('?') => 1,
-        Some('!') => 2,
-        Some(c) if c.is_ascii_digit() => 3,
-        Some(c) if c.is_ascii_punctuation() => 4,
-        _ => 0,
-    }
+    aterm_effects::trail_sound::typed_glyph_class(typed)
 }
 
 /// THE KEYED SEAM'S `at_ms` — the melody's clock for this press, read at the
@@ -1745,6 +1747,10 @@ struct PressClass<'ev> {
     kill_word: bool,
     /// Any Enter press, chorded or not (`is_plain_enter` is the bare form).
     enter_like: bool,
+    /// A KEYED ENTER for the armed celebration (`kitty_sing`, §27): the
+    /// Enter key, or raw controller bytes ending in a newline — an agent's
+    /// `send`/`turn` is a keypress; program output never reaches this path.
+    keyed_enter: bool,
     /// Any Tab press (joins the typed-hint disarm set).
     tab_key: bool,
     /// Bare printable glyph for the cosmetic feeds — the SHIFTED glyph the
@@ -1966,6 +1972,11 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
             ..
         }
     );
+    let keyed_enter = enter_like
+        || matches!(
+            ev,
+            InputEvent::KeySequence(bytes) if bytes.last().is_some_and(|b| matches!(b, b'\r' | b'\n'))
+        );
     let mut typed: Option<char> = None;
     let mut ime: Option<&str> = None;
     let mut backspace = false;
@@ -2078,6 +2089,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         kill_moves,
         kill_word,
         enter_like,
+        keyed_enter,
         tab_key,
         typed,
         ime,
@@ -3353,6 +3365,7 @@ impl App {
                     kill_moves,
                     kill_word,
                     enter_like,
+                    keyed_enter,
                     tab_key,
                     typed,
                     ime,
@@ -3818,7 +3831,7 @@ impl App {
                             } else {
                                 aterm_effects::trail_sound::SoundKind::Typed
                             };
-                            // THE CAPITAL'S OCTAVE. Shiftedness is a property
+                            // THE CAPITAL'S RING. Shiftedness is a property
                             // of the KEY EVENT and this is the only seam that
                             // has one: the echo path mints its Typed cues from
                             // a cursor delta and cannot tell `A` from `a`, so a
@@ -3827,7 +3840,18 @@ impl App {
                             // spacebar's comma already takes, and for the same
                             // reason. Never on the space: a word boundary is a
                             // word boundary in either case.
-                            let click_shifted = glyph_shifted && !spacebar;
+                            //
+                            // SHIFTEDNESS AGREES WITH `typed_class_for`
+                            // (2026-09-10), which asks the GLYPH: a Caps-Lock
+                            // capital rings and sparkles like a Shift capital
+                            // — the visual hero deal already counted it — and
+                            // gets no pickup, because Caps Lock mints no Shift
+                            // cue. `glyph_shifted` itself is left alone: it
+                            // also feeds `note_typed_glyph`'s VISUAL `shifted`
+                            // above, and the visuals were not asked to move.
+                            let click_shifted = (glyph_shifted
+                                || typed.is_some_and(char::is_uppercase))
+                                && !spacebar;
                             if click_audible
                                 && ws.cursor_glow.cue_keystroke_shifted(
                                     input_now,
@@ -4392,6 +4416,14 @@ impl App {
                                 |sing| sing.note_backspace(input_now),
                                 |sing, c| sing.note_char(input_now, session, c),
                             );
+                            // THE ENTER EDGE of an armed celebration (§27,
+                            // `fx celebrate on=enter`): the keystroke IS the
+                            // edge, so it is spent here on the input seam,
+                            // never on the echo. A no-op unless an `on=enter`
+                            // arm is pending for this session.
+                            if keyed_enter {
+                                ws.kitty_sing.note_keyed_enter(input_now, session);
+                            }
                         }
                         // The detector needs the compiled lexicon (multilingual
                         // feline + profanity) while `windows` is borrowed mutably;
@@ -5166,6 +5198,17 @@ impl App {
         if movement_capable && let Some(ws) = self.windows.get_mut(&wid) {
             ws.cursor_glow.note_user_gesture(input_now);
             ws.cursor_trail.note_user_gesture(input_now);
+            // THE UP-STRUM (RAINBOW-KITTY-V2.md §28, the even hand): a paste's
+            // one sound, keyed off the event KIND here — a human's Cmd-V and
+            // an agent's `paste` / `turn` remainder alike — and voiced by the
+            // music box alone (`cue_paste` records nothing under the nine
+            // other styles). The redraw is the courier: the frame's drain
+            // delivers it under the same host policy as every echo cue.
+            if ws.cursor_glow.cue_paste(input_now)
+                && let Some(w) = ws.os_window.as_ref()
+            {
+                w.request_redraw();
+            }
         }
         // Enqueue the paste on the session's ordered FIFO: it writes OFF the UI
         // thread (a 16 MiB paste into a stalled child must never block the event
@@ -12907,6 +12950,54 @@ mod keystroke_press_side_effect_tests {
         }
     }
     #[test]
+    fn fx_celebration_enter_uses_the_committed_input_path() {
+        use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
+        let enter = || InputEvent::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        for (event, fires) in [
+            (enter(), true),
+            (InputEvent::KeySequence(b"echo done\r".to_vec()), true),
+            (InputEvent::KeySequence(b"echo done\n".to_vec()), true),
+            (InputEvent::KeySequence(b"echo done".to_vec()), false),
+            (InputEvent::Text("done".to_string()), false),
+            (
+                InputEvent::Paste("done\n".to_string(), crate::input::PasteFraming::AtDrain),
+                false,
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            app.config = aterm_toml::from_str(
+                "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"",
+            )
+            .expect("valid fixture");
+            let wid = WindowId(0);
+            app.fx_control(crate::FxCtlOp::Celebrate {
+                sig: song_signature('C'),
+                bars: 2,
+                on: CelebrateOn::Enter,
+            })
+            .expect("positive fixture arms");
+            assert!(!app.windows[&wid].kitty_sing.external_live());
+            let _ = app.input(wid, event, Source::Human);
+            let sing = &app.windows[&wid].kitty_sing;
+            assert_eq!(
+                sing.external_live(),
+                fires,
+                "only accepted Enter-shaped input fires"
+            );
+            assert_eq!(
+                sing.armed_external().is_none(),
+                fires,
+                "the edge consumes exactly its arm"
+            );
+        }
+    }
+
+    #[test]
     fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -15099,23 +15190,54 @@ mod predictive_echo_input_gate_tests {
         );
     }
 
-    /// The synth's glyph class (§16 row 8): `0` letter/unknown, `1` `?`,
-    /// `2` `!`, `3` digit, `4` punctuation — keyboard-shaped, ASCII only, and
-    /// `0` for the space, the IME run and every non-ASCII glyph.
+    /// The synth's glyph class (§16 row 8): the twelve-way keyboard table —
+    /// `0` letter, `1` `?`, `2` `!`, `3` digit, `4` stop, `5` open, `6` close,
+    /// `7` quote, `8` line, `9` rise, `10` math, `11` sigil — ASCII only, and
+    /// `0` for the space, the IME run and every non-ASCII glyph. This seam's
+    /// job is to fill it from the keyed cue; the table is the engine's, and
+    /// the last loop pins that this is a DELEGATION and not a second copy.
     #[test]
-    fn the_synth_glyph_class_is_the_documented_five_way_split() {
+    fn the_synth_glyph_class_is_the_documented_twelve_way_split() {
         assert_eq!(typed_glyph_class(Some('?')), 1);
         assert_eq!(typed_glyph_class(Some('!')), 2);
         for digit in '0'..='9' {
             assert_eq!(typed_glyph_class(Some(digit)), 3, "{digit:?}");
         }
-        for punct in [',', '.', ';', ':', '-', '(', ')', '"', '\'', '/'] {
-            assert_eq!(typed_glyph_class(Some(punct)), 4, "{punct:?}");
+        for stop in [',', '.', ';', ':'] {
+            assert_eq!(typed_glyph_class(Some(stop)), 4, "{stop:?}");
+        }
+        for open in ['(', '[', '{'] {
+            assert_eq!(typed_glyph_class(Some(open)), 5, "{open:?}");
+        }
+        for close in [')', ']', '}'] {
+            assert_eq!(typed_glyph_class(Some(close)), 6, "{close:?}");
+        }
+        for quote in ['"', '\'', '`'] {
+            assert_eq!(typed_glyph_class(Some(quote)), 7, "{quote:?}");
+        }
+        for line in ['-', '_', '~', '\\', '|'] {
+            assert_eq!(typed_glyph_class(Some(line)), 8, "{line:?}");
+        }
+        assert_eq!(typed_glyph_class(Some('/')), 9);
+        for math in ['+', '=', '*', '%', '^', '<', '>'] {
+            assert_eq!(typed_glyph_class(Some(math)), 10, "{math:?}");
+        }
+        for sigil in ['@', '#', '$', '&'] {
+            assert_eq!(typed_glyph_class(Some(sigil)), 11, "{sigil:?}");
         }
         for letter in ['a', 'Z', ' ', 'é', '漢', '٣'] {
             assert_eq!(typed_glyph_class(Some(letter)), 0, "{letter:?}");
         }
         assert_eq!(typed_glyph_class(None), 0, "an IME run stamps nothing");
+        // THE DELEGATION: over every printable ASCII glyph the seam's answer
+        // IS the engine's.
+        for c in (0x20u8..0x7f).map(char::from) {
+            assert_eq!(
+                typed_glyph_class(Some(c)),
+                aterm_effects::trail_sound::typed_glyph_class(Some(c)),
+                "{c:?}: the host seam carries a second copy of the class table"
+            );
+        }
     }
 
     /// The synth's glyph RANK (§3.1's R2) — the ordered alphabet position the

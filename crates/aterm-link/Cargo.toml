@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+# THE ONE ATERM-SIDE FABRIC CRATE — the `aterm-link serve` bridge (§11.2).
+#
+# IN THE WORKSPACE SINCE 2026-09-10, and that is the change. It used to carry
+# its own `[workspace]` table and path-depend on `../../astream`, a SIBLING
+# CHECKOUT most clones do not have — so `cargo build` at the aterm root never
+# built it, no release ever carried it, and turning the fabric on meant building
+# two repositories by hand. The astream crates it needs are now VENDORED under
+# `vendor/astream/crates/`, the same way this repository already vendors winit
+# and the other forks it must keep reviewing, so a clean clone builds the bridge
+# and the shipped binary carries it.
+#
+# Re-syncing the vendored copy: see `vendor/astream/README.md`. The upstream is
+# github.com/alabsystems/astream, and the fabric now lives on its `main`.
+[package]
+name = "aterm-link"
+version.workspace = true
+# EDITION 2021, not the workspace's 2024, and deliberately: this crate and the
+# vendored astream crates beside it use `gen` as an identifier (the fabric's
+# `gen=<content_seq>:<fp16>` fence), which 2024 reserves as a keyword. Migrating
+# is a rename across two projects' source for no behavioural gain.
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+# The sealed cross-host transport (`--tcp --key-file`), OFF BY DEFAULT — so a
+# default build, and every shipped binary, carries no cipher tree at all.
+#
+# It is a feature and not a plain dependency because of what it costs: `aead`
+# pulls astream-aead and with it chacha20poly1305 + getrandom, and the further
+# rungs the x25519/ed25519 curves — 22 third-party packages. This repository
+# COUNTS packages (`crates/aterm-digest` exists because `sha2` + `hmac` cost
+# eight of them to expose four methods), so the cross-host wire is opt-in.
+#
+# They appear in `Cargo.lock` regardless, because a lockfile records every
+# optional resolution; `targo tree -p aterm-link -e normal` is what shows that
+# a default build compiles none of them. `tests/two_nodes_sealed.rs` is the one
+# thing that turns it on.
+sealed = ["astream-broker/aead"]
+
+[dependencies]
+# The bus. `cap` for the bound grant every fabric principal attaches with; `aead`
+# for the sealed TCP the cross-host rung (A5) deploys on. Together they are the
+# crate's WHOLE third-party surface: sha2, chacha20poly1305, getrandom.
+astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap"] }
+astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
+# aterm's own: the verb table (one source of truth for what the bridge may call)
+# and the control-socket vocabulary. Neither pulls the engine.
+aterm-types = { workspace = true }
+aterm-uds = { workspace = true }
+
+[[bin]]
+name = "aterm-link"
+path = "src/main.rs"

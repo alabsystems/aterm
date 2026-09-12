@@ -29,6 +29,80 @@ pub enum AbsoluteRowUpdate {
     Invalidate,
 }
 
+/// One translation of a band of SCREEN rows: rows `top..=bottom` (0-based, visible
+/// coordinates) moved by `delta` rows, and a row whose new index `r + delta` leaves
+/// the band is GONE — destroyed by the scroll, with nothing landing in its place.
+///
+/// This is the EXACT shape of every row-moving VT operation that is not a
+/// whole-screen scroll: a DECSTBM region scroll up (`delta < 0`, the region's top
+/// rows leave, its bottom rows are vacated blank), a region scroll down / reverse
+/// index at a region top (`delta > 0`), IL/DL at a cursor row inside the region
+/// (the band is `cursor_row..=region.bottom`), and the top-anchored archival
+/// scroll (the band is `0..=bottom` with `delta = -n`; the rows that leave enter
+/// history, which is still "gone from the screen"). The footer rows below a
+/// Codex-shaped region, and every row above an interior region, are OUTSIDE the
+/// band and did not move.
+///
+/// A host that caches screen coordinates (the cursor effects' ribbon, the sparks,
+/// the meteor landing rows) can apply this as a transform instead of discarding
+/// everything: a mark at row `r` inside the band goes to `r + delta` or dies, a
+/// mark outside the band stays. [`AbsoluteRowUpdate::Splice`] cannot say this — it
+/// carries only the history insertion point, which the RI-only phase of an inline
+/// viewport never produces — so the grid records the band itself, with numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowBandMove {
+    /// First screen row of the band that moved (inclusive).
+    pub top: u16,
+    /// Last screen row of the band that moved (inclusive).
+    pub bottom: u16,
+    /// Signed row displacement: positive is DOWN the screen (a reverse index or IL),
+    /// negative is UP (a region scroll up, DL, or the archival top-anchored scroll).
+    pub delta: i16,
+}
+
+/// How many DISTINCT row-band moves one parser batch records before the record
+/// degrades to [`RowBandMoves::inexact`].
+///
+/// EIGHT, and it is a coverage claim over the measured shapes rather than a taste:
+/// the real Codex capture (scratchpad `codex-bytes.bin`, 109 842 B, 781 byte records)
+/// never carries more than ONE band per batch — every streamed line is its own
+/// synchronized-output block, and the five reverse indices of an Enter COMPOSE into
+/// one entry (see [`GridPresentationState::record_row_band_move`]). A tmux pane
+/// repaint that scrolls two panes and a status row in one write is three. Anything
+/// that needs a ninth distinct band in one batch is a full-screen re-layout, where
+/// "discard and rebuild" IS the honest answer, so the overflow does not drop a move
+/// silently: it marks the whole batch inexact and the host falls back to today's
+/// invalidation.
+pub const ROW_BAND_MOVES_PER_BATCH: usize = 8;
+
+/// The row-band moves one parser batch recorded, in the order they happened.
+///
+/// Fixed-arity and `Copy` on purpose, like [`BandSet`]: this lives in the grid's
+/// per-batch presentation state and is written from the scroll paths, so it must
+/// never allocate. `inexact` is the fail-closed bit: once set, the moves listed are
+/// NOT a complete description of the batch's row motion (a margined rectangle
+/// scroll, a column op, an alt-screen flip, RIS, a ninth band, a displacement past
+/// `i16`) and a consumer must treat the batch as an invalidation exactly as before
+/// this record existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowBandMoves {
+    /// The recorded moves; only `moves[..len]` is meaningful.
+    pub moves: [RowBandMove; ROW_BAND_MOVES_PER_BATCH],
+    /// Number of live entries in `moves`.
+    pub len: u8,
+    /// The batch moved rows in a way these entries do not fully describe.
+    pub inexact: bool,
+}
+
+impl RowBandMoves {
+    /// The recorded moves, oldest first.
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> &[RowBandMove] {
+        &self.moves[..usize::from(self.len)]
+    }
+}
+
 /// How many DISJOINT damage bands one parser batch keeps before they degrade to
 /// their hull.
 ///
@@ -312,6 +386,14 @@ pub struct GridPresentationState {
     /// is both. An EL or a DECERA is only the latter — it rewrites cells without
     /// moving any row — which is why the two cannot be derived from one another.
     pub coordinates_invalidated: bool,
+    /// The row-band moves behind this batch's `coordinates_invalidated`, with
+    /// numbers — see [`RowBandMove`]. Recorded BESIDE the flag, never instead of
+    /// it: every producer still sets `coordinates_invalidated` (or the splice)
+    /// exactly as before, so the epoch contract every host relies on is unchanged,
+    /// and a host that can translate bands reads this as an ADDITIONAL exact
+    /// explanation of that epoch step. Drained once per batch by
+    /// `take_row_band_moves()`.
+    pub row_band_moves: RowBandMoves,
     /// Pending logical-row insertion for durable absolute-row metadata.
     pub pending_absolute_row_update: Option<AbsoluteRowUpdate>,
     /// Independent copy retained until terminal post-processing remaps the
@@ -403,6 +485,7 @@ impl GridPresentationState {
             last_output_damage_abs: None,
             last_resize_row_shift: 0,
             coordinates_invalidated: false,
+            row_band_moves: RowBandMoves::default(),
             pending_absolute_row_update: None,
             pending_selection_row_update: None,
             row_rev: Vec::new(),
@@ -482,6 +565,82 @@ impl GridPresentationState {
     #[inline]
     pub(crate) fn take_coordinates_invalidated(&mut self) -> bool {
         std::mem::take(&mut self.coordinates_invalidated)
+    }
+
+    /// Record that screen rows `top..=bottom` moved by `delta` rows (see
+    /// [`RowBandMove`]), COMPOSING with the newest entry when the two moves are
+    /// provably one translation.
+    ///
+    /// The compose rule: the new move `(top, bottom, delta)` folds into the newest
+    /// entry `(t1, b1, d1)` iff `b1 == bottom`, `d1` and `delta` have the same sign,
+    /// and either `top == t1` or (for DOWNWARD moves only) `top == t1 + d1`. The
+    /// exactness argument, per case, for a mark sitting at original row `r`:
+    ///
+    /// * Same band twice (`top == t1`), either sign: the first move sends `r` to
+    ///   `r + d1` or kills it; the second sends the survivor to `r + d1 + delta` or
+    ///   kills it; the rows the first move vacated are blank and hold no mark, so
+    ///   moving them again changes nothing. That is exactly `(t1, b1, d1 + delta)`.
+    ///   This is the Codex Enter (five reverse indices on one region → `+5`) and
+    ///   the pinned phase of its streaming (`(0, 51, -1)` per line).
+    /// * Downward, band narrowed from above by exactly the first displacement
+    ///   (`top == t1 + d1`, `d1 > 0`): the rows the second move excludes,
+    ///   `t1..t1 + d1 - 1`, are precisely the rows the first move vacated — blank, no
+    ///   mark — so excluding them is a no-op on marks and the composite is again
+    ///   `(t1, b1, d1 + delta)`. This is an inline viewport growing one row per
+    ///   line while its top slides down (`(24, 56, +1)` then `(25, 56, +1)`).
+    /// * Upward with `top == t1 + d1` (`d1 < 0`, so `top < t1`) is NOT exact and is
+    ///   refused: the second band is WIDER from above and destroys rows
+    ///   `top..t1 - 1` that the first move never touched, rows that can hold marks
+    ///   the composite `(t1, b1, d1 + delta)` would report as untouched. The only
+    ///   exact upward composition on a shared bottom is the same top.
+    ///
+    /// Anything else — a different bottom, mixed signs, any other top — is not one
+    /// viewport slide and is recorded as a SEPARATE entry (the consumer replays them
+    /// in order). When the record is already full (`ROW_BAND_MOVES_PER_BATCH`) or a
+    /// composed displacement would not fit `i16`, the batch is marked `inexact`
+    /// rather than losing a move silently. A zero delta or an inverted band records
+    /// nothing: neither moved a row.
+    pub(crate) fn record_row_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        let record = &mut self.row_band_moves;
+        let len = usize::from(record.len);
+        if let Some(newest) = len.checked_sub(1).and_then(|i| record.moves.get_mut(i)) {
+            let same_bottom = newest.bottom == bottom;
+            let same_sign = newest.delta.signum() == delta.signum();
+            let same_top = newest.top == top;
+            let narrowed_by_first_shift = newest.delta > 0
+                && i32::from(top) == i32::from(newest.top) + i32::from(newest.delta);
+            if same_bottom && same_sign && (same_top || narrowed_by_first_shift) {
+                match newest.delta.checked_add(delta) {
+                    Some(composed) => newest.delta = composed,
+                    None => record.inexact = true,
+                }
+                return;
+            }
+        }
+        match record.moves.get_mut(len) {
+            Some(slot) => {
+                *slot = RowBandMove { top, bottom, delta };
+                record.len += 1;
+            }
+            None => record.inexact = true,
+        }
+    }
+
+    /// Mark this batch's row motion as NOT fully described by its band record —
+    /// the fail-closed bit every non-band coordinate move sets (see
+    /// [`RowBandMoves::inexact`]).
+    #[inline]
+    pub(crate) fn poison_row_band_moves(&mut self) {
+        self.row_band_moves.inexact = true;
+    }
+
+    /// Drain this batch's row-band move record.
+    #[inline]
+    pub(crate) fn take_row_band_moves(&mut self) -> RowBandMoves {
+        std::mem::take(&mut self.row_band_moves)
     }
 
     /// Drain the most recent resize's revealed-history row shift.

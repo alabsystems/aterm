@@ -239,10 +239,11 @@ impl App {
     ///    worker is `App`-owned and a Settings reducer cannot reach `App`.
     ///
     /// The NAME is still the Smart Titles one, for the benefit of its five
-    /// existing call sites in `title_summary.rs`. The honest long-term shape is
-    /// one line in `about_to_wait` calling each publisher by its own name; that
-    /// is a `lib.rs` edit this change deliberately does not make, and it is
-    /// recorded rather than hidden.
+    /// existing call sites in `title_summary.rs`. The consent half no longer
+    /// depends on this pairing: `about_to_wait` calls
+    /// [`Self::sync_settings_consent_posture`] by its own name on every park
+    /// (2026-09-10), because a Settings ▸ Security opened by any route other
+    /// than a native-view action showed no posture at all otherwise.
     pub(crate) fn sync_settings_title_summary_health(&mut self) {
         self.publish_settings_title_summary_health();
         self.sync_settings_consent_posture();
@@ -372,15 +373,22 @@ impl App {
         // warmup` re-checks every gate itself — the master switch, the mode, and
         // headless — so a stale request cannot smuggle a worker past config.
         let mut requested = false;
+        let mut opened = false;
         for (_, view) in &targets {
             if let Some(crate::native_app::AppViewState::Settings(state)) =
                 self.native_runtime.view_state_mut(*view)
             {
                 requested |= state.take_consent_warmup_request();
+                opened |= state.take_consent_open_request();
             }
         }
         if requested {
             let _ = self.begin_consent_warmup();
+        }
+        // The page's Open Privacy & Security… is the card's Open Settings by
+        // another door: the same `opened` marker, and the same watch for the ✓.
+        if opened {
+            self.note_macos_access_settings_opened(std::time::Instant::now());
         }
         let access = self.macos_access_projection();
         let gestures = crate::native_settings::ConsentGestures::for_instance(self.headless);
@@ -417,13 +425,22 @@ impl App {
         let tccutil = tccutil_presence_once();
         let warmup_live = self.consent_warmup_live();
         let warmup_rows = self.consent_warmup_rows().to_vec();
+        let evidence = aterm_containment::SpikeEvidence::UNMEASURED;
+        let split = crate::control_privacy::covers_split(evidence);
         crate::native_settings::MacosAccess {
             enabled: facts.enabled,
             fda: facts.fda,
             probe: facts.probe,
             dr: facts.dr,
-            evidence: aterm_containment::SpikeEvidence::UNMEASURED,
+            evidence,
             bundle_id: facts.bundle_id,
+            install: facts.install,
+            running: facts.running,
+            sessions_total: facts.sessions_total,
+            sessions_adopted: facts.sessions_adopted,
+            covers: split.covers,
+            uncovered: split.uncovered,
+            unmeasured: split.unmeasured,
             tccutil,
             warmup_offered,
             warmup_live,

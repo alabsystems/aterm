@@ -31,37 +31,38 @@ use aterm_spec::derive::{
     cursor_companion_owner_lifecycle_model, cursor_cutout_clip_model, cursor_effect_scroll_model,
     cursor_hint_license_model, cursor_model, cursor_scroll_signal_model,
     cursor_viewport_lifecycle_model, damage_to_present_model, deco_band_containment_model,
-    deco_phase_model, done_mark_lru_model, dsu_quiescence_model, effect_phase_lock_model,
-    effect_present_rebase_model, effect_presentability_settle_model, emacs_search_navigation_model,
-    emacs_search_repeat_work_model, evict_full_model, exact_instance_retention_model,
-    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
-    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
-    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
-    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
-    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_flush_worker_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
-    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
-    manual_config_diagnostics_lane_model, manual_config_handoff_model,
-    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
-    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
-    native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_document_queue_model,
-    native_draft_journal_model, native_editor_command_palette_model, native_editor_modal_model,
-    native_editor_viewport_model, native_file_watch_model, native_markdown_history_model,
-    native_markdown_viewport_model, native_packages_worker_model,
-    native_recovery_interaction_model, native_reopen_ledger_model, native_save_intent_latch_model,
-    native_settings_draft_close_model, native_settings_singleton_model, native_tab_identity_model,
-    native_update_admission_model, native_update_attempt_identity_model,
-    native_update_auto_intent_model, native_update_channel_scan_model,
-    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
-    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
-    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
-    native_update_status_reconciliation_model, native_update_worker_queue_model,
-    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
-    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
-    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
+    deco_phase_model, done_mark_lru_model, dsu_quiescence_model, echo_ledger_bridge_model,
+    effect_phase_lock_model, effect_present_rebase_model, effect_presentability_settle_model,
+    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
+    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
+    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
+    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
+    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
+    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
+    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
+    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
+    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
+    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
+    motion_policy_model, native_async_delivery_model, native_capture_source_model,
+    native_close_plan_model, native_config_observation_handoff_model,
+    native_config_transaction_model, native_control_routing_model,
+    native_document_publication_model, native_document_queue_model, native_draft_journal_model,
+    native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
+    native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
+    native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
+    native_save_intent_latch_model, native_settings_draft_close_model,
+    native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
+    native_update_attempt_identity_model, native_update_auto_intent_model,
+    native_update_channel_scan_model, native_update_disk_transaction_model,
+    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
+    native_update_menu_activation_model, native_update_overlap_handoff_model,
+    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
+    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
+    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model,
+    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
+    operator_resync_cursor_model, operator_wal_actuator_model,
     output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
     path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
     present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
@@ -141,6 +142,11 @@ fn derived_ring_spec_model_checks() {
 fn derived_cursor_spec_model_checks() {
     // Exercises the multi-action / UNCHANGED generation path through `ty`.
     assert_model_checks(&cursor_model());
+}
+
+#[test]
+fn derived_momentum_wait_read_proves_and_catches_expired_reparking() {
+    assert_proves_and_catches(&aterm_spec::derive::momentum_wait_read_model());
 }
 
 #[test]
@@ -7841,11 +7847,11 @@ fn derived_reduced_motion_companion_handoff_proves_and_catches_blackout() {
 
     let mut cadenced = model.init_state();
     assert!(model.fire("StartReducedSong", &mut cadenced));
-    assert_eq!(cadenced[&"singer_visible"], 1);
-    assert_eq!(cadenced[&"pet_visible"], 0);
+    assert_eq!(cadenced[&"singer_visible"], 0);
+    assert_eq!(cadenced[&"pet_visible"], 1);
     assert!(model.fire("SampleAtHalfCutoff", &mut cadenced));
     assert_eq!(cadenced[&"pet_ready"], 1);
-    assert_eq!(cadenced[&"singer_visible"], 1);
+    assert_eq!(cadenced[&"singer_visible"], 0);
     assert!(model.fire("SampleCadencedBelowHalf", &mut cadenced));
     assert_eq!(cadenced[&"phase"], 3);
     assert_eq!(cadenced[&"singer_visible"] + cadenced[&"pet_visible"], 1);
@@ -7863,8 +7869,8 @@ fn derived_reduced_motion_companion_handoff_proves_and_catches_blackout() {
     assert!(model.fire("SampleLateBelowHalf", &mut late));
     assert_eq!(late[&"phase"], 3);
     assert_eq!(late[&"pet_ready"], 1);
-    assert_eq!(late[&"singer_visible"], 1);
-    assert_eq!(late[&"pet_visible"], 0);
+    assert_eq!(late[&"singer_visible"], 0);
+    assert_eq!(late[&"pet_visible"], 1);
     assert!(model.check_invariant("LiveTailKeepsCompanionVisible", &late));
     assert!(model.fire("SampleBelowFaceSwap", &mut late));
     assert_eq!(late[&"pet_visible"], 1);
@@ -7892,6 +7898,10 @@ fn derived_reduced_motion_companion_handoff_proves_and_catches_blackout() {
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut at_half = buggy.init_state();
     assert!(buggy.fire("StartReducedSong", &mut at_half));
+    assert!(
+        !buggy.check_invariant("ResidentAlwaysOwnsPetMode", &at_half),
+        "the former head substitution must fail even before a blackout"
+    );
     assert!(buggy.fire("SampleAtHalfCutoff", &mut at_half));
     assert_eq!(at_half[&"pet_ready"], 1);
     assert_eq!(at_half[&"singer_visible"] + at_half[&"pet_visible"], 0);
@@ -8237,6 +8247,317 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert_eq!(refund["spent"], 1, "a retired hint gave a spent cell back");
     assert_eq!(refund["credit_refunded"], 1);
     assert!(!buggy.check_invariant("SpentCreditsNeverComeBack", &refund));
+}
+
+/// THE ECHO LEDGER (`docs/design/RAINBOW-KITTY-V2.md`, "The late echo's
+/// one-press case"): a licensed typed move may lay the hole the seam refused
+/// only out of presses OLDER than its licensing key, exactly, one press one
+/// cell; a hop those presses do not explain lays nothing and forgets them; a
+/// press past the patience buys nothing; no cell is bridged outside a
+/// licensed move, and none on a refused one. Tier-0 proves the seven laws
+/// over the whole bounded space and requires the `Buggy=1` family to falsify
+/// every one when isolated;
+/// `StateBounded` is the space, not a claim. Tier-1 drives the real `Engine`
+/// in `aterm-effects` (`the_real_engine_conforms_to_the_echo_ledger_model`).
+#[test]
+fn derived_echo_ledger_bridge_proves_and_catches_the_unexplained_hole() {
+    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect();
+    assert!(
+        registered.contains("EchoLedgerBridge"),
+        "EchoLedgerBridge must participate in the global spec registry"
+    );
+
+    let model = echo_ledger_bridge_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["StateBounded"]);
+
+    // THE SCREENSHOT: a key whose echo the seam refused (the caret advanced,
+    // nothing arrived), then the next key, echoed under the host's sweep on
+    // ITS clock. The hole is one cell, the older press is one, the bridge lays
+    // it and spends both presses.
+    let mut relit = model.init_state();
+    assert!(model.fire("KeyPressed", &mut relit));
+    assert!(model.fire("UnlicensedAdvance", &mut relit));
+    assert!(model.fire("KeyPressed", &mut relit));
+    assert_eq!(
+        relit["older"], 1,
+        "the refused key is older than the licensing key"
+    );
+    assert_eq!(relit["younger"], 1, "the licensing key itself");
+    assert_eq!(relit["hole"], 1);
+    assert!(
+        !model.fire("SweptMoveRefuses", &mut relit),
+        "an exactly explained hole is not a refusal"
+    );
+    assert!(model.fire("SweptMovePays", &mut relit));
+    assert_eq!(relit["bridged"], 1, "the hole is laid");
+    assert_eq!(relit["spent"], 2, "…and both presses are spent");
+    assert_eq!(relit["older"] + relit["younger"], 0);
+    assert_eq!(relit["hole"], 0);
+    assert_eq!(relit["laid_hole"], 1);
+    assert_eq!(relit["last_older"], 1);
+
+    // THE CONTROL: the same hop with no press behind it. Program output moved
+    // the caret; the ledger lays nothing and forgets the key it was holding.
+    let mut nudged = model.init_state();
+    assert!(model.fire("UnlicensedAdvance", &mut nudged));
+    assert!(model.fire("KeyPressed", &mut nudged));
+    assert!(
+        !model.fire("SweptMovePays", &mut nudged),
+        "a hole no older press explains is not paid"
+    );
+    assert!(model.fire("SweptMoveRefuses", &mut nudged));
+    assert_eq!(nudged["bridged"], 0);
+    assert_eq!(nudged["forfeited"], 1, "the key's press is forfeited");
+    assert_eq!(nudged["just_refused"], 1);
+    assert!(model.check_invariant("ForfeitedCreditsNeverReturn", &nudged));
+
+    // THE ADVERSARY'S BREAK: a nudge, then a fast burst of two keys. The first
+    // key's echo lands one past the mirror with the second press in flight
+    // behind it; the in-flight press's glyph lies to the RIGHT, so it cannot
+    // pay for the nudge's cell — and the refusal forgets both.
+    let mut burst = model.init_state();
+    assert!(model.fire("UnlicensedAdvance", &mut burst));
+    assert!(model.fire("KeyPressed", &mut burst));
+    assert!(model.fire("PressInFlight", &mut burst));
+    assert_eq!((burst["older"], burst["younger"], burst["hole"]), (0, 2, 1));
+    assert!(!model.fire("SweptMovePays", &mut burst));
+    assert!(model.fire("SweptMoveRefuses", &mut burst));
+    assert_eq!(burst["bridged"], 0, "three presses never light four cells");
+    assert_eq!(burst["forfeited"], 2);
+
+    // THE PHANTOM: a swallowed press, then an ordinary echo with no hole. The
+    // older press explains nothing, so the ordinary echo forgets it rather
+    // than carrying it forward to pay for the first program nudge.
+    let mut phantom = model.init_state();
+    assert!(model.fire("KeyPressed", &mut phantom));
+    assert!(model.fire("KeyPressed", &mut phantom));
+    assert_eq!(
+        (phantom["older"], phantom["younger"], phantom["hole"]),
+        (1, 1, 0)
+    );
+    assert!(!model.fire("SweptMovePays", &mut phantom));
+    assert!(model.fire("SweptMoveRefuses", &mut phantom));
+    assert_eq!(phantom["older"] + phantom["younger"], 0);
+    assert!(model.fire("UnlicensedAdvance", &mut phantom));
+    assert!(model.fire("KeyPressed", &mut phantom));
+    assert!(!model.fire("SweptMovePays", &mut phantom));
+    assert!(model.fire("SweptMoveRefuses", &mut phantom));
+    assert_eq!(
+        phantom["bridged"], 0,
+        "the phantom credit never rolls forward"
+    );
+
+    // THE UNSWEPT ECHO: two presses, a two-cell licensed move the host did not
+    // sweep, starting at the mirror. Both cells are the presses' own.
+    let mut batch = model.init_state();
+    assert!(model.fire("KeyPressed", &mut batch));
+    assert!(model.fire("PressInFlight", &mut batch));
+    assert!(!model.fire("UnsweptMoveRefuses", &mut batch));
+    assert!(model.fire("UnsweptMovePays", &mut batch));
+    assert_eq!(batch["bridged"], 2);
+    assert_eq!(batch["spent"], 2);
+    assert_eq!(batch["older"] + batch["younger"], 0);
+    // …and with a hole before it there is no clock to partition by: refused.
+    let mut holed = model.init_state();
+    assert!(model.fire("KeyPressed", &mut holed));
+    assert!(model.fire("PressInFlight", &mut holed));
+    assert!(model.fire("UnlicensedAdvance", &mut holed));
+    assert!(!model.fire("UnsweptMovePays", &mut holed));
+    assert!(model.fire("UnsweptMoveRefuses", &mut holed));
+    assert_eq!(holed["bridged"], 0);
+    assert_eq!(holed["forfeited"], 2);
+
+    // THE PATIENCE: a press the program swallowed goes stale; the next move
+    // drops it as expired, and it pays for nothing.
+    let mut swallowed = model.init_state();
+    assert!(model.fire("KeyPressed", &mut swallowed));
+    assert!(model.fire("TimePasses", &mut swallowed));
+    assert_eq!(
+        (swallowed["older"], swallowed["younger"], swallowed["stale"]),
+        (0, 0, 1)
+    );
+    assert!(model.fire("UnlicensedAdvance", &mut swallowed));
+    assert!(model.fire("KeyPressed", &mut swallowed));
+    assert!(!model.fire("SweptMovePays", &mut swallowed));
+    assert!(model.fire("SweptMoveRefuses", &mut swallowed));
+    assert_eq!(
+        swallowed["expired"], 1,
+        "the stale press was dropped, not spent"
+    );
+    assert_eq!(swallowed["stale"], 0);
+    assert_eq!(swallowed["bridged"], 0);
+    assert!(model.check_invariant("ExpiredPressesBuyNothing", &swallowed));
+
+    // A navigation licence (a move-shaped clear), an erase (an in-place
+    // clear), and a retreat: the first forgets the waiting press and the
+    // hole, the second forgets the press and leaves the hole standing, the
+    // third leaves the fresh press waiting.
+    let mut nav = model.init_state();
+    assert!(model.fire("KeyPressed", &mut nav));
+    assert!(model.fire("UnlicensedAdvance", &mut nav));
+    assert!(model.fire("LedgerForgotten", &mut nav));
+    assert_eq!((nav["older"], nav["younger"], nav["hole"]), (0, 0, 0));
+    assert_eq!(nav["forfeited"], 1);
+    let mut erased = model.init_state();
+    assert!(model.fire("KeyPressed", &mut erased));
+    assert!(model.fire("UnlicensedAdvance", &mut erased));
+    assert!(model.fire("LedgerClearedInPlace", &mut erased));
+    assert_eq!(
+        (erased["older"], erased["younger"], erased["hole"]),
+        (0, 0, 1),
+        "an in-place clear leaves the mirror, and so the hole, where it was"
+    );
+    assert_eq!(erased["forfeited"], 1);
+    assert!(
+        !model.fire("SweptMovePays", &mut erased),
+        "…and nothing is left to explain that hole"
+    );
+    let mut retreat = model.init_state();
+    assert!(model.fire("KeyPressed", &mut retreat));
+    assert!(model.fire("UnlicensedAdvance", &mut retreat));
+    assert!(model.fire("RetreatKeepsPresses", &mut retreat));
+    assert_eq!(
+        (retreat["older"], retreat["younger"], retreat["hole"]),
+        (0, 1, 0)
+    );
+    assert_eq!(retreat["forfeited"], 0);
+    // …but a retreat over a STALE press drops it: the engine expires before
+    // it looks at the move's shape.
+    let mut stale_retreat = model.init_state();
+    assert!(model.fire("KeyPressed", &mut stale_retreat));
+    assert!(model.fire("TimePasses", &mut stale_retreat));
+    assert!(model.fire("RetreatKeepsPresses", &mut stale_retreat));
+    assert_eq!(
+        (stale_retreat["stale"], stale_retreat["expired"]),
+        (0, 1),
+        "the stale press is dropped by the retreat, not kept"
+    );
+    assert!(model.check_invariant("ExpiredPressesBuyNothing", &stale_retreat));
+
+    // THE PARTIAL EXPIRY: presses are banked in clock order, so the patience
+    // elapses oldest-first — the older press goes stale while the key stays
+    // fresh, and the key's echo pays only its own cell.
+    let mut partial = model.init_state();
+    assert!(model.fire("KeyPressed", &mut partial));
+    assert!(model.fire("KeyPressed", &mut partial));
+    assert_eq!((partial["older"], partial["younger"]), (1, 1));
+    assert!(model.fire("OnePressGoesStale", &mut partial));
+    assert_eq!(
+        (partial["older"], partial["younger"], partial["stale"]),
+        (0, 1, 1),
+        "the OLDER press is the one that went stale"
+    );
+    assert!(model.fire("SweptMovePays", &mut partial));
+    assert_eq!(
+        (partial["expired"], partial["spent"], partial["bridged"]),
+        (1, 1, 0)
+    );
+    assert!(model.check_invariant("OnePressOneCell", &partial));
+
+    // THE MUTANTS, each named and each with its own concrete counterexample.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // The first ledger: the burst's in-flight press pays for the nudge's cell.
+    let mut four_cells = buggy.init_state();
+    assert!(buggy.fire("UnlicensedAdvance", &mut four_cells));
+    assert!(buggy.fire("KeyPressed", &mut four_cells));
+    assert!(buggy.fire("PressInFlight", &mut four_cells));
+    assert!(buggy.fire("SweptMovePays", &mut four_cells));
+    assert_eq!(four_cells["laid_hole"], 1);
+    assert_eq!(four_cells["last_older"], 0);
+    assert!(!buggy.check_invariant("BridgedNeverExceedsOlderPresses", &four_cells));
+    assert!(!buggy.check_invariant("AProgramGapIsNeverBridged", &four_cells));
+
+    // …and the other half of the partition: two swallowed keys before a
+    // one-cell nudge, the nudge laid from a press that never produced it.
+    let mut inexact = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut inexact));
+    assert!(buggy.fire("KeyPressed", &mut inexact));
+    assert!(buggy.fire("UnlicensedAdvance", &mut inexact));
+    assert!(buggy.fire("KeyPressed", &mut inexact));
+    assert_eq!((inexact["older"], inexact["hole"]), (2, 1));
+    assert!(buggy.fire("SweptMovePays", &mut inexact));
+    assert!(buggy.check_invariant("BridgedNeverExceedsOlderPresses", &inexact));
+    assert!(!buggy.check_invariant("AProgramGapIsNeverBridged", &inexact));
+
+    // A refusal that keeps the ledger: the presses survive to fund a later cell.
+    let mut kept = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut kept));
+    assert!(buggy.fire("KeyPressed", &mut kept));
+    assert!(buggy.fire("SweptMoveRefuses", &mut kept));
+    assert_eq!(kept["older"] + kept["younger"], 2);
+    assert!(!buggy.check_invariant("ForfeitedCreditsNeverReturn", &kept));
+
+    // The keydown that pre-draws its cell — T1 broken in ledger terms.
+    let mut predrawn = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut predrawn));
+    assert_eq!(predrawn["bridged"], 1);
+    assert_eq!(predrawn["spent"], 0);
+    assert!(!buggy.check_invariant("NoBridgeOutsideALicensedMove", &predrawn));
+
+    // One press, two cells: the unswept batch billed against a single press.
+    let mut double = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut double));
+    assert!(buggy.fire("UnsweptMovePays", &mut double));
+    assert_eq!(double["spent"], 2);
+    assert_eq!(double["banked"], 1);
+    assert!(!buggy.check_invariant("OnePressOneCell", &double));
+
+    // A stale press spent as payment instead of dropped.
+    let mut stale_paid = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut stale_paid));
+    assert!(buggy.fire("TimePasses", &mut stale_paid));
+    assert!(buggy.fire("KeyPressed", &mut stale_paid));
+    assert!(buggy.fire("SweptMovePays", &mut stale_paid));
+    assert_eq!(stale_paid["stale_gone"], 1);
+    assert_eq!(
+        stale_paid["expired"], 0,
+        "the mutant spent the swallowed press"
+    );
+    assert!(!buggy.check_invariant("ExpiredPressesBuyNothing", &stale_paid));
+    // …and when the stale presses alone cover the bill, the older ones
+    // SURVIVE on the mutant's ledger: the mutant spends, it does not
+    // evaporate — conservation holds, only the patience law falls.
+    let mut stale_covers = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut stale_covers));
+    assert!(buggy.fire("TimePasses", &mut stale_covers));
+    assert!(buggy.fire("KeyPressed", &mut stale_covers));
+    assert!(buggy.fire("KeyPressed", &mut stale_covers));
+    assert_eq!(
+        (
+            stale_covers["older"],
+            stale_covers["younger"],
+            stale_covers["stale"]
+        ),
+        (1, 1, 1)
+    );
+    assert!(buggy.fire("SweptMovePays", &mut stale_covers));
+    assert_eq!(
+        (
+            stale_covers["older"],
+            stale_covers["younger"],
+            stale_covers["stale"]
+        ),
+        (1, 1, 0),
+        "the stale press paid; the older and the key are still banked"
+    );
+    assert!(buggy.check_invariant("OnePressOneCell", &stale_covers));
+    assert!(!buggy.check_invariant("ExpiredPressesBuyNothing", &stale_covers));
+
+    // A refusal that lays the hop's cell anyway.
+    let mut laid_anyway = buggy.init_state();
+    assert!(buggy.fire("KeyPressed", &mut laid_anyway));
+    assert!(buggy.fire("KeyPressed", &mut laid_anyway));
+    assert!(buggy.fire("SweptMoveRefuses", &mut laid_anyway));
+    assert_eq!(
+        (laid_anyway["just_refused"], laid_anyway["bridged_delta"]),
+        (1, 1)
+    );
+    assert!(!buggy.check_invariant("NoBridgeOnARefusedMove", &laid_anyway));
 }
 
 /// Retained history is a different coordinate space from the active cursor.

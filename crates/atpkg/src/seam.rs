@@ -34,7 +34,8 @@
 //!   or dangling entry heals on the next pass. Every recorded seam is re-asserted,
 //!   plus a FIRST attach of `trust` when rustup is present and the entry is absent
 //!   (creating a name nothing else owns is safe by construction).
-//! * `uninstall --all` detaches every recorded seam with the toolset it removes.
+//! * `uninstall --all` detaches every recorded seam with the toolset it removes
+//!   ([`detach_recorded`], from the CLI edge, before the build trees go).
 //!
 //! The library entry points take the rustup home as DATA ([`attach`], [`detach`],
 //! [`status`], [`reassert`]); only the CLI edge reads `RUSTUP_HOME` / `HOME`

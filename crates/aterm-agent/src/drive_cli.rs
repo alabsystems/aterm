@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use crate::supervise::{
+    self, EXIT_TIMEOUT, Session, SuperviseOpts, classify_command_with, render_phase, worker_phase,
+};
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
 
 /// Resolve the `aterm-ctl` binary: `$ATERM_CTL`, then a sibling of this binary
@@ -250,6 +253,128 @@ fn run_persistent_local_prompt(
     )
 }
 
+/// What a command prints and the code it exits with: `0` for success, `1` for
+/// `classify`'s not-read-only, [`EXIT_TIMEOUT`] for a spent supervisor budget.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub text: String,
+    pub code: u8,
+}
+
+impl Reply {
+    fn text(text: String) -> Self {
+        Self { text, code: 0 }
+    }
+}
+
+/// The arguments after a supervisor verb: `[@sid]` then its flags.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SubArgs {
+    sid: Option<String>,
+    timeout_ms: Option<u64>,
+    auto_reads: bool,
+    max_s: Option<u64>,
+    allow_python: Vec<String>,
+    notes: Option<PathBuf>,
+    /// Positional words (the command text for `classify`).
+    rest: Vec<String>,
+}
+
+fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
+    let mut out = SubArgs::default();
+    // `classify`'s positionals are a shell line: from its first word on, every
+    // word — a `--oneline` included — is the command's, and `--` ends the
+    // flags for every verb.
+    let words_after_first = verb == "classify";
+    let mut it = args.iter();
+    let need = |flag: &str, what: &str, v: Option<&String>| -> Result<String, String> {
+        v.cloned()
+            .ok_or_else(|| format!("{verb}: {flag} needs {what}"))
+    };
+    let int = |flag: &str, what: &str, v: Option<&String>| -> Result<u64, String> {
+        need(flag, what, v)?
+            .parse()
+            .map_err(|_| format!("{verb}: {flag} needs {what}"))
+    };
+    while let Some(a) = it.next() {
+        if words_after_first && !out.rest.is_empty() {
+            out.rest.push(a.clone());
+            continue;
+        }
+        match a.as_str() {
+            "--" => {
+                out.rest.extend(it.by_ref().cloned());
+                break;
+            }
+            s if s.starts_with('@') && !words_after_first && out.sid.is_none() => {
+                out.sid = Some(s.to_string());
+            }
+            "--timeout" => {
+                out.timeout_ms = Some(int("--timeout", "a millisecond integer", it.next())?)
+            }
+            "--auto-reads" => out.auto_reads = true,
+            "--max-s" => out.max_s = Some(int("--max-s", "a seconds integer", it.next())?),
+            "--allow-python" => out.allow_python.push(need(
+                "--allow-python",
+                "a GLOB (e.g. 'scripts/*report*.py')",
+                it.next(),
+            )?),
+            "--notes" => out.notes = Some(PathBuf::from(need("--notes", "a FILE", it.next())?)),
+            other if other.starts_with("--") => {
+                return Err(format!(
+                    "{verb}: unknown option '{other}'. Run `aterm-drive --help` for the flags."
+                ));
+            }
+            other => out.rest.push(other.to_string()),
+        }
+    }
+    Ok(out)
+}
+
+/// `classify <cmd>`: pure, no host needed.
+fn classify_verb(args: &[String]) -> Result<Reply, String> {
+    let sub = parse_sub("classify", args)?;
+    let cmd = sub.rest.join(" ");
+    if cmd.trim().is_empty() {
+        return Err(
+            "classify needs a shell command line, e.g. `aterm-drive classify 'git status && git pull'`"
+                .to_string(),
+        );
+    }
+    let allow = python_allow(&sub);
+    let v = classify_command_with(&cmd, &allow);
+    Ok(if v.read_only {
+        Reply::text("read-only\n".to_string())
+    } else {
+        Reply {
+            text: format!("not-read-only {}\n", v.reason),
+            code: 1,
+        }
+    })
+}
+
+fn python_allow(sub: &SubArgs) -> Vec<String> {
+    if sub.allow_python.is_empty() {
+        supervise::DEFAULT_PYTHON_ALLOW
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        sub.allow_python.clone()
+    }
+}
+
+fn no_positionals(verb: &str, sub: &SubArgs) -> Result<(), String> {
+    if sub.rest.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{verb} takes only [@sid] and flags; unexpected: {}",
+            sub.rest.join(" ")
+        ))
+    }
+}
+
 /// The whole drive CLI as a callable: `argv[1..]` in, exit code out. Served
 /// in-process by the ONE `aterm` binary (`aterm drive …` / argv0 alias) and
 /// by the thin standalone bin.
@@ -262,9 +387,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         }
     };
     match run(&opts) {
-        Ok(out) => {
-            print!("{out}");
-            ExitCode::SUCCESS
+        Ok(Reply { text, code }) => {
+            print!("{text}");
+            ExitCode::from(code)
         }
         Err(e) => {
             eprintln!("aterm-drive: {e}");
@@ -273,10 +398,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
 }
 
-fn run(opts: &Opts) -> Result<String, String> {
+fn run(opts: &Opts) -> Result<Reply, String> {
     let verb = opts.cmd.first().map(String::as_str).unwrap_or("help");
     if verb == "help" {
-        return Ok(format!("{DRIVE_HELP}\n"));
+        return Ok(Reply::text(format!("{DRIVE_HELP}\n")));
+    }
+    if verb == "classify" {
+        return classify_verb(&opts.cmd[1..]);
     }
 
     // `--dial <name>`: drive a REMOTE aterm over the local host's `dial` relay. A
@@ -304,7 +432,7 @@ fn run(opts: &Opts) -> Result<String, String> {
                  • Is the LOCAL socket/token right? (--socket / ATERM_CONTROL_SOCK / ATERM_CONTROL_TOKEN)"
             )
         })?;
-        return run_prompt_turn(opts, &mut client, &text);
+        return run_prompt_turn(opts, &mut client, &text).map(Reply::text);
     }
 
     // A configured local endpoint already gives us everything the control CLI
@@ -316,7 +444,7 @@ fn run(opts: &Opts) -> Result<String, String> {
         opts,
         local_prompt_route(resolve_configured_local_endpoint(opts)),
     ) {
-        return result;
+        return result.map(Reply::text);
     }
 
     let ctl = resolve_ctl();
@@ -342,22 +470,61 @@ fn run(opts: &Opts) -> Result<String, String> {
             if text.is_empty() {
                 return Err("prompt needs text, e.g. `aterm-drive prompt 'say hi'`".to_string());
             }
-            run_prompt_turn(opts, &mut client, &text)
+            run_prompt_turn(opts, &mut client, &text).map(Reply::text)
         }
-        "read" => client.run(&["text"]),
+        "read" => client.run(&["text"]).map(Reply::text),
         "shot" => {
             let path = opts.cmd.get(1).cloned();
             let mut args = vec!["image"];
             if let Some(p) = &path {
                 args.push(p);
             }
-            client.run(&args)
+            client.run(&args).map(Reply::text)
+        }
+        "phase" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            no_positionals(verb, &sub)?;
+            let allow = python_allow(&sub);
+            let mut session = Session::new(&mut client, sub.sid);
+            let screen = session.read_screen()?;
+            let turn = supervise::Turn {
+                phase: worker_phase(&screen.rows),
+                screen,
+                timed_out: false,
+            };
+            Ok(Reply::text(render_phase(&turn, &allow)))
+        }
+        "await-turn" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            no_positionals(verb, &sub)?;
+            let allow = python_allow(&sub);
+            let timeout = Duration::from_millis(sub.timeout_ms.unwrap_or(opts.timeout_ms));
+            let mut session = Session::new(&mut client, sub.sid);
+            let turn = session.await_turn(timeout)?;
+            Ok(Reply {
+                text: render_phase(&turn, &allow),
+                code: if turn.timed_out { EXIT_TIMEOUT } else { 0 },
+            })
+        }
+        "supervise" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            no_positionals(verb, &sub)?;
+            let sopts = SuperviseOpts {
+                auto_reads: sub.auto_reads,
+                max: Duration::from_secs(sub.max_s.unwrap_or(DEFAULT_MAX_S)),
+                python_allow: sub.allow_python.clone(),
+                notes: sub.notes.clone(),
+            };
+            let mut session = Session::new(&mut client, sub.sid);
+            let (text, code) = session.supervise(&sopts)?;
+            Ok(Reply { text, code })
         }
         "await" => {
             if opts.cmd.len() < 2 {
                 return Err(
-                    "await needs a condition: idle <ms> | match <regex> | seq | block\n  \
-                     e.g. `aterm-drive await match 'BUILD SUCCESSFUL'`"
+                    "await needs a condition: idle <ms> | match <regex> | gone <regex> | seq | block\n  \
+                     e.g. `aterm-drive await match BUILD.SUCCESSFUL` or `aterm-drive await gone \
+                     esc.to.interrupt` (a regex is ONE whitespace-free token: the wire never quotes)"
                         .to_string(),
                 );
             }
@@ -370,18 +537,157 @@ fn run(opts: &Opts) -> Result<String, String> {
             }
             let mut a: Vec<&str> = vec!["await"];
             a.extend(args.iter().map(String::as_str));
-            client.run(&a)
+            client.run(&a).map(Reply::text)
         }
         other => Err(format!(
-            "unknown command '{other}'. Valid: prompt | read | await | shot | help.\n  \
+            "unknown command '{other}'. Valid: prompt | read | await | shot | classify | phase | \
+             await-turn | supervise | help.\n  \
              Run `aterm-drive --help` for the full guide."
         )),
     }
 }
 
+/// `supervise`'s default budget: the longest a worker is left unattended
+/// before the manager is told (30 min — the rate-limit wait the owner chose).
+const DEFAULT_MAX_S: u64 = 1800;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `classify <cmd>`: the command is the positional text (joined), the
+    /// verdict is the exit code, `--allow-python` widens the python rule, and
+    /// no command is a usage error.
+    #[test]
+    fn classify_parses_the_command_and_exits_on_the_verdict() {
+        let r = classify_verb(&args(&["git status --short && git pull | tail"])).expect("ok");
+        assert_eq!(
+            r,
+            Reply {
+                text: "not-read-only git pull\n".to_string(),
+                code: 1
+            }
+        );
+        let r = classify_verb(&args(&["git", "log", "-3"])).expect("joined words");
+        assert_eq!(
+            r,
+            Reply {
+                text: "read-only\n".to_string(),
+                code: 0
+            }
+        );
+        // Unquoted, with a flag inside the command: the words after the first
+        // are the command's, not classify's.
+        let r = classify_verb(&args(&["git", "log", "--oneline"])).expect("a flag in the command");
+        assert_eq!(r.code, 0, "{r:?}");
+        let sub = parse_sub("classify", &args(&["git", "log", "--oneline", "-5"])).expect("parses");
+        assert_eq!(sub.rest, args(&["git", "log", "--oneline", "-5"]));
+        let sub = parse_sub("classify", &args(&["--", "--weird", "x"])).expect("-- ends the flags");
+        assert_eq!(sub.rest, args(&["--weird", "x"]));
+        let sub = parse_sub("classify", &args(&["@foo", "bar"])).expect("no sid for classify");
+        assert_eq!((sub.sid, sub.rest), (None, args(&["@foo", "bar"])));
+        let sub = parse_sub("supervise", &args(&["@s-1", "--", "extra"])).expect("parses");
+        assert_eq!(
+            (sub.sid.as_deref(), sub.rest),
+            (Some("@s-1"), args(&["extra"]))
+        );
+        let r = classify_verb(&args(&["python3 tools/audit.py"])).expect("ok");
+        assert_eq!(r.code, 1);
+        let r = classify_verb(&args(&[
+            "--allow-python",
+            "tools/*.py",
+            "python3 tools/audit.py",
+        ]))
+        .expect("ok");
+        assert_eq!(r.code, 0, "{r:?}");
+        let err = classify_verb(&args(&[])).expect_err("no command");
+        assert!(err.contains("classify needs a shell command line"), "{err}");
+        // Through the top-level parse: the verb and its text reach `run`.
+        let o = parse(vec!["classify".into(), "ls -la".into()]).expect("parses");
+        assert_eq!(o.cmd, args(&["classify", "ls -la"]));
+        assert_eq!(run(&o).expect("pure verb needs no host").code, 0);
+    }
+
+    #[test]
+    fn phase_parses_an_optional_sid_and_nothing_else() {
+        let sub = parse_sub("phase", &args(&["@s-abc"])).expect("parses");
+        assert_eq!(sub.sid.as_deref(), Some("@s-abc"));
+        assert!(no_positionals("phase", &sub).is_ok());
+        let sub = parse_sub("phase", &args(&[])).expect("parses");
+        assert_eq!(sub.sid, None);
+        let sub = parse_sub("phase", &args(&["@s-abc", "extra"])).expect("parses");
+        let err = no_positionals("phase", &sub).expect_err("no positionals");
+        assert!(err.contains("unexpected: extra"), "{err}");
+        let err = parse_sub("phase", &args(&["--bogus"])).expect_err("unknown flag");
+        assert!(err.contains("unknown option '--bogus'"), "{err}");
+    }
+
+    #[test]
+    fn await_turn_parses_sid_and_timeout() {
+        let sub = parse_sub("await-turn", &args(&["@s-1", "--timeout", "5000"])).expect("parses");
+        assert_eq!(sub.sid.as_deref(), Some("@s-1"));
+        assert_eq!(sub.timeout_ms, Some(5000));
+        let sub = parse_sub("await-turn", &args(&["--timeout", "7"])).expect("no sid");
+        assert_eq!((sub.sid, sub.timeout_ms), (None, Some(7)));
+        let err = parse_sub("await-turn", &args(&["--timeout", "soon"])).expect_err("not an int");
+        assert!(
+            err.contains("--timeout needs a millisecond integer"),
+            "{err}"
+        );
+        let err = parse_sub("await-turn", &args(&["--timeout"])).expect_err("missing");
+        assert!(err.contains("--timeout needs"), "{err}");
+    }
+
+    #[test]
+    fn supervise_parses_every_flag_and_repeats_allow_python() {
+        let sub = parse_sub(
+            "supervise",
+            &args(&[
+                "@s-9",
+                "--auto-reads",
+                "--max-s",
+                "600",
+                "--allow-python",
+                "tools/*.py",
+                "--allow-python",
+                "scripts/*report*.py",
+                "--notes",
+                "/tmp/notes.txt",
+            ]),
+        )
+        .expect("parses");
+        assert_eq!(
+            sub,
+            SubArgs {
+                sid: Some("@s-9".to_string()),
+                timeout_ms: None,
+                auto_reads: true,
+                max_s: Some(600),
+                allow_python: args(&["tools/*.py", "scripts/*report*.py"]),
+                notes: Some(PathBuf::from("/tmp/notes.txt")),
+                rest: vec![],
+            }
+        );
+        // Defaults: no auto-reads, no notes, the built-in python allowlist.
+        let sub = parse_sub("supervise", &args(&[])).expect("parses");
+        assert!(!sub.auto_reads && sub.notes.is_none() && sub.max_s.is_none());
+        assert_eq!(
+            python_allow(&sub),
+            args(&[
+                "scripts/*standing*.py",
+                "scripts/*report*.py",
+                "scripts/*score*.py"
+            ])
+        );
+        let err = parse_sub("supervise", &args(&["--max-s", "-1"])).expect_err("not a u64");
+        assert!(err.contains("--max-s needs a seconds integer"), "{err}");
+        let err = parse_sub("supervise", &args(&["--notes"])).expect_err("missing");
+        assert!(err.contains("--notes needs a FILE"), "{err}");
+    }
 
     fn prompt_opts(socket: String) -> Opts {
         Opts {

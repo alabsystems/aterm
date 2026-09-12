@@ -44,6 +44,45 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 /// stage2 dir is exactly what makes `cargo ship …` dispatch into Trust — the
 /// front door `provision` audits. The gates still never rely on it.)
 pub fn trust_stage2_bin() -> Result<PathBuf> {
+    // PINNED ONCE PER PROCESS. The candidate walk below ends at the atpkg
+    // store's `store/trust/current`, which is a MUTABLE indirection: `aterm pkg
+    // install trust` (and `promote-toolchain.sh` behind the rustup spelling)
+    // repoints it, and this function is called from at least six places spread
+    // across a cut that runs for half an hour — `provision`, the buildplan, the
+    // targo and trustc resolvers here, and the publish leg. Re-resolving at
+    // each of them is the same defect a peer fixed in `publish/config.sh` on
+    // 2026-09-10 (`rustup run trust …` re-resolved per invocation, so its
+    // conformance clause could land on a different seal than the build it
+    // tested): a run that resolves a moving name more than once can be split
+    // across two compilers with nothing going red. Resolving once and reusing
+    // the PHYSICAL path makes a concurrent seal unable to reach a running cut.
+    //
+    // Only SUCCESS is pinned. A failure caches nothing — there is no toolchain
+    // identity to protect in that case, and a sticky "no toolchain" would
+    // outlive an install the operator performs on the advice of this very
+    // error.
+    static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    pin_first_success(&PINNED, resolve_trust_stage2_bin)
+}
+
+/// Return the cell's value, resolving it exactly once and only on success.
+///
+/// Split out so the pinning is a test rather than a promise: a second call with
+/// a DIFFERENT resolver must still answer the first one's path, which is the
+/// whole property — a mid-run seal cannot change what a running cut compiles
+/// with.
+fn pin_first_success(
+    cell: &std::sync::OnceLock<PathBuf>,
+    resolve: impl FnOnce() -> Result<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(pinned) = cell.get() {
+        return Ok(pinned.clone());
+    }
+    let resolved = resolve()?;
+    Ok(cell.get_or_init(|| resolved).clone())
+}
+
+fn resolve_trust_stage2_bin() -> Result<PathBuf> {
     // Resolution order, first hit wins. No step requires anyone to remember an
     // environment variable: a toolchain installed by `atpkg install trust` is found
     // automatically, which is the ordinary way to get one.
@@ -876,5 +915,51 @@ mod cutter_identity_tests {
             BUILD_COMMIT.chars().all(|c| c.is_ascii_hexdigit()),
             "not hex: {BUILD_COMMIT}"
         );
+    }
+}
+
+#[cfg(test)]
+mod toolchain_pin_tests {
+    //! THE PIN for a cut that can be split across two compilers.
+    //!
+    //! [`trust_stage2_bin`]'s candidate walk ends at the atpkg store's
+    //! `store/trust/current`, a MUTABLE indirection that `aterm pkg install
+    //! trust` repoints. It is called from at least six places spread across a
+    //! half-hour cut, and before this it canonicalised afresh at every one of
+    //! them — so a peer sealing a toolchain mid-cut could hand the buildplan
+    //! one compiler and the publish leg another, with nothing going red. The
+    //! same defect, in the same week, cost `publish/config.sh` its fix.
+
+    use super::*;
+    use std::sync::OnceLock;
+
+    #[test]
+    fn the_first_resolution_is_the_one_the_whole_process_gets() {
+        let cell: OnceLock<PathBuf> = OnceLock::new();
+        let first = pin_first_success(&cell, || Ok(PathBuf::from("/seal/alpha/bin")))
+            .expect("the first resolution succeeds");
+        assert_eq!(first, Path::new("/seal/alpha/bin"));
+
+        // A seal lands mid-run and the store's `current` now points elsewhere.
+        // The running cut must not notice.
+        let second = pin_first_success(&cell, || {
+            panic!("a pinned toolchain must never be re-resolved")
+        })
+        .expect("the pin answers without resolving");
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn a_failed_resolution_pins_nothing_and_is_retried() {
+        let cell: OnceLock<PathBuf> = OnceLock::new();
+        assert!(pin_first_success(&cell, || Err(Error::new("no Trust toolchain found"))).is_err());
+        assert!(
+            cell.get().is_none(),
+            "a failure has no toolchain identity to protect; caching it would outlive \
+             the install the error text tells the operator to perform"
+        );
+        let after = pin_first_success(&cell, || Ok(PathBuf::from("/seal/beta/bin")))
+            .expect("the retry resolves");
+        assert_eq!(after, Path::new("/seal/beta/bin"));
     }
 }

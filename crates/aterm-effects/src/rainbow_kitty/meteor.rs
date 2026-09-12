@@ -34,9 +34,29 @@
 //!   `3.0 ch` where it was `1.3`, 420 ms where it was 180, its circumference
 //!   carrying the spectrum twice over and spinning ([`RING_R_CH`],
 //!   [`RING_MS`], [`RING_SWEEPS`]); the fan is twice the count
-//!   ([`FAN_N_BASE`]); a [`draw_splash`] of the bed's ink at the transient
+//!   ([`FAN_N_BASE`]); a `draw_splash` of the bed's ink at the transient
 //!   cap bursts along the landing row; and [`draw_sparks`] throws a shower
 //!   of coloured sparks that fall under gravity and fade.
+//! * **The impact, third round (2026-09-10, "A STARBURST, NOT BANDS")** —
+//!   the owner, on the second round's landing: *"I want more a starburst
+//!   versus the bands effect."* Measured
+//!   (`docs/design/METEOR-STARBURST-2026-09-10.md`), the second round's
+//!   shockwave put **70.4 %** of the impact's light within 30 degrees of
+//!   HORIZONTAL and 5.0 % within 30 degrees of vertical, and its perimeter
+//!   never went dark — because a `3.0 ch` ring squashed to a `1.5 ch` rise is
+//!   two flat slabs, and the splash laid two more directly on them. Both are
+//!   GONE. In their place [`draw_burst`] paints an ISOTROPIC set of tapered
+//!   lances at true SCREEN angles round the caret ([`BURST_CORE_CH`],
+//!   [`BURST_N_BASE`]), rooted clear of the caret's own disc
+//!   ([`BURST_ROOT_CH`]) so they emerge as the flash's white dies, plus jets
+//!   along the flight line ([`JET_N_PER_SIDE`]) that carry the distance grade
+//!   on the ring's own unchanged reach and life. THE LAW, which killed two
+//!   spiked designs before this one: **dark angular gaps are necessary but
+//!   NOT sufficient — what reads as radial is uniform angular coverage in
+//!   SCREEN space**, so no direction here is ever an ellipse parameter.
+//!   Everything about the ring that was not its silhouette is reused byte for
+//!   byte: [`RING_R_EXP`]'s quartic, [`ring_ms`], [`ring_full_radius`],
+//!   [`RING_COV_HOLD_U`] and the spectrum walk.
 //! * **The impact, second round (2026-09-08, "BIGGER and MORE SPECIAL")** —
 //!   at the owner's cell the first round's impact read as a thin rainbow ring
 //!   with tiny coloured dots: polite. Now the arrival is a WHITE-HOT FLASH
@@ -45,7 +65,7 @@
 //!   arriving, one way ([`FLASH_COLOUR_MS`]); over a blank cell the burst
 //!   asks [`FLASH_FULL_COV`], over a glyph cell the transient cap, so the
 //!   text under it stays legible. The shockwave's stroke is two and a half
-//!   times the first round's ([`RING_THICK_SHARE`]) and holds near the cap
+//!   times the first round's (`RING_THICK_SHARE`) and holds near the cap
 //!   for its first 120 ms ([`RING_COV_HOLD_U`]) at the same three-cell-height
 //!   reach. The sparks are twice as many ([`SPARK_N_BASE`]) and each is a
 //!   small HALOED STAR — the family's own four-point star at 5–9 px
@@ -53,7 +73,7 @@
 //!   climbs, hangs and falls as before. The splash leaves the text: the
 //!   under-ink splash is gone, and in its place a rainbow band runs through
 //!   the SKY BAND above the row and its mirror below the row, six cells
-//!   either side ([`draw_splash`]), at the transient ceiling, gated cell by
+//!   either side (`draw_splash`), at the transient ceiling, gated cell by
 //!   cell on the sky's own glyph probe ([`SkyMask`]) so it never enters a
 //!   glyph's rows. Under reduced motion the landing is the flash and the
 //!   colours, static — no expansion, no sparks, no pin — on the theme's one
@@ -68,7 +88,7 @@
 //!   reach (`2.8 → 6.8 ch`, [`FAN_REACH_PER_IMPACT_CH`]). The 8-cell floor is
 //!   byte-identical to the second round; a full line lands on the cap. The
 //!   ring grows ALONG the line — its vertical semi-axis stays the floor
-//!   ring's `1.5 ch` ([`RING_RISE_MAX_CH`]) — and its stroke keeps the second
+//!   ring's `1.5 ch` (`RING_RISE_MAX_CH`) — and its stroke keeps the second
 //!   round's ceiling, so a bigger landing is wider and longer, never taller
 //!   or fatter. Every classic style's landing ring takes the same grade
 //!   (`cursor_glow::classic_ring_radius_factor`).
@@ -141,14 +161,14 @@ use aterm_render::{
     premul_rgb, ribbon_beam, ribbon_beam_v,
 };
 
-use crate::cursor_glow::Geom;
+use crate::cursor_glow::{BandPx, Geom};
 use crate::effect_util::{push_fx_rect, push_twinkle_star};
 use crate::spectrum::{
     SPECTRUM_STOPS, spectrum, spectrum_snap, spectrum_snap_index, spectrum_stop,
 };
 
-use super::ribbon::{TALL_UP_CH, WALK_LAY_RATE};
-use super::stardust::{AURORA_TALL_CH, FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust};
+use super::ribbon::WALK_LAY_RATE;
+use super::stardust::{FAN_RISE_MAX_CH, FanSow, GlyphProbe, ShedSow, Stardust};
 use super::timing::{
     CHROMA_CULL_ALPHA, FLIGHT_ENTER_EXP, FLIGHT_MAX_LIVE, FLIGHT_OFF_GLASS_MS, FLIGHT_P0,
     FLIGHT_RETIRE_MS, JUMP_COV_CEIL, JUMP_MIN_CELLS, MINI_FAN_MAX_CELLS, MINI_FAN_MIN_CELLS,
@@ -292,37 +312,16 @@ pub const STATION_STRIDE_MIN_PX: f32 = 2.0;
 /// **HARD CAP on one meteor's `under` share** (§6.5, §18): the colour layer
 /// sheds STATIONS before it exceeds this, so a two-meteor ping-pong can never
 /// shed the ribbon. `2 × 2304 + 2 × 768 + 10240 = 16384`, exactly
-/// `MAX_QUADS` — the 2026-09-08 splash ([`SPLASH_QUAD_CAP`]) is paid for out
+/// `MAX_QUADS` — the 2026-09-08 splash (`SPLASH_QUAD_CAP`) is paid for out
 /// of the train's former 3 072, which an 80-cell train at the retina cell
 /// (≈ 1 900 quads) never reached.
 pub const UNDER_QUAD_CAP: usize = 2_304;
-
-/// Cap on one landing's SPLASH (`under`, [`draw_splash`]): each half of the
-/// row is rasterized head-first from the caret outward under half of this,
-/// so a saturated budget sheds the splash's far ends, never its heart.
-pub const SPLASH_QUAD_CAP: usize = 768;
 
 /// Cap on one meteor's white (`out`) layer (§18).
 pub const WHITE_QUAD_CAP: usize = 1_152;
 
 /// Cap on the landing pin's quads (§18).
 pub const PIN_QUAD_CAP: usize = 12;
-
-/// Cap on the landing ring's quads (§18). §18 prices the ring at ONE QUAD PER
-/// SEGMENT, which is what a segment-stepped rasterizer would emit;
-/// `comet_beam` at step 1 emits one quad per device row of each slab, so the
-/// ring's true `out` share is this times the stroke's row count (≤ 0.5 `ch`).
-/// The cap is not enforced by truncation, deliberately: truncating a ring
-/// leaves a notch, which is exactly the artefact
-/// `the_ring_has_no_notch_on_the_steep_quadrants` forbids. The sanctioned way
-/// to reach the §18 figure is the analytic annulus the spec names as the
-/// preferred later refactor (a `RainHalo` ring mode with CPU/GPU parity) —
-/// which is also where §6.5 layer 10's "de-cover at the four axis switches"
-/// lives: `comet_beam` de-covers same-axis monotone joins and keeps the corner
-/// overlap at an axis switch, and that overlap is the primitive's to remove,
-/// not a caller's. **KNOWN OPEN**: until `aterm-render` grows either, a ring
-/// double-adds a few pixels at each of its four diagonals.
-pub const RING_QUAD_CAP: usize = 72;
 
 /// Width falloff length as a share of `L`: `w(s) = w·(0.30 + 0.70·exp(−s/(0.5·L)))`
 /// (§6.5 layer 1).
@@ -543,12 +542,6 @@ pub const FLASH_STATIC_WHITE_SHARE: f32 = 0.5;
 /// [`super::timing::FLIGHT_OFF_GLASS_MS`].
 pub const RING_MS: f32 = 480.0;
 
-/// Ring segments (§6.5 layer 10 wrote 48; 72 since 2026-09-08 — a 3 `ch`
-/// ring at the retina cell is 84 px across, and 48 chords showed as facets).
-/// The de-cover at the four axis switches is what
-/// `the_ring_has_no_notch_on_the_steep_quadrants` measures.
-pub const RING_SEGMENTS: usize = 72;
-
 // ---- the landing's GRADE (2026-09-08, "scales more with the distance") ----
 //
 // Owner: *"a bigger impact splash that scales more with the distance
@@ -577,14 +570,6 @@ pub const RING_MS_MAX: f32 = FLIGHT_OFF_GLASS_MS;
 /// reach — the same ×2 the classic landing ring takes at the cap
 /// (`cursor_glow::classic_ring_radius_factor`).
 pub const RING_R_PER_IMPACT_CH: f32 = 1.2;
-
-/// The ring's vertical semi-axis cap, in `ch` — the floor ring's own
-/// (`RING_R_CH · RING_SQUASH = 1.5 ch`, the number the const assert against
-/// [`FAN_RISE_MAX_CH`] has always stated). A bigger ring grows ALONG the
-/// line and flattens past this, exactly as the fan flattens under
-/// [`FAN_RISE_MAX_CH`]: one law, and the ring never rises above where the
-/// fan may, at any grade.
-pub const RING_RISE_MAX_CH: f32 = RING_R_CH * RING_SQUASH;
 
 /// The ring's life for a landing of `cells` — [`RING_MS`] at the floor,
 /// [`RING_MS_PER_IMPACT`] more per unit of [`impact`], capped at
@@ -665,88 +650,30 @@ pub const RING_R_CH_2026_09_05: f32 = 1.3;
 /// around it, not seven snapped arcs.
 pub const RING_SWEEPS: f32 = 2.0;
 
-/// How far the shockwave's spectrum turns around the ring over its life, in
-/// turns — the "dynamic" of the owner's brief: the colours rotate as the
-/// ring expands. Static under reduced motion (no ring at all, §6.11).
-pub const RING_SPIN_TURNS: f32 = 0.5;
-
 /// The exponent of the ring's radius law (§6.5 layer 10) — `(1 − (1 − u)^4)`,
 /// so the ring is already most of the way out on the frame it is born (the
 /// arrival edge owes the eye an EVENT, not a slow bloom).
 pub const RING_R_EXP: i32 = 4;
 
-/// Ring squash (§6.5 layer 10 wrote 0.62, the fan's). **0.5 since
-/// 2026-09-08**: at 3 `ch` the fan's aspect would put the ring's crown
-/// `1.86 ch` above the landing row — past the fan's own rise cap. A flatter
-/// ellipse is a shockwave seen on a plane: 3 `ch` along the line, 1.5 `ch`
-/// up, still inside where the fan may rise ([`FAN_RISE_MAX_CH`], asserted
-/// below). The fan keeps its own `stardust::FAN_SQUASH`; the two are no longer one
-/// ellipse — the ring is now the outermost mark of the landing, and the
-/// fan and the splash sit inside it.
-pub const RING_SQUASH: f32 = 0.5;
-
-// The ring's vertical semi-axis at full radius is `3.0 · 0.5 = 1.5 ch`
-// (§6.5 layer 10: `r(u) = R·(1 − (1 − u)^4)`, so `r_y ≤ 1.5 ch` for every
-// `u` by construction): under the fan's own rise cap ([`FAN_RISE_MAX_CH`]) —
-// the ring never rises above where the fan may.
-const _: () = assert!(
-    RING_R_CH * RING_SQUASH < FAN_RISE_MAX_CH,
-    "the ring's vertical semi-axis must stay inside the fan's rise"
-);
-
-/// Ring stroke thickness as a share of its own radius (§6.5 layer 10 wrote
-/// 0.10; 0.16 in the 2026-09-08 bold round — 13 px at the retina cell,
-/// which at the owner's cell read as "a thin rainbow ring around the caret";
-/// **0.40 in the second round, two and a half times that**, 34 px at the
-/// retina cell under a `1.2 ch` ceiling: a BAND of spectrum, not a line).
-/// The reach ([`RING_R_CH`]) is the same three cell heights; the stroke is
-/// what grew. `the_shockwave_stroke_is_two_and_a_half_times_the_bold_round_s`
-/// measures it on glass.
-pub const RING_THICK_SHARE: f32 = 0.40;
-
-/// The bold round's stroke share (2026-09-08, first round) — kept only as
-/// the number the second round's law is measured against.
-pub const RING_THICK_SHARE_BOLD_ROUND: f32 = 0.16;
-
-/// Ring stroke thickness floor, px (§6.5 layer 10 wrote 1.5).
-///
-/// **2.0, not 1.5 — measured on glass (offline judge, 2026-09-05, defect 3).**
-/// `comet_beam` paints a slab as a flat interior between two anti-aliased
-/// EDGE pixels, and a 1.5 px stroke has an interior row only when its centre
-/// happens to straddle a pixel boundary — half the ring's columns carried two
-/// edge pixels at ≈ 0.75 of the request and nothing at the request itself,
-/// which is why the ring composited at ≤ 29/255 chroma on `B/frame_0064-0071`
-/// while asking 35-47. At 2.0 px every column of the stroke owns one pixel at
-/// the full request; the ceiling (`0.5 ch`) and the share are untouched.
-pub const RING_THICK_MIN_PX: f32 = 2.0;
-
-/// Ring stroke thickness ceiling, in `ch` (§6.5 layer 10 wrote 0.5; 1.2
-/// since the second round, so the `0.40·r` share binds at every cell size
-/// — `0.40 · 3.0 ch = 1.2 ch` exactly at full reach).
-pub const RING_THICK_MAX_CH: f32 = RING_THICK_SHARE * RING_R_CH;
-
-/// The stroke thickness from which the shockwave is rasterized at a 2 px
-/// major-axis step instead of 1 (2026-09-08). A 3 `ch` ring at the retina
-/// cell is ≈ 600 px of major axis, three quads a pixel at step 1 — the one
-/// term that moved the ping-pong's p50 from 21 to 44 µs — and on a stroke
-/// this thick the 2 px stair on the diagonals is under its own edge
-/// anti-aliasing. A thin ring (small cell) keeps step 1.
-pub const RING_STEP2_THICK_PX: f32 = 6.0;
-
-/// The stroke thickness from which the shockwave is rasterized at a 3 px
-/// major-axis step (second round): the stroke is up to 34 px at the retina
-/// cell, its edge anti-aliasing swallows a 3 px stair, and the extra step
-/// is what keeps the ping-pong's p50 under its budget with a stroke two and
-/// a half times thicker (each step is one interior slab per row it crosses
-/// plus two edge pixels, so a thick stroke costs more per step, not fewer).
-pub const RING_STEP3_THICK_PX: f32 = 18.0;
-
-/// The stroke thickness from which the shockwave is rasterized at a 4 px
-/// major-axis step (second round, measured): at the bench cell (`ch` 40) the
-/// stroke is 48 px, and a 4 px stair inside a 48 px band is under its own
-/// edge anti-aliasing. The ring is 3.3 µs at step 3 and 2.5 at step 4 on
-/// the release probe; the ping-pong row's budget is what asked.
-pub const RING_STEP4_THICK_PX: f32 = 30.0;
+// THE RING'S RISE ASSERT IS GONE WITH THE RING, AND IT WAS WRONG.
+//
+// It read `RING_R_CH * RING_SQUASH < FAN_RISE_MAX_CH` — `1.5 ch < 1.6 ch`,
+// "the ring's vertical semi-axis must stay inside the fan's rise" — and it was
+// TRUE and it did not hold the law it was written for. `RING_R_CH ·
+// RING_SQUASH` was the ellipse's CENTRELINE semi-axis, and `comet_beam`'s
+// `half_perp = thickness * 0.5` makes the polyline it is handed a centreline:
+// the stroke, `clamp(0.40·r, 2, 1.2 ch)`, added another `0.6 ch` outside it, so
+// the shipped ring PAINTED to `2.10 ch` — half a cell above the bound
+// (`docs/design/METEOR-STARBURST-2026-09-10.md` section 2.2, confirmed on
+// captured frames with the mark's top edge at `−2.05 ch`). A const assert on a
+// number that is not the mark's extent cannot catch that, however true it is.
+//
+// The lesson is spent where the mark now is: `BURST_CORE_CH`'s assert states
+// the PAINTED envelope (tip + half the root stroke + the rasterizer's fringe),
+// `burst_rise_limit` clamps that same envelope again in DEVICE PX at emit, and
+// `the_burst_paints_inside_the_fan_s_rise_at_every_cell` measures the emitted
+// QUADS at four cell heights — the test that would have caught the ring.
+// Measured there: the burst paints to 1.444 ch against the ring's 2.10.
 
 /// Ring coverage as a share of [`TRANSIENT_STAR_COV_CEIL`], HELD for
 /// [`RING_COV_HOLD_U`] and then spent on `spend`:
@@ -795,13 +722,6 @@ pub const RING_HOLD_MS: f32 = RING_COV_HOLD_U * RING_MS;
 /// The stroke's hold at the cap, ms — `0.25 · 600 = 150`, the pin's own
 /// window exactly; the const assert below holds it there.
 pub const RING_HOLD_MAX_MS: f32 = RING_COV_HOLD_U * RING_MS_MAX;
-
-/// Light-theme ring dots (§6.10, §18's halo budget; 24 → 36 with the 2.3×
-/// reach, so the dots still read as a ring and not a necklace). NOT graded:
-/// at the cap the ring is `2π·√((36 + 2.25)/2) ≈ 27.5 ch` around, `0.76 ch`
-/// per dot against a `1.2 ch` dot — still overlapping, still a ring — and
-/// `stardust::STARDUST_LIGHT_HALO_BUDGET` is priced on this number.
-pub const RING_LIGHT_DOTS: usize = 36;
 
 /// Fan reach at the FLOOR landing, in `ch` — `1.6 + 0.15·8 = 2.8`, the reach
 /// the second round's 8-cell landing has always thrown (§6.5 layer 11 wrote
@@ -994,55 +914,376 @@ pub const SOW_SCRATCH: usize = METEOR_POOL * (SHED_MAX as usize + 1) + 1;
 
 // ---- the splash (2026-09-08; out from under the text in the second round)
 
-/// Splash life, ms — "a brief rainbow splash". Held for [`SPLASH_HOLD_U`] of
-/// it, then spent; its reach bursts outward on the ring's own quartic
-/// ([`RING_R_EXP`]).
-pub const SPLASH_MS: f32 = 260.0;
+// ---- THE STARBURST (2026-09-10) -------------------------------------------
+//
+// The owner, 2026-09-10: *"I want more a starburst versus the bands effect."*
+// `docs/design/METEOR-STARBURST-2026-09-10.md` measured what the landing
+// actually was — at `T + 344 ms` **70.4 %** of the impact's light lay within
+// 30 deg of HORIZONTAL and 5.0 % within 30 deg of vertical, and brightness
+// around the un-squashed perimeter read `max/mean 1.62`, `min/mean 0.50`: a
+// contour that never goes dark. That is not a starburst with a banding
+// problem, it is a set of bands.
+//
+// THE LAW THE DESIGN ESTABLISHED, which cost two designers their geometry:
+// **dark angular gaps are NECESSARY BUT NOT SUFFICIENT. What reads as radial
+// is uniform angular coverage in SCREEN space.** A spike placed at ellipse
+// PARAMETER 45 deg on the shipped ring (`rx 209`, `ry 47.5`) leaves the caret
+// at a SCREEN angle of `atan(47.5/209) = 12.8 deg`, so six of eight "radial"
+// lances sat within 13 deg of horizontal. Every direction below is therefore a
+// TRUE SCREEN direction on an ISOTROPIC circle — no ellipse, no squash — and
+// the distance grade is bought where the rise cap does not charge for it:
+// along the row, in the jets.
 
-/// How far the splash reaches along the row, in cells, EACH side of the
-/// caret ("six cells either side").
-pub const SPLASH_CELLS: f32 = 6.0;
+/// The core spike's TIP radius at full expansion, in `ch` — the star's own
+/// reach, isotropic in screen space.
+///
+/// Sized by the rise cap and nothing else: the PAINTED envelope is
+/// `BURST_CORE_CH + BURST_SEC_THICK_CH[0]/2 + BURST_AA_SUPPORT_CH = 1.57 ch`,
+/// inside [`FAN_RISE_MAX_CH`] and TIGHTER than the ring it replaces, which
+/// painted to 2.10 ch (see the const assert below).
+///
+/// FALSIFIED BY: a measured painted extent above `FAN_RISE_MAX_CH` at any
+/// cell height, or a star whose radius no longer reads as bigger than the
+/// caret block it is thrown from.
+pub const BURST_CORE_CH: f32 = 1.42;
 
-/// **THE SPLASH IS IN THE SKY** (second round). The bold round's splash was
-/// the bed's ink under the text; the owner asked for the impact out from
-/// under the letters, so the splash is now two RAINBOW BANDS in `out`: one
-/// in the sky band above the row and its mirror below the row — never a
-/// pixel of the landing row's own cell rows, never a cell of the neighbour
-/// row the probe has not proved blank ([`SkyMask`]). This is the band's
-/// height in `ch` — the aurora's own ([`AURORA_TALL_CH`]), because the
-/// splash lies in the aurora's band and the two must agree on what the sky
-/// band IS.
-pub const SPLASH_BAND_CH: f32 = AURORA_TALL_CH;
+/// Every spike's ROOT radius, in `ch`. Two laws meet on this number and it is
+/// the larger of the two:
+///
+/// * **the caret keeps a disc of its own half-height** — `0.5 ch`, so no
+///   pixel of the star is ever nearer the caret's centre than that, and the
+///   pin's nucleus and the flash's white are never painted over. It is also
+///   why the star EMERGES: on the quartic there is nothing to paint until the
+///   tips have passed the root, which lands the first spike as the flash's
+///   white dies (`the_star_emerges_as_the_flash_s_white_dies`);
+/// * **the wedges stay dark all the way in** — two adjacent spikes of
+///   thickness `w` at angular spacing `2pi/n` first separate at radius
+///   `w / (2·sin(pi/n))`; inside that radius the star is a merged hub, and a
+///   merged hub is where a dozen additive beams pile onto the flash's white.
+///   At `n = 12` and `w = 0.22 ch` that radius is `0.425 ch`
+///   ([`BURST_ROOT_SEP_AT_MAX_N`] holds it under this constant at compile
+///   time).
+///
+/// FALSIFIED BY: a composited caret-cell peak at small `u` above the flash's
+/// own [`FLASH_FULL_COV`] (design section 7 falsifier 4), or an annulus
+/// sample between adjacent spikes that is not near zero (falsifier 5).
+pub const BURST_ROOT_CH: f32 = 0.50;
 
-/// Stations per cell of splash — a `spectrum` sample every half cell (C1: a
-/// linear mark samples `spectrum`); the beam lerps colour slab by slab
-/// between stations, so the sweep reads as a ramp at two per cell. Three per
-/// cell (the first cut) tripled the segments for no visible gain: the band
-/// costs per SEGMENT slab, not per station, and at a third of a cell every
-/// segment was one slab — 466 quads and 5.9 µs for two bands of six cells at
-/// the bench cell against ~300 and ~3 at two.
-pub const SPLASH_STATIONS_PER_CELL: usize = 2;
+/// `2·sin(pi/BURST_N_MAX)` — the separation coefficient of the root law
+/// above, spelled as a literal because `sin` is not `const`.
+/// `a_spike_root_is_derived_from_the_spacing_it_must_keep_open` proves the
+/// literal against the real trigonometry at run time, so the two can never
+/// drift.
+pub const BURST_ROOT_SEP_AT_MAX_N: f32 = 0.517_638_1;
 
-/// The band's rasterization step along the row as a share of `cw` — half a
-/// cell (7–9 px), one slab per station segment: the band is a flat ribbon
-/// of constant height and the slab is what a frame pays for.
-pub const SPLASH_STEP_CW_SHARE: f32 = 0.5;
+const _: () = assert!(
+    BURST_ROOT_CH * BURST_ROOT_SEP_AT_MAX_N >= BURST_SEC_THICK_CH[0],
+    "at the spike ceiling two adjacent spikes must already be separated at their roots — \
+     otherwise the star has a merged hub and no dark wedges"
+);
+const _: () = assert!(
+    BURST_ROOT_CH >= 0.5,
+    "a spike root inside the landing cell's own rows is light on the caret, not from it"
+);
 
-/// The `u` up to which the splash holds its full coverage (the transient
-/// ceiling, 118 — the level §3.2 gives every transient white, so a yellow
-/// band at it is under the pin's nucleus and far under the caret) before
-/// spending it on `spend`.
-pub const SPLASH_HOLD_U: f32 = 0.35;
+/// The AA fringe [`comet_beam`] adds outside the nominal stroke, in `ch` — one
+/// device pixel at a `25 px` cell, which is the smallest cell the family is
+/// tuned for. The const rise assert keeps this much headroom; the emitter
+/// ALSO clamps in device px ([`burst_rise_limit`]), because a normalized
+/// constant cannot account for a device-pixel fringe at every font size.
+pub const BURST_AA_SUPPORT_CH: f32 = 0.04;
 
-/// The share of the splash's reach over which it is at full coverage; past
-/// it the band feathers to nothing at its far end on `smoothstep`, so the
-/// six cells end as light leaving and not as a cut.
-pub const SPLASH_FEATHER_SHARE: f32 = 0.6;
+/// **THE PAINTED-EXTENT RISE LAW.** [`RING_R_CH`]`·`[`RING_SQUASH`] asserted
+/// the ring's CENTRELINE semi-axis against [`FAN_RISE_MAX_CH`] and let its
+/// `0.6 ch` half-stroke escape the law — the shipped ring painted to
+/// `2.10 ch`, half a cell above the bound the assert was written to hold
+/// (design section 2.2, confirmed at `-2.05 ch` by measurement). The burst
+/// asserts the PAINTED envelope: tip, plus half the root section's stroke,
+/// plus the rasterizer's fringe.
+const _: () = assert!(
+    BURST_CORE_CH + 0.5 * BURST_SEC_THICK_CH[0] + BURST_AA_SUPPORT_CH <= FAN_RISE_MAX_CH,
+    "the burst's PAINTED rise must stay inside the fan's — the centreline is not the mark"
+);
 
-/// How far the band's spectrum walk slides outward over the splash's life,
-/// in `t`-units — the "dynamic" of the brief: the colours run away from the
-/// caret as the band spends. Static under reduced motion.
-pub const SPLASH_DRIFT_T: f32 = 0.5;
+/// Spikes at the 8-cell floor.
+///
+/// Nine is the smallest count whose wedges still read as a ring of gaps
+/// rather than as a cross or a plus; twelve ([`BURST_N_CEIL`]) is where the
+/// `30 deg` spacing stops being legible against a `0.22 ch` spike at the
+/// annulus radius the design measures.
+///
+/// FALSIFIED BY: an annulus metric on the rendered burst whose `min/mean`
+/// approaches the ring's 0.50 instead of zero.
+pub const BURST_N_BASE: f32 = 9.0;
+
+/// Spikes gained per unit of [`impact`] above the floor:
+/// `n = min(9 + 1.2·(impact − 1), 12)`. The count is the part of the distance
+/// grade that survives dense text, where the jets are gated away.
+pub const BURST_N_PER_IMPACT: f32 = 1.2;
+
+/// Spike-count ceiling — reached at [`super::timing::IMPACT_MAX`].
+pub const BURST_N_CEIL: f32 = 12.0;
+
+/// The `Burst::dir` / `Burst::len` array length. Equal to [`BURST_N_CEIL`];
+/// the const assert below keeps them one number.
+pub const BURST_N_MAX: usize = 12;
+
+const _: () = assert!(
+    BURST_N_BASE + BURST_N_PER_IMPACT * (super::timing::IMPACT_MAX - 1.0) <= BURST_N_CEIL + 1e-3,
+    "the graded spike count reaches the ceiling exactly at the impact cap and never past it"
+);
+const _: () = assert!(
+    BURST_N_CEIL as usize == BURST_N_MAX,
+    "the spike ceiling and the array that holds the spikes are ONE number"
+);
+
+/// The shortest spike, as a share of [`BURST_CORE_CH`]:
+/// `len_i = 0.78 + 0.22·unit01(seed, i)`.
+///
+/// The range is deliberately narrow. Under the rise cap the whole star lives
+/// between [`BURST_ROOT_CH`] and [`BURST_CORE_CH`] — `0.92 ch` of span at the
+/// longest — so a wide length spread does not read as "varied", it reads as
+/// half the spikes missing.
+pub const BURST_LEN_MIN: f32 = 0.78;
+
+/// Every third spike is a HERO — full length, so the star has a rhythm rather
+/// than a hash's noise.
+pub const BURST_HERO_EVERY: usize = 3;
+
+/// A hero's length gain, clamped to 1.0 — a hero is always at
+/// [`BURST_CORE_CH`], which is also why sorting the spikes by descending
+/// length puts the heroes first and makes [`BURST_QUAD_CAP`]'s shed order
+/// hero-last for free.
+pub const BURST_HERO_GAIN: f32 = 1.28;
+
+/// Angular jitter, as a share of ONE spacing (`2pi/n`) — `+/- 0.15` of a
+/// spacing, which breaks the asterisk without ever letting two spikes close
+/// their wedge. A jitter at or above 1.0 would let neighbours cross.
+pub const BURST_JITTER: f32 = 0.30;
+
+const _: () = assert!(
+    BURST_JITTER < 1.0,
+    "an angular jitter of a whole spacing lets two spikes swap places and close their wedge"
+);
+
+/// The collinear sections of one spike, as shares of its span.
+///
+/// **One constant-thickness beam is not a lance** (Codex CLI, round 3, on the
+/// design's first spike: *"Root coverage 118 falling to zero produces a fading
+/// bar"*). [`comet_beam`] takes ONE thickness per call, so the taper has to be
+/// geometric: sections of decreasing thickness, collinear, sharing vertices.
+///
+/// THREE, not the design's two. Two were captured from the real renderer and
+/// judged at 5x: the single step reads as a streamer with a BLUNT END, which
+/// is the other half of the same attack Codex made — *"the thickness steps
+/// could resemble joined sticks rather than a sharp lance"*. A third short
+/// section at a third of the root's stroke closes the lance toward a point,
+/// and the sections get SHORTER outward so the steps crowd at the tip where
+/// the eye reads a taper rather than at the middle where it reads a joint.
+pub const BURST_SEC_SHARE: [f32; 3] = [0.46, 0.32, 0.22];
+
+/// Vertices per lance section. Three, not two, because [`comet_beam`]
+/// interpolates COLOUR linearly in RGB between the vertices it is handed and a
+/// straight chord across a quarter of the spectrum's walk cuts the corner off
+/// its curve — the mark then carries five named stops where the law wants
+/// seven.
+pub const BURST_SEC_STATIONS: usize = 3;
+
+/// The sections' stroke thickness, in `ch` — `0.22 -> 0.15 -> 0.08`, each
+/// about two thirds of the last, so no single step is large enough to read as
+/// a joint.
+///
+/// FALSIFIED BY: design section 7 falsifier 3 — a spike rendered at native
+/// resolution that reads as joined sticks instead of one lance. Captured and
+/// judged at 1x, 2x and 5x on the real renderer.
+pub const BURST_SEC_THICK_CH: [f32; 3] = [0.22, 0.15, 0.08];
+
+/// How much of the root's coverage the TIP keeps: a lance is brightest where
+/// it leaves the impact. `1 − 0.45 = 0.55` at the tip.
+pub const BURST_TIP_FADE: f32 = 0.45;
+
+/// The FLOOR of [`comet_beam`]'s major-axis stride for a core spike, px. The
+/// core is short and is the mark the eye lands on, so it is tiled finely.
+pub const BURST_STEP_PX: usize = 2;
+
+/// The core's stride as a share of the CELL, floored at [`BURST_STEP_PX`].
+///
+/// A stride fixed in device px makes the quad count a function of the panel's
+/// pixel density: the same star costs twice as much at a `76 px` cell as at a
+/// `38 px` one, purely because it is bigger in pixels. Tying the stride to the
+/// cell makes the cost a function of the SHAPE — the slab count is the same at
+/// every font size — which is what makes [`BURST_QUAD_CAP`] a cap on a
+/// composition rather than a cap on a font size.
+///
+/// `0.055` is `2 px` at the owner's `38 px` cell, exactly what
+/// [`BURST_STEP_PX`] asked for there.
+pub const BURST_STEP_CH_SHARE: f32 = 0.055;
+
+// ---- the jets: the distance grade, along the line, at no rise cost --------
+
+/// Jets per side, along the flight axis.
+///
+/// The jets are the star's EXTENSIONS, not a second mark: they root exactly
+/// where the core's envelope ends, ride the same quartic and the same clock,
+/// and carry the spectrum outward from where the star's own walk left it.
+/// Codex CLI, on the mock: *"It reads as one impact with horizontal
+/// extensions... Keep the round star dominant; stronger jets could turn it
+/// back into an arrow."*
+pub const JET_N_PER_SIDE: usize = 2;
+
+/// Each jet's tilt off the flight axis, radians. The long jet is flat; the
+/// short one is tilted, and its sign is hashed per side at the mint so the
+/// pair reads as a skid rather than as a symmetric "V".
+pub const JET_TILT_RAD: [f32; JET_N_PER_SIDE] = [0.00, 0.13];
+
+/// Each jet's tip, as a share of the ring's own unchanged
+/// [`ring_full_radius`] — this is where the distance grade lives:
+/// `3.0 ch` at the floor to `6.0 ch` at the cap, exactly the reach the
+/// shockwave had.
+pub const JET_LEN_SHARE: [f32; JET_N_PER_SIDE] = [1.00, 0.66];
+
+/// The tilted jet's vertical component, as a share of `sin(tilt)`: the jets
+/// buy LENGTH along the line, never height. At the cap the tilted jet's
+/// painted rise is `0.66·6.0·sin(0.13)·0.55 + 0.09 = 0.37 ch`, a quarter of
+/// the cap.
+pub const JET_RISE_SQUASH: f32 = 0.55;
+
+/// The jets' two collinear sections, as shares of their span — the same
+/// taper law as the core's, tuned longer at the root because a jet is read
+/// end-on.
+pub const JET_SEC_SHARE: [f32; 2] = [0.55, 0.45];
+
+/// The jets' stroke, in `ch`. **Below the core's** [`BURST_SEC_THICK_CH`] at
+/// both sections, by the ruling above: the star is always the thicker,
+/// brighter mark and the jets are its extensions.
+pub const JET_SEC_THICK_CH: [f32; 2] = [0.13, 0.07];
+
+const _: () = assert!(
+    JET_SEC_THICK_CH[0] < BURST_SEC_THICK_CH[0] && JET_SEC_THICK_CH[1] < BURST_SEC_THICK_CH[1],
+    "the round star stays dominant — a jet thicker than a spike is an arrow, not a starburst"
+);
+const _: () = assert!(
+    BURST_SEC_SHARE[0] + BURST_SEC_SHARE[1] + BURST_SEC_SHARE[2] > 0.999
+        && BURST_SEC_SHARE[0] + BURST_SEC_SHARE[1] + BURST_SEC_SHARE[2] < 1.001,
+    "a spike's sections must tile its span exactly once"
+);
+const _: () = assert!(
+    BURST_SEC_THICK_CH[1] < BURST_SEC_THICK_CH[0] && BURST_SEC_THICK_CH[2] < BURST_SEC_THICK_CH[1],
+    "a lance narrows toward its point"
+);
+
+/// The share of a jet's reach it holds full coverage over; past it the
+/// coverage falls to nothing, so the far end is a fade and never a bar end.
+///
+/// This is the strongest lever on the design's own section 3.2 metric: the
+/// jets are deliberately horizontal light, and a jet that held full coverage
+/// to its tip would put the horizontal share back where the ring had it. A
+/// third, then a smooth fall, keeps the graded REACH (which is what the eye
+/// reads as "that was a big jump") without keeping the graded AREA.
+pub const JET_FEATHER_SHARE: f32 = 0.30;
+
+/// The jets' share of the core's coverage. Below 1.0 by the ruling that keeps
+/// the round star dominant — Codex CLI: *"stronger jets could turn it back
+/// into an arrow."*
+pub const JET_COV_SHARE: f32 = 0.62;
+
+/// Sweeps of the spectrum around the star — [`RING_SWEEPS`]'s own number, and
+/// for [`RING_SWEEPS`]'s own reason: `tri` REFLECTS the walk rather than
+/// wrapping it, so a single sweep starting at an arbitrary landing stop folds
+/// back and shows only part of the spectrum. Two sweeps show all seven stops
+/// from every starting phase.
+pub const BURST_SWEEPS: f32 = RING_SWEEPS;
+
+/// Cells of jet per full sweep of the spectrum — the splash's "the colours
+/// run away from the caret" dynamic, kept; its band geometry, dropped.
+pub const JET_SWEEP_CELLS: f32 = 6.0;
+
+/// How far the jets' spectrum walk slides outward over the life, in
+/// `t`-units. Static under reduced motion.
+pub const JET_DRIFT_T: f32 = 0.5;
+
+/// Stations per cell along a jet — the gating grain (each station asks the
+/// sky's probe about the cell it is over) and the colour grain (C1: a LINEAR
+/// mark samples `spectrum` continuously).
+pub const JET_STATIONS_PER_CELL: usize = 2;
+
+/// How many cells EACH SIDE of the caret the landing row is probed over — the
+/// jets' gate window, and the width of [`SkyMask::row`].
+///
+/// The jets reach `6.0 ch` at the cap, which is `6.0·(ch/cw)` CELLS: 11.4 at
+/// the owner's `20x38` cell, 12.0 at the tests' `9x18`. Fourteen covers every
+/// cell aspect up to `14/6 = 2.33`; past that a jet's far tip has no licence
+/// and is shed, which is the same degradation dense text produces and is
+/// pinned by `a_jet_is_probed_over_its_whole_capped_reach`.
+pub const JET_PROBE_CELLS: i32 = 14;
+
+/// The FLOOR of [`comet_beam`]'s major-axis stride for a jet, px — coarser
+/// than the core's because a jet is long, thin and peripheral.
+pub const JET_STEP_PX: usize = 4;
+
+/// The jets' stride as a share of the cell, floored at [`JET_STEP_PX`] — the
+/// same density-independence law as [`BURST_STEP_CH_SHARE`].
+pub const JET_STEP_CH_SHARE: f32 = 0.11;
+
+/// A light-arm lance's step between ink squares, as a share of the section's
+/// own thickness: overlapping squares, so the ink lance is continuous and not
+/// a dotted line.
+pub const BURST_LIGHT_STEP_SHARE: f32 = 0.6;
+
+// A jet is gated cell by cell on the LANDING ROW's own probe
+// ([`SkyMask::row_blank`]), so every station of every jet must actually be on
+// that row. `sin(x) <= x` bounds the tilted jet's painted rise at the capped
+// reach; the flat jet has no rise at all.
+const _: () = assert!(
+    JET_LEN_SHARE[1]
+        * (RING_R_CH + RING_R_PER_IMPACT_CH * (super::timing::IMPACT_MAX - 1.0))
+        * JET_TILT_RAD[1]
+        * JET_RISE_SQUASH
+        + 0.5 * JET_SEC_THICK_CH[0]
+        < 0.5,
+    "a jet must stay inside the landing row it is gated on"
+);
+
+/// **NO ROTATION IN v1.** Codex CLI caught the hazard in the design's first
+/// spiked geometry: *"It can sweep light through otherwise dark angular gaps
+/// over time. Remove it for the first comparison."* A rotating spike set
+/// fills its own wedges inside the eye's integration window;
+/// the ring's own half-turn (`RING_SPIN_TURNS`) was harmless on a continuous ring and is
+/// not harmless here.
+pub const BURST_SPIN_TURNS: f32 = 0.0;
+
+/// **ENFORCED** cap on one landing's burst (`out`).
+///
+/// The ring's own cap (`RING_QUAD_CAP`, retired with it) was documented as
+/// deliberately unenforced because
+/// truncating a ring leaves a notch. A discrete spike set has no such
+/// problem: this cap sheds WHOLE elements in a fixed order — spikes by
+/// descending length (so the heroes go last), then the long jets, then the
+/// tilted jets — so a shed element is a missing short spike, never a broken
+/// contour. The order is fixed at the MINT, and the geometry only grows, so
+/// a shed element stays shed for the rest of the mark's life and nothing
+/// flickers.
+///
+/// Set from measurement, not arithmetic:
+/// `a_burst_stays_inside_its_quad_cap_at_every_grade` reads the real emitter
+/// at every grade and every cell it is tuned for.
+pub const BURST_QUAD_CAP: usize = 1_280;
+
+/// A beam stride in device px for a mark whose stride is `share` of the cell,
+/// floored at `floor` — see [`BURST_STEP_CH_SHARE`].
+#[inline]
+#[must_use]
+fn burst_step(ch: f32, share: f32, floor: usize) -> usize {
+    ((ch * share).round() as usize).max(floor)
+}
+
+/// The largest spike count for a landing of `cells` (the grade that survives
+/// dense text): `min(9 + 1.2·(impact − 1), 12)`.
+#[must_use]
+pub fn burst_n(cells: f32) -> usize {
+    let n = (BURST_N_BASE + BURST_N_PER_IMPACT * (impact(cells) - 1.0)).min(BURST_N_CEIL);
+    (n.round() as usize).clamp(1, BURST_N_MAX)
+}
 
 // ---- the sparks (2026-09-08) ----------------------------------------------
 
@@ -1442,23 +1683,118 @@ pub struct Pin {
     pub t: f32,
 }
 
-/// The landing RING (§6.5 layer 10) — hollow, expanding past its own debris,
-/// finished before the fan. Reserved for same-row nav and history recall: an
-/// Enter or a PTY line feed has no ring (D8). Since 2026-09-08 it is graded
-/// by distance like the fan: `r_full = (3.0 + 1.2·(scale − 1)) ch`
-/// ([`ring_full_radius`]), life [`ring_ms`], where `scale` is the landing's
-/// [`impact`] — the floor landing is byte-identical to the second round's
-/// fixed shockwave, a full-line landing rings twice as wide for 600 ms. It
-/// grows ALONG the line: the vertical semi-axis is capped at
-/// [`RING_RISE_MAX_CH`], the same flattening the fan takes.
+/// **THE LANDING STARBURST** (2026-09-10) — the mark that replaced the
+/// shockwave ring and the splash's two rainbow bands.
+///
+/// An ISOTROPIC set of tapered lances at TRUE SCREEN angles around the caret,
+/// plus [`JET_N_PER_SIDE`] jets per side along the flight axis carrying the
+/// distance grade. Everything non-silhouette about the ring is reused
+/// verbatim: the quartic expansion ([`RING_R_EXP`]), the graded life
+/// ([`ring_ms`]), the graded reach ([`ring_full_radius`], which the jets ride),
+/// the hold-then-spend coverage ([`RING_COV_HOLD_U`]) and the spectrum walk —
+/// so "something left the caret and ran outward" survives and the belt is
+/// gone.
+///
+/// Directions, lengths and the jets' tilt signs are hashed ONCE at the mint
+/// ([`mint_burst`]), exactly as [`Landing::spark`] precomputes its throws, so
+/// the frame path does no trigonometry and no hashing at all (section 18) —
+/// strictly cheaper than the ring's 72 complex multiplies per frame.
 #[derive(Clone, Copy, Debug)]
-pub struct Ring {
+pub struct Burst {
     /// The arrival edge.
     pub at: Instant,
-    /// The landing's [`impact`] — 1.0 at the 8-cell floor.
+    /// The landing's [`impact`] — 1.0 at the 8-cell floor. The jets read it
+    /// through [`ring_full_radius`].
     pub scale: f32,
-    /// This ring's life in ms ([`ring_ms`]).
+    /// This burst's life in ms — [`ring_ms`], unchanged, so the const assert
+    /// that the graded life reaches [`FLIGHT_OFF_GLASS_MS`] exactly at the cap
+    /// still holds the whole mark off glass by 600 ms.
     pub ms: f32,
+    /// Live spikes, `<= BURST_N_MAX` ([`burst_n`]).
+    pub n: u8,
+    /// Each spike's UNIT SCREEN direction — no ellipse and no squash anywhere
+    /// near it, which is the whole design (see the section header above).
+    pub dir: [(f32, f32); BURST_N_MAX],
+    /// Each spike's tip radius as a share of [`BURST_CORE_CH`],
+    /// [`BURST_LEN_MIN`]`..=1.0`.
+    pub len: [f32; BURST_N_MAX],
+    /// The spikes' EMIT ORDER, by descending length — [`BURST_QUAD_CAP`]'s
+    /// shed order, fixed at the mint so a spike that is in is in for the whole
+    /// life of the mark.
+    pub order: [u8; BURST_N_MAX],
+    /// The jets' UNIT SCREEN directions, `k * 2 + side` (side 0 is leftward).
+    /// Resolved here so the frame path does no trigonometry at all: the tilt
+    /// is a constant in radians and `sin`/`cos` are not `const`, so the only
+    /// place they can be paid once is the mint. The tilted jet's vertical sign
+    /// is hashed per side, so the pair reads as a skid rather than a
+    /// symmetric "V".
+    pub jet_dir: [(f32, f32); JET_N_PER_SIDE * 2],
+}
+
+/// Hash one landing's whole starburst from its seed: [`burst_n`] directions
+/// jittered inside their own spacing, their lengths, the hero rhythm, the
+/// emit order and the jets' tilt signs. Called ONCE, at the arrival edge.
+///
+/// The directions are laid on a TRUE SCREEN circle and rotated by a hashed
+/// phase, so two landings on the same cell are not the same star.
+#[must_use]
+fn mint_burst(seed: u32, at: Instant, cells: f32) -> Burst {
+    let n = burst_n(cells);
+    let step = std::f32::consts::TAU / n as f32;
+    let phase = unit01(seed, 0x51) * step;
+    let mut dir = [(0.0_f32, 0.0_f32); BURST_N_MAX];
+    let mut len = [0.0_f32; BURST_N_MAX];
+    for i in 0..n {
+        let salt = (i as u32).wrapping_mul(0x9E37_79B9) ^ 0x00B5;
+        let a = phase + (i as f32 + BURST_JITTER * (unit01(seed, salt) - 0.5)) * step;
+        dir[i] = (a.cos(), a.sin());
+        let raw = BURST_LEN_MIN + (1.0 - BURST_LEN_MIN) * unit01(seed, salt ^ 0x1D);
+        len[i] = if i % BURST_HERO_EVERY == 0 {
+            (raw * BURST_HERO_GAIN).min(1.0)
+        } else {
+            raw
+        };
+    }
+    // Descending length: an insertion sort over at most twelve slots, so the
+    // shed order costs no allocation and no comparator.
+    let mut order = [0_u8; BURST_N_MAX];
+    for (i, slot) in order.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    for i in 1..n {
+        let mut j = i;
+        while j > 0 && len[usize::from(order[j - 1])] < len[usize::from(order[j])] {
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    // The jets' directions, resolved once: `cos`/`sin` of a constant tilt, the
+    // vertical component squashed by [`JET_RISE_SQUASH`] and signed per side.
+    let mut jet_dir = [(0.0_f32, 0.0_f32); JET_N_PER_SIDE * 2];
+    for k in 0..JET_N_PER_SIDE {
+        let (ct, st) = (JET_TILT_RAD[k].cos(), JET_TILT_RAD[k].sin());
+        for si in 0..2 {
+            let side = if si == 0 { -1.0_f32 } else { 1.0 };
+            let sign = if unit01(seed, 0x7A ^ si as u32) < 0.5 {
+                -1.0_f32
+            } else {
+                1.0
+            };
+            let (rx, ry) = (ct * side, st * JET_RISE_SQUASH * sign);
+            let inv = (rx * rx + ry * ry).sqrt().max(1e-6).recip();
+            jet_dir[k * 2 + si] = (rx * inv, ry * inv);
+        }
+    }
+    Burst {
+        at,
+        scale: impact(cells),
+        ms: ring_ms(cells),
+        n: n as u8,
+        dir,
+        len,
+        order,
+        jet_dir,
+    }
 }
 
 /// The landing FAN (§6.5 layer 11) — "every landing is its own party". What
@@ -1501,27 +1837,28 @@ pub struct Spark {
     pub arm: u8,
 }
 
-/// **WHAT THE SKY'S PROBE SAID** about the cells the landing's flash and
-/// splash may light, latched ONCE per landing on the frame after the mint
-/// ([`Meteors::sow_into`], the meteor's one sight of the probe) and read for
-/// its life. Bit `k` of [`SkyMask::above`] / [`SkyMask::below`] is the cell
-/// `k − SPLASH_CELLS` columns from the caret on the row above / below,
-/// set where that cell is PROVABLY blank (`Some(false)`, §5.4 / L4 — unknown
-/// is not blank); bit `k` of [`SkyMask::flash`] is the same for the landing
-/// row's own cell `k − FLASH_CELLS` columns from the caret. Latched rather
+/// **WHAT THE SKY'S PROBE SAID** about the cells of the landing row the
+/// landing's flash and jets may light, latched ONCE per landing on the frame
+/// after the mint ([`Meteors::sow_into`], the meteor's one sight of the probe)
+/// and read for its life. Bit `k` of [`SkyMask::row`] is the cell
+/// `k − JET_PROBE_CELLS` columns from the caret on the LANDING ROW, set where
+/// that cell is PROVABLY blank (`Some(false)`, §5.4 / L4 — unknown is not
+/// blank). Before 2026-09-10 there were two more masks, for the rows above and
+/// below, and they were the splash's; the starburst's core crosses those rows
+/// at the transient ceiling rather than asking for a licence, exactly as the
+/// ring's stroke did over the same rows. Latched rather
 /// than read per frame because a frame is a function of `now` and the
 /// landing (§18), and because the probe is the sky's: the meteor never holds
 /// it, it asks once through the hand-off it already makes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkyMask {
-    /// Blank cells of the row ABOVE the landing row, `2·SPLASH_CELLS + 1`
-    /// bits centred on the caret's column.
-    pub above: u16,
-    /// Blank cells of the row BELOW the landing row.
-    pub below: u16,
-    /// Blank cells of the landing row itself under the flash,
-    /// `2·FLASH_CELLS + 1` bits centred on the caret's column.
-    pub flash: u8,
+    /// Blank cells of the LANDING ROW itself, `2·JET_PROBE_CELLS + 1` bits
+    /// centred on the caret's column. The flash reads its own three of them
+    /// ([`SkyMask::flash_blank`]); the jets read the whole span
+    /// ([`SkyMask::row_blank`]) — one probe of one row, two readers, rather
+    /// than a second mask that could disagree with this one about the same
+    /// cell.
+    pub row: u32,
 }
 
 impl SkyMask {
@@ -1535,37 +1872,29 @@ impl SkyMask {
             probe.at_px(px, py, geom) == Some(false)
         };
         let mut mask = Self::default();
-        let reach = SPLASH_CELLS as i32;
-        for k in -reach..=reach {
-            let bit = 1_u16 << (k + reach);
-            if blank(k, -1) {
-                mask.above |= bit;
-            }
-            if blank(k, 1) {
-                mask.below |= bit;
-            }
-        }
-        for k in -FLASH_CELLS..=FLASH_CELLS {
+        for k in -JET_PROBE_CELLS..=JET_PROBE_CELLS {
             if blank(k, 0) {
-                mask.flash |= 1_u8 << (k + FLASH_CELLS);
+                mask.row |= 1_u32 << (k + JET_PROBE_CELLS);
             }
         }
         mask
     }
 
-    /// Is the cell `k` columns from the caret on the row above (`−1`) or
-    /// below (`+1`) proven blank?
+    /// Is the landing row's cell `k` columns from the caret proven blank?
+    /// The jets' gate — a station over a cell this says no about breaks the
+    /// polyline, so the mark degrades to the bare core star over dense text.
     #[must_use]
-    fn sky_blank(self, side: i32, k: i32) -> bool {
-        let bit = 1_u16 << (k + SPLASH_CELLS as i32);
-        let row = if side < 0 { self.above } else { self.below };
-        row & bit != 0
+    fn row_blank(self, k: i32) -> bool {
+        if !(-JET_PROBE_CELLS..=JET_PROBE_CELLS).contains(&k) {
+            return false;
+        }
+        self.row & (1_u32 << (k + JET_PROBE_CELLS)) != 0
     }
 
-    /// Is the landing row's cell `k` columns from the caret proven blank?
+    /// The flash's own three cells of the same row.
     #[must_use]
     fn flash_blank(self, k: i32) -> bool {
-        self.flash & (1_u8 << (k + FLASH_CELLS)) != 0
+        self.row_blank(k)
     }
 }
 
@@ -1577,8 +1906,14 @@ impl SkyMask {
 pub struct Landing {
     /// Always present — the pin IS the caret (§6.5 layer 9, D8).
     pub pin: Pin,
-    /// Absent on an Enter / vertical landing (D8).
-    pub ring: Option<Ring>,
+    /// **THE STARBURST** — the impact's one big mark (§6.5 layer 10 since
+    /// 2026-09-10, where the shockwave ring and the splash's two rainbow
+    /// bands used to be). Absent on an Enter / vertical landing (D8: an Enter
+    /// lands small). A celebration's fourth bar also carries a burst, but
+    /// does not carry an impact flash.
+    pub burst: Option<Burst>,
+    /// A meteor impact licenses the flash. A celebration bar does not.
+    pub flash: bool,
     /// Always present; its composition varies (D8).
     pub fan: Fan,
     /// Window-absolute X of the landing cell's centre, px. The pin closes onto
@@ -1594,22 +1929,19 @@ pub struct Landing {
     /// hashed once at the mint from the fan's own seed, so one landing's
     /// whole party is one number (§18) and the frame path only adds.
     pub spark: [Spark; SPARK_N_MAX],
-    /// Whether this landing splashes and flashes — the same verdict as the
-    /// ring (D8): the splash and the flash are the big landing's.
-    pub splash: bool,
-    /// What the sky's probe said about the cells the flash and the splash
-    /// may light — `None` until the hand-off after the mint latches it
-    /// ([`Meteors::sow_into`]). On the mint frame itself the flash draws at
-    /// the transient cap everywhere and the splash draws nothing (its reach
-    /// is zero on that frame anyway, `r(0) = 0`).
+    /// What the sky's probe said about the cells of the landing row the
+    /// flash and the jets may light — `None` until the hand-off after the
+    /// mint latches it ([`Meteors::sow_into`]). On the mint frame itself the
+    /// flash draws at the transient cap everywhere and the jets draw nothing
+    /// (the star has not cleared the caret's disc on that frame anyway).
     pub sky: Option<SkyMask>,
 }
 
 impl Landing {
     /// When the last landing pixel leaves the glass: the pin closes at
-    /// [`PIN_MS`], the flash's colour at [`FLASH_COLOUR_MS`], the ring
-    /// finishes at its own graded life ([`Ring::ms`], [`RING_MS`] at the
-    /// floor), the splash at [`SPLASH_MS`], the last spark at
+    /// [`PIN_MS`], the flash's colour at [`FLASH_COLOUR_MS`], the starburst
+    /// finishes at its own graded life ([`Burst::ms`], [`RING_MS`] at the
+    /// floor — the ring's clock, kept), the last spark at
     /// [`SPARK_LIFE_MAX_MS`]. The fan is not counted because the fan is
     /// STARS, and stars are the sky's pool, not this one. Under reduced
     /// motion the static form lives the pool's whole horizon
@@ -1617,13 +1949,51 @@ impl Landing {
     /// one linear fade.
     #[must_use]
     pub fn end(&self) -> Instant {
-        let ring_ms = self.ring.map_or(0.0, |r| r.ms);
+        let burst_ms = self.burst.map_or(0.0, |b| b.ms);
         let life = PIN_MS
             .max(FLASH_COLOUR_MS)
-            .max(ring_ms)
-            .max(SPLASH_MS)
+            .max(burst_ms)
             .max(SPARK_LIFE_MAX_MS);
         self.pin.at + Duration::from_secs_f32(life / 1000.0)
+    }
+
+    /// **A PARTY LANDING** (RAINBOW-KITTY-V2.md §27) — the celebration's bar
+    /// fan, minted at the caret with no meteor behind it: `n` stars thrown
+    /// ROYGBIV in order from the caret's own stop (`tint_t`), the pin
+    /// closing onto the caret, the starburst only when `ring` (every
+    /// fourth bar), NO splash, NO flash, NO sparks, no gold hero — a bar
+    /// line is a beat, not an impact. Reach is the fan's floor
+    /// ([`FAN_REACH_BASE_CH`]), so it clears the caret cell inside the m2
+    /// hold like every landing fan and is off the glass with the sky's own
+    /// transient lives (≤ 315 ms). One landing is one number (`seed`), §18.
+    #[must_use]
+    pub fn party(
+        at: Instant,
+        at_px: (f32, f32),
+        n: u8,
+        ring: bool,
+        seed: u32,
+        ch: f32,
+        tint_t: f32,
+    ) -> Self {
+        let n = usize::from(n).clamp(1, super::timing::FAN_MAX_N) as u8;
+        Self {
+            pin: Pin { at, t: tint_t },
+            burst: ring.then(|| mint_burst(mix32(seed ^ 0xB0B5), at, f32::from(JUMP_MIN_CELLS))),
+            flash: false,
+            fan: Fan {
+                at,
+                n,
+                reach: FAN_REACH_BASE_CH * ch,
+                seed,
+                hero: false,
+            },
+            x: at_px.0,
+            y: at_px.1,
+            sparks: 0,
+            spark: [Spark::default(); SPARK_N_MAX],
+            sky: None,
+        }
     }
 
     /// The landing's end under reduced motion: the pool's own horizon, so
@@ -1650,7 +2020,7 @@ impl Landing {
     /// is in MOTION on glass: the pin's arms close through [`PIN_MS`], the
     /// flash turns white → spectrum through [`FLASH_COLOUR_MS`], the ring
     /// expands and spins through [`RING_MS`], the splash reaches through
-    /// [`SPLASH_MS`], and every spark is ballistic until its own chroma cull
+    /// its own graded life, and every spark is ballistic until its own chroma cull
     /// ([`spark_cull_u`] of its life). Each mark is under its cull by then,
     /// so past this instant nothing of the landing draws and the pool only
     /// waits for [`Landing::end`]. The cadence law's motion bound
@@ -1660,11 +2030,8 @@ impl Landing {
     #[must_use]
     pub fn moving_until(&self) -> Instant {
         let mut ms = PIN_MS;
-        if let Some(r) = self.ring {
-            ms = ms.max(r.ms);
-        }
-        if self.splash {
-            ms = ms.max(SPLASH_MS).max(FLASH_COLOUR_MS);
+        if let Some(b) = self.burst {
+            ms = ms.max(b.ms).max(FLASH_COLOUR_MS);
         }
         let cull = spark_cull_u();
         for s in self.spark.iter().take(usize::from(self.sparks)) {
@@ -1944,7 +2311,7 @@ impl Meteors {
     /// never by starving the ribbon; layers 2 and 3 (white train, shoulder)
     /// into `frame.out` under [`WHITE_QUAD_CAP`]; layers 6 and 7 (coma,
     /// nucleus, as the corona) into `frame.halos`; the impact — the splash
-    /// into `frame.under` under [`SPLASH_QUAD_CAP`], layers 9 and 10 (pin,
+    /// into `frame.under` under its own cap, layers 9 and 10 (pin,
     /// shockwave) and the sparks into `frame.out`. Layers 5 and 11 (shed
     /// fragments, fan) are MINTED onto [`Meteors::sown`] rather than drawn —
     /// see [`Meteors::sow_into`].
@@ -2021,19 +2388,56 @@ impl Meteors {
                 landings.push(landing);
             }
         }
-        // The impact, bottom → top, all `out`: the splash's two sky bands,
-        // the flash, the pin, the shockwave and the sparks. The fan is the
-        // sky's. Spark halos share one budget across the landings.
+        // The impact, bottom → top, all `out`: the STARBURST, the flash, the
+        // pin and the sparks. The fan is the sky's. Spark halos share one
+        // budget across the landings. (Before 2026-09-10 the bottom two were
+        // the splash's two rainbow bands and the shockwave ring — the marks
+        // the owner named as "the bands effect".)
         let halo_cap = frame.halos.len() + SPARK_HALO_CAP;
         for l in landings.iter() {
-            draw_splash(&mut verts, l, ctx, frame);
+            draw_burst(l, ctx, frame);
             draw_flash(l, ctx, frame);
             draw_pin(l, ctx, frame);
-            draw_ring(l, ctx, frame);
             draw_sparks(l, ctx, frame, halo_cap);
         }
 
         self.verts = verts;
+    }
+
+    /// **THE PARTY** (§27): stage one bar fan at the caret for the sky, and
+    /// on a ring bar pool the [`Landing::party`] that draws the pin and the
+    /// shockwave. Called from `Engine::tick` on the frame the host first saw
+    /// the bar, with that frame's `ctx` — so the fan is born on the bar's
+    /// first echo frame and the sky prices it against a frame that exists.
+    /// A caret off the glass mints nothing (seam point 12's own rule). The
+    /// seed is the spawn ordinal's, so a party is deterministic in the event
+    /// sequence like every meteor (§18); the pools are resident, so nothing
+    /// here allocates.
+    pub fn party(&mut self, at: Instant, n: u8, ring: bool, ctx: &Ctx<'_>) {
+        let (x, y) = ctx.geom.cell_center(ctx.caret.0, ctx.caret.1);
+        if !on_glass(ctx.geom, x, y) {
+            return;
+        }
+        self.ord = self.ord.wrapping_add(1);
+        let seed = seed_of(ctx.caret.0, ctx.caret.1, self.ord);
+        let landing = Landing::party(at, (x, y), n, ring, seed, ctx.geom.ch as f32, ctx.caret_t);
+        self.sown.push(Sow::Fan {
+            at,
+            spec: FanSow {
+                at_px: (x, y),
+                reach: landing.fan.reach,
+                tint_t: landing.pin.t,
+                seed,
+                n: landing.fan.n,
+                hero: false,
+            },
+        });
+        if ring {
+            if self.landings.len() >= LANDING_POOL {
+                self.landings.remove(0);
+            }
+            self.landings.push(landing);
+        }
     }
 
     /// **HAND THE DECIDED BIRTHS TO THE SKY** — the shed fragments (§6.5
@@ -2266,6 +2670,51 @@ impl Meteors {
                 Sow::MiniFan { at_px, .. } => at_px.1,
             };
             y >= 0.0
+        });
+    }
+
+    /// [`Meteors::translate_scroll`]'s ROW-BAND twin (seam point 12, the band
+    /// path): screen rows `top..=bottom` moved by `delta`, every other row
+    /// stood still, and the flights, landings and sown hand-offs — all
+    /// window-absolute px — move under [`BandPx`]'s law. A landing and a sow
+    /// are POINTS: inside the band's pixel span they move by `delta` rows and
+    /// are kept iff they are still inside; outside they are untouched. A
+    /// flight is a SPAN from tail to head: both endpoints inside → the whole
+    /// train moves; neither → untouched; one in and one out → the train is
+    /// DROPPED, because half of it belongs to text that moved and half to
+    /// text that did not, and a streak bent to fit would be light over cells
+    /// neither end earned. A dropped flight mints no landing — its endpoint
+    /// is gone from `live` before [`Meteors::emit`] could arrive it, the
+    /// same silence a scroll buys a train it carried off the glass.
+    ///
+    /// With no cell height yet (`cell_h == 0`, no tick observed) there is no
+    /// geometry to address the pools by, so every pixel mark is dropped —
+    /// fail closed, as `CursorGlow::translate_band_state` treats its own
+    /// pixel pools — rather than left where the text no longer is.
+    pub fn translate_band(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        delta: i16,
+        cell_h: u16,
+        origin_y: u16,
+    ) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        if cell_h == 0 {
+            self.live.clear();
+            self.landings.clear();
+            self.sown.clear();
+            return;
+        }
+        let px = BandPx::new(top, bottom, delta, cell_h, origin_y);
+        self.live.retain_mut(|m| px.span(&mut m.y0, &mut m.y1));
+        self.landings.retain_mut(|l| px.point(&mut l.y));
+        self.sown.retain_mut(|s| match s {
+            Sow::Shed { spec, .. } => px.point(&mut spec.at_px.1),
+            Sow::Fan { spec, .. } => px.point(&mut spec.at_px.1),
+            Sow::MiniFan { at_px, .. } => px.point(&mut at_px.1),
         });
     }
 
@@ -3182,16 +3631,6 @@ fn draw_pin(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     );
 }
 
-/// The shockwave's colour at `share` of the way around it, at `u` of its
-/// life: the spectrum walked [`RING_SWEEPS`] times around through `tri` (so
-/// the ring has no seam) and turned [`RING_SPIN_TURNS`] over the life. A
-/// linear mark samples `spectrum` (C1).
-#[inline]
-#[must_use]
-pub fn ring_colour(share: f32, u: f32) -> u32 {
-    spectrum(tri(RING_SWEEPS * (share + RING_SPIN_TURNS * u)))
-}
-
 /// Per-channel lerp of two `0x00RRGGBB` colours, `t` in `0..=1` — the one
 /// place this file mixes colours (a spark's tinted core).
 #[inline]
@@ -3226,7 +3665,7 @@ fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 /// Reduced motion: the static form — white and colour at half each, held,
 /// then the theme's one linear fade (§6.11).
 fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
-    if !l.splash {
+    if !l.flash {
         return;
     }
     let age = ms_since(l.pin.at, ctx.now);
@@ -3296,208 +3735,343 @@ fn draw_flash(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
     }
 }
 
-/// §6.5 layer 10 — the landing RING, since 2026-09-08 **THE SHOCKWAVE**.
+/// The largest radius a mark may reach along a unit direction whose vertical
+/// component is `dy` before its PAINTED edge — centreline plus half the
+/// stroke — crosses `rise_px`.
 ///
-/// Hollow, expanding past the fan and the splash to [`RING_R_CH`] over
-/// [`RING_MS`], its circumference carrying the spectrum ([`ring_colour`]).
-/// 72 segments where §6.5 wrote 48 and v1 used 32: the notch
-/// `the_ring_has_no_notch_on_the_steep_quadrants` measures is what too few
-/// leave on the steep quadrants, where an ellipse's arc-length per angle
-/// step is longest.
-fn draw_ring(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
-    let Some(ring) = l.ring else {
+/// The const assert on [`BURST_CORE_CH`] holds the law in normalized `ch`;
+/// this is the same law in DEVICE PX, which is what a constant alone cannot
+/// give — Codex CLI: *"A normalized constant assertion alone cannot account
+/// for a device-pixel AA fringe at every font size."* At the cells this family
+/// is tuned for it is a no-op; at a tiny cell it shortens the near-vertical
+/// spikes and nothing else.
+#[inline]
+#[must_use]
+fn burst_rise_limit(dy: f32, rise_px: f32, half_thick_px: f32) -> f32 {
+    let room = rise_px - half_thick_px;
+    if room <= 0.0 {
+        return 0.0;
+    }
+    let ady = dy.abs();
+    if ady < 1e-3 {
+        f32::INFINITY
+    } else {
+        room / ady
+    }
+}
+
+/// ONE TAPERED LANCE — two collinear [`comet_beam`] sections of decreasing
+/// thickness from `root` to `tip` along `dir`, its colour ramping from
+/// `ends.0` to `ends.1` and its coverage falling to `1 − `[`BURST_TIP_FADE`]
+/// at the tip. A lance is brightest and fattest where it leaves the impact.
+///
+/// Light (section 6.10): the SAME silhouette in source-over ink — a run of
+/// overlapping ink squares of the section's own thickness — because additive
+/// light is invisible on a page and the burst's whole content is its SHAPE.
+/// The light arm buys "bigger" as AREA (L6), never as brightness.
+#[allow(clippy::too_many_arguments)]
+fn burst_lance(
+    frame: &mut Frame<'_>,
+    ctx: &Ctx<'_>,
+    origin: (f32, f32),
+    dir: (f32, f32),
+    root: f32,
+    tip: f32,
+    sec_thick_px: [f32; 3],
+    walk: (f32, f32),
+    cov: f32,
+    step: usize,
+    light: bool,
+) {
+    let (ox, oy) = origin;
+    let span = tip - root;
+    if span < 1.0 {
+        return;
+    }
+    let clip = ctx.geom.beam_clip();
+    // The colour at `t` along the lance: the SPECTRUM ITSELF, sampled, never a
+    // straight RGB chord between two distant stops. A chord across a quarter
+    // of the walk cuts the corner off the spectrum's own curve and skips whole
+    // named stops — which is what `the_burst_walks_the_whole_spectrum_around_
+    // the_star` catches.
+    let hue = |t: f32| spectrum(tri(walk.0 + walk.1 * t));
+    let mut s0 = root;
+    let mut done = 0.0_f32;
+    for (k, &thick_ch) in sec_thick_px.iter().enumerate() {
+        done += BURST_SEC_SHARE[k];
+        let s1 = if k + 1 == sec_thick_px.len() {
+            tip
+        } else {
+            root + span * done
+        };
+        if s1 - s0 < 0.5 {
+            s0 = s1;
+            continue;
+        }
+        let thick = thick_ch.max(1.0);
+        if light {
+            let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP);
+            let side = (thick.round() as i32).max(1);
+            let stride = (thick * BURST_LIGHT_STEP_SHARE).max(1.0);
+            let mut s = s0;
+            while s <= s1 {
+                let t = (s - root) / span;
+                let a = (ink * (1.0 - BURST_TIP_FADE * t)) as u8;
+                let rect = (
+                    (ox + dir.0 * s).round() as i32 - side / 2,
+                    (oy + dir.1 * s).round() as i32 - side / 2,
+                    side,
+                    side,
+                );
+                push_ink_rect(frame.out, ctx.geom, rect, light_ink(hue(t)), a);
+                s += stride;
+            }
+        } else {
+            frame.beams.clear();
+            for j in 0..BURST_SEC_STATIONS {
+                let f = j as f32 / (BURST_SEC_STATIONS - 1) as f32;
+                let s = s0 + (s1 - s0) * f;
+                let t = (s - root) / span;
+                frame.beams.push(BeamVertex {
+                    x: ox + dir.0 * s,
+                    y: oy + dir.1 * s,
+                    color: hue(t),
+                    cov: (cov * (1.0 - BURST_TIP_FADE * t)).clamp(0.0, 255.0) as u8,
+                });
+            }
+            comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+        }
+        s0 = s1;
+    }
+}
+
+/// ONE JET — the distance grade, along the flight line, at no rise cost.
+///
+/// A jet roots exactly where the core's own envelope ends and runs out to
+/// [`JET_LEN_SHARE`] of the ring's unchanged [`ring_full_radius`] on the same
+/// quartic, so the star and its extensions share an origin, an onset, a clock
+/// and a colour walk — which is what binds them into one impact.
+///
+/// **HOW A MARK THAT CROSSES THE TEXT HOLDS THE LEGIBILITY BAR.** Unlike the
+/// core, a jet runs the length of the landing ROW. Every station asks the
+/// sky's probe about the cell it is over ([`SkyMask::row_blank`]) and a
+/// station the probe has not proved blank BREAKS the polyline — exactly the
+/// splash's gate, moved from two sky bands onto the row itself. Over dense
+/// text the jets vanish and the mark degrades to the bare core star, which the
+/// design accepts: *"Degrading to C over dense text is acceptable. It
+/// preserves the requested starburst and respects legibility."* The graded fan
+/// is the distance cue that survives that degradation.
+#[allow(clippy::too_many_arguments)]
+fn burst_jet(
+    frame: &mut Frame<'_>,
+    ctx: &Ctx<'_>,
+    l: &Landing,
+    dir: (f32, f32),
+    root: f32,
+    tip: f32,
+    cov: f32,
+    drift: f32,
+    light: bool,
+) {
+    let Some(sky) = l.sky else {
+        // Before the probe has been asked there is no licence to cross the
+        // row, so the mark is the bare core star on that one frame.
+        return;
+    };
+    let span = tip - root;
+    let cw = (ctx.geom.cw as f32).max(1.0);
+    let ch = ctx.geom.ch as f32;
+    if span < 1.0 {
+        return;
+    }
+    let clip = ctx.geom.beam_clip();
+    let ink_gain = if light { LIGHT_INK_GAIN } else { 1.0 };
+    let sec_end = [root + span * JET_SEC_SHARE[0], tip];
+    let mut s0 = root;
+    for k in 0..2 {
+        let s1 = sec_end[k];
+        let seg = s1 - s0;
+        if seg < 1.0 {
+            s0 = s1;
+            continue;
+        }
+        let thick = (JET_SEC_THICK_CH[k] * ch).max(1.0);
+        let step = burst_step(ch, JET_STEP_CH_SHARE, JET_STEP_PX);
+        let stations = ((seg / cw) * JET_STATIONS_PER_CELL as f32).ceil().max(1.0) as usize + 1;
+        frame.beams.clear();
+        for j in 0..stations {
+            let share = j as f32 / (stations - 1) as f32;
+            let d = s0 + seg * share;
+            let along = (dir.0 * d).abs();
+            let cell = ((dir.0 * d) / cw).round() as i32;
+            // The feather is measured over the WHOLE jet, not the section, so
+            // the two sections meet at one coverage and the seam is invisible.
+            let t_all = ((d - root) / span).clamp(0.0, 1.0);
+            let fade = 1.0 - smoothstep01((t_all - JET_FEATHER_SHARE) / (1.0 - JET_FEATHER_SHARE));
+            let c = (cov * fade * ink_gain).min(if light { LIGHT_ALPHA_CAP } else { 255.0 });
+            if !sky.row_blank(cell) || c < 1.0 {
+                if !light {
+                    comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+                    frame.beams.clear();
+                }
+                continue;
+            }
+            // The splash's dynamic, kept: one sweep of the spectrum per
+            // [`JET_SWEEP_CELLS`] outward from the landing's own stop, sliding
+            // outward as the mark spends.
+            let stop = spectrum(tri(l.pin.t + along / cw / JET_SWEEP_CELLS + drift));
+            if light {
+                let w = ((seg / (stations - 1) as f32).round() as i32).max(1) + 1;
+                let h = (thick.round() as i32).max(1);
+                let rect = (
+                    (l.x + dir.0 * d).round() as i32 - w / 2,
+                    (l.y + dir.1 * d).round() as i32 - h / 2,
+                    w,
+                    h,
+                );
+                push_ink_rect(frame.out, ctx.geom, rect, light_ink(stop), c as u8);
+            } else {
+                frame.beams.push(BeamVertex {
+                    x: l.x + dir.0 * d,
+                    y: l.y + dir.1 * d,
+                    color: stop,
+                    cov: c as u8,
+                });
+            }
+        }
+        if !light {
+            comet_beam(frame.out, clip, frame.beams, thick, step, 0.0);
+        }
+        s0 = s1;
+    }
+}
+
+/// **THE LANDING STARBURST** (2026-09-10) — section 6.5 layer 10, replacing
+/// BOTH the shockwave ring and the splash's two rainbow bands.
+///
+/// [`Burst::n`] tapered lances at TRUE SCREEN angles out to
+/// [`BURST_CORE_CH`], rooted at [`BURST_ROOT_CH`] so the caret keeps its own
+/// cell and the wedges between spikes are dark all the way in, plus
+/// [`JET_N_PER_SIDE`] jets per side carrying the distance grade along the
+/// line. One full ROYGBIV walk goes round the star — spike `i` ramps from
+/// `spectrum(tri(t + i/n))` at its root to `spectrum(tri(t + (i+1)/n))` at its
+/// tip, so every spike is its own little rainbow (C1: a LINEAR mark samples
+/// `spectrum` continuously) — and the jets continue that walk outward.
+///
+/// Everything about the ring that was not its SILHOUETTE is reused byte for
+/// byte: the quartic ([`RING_R_EXP`]), the graded life ([`ring_ms`]), the
+/// graded reach ([`ring_full_radius`]), the hold-then-spend coverage
+/// ([`RING_COV_HOLD_U`], [`RING_COV_SHARE`]) and the transient ceiling. The
+/// 600 ms budget is therefore met by construction and the const assert that
+/// proves it is unchanged.
+///
+/// The frame path does NO trigonometry and NO hashing — every direction and
+/// length was resolved at the mint ([`mint_burst`]) — and allocates nothing:
+/// `frame.beams` is the host's existing scratch, cleared per section exactly
+/// as the shockwave ring it replaced cleared it.
+///
+/// Reduced motion (section 6.11): the full star and its jets drawn once at
+/// full reach, held, then the theme's ONE linear fade. The static form of a
+/// starburst is a better still than the static form of an expanding hoop.
+fn draw_burst(l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
+    let Some(b) = l.burst else {
         return;
     };
     let ch = ctx.geom.ch as f32;
-    // The landing's GRADE: the full radius grows ALONG the line with the
-    // jump's impact ([`ring_full_radius`]); the vertical semi-axis is capped
-    // at the floor ring's own ([`RING_RISE_MAX_CH`]), so a big ring flattens
-    // into a wide ellipse under the row exactly as the fan flattens under
-    // its rise cap (one law, one squash), and never rises above where the
-    // fan may.
-    let r_full = ring_full_radius(ring.scale, ch);
-    // §6.11: under reduced motion the shockwave is STATIC at its full reach
-    // — the colours without the expansion — and leaves on the linear fade.
-    let (u, r, alpha) = if ctx.cfg.reduced_motion {
-        (0.0, r_full, l.static_alpha(ctx.now))
-    } else {
-        let u = clamp01(ms_since(ring.at, ctx.now) / ring.ms);
-        // Hold-then-fall (`RING_COV_SHARE`): full while the ring is small,
-        // spent on `spend` over the rest of its life as it expands past the
-        // fan.
-        let u_spend = clamp01((u - RING_COV_HOLD_U) / (1.0 - RING_COV_HOLD_U));
-        (
-            u,
-            r_full * (1.0 - (1.0 - u).powi(RING_R_EXP)),
-            spend(u_spend),
-        )
-    };
-    let (rx, ry) = (r, (r * RING_SQUASH).min(RING_RISE_MAX_CH * ch));
-    let cov = RING_COV_SHARE * TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
-    if cov < 1.0 || r < 1.0 {
-        return;
-    }
-    let light = !ctx.cfg.dark_theme;
-    let step = std::f32::consts::TAU / RING_SEGMENTS as f32;
-
-    // §6.10: the light ring is source-over dots, not a stroked polyline —
-    // `comet_beam` emits additive light, and additive light is invisible on a
-    // page (you cannot brighten white).
-    if light {
-        let ink = (cov * LIGHT_INK_GAIN).min(LIGHT_ALPHA_CAP) as u8;
-        let dot = (r * RING_THICK_SHARE).clamp(RING_THICK_MIN_PX, RING_THICK_MAX_CH * ch);
-        for k in 0..RING_LIGHT_DOTS {
-            let share = (k as f32) / (RING_LIGHT_DOTS as f32);
-            let a = std::f32::consts::TAU * share;
-            let c = (l.x + rx * a.cos(), l.y + ry * a.sin());
-            let rgb = light_ink(ring_colour(share, u));
-            push_halo_veil(frame.halos, ctx.geom, c, (dot, dot * RING_SQUASH), rgb, ink);
-        }
-        return;
-    }
-
-    // The unit circle walked by ONE rotation per vertex (a complex multiply
-    // by `e^(i·step)`) — no trigonometry on the frame path beyond the step
-    // itself; over 72 steps the drift is under 1e-4 px, and the last vertex
-    // is pinned to the first so the ring closes exactly.
-    frame.beams.clear();
-    let (cos_step, sin_step) = (step.cos(), step.sin());
-    let (mut c, mut s) = (1.0_f32, 0.0_f32);
-    for k in 0..=RING_SEGMENTS {
-        let (ux, uy) = if k == RING_SEGMENTS {
-            (1.0, 0.0)
-        } else {
-            (c, s)
-        };
-        frame.beams.push(BeamVertex {
-            x: l.x + rx * ux,
-            y: l.y + ry * uy,
-            color: ring_colour((k % RING_SEGMENTS) as f32 / RING_SEGMENTS as f32, u),
-            cov: cov as u8,
-        });
-        (c, s) = (c * cos_step - s * sin_step, s * cos_step + c * sin_step);
-    }
-    let thick = (r * RING_THICK_SHARE).clamp(RING_THICK_MIN_PX, RING_THICK_MAX_CH * ch);
-    let step = if thick >= RING_STEP4_THICK_PX {
-        4
-    } else if thick >= RING_STEP3_THICK_PX {
-        3
-    } else if thick >= RING_STEP2_THICK_PX {
-        2
-    } else {
-        1
-    };
-    comet_beam(
-        frame.out,
-        ctx.geom.beam_clip(),
-        frame.beams,
-        thick,
-        step,
-        0.0,
-    );
-}
-
-/// **THE SPLASH — TWO RAINBOW BANDS IN THE SKY** (second round, 2026-09-08).
-/// [`SPLASH_CELLS`] each side of the caret, a full sweep of the spectrum
-/// outward from the landing's own stop, mirrored, sliding outward over the
-/// life ([`SPLASH_DRIFT_T`]), at the transient ceiling and feathered to
-/// nothing past [`SPLASH_FEATHER_SHARE`] of its reach. Its reach bursts out
-/// on the ring's quartic and its coverage is held then spent.
-///
-/// WHERE: one band in the sky band above the landing row — the aurora's
-/// band, `[top − gap − SPLASH_BAND_CH·ch, top − gap)` with `gap` the tall
-/// ribbon's rise above the cell (`TALL_UP_CH − 1`) or nothing under
-/// `underline` — and its mirror below the row, about the row's centre. Both
-/// lie STRICTLY OUTSIDE the landing row's own cell rows, so no pixel of the
-/// splash is ever on the text it celebrates; and each station is gated on
-/// the sky's probe ([`SkyMask::sky_blank`]) so a band is never laid over a
-/// neighbour-row cell that carries a glyph or that the probe has not seen.
-/// The bold round's under-ink splash on the row itself is gone: the owner
-/// asked for the impact out from under the letters.
-///
-/// Four head-first polylines (two sides of two bands), each under a quarter
-/// of [`SPLASH_QUAD_CAP`], so a saturated budget sheds the far ends and
-/// never the heart; a station the probe refuses breaks the polyline there.
-/// `out`: above ink, and it blooms. Light: source-over ink at the leading's
-/// cap — nothing under a band is a glyph, by construction (§6.10). Reduced
-/// motion: static at full reach, on the linear fade (§6.11).
-fn draw_splash(verts: &mut Vec<RibbonVertex>, l: &Landing, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
-    if !l.splash {
-        return;
-    }
-    let Some(sky) = l.sky else {
-        return;
-    };
     let reduced = ctx.cfg.reduced_motion;
-    let (u, alpha) = if reduced {
-        (1.0, l.static_alpha(ctx.now))
+    let (u, grow, alpha) = if reduced {
+        (0.0, 1.0, l.static_alpha(ctx.now))
     } else {
-        let u = clamp01(ms_since(l.pin.at, ctx.now) / SPLASH_MS);
-        let u_spend = clamp01((u - SPLASH_HOLD_U) / (1.0 - SPLASH_HOLD_U));
-        (u, spend(u_spend))
+        let u = clamp01(ms_since(b.at, ctx.now) / b.ms);
+        // Hold-then-fall, the ring's own: full while the star is small, spent
+        // over the rest of its life as it opens.
+        let u_spend = clamp01((u - RING_COV_HOLD_U) / (1.0 - RING_COV_HOLD_U));
+        (u, 1.0 - (1.0 - u).powi(RING_R_EXP), spend(u_spend))
     };
-    let (cw, ch) = ((ctx.geom.cw as f32).max(1.0), ctx.geom.ch as f32);
-    let reach = SPLASH_CELLS * cw * (1.0 - (1.0 - u).powi(RING_R_EXP));
-    let peak = TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
-    if peak < 1.0 || reach < 1.0 {
+    let cov = RING_COV_SHARE * TRANSIENT_STAR_COV_CEIL * alpha * clamp01(ctx.cfg.intensity);
+    if cov < 1.0 || grow <= 0.0 {
         return;
     }
     let light = !ctx.cfg.dark_theme;
-    let (blend, gain, cap_ink) = if light {
-        (GlowBlend::Over, LIGHT_INK_GAIN, LIGHT_RAIL_ALPHA_CAP)
-    } else {
-        (GlowBlend::Add, 1.0, 255.0)
-    };
-    let drift = if reduced { 0.0 } else { SPLASH_DRIFT_T * u };
-    let gap = if ctx.cfg.ribbon_tall {
-        (TALL_UP_CH - 1.0) * ch
-    } else {
-        0.0
-    };
-    let half = SPLASH_BAND_CH * ch * 0.5;
-    let n = SPLASH_CELLS as usize * SPLASH_STATIONS_PER_CELL + 1;
-    let step = ((cw * SPLASH_STEP_CW_SHARE).round() as usize).max(2);
-    let clip = ctx.geom.beam_clip();
-    let cap_quarter = SPLASH_QUAD_CAP / 4;
-    for side_y in [-1_i32, 1] {
-        let spine = l.y + side_y as f32 * (ch * 0.5 + gap + half);
-        for side_x in [-1.0_f32, 1.0] {
-            verts.clear();
-            let cap = frame.out.len() + cap_quarter;
-            for k in 0..n {
-                let share = (k as f32) / ((n - 1) as f32);
-                let d = reach * share;
-                // The cell this station is over, columns from the caret:
-                // a station the probe has not proved blank breaks the band.
-                let cell = ((side_x * d + cw * 0.5) / cw).floor() as i32;
-                let cov = peak
-                    * (1.0
-                        - smoothstep01(
-                            (share - SPLASH_FEATHER_SHARE) / (1.0 - SPLASH_FEATHER_SHARE),
-                        ))
-                    * gain;
-                if !sky.sky_blank(side_y, cell) || cov < 1.0 {
-                    rasterize(frame.out, clip, verts, Axis::Horizontal, step, cap, blend);
-                    verts.clear();
-                    continue;
-                }
-                // A full sweep over the reach, from the landing's own stop
-                // out, sliding outward as the splash spends.
-                let stop = spectrum(tri(l.pin.t + d / cw / SPLASH_CELLS + drift));
-                verts.push(RibbonVertex {
-                    x: l.x + side_x * d,
-                    spine,
-                    up: half,
-                    dn: half,
-                    core_up: half * TRAIN_CORE_SHARE,
-                    core_dn: half * TRAIN_CORE_SHARE,
-                    color: if light { light_ink(stop) } else { stop },
-                    cov: cov.min(cap_ink),
-                    lift: 0.0,
-                    lift_span: 0.0,
-                });
+    // The cap is ENFORCED, by shedding whole elements in the mint's own fixed
+    // order. See [`BURST_QUAD_CAP`].
+    let cap = frame.out.len() + BURST_QUAD_CAP;
+    // The painted-extent rise law, in device px (see [`burst_rise_limit`]).
+    let rise_px = (FAN_RISE_MAX_CH * ch - 1.0).max(1.0);
+    let n = usize::from(b.n).min(BURST_N_MAX);
+    let root = BURST_ROOT_CH * ch;
+    let core_full = BURST_CORE_CH * ch;
+    let sec_thick = [
+        BURST_SEC_THICK_CH[0] * ch,
+        BURST_SEC_THICK_CH[1] * ch,
+        BURST_SEC_THICK_CH[2] * ch,
+    ];
+    let half_root_thick = sec_thick[0] * 0.5;
+    for slot in 0..n {
+        if frame.out.len() >= cap {
+            break;
+        }
+        let i = usize::from(b.order[slot]);
+        let dir = b.dir[i];
+        let tip =
+            (core_full * b.len[i] * grow).min(burst_rise_limit(dir.1, rise_px, half_root_thick));
+        if tip <= root + 1.0 {
+            continue;
+        }
+        // Spike `i` carries its own slice of ONE walk round the star: from
+        // `spectrum(tri(t + 2i/n))` at its root to `spectrum(tri(t + 2(i+1)/n))`
+        // at its tip, so every spike is its own little rainbow and the star as
+        // a whole is a full ROYGBIV wheel.
+        let walk = (
+            l.pin.t + BURST_SWEEPS * (i as f32) / (n as f32) + BURST_SPIN_TURNS * u,
+            BURST_SWEEPS / n as f32,
+        );
+        burst_lance(
+            frame,
+            ctx,
+            (l.x, l.y),
+            dir,
+            root,
+            tip,
+            sec_thick,
+            walk,
+            cov,
+            burst_step(ch, BURST_STEP_CH_SHARE, BURST_STEP_PX),
+            light,
+        );
+    }
+
+    // The jets, longest first — the shed order's tail.
+    let r_full = ring_full_radius(b.scale, ch);
+    let drift = if reduced { 0.0 } else { JET_DRIFT_T * u };
+    let jet_half_thick = JET_SEC_THICK_CH[0] * ch * 0.5;
+    // THE JETS ARE THE STAR'S EXTENSIONS, so they root exactly where its
+    // envelope is and do not exist before it does — otherwise the first
+    // frames of the mark are a horizontal nub at the caret with no star
+    // around it, which is the composition the whole redesign is against.
+    let jet_root = core_full * grow;
+    if jet_root <= root {
+        return;
+    }
+    for (k, &len_share) in JET_LEN_SHARE.iter().enumerate() {
+        for si in 0..2 {
+            if frame.out.len() >= cap {
+                return;
             }
-            rasterize(frame.out, clip, verts, Axis::Horizontal, step, cap, blend);
+            let dir = b.jet_dir[k * 2 + si];
+            let tip =
+                (len_share * r_full * grow).min(burst_rise_limit(dir.1, rise_px, jet_half_thick));
+            burst_jet(
+                frame,
+                ctx,
+                l,
+                dir,
+                jet_root,
+                tip,
+                cov * JET_COV_SHARE,
+                drift,
+                light,
+            );
         }
     }
 }
@@ -3756,11 +4330,15 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>) -> Landing {
 
     Landing {
         pin: Pin { at, t: m.arc(0.0) },
-        ring: m.ring.then_some(Ring {
-            at,
-            scale: impact(m.cells),
-            ms: ring_ms(m.cells),
-        }),
+        // The star is hashed off its own salt of the landing seed, so the
+        // shower and the starburst are not correlated shapes. `m.ring` is
+        // still the flag's name at the spawn edge — the ONE decision that
+        // says "this landing is the big one" (D8) — and the mark it now
+        // licenses is the burst.
+        burst: m
+            .ring
+            .then(|| mint_burst(mix32(seed ^ 0xB0B5), at, m.cells)),
+        flash: m.ring,
         fan: Fan {
             at,
             n: n as u8,
@@ -3772,7 +4350,6 @@ fn mint_landing(m: &Meteor, ctx: &Ctx<'_>) -> Landing {
         y,
         sparks: sparks as u8,
         spark,
-        splash: m.ring,
         sky: None,
     }
 }
@@ -4090,10 +4667,21 @@ fn push_ink_rect(
 /// later retune cannot silently break the "a ping-pong never blanks the
 /// ribbon" law by editing one number.
 const _: () = {
+    // The `under` stream: two meteors' colour trains and the ribbon. Until
+    // 2026-09-10 the splash held 768 of it per meteor and the three landed
+    // exactly on MAX_QUADS; the starburst that replaced the splash emits
+    // NOTHING under the ink, so that share is now slack. It is left as slack
+    // rather than handed back to the train's stations: this retirement is not
+    // a retune of the train's look.
     assert!(
-        FLIGHT_MAX_LIVE * (UNDER_QUAD_CAP + SPLASH_QUAD_CAP) + super::ribbon::RIBBON_QUAD_BUDGET
-            == 16_384,
-        "§18: two meteors, two splashes and the ribbon must land exactly on MAX_QUADS"
+        FLIGHT_MAX_LIVE * UNDER_QUAD_CAP + super::ribbon::RIBBON_QUAD_BUDGET <= 16_384,
+        "§18: two meteors' trains and the ribbon must fit inside MAX_QUADS"
+    );
+    // The landing's own `out` share: every live landing's burst plus two
+    // meteors' white layers, which is what took the splash's place.
+    assert!(
+        LANDING_POOL * BURST_QUAD_CAP + FLIGHT_MAX_LIVE * WHITE_QUAD_CAP <= 16_384,
+        "§18: three bursts and two white layers must fit inside MAX_QUADS"
     );
     // The impact's last light — the longest spark, the shockwave, the
     // splash, the colour train's chroma cull (`τ·ln(1/0.12)`) and its root's
@@ -4101,7 +4689,6 @@ const _: () = {
     assert!(
         SPARK_LIFE_MAX_MS <= FLIGHT_OFF_GLASS_MS
             && RING_MS_MAX <= FLIGHT_OFF_GLASS_MS
-            && SPLASH_MS <= FLIGHT_OFF_GLASS_MS
             && TRAIN_COLOUR_TAU_MS * RETIRE_DECAY <= FLIGHT_OFF_GLASS_MS
             && ROOT_SUCK_MS <= FLIGHT_OFF_GLASS_MS,
         "every impact mark must be off glass by FLIGHT_OFF_GLASS_MS"
@@ -4114,11 +4701,10 @@ const _: () = {
         SPARK_ARM_MIN_PX >= 1 && SPARK_ARM_MAX_PX >= SPARK_ARM_MIN_PX && SPARK_ARM_MAX_PX <= 255,
         "a spark's arm is a u8 of at least one pixel"
     );
-    // The second round's impact: the flash's colour is inside the pool's
-    // horizon; the flash and the shockwave's hold are ATTACK inside the pin's
-    // own window, so the cadence law's attack is the pin's as before; the
-    // stroke is two and a half times the bold round's; the two masks hold
-    // every cell they are asked about.
+    // The impact's clocks: the flash's colour is inside the pool's horizon;
+    // the flash and the burst's hold are ATTACK inside the pin's own window,
+    // so the cadence law's attack is the pin's as before; and the sky mask
+    // holds every cell it is asked about.
     assert!(
         FLASH_COLOUR_MS <= FLIGHT_OFF_GLASS_MS
             && FLASH_BURST_MS <= PIN_MS
@@ -4128,13 +4714,8 @@ const _: () = {
         "the flash and the shockwave's hold must sit inside the pin's attack"
     );
     assert!(
-        RING_THICK_SHARE >= 2.5 * RING_THICK_SHARE_BOLD_ROUND,
-        "the second round's stroke is two and a half times the bold round's"
-    );
-    assert!(
-        2 * (SPLASH_CELLS as usize) < u16::BITS as usize
-            && 2 * (FLASH_CELLS as usize) < u8::BITS as usize,
-        "the sky masks must hold every cell the splash and the flash light"
+        2 * (JET_PROBE_CELLS as usize) < u32::BITS as usize,
+        "the sky mask must hold every cell of the landing row a jet can reach"
     );
     assert!(
         FLASH_FULL_COV > TRANSIENT_STAR_COV_CEIL && FLASH_FULL_COV < 255.0,
@@ -4143,10 +4724,6 @@ const _: () = {
     assert!(
         WHITE_QUAD_CAP < UNDER_QUAD_CAP,
         "§6.5: the white layer is the short one"
-    );
-    assert!(
-        RING_QUAD_CAP == RING_SEGMENTS,
-        "§6.5 layer 10: one quad per ring segment"
     );
 };
 
@@ -5418,58 +5995,6 @@ mod tests {
         }
     }
 
-    /// **THE SHOCKWAVE** (owner, 2026-09-08: "a bigger more special rainbow
-    /// impact"). The landing ring, drawn alone, reaches at least TWICE the
-    /// 2026-09-05 ring's 1.3 `ch` along the row, and its circumference
-    /// carries at least six of the seven stops — a rainbow shockwave, not
-    /// a small pop. Before the re-ruling the reach is 1.3 `ch`.
-    #[test]
-    fn the_landing_is_a_rainbow_shockwave_twice_the_old_reach() {
-        let cfg = config();
-        let t0 = Instant::now();
-        let ch = geom().ch as f32;
-        for (from, to) in [((5_u16, 0_u16), (5_u16, 40_u16)), ((5, 40), (5, 0))] {
-            let mut m = Meteors::new();
-            let ctx = ctx_at(t0, &cfg, to, 0.25);
-            let spawn = m.on_event(&mv(from, to), t0, &ctx).expect("fly");
-            let arrival = t0 + spawn.t_flight;
-            let mut sc = Scratch::default();
-            sc.emit(&mut m, &ctx_at(arrival, &cfg, to, 0.25));
-            let l = m.landings[0];
-            // The ring at the top of its expansion, drawn by itself so the
-            // sparks and the pin cannot stand in for it.
-            let mut reach = 0.0_f32;
-            let mut seen = [false; 7];
-            let mut after = 0_u64;
-            while after <= RING_MS as u64 {
-                sc.clear();
-                let at = ctx_at(arrival + ms(after), &cfg, to, 0.25);
-                let mut fr = sc.frame();
-                draw_ring(&l, &at, &mut fr);
-                for q in sc.out.iter().filter(|q| is_chromatic(q.color)) {
-                    let (r, g, b) = chan(q.color);
-                    if r.max(g).max(b) >= 24 {
-                        seen[stop_of(q.color)] = true;
-                        let x = f32::from(q.x) + f32::from(q.w) * 0.5;
-                        reach = reach.max((x - l.x).abs());
-                    }
-                }
-                after += 8;
-            }
-            let want = 2.0 * RING_R_CH_2026_09_05 * ch;
-            assert!(
-                reach >= want,
-                "{from:?}->{to:?}: the ring reaches {reach} px along the row, under twice the \
-                 old {want} px"
-            );
-            let n = seen.iter().filter(|s| **s).count();
-            assert!(
-                n >= 6,
-                "{from:?}->{to:?}: the ring carried {n} stops, not the spectrum: {seen:?}"
-            );
-        }
-    }
-
     /// **THE FAN'S GRADE, READ OFF THE FUNCTION** (LAW 2, 2026-09-08: m15's
     /// look is what the grade scales). The const asserts on `FAN_N_*` and
     /// `FAN_REACH_*` constrain the CONSTANTS in the `(impact − 1)` form; this
@@ -5584,7 +6109,7 @@ mod tests {
             );
         }
         assert!(
-            m.landings.iter().any(|l| l.ring.is_some()),
+            m.landings.iter().any(|l| l.burst.is_some()),
             "a recall's landing minted no ring"
         );
     }
@@ -6084,9 +6609,10 @@ mod tests {
         while t <= t0 + ms(200) {
             let at = ctx_at(t, &cfg, (5, 0), 1.0);
             sc.emit(&mut m, &at);
-            // Two trains and, past their arrival edges, two splashes
-            // (2026-09-08) — each under its own cap.
-            let share = FLIGHT_MAX_LIVE * UNDER_QUAD_CAP + LANDING_POOL * SPLASH_QUAD_CAP;
+            // Two trains, each under its own cap. Since 2026-09-10 the
+            // landing puts NOTHING under the ink at all — the splash that
+            // used to is retired — so the trains have the whole share.
+            let share = FLIGHT_MAX_LIVE * UNDER_QUAD_CAP;
             assert!(
                 sc.under.len() <= share,
                 "two meteors spent {} under quads — over their {share} share",
@@ -6146,10 +6672,8 @@ mod tests {
             sc.clear();
             let at = ctx_at(t0 + spawn.t_flight + ms(after), &cfg, (5, 80), 0.25);
             let mut fr = sc.frame();
-            let mut verts = Vec::new();
-            draw_splash(&mut verts, &l, &at, &mut fr);
+            draw_burst(&l, &at, &mut fr);
             draw_flash(&l, &at, &mut fr);
-            draw_ring(&l, &at, &mut fr);
             draw_sparks(&l, &at, &mut fr, SPARK_HALO_CAP);
             (sc.under.clone(), sc.out.clone(), sc.halos.clone())
         };
@@ -6325,7 +6849,7 @@ mod tests {
                 "D8: an Enter landing carries 5-7 grains, not {grains} (from column {col})"
             );
             assert!(
-                m2.landings.iter().all(|l| l.ring.is_none()),
+                m2.landings.iter().all(|l| l.burst.is_none()),
                 "D8: an Enter landing must never ring"
             );
         }
@@ -6737,6 +7261,101 @@ mod tests {
     /// flight plus a scroll inside one 60-120 ms window). A scroll that
     /// carries the endpoint off the glass takes the landing with it: nothing
     /// is minted, and nothing is sown above the window.
+    /// Seam point 12, the band path — a flight is a SPAN and a landing is
+    /// a POINT under the band's pixel law. INSIDE: a same-row flight on row 5
+    /// under Codex's viewport `[3..10]` sliding down one row rides to row 6
+    /// whole, and its landing is minted at the MOVED endpoint (the arrival
+    /// reads the train's end, as the scroll twin does). A landing is then a
+    /// point: the band `[6..10]` archiving up carries it out through the top
+    /// edge and it is gone, not parked on row 6. OUTSIDE: a band below the
+    /// flight leaves both endpoints untouched. STRADDLE: a vertical recall
+    /// from row 9 to row 3 under a band `[5..20]` sliding down has its tail
+    /// inside and its head outside — the train is dropped, and the arrival
+    /// that would have minted its landing mints nothing.
+    #[test]
+    fn a_band_move_carries_a_flight_inside_the_band_and_retires_one_that_straddles_it() {
+        let cfg = config();
+        let t0 = Instant::now();
+        let g = geom();
+        let ch = g.ch as u16;
+
+        // INSIDE.
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
+        let spawn = m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("flies");
+        let (_, y5) = g.cell_center(5, 40);
+        assert!(
+            (m.live[0].y1 - y5).abs() < 0.5,
+            "fixture: the head is on row 5"
+        );
+        m.translate_band(3, 10, 1, ch, 0);
+        assert_eq!(m.live.len(), 1, "a train wholly inside the band is kept");
+        let (wx, wy) = g.cell_center(6, 40);
+        assert!(
+            (m.live[0].y0 - wy).abs() < 0.5 && (m.live[0].y1 - wy).abs() < 0.5,
+            "the train rode one row down with its text: y0 {} y1 {} want {wy}",
+            m.live[0].y0,
+            m.live[0].y1
+        );
+        let mut sc = Scratch::default();
+        let land = ctx_at(t0 + spawn.t_flight, &cfg, (6, 40), 0.25);
+        sc.emit(&mut m, &land);
+        let l = m
+            .landings
+            .first()
+            .copied()
+            .expect("the landing is minted at T");
+        assert!(
+            (l.x - wx).abs() < 0.5 && (l.y - wy).abs() < 0.5,
+            "the landing was minted at ({}, {}), not at the moved endpoint ({wx}, {wy})",
+            l.x,
+            l.y
+        );
+        m.translate_band(6, 10, -1, ch, 0);
+        assert!(
+            m.landings.is_empty(),
+            "a landing carried past the band's edge is gone, not parked on it"
+        );
+
+        // OUTSIDE.
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
+        m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("flies");
+        let (y0, y1) = (m.live[0].y0, m.live[0].y1);
+        m.translate_band(8, 20, 1, ch, 0);
+        assert_eq!(m.live.len(), 1);
+        assert_eq!(
+            (m.live[0].y0, m.live[0].y1),
+            (y0, y1),
+            "a band below the flight does not touch it"
+        );
+
+        // STRADDLE.
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (3, 40), 0.25);
+        let spawn = m.on_event(&mv((9, 40), (3, 40)), t0, &ctx).expect("flies");
+        assert_eq!(m.live.len(), 1);
+        m.translate_band(5, 20, 1, ch, 0);
+        assert!(
+            m.live.is_empty(),
+            "a train straddling the band's edge is dropped, never bent to fit"
+        );
+        let mut sc = Scratch::default();
+        let land = ctx_at(t0 + spawn.t_flight, &cfg, (3, 40), 0.25);
+        sc.emit(&mut m, &land);
+        assert!(m.landings.is_empty(), "a dropped flight mints no landing");
+
+        // No geometry yet: nothing honest can be kept.
+        let mut m = Meteors::new();
+        let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
+        m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("flies");
+        m.translate_band(3, 10, 1, 0, 0);
+        assert!(
+            m.live.is_empty(),
+            "with no cell height the pools fail closed"
+        );
+    }
+
     #[test]
     fn a_scroll_between_spawn_and_arrival_moves_the_landing_with_the_train() {
         let cfg = config();
@@ -6953,88 +7572,810 @@ mod tests {
         );
     }
 
-    /// **§20.1 `the_ring_has_no_notch_on_the_steep_quadrants`.** Per-column
-    /// continuity on all four quadrants at 72 segments: every column across
-    /// the ring carries ring light with no gap in it, and every row carries
-    /// it on both sides. (v1 notched 16 of its 32 segments on the steep
-    /// quadrants.)
-    #[test]
-    fn the_ring_has_no_notch_on_the_steep_quadrants() {
-        let cfg = config();
+    // -- THE STARBURST (2026-09-10) -----------------------------------------
+
+    /// The owner's own cell, in device px — `font_px 32` on the retina panel
+    /// the design's captures were made at (`cw 20`, `ch 38`). The rest of this
+    /// module runs at `cw 9`, `ch 18`; the burst is measured at BOTH, because
+    /// its whole content is a screen-space shape and a shape can be right at
+    /// one cell and wrong at another.
+    fn owner_geom() -> Geom {
+        Geom {
+            cw: 20,
+            ch: 38,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 1600,
+            win_h: 912,
+            head: 0,
+        }
+    }
+
+    fn ctx_on(now: Instant, cfg: &Config, caret: (u16, u16), g: Geom) -> Ctx<'_> {
+        let mut c = ctx_at(now, cfg, caret, 0.25);
+        c.geom = g;
+        c
+    }
+
+    /// **THE DESIGN'S SECTION 3.2 METRIC.** The share of an impact's light
+    /// within `deg` degrees of HORIZONTAL and within `deg` of VERTICAL,
+    /// weighted by premultiplied luminance x area about the caret. The shipped
+    /// ring read 70.4 % / 5.0 % at 30 degrees, which is what "bands" means in
+    /// a number; a perfectly isotropic mark reads 33.3 % / 33.3 %.
+    fn angular_shares(quads: &[GlowQuad], cx: f32, cy: f32, deg: f32) -> (f32, f32) {
+        let lim = deg.to_radians();
+        let (mut h, mut v, mut tot) = (0.0_f32, 0.0_f32, 0.0_f32);
+        for q in quads {
+            let w = lum(q.color) * f32::from(q.w) * f32::from(q.h);
+            if w <= 0.0 {
+                continue;
+            }
+            let dx = f32::from(q.x) + f32::from(q.w) * 0.5 - cx;
+            let dy = f32::from(q.y) + f32::from(q.h) * 0.5 - cy;
+            if dx.abs() < 1e-3 && dy.abs() < 1e-3 {
+                continue;
+            }
+            let a = dy.atan2(dx).abs();
+            let from_h = a.min(std::f32::consts::PI - a);
+            let from_v = std::f32::consts::FRAC_PI_2 - from_h;
+            tot += w;
+            if from_h <= lim {
+                h += w;
+            }
+            if from_v <= lim {
+                v += w;
+            }
+        }
+        if tot <= 0.0 {
+            (0.0, 0.0)
+        } else {
+            (h / tot, v / tot)
+        }
+    }
+
+    /// Brightness around a circle of radius `r` about the caret, 36 buckets of
+    /// 10 degrees: `(max/mean, min/mean)`. A flat continuous contour reads
+    /// `1.00 / 1.00`; the shipped ring read `1.62 / 0.50` — it never went dark
+    /// anywhere, which is why it had no rays to read. A spoked starburst reads
+    /// far above 1 and near 0.
+    fn annulus_profile(quads: &[GlowQuad], cx: f32, cy: f32, r: f32, band: f32) -> (f32, f32) {
+        let tau = std::f32::consts::TAU;
+        let mut bucket = [0.0_f32; 36];
+        for q in quads {
+            let w = lum(q.color) * f32::from(q.w) * f32::from(q.h);
+            if w <= 0.0 {
+                continue;
+            }
+            let dx = f32::from(q.x) + f32::from(q.w) * 0.5 - cx;
+            let dy = f32::from(q.y) + f32::from(q.h) * 0.5 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            if (d - r).abs() > band {
+                continue;
+            }
+            let k = ((dy.atan2(dx).rem_euclid(tau) / tau) * 36.0) as usize % 36;
+            bucket[k] += w;
+        }
+        let mean = bucket.iter().sum::<f32>() / 36.0;
+        if mean <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let max = bucket.iter().copied().fold(0.0_f32, f32::max);
+        let min = bucket.iter().copied().fold(f32::INFINITY, f32::min);
+        (max / mean, min / mean)
+    }
+
+    /// The radius the landing's own STARBURST occupies at `after` ms — the
+    /// jets' tip on the ring's unchanged quartic plus half their stroke. The
+    /// train census tests exclude it so a landing's light is never counted as
+    /// the train's.
+    fn burst_excl(m: &Meteors, after: u64, ch: f32) -> f32 {
+        m.landings.first().and_then(|l| l.burst).map_or(0.0, |b| {
+            let u = clamp01(after as f32 / b.ms);
+            let grow = 1.0 - (1.0 - u).powi(RING_R_EXP);
+            JET_LEN_SHARE[0] * ring_full_radius(b.scale, ch) * grow
+                + 0.5 * JET_SEC_THICK_CH[0] * ch
+                + 1.0
+        })
+    }
+
+    /// A landing minted from a `cells`-cell same-row jump, with the sky's
+    /// probe latched over `blank` rows, drawn by whichever mark the caller
+    /// hands back.
+    fn landed(cells: u16, cfg: &Config, g: Geom, blank: bool) -> (Meteors, Landing, Instant) {
         let t0 = Instant::now();
         let mut m = Meteors::new();
-        let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
-        let spawn = m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("fly");
+        let to = (5_u16, cells);
+        let ctx = ctx_on(t0, cfg, to, g);
+        let spawn = m.on_event(&mv((5, 0), to), t0, &ctx).expect("fly");
         let arrival = t0 + spawn.t_flight;
         let mut sc = Scratch::default();
-        // The ring is drawn BY ITSELF (the sparks and the splash of
-        // 2026-09-08 share its streams) at T + 60: `u = 1/8`, r = 3.0 ch ·
-        // (1 − (7/8)⁴) ≈ 22.4 px, ry ≈ 11.2 px.
-        sc.emit(&mut m, &ctx_at(arrival + ms(60), &cfg, (5, 40), 0.25));
-        let l = m.landings[0];
-        sc.clear();
         {
-            let at = ctx_at(arrival + ms(60), &cfg, (5, 40), 0.25);
+            let at = ctx_on(arrival, cfg, to, g);
             let mut fr = sc.frame();
-            draw_ring(&l, &at, &mut fr);
+            m.emit(&at, &mut fr);
         }
-        let (cx, cy) = (l.x.round() as i32, l.y.round() as i32);
-        let ring_law = l.ring.expect("a 40-cell nav landing rings");
-        let ch = geom().ch as f32;
-        let u = 60.0 / ring_law.ms;
-        let r = ring_full_radius(ring_law.scale, ch) * (1.0 - (1.0 - u).powi(RING_R_EXP));
-        let (rx, ry) = (
-            r.round() as i32,
-            (r * RING_SQUASH).min(RING_RISE_MAX_CH * ch).round() as i32,
-        );
-        let ring: Vec<&GlowQuad> = sc.out.iter().filter(|q| is_chromatic(q.color)).collect();
-        assert!(
-            ring.len() >= RING_SEGMENTS,
-            "only {} ring quads",
-            ring.len()
-        );
+        let mut dust = Stardust::new();
+        for r in 4..=6 {
+            dust.probe_mut().probe_row(r, &[!blank; 120]);
+        }
+        m.sow_into(&mut dust);
+        let l = m.landings[0];
+        (m, l, arrival)
+    }
 
-        let covers_col =
-            |q: &GlowQuad, x: i32| (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).contains(&x);
-        let covers_row =
-            |q: &GlowQuad, y: i32| (i32::from(q.y)..i32::from(q.y) + i32::from(q.h)).contains(&y);
-        // A hollow ring crosses a line in at most TWO runs (the two arcs);
-        // a third run is a notch, and every run is contiguous.
-        let runs = |mut px: Vec<i32>| -> usize {
-            px.sort_unstable();
-            px.dedup();
-            1 + px.windows(2).filter(|w| w[1] - w[0] > 1).count()
+    /// Draw ONE landing's burst, by itself, at `after` ms.
+    fn burst_only(
+        sc: &mut Scratch,
+        l: &Landing,
+        cfg: &Config,
+        g: Geom,
+        arrival: Instant,
+        after: u64,
+    ) {
+        sc.clear();
+        let at = ctx_on(arrival + ms(after), cfg, (5, 40), g);
+        let mut fr = sc.frame();
+        draw_burst(l, &at, &mut fr);
+    }
+
+    /// **THE ONE LAW THE 2026-09-10 REDESIGN IS FOR: UNIFORM ANGULAR COVERAGE
+    /// IN SCREEN SPACE.** Dark angular gaps are necessary but NOT sufficient —
+    /// two designers proposed spiked geometry on the shipped ellipse and both
+    /// were killed by rendering it, because a spike at ellipse PARAMETER 45
+    /// degrees leaves a `209 x 47.5` ellipse at a SCREEN angle of 12.8
+    /// degrees. So this test measures SCREEN angles, at the owner's own cell,
+    /// against the ring it replaces, on the same frames and the same oracle:
+    ///
+    /// * the ring reads `70.4 % / 5.0 %` horizontal/vertical at 30 degrees and
+    ///   `min/mean 0.50` around its perimeter — the contour never goes dark;
+    /// * the burst must put substantial light within 30 degrees of VERTICAL,
+    ///   must not concentrate it on the horizontal, and must go genuinely DARK
+    ///   between its spikes.
+    ///
+    /// FALSIFIED BY: an annulus `min/mean` creeping back toward the ring's
+    /// 0.50 (design section 7 falsifier 5), or a vertical share collapsing
+    /// toward the ring's 5 %.
+    #[test]
+    fn the_burst_covers_its_angles_uniformly_in_screen_space() {
+        let cfg = config();
+        for g in [owner_geom(), geom()] {
+            let (_m, l, arrival) = landed(40, &cfg, g, true);
+            let b = l.burst.expect("a 40-cell nav landing bursts");
+            let mut sc = Scratch::default();
+            // Two thirds through the life: the star is open, the ring it
+            // replaces was at its widest, and the design's own reading was
+            // taken here (T + 344 of a 580 ms mark).
+            let after = (b.ms * 0.59) as u64;
+            burst_only(&mut sc, &l, &cfg, g, arrival, after);
+            let (h, v) = angular_shares(&sc.out, l.x, l.y, 30.0);
+            let r = BURST_CORE_CH * g.ch as f32 * 0.72;
+            let (mx, mn) = annulus_profile(&sc.out, l.x, l.y, r, g.ch as f32 * 0.10);
+            // The CORE ALONE, over a full row of text: the jets are gated away
+            // and what is left is the bare star, which is where the isotropy
+            // law is actually stated.
+            let (_m2, l2, arr2) = landed(40, &cfg, g, false);
+            let mut sc2 = Scratch::default();
+            burst_only(&mut sc2, &l2, &cfg, g, arr2, after);
+            let (hc, vc) = angular_shares(&sc2.out, l2.x, l2.y, 30.0);
+            println!(
+                "burst cw{} ch{}: horiz {:.3} vert {:.3} annulus max/mean {:.2} min/mean {:.2} \
+                 quads {} | core alone horiz {:.3} vert {:.3}",
+                g.cw,
+                g.ch,
+                h,
+                v,
+                mx,
+                mn,
+                sc.out.len(),
+                hc,
+                vc
+            );
+            assert!(
+                vc >= 0.28 && hc <= 0.42,
+                "cw{} ch{}: the CORE alone reads {:.1} % horizontal / {:.1} % vertical — an \
+                 isotropic star reads 33/33 and this one is squashed",
+                g.cw,
+                g.ch,
+                hc * 100.0,
+                vc * 100.0
+            );
+            assert!(
+                v >= 0.20,
+                "cw{} ch{}: only {:.1} % of the burst's light is within 30 deg of vertical — the \
+                 ring read 5 %, an isotropic mark reads 33 %",
+                g.cw,
+                g.ch,
+                v * 100.0
+            );
+            assert!(
+                h <= 0.50,
+                "cw{} ch{}: {:.1} % of the burst's light is within 30 deg of horizontal — the \
+                 ring read 70.4 %, and that is what the owner called bands",
+                g.cw,
+                g.ch,
+                h * 100.0
+            );
+            assert!(
+                mn <= 0.15,
+                "cw{} ch{}: the dimmest 10 deg of the burst's perimeter is {mn:.2} of its mean — \
+                 the ring read 0.50 and had no rays to read",
+                g.cw,
+                g.ch
+            );
+            assert!(
+                mx >= 1.8,
+                "cw{} ch{}: the brightest 10 deg is only {mx:.2} of the mean — there are no \
+                 spikes here, only a contour",
+                g.cw,
+                g.ch
+            );
+        }
+    }
+
+    /// **THE ROOT IS DERIVED, NOT CHOSEN.** [`BURST_ROOT_SEP_AT_MAX_N`] is a
+    /// literal because `sin` is not `const`; this proves the literal against
+    /// the real trigonometry, and proves both laws the root has to satisfy —
+    /// two adjacent spikes at the ceiling count are already separated at their
+    /// roots, and no root is inside the landing cell's own rows.
+    #[test]
+    fn a_spike_root_is_derived_from_the_spacing_it_must_keep_open() {
+        let want = 2.0 * (std::f32::consts::PI / BURST_N_MAX as f32).sin();
+        assert!(
+            (BURST_ROOT_SEP_AT_MAX_N - want).abs() < 1e-6,
+            "the separation coefficient is {BURST_ROOT_SEP_AT_MAX_N}, not 2 sin(pi/12) = {want}"
+        );
+        let merge = BURST_SEC_THICK_CH[0] / want;
+        assert!(
+            BURST_ROOT_CH >= merge,
+            "spikes merge inside {merge} ch but root at {BURST_ROOT_CH} ch"
+        );
+        // The other half of the root's derivation — that the caret keeps a
+        // disc of its own half-height — is a CONST assert beside the constant
+        // (a runtime re-evaluation of it would be a tautology). What is worth
+        // testing at run time is that the disc is actually respected in the
+        // PIXELS, which `the_star_emerges_as_the_flash_s_white_dies` does.
+    }
+
+    /// **THE STARBURST IS A RAINBOW.** One full ROYGBIV walk goes round the
+    /// star (C1: a LINEAR mark samples `spectrum` continuously), so at least
+    /// six of the seven named stops are on glass at once — the shockwave's own
+    /// law, restated for the mark that replaced it.
+    #[test]
+    fn the_burst_walks_the_whole_spectrum_around_the_star() {
+        let cfg = config();
+        let g = owner_geom();
+        for cells in [8_u16, 40] {
+            let (_m, l, arrival) = landed(cells, &cfg, g, true);
+            let b = l.burst.expect("a nav landing bursts");
+            let mut sc = Scratch::default();
+            let mut seen = [false; 7];
+            let mut after = 8_u64;
+            while after <= b.ms as u64 {
+                burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                for q in sc.out.iter().filter(|q| is_chromatic(q.color)) {
+                    let (r, gg, bb) = chan(q.color);
+                    if r.max(gg).max(bb) >= 24 {
+                        seen[stop_of(q.color)] = true;
+                    }
+                }
+                after += 8;
+            }
+            let n = seen.iter().filter(|s| **s).count();
+            assert!(
+                n >= 6,
+                "{cells} cells: the burst carried {n} stops: {seen:?}"
+            );
+        }
+    }
+
+    /// **THE DISTANCE GRADE.** The jets ride the ring's own unchanged
+    /// [`ring_full_radius`], so a 40-cell landing still reaches nearly twice
+    /// as far along the line as the 8-cell floor, and the star gains spikes.
+    /// This is the law `the_landing_is_a_rainbow_shockwave_twice_the_old_reach`
+    /// was written to hold, on the mark that now holds it.
+    #[test]
+    fn the_burst_reaches_farther_and_spikes_harder_with_distance() {
+        let cfg = config();
+        let g = owner_geom();
+        let mut reach = [0.0_f32; 2];
+        for (i, cells) in [8_u16, 40].into_iter().enumerate() {
+            let (_m, l, arrival) = landed(cells, &cfg, g, true);
+            let b = l.burst.expect("a nav landing bursts");
+            let mut sc = Scratch::default();
+            let mut after = 8_u64;
+            while after <= b.ms as u64 {
+                burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                for q in sc.out.iter().filter(|q| is_chromatic(q.color)) {
+                    let x = f32::from(q.x) + f32::from(q.w) * 0.5;
+                    reach[i] = reach[i].max((x - l.x).abs());
+                }
+                after += 8;
+            }
+        }
+        let ch = g.ch as f32;
+        assert!(
+            reach[0] >= 2.0 * RING_R_CH_2026_09_05 * ch,
+            "the floor burst reaches {} px, under twice the 2026-09-05 ring's",
+            reach[0]
+        );
+        assert!(
+            reach[1] >= 1.6 * reach[0],
+            "a 40-cell burst reaches {} px against the floor's {} — the grade is gone",
+            reach[1],
+            reach[0]
+        );
+        assert!(
+            burst_n(8.0) == 9 && burst_n(48.0) == 12,
+            "the spike grade moved"
+        );
+    }
+
+    /// **A JET BREAKS OVER A GLYPH AND THE STAR SURVIVES.** The jets run the
+    /// length of the landing ROW, so each of their stations asks the sky's
+    /// probe about the cell it is over and a station the probe has not proved
+    /// blank breaks the polyline. Over a full row of text the mark degrades to
+    /// the bare core star — the design's own ruling — and the core is still
+    /// there. Nothing the burst emits over an inked cell exceeds the transient
+    /// ceiling, which is the same price the ring's stroke paid over the same
+    /// rows (L3).
+    #[test]
+    fn a_jet_breaks_over_a_glyph_and_the_star_survives() {
+        let cfg = config();
+        let g = owner_geom();
+        let mut span = [0.0_f32; 2];
+        let mut core = [0_usize; 2];
+        for (i, blank) in [true, false].into_iter().enumerate() {
+            let (_m, l, arrival) = landed(40, &cfg, g, blank);
+            let b = l.burst.expect("a 40-cell nav landing bursts");
+            let mut sc = Scratch::default();
+            burst_only(&mut sc, &l, &cfg, g, arrival, (b.ms * 0.9) as u64);
+            for q in &sc.out {
+                let x = f32::from(q.x) + f32::from(q.w) * 0.5;
+                span[i] = span[i].max((x - l.x).abs());
+                let (r, gg, bb) = chan(q.color);
+                assert!(
+                    f32::from(r.max(gg).max(bb) as u8) <= TRANSIENT_STAR_COV_CEIL + 1.0,
+                    "a burst quad asks {} — over the transient ceiling",
+                    r.max(gg).max(bb)
+                );
+                if (x - l.x).abs() <= BURST_CORE_CH * g.ch as f32 {
+                    core[i] += 1;
+                }
+            }
+        }
+        assert!(
+            span[1] < BURST_CORE_CH * g.ch as f32 + 2.0,
+            "over a full row of text the burst still reaches {} px — the jets did not break",
+            span[1]
+        );
+        assert!(
+            span[0] > 2.0 * BURST_CORE_CH * g.ch as f32,
+            "over blank cells the jets only reached {} px",
+            span[0]
+        );
+        assert!(
+            core[1] * 4 >= core[0] * 3,
+            "the core star lost {} of its {} quads to the gate — it must not be gated at all",
+            core[0] - core[1],
+            core[0]
+        );
+    }
+
+    /// **THE CAP IS ENFORCED**, unlike the ring's own `RING_QUAD_CAP` — and
+    /// it is not
+    /// reached in normal service. Measured at every grade and at both cells,
+    /// over the whole life, with the jets ungated (their worst case).
+    ///
+    /// The design predicted `777 -> 1203` `out` quads against ring + splash's
+    /// `1296 -> 1626`. This reads the real emitter; it is the measurement that
+    /// the design says arithmetic cannot stand in for.
+    #[test]
+    fn a_burst_stays_inside_its_quad_cap_at_every_grade() {
+        let cfg = config();
+        // The tests' `9x18`, the owner's `20x38`, and a `40x76` panel twice
+        // the owner's — the cost must be a function of the SHAPE, not of the
+        // panel's pixel density ([`BURST_STEP_CH_SHARE`]).
+        let big = Geom {
+            cw: 40,
+            ch: 76,
+            ..owner_geom()
         };
-        for x in cx - rx + 2..=cx + rx - 2 {
-            let rows: Vec<i32> = ring
-                .iter()
-                .filter(|q| covers_col(q, x))
-                .flat_map(|q| i32::from(q.y)..i32::from(q.y) + i32::from(q.h))
-                .collect();
-            assert!(!rows.is_empty(), "column {x} of the ring is dark (a notch)");
-            let n = runs(rows);
+        for g in [owner_geom(), geom(), big] {
+            for cells in [8_u16, 19, 40, 60] {
+                let (_m, l, arrival) = landed(cells, &cfg, g, true);
+                let b = l.burst.expect("a nav landing bursts");
+                let mut sc = Scratch::default();
+                let mut peak = 0_usize;
+                let mut after = 0_u64;
+                while after <= b.ms as u64 {
+                    burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                    peak = peak.max(sc.out.len());
+                    assert!(
+                        sc.out.len() <= BURST_QUAD_CAP,
+                        "cw{} ch{} {cells} cells at T+{after}: {} quads, over the cap",
+                        g.cw,
+                        g.ch,
+                        sc.out.len()
+                    );
+                    after += 8;
+                }
+                println!("burst quads cw{} ch{} {cells} cells: {peak}", g.cw, g.ch);
+                assert!(peak > 0, "the burst never drew");
+                assert!(sc.under.is_empty(), "the burst moved light UNDER the ink");
+                assert!(sc.halos.is_empty(), "the burst added a halo");
+            }
+        }
+    }
+
+    /// **EVERYTHING IS OFF GLASS BY 600 ms.** The burst reuses [`ring_ms`]
+    /// verbatim, so the const assert that the graded life reaches
+    /// [`FLIGHT_OFF_GLASS_MS`] exactly at the cap still holds the whole mark —
+    /// this proves the pixels agree with the constant.
+    #[test]
+    fn the_burst_is_off_glass_by_the_flight_horizon() {
+        let cfg = config();
+        let g = owner_geom();
+        for cells in [8_u16, 40, 60] {
+            let (_m, l, arrival) = landed(cells, &cfg, g, true);
+            let mut sc = Scratch::default();
+            burst_only(&mut sc, &l, &cfg, g, arrival, FLIGHT_OFF_GLASS_MS as u64);
             assert!(
-                n <= 2,
-                "column {x} crosses the ring in {n} runs — it is notched"
+                sc.out.is_empty(),
+                "{cells} cells: {} burst quads still on glass at the horizon",
+                sc.out.len()
             );
         }
-        for y in cy - ry + 2..=cy + ry - 2 {
-            let left = ring.iter().any(|q| covers_row(q, y) && i32::from(q.x) < cx);
-            let right = ring
-                .iter()
-                .any(|q| covers_row(q, y) && i32::from(q.x) + i32::from(q.w) > cx);
-            assert!(left && right, "row {y} of the ring is open on one side");
-            let cols: Vec<i32> = ring
-                .iter()
-                .filter(|q| covers_row(q, y))
-                .flat_map(|q| i32::from(q.x)..i32::from(q.x) + i32::from(q.w))
-                .collect();
-            let n = runs(cols);
+    }
+
+    /// **THE LIGHT ARM KEEPS THE SHAPE.** Section 6.10's operator flip is
+    /// additive light -> source-over ink, and L6 buys "bigger" as AREA, never
+    /// as brightness. The design left the burst's light fork UNSPECIFIED; the
+    /// ruling taken here is that the SILHOUETTE is the law and the operator is
+    /// not, so the light burst is the same star drawn as ink. It must
+    /// therefore pass the same angular metric as the dark one, and ask no
+    /// additive light at all.
+    #[test]
+    fn the_light_burst_is_the_same_star_in_ink() {
+        let mut cfg = config();
+        cfg.dark_theme = false;
+        let g = owner_geom();
+        let (_m, l, arrival) = landed(40, &cfg, g, true);
+        let b = l.burst.expect("a 40-cell nav landing bursts");
+        let mut sc = Scratch::default();
+        burst_only(&mut sc, &l, &cfg, g, arrival, (b.ms * 0.59) as u64);
+        assert!(!sc.out.is_empty(), "the light burst drew nothing");
+        for q in &sc.out {
+            assert!(q.alpha > 0, "an additive quad on a light page");
             assert!(
-                n <= 2,
-                "row {y} crosses the ring in {n} runs — it is notched"
+                f32::from(q.alpha) <= LIGHT_ALPHA_CAP + 1.0,
+                "a light burst quad at alpha {}",
+                q.alpha
             );
         }
+        let (h, v) = angular_shares(&sc.out, l.x, l.y, 30.0);
+        println!(
+            "light burst: horiz {h:.3} vert {v:.3} quads {}",
+            sc.out.len()
+        );
+        assert!(
+            v >= 0.20 && h <= 0.50,
+            "the light burst reads {:.1} % horizontal / {:.1} % vertical — not the same star",
+            h * 100.0,
+            v * 100.0
+        );
+    }
+
+    /// **REDUCED MOTION KEEPS A STATIC STAR** (section 6.11): the full form at
+    /// full reach, held, then the theme's ONE linear fade. The static form of
+    /// a starburst is a better still than the static form of an expanding
+    /// hoop, which is why the mark is drawn at all under reduced motion.
+    #[test]
+    fn the_reduced_motion_burst_is_a_still_star() {
+        let mut cfg = config();
+        cfg.reduced_motion = true;
+        let g = owner_geom();
+        let (_m, l, arrival) = landed(40, &cfg, g, true);
+        let mut sc = Scratch::default();
+        let mut spans = Vec::new();
+        for after in [0_u64, 120, 300] {
+            burst_only(&mut sc, &l, &cfg, g, arrival, after);
+            let mut r = 0.0_f32;
+            for q in &sc.out {
+                let dx = f32::from(q.x) + f32::from(q.w) * 0.5 - l.x;
+                let dy = f32::from(q.y) + f32::from(q.h) * 0.5 - l.y;
+                r = r.max((dx * dx + dy * dy).sqrt());
+            }
+            spans.push(r);
+        }
+        assert!(
+            (spans[0] - spans[2]).abs() < 2.0,
+            "the static star changed size: {spans:?}"
+        );
+        burst_only(&mut sc, &l, &cfg, g, arrival, FLIGHT_OFF_GLASS_MS as u64);
+        assert!(sc.out.is_empty(), "the static star outlived the horizon");
+    }
+
+    /// **A SPIKE IS WHOLE OR ABSENT** — the inversion of the ring's own
+    /// `the_ring_has_no_notch_on_the_steep_quadrants`, and the law that
+    /// survives it.
+    ///
+    /// The ring's law was that its CONTOUR never breaks, which is exactly why
+    /// the ring's own `RING_QUAD_CAP` could never be enforced: truncating a
+    /// ring leaves a
+    /// notch. A discrete spike set inverts the law — the mark is REQUIRED to
+    /// break between spikes (`the_burst_covers_its_angles_uniformly_in_screen_
+    /// space` measures those breaks) — and what must not break is a spike
+    /// ITSELF. So: walk each live spike from its root to its tip and require
+    /// unbroken light the whole way, which is what makes shedding safe. A shed
+    /// element is a missing short spike; it is never half a spike.
+    #[test]
+    fn a_spike_is_whole_or_absent() {
+        let cfg = config();
+        for g in [owner_geom(), geom()] {
+            let (_m, l, arrival) = landed(40, &cfg, g, true);
+            let b = l.burst.expect("a 40-cell nav landing bursts");
+            let ch = g.ch as f32;
+            let mut sc = Scratch::default();
+            for frac in [0.30_f32, 0.59, 0.85] {
+                let after = (b.ms * frac) as u64;
+                burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                let u = after as f32 / b.ms;
+                let grow = 1.0 - (1.0 - u).powi(RING_R_EXP);
+                let lit = |x: f32, y: f32| {
+                    sc.out.iter().any(|q| {
+                        let (qx, qy) = (f32::from(q.x), f32::from(q.y));
+                        x >= qx - 1.0
+                            && x <= qx + f32::from(q.w) + 1.0
+                            && y >= qy - 1.0
+                            && y <= qy + f32::from(q.h) + 1.0
+                    })
+                };
+                let mut whole = 0;
+                for i in 0..usize::from(b.n) {
+                    let dir = b.dir[i];
+                    let root = BURST_ROOT_CH * ch;
+                    let tip = BURST_CORE_CH * ch * b.len[i] * grow;
+                    if tip <= root + 2.0 {
+                        continue;
+                    }
+                    // A spike that drew nothing at all is SHED, which is
+                    // allowed; a spike that drew must be continuous.
+                    if !lit(l.x + dir.0 * (root + 1.0), l.y + dir.1 * (root + 1.0)) {
+                        continue;
+                    }
+                    let mut s = root;
+                    while s <= tip - 1.0 {
+                        assert!(
+                            lit(l.x + dir.0 * s, l.y + dir.1 * s),
+                            "cw{} ch{} T+{after}: spike {i} is notched at {s} px of {root}..{tip}",
+                            g.cw,
+                            g.ch
+                        );
+                        s += 1.0;
+                    }
+                    whole += 1;
+                }
+                assert!(
+                    whole >= usize::from(b.n) - 1,
+                    "T+{after}: only {whole} of {} spikes drew",
+                    b.n
+                );
+            }
+        }
+    }
+
+    /// **BRIGHT, NOT DIM — THEN SPENT.** The owner's standing ruling, and the
+    /// hold-then-spend clock the shockwave's stroke carried before it
+    /// (`the_shockwave_stroke_is_two_and_a_half_times_the_bold_round_s`): the
+    /// burst is at the transient ceiling at the end of its hold
+    /// ([`RING_COV_HOLD_U`] of the life, the pin's own window) and is
+    /// visibly spending by `T + 300`.
+    ///
+    /// It never asks MORE than the ceiling, which is the other half of the
+    /// ruling: no peak-luminance increase over the text. The caret and the
+    /// pin's nucleus stay the brightest things on the landing.
+    #[test]
+    fn the_burst_is_bright_at_its_hold_and_spent_after_it() {
+        let cfg = config();
+        let g = owner_geom();
+        let (_m, l, arrival) = landed(40, &cfg, g, true);
+        let b = l.burst.expect("a 40-cell nav landing bursts");
+        let mut sc = Scratch::default();
+        let peak = |sc: &Scratch| {
+            sc.out
+                .iter()
+                .map(|q| {
+                    let (r, gg, bb) = chan(q.color);
+                    r.max(gg).max(bb)
+                })
+                .max()
+                .unwrap_or(0) as f32
+        };
+        burst_only(
+            &mut sc,
+            &l,
+            &cfg,
+            g,
+            arrival,
+            (b.ms * RING_COV_HOLD_U) as u64,
+        );
+        let held = peak(&sc);
+        assert!(
+            held >= 0.95 * TRANSIENT_STAR_COV_CEIL,
+            "the burst asks {held} at the end of its hold, not the ceiling"
+        );
+        assert!(
+            held <= TRANSIENT_STAR_COV_CEIL + 1.0,
+            "the burst asks {held} — over the transient ceiling, and over the text"
+        );
+        burst_only(&mut sc, &l, &cfg, g, arrival, 300);
+        let spent = peak(&sc);
+        assert!(
+            spent < 0.75 * TRANSIENT_STAR_COV_CEIL,
+            "the burst is still at {spent} at T + 300 — not spending"
+        );
+    }
+
+    /// **A JET IS PROBED OVER ITS WHOLE CAPPED REACH.** The jets are gated on
+    /// [`SkyMask::row`], which is [`JET_PROBE_CELLS`] cells wide each side; the
+    /// jets themselves reach `6.0 ch`, which in CELLS depends on the cell's
+    /// aspect. This proves the window covers the reach at the aspects the
+    /// family is tuned for, so a jet is never clipped by its own gate.
+    #[test]
+    fn a_jet_is_probed_over_its_whole_capped_reach() {
+        for g in [owner_geom(), geom()] {
+            let cells = JET_LEN_SHARE[0]
+                * (RING_R_CH + RING_R_PER_IMPACT_CH * (super::super::timing::IMPACT_MAX - 1.0))
+                * (g.ch as f32 / g.cw as f32);
+            assert!(
+                cells <= JET_PROBE_CELLS as f32,
+                "cw{} ch{}: the capped jet reaches {cells:.1} cells, past the {} the probe covers",
+                g.cw,
+                g.ch,
+                JET_PROBE_CELLS
+            );
+        }
+    }
+
+    /// **THE STAR EMERGES AS THE FLASH'S WHITE DIES.** Not a timer — a
+    /// consequence of the geometry: every spike roots at [`BURST_ROOT_CH`],
+    /// which is the caret cell's own half-height, so on the quartic there is
+    /// nothing to paint until the expansion has carried the tips past that
+    /// root. At the graded life that lands the first spike between 50 and
+    /// 110 ms — inside [`FLASH_COLOUR_MS`], as the flash turns white into the
+    /// spectrum, and past [`FLASH_BURST_MS`], where the white is gone.
+    ///
+    /// This is the same law that holds the sparks until [`FLASH_BURST_MS`]:
+    /// light under a cell of white at [`FLASH_FULL_COV`] is invisible on an
+    /// additive glass and costs every quad it spends. It is also what makes
+    /// design section 7's falsifier 4 — a dozen spike roots piling additively
+    /// onto the caret cell early in the expansion — impossible rather than
+    /// merely unlikely: there are no roots on the caret cell at any `u`.
+    #[test]
+    fn the_star_emerges_as_the_flash_s_white_dies() {
+        let cfg = config();
+        let g = owner_geom();
+        for cells in [8_u16, 40, 60] {
+            let (_m, l, arrival) = landed(cells, &cfg, g, true);
+            let mut sc = Scratch::default();
+            let mut first = None;
+            let mut after = 0_u64;
+            while after <= 200 {
+                burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                if !sc.out.is_empty() && first.is_none() {
+                    first = Some(after);
+                }
+                // THE CARET KEEPS A DISC OF ITS OWN HALF-HEIGHT: no pixel of
+                // the star is ever nearer the caret's centre than
+                // [`BURST_ROOT_CH`], at any `u`, so the pin's nucleus and the
+                // flash's white are never painted over and there is no `u` at
+                // which a dozen roots can pile onto the caret cell.
+                let ch = g.ch as f32;
+                // The bound is the CENTRELINE root less the rasterizer's own
+                // perpendicular support: `comet_beam` widens a slab by up to
+                // `half·sqrt(2)` at the 45-degree axis switch and tiles the
+                // major axis from `floor(min)`, so a 1 px AA edge of a steep
+                // spike's root slab can sit that far inside the disc. What the
+                // law protects is the caret's CENTRE — the pin's nucleus and
+                // the flash's white — and this is the honest radius of it.
+                let keep = BURST_ROOT_CH * ch
+                    - (0.5 * BURST_SEC_THICK_CH[0] * ch * std::f32::consts::SQRT_2
+                        + burst_step(ch, BURST_STEP_CH_SHARE, BURST_STEP_PX) as f32);
+                for q in &sc.out {
+                    let (cx, cy) = (
+                        f32::from(q.x) + f32::from(q.w) * 0.5,
+                        f32::from(q.y) + f32::from(q.h) * 0.5,
+                    );
+                    let d = (cx - l.x).hypot(cy - l.y);
+                    assert!(
+                        d >= keep,
+                        "{cells} cells T+{after}: burst light {d:.1} px from the caret, inside \
+                         the {keep:.1} px the caret keeps"
+                    );
+                }
+                after += 4;
+            }
+            let first = first.expect("the star never emerged");
+            assert!(
+                (50..=110).contains(&first),
+                "{cells} cells: the star arrives at T+{first}, not with the flash's turn"
+            );
+        }
+    }
+
+    /// **THE RISE LAW IS ABOUT THE PAINTED MARK, NOT ITS CENTRELINE** — the
+    /// latent defect `docs/design/METEOR-STARBURST-2026-09-10.md` section 2.2
+    /// found in the mark this one replaced, restated as the test that would
+    /// have caught it.
+    ///
+    /// The shipped shockwave asserted `RING_R_CH · RING_SQUASH < FAN_RISE_MAX_CH`
+    /// — `1.5 ch < 1.6 ch` — but `RING_R_CH · RING_SQUASH` was the CENTRELINE
+    /// semi-axis of a stroked ellipse, and `comet_beam`'s
+    /// `half_perp = thickness · 0.5` (`aterm_render`) makes the polyline it is
+    /// handed a centreline. The stroke was `clamp(0.40·r, 2, 1.2 ch)`, so the
+    /// ring PAINTED to `1.5 + 0.6 = 2.10 ch` — half a cell above the law the
+    /// assert was written to hold, confirmed on captured frames at `−2.05 ch`.
+    /// A compile-time assert on a number that is not the mark's extent cannot
+    /// catch that, however true it is.
+    ///
+    /// So the burst asserts the PAINTED envelope at compile time
+    /// (`BURST_CORE_CH + 0.5·BURST_SEC_THICK_CH[0] + BURST_AA_SUPPORT_CH`),
+    /// clamps it again in DEVICE PX at emit ([`burst_rise_limit`], because a
+    /// normalized constant cannot account for a rasterizer fringe at every
+    /// font size), and this reads the actual QUADS — every quad of every mark
+    /// of the burst, over its whole life, at four cell heights including one
+    /// small enough to make the px clamp bite.
+    #[test]
+    fn the_burst_paints_inside_the_fan_s_rise_at_every_cell() {
+        let cfg = config();
+        let mut worst = 0.0_f32;
+        for ch in [12_usize, 18, 38, 76] {
+            let g = Geom {
+                cw: (ch as f32 * 0.52).round() as usize,
+                ch,
+                rows: 24,
+                cols: 100,
+                origin_x: 0,
+                origin_y: 0,
+                win_w: 2000,
+                win_h: 2000,
+                head: 0,
+            };
+            for cells in [8_u16, 40, 60] {
+                let (_m, l, arrival) = landed(cells, &cfg, g, true);
+                let b = l.burst.expect("a nav landing bursts");
+                let mut sc = Scratch::default();
+                let mut rise = 0.0_f32;
+                let mut after = 0_u64;
+                while after <= b.ms as u64 + 8 {
+                    burst_only(&mut sc, &l, &cfg, g, arrival, after);
+                    for q in &sc.out {
+                        let top = f32::from(q.y);
+                        let bot = f32::from(q.y) + f32::from(q.h);
+                        rise = rise.max((l.y - top).max(bot - l.y));
+                    }
+                    after += 4;
+                }
+                let cap = FAN_RISE_MAX_CH * ch as f32;
+                let in_ch = rise / ch as f32;
+                worst = worst.max(in_ch);
+                assert!(
+                    rise <= cap,
+                    "ch {ch}, {cells} cells: the burst PAINTS to {in_ch:.3} ch, past the fan's \
+                     rise of {FAN_RISE_MAX_CH} ch — the shipped ring painted to 2.10 ch under an \
+                     assert that said 1.5"
+                );
+            }
+        }
+        println!("burst painted rise: {worst:.3} ch (cap {FAN_RISE_MAX_CH})");
+        // Not merely under the cap: TIGHTER than the mark it replaced, which
+        // is the design's own claim about it.
+        assert!(
+            worst < 2.10,
+            "the burst paints to {worst:.3} ch — no tighter than the ring's own 2.10 ch"
+        );
     }
 
     // -- T6, idle → zero ----------------------------------------------------
@@ -7364,185 +8705,6 @@ mod tests {
         );
     }
 
-    /// **THE SHOCKWAVE'S STROKE IS TWO AND A HALF TIMES THE BOLD ROUND'S**,
-    /// measured across the top of the ring at the end of its hold
-    /// (`T + 120`, `u = 0.25`, `r ≈ 2.05 ch`): the rows of ring light in the
-    /// caret's own column above the row span at least `2.5 × 0.16 × r`
-    /// pixels — and the stroke is still at the cap there (held), and spent
-    /// by `T + 300`. Before the second round: `0.16 × r`, 6 px at `ch = 18`,
-    /// and the hold ran to `T + 168`.
-    #[test]
-    fn the_shockwave_stroke_is_two_and_a_half_times_the_bold_round_s() {
-        let cfg = config();
-        let t0 = Instant::now();
-        let ch = geom().ch as f32;
-        let mut m = Meteors::new();
-        let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
-        let spawn = m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("fly");
-        let arrival = t0 + spawn.t_flight;
-        let mut sc = Scratch::default();
-        sc.emit(&mut m, &ctx_at(arrival, &cfg, (5, 40), 0.25));
-        let l = m.landings[0];
-        let ring_only = |sc: &mut Scratch, after: u64| {
-            sc.clear();
-            let at = ctx_at(arrival + ms(after), &cfg, (5, 40), 0.25);
-            let mut fr = sc.frame();
-            draw_ring(&l, &at, &mut fr);
-        };
-        let (cx, cy) = (l.x.round() as i32, l.y.round() as i32);
-        // The ring's OWN life and radius (distance-graded: a 40-cell landing
-        // is impact 3.09 — 580 ms, `r_full` 5.5 ch), so the hold is read
-        // where this ring holds, not where the floor ring would.
-        let ring_law = l.ring.expect("a 40-cell nav landing rings");
-        let hold_ms = (RING_COV_HOLD_U * ring_law.ms) as u64;
-        ring_only(&mut sc, hold_ms);
-        let u = hold_ms as f32 / ring_law.ms;
-        let r = ring_full_radius(ring_law.scale, ch) * (1.0 - (1.0 - u).powi(RING_R_EXP));
-        let top: Vec<&GlowQuad> = sc
-            .out
-            .iter()
-            .filter(|q| {
-                is_chromatic(q.color)
-                    && (i32::from(q.x)..i32::from(q.x) + i32::from(q.w)).contains(&cx)
-                    && i32::from(q.y) + i32::from(q.h) <= cy - 2
-            })
-            .collect();
-        assert!(
-            !top.is_empty(),
-            "no ring light above the caret at T + {hold_ms}"
-        );
-        let y_lo = top.iter().map(|q| i32::from(q.y)).min().unwrap();
-        let y_hi = top
-            .iter()
-            .map(|q| i32::from(q.y) + i32::from(q.h))
-            .max()
-            .unwrap();
-        let stroke = (y_hi - y_lo) as f32;
-        // The law carries its own ceiling (`RING_THICK_MAX_CH`, 1.2 ch): on a
-        // graded ring the share binds at the ceiling, and the ceiling is what
-        // the stroke must reach.
-        let want = (2.5 * RING_THICK_SHARE_BOLD_ROUND * r).min(RING_THICK_MAX_CH * ch);
-        assert!(
-            stroke + 1.0 >= want,
-            "the stroke is {stroke} px across the top of a {r:.1} px ring — under two and a \
-             half times the bold round's {want:.1}"
-        );
-        let peak = top.iter().map(|q| peak_of(q)).max().unwrap_or(0) as f32;
-        assert!(
-            peak >= 0.95 * TRANSIENT_STAR_COV_CEIL,
-            "the stroke asks {peak} at the end of its hold, not the cap"
-        );
-        ring_only(&mut sc, 300);
-        let spent = sc.out.iter().map(peak_of).max().unwrap_or(0) as f32;
-        assert!(
-            spent < 0.75 * TRANSIENT_STAR_COV_CEIL,
-            "the stroke is still at {spent} at T + 300 — not spending"
-        );
-    }
-
-    /// **THE SPLASH NEVER ENTERS A GLYPH ROW.** Under `tall` and under
-    /// `underline`: every splash quad over the life lies OUTSIDE the landing
-    /// row's own cell rows, inside the sky band above it or its mirror below
-    /// (`0.45 ch` of the cell's edges), the two bands reach at least 4.5
-    /// cells each side at `T + 120`, and both bands are lit. With the row
-    /// above inked the upper band is not laid and the lower one still is;
-    /// before the probe has been asked, nothing is laid. Before the second
-    /// round the splash was bed ink ON the row.
-    #[test]
-    fn the_splash_never_enters_a_glyph_row() {
-        let g = geom();
-        let (cw, ch) = (g.cw as f32, g.ch as f32);
-        let t0 = Instant::now();
-        for tall in [true, false] {
-            let mut cfg = config();
-            cfg.ribbon_tall = tall;
-            let mut m = Meteors::new();
-            let ctx = ctx_at(t0, &cfg, (5, 40), 0.25);
-            let spawn = m.on_event(&mv((5, 0), (5, 40)), t0, &ctx).expect("fly");
-            let arrival = t0 + spawn.t_flight;
-            let mut sc = Scratch::default();
-            sc.emit(&mut m, &ctx_at(arrival, &cfg, (5, 40), 0.25));
-            let mut dust = sky_around(5);
-            m.sow_into(&mut dust);
-            let l = m.landings[0];
-            let (lx, ly) = g.cell_center(5, 40);
-            let (row_top, row_bot) = (ly - ch * 0.5, ly + ch * 0.5);
-            let splash_only = |sc: &mut Scratch, l: &Landing, after: u64| {
-                sc.clear();
-                let at = ctx_at(arrival + ms(after), &cfg, (5, 40), 0.25);
-                let mut fr = sc.frame();
-                let mut verts = Vec::new();
-                draw_splash(&mut verts, l, &at, &mut fr);
-            };
-            let mut after = 8_u64;
-            let mut lit = 0_usize;
-            while after <= SPLASH_MS as u64 {
-                splash_only(&mut sc, &l, after);
-                for q in sc.under.iter().chain(sc.out.iter()) {
-                    lit += 1;
-                    let (y0, y1) = (f32::from(q.y), f32::from(q.y) + f32::from(q.h));
-                    assert!(
-                        y1 <= row_top || y0 >= row_bot,
-                        "tall {tall}, T + {after}: a splash quad at y {y0}..{y1} is INSIDE the \
-                         glyph row {row_top}..{row_bot}"
-                    );
-                    assert!(
-                        y0 >= row_top - 0.45 * ch - 1.0 && y1 <= row_bot + 0.45 * ch + 1.0,
-                        "tall {tall}, T + {after}: a splash quad at y {y0}..{y1} is outside \
-                         the sky band"
-                    );
-                }
-                after += 8;
-            }
-            assert!(lit > 0, "tall {tall}: the splash never lit");
-            splash_only(&mut sc, &l, 120);
-            let reach = |above: bool, left: bool| -> f32 {
-                sc.out
-                    .iter()
-                    .filter(|q| {
-                        let y = f32::from(q.y);
-                        let x = f32::from(q.x) + f32::from(q.w) * 0.5;
-                        (y < ly) == above && (x < lx) == left
-                    })
-                    .map(|q| (f32::from(q.x) + f32::from(q.w) * 0.5 - lx).abs())
-                    .fold(0.0, f32::max)
-            };
-            for above in [true, false] {
-                for left in [true, false] {
-                    let r = reach(above, left);
-                    assert!(
-                        r >= 4.5 * cw,
-                        "tall {tall}: the band {} the row reaches {r} px {} — under 4.5 cells",
-                        if above { "above" } else { "below" },
-                        if left { "leftward" } else { "rightward" }
-                    );
-                }
-            }
-
-            // The row above inked: no band above, the band below still.
-            let mut boxed = sky_around(5);
-            boxed.probe_mut().probe_row(4, &[true; 120]);
-            let mut l2 = l;
-            l2.sky = Some(SkyMask::probe(l.x, l.y, boxed.probe(), g));
-            splash_only(&mut sc, &l2, 120);
-            assert!(
-                !sc.out.iter().any(|q| f32::from(q.y) < ly),
-                "tall {tall}: a band was laid over an inked row above"
-            );
-            assert!(
-                sc.out.iter().any(|q| f32::from(q.y) > ly),
-                "tall {tall}: the band below went with the one above"
-            );
-            let mut l3 = l;
-            l3.sky = None;
-            splash_only(&mut sc, &l3, 120);
-            assert!(
-                sc.out.is_empty() && sc.under.is_empty(),
-                "tall {tall}: the splash was laid before the probe was asked"
-            );
-        }
-    }
-
     /// **THE SPARKS ARE HALOED STARS, TWICE AS MANY.** A 48-cell jump (the
     /// owner's Ctrl-A, landed ten cells in so the leftward half of the shower
     /// is on the glass) throws at least sixty sparks (the bold round threw
@@ -7708,10 +8870,16 @@ mod tests {
             "the train ({train_peak}) out-shines the landing it ends ({landing_peak})"
         );
 
-        // The ring, on its first frame as a ring. Its arcs off the pin's own
-        // row and column are the ring and nothing else (the ring is the only
+        // The BURST, on its first frame as a star. Its spikes off the pin's
+        // own row and column are the burst and nothing else (it is the only
         // chromatic `out` mark the meteor draws there; the fan is the sky's).
-        sc.emit(&mut m, &ctx_at(arrival + ms(30), &cfg, (5, 80), 0.25));
+        //
+        // T + 100, not T + 30: the star's roots clear the caret's own cell
+        // ([`BURST_ROOT_CH`]), so the spikes emerge from under the flash's
+        // white as it dies into the spectrum — the same law that holds the
+        // sparks until [`FLASH_BURST_MS`], and for the same reason. Pinned by
+        // `the_star_emerges_as_the_flash_s_white_dies`.
+        sc.emit(&mut m, &ctx_at(arrival + ms(100), &cfg, (5, 80), 0.25));
         let (cx, cy) = (lx.round() as i32, ly.round() as i32);
         let ring_peak = sc
             .out
@@ -7724,10 +8892,10 @@ mod tests {
                 r.max(g).max(b) as f32
             })
             .fold(0.0_f32, f32::max);
-        assert!(ring_peak > 0.0, "no ring at T + 30");
+        assert!(ring_peak > 0.0, "no burst at T + 100");
         assert!(
             ring_peak >= 0.5 * TRANSIENT_STAR_COV_CEIL,
-            "the ring's stroke asks {ring_peak}/255 on its first frame — a whisper beside a \
+            "the burst's spikes ask {ring_peak}/255 on their first frame — a whisper beside a \
              pin at {TRANSIENT_STAR_COV_CEIL}"
         );
 
@@ -7806,20 +8974,15 @@ mod tests {
             // The landing's own light is not the train's: the shockwave
             // crosses the train inside its reach, and where two hues add the
             // composite is less saturated than either. The exclusion is the
-            // ring WHERE IT IS at this instant — its graded radius law
-            // (`ring_full_radius`, 6 `ch` at full reach for this 80-cell
-            // jump, which is the impact cap) on its quartic, plus its stroke
-            // (`RING_THICK_SHARE` of the radius, half each side) — so at `T`
-            // (`r(0) = 0`) the white layer next to the landing is COUNTED,
-            // and at `T + 150` only the ring's own annulus is not. A fixed
-            // 3 `ch` was enough while the ring was un-graded (2.3 `ch` at
-            // `T + 150`); a fixed 6 `ch` would cut the very white this test
-            // is about.
-            let ring_excl = m.landings.first().and_then(|l| l.ring).map_or(0.0, |r| {
-                let u = clamp01(after as f32 / r.ms);
-                let radius = ring_full_radius(r.scale, ch) * (1.0 - (1.0 - u).powi(RING_R_EXP));
-                radius * (1.0 + 0.5 * RING_THICK_SHARE) + 1.0
-            });
+            // BURST WHERE IT IS at this instant — the jets ride the ring's own
+            // graded radius law (`ring_full_radius`, 6 `ch` at full reach for
+            // this 80-cell jump, which is the impact cap) on its quartic, plus
+            // half their stroke — so at `T` (`r(0) = 0`) the white layer next
+            // to the landing is COUNTED, and at `T + 150` only the landing's
+            // own mark is not. A fixed 3 `ch` was enough while the shockwave
+            // was un-graded (2.3 `ch` at `T + 150`); a fixed 6 `ch` would cut
+            // the very white this test is about.
+            let ring_excl = burst_excl(&m, after, ch);
             let px = composite(&[&sc.under, &sc.out], wx, wy, w, h);
             let (mut sum, mut n) = (0.0_f32, 0_usize);
             for (i, p) in px.iter().enumerate() {
@@ -7895,11 +9058,7 @@ mod tests {
         let mut rows: Vec<Row> = Vec::new();
         for &after in &offsets {
             sc.emit(&mut m, &ctx_at(arrival + ms(after), &cfg, (5, 80), 0.25));
-            let ring_excl = m.landings.first().and_then(|l| l.ring).map_or(0.0, |r| {
-                let u = clamp01(after as f32 / r.ms);
-                let radius = ring_full_radius(r.scale, ch) * (1.0 - (1.0 - u).powi(RING_R_EXP));
-                radius * (1.0 + 0.5 * RING_THICK_SHARE) + 1.0
-            });
+            let ring_excl = burst_excl(&m, after, ch);
             let px = composite(&[&sc.under, &sc.out], wx, wy, w, h);
             let (mut chroma, mut white, mut rch, mut rwh) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             let (mut cpx, mut wpx, mut peak) = (0usize, 0usize, 0u32);
@@ -8025,5 +9184,99 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// §27: A PARTY LANDING IS A FAN AND NOTHING ELSE — `n` stars ROYGBIV
+    /// from the caret, no sparks, no splash, no gold hero, the ring only when
+    /// asked — born on the frame it is staged and off the glass within
+    /// 315 ms (the sky's longest transient life), so one fan per 1.6 s bar
+    /// never stacks and `LANDING_POOL` holds every ring bar. A party at a
+    /// caret off the glass mints nothing.
+    #[test]
+    fn a_party_landing_is_a_fan_off_the_glass_inside_315_ms() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut m = Meteors::new();
+        let mut sc = Scratch::default();
+        let at = ctx_at(t0, &cfg, (5, 40), 0.3);
+
+        // A plain bar: the fan is staged for the sky, no landing is pooled.
+        m.party(t0, 5, false, &at);
+        assert_eq!(m.sown.len(), 1, "the fan is staged for the sky");
+        assert!(m.landings.is_empty(), "no ring bar, no landing in the pool");
+        // The fourth bar: the pin and starburst, without an impact flash.
+        m.party(t0, 11, true, &at);
+        assert_eq!(m.landings.len(), 1);
+        let l = m.landings[0];
+        assert!(l.burst.is_some(), "the fourth bar carries the starburst");
+        assert!(
+            !l.flash && l.sparks == 0,
+            "a bar line is a beat, not an impact"
+        );
+        let mut flash_only = Scratch::default();
+        draw_flash(&l, &at, &mut flash_only.frame());
+        assert!(
+            flash_only.out.is_empty(),
+            "the celebration emits no flash quads"
+        );
+        assert!(!l.fan.hero, "no gold hero: the party is the spectrum");
+        assert_eq!(l.fan.n, 11);
+        let (cx, cy) = at.geom.cell_center(5, 40);
+        assert!(
+            (l.x - cx).abs() < 1e-3 && (l.y - cy).abs() < 1e-3,
+            "minted at the caret"
+        );
+
+        // Born on this frame: emit, hand to the sky, count the stars.
+        sc.emit(&mut m, &at);
+        let mut dust = sky_around(5);
+        m.sow_into(&mut dust);
+        assert_eq!(
+            dust.live(),
+            16,
+            "5 + 11 stars, all admitted on a dark theme"
+        );
+        let fan = lane(&dust, StarLane::Fan);
+        assert_eq!(
+            fan.len(),
+            16,
+            "every party star is a fan-lane (silent, transient) star"
+        );
+        assert!(m.sown.is_empty(), "the stage is drained");
+
+        // Off the glass inside 315 ms; the ring landing leaves with its pool.
+        let mut t = t0;
+        let mut gone_at = None;
+        while t <= t0 + ms(700) {
+            let ctx = ctx_at(t, &cfg, (5, 40), 0.3);
+            sc.clear();
+            let mut fr = sc.frame();
+            dust.emit(&ctx, &mut fr);
+            if gone_at.is_none() && dust.at_rest() {
+                gone_at = Some(t);
+            }
+            t += ms(16);
+        }
+        let gone = gone_at.expect("the fan leaves the glass");
+        assert!(
+            gone <= t0 + ms(315),
+            "the party's last star must be gone by T + 315 ms, was {:?}",
+            gone.saturating_duration_since(t0)
+        );
+        let late = ctx_at(t0 + ms(700), &cfg, (5, 40), 0.3);
+        sc.emit(&mut m, &late);
+        assert!(
+            m.at_rest(),
+            "the ring landing is out of the pool with the meteor horizon"
+        );
+
+        // Off the glass: nothing.
+        let mut off = Meteors::new();
+        let far = ctx_at(t0, &cfg, (200, 40), 0.3);
+        off.party(t0, 9, true, &far);
+        assert!(
+            off.sown.is_empty() && off.landings.is_empty(),
+            "a caret off the glass mints nothing"
+        );
     }
 }

@@ -158,8 +158,9 @@ const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
 /// Compile a regex row matcher. The returned `Arc<dyn RowMatch>` is what
-/// [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) takes —
-/// the core receives only the opaque handle.
+/// [`Terminal::watch_rows`](aterm_core::terminal::Terminal::watch_rows) and its
+/// inverse [`Terminal::watch_rows_gone`](aterm_core::terminal::Terminal::watch_rows_gone)
+/// take — the core receives only the opaque handle.
 ///
 /// The pattern is untrusted, so this bounds it on every axis it has. Patterns
 /// longer than [`MAX_REGEX_PATTERN_LEN`] are rejected up front; the compiler is
@@ -269,6 +270,55 @@ mod tests {
             t.watch_poll(id).is_some(),
             "an already-matching row latches at arm time"
         );
+    }
+
+    /// The inverse predicate, level-triggered: a surface with no matching row
+    /// latches AT ARM (the `watch_rows_gone` immediate eval), so an agent asking
+    /// "is the busy footer gone?" of an already-finished turn is told yes now.
+    #[test]
+    fn row_gone_latches_immediately_if_nothing_matches() {
+        let base = Instant::now();
+        let mut t = Terminal::new(24, 80);
+        t.process_at(b"Done.\r\n", clock_at(base, 5));
+        let m = row_matcher("esc to interrupt").expect("compile");
+        let id = t.watch_rows_gone(m, anywhere(), base).expect("arm");
+        assert!(
+            t.watch_poll(id).is_some(),
+            "no matching row at arm => latched at arm time"
+        );
+    }
+
+    /// The inverse of `row_matcher_latches_on_real_engine_output`, through the
+    /// real pipeline: a visible matching row HOLDS `gone` pending across repaints
+    /// that keep it on screen, and the paint that takes it away latches.
+    #[test]
+    fn row_gone_waits_for_the_matching_row_to_leave() {
+        let base = Instant::now();
+        let mut t = Terminal::new(24, 80);
+        t.process_at(
+            b"thinking\xe2\x80\xa6 (esc to interrupt)\r\n",
+            clock_at(base, 5),
+        );
+        let m = row_matcher("esc to interrupt").expect("compile");
+        let id = t.watch_rows_gone(m, anywhere(), base).expect("arm");
+        assert!(
+            t.watch_poll(id).is_none(),
+            "the footer is on screen => pending"
+        );
+
+        // More output that leaves the footer in place: still pending.
+        t.process_at(b"still thinking\r\n", clock_at(base, 10));
+        assert!(
+            t.watch_poll(id).is_none(),
+            "content advanced but the row is still visible => still pending"
+        );
+
+        // Clear the screen (home + ED 2): the footer leaves => latched.
+        t.process_at(b"\x1b[H\x1b[2JDone.\r\n", clock_at(base, 20));
+        let sat = t
+            .watch_poll(id)
+            .expect("the row leaving the real surface latched `gone`");
+        assert!(sat.seq > 0);
     }
 
     #[test]

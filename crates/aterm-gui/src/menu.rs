@@ -179,7 +179,8 @@ pub enum MenuAction {
     /// Quit aterm.
     Quit,
     // File menu
-    /// New Window — a fresh independent aterm process (`open_new_window`).
+    /// New Window — a new in-process window of this App, sharing its sessions
+    /// (`App::create_window_internal`); no second process is spawned.
     NewWindow,
     /// New Tab — a new in-window session (`App::open_tab`).
     NewTab,
@@ -1068,11 +1069,14 @@ const HELP_MENU: &[MenuEntry] = &[Item {
 /// Order is the standard Mac arrangement (App / File / Edit / View / Window / Help); the
 /// App section is titled with the app name by convention.
 ///
-/// It MIRRORS the macOS `NSMenu` the `install` builder constructs item-for-item (a
-/// `#[test]` asserts every [`MenuAction`] appears here exactly once, so an action added
-/// to one and not the other fails CI). Unifying `install` to build directly from this
-/// model is a safe follow-up; it is kept descriptive here to avoid rewriting the
-/// (host-only, untestable-in-CI) objc2 menu construction.
+/// It DESCRIBES the macOS `NSMenu` the `install` builder constructs. A `#[test]`
+/// asserts every [`MenuAction`] appears here exactly once, but nothing compares the
+/// model to the builder item-for-item, and today they differ: this File section
+/// carries "Reopen Closed View" (`ReopenClosedView`), which `build_file_menu` never
+/// adds, and labels the reopen-tab row "Reopen Closed Tab" where the live menu says
+/// "Reopen Closed Native Tab". Unifying `install` to build directly from this model
+/// would close that; it is kept descriptive here to avoid rewriting the (host-only,
+/// untestable-in-CI) objc2 menu construction.
 // On macOS the `chrome` verb reads the LIVE `NSMenu`, so the model + serialiser are used
 // only off macOS (and by tests) — not dead, just per-target. The chain from `MENU_MODEL`
 // keeps the sections/consts/types alive, so this one allow covers them.

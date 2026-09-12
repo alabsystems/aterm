@@ -300,15 +300,74 @@ impl Ctx {
     }
 }
 
+/// The one line that names the compiler every stage below runs.
+///
+/// Pure over the two facts that decide it, so the sentence is a test and not a
+/// promise: the directory the toolchain walk settled on, and whether a `targo`
+/// was actually found in it. A RELATIVE path is called out rather than printed
+/// as if it were an answer — a gate that cannot say where its compiler is has
+/// not pinned one, and the whole point of the line is that a reader never has
+/// to take the pin on trust again.
+#[must_use]
+pub fn toolchain_header_line(
+    stage2_dir: &std::path::Path,
+    channel: Option<&str>,
+    have_targo: bool,
+) -> String {
+    let channel = channel.unwrap_or("<unpinned>");
+    if !have_targo {
+        return format!(
+            "verify: toolchain NONE — channel \"{channel}\" resolved to no usable targo \
+             (looked last at {})\n",
+            stage2_dir.display()
+        );
+    }
+    if !stage2_dir.is_absolute() {
+        return format!(
+            "verify: toolchain {} — RELATIVE, so this run cannot say which compiler it \
+             used (channel \"{channel}\")\n",
+            stage2_dir.display()
+        );
+    }
+    format!(
+        "verify: toolchain {} (channel \"{channel}\", absolute and resolved once — every \
+         stage below ran this targo)\n",
+        stage2_dir.display()
+    )
+}
+
+/// [`toolchain_header_line`] for a live run.
+#[must_use]
+pub fn toolchain_header(ctx: &Ctx) -> String {
+    toolchain_header_line(
+        &ctx.tools.stage2_dir,
+        crate::toolchain::pinned_channel(&ctx.root).as_deref(),
+        ctx.tools.have_targo(),
+    )
+}
+
 /// Run the whole gate: hooks, ladder, verdict. Returns the process exit code.
 ///
-/// `out` receives the ladder — and only the ladder, in declared order, byte-for-byte
-/// in the vocabulary `tools/verify.sh` established. Live progress goes to stderr so
-/// a long stage is not silent without polluting the scannable part.
+/// `out` receives, in this order: the [`toolchain_header`] line, the prelude rungs,
+/// the `hooks pinned:` note when `pin_hooks` had to set `core.hooksPath`, the ladder
+/// in declared order, and the verdict (or the gate-defect `FAIL` and `VERIFY: COULD
+/// NOT RUN` lines) — byte-for-byte in the vocabulary `tools/verify.sh` established.
+/// Live progress goes to stderr so a long stage is not silent without polluting the
+/// scannable part.
 ///
 /// # Errors
 /// Propagates write failures on `out`.
 pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
+    // WHICH COMPILER DECIDED THIS, named before anything is decided.
+    //
+    // MEASURED 2026-09-10, and it cost an 80-minute gate: a run was killed on
+    // the hypothesis that `verify.sh` resolved its toolchain through a mutable
+    // rustup symlink and that a peer's re-seal had split the gate across two
+    // compilers. It does not — the shim resolves a PHYSICAL path once (`cd
+    // "$cand_dir" && pwd -P`) and prepends it for the whole run — but nothing
+    // the gate printed said so, so two readers believed it and neither could
+    // check in less than a code read. One line ends that question forever.
+    out.write_all(toolchain_header(ctx).as_bytes())?;
     // The change-scope stage first: it is what CHOSE the scope every header
     // below prints, so a reader meets the narrowing before its consequences.
     for r in &ctx.prelude {
@@ -596,5 +655,45 @@ mod tests {
             "and an operator who types `off` gets the old unbounded wait"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE PIN for the question that killed an 80-minute gate on 2026-09-10.
+    ///
+    /// A run was aborted on the hypothesis that the gate resolved its compiler
+    /// through a mutable rustup symlink and that a peer's re-seal had split it
+    /// across two toolchains. The shim had in fact resolved a PHYSICAL path
+    /// once and prepended it for the whole run — but the gate printed nothing
+    /// about it, so the claim could be neither supported nor refuted without a
+    /// code read, and two readers believed it. This holds the sentence that
+    /// answers it in the record itself, and holds that the two ways of NOT
+    /// being able to answer are said out loud rather than dressed as answers.
+    #[test]
+    fn the_gate_names_the_absolute_toolchain_it_resolved_and_admits_when_it_cannot() {
+        let line = toolchain_header_line(
+            std::path::Path::new("/Users//x/toolchains/trust-current/bin"),
+            Some("trust"),
+            true,
+        );
+        assert!(line.starts_with("verify: toolchain /Users//x/toolchains/trust-current/bin "));
+        assert!(line.contains("channel \"trust\""));
+        assert!(
+            line.contains("absolute and resolved once"),
+            "the line must say the path is PINNED, not merely print one: {line}"
+        );
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+
+        // A relative path is a gate that cannot say which compiler it used.
+        let rel = toolchain_header_line(std::path::Path::new("bin"), Some("trust"), true);
+        assert!(rel.contains("RELATIVE"), "{rel}");
+        assert!(!rel.contains("resolved once"), "{rel}");
+
+        // And no toolchain at all is NONE, never a bare path that reads like one.
+        let none = toolchain_header_line(
+            std::path::Path::new("/Users//x/trust/build/host/stage2/bin"),
+            None,
+            false,
+        );
+        assert!(none.contains("toolchain NONE"), "{none}");
+        assert!(none.contains("<unpinned>"), "{none}");
     }
 }

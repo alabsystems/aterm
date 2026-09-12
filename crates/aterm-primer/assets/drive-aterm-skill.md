@@ -50,10 +50,16 @@ The other tabs on this machine are often other agents mid-task. Before any `turn
 `key`, or `paste` into a peer:
 
 1. `aterm ctl "@$SID" status` — `detail=` names what it is running while a
-   shell-integration block executes: the command's FIRST word reduced to its basename, plus
-   an allow-listed subcommand, never an argument (`claude`, `codex`, `targo%20test`; `-`
-   when idle or the engine was busy). A compound command's first word is the shell keyword
-   that opens it, so `for i in …; do …; done` reads `for`, not the program inside.
+   shell-integration block executes: the program reduced to its basename, plus an
+   allow-listed subcommand, never an argument (`claude`, `codex`, `targo%20test`; `-`
+   when idle or the engine was busy). A compound line reports the segment that RUNS:
+   the last `;`-group, and within it a trailing `|| …` alternative (it runs only on
+   failure) is dropped and the last segment left is read — `cd ~/proj && claude` reads
+   `claude`, `a || b` reads `a`, `a && b || c` reads `b`, `a || b && c` reads `c`; a
+   keyword opener stays the keyword (`for i in …; do …; done` reads `for`,
+   not the program inside). On older builds that same `cd … && claude` reads `detail=cd`
+   — when `detail=` is a shell builtin (`cd`, `export`, `source`), confirm with `text`
+   before you decide what lives there.
    `ls` carries the same `detail=` for every session at once, and `blocks` carries the
    executing block's `cmdline=`.
 2. `aterm ctl "@$SID" meta` — `role=` is whatever its owner stamped (`-` = unset).
@@ -139,9 +145,11 @@ session, else the lowest window id; `none` = no window holds it; `-` = the insta
 ask its main thread); `active=` the session is on that window's active tab; `wfocus=` that
 window is aterm's MOST RECENTLY FOCUSED window — set when a window takes focus and never
 cleared by a blur, a minimize or the app deactivating, so exactly one window per instance
-reads `1`; `detail=` the sanitized RUNNING command — the first word plus an
+reads `1`; `detail=` the sanitized RUNNING command — the program plus an
 allow-listed subcommand, never its arguments (`claude`, `codex`, `targo%20test`; `-` idle;
-a compound command reads as the shell keyword that opens it).
+a compound line reads as the segment that runs — the last one once a trailing `|| …`
+alternative is dropped, so `a && b` → `b`, `a || b` → `a` — and a keyword opener stays
+the keyword; older builds read the first word, `cd`).
 
 `*` / `self` mark the caller's own session/instance. **Parse by key, not by column:** the
 title is percent-encoded, **may be empty** (two consecutive spaces), and any program can set
@@ -206,7 +214,9 @@ Session-targeted (`aterm ctl "@<sid>" close` → `OK closed <sid>`).
 aterm ctl "@$SID" status        # OK schema=1 … phase= … detail=<running program|-> … — read this BEFORE driving
 aterm ctl "@$SID" text          # visible screen, one row per line — the CHEAP read
 aterm ctl "@$SID" text trim     # the same minus the trailing all-blank rows: header OK <n> trimmed=<k>
-aterm ctl "@$SID" text --json   # {"rows":[…],"cursor":{…},"dims":{…},"seq":N} (+ "trimmed":k with trim)
+aterm ctl "@$SID" text tail=20 trim  # only the LAST 20 rows: header OK <n> trimmed=<k> first=<row> (line i = screen row first+i)
+aterm ctl "@$SID" text rows=40-62    # an inclusive 0-based span, clamped to the grid: header OK <n> first=40
+aterm ctl "@$SID" text --json   # {"rows":[…],"cursor":{…},"dims":{…},"seq":N} (+ "trimmed":k with trim, "first":row with tail=/rows=)
 aterm ctl "@$SID" cursor        # OK <row> <col> <visible 0|1> <style>   (0-based)
 aterm ctl "@$SID" dims          # OK <rows> <cols> <px_w> <px_h> … window=<id> …
 aterm ctl "@$SID" screen        # lossless styled JSON — one enormous line
@@ -214,13 +224,26 @@ aterm ctl "@$SID" search 'panic'
 aterm ctl "@$SID" blocks        # shell-integration command blocks; the executing one carries cmdline=
 ```
 
-- `text` takes one optional argument, `trim`: it drops the trailing all-blank rows and the
-  header becomes `OK <n> trimmed=<k>` with `n` = the rows actually sent; interior blanks
-  stay, so row *i* is still screen row *i*. Off by default (scripts count rows). **Anything
-  else is `ERR usage: text [trim]`** — `text 20` is refused, not silently treated as `text`.
-  `blocktext <id> trim` and `temporal <tick> trim` take the same modifier.
+- `text` takes `trim`, and at most one of `tail=<n>` / `rows=<a>-<b>`, in any order after
+  `--json`. `trim` drops the trailing all-blank rows and the header becomes `OK <n>
+  trimmed=<k>` with `n` = the rows actually sent; interior blanks stay, so row *i* is still
+  screen row *i*. `tail=<n>` sends only the last n rows of the grid (n ≥ 1; more than the
+  grid has is the whole grid) and `rows=<a>-<b>` the inclusive 0-based span, clamped to the
+  grid (a span with no row on it, or `b < a`, is `ERR bad rows`). **The `first=` rule:**
+  whenever the reply does not start at row 0 the header closes with `first=<row>` — `OK
+  <n>[ trimmed=<k>][ first=<row>]` — so reply line *i* is screen row `first+i`; `--json`
+  carries `"first":<row>` the same way and `dims.rows` stays the grid. `trim` trims the
+  SLICE, not the grid. All off by default (scripts count rows). **Anything else is `ERR
+  usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>]`** — `text 20` and `tail=0` are
+  refused, not silently treated as `text`. `blocktext <id> trim` and `temporal <tick> trim`
+  take the `trim` modifier too.
 - `screen` is always JSON and budgets ~213 bytes per cell — **~400 KB on a 24×80 grid**.
   Reach for `text trim` unless you genuinely need attributes.
+- On a bottom-pinned TUI `trim` buys nothing: Claude Code pins its composer to the LAST
+  row, so `text trim` trims 0 rows and every look costs the whole 63-row grid, ~5 KB
+  (measured: 1,518 reads moved 8.1 MB for the last ~20 rows each time) — `text tail=20
+  trim` is the cheap read there. Let `await gone` / `await seq` decide WHEN to read, and
+  read the prompt box only at decision points — never on a poll.
 - `search` replies `OK <n>` (or `OK <n> incomplete` when scrollback was evicted mid-scan),
   then one `<row> <col> <len>` per match where **row is the ABSOLUTE scrollback row**.
 - `--json` goes *after* the verb, honored only by `text screen cursor dims blocks edges grants`.
@@ -253,6 +276,8 @@ aterm ctl "@$SID" image --bytes                # OK 1 + "<w> <h> <nbytes> <base6
 ```sh
 aterm ctl "@$SID" send 'echo hi\n'   # raw to the PTY; trailing literal \n becomes CR
 aterm ctl "@$SID" key enter
+aterm ctl "@$SID" key if=Do.you.want.to.proceed 1   # GUARDED: pressed only if a visible row matches — OK seq=<n> | OK skipped seq=<n>
+aterm ctl "@$SID" send if=Do.you.want.to.proceed 1  # the same guard on a raw write
 aterm ctl "@$SID" ctrl c
 aterm ctl "@$SID" paste 'some text'  # bracketed-paste seam
 aterm ctl "@$SID" resize 30 100      # ROWS first
@@ -261,6 +286,31 @@ aterm ctl "@$SID" resize 30 100      # ROWS first
 `send|key|ctrl|feed|mouse|paste` reply `OK seq=<n>` — the content baseline *before* the
 input. `send` writes straight to the PTY and builds no input event, so typing-reactive
 effects stay inert; use `key` when you want "a human typed this" provenance.
+
+### Answer a prompt that can vanish: `key if=<re> <name>`
+
+A prompt can resolve between your read and your press — measured: an auto-mode rule
+answered a Claude Code permission box between a supervisor's `text` and its `key 1`, and
+the `1` landed in the composer as text. A read-then-press is two requests with a window
+between them; `key [id=<key>] [if=<re>] <name>` closes it. Under ONE hold of the terminal
+lock the server tests `<re>` against the visible rows and, only if some row matches, writes
+the key — no output can land between the check and the press.
+
+- A match answers `OK seq=<n>` like a plain press. **No match writes nothing and answers
+  `OK skipped seq=<n>` — exit 0: a skipped guard is an answer (the prompt was gone), not
+  an error.** A bad pattern is `ERR badregex` (nothing written); `ERR busy sink` is
+  transient (zero bytes) — retry.
+- **The regex is ONE wire token.** The control line is split on whitespace and nothing
+  quotes, so write a space as `.`: `key if=Do.you.want.to.proceed 1`, never
+  `key if='Do you want' 1` (that arms `Do` and presses `you`). `aterm ctl` prints one
+  stderr line before sending such a pattern — `aterm-ctl: note: '<arg>' contains
+  whitespace and is split on the wire; write the pattern as ONE token (e.g.
+  esc.to.interrupt)` — and still sends it, so treat the note as the bug, not as a refusal.
+- Composes with the exactly-once `id=<epoch>:<producer>:<seq>` key in either order; a
+  skipped guard gives its sequence back, so the retry is re-evaluated against the live
+  screen instead of answered `dup=1`. A halted session is `ERR halted` whatever the guard
+  says. `send if=<re> <text>` is the same guard on a raw write; `key` and `send` are the
+  two verbs that take it.
 
 ### Exact bytes without shell-quoting hell
 
@@ -285,11 +335,28 @@ aterm ctl "@$SID" turn 'echo HELLO'
 aterm ctl "@$SID" turn idle=800 timeout=30000 'make test'
 aterm ctl "@$SID" turn trim=1 'make test'          # settled screen minus its trailing blank rows
 aterm ctl "@$SID" turn submit=none 'draft text'
-aterm ctl "@$SID" turn settle=match:'BUILD SUCCESSFUL' 'make'
+aterm ctl "@$SID" turn settle=match:BUILD.SUCCESSFUL 'make'                         # settle on a row matching; the pattern is ONE token
+aterm ctl "@$SID" turn settle=gone:esc.to.interrupt timeout=600000 'fix the test'   # an interactive agent: settle when its busy footer LEAVES
 ```
 
 `turn` types the text, verifies the submit landed (re-pressing if needed), waits for
 settle, and returns the settled screen.
+
+- **A `settle=` pattern is ONE whitespace-free token — `esc.to.interrupt`, never
+  `'esc to interrupt'`.** The client joins argv with single spaces and the server
+  re-splits the line on whitespace (the same rule that collapses inline `send`, above), so
+  shell quotes do not survive the wire: `turn settle=gone:'esc to interrupt' timeout=600000
+  'fix it'` arrives as `turn settle=gone:esc to interrupt timeout=600000 fix it` — the regex
+  is `esc`, the option parse stops at `to`, and `to interrupt timeout=600000 fix it` is what
+  gets TYPED into the session, with the timeout left at its 240 s default. `.` (or `\s+`,
+  quoted so the shell keeps the backslash) is regex, not the shell's business.
+- `settle=gone:<re>` is TWO waits: after the verified submit it first waits (bounded by
+  `submit_window`, default 2000 ms) for `<re>` to APPEAR, then for it to LEAVE — `gone` is
+  level-triggered and the footer can land a frame after the submit verified, so arming it
+  in that gap would settle on the pre-response screen. A pattern never seen inside the
+  window degrades to the plain idle settle, and the verdict line does not say which settle
+  fired; when you need certainty, follow the turn with `await gone <re>` while the footer
+  is up.
 
 **The reply is split across two streams — verdict to stderr, rows to stdout:**
 
@@ -351,10 +418,31 @@ Event-driven server-side, no polling. Server timeouts are **milliseconds**, clam
 aterm ctl "@$SID" ready                              # OK ready prompt | OK ready idle | OK timeout
 aterm ctl "@$SID" await idle 400 timeout 5000        # OK idle <seq>
 aterm ctl "@$SID" await match 'DONE' timeout 20000   # OK match <seq>
+aterm ctl "@$SID" await gone esc.to.interrupt timeout=600000    # OK gone <seq> | OK timeout — <re> is ONE token
 aterm ctl "@$SID" await block                        # OK block <seq>
 aterm ctl "@$SID" wait 30000                         # OK complete <id> exit=<code|->
 ```
 
+- **Idle-settle is NOT a completion signal for an interactive agent.** Measured against
+  Claude Code: `turn idle=3000` settled after 4.5 s while the worker was still thinking —
+  its screen sits static for 3+ s mid-turn, and its composer glyph is on screen the whole
+  time, so `await match` on the prompt returns mid-turn too. The signal that holds is the
+  busy footer DISAPPEARING (`esc to interrupt` in Claude Code; substitute the program's
+  own). `await gone <re>` blocks until no screen row matches and replies `OK gone <seq>` or
+  `OK timeout` (exit 124). **`<re>` is ONE whitespace-free token — `esc.to.interrupt`.** The
+  request line is re-split on whitespace server-side, so `await gone 'esc to interrupt'`
+  arms the regex `esc` and silently drops `to interrupt`: any row holding `esc` (a `press
+  esc` hint, say) then pins the wait, and it never matched the footer at all (`aterm ctl`
+  prints a stderr `note:` before sending such a pattern, and still sends it — see *Act*). It is
+  **level-triggered**: if the text is already absent it returns at once, so issue it only
+  after the footer is up (right after your `turn`/`send`, or after `text` showed it), or
+  you latch on the pre-turn screen. The turn form, `turn settle=gone:esc.to.interrupt
+  '<msg>'`, handles that itself — it waits for the footer to APPEAR (within
+  `submit_window`) before waiting for it to LEAVE, and degrades to idle-settle if it never
+  appears (see the `turn` section). Bad regex → `ERR badregex`. An older build answers
+  `gone` with `ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|block|…>` —
+  a grammar with no `gone` in it — so fall back to the loop `await idle` → read the footer
+  with `text` → `await seq` until the footer is absent.
 - **`await seq <n>` is the cheap dirty check** — level-triggered, so it latches immediately
   when `content_seq` has *already* moved past `<n>`. Record the `seq` from `text --json`
   (or an input verb's `OK … seq=<n>` reply) one turn, pass it back the next:
@@ -528,8 +616,12 @@ aterm drive --socket "$SOCK" read
 aterm drive --socket "$SOCK" --idle 800 --timeout 20000 prompt 'echo hi'
 aterm drive --socket "$SOCK" --ready '^\$ ' prompt 'make test'   # a shell prompt
 aterm drive --socket "$SOCK" --ready '' prompt 'echo hi'         # idle-only
-aterm drive --socket "$SOCK" await match 'BUILD SUCCESSFUL'
+aterm drive --socket "$SOCK" await match BUILD.SUCCESSFUL     # ONE token: it shells out to `aterm ctl`, same wire rule
 aterm drive --socket "$SOCK" shot out.png
+aterm drive classify 'git status --short && git pull | tail'  # read-only (exit 0) | not-read-only <reason> (exit 1) — pure, no host needed
+aterm drive phase "@$SID"                                     # busy | prompt | idle | question, then the parsed prompt box
+aterm drive await-turn "@$SID" --timeout 600000               # block until not busy, print the phase; exit 124 = still busy
+aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill
 ```
 
 `prompt` is `send` → `key enter` → `await idle <ms> timeout <ms>` → best-effort
@@ -541,6 +633,12 @@ The default matches a **Claude** input caret (`(^|\s)❯(\s|$)`) — right only 
 program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` for
 idle-only. Also settable via `$ATERM_DRIVE_READY` (the flag wins). A non-matching pattern
 costs a bounded extra wait, never a failed turn.
+
+The last four are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
+WORKER*): `classify` is the read-only judgment, `phase` one read → one word, `await-turn`
+the wait that never sleeps, `supervise` the loop that approves only a read-only Bash prompt
+(guarded: `key if=Do.you.want.to.proceed 1`) and stops at everything else. `--timeout` is
+milliseconds; `--max-s` is seconds.
 
 `drive` **shells out** to `aterm-ctl`, so through a bare symlink with no sibling client it
 fails with `could not run aterm-ctl`. Set `$ATERM_CTL`, or just use `aterm ctl` — that path
@@ -562,9 +660,25 @@ is in-process.
 8. `image` can't capture a background tab, needs a bare filename, returns a path with spaces.
 9. Inline `send` collapses whitespace and forbids newlines — use `--stdin` forms (≤256 KiB).
 10. `search` rows are absolute scrollback rows; header may carry ` incomplete`.
-11. `screen` is ~400 KB; `text trim` is the cheap read. `text <anything but trim>` is `ERR usage`.
+11. `screen` is ~400 KB; `text trim` is the cheap read (`text tail=<n> trim` on a bottom-pinned
+    TUI). `text <anything but trim / tail= / rows=>` is `ERR usage`.
 12. Client `--timeout` is seconds; server-side timeouts are milliseconds (cap 600000).
 13. A subscribe `seq` skip is coalescing, never loss; a `GAP resync=` is a real discontinuity.
 14. `@.` follows the human's tab switches; `@self` and `@<sid>` do not.
 15. `spawn window=<id>` and `@<sid> spawn` do NOT raise the window; a plain `spawn` does.
 16. `help <verb>` for one entry; bare `help` is the short catalog; `help --full` is everything.
+17. Idle-settle is not completion for an interactive agent (Claude Code sits static 3+ s
+    mid-turn). `await gone esc.to.interrupt` / `turn settle=gone:esc.to.interrupt` is. The
+    regex is ONE token — a quoted space does not survive the wire (`'esc to interrupt'`
+    arms `esc`, and in a `turn` TYPES `to interrupt …` as the message). `await gone` is
+    level-triggered, so arm it only while the footer is up; the turn form waits for the
+    footer to appear first and falls back to idle-settle if it never does. On a
+    bottom-pinned TUI `text trim` trims nothing — read `text tail=20 trim` and let `await
+    gone`/`await seq` decide when to read. `aterm ctl` prints a stderr `note:` before
+    sending a pattern with whitespace, and still sends it.
+18. `detail=` on a compound line is the segment that runs (the last one once a trailing
+    `|| …` alternative is dropped: `a && b` → `b`, `a || b` → `a`, `a && b || c` → `b`);
+    an older build reads the first word, so `detail=cd` means "confirm with `text`".
+19. `key if=<re> <name>` / `send if=<re> <text>` check and press under ONE lock: `OK skipped
+    seq=<n>` (exit 0) means no row matched and nothing was written — an answer, not an
+    error. The guard is ONE token: `if=Do.you.want.to.proceed`.

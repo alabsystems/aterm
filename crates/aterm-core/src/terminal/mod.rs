@@ -150,7 +150,9 @@ pub use aterm_types::{WindowOperation, WindowResponse};
 pub use clipboard_auth::ClipboardAccess;
 pub use render_cells::{RenderCell, UnderlineStyle};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
-pub use state::{ContentScrollState, Terminal};
+pub use state::{
+    CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove, Terminal,
+};
 use types::{SgrPushMask, SgrStackEntry, TaskbarProgress};
 
 use crate::grid::Cursor;

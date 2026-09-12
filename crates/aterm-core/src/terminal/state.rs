@@ -20,23 +20,88 @@ use crate::platform::FontDescriptor;
 use aterm_types::charset::CharacterSetState;
 use aterm_types::{KittyKeyboardState, Rgb, XtermKeyboardState};
 
+pub use aterm_grid::RowBandMove;
+
+/// How many row-band moves [`ContentScrollState::bands`] remembers.
+///
+/// Sixteen is a bounded storage choice at the scale of an observed Codex
+/// transcript burst: its fastest captured line gap was 9.1 ms, while the GUI's
+/// synchronized-output hold cap is 150 ms. These observations do not guarantee
+/// that an interval fits: seventeen arrivals can span only sixteen gaps, and
+/// future output may be denser. A longer present delay, minimization, or a
+/// denser burst may overwrite unread moves. `delta_since` then answers
+/// `Invalidate`, so the host discards old coordinates instead of replaying an
+/// incomplete transform.
+pub const CONTENT_SCROLL_BAND_RING: usize = 16;
+
 /// Cumulative, non-consuming summary of terminal content-coordinate motion.
 ///
-/// Hosts keep a previous copy and diff it against a later snapshot. An advance
-/// in [`uniform_up_rows`](Self::uniform_up_rows) means the entire active-screen
+/// Hosts keep a previous copy and diff it against a later snapshot, normally
+/// through [`ContentScrollState::delta_since`]. An advance in
+/// [`uniform_up_rows`](Self::uniform_up_rows) means the entire active-screen
 /// viewport moved upward by that many rows. An advance in
-/// [`invalidation_epoch`](Self::invalidation_epoch) means at least one
-/// non-uniform or otherwise ambiguous mutation occurred, so cached coordinates
-/// must be discarded instead of translated.
+/// [`invalidation_epoch`](Self::invalidation_epoch) STILL means "discard": at
+/// least one non-uniform mutation moved rows, so cached coordinates cannot be
+/// carried by a whole-screen translation.
 ///
-/// Both counters are monotonic for the lifetime of a [`Terminal`], survive RIS
-/// and direct [`Terminal::reset`], and are intentionally not checkpointed.
+/// [`band_batches`](Self::band_batches) and [`bands`](Self::bands) are an
+/// ADDITIONAL, exact transform a consumer MAY apply instead of discarding: an
+/// epoch step whose entire row motion was a short list of
+/// [`RowBandMove`]s (a DECSTBM region scroll, a reverse index at a region top,
+/// IL/DL, the top-anchored archival scroll an inline viewport streams through)
+/// is counted in `band_batches` and its moves are appended to the `bands` ring.
+/// A consumer that can translate bands applies them, oldest first, when EVERY
+/// epoch step since its last snapshot is explained — `delta_since` decides that,
+/// and only that. A consumer that cannot translate bands (the selection, the
+/// viewport row cache, the pet world's surface key) ignores the two new fields
+/// and treats any epoch change as an invalidation exactly as before: nothing
+/// about the epoch's meaning or cadence changed, `band_batches` is a subset of
+/// it, and `record_band_batch` is only ever called right after `invalidate`.
+///
+/// All counters are monotonic for the lifetime of a [`Terminal`], survive RIS
+/// and direct [`Terminal::reset`] (both of which bump the epoch WITHOUT a band
+/// batch, so a consumer sees an unexplained step and discards — fail-closed by
+/// construction), and are intentionally not checkpointed. `Copy`, 128 bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ContentScrollState {
     /// Total rows of composable, full-screen upward motion on the active screen.
     pub uniform_up_rows: u64,
     /// Number of coordinate-invalidating content-motion batches observed.
     pub invalidation_epoch: u64,
+    /// Invalidating batches whose WHOLE row motion is in [`bands`](Self::bands) —
+    /// a subset of [`invalidation_epoch`](Self::invalidation_epoch). A batch
+    /// counts only when the grid's band record was non-empty and exact, no
+    /// whole-screen scroll happened in the same batch, the batch did not switch
+    /// screens, and no splice degraded to `Invalidate`.
+    pub band_batches: u64,
+    /// Band moves recorded for the Terminal's life; `bands[seq % 16]` holds move
+    /// `seq`. A consumer reads the moves `previous.band_seq..current.band_seq`.
+    pub band_seq: u64,
+    /// The ring of the most recent [`CONTENT_SCROLL_BAND_RING`] moves.
+    pub bands: [RowBandMove; CONTENT_SCROLL_BAND_RING],
+}
+
+/// What a host should do with the coordinates it cached at `previous` now that
+/// the terminal reads `current` — the ONE decision both hosts (`aterm-gui`'s
+/// `sync_cursor_effect_scroll` and `aterm-effects`' pipeline) call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentScrollDelta {
+    /// No previous snapshot: adopt `current` and translate nothing.
+    Baseline,
+    /// Nothing moved.
+    Unchanged,
+    /// The whole screen moved UP by exactly this many rows (no epoch step).
+    Translate(u16),
+    /// Every epoch step since `previous` is explained by the `count` band moves
+    /// `bands[first_seq..first_seq + count]` (oldest first; `count` is 1..=16).
+    Bands {
+        /// Sequence number of the oldest move to replay.
+        first_seq: u64,
+        /// How many moves to replay, at most [`CONTENT_SCROLL_BAND_RING`].
+        count: u8,
+    },
+    /// Something moved rows that no exact transform describes: discard.
+    Invalidate,
 }
 
 impl ContentScrollState {
@@ -48,6 +113,98 @@ impl ContentScrollState {
     #[inline]
     pub(super) fn invalidate(&mut self) {
         self.invalidation_epoch = self.invalidation_epoch.saturating_add(1);
+    }
+
+    /// Record that the epoch step just taken (by `invalidate`) is FULLY explained
+    /// by `moves`: append them to the ring, oldest first, and count the batch.
+    /// Called only by `post_process`, only right after `invalidate`, and only
+    /// with a non-empty exact record.
+    pub(super) fn record_band_batch(&mut self, moves: &[RowBandMove]) {
+        for &m in moves {
+            let slot = usize::try_from(self.band_seq % CONTENT_SCROLL_BAND_RING as u64)
+                .unwrap_or_default();
+            if let Some(entry) = self.bands.get_mut(slot) {
+                *entry = m;
+            }
+            self.band_seq = self.band_seq.wrapping_add(1);
+        }
+        self.band_batches = self.band_batches.saturating_add(1);
+    }
+
+    /// The band move with sequence number `seq` — valid for the last
+    /// [`CONTENT_SCROLL_BAND_RING`] moves, i.e. `seq` in
+    /// `band_seq - 16..band_seq`; older sequence numbers read whatever overwrote
+    /// the slot, which is why [`Self::delta_since`] never hands out more than 16.
+    #[must_use]
+    #[inline]
+    pub fn band(&self, seq: u64) -> RowBandMove {
+        let slot = usize::try_from(seq % CONTENT_SCROLL_BAND_RING as u64).unwrap_or_default();
+        self.bands.get(slot).copied().unwrap_or_default()
+    }
+
+    /// The host decision between two snapshots — see [`ContentScrollDelta`].
+    ///
+    /// The table, with `d_u/d_e/d_bb/d_bs` the advances of `uniform_up_rows`,
+    /// `invalidation_epoch`, `band_batches`, `band_seq`:
+    ///
+    /// * no `previous` → `Baseline`;
+    /// * any counter went BACKWARDS (another Terminal's snapshot, a restart) →
+    ///   `Invalidate`;
+    /// * `d_e == 0`: the byte-identical pre-ring table — `d_u == 0` → `Unchanged`,
+    ///   a `d_u` that fits `u16` → `Translate`, larger → `Invalidate` (an
+    ///   unrepresentable exact delta retires instead of under-translating); a
+    ///   band count that moved without an epoch step cannot happen by
+    ///   construction and is `Invalidate` defensively;
+    /// * `d_e > 0`: `Bands` iff NO uniform rows were recorded meanwhile
+    ///   (`d_u == 0` — the epoch wins over later uniform rows, the pin
+    ///   `epoch_change_wins_over_later_uniform_rows_and_overflow_retires` keeps),
+    ///   EVERY epoch step was a band batch (`d_e == d_bb`), and the moves fit the
+    ///   ring (`1 <= d_bs <= 16`); otherwise `Invalidate` — a RIS, a resize, an
+    ///   alt flip, a margined scroll, a mixed batch, or more than 16 moves between
+    ///   two presents all land here, which is today's reset.
+    #[must_use]
+    pub fn delta_since(previous: Option<Self>, current: Self) -> ContentScrollDelta {
+        let Some(p) = previous else {
+            return ContentScrollDelta::Baseline;
+        };
+        if current.uniform_up_rows < p.uniform_up_rows
+            || current.invalidation_epoch < p.invalidation_epoch
+            || current.band_batches < p.band_batches
+            || current.band_seq < p.band_seq
+        {
+            return ContentScrollDelta::Invalidate;
+        }
+        let d_u = current.uniform_up_rows - p.uniform_up_rows;
+        let d_e = current.invalidation_epoch - p.invalidation_epoch;
+        let d_bb = current.band_batches - p.band_batches;
+        let d_bs = current.band_seq - p.band_seq;
+        if d_e == 0 {
+            if d_bs != 0 || d_bb != 0 {
+                // A band batch is always an epoch step; bands without one are a
+                // snapshot from some other lineage.
+                return ContentScrollDelta::Invalidate;
+            }
+            return if d_u == 0 {
+                ContentScrollDelta::Unchanged
+            } else if let Ok(rows) = u16::try_from(d_u) {
+                ContentScrollDelta::Translate(rows)
+            } else {
+                ContentScrollDelta::Invalidate
+            };
+        }
+        match u8::try_from(d_bs) {
+            Ok(count)
+                if d_u == 0
+                    && d_e == d_bb
+                    && (1..=CONTENT_SCROLL_BAND_RING).contains(&usize::from(count)) =>
+            {
+                ContentScrollDelta::Bands {
+                    first_seq: p.band_seq,
+                    count,
+                }
+            }
+            _ => ContentScrollDelta::Invalidate,
+        }
     }
 }
 
@@ -582,9 +739,11 @@ impl Terminal {
 
     /// Return the cumulative, non-consuming content-scroll snapshot.
     ///
-    /// Diff this copy against a previously observed value. If
+    /// Diff this copy against a previously observed value — through
+    /// [`ContentScrollState::delta_since`]. If
     /// [`ContentScrollState::invalidation_epoch`] changed, discard cached grid
-    /// coordinates. Otherwise the increase in
+    /// coordinates unless every step is explained by band moves
+    /// (`ContentScrollDelta::Bands`). Otherwise the increase in
     /// [`ContentScrollState::uniform_up_rows`] is an exact whole-screen upward
     /// translation, independent of retained scrollback capacity.
     #[must_use]
@@ -899,5 +1058,281 @@ mod damage_epoch_tests {
         term.process(b"x");
         let g4 = term.content_seq();
         assert!(g4 > g3, "content_gen is monotonic across further writes");
+    }
+}
+
+#[cfg(test)]
+mod content_scroll_delta_tests {
+    use super::{CONTENT_SCROLL_BAND_RING, ContentScrollDelta, ContentScrollState, RowBandMove};
+
+    /// The writer can overwrite the bounded ring while a reader is between
+    /// presents. A reader may replay only a complete, explained interval.
+    fn band_history_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            ContentScrollBandHistory {
+                const Cap = 16;
+                const Buggy = 0;
+                var moves = 0;
+                var unexplained = 0;
+                // Unchanged, Bands, Invalidate.
+                var verdict = 0;
+                action Step when (moves <= Cap) {
+                    moves = moves + 1;
+                    verdict = if unexplained == 1 { 2 } else {
+                        if moves <= Cap - 1 || Buggy == 1 { 1 } else { 2 }
+                    };
+                }
+                action Poison when (unexplained == 0) {
+                    unexplained = 1;
+                    verdict = 2;
+                }
+                action Baseline when (moves > 0 || unexplained == 1) {
+                    moves = 0;
+                    unexplained = 0;
+                    verdict = 0;
+                }
+                invariant Bounds: moves <= Cap + 1 && unexplained <= 1 && verdict <= 2;
+                invariant ReplayComplete: verdict == 0 || verdict == 2 ||
+                    (moves > 0 && moves <= Cap && unexplained == 0);
+                invariant RetireIncomplete: (moves <= Cap && unexplained == 0) || verdict == 2;
+            }
+        }
+    }
+
+    #[test]
+    fn band_history_model_proves_and_catches_overwritten_replay() {
+        let model = band_history_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    /// Tier 1: genuine VT processing writes the history; the shipping snapshot
+    /// reader decides what the hosts may replay. Re-baselining then writing a
+    /// second interval exercises physical ring wrap, not a fresh mock ring.
+    #[test]
+    fn terminal_band_history_conforms_through_overflow_and_rebaseline() {
+        use crate::terminal::TerminalBuilder;
+        let model = band_history_model();
+        assert_eq!(
+            model
+                .consts
+                .iter()
+                .find(|(name, _)| *name == "Cap")
+                .unwrap()
+                .1,
+            CONTENT_SCROLL_BAND_RING as i64
+        );
+        let mut caught_overflow = 0;
+        let mut caught_unexplained = 0;
+        for poison_at in [None, Some(0), Some(1), Some(8), Some(16), Some(17)] {
+            let mut term = TerminalBuilder::new()
+                .size(57, 151)
+                .ring_buffer_size(1000)
+                .build();
+            let mut baseline = term.content_scroll_state();
+            let mut expected = model.init_state();
+            for _ in 0..2 {
+                let mut written = Vec::new();
+                for step in 0..=CONTENT_SCROLL_BAND_RING + 1 {
+                    if poison_at == Some(step) {
+                        // RIS is an unexplained coordinate replacement. Later
+                        // exact moves must not make that lost interval replayable.
+                        term.process(b"\x1bc");
+                        assert!(model.fire("Poison", &mut expected));
+                    }
+                    if step > 0 {
+                        let top = (step % 3) as u16;
+                        let bytes = format!("\x1b[{};52r\x1b[52;1H\n", top + 1);
+                        term.process(bytes.as_bytes());
+                        written.push(RowBandMove {
+                            top,
+                            bottom: 51,
+                            delta: -1,
+                        });
+                        assert!(model.fire("Step", &mut expected));
+                    }
+                    let current = term.content_scroll_state();
+                    let actual = match ContentScrollState::delta_since(Some(baseline), current) {
+                        ContentScrollDelta::Unchanged => 0,
+                        ContentScrollDelta::Bands { first_seq, count } => {
+                            assert_eq!(first_seq, baseline.band_seq);
+                            assert_eq!(usize::from(count), written.len());
+                            for (offset, &movement) in written.iter().enumerate() {
+                                assert_eq!(current.band(first_seq + offset as u64), movement);
+                            }
+                            1
+                        }
+                        ContentScrollDelta::Invalidate => 2,
+                        other => panic!("unexpected reader decision {other:?}"),
+                    };
+                    assert_eq!(
+                        actual, expected["verdict"],
+                        "step {step}, poison {poison_at:?}"
+                    );
+                    assert_eq!(
+                        current.band_seq - baseline.band_seq,
+                        expected["moves"] as u64
+                    );
+                    if actual == 2 {
+                        let mut unsafe_replay = expected.clone();
+                        unsafe_replay.insert("verdict", 1);
+                        assert!(!model.check_invariant("ReplayComplete", &unsafe_replay));
+                        if expected["unexplained"] == 1 {
+                            caught_unexplained += 1;
+                        } else {
+                            caught_overflow += 1;
+                        }
+                    }
+                }
+                baseline = term.content_scroll_state();
+                assert!(model.fire("Baseline", &mut expected));
+                assert_eq!(
+                    ContentScrollState::delta_since(Some(baseline), baseline),
+                    ContentScrollDelta::Unchanged
+                );
+            }
+        }
+        assert_eq!(caught_overflow, 2);
+        assert!(caught_unexplained > 0);
+    }
+
+    fn state(uniform: u64, epoch: u64, batches: u64, seq: u64) -> ContentScrollState {
+        ContentScrollState {
+            uniform_up_rows: uniform,
+            invalidation_epoch: epoch,
+            band_batches: batches,
+            band_seq: seq,
+            ..Default::default()
+        }
+    }
+
+    /// The whole decision table. The `d_e == 0` rows are byte-identical to the
+    /// pre-ring table the hosts pinned (`Baseline` / `Unchanged` / `Translate` /
+    /// overflow → `Invalidate`); `Bands` is answered ONLY when every epoch step
+    /// since the snapshot was a band batch, no uniform rows intervened, and the
+    /// moves fit the 16-ring.
+    #[test]
+    fn delta_since_replays_only_fully_explained_epochs() {
+        let prev = state(10, 4, 2, 7);
+        assert_eq!(
+            ContentScrollState::delta_since(None, prev),
+            ContentScrollDelta::Baseline
+        );
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), prev),
+            ContentScrollDelta::Unchanged
+        );
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(13, 4, 2, 7)),
+            ContentScrollDelta::Translate(3)
+        );
+        assert_eq!(
+            ContentScrollState::delta_since(
+                Some(prev),
+                state(10 + u64::from(u16::MAX) + 1, 4, 2, 7)
+            ),
+            ContentScrollDelta::Invalidate,
+            "an unrepresentable exact delta retires instead of under-translating"
+        );
+
+        // One explained epoch step carrying one move.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 8)),
+            ContentScrollDelta::Bands {
+                first_seq: 7,
+                count: 1
+            }
+        );
+        // One explained step carrying five composed-into-one... and five separate.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 12)),
+            ContentScrollDelta::Bands {
+                first_seq: 7,
+                count: 5
+            }
+        );
+        // Several explained steps between two presents replay together.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 9, 7, 12)),
+            ContentScrollDelta::Bands {
+                first_seq: 7,
+                count: 5
+            }
+        );
+        // Two epoch steps, one band batch: the other step is unexplained.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 6, 3, 8)),
+            ContentScrollDelta::Invalidate
+        );
+        // Uniform rows beside a band batch: the epoch wins, as it always has.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(13, 5, 3, 8)),
+            ContentScrollDelta::Invalidate,
+            "later uniform output cannot hide an intervening non-uniform batch"
+        );
+        // Exactly the ring fits; one more does not.
+        let ring = CONTENT_SCROLL_BAND_RING as u64;
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 7 + ring)),
+            ContentScrollDelta::Bands {
+                first_seq: 7,
+                count: 16
+            }
+        );
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 7 + ring + 1)),
+            ContentScrollDelta::Invalidate,
+            "seventeen moves between presents overflow the ring: today's reset"
+        );
+        // A band batch with no moves cannot happen; refused rather than trusted.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 5, 3, 7)),
+            ContentScrollDelta::Invalidate
+        );
+        // Bands without an epoch step are another lineage's numbers.
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 4, 2, 8)),
+            ContentScrollDelta::Invalidate
+        );
+        assert_eq!(
+            ContentScrollState::delta_since(Some(prev), state(10, 4, 3, 7)),
+            ContentScrollDelta::Invalidate
+        );
+        // Every regression is an invalidation.
+        for regressed in [
+            state(9, 4, 2, 7),
+            state(10, 3, 2, 7),
+            state(10, 4, 1, 7),
+            state(10, 4, 2, 6),
+        ] {
+            assert_eq!(
+                ContentScrollState::delta_since(Some(prev), regressed),
+                ContentScrollDelta::Invalidate
+            );
+        }
+    }
+
+    /// The ring is addressed by sequence number modulo its length, and a batch of
+    /// several moves lands them oldest first.
+    #[test]
+    fn the_band_ring_is_addressed_by_sequence_and_wraps() {
+        let mut s = ContentScrollState::default();
+        let moves: Vec<RowBandMove> = (0..20u16)
+            .map(|i| RowBandMove {
+                top: i,
+                bottom: 56,
+                delta: 1,
+            })
+            .collect();
+        s.invalidate();
+        s.record_band_batch(&moves[..3]);
+        assert_eq!((s.band_batches, s.band_seq), (1, 3));
+        assert_eq!(s.band(0).top, 0);
+        assert_eq!(s.band(2).top, 2);
+        s.invalidate();
+        s.record_band_batch(&moves[3..]);
+        assert_eq!((s.band_batches, s.band_seq), (2, 20));
+        assert_eq!(s.band(19).top, 19);
+        assert_eq!(s.band(4).top, 4, "the 16 newest moves are intact");
+        assert_eq!(s.band(3).top, 19, "seq 3's slot was overwritten by seq 19");
     }
 }

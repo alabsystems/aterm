@@ -90,7 +90,8 @@ use super::timing::{
 use super::{Cadence, Config, Ctx, Event, Frame, TypedClass};
 use crate::color_math::relative_luminance;
 use crate::cursor_glow::{
-    Geom, InkRole, RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_SPARKLE_LIGHT_SHARE, SoundCue,
+    BandPx, Geom, InkRole, RAINBOW_CARET_LIGHT_FLOOR, RAINBOW_SPARKLE_LIGHT_SHARE, SoundCue,
+    band_row,
 };
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_CORE_ADD, STAR_GLINT,
@@ -1029,13 +1030,20 @@ pub const STREAM_DISP: f32 = 0.5;
 /// non-finite input, or no cell.
 #[must_use]
 pub fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
-    if !(cw.is_finite() && ioi_ms.is_finite()) || cw <= 0.0 {
+    stream_px_per_s_with_share(STREAM_SHARE_CW, cw, ioi_ms)
+}
+
+/// Scale the sky's velocity by its cell share, with the same stroll gate
+/// and interval clamp used by the cadence measurement.
+#[must_use]
+fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
+    if !(share.is_finite() && cw.is_finite() && ioi_ms.is_finite()) || cw <= 0.0 || share <= 0.0 {
         return 0.0;
     }
     let ioi = ioi_ms.clamp(STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS);
     let gate =
         smoothstep01((STREAM_IOI_STROLL_MS - ioi) / (STREAM_IOI_STROLL_MS - STREAM_IOI_RUN_MS));
-    STREAM_SHARE_CW * cw * 1000.0 / ioi * gate
+    share * cw * 1000.0 / ioi * gate
 }
 
 /// The whole travel, px, of a star born at `px_per_s` — the exponential's
@@ -1048,7 +1056,7 @@ pub fn stream_travel_px(px_per_s: f32) -> f32 {
 
 /// The drift's unit progress at `age_ms`, `0..=1`: the exponential's rise
 /// normalised to reach exactly 1 at [`STREAM_END_MS`], and 1 thereafter.
-/// The one curve the position and the cadence solver share.
+/// The one curve the sky position and the cadence solver share.
 #[inline]
 #[must_use]
 fn stream_unit(age_ms: f32) -> f32 {
@@ -1168,7 +1176,7 @@ pub const FAN_THROW_JITTER_MAX: f32 = 1.05;
 // mid-screen row (`capture-after`, bbox ymin 9-20 px against a grid top of
 // 84). The reach has no relation to the vertical room: a row is ONE ch tall
 // whatever the path length was. So the throw is an ellipse, not a disc —
-// squashed to the ring's own aspect ([`FAN_SQUASH`], §6.5 layer 10) and
+// squashed to its own aspect ([`FAN_SQUASH`], §6.5 layer 10) and
 // never taller than [`FAN_RISE_MAX_CH`] above or below the landing row's
 // centre, while the reach along the line keeps §6.5's formula: distance buys
 // length ALONG THE LINE (§6.3's spirit), not height. A ray that would exceed
@@ -1177,9 +1185,16 @@ pub const FAN_THROW_JITTER_MAX: f32 = 1.05;
 // band is row 0's sky (§5.4) and the fan may rise into it, to the band's own
 // top and not a pixel beyond; the same glass bound holds below.
 
-/// The fan's vertical squash — the ring's (§6.5 layer 10, `RING_SQUASH`), so
-/// the ring and the fan read as ONE squashed landing; the meteor asserts the
-/// two are equal.
+/// The fan's vertical squash: distance buys the fan LENGTH along the line,
+/// not height, and this is the aspect it buys it at.
+///
+/// §6.5 layer 10 wrote it as the landing ring's own, so that the ring and the
+/// fan read as ONE squashed landing. The ring took 0.5 in the 2026-09-08 bold
+/// round and was retired entirely on 2026-09-10 (the landing is a STARBURST,
+/// whose core is ISOTROPIC and has no squash at all — see
+/// `meteor::BURST_CORE_CH`), so this is now the fan's own number and nothing
+/// else's. What still binds the two marks is the RISE CAP below, which they
+/// share.
 pub const FAN_SQUASH: f32 = 0.62;
 
 /// The fan's rise ceiling, in `ch`, above and below the landing row's centre
@@ -1266,17 +1281,21 @@ pub const STARDUST_HALO_BUDGET: usize = 16;
 /// Source-over `RainHalo`s stardust may spend on one LIGHT frame. §3.3 draws
 /// every light star as ink lays (the `push_twinkle_over` silhouette spends up
 /// to five per star, each split per crossed row) and §18 holds a light frame
-/// to ≤ 400 of `MAX_HALOS 512` with the meteor's train chain at 96 and its
-/// ring at 36 ahead of the sky (`RING_LIGHT_DOTS`, 24 → 36 with the
-/// shockwave's 2.3× reach; NOT graded with the ring's radius — see its doc),
-/// which is the LAST emitter and the one `halos.truncate` sheds:
-/// `400 − 96 − 36`. The const assert holds the three to the law, so a
-/// retune of the ring's dots cannot silently overdraw the light frame.
+/// to ≤ 400 of `MAX_HALOS 512` with the meteor's train chain at 96 ahead of
+/// the sky, which is the LAST emitter and the one `halos.truncate` sheds.
+///
+/// Until 2026-09-10 the meteor's light RING took another 36 of it
+/// (`RING_LIGHT_DOTS`) and this budget was exactly `400 − 96 − 36`. The
+/// STARBURST that replaced the ring has a light arm made of source-over ink
+/// rects in `out`, not halos — the silhouette is the law and the operator is
+/// not — so it spends NONE, and those 36 are now slack. Left as slack rather
+/// than handed to the sky: retiring a mark is not a retune of the sky's
+/// density.
 pub const STARDUST_LIGHT_HALO_BUDGET: usize = 268;
 
 const _: () = assert!(
-    STARDUST_LIGHT_HALO_BUDGET + 96 + super::meteor::RING_LIGHT_DOTS == 400,
-    "§18: the light frame's 400-halo law — train chain + ring dots + sky"
+    STARDUST_LIGHT_HALO_BUDGET + 96 <= 400,
+    "§18: the light frame's 400-halo law — train chain + sky"
 );
 
 /// The source-over ceiling of a light-theme star mark (§3.3: `light_ink_bold`
@@ -1641,6 +1660,10 @@ pub struct Star {
     pub x: f32,
     /// Window-absolute Y of the centre, pinned the same way.
     pub y: f32,
+    /// The glyph row that earned a sky star. Its sky can occupy the preceding
+    /// pixel row, so regional scrolls follow this owner rather than `y`.
+    /// Free transients have no glyph owner and follow their pixel position.
+    pub home_row: Option<u16>,
     /// The birth edge. Every envelope and both scintillation clocks read
     /// `now − born`.
     pub born: Instant,
@@ -2275,8 +2298,17 @@ pub struct Glint {
 /// `tick`; a producer test writes it through [`Stardust::probe_mut`].
 #[derive(Clone, Debug, Default)]
 pub struct GlyphProbe {
-    /// The probed rows, most recent last. At most [`Self::ROWS`].
+    /// The row storage: the first [`Self::live`] entries are the HELD rows,
+    /// most recent last; any entry past them is retired storage kept for its
+    /// bitset capacity. At most [`Self::ROWS`] entries ever exist.
     rows: Vec<ProbedRow>,
+    /// How many of [`Self::rows`] are held. [`Self::clear`] resets this and
+    /// nothing else, so the clear the sky performs on EVERY scroll and band
+    /// move — under Codex one per streamed line, 9–233 ms apart — and the
+    /// host's re-probe of the caret's rows right after it allocate nothing
+    /// (§18: zero allocation on the tick; measured 6 × 32 B per band move
+    /// before this count existed, from `rows.clear()` dropping the bitsets).
+    live: usize,
     /// Round-robin write cursor into [`Self::rows`].
     at: usize,
 }
@@ -2434,11 +2466,14 @@ impl GlyphProbe {
     /// both bitsets cleared and sized for `width` columns.
     fn slot_for(&mut self, row: i32, width: usize) -> usize {
         let words = width.div_ceil(64);
-        let slot = if let Some(i) = self.rows.iter().position(|r| r.row == row) {
+        let slot = if let Some(i) = self.rows[..self.live].iter().position(|r| r.row == row) {
             i
-        } else if self.rows.len() < Self::ROWS {
-            self.rows.push(ProbedRow::default());
-            self.rows.len() - 1
+        } else if self.live < Self::ROWS {
+            if self.rows.len() == self.live {
+                self.rows.push(ProbedRow::default());
+            }
+            self.live += 1;
+            self.live - 1
         } else {
             let i = self.at % Self::ROWS;
             self.at = (self.at + 1) % Self::ROWS;
@@ -2454,9 +2489,12 @@ impl GlyphProbe {
         slot
     }
 
-    /// Forget everything — a reset, a layout change, a style switch.
+    /// Forget everything — a reset, a layout change, a style switch, and
+    /// every scroll or band move (the host re-probes before the next deal).
+    /// The rows' bitsets are KEPT as retired storage ([`Self::live`]), so
+    /// the re-probe that follows allocates nothing.
     pub fn clear(&mut self) {
-        self.rows.clear();
+        self.live = 0;
         self.at = 0;
     }
 
@@ -2468,7 +2506,7 @@ impl GlyphProbe {
             // Off-grid bands hold no glyphs by construction.
             return Some(false);
         }
-        let r = self.rows.iter().find(|r| r.row == row)?;
+        let r = self.rows[..self.live].iter().find(|r| r.row == row)?;
         if col >= r.width {
             return Some(false);
         }
@@ -2519,7 +2557,7 @@ impl GlyphProbe {
     /// Is the (in-grid, held) cell's ink a [`CellInk::Rule`]? Asked only
     /// after [`Self::at`] answered `Some(true)`, so a miss is simply "no".
     fn rule_at(&self, row: i32, col: u16) -> bool {
-        let Some(r) = self.rows.iter().find(|r| r.row == row) else {
+        let Some(r) = self.rows[..self.live].iter().find(|r| r.row == row) else {
             return false;
         };
         let i = usize::from(col);
@@ -2529,7 +2567,7 @@ impl GlyphProbe {
     /// True when the probe has no rows at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.live == 0
     }
 }
 
@@ -2839,7 +2877,7 @@ impl Stardust {
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
         match *ev {
             Event::Typed { cells, class, .. } => {
-                self.note_cadence(at);
+                self.note_cadence(at, cells);
                 self.relight_field(ctx.caret, at, ctx.geom);
                 self.deal_typed(cells, class, at, ctx, ribbon);
             }
@@ -3359,10 +3397,16 @@ impl Stardust {
             return;
         }
         let dy = f32::from(rows) * f32::from(cell_h);
-        for s in &mut self.stars {
+        self.stars.retain_mut(|s| {
+            if let Some(row) = s.home_row {
+                let Some(row) = row.checked_sub(rows) else {
+                    return false;
+                };
+                s.home_row = Some(row);
+            }
             s.y -= dy;
-        }
-        self.stars.retain(|s| s.y >= 0.0);
+            s.y >= 0.0
+        });
         // The veil moves with its row and leaves with it.
         for v in &mut self.veil {
             v.row = v.row.checked_sub(rows).unwrap_or(u16::MAX);
@@ -3371,6 +3415,55 @@ impl Stardust {
         self.last_hero = self
             .last_hero
             .and_then(|(r, c)| r.checked_sub(rows).map(|r| (r, c)));
+        self.probe.clear();
+    }
+
+    /// Move sky stars with the glyph rows that earned them. Under tall ribbon
+    /// geometry a row's sky is in the previous pixel row, including the band
+    /// above row zero; pixel membership alone would move a fixed footer's stars
+    /// and leave the moving top row's stars behind. Free transients use
+    /// [`BandPx`]'s point law. Veils and hero-spacing memory follow grid rows.
+    /// The probe is cleared and re-read by the host before the next deal.
+    /// Without cell height, stars fail closed while row ownership still moves.
+    pub fn translate_band(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        delta: i16,
+        cell_h: u16,
+        origin_y: u16,
+    ) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        if cell_h == 0 {
+            self.stars.clear();
+        } else {
+            let px = BandPx::new(top, bottom, delta, cell_h, origin_y);
+            self.stars.retain_mut(|s| {
+                if let Some(home) = s.home_row {
+                    let Some(row) = band_row(home, top, bottom, delta) else {
+                        return false;
+                    };
+                    s.y += (i32::from(row) - i32::from(home)) as f32 * f32::from(cell_h);
+                    s.home_row = Some(row);
+                    true
+                } else {
+                    px.point(&mut s.y)
+                }
+            });
+        }
+        self.veil
+            .retain_mut(|v| match band_row(v.row, top, bottom, delta) {
+                Some(row) => {
+                    v.row = row;
+                    true
+                }
+                None => false,
+            });
+        self.last_hero = self
+            .last_hero
+            .and_then(|(r, c)| band_row(r, top, bottom, delta).map(|r| (r, c)));
         self.probe.clear();
     }
 
@@ -3801,6 +3894,7 @@ impl Stardust {
             lane: spec.lane,
             x,
             y,
+            home_row: Some(spec.cell.0),
             born: at,
             lit: at,
             seed,
@@ -3831,6 +3925,7 @@ impl Stardust {
             lane: spec.lane,
             x: spec.at_px.0.round(),
             y: spec.at_px.1.round(),
+            home_row: None,
             born: at,
             lit: at,
             seed: spec.seed,
@@ -3949,10 +4044,20 @@ impl Stardust {
     /// the one number the slipstream is priced from, read off the typed
     /// events' own instants and never off the spine. A second event on the
     /// same instant (a coalesced burst delivered as two) keeps the interval
-    /// already read: it is one keystroke's worth. Event-edge work.
-    fn note_cadence(&mut self, at: Instant) {
+    /// already read: it is one keystroke's worth.
+    ///
+    /// A COALESCED ECHO IS PRICED PER KEY: a `Typed { cells: n }` is one
+    /// event carrying `n` keystrokes the host delivered in one frame (a
+    /// Codex burst, Claude Code's Sweep), so the gap since the last event
+    /// is `n` key intervals, not one — it is divided by `cells` before the
+    /// clamp. A 1-cell event is priced exactly as before (the divisor is
+    /// 1). Without the division a 5-key burst 400 ms after the last key
+    /// reads as a 2.5 cps stroll and the sky stands still under a hand
+    /// that just typed at 12 cps. Event-edge work.
+    fn note_cadence(&mut self, at: Instant, cells: u16) {
         if let Some(last) = self.last_typed {
-            let gap_ms = at.saturating_duration_since(last).as_secs_f32() * 1000.0;
+            let gap_ms =
+                at.saturating_duration_since(last).as_secs_f32() * 1000.0 / f32::from(cells.max(1));
             if gap_ms > 0.0 {
                 self.ioi_ms = gap_ms.clamp(STREAM_IOI_MIN_MS, STREAM_IOI_MAX_MS);
             }
@@ -3971,8 +4076,21 @@ impl Stardust {
     /// Event-edge work: a walk of at most one row's columns per birth,
     /// nothing per frame.
     fn stream_reach(&self, x: f32, row: u16, ctx: &Ctx<'_>) -> f32 {
+        let want = stream_travel_px(stream_px_per_s(ctx.geom.cw as f32, self.ioi_ms));
+        self.blank_frontier_px(x, row, want, ctx)
+    }
+
+    /// **THE BLANK FRONTIER** — how far, px ≥ 0, a thing at `x` on `row`
+    /// may travel LEFT of the `want` it was priced: clamped at the first
+    /// column of `row − 1` the probe has not proved blank (contiguously from
+    /// the thing's own column) and at the pane's first column. The one
+    /// clamp [`Stardust::stream_reach`] (the sky's travel) and the exhaust
+    /// (the ribbon's stream at its own share, §27) share, so L4 is one
+    /// walk with two callers and not two walks. Zero for a non-finite or
+    /// sub-half-pixel `want` and off the grid's left edge. Event-edge work:
+    /// at most one row's columns per birth.
+    fn blank_frontier_px(&self, x: f32, row: u16, want: f32, ctx: &Ctx<'_>) -> f32 {
         let g = ctx.geom;
-        let want = stream_travel_px(stream_px_per_s(g.cw as f32, self.ioi_ms));
         if !want.is_finite() || want < 0.5 {
             return 0.0;
         }
@@ -4203,6 +4321,7 @@ impl Stardust {
             return false;
         };
         s.lane = StarLane::Field;
+        s.home_row = Some(cell.0);
         s.lit = at;
         s.v0 = (0.0, 0.0);
         true
@@ -6024,6 +6143,7 @@ mod tests {
             lane,
             x: 200.0,
             y: 100.0,
+            home_row: None,
             born,
             lit: born,
             seed: peak_seed(),
@@ -8907,6 +9027,179 @@ mod tests {
         assert_eq!(sky.last_hero, None);
     }
 
+    /// Seam point 12, the band path: Codex's viewport `[4..10]` sliding
+    /// down one row carries the star on row 5 to row 6, the veil on row 5
+    /// to row 6 and the hero memory with it, drops the veil on row 10 that
+    /// the slide pushed past the band's edge, leaves the star on row 2
+    /// (outside the band) exactly where it was, and forgets the probe — the
+    /// host re-probes before the next deal, and a stale row answered as
+    /// blank would be a star over ink. Then the pinned phase: the transcript
+    /// `[0..3]` archives up and only the row-2 star rides; two more rows and
+    /// it leaves through the top, gone rather than pinned to row 0.
+    #[test]
+    fn a_band_move_moves_stars_in_the_band_and_clears_the_probe() {
+        let t0 = Instant::now();
+        let mut sky = sky();
+        assert!(!sky.probe().is_empty(), "fixture: rows 2-4 are probed");
+        let mut high = star(StarClass::M2, StarLane::Strike, t0, TINT_WHITE_RGB);
+        high.y = 50.0;
+        sky.sow(high);
+        sky.sow(star(StarClass::M2, StarLane::Strike, t0, TINT_WHITE_RGB));
+        for row in [5u16, 10] {
+            sky.veil.push(Veil {
+                row,
+                col: 4,
+                t: 0.3,
+                gain: 1.0,
+                born: t0,
+                lit: t0,
+                finish: None,
+            });
+        }
+        sky.last_hero = Some((5, 4));
+
+        sky.translate_band(4, 10, 1, 18, 0);
+
+        assert_eq!(sky.live(), 2, "no star inside or outside the band was lost");
+        let ys: Vec<f32> = sky.live_iter().map(|s| s.y).collect();
+        assert!(
+            ys.contains(&50.0),
+            "the row-2 star is outside the band: {ys:?}"
+        );
+        assert!(ys.contains(&118.0), "the row-5 star rode to row 6: {ys:?}");
+        assert_eq!(
+            sky.veil.iter().map(|v| v.row).collect::<Vec<_>>(),
+            vec![6],
+            "the row-5 veil rode to row 6 and the row-10 veil left the band"
+        );
+        assert_eq!(sky.last_hero, Some((6, 4)));
+        assert!(sky.probe().is_empty(), "the probe survived a band move");
+
+        sky.translate_band(0, 3, -1, 18, 0);
+        let ys: Vec<f32> = sky.live_iter().map(|s| s.y).collect();
+        assert!(ys.contains(&32.0) && ys.contains(&118.0), "{ys:?}");
+        assert_eq!(
+            sky.last_hero,
+            Some((6, 4)),
+            "a hero outside the band is untouched"
+        );
+        sky.translate_band(0, 3, -2, 18, 0);
+        assert_eq!(sky.live(), 1, "a star that left the band was kept");
+        assert_eq!(sky.live_iter().next().map(|s| s.y), Some(118.0));
+
+        // No geometry yet: stars fail closed, rows still translate.
+        let mut cold = Stardust::new();
+        cold.sow(star(StarClass::M2, StarLane::Strike, t0, TINT_WHITE_RGB));
+        cold.last_hero = Some((5, 4));
+        cold.translate_band(4, 10, 1, 0, 0);
+        assert_eq!(cold.live(), 0);
+        assert_eq!(cold.last_hero, Some((6, 4)));
+    }
+
+    #[test]
+    fn band_moves_follow_the_earning_glyph_at_sky_and_footer_edges() {
+        let now = Instant::now();
+        let ribbon = Ribbon::new();
+        let mut caught_pixel_only = 0;
+        for tall in [false, true] {
+            let mut config = cfg(true);
+            config.ribbon_tall = tall;
+            for top in [0u16, 4] {
+                let bottom = top + 6;
+                for home in [top, top + 1, bottom, bottom + 1] {
+                    for delta in [-1i16, 1] {
+                        let mut sky = Stardust::new();
+                        if let Some(above) = home.checked_sub(1) {
+                            sky.probe_mut().probe_row(i32::from(above), &[false; 120]);
+                        }
+                        sky.probe_mut().probe_row(i32::from(home), &[false; 120]);
+                        let context = ctx(now, &config, (home, 10));
+                        assert!(sky.deal_star(
+                            Deal {
+                                class: StarClass::M2,
+                                lane: StarLane::Field,
+                                cell: (home, 10),
+                                earned: false,
+                                pull: None,
+                                tint: None,
+                            },
+                            now,
+                            &context,
+                            &ribbon
+                        ));
+                        let before = *sky.live_iter().next().unwrap();
+                        assert_eq!(before.home_row, Some(home));
+                        let moved = i32::from(home) + i32::from(delta);
+                        let expected = if home > bottom {
+                            Some(home)
+                        } else if moved < i32::from(top) || moved > i32::from(bottom) {
+                            None
+                        } else {
+                            Some(moved as u16)
+                        };
+                        sky.translate_band(top, bottom, delta, geom().ch as u16, geom().origin_y);
+                        if let Some(row) = expected {
+                            let after = sky.live_iter().next().unwrap();
+                            assert_eq!(after.home_row, Some(row));
+                            let wanted_y = before.y
+                                + (i32::from(row) - i32::from(home)) as f32 * geom().ch as f32;
+                            assert_eq!(after.y, wanted_y);
+                            assert_eq!(
+                                (after.born, after.lit, after.seed),
+                                (before.born, before.lit, before.seed)
+                            );
+                            // The rejected implementation uses the star's sky
+                            // pixel as though it were the earning glyph row.
+                            let mut wrong_y = before.y;
+                            let retained =
+                                BandPx::new(top, bottom, delta, geom().ch as u16, geom().origin_y)
+                                    .point(&mut wrong_y);
+                            if !retained || wrong_y != wanted_y {
+                                caught_pixel_only += 1;
+                            }
+                        } else {
+                            assert_eq!(sky.live(), 0, "a star outlived its ejected glyph row");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            caught_pixel_only >= 4,
+            "the fixture must catch pixel-row ownership at both band edges"
+        );
+    }
+
+    #[test]
+    fn sky_ownership_survives_uniform_scroll_before_a_band_move() {
+        let now = Instant::now();
+        let config = cfg(true);
+        let mut sky = Stardust::new();
+        sky.probe_mut().probe_row(6, &[false; 120]);
+        sky.probe_mut().probe_row(7, &[false; 120]);
+        assert!(sky.deal_star(
+            Deal {
+                class: StarClass::M2,
+                lane: StarLane::Field,
+                cell: (7, 10),
+                earned: false,
+                pull: None,
+                tint: None,
+            },
+            now,
+            &ctx(now, &config, (7, 10)),
+            &Ribbon::new()
+        ));
+        let before = *sky.live_iter().next().unwrap();
+        sky.translate_scroll(1, geom().ch as u16);
+        assert_eq!(sky.live_iter().next().unwrap().home_row, Some(6));
+        sky.translate_band(6, 10, 1, geom().ch as u16, geom().origin_y);
+        let after = sky.live_iter().next().unwrap();
+        assert_eq!((after.home_row, after.y), (Some(7), before.y));
+        sky.translate_scroll(8, geom().ch as u16);
+        assert_eq!(sky.live(), 0, "an ejected owner retires its sky star");
+    }
+
     // -- §18 cadence: the sky's clocks are solved, not polled ---------------
 
     /// **THE SIZE CLOCK'S NEXT STEP IS SOLVED IN CLOSED FORM** (§18's
@@ -10706,6 +10999,813 @@ mod tests {
                     "{label}: the mend's star centre at +{ms} ms reads Y {lum:.1} over the caret law's {ceil:.1}"
                 );
             }
+        }
+    }
+
+    // =======================================================================
+    // THE END-TO-END STAR CATCH (panel #10(b)) — the seam walked WHOLE
+    // =======================================================================
+    //
+    // `mod.rs` proves the sky's half (`Engine::pet_offer` / `catch_star`)
+    // against a hand-built `PetOnGlass`, and `kitty_pet.rs` proves the
+    // receiver's half against a hand-built `PetOffer`. What neither proves is
+    // that a REAL star born on a REAL keystroke reaches a REAL cat's paw and
+    // comes back to the sky: the two halves agree on a type, and a type is
+    // not a walk. The harness below is that walk — one engine and one brain
+    // on one clock, the host's two lines between them, and a twin of each
+    // that never hears of the seam, so every "nothing else moved" below is a
+    // diff against an un-offered world rather than a belief about one.
+
+    use crate::kitty_pet::{PetAction, PetBrain, PetFrame, PetSense};
+    use crate::rainbow_kitty::companion::{CATCH_REACH_CELLS, PetOffer, PetOnGlass, StarCatch};
+    use crate::rainbow_kitty::{Dir, Engine, Licence};
+
+    /// The paw's grid: the pet's own fixture (100×30 cells of 10×20) as the
+    /// sky sees it, at origin 0 so the pet's grid px and the sky's window px
+    /// are one coordinate.
+    fn paw_geom() -> Geom {
+        Geom {
+            cw: 10,
+            ch: 20,
+            rows: 30,
+            cols: 100,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 1000,
+            win_h: 600,
+            head: 0,
+        }
+    }
+
+    fn paw_sense(now: Instant, caret: (u16, u16)) -> PetSense {
+        PetSense {
+            now,
+            caret: Some(caret),
+            wrapped: false,
+            rows: 30,
+            cols: 100,
+            cell_w: 10,
+            cell_h: 20,
+            reduced_motion: false,
+            output_burst: false,
+            pointer: None,
+        }
+    }
+
+    /// The host's frame cadence while the pet or the sky is live.
+    const FRAME_MS: u64 = 16;
+
+    /// The column past which the typist's line wraps to the next row.
+    const WRAP_COL: u16 = 90;
+
+    /// What one lockstep frame reported, for the tests to read.
+    #[derive(Clone, Copy, Debug)]
+    struct Step {
+        at: Instant,
+        pet: PetFrame,
+        twin_pet: PetFrame,
+        offer: PetOffer,
+        /// The star the paw handed back this frame, and whether the sky still
+        /// had it (`Engine::catch_star`).
+        caught: Option<(StarCatch, bool)>,
+        /// `(quads, halos, cues)` the offered engine emitted this frame …
+        emitted: (usize, usize, usize),
+        /// … and the un-offered twin.
+        twin_emitted: (usize, usize, usize),
+    }
+
+    /// ONE WORLD, TWICE: an engine and a brain wired through the host's two
+    /// lines, and a twin pair fed byte-identical events on the same clock
+    /// that never hears of panel #10.
+    struct Lockstep {
+        eng: Engine,
+        pet: PetBrain,
+        twin_eng: Engine,
+        twin_pet: PetBrain,
+        sc: Scratch,
+        tsc: Scratch,
+        cfg: Config,
+        t: Instant,
+        caret: (u16, u16),
+        /// Tick the un-offered twin pair too (the walk's diff), or leave
+        /// them still (the census, which only counts).
+        twins: bool,
+        last: Option<Step>,
+    }
+
+    impl Lockstep {
+        fn new(t0: Instant, caret: (u16, u16)) -> Self {
+            let mut eng = Engine::new();
+            eng.set_engaged(true);
+            let mut twin_eng = Engine::new();
+            twin_eng.set_engaged(true);
+            Self {
+                eng,
+                pet: PetBrain::default(),
+                twin_eng,
+                twin_pet: PetBrain::default(),
+                sc: Scratch::default(),
+                tsc: Scratch::default(),
+                cfg: cfg(true),
+                t: t0,
+                caret,
+                twins: true,
+                last: None,
+            }
+        }
+
+        /// The offered pair alone.
+        fn solo(t0: Instant, caret: (u16, u16)) -> Self {
+            Self {
+                twins: false,
+                ..Self::new(t0, caret)
+            }
+        }
+
+        /// One frame at `self.t`: both engines tick, both brains tick, then
+        /// the host's two lines — `app_render::route_v2_pet_offer`'s order,
+        /// "immediately after the pet's OWN tick, with the frame that tick
+        /// just published".
+        fn frame(&mut self) -> Step {
+            let g = paw_geom();
+            let t = self.t;
+            clear(&mut self.sc);
+            clear(&mut self.tsc);
+            {
+                let mut fr = self.sc.frame();
+                self.eng.tick(t, g, &self.cfg, &mut fr);
+            }
+            if self.twins {
+                let mut fr = self.tsc.frame();
+                self.twin_eng.tick(t, g, &self.cfg, &mut fr);
+            }
+            let pet = self.pet.tick(paw_sense(t, self.caret));
+            let twin_pet = if self.twins {
+                self.twin_pet.tick(paw_sense(t, self.caret))
+            } else {
+                pet
+            };
+            // THE SEAM — the host's two lines, verbatim from `pet_offer`'s
+            // contract.
+            let offer = self.eng.pet_offer(g, PetOnGlass::of(&pet, g));
+            let caught = self
+                .pet
+                .note_v2_offer(&offer)
+                .map(|star| (star, self.eng.catch_star(star, t)));
+            let step = Step {
+                at: t,
+                pet,
+                twin_pet,
+                offer,
+                caught,
+                emitted: emitted(&self.sc),
+                twin_emitted: emitted(&self.tsc),
+            };
+            self.last = Some(step);
+            step
+        }
+
+        /// Advance the clock one frame and run it.
+        fn next_frame(&mut self) -> Step {
+            self.t += Duration::from_millis(FRAME_MS);
+            self.frame()
+        }
+
+        /// Run frames up to (not at) `self.t + gap`, and set the clock there
+        /// — the next key's instant, with nothing yet dealt on it, so a test
+        /// may read the seed knob before it presses.
+        fn advance(&mut self, gap: Duration) {
+            let due = self.t + gap;
+            while self.t + Duration::from_millis(FRAME_MS) < due {
+                self.next_frame();
+            }
+            self.t = due;
+        }
+
+        /// One keystroke at `self.t`, in both worlds: the echo's one-cell
+        /// move under the Typed licence and the key itself, on a row the
+        /// probe has just proved blank (§5.4), then the frame that echoes it.
+        fn key(&mut self, class: TypedClass) -> Step {
+            let (r, c) = self.caret;
+            let t = self.t;
+            let to = (r, c + 1);
+            for e in self.engines() {
+                e.probe_mut().probe_row(i32::from(r) - 1, &[false; 100]);
+                e.probe_mut().probe_row(i32::from(r), &[false; 100]);
+                e.on_event(
+                    Event::Move {
+                        from: (r, c),
+                        to,
+                        licence: Licence::Typed,
+                        dir: Dir::of(1, 0),
+                    },
+                    t,
+                );
+                e.on_event(
+                    Event::Typed {
+                        cells: 1,
+                        shifted: matches!(class, TypedClass::Capital),
+                        class,
+                    },
+                    t,
+                );
+            }
+            self.caret = to;
+            self.frame()
+        }
+
+        /// One Backspace at `self.t`, in both worlds: the retreat's one-cell
+        /// move and the erase.
+        fn backspace(&mut self) -> Step {
+            let (r, c) = self.caret;
+            let t = self.t;
+            let to = (r, c.saturating_sub(1));
+            for e in self.engines() {
+                e.on_event(
+                    Event::Move {
+                        from: (r, c),
+                        to,
+                        licence: Licence::Typed,
+                        dir: Dir::of(-1, 0),
+                    },
+                    t,
+                );
+                e.on_event(Event::Erase, t);
+            }
+            self.caret = to;
+            self.frame()
+        }
+
+        /// Enter at `self.t`: the caret to the start of the next row, under
+        /// the Return licence, in both worlds.
+        fn newline(&mut self) -> Step {
+            let (r, c) = self.caret;
+            let t = self.t;
+            let to = (r + 1, 0);
+            for e in self.engines() {
+                e.on_event(
+                    Event::Move {
+                        from: (r, c),
+                        to,
+                        licence: Licence::Return,
+                        dir: Dir::of(-i32::from(c), 1),
+                    },
+                    t,
+                );
+                e.on_event(Event::Return, t);
+            }
+            self.caret = to;
+            self.frame()
+        }
+
+        /// `gap` later, the next key — an Enter first when the line is full.
+        fn key_after(&mut self, gap: Duration, class: TypedClass) -> Step {
+            self.advance(gap);
+            if self.caret.1 >= WRAP_COL {
+                self.newline();
+                self.advance(gap);
+            }
+            self.key(class)
+        }
+
+        /// The engines an event is reported to.
+        fn engines(&mut self) -> impl Iterator<Item = &mut Engine> {
+            std::iter::once(&mut self.eng).chain(self.twins.then_some(&mut self.twin_eng))
+        }
+
+        /// Idle for `secs` at frame cadence.
+        fn idle(&mut self, secs: f32) -> Step {
+            let end = self.t + Duration::from_secs_f32(secs);
+            let mut step = self.frame();
+            while self.t < end {
+                step = self.next_frame();
+            }
+            step
+        }
+
+        /// The cat as the sky will read it on the NEXT frame's offer — the
+        /// last published frame, which is what the host hands `pet_offer`.
+        fn cat(&self) -> Option<PetOnGlass> {
+            self.last.and_then(|s| PetOnGlass::of(&s.pet, paw_geom()))
+        }
+
+        /// The offered engine's copy of `star`, by identity.
+        fn star(&self, star: StarCatch) -> Option<Star> {
+            find_star(&self.eng, star)
+        }
+
+        /// The un-offered twin's copy of `star`, by identity.
+        fn twin_star(&self, star: StarCatch) -> Option<Star> {
+            find_star(&self.twin_eng, star)
+        }
+    }
+
+    fn clear(sc: &mut Scratch) {
+        sc.under.clear();
+        sc.out.clear();
+        sc.halos.clear();
+        sc.beams.clear();
+        sc.cues.clear();
+    }
+
+    fn emitted(sc: &Scratch) -> (usize, usize, usize) {
+        (sc.under.len() + sc.out.len(), sc.halos.len(), sc.cues.len())
+    }
+
+    fn find_star(eng: &Engine, star: StarCatch) -> Option<Star> {
+        eng.stardust
+            .live_iter()
+            .find(|s| s.born == star.born && s.x == star.x && s.y == star.y)
+            .copied()
+    }
+
+    /// The gold m1 born on THIS instant in `eng`'s sky, if the key dealt one.
+    fn gold_born(eng: &Engine, at: Instant) -> Option<Star> {
+        eng.stardust
+            .live_iter()
+            .find(|s| s.gold && s.class == StarClass::M1 && s.lane.is_sky() && s.born == at)
+            .copied()
+    }
+
+    /// **THE SEED KNOB, READ AHEAD** — whether a shifted capital pressed NOW
+    /// on `cell` deals a GOLD m1, and where. Two laws, both the sky's own:
+    ///
+    /// * the CLASS is by rule: a capital EARNS its hero (§5.8,
+    ///   `TypedClass::Capital` → `Deal::earned`), and an earned hero is never
+    ///   demoted by the spacing or the bucket ([`Stardust::deal_star`]);
+    /// * the TINT is by seed: `deal_tint` on the strike's seed,
+    ///   `cell_hash(row, col, minted + 1)` — [`Stardust::mint_seed`] folds the
+    ///   pool's mint count, and the strike is the first star a key mints — at
+    ///   the cell the strike is BORN on, which is [`Stardust::free_sky_cell`]
+    ///   of the typed cell (a taken cell births one cell ahead).
+    ///
+    /// So a test drives keys until the knob reads gold and presses a capital
+    /// there: a fixed search over the event sequence (§18), not a die roll.
+    fn gold_capital_at(eng: &Engine, cell: (u16, u16)) -> Option<(u16, u16)> {
+        let free = eng.stardust.free_sky_cell(cell, paw_geom())?;
+        let seed = cell_hash(free.0, free.1, eng.stardust.minted.wrapping_add(1));
+        deal_tint(seed, 0.0).1.then_some(free)
+    }
+
+    /// The typo rally that SEATS a cat beside the caret: `fwd` keys forward
+    /// and `back` Backspaces, repeated at `gap`. Three reversals inside
+    /// `FROLIC_WINDOW` earn a frolic, a second frolic inside `TENNIS_AFTER`
+    /// sits the cat down to WATCH the rally (`kitty_pet.rs`, the tennis
+    /// watch) — and that seat is the one settled, purring posture a cat holds
+    /// while the caret keeps moving on its row. Returns once the pet's own
+    /// frame says `Sit` with the purr tell up, or panics after `rounds`.
+    fn rally_until_seated(w: &mut Lockstep, gap: Duration, rounds: u32) -> u32 {
+        for round in 0..rounds {
+            for _ in 0..3 {
+                w.key_after(gap, TypedClass::Glyph);
+            }
+            for _ in 0..2 {
+                w.advance(gap);
+                w.backspace();
+            }
+            if w.cat().is_some_and(|c| {
+                c.contented() && w.last.is_some_and(|s| s.pet.action == PetAction::Sit)
+            }) {
+                return round + 1;
+            }
+        }
+        panic!("fixture: the rally did not seat the cat in {rounds} rounds");
+    }
+
+    /// The one honest residual of the wiring round — "no single test walks a
+    /// real star from `deal_typed` through the paw to `Stardust::catch`" —
+    /// written: a real `Engine` typing at 12 cps and a real `PetBrain` on
+    /// the same clock, ticked in lockstep with the host's two lines between
+    /// them; a gold m1 dealt WITHIN REACH by the engine's own seed knob (a
+    /// capital on the cell whose strike seed `deal_tint`s gold —
+    /// [`gold_capital_at`]); and the whole of what may change: ONE star's
+    /// life, on ONE frame, to the catch horizon, in a world otherwise
+    /// bit-identical to its un-offered twin.
+    ///
+    /// **RED ON MAIN, AND IGNORED FOR THAT REASON (measured 2026-09-10).**
+    /// The seated cat is the RALLY seat ([`rally_until_seated`]) because it
+    /// is the only settled, purring posture a keystroke finds: a seat stands
+    /// on the first key of a resume (`Sit → Stand`, the purr tell down, on
+    /// the key's own tick), and no star outlives the 1.4 s it takes to sit
+    /// again. But `kitty_pet.rs`'s tennis arm (`PetAction::Sit if
+    /// self.tennis`) returns before the arrived branch that calls
+    /// `consume_v2_offer`, so the rally seat LATCHES the star and never
+    /// reaches for it, and the 0.25 s TTL retires it. With that one arm
+    /// consuming the offer (a two-line experiment, not landed — the file is
+    /// another agent's) every assertion here passes: paw 16 ms after birth,
+    /// the sky at zero 1.5 s after the catch. Until the pet lands the paw,
+    /// [`a_keystroke_s_star_finds_no_seat_that_can_reach_for_it`] pins the
+    /// truth as it stands; when THAT goes red, un-ignore this.
+    #[test]
+    fn a_gold_star_walks_from_the_deal_through_the_paw_to_the_catch() {
+        let t0 = Instant::now();
+        let g = paw_geom();
+        let gap = Duration::from_micros(83_333); // 12 cps
+        let mut w = Lockstep::new(t0, (4, 0));
+
+        // A sentence of running earns the cat its contentment and the engine
+        // its heat; then the rally seats the cat.
+        for _ in 0..30 {
+            w.key_after(gap, TypedClass::Glyph);
+        }
+        let rounds = rally_until_seated(&mut w, gap, 12);
+        let seat = w.cat().expect("fixture: the cat is on glass");
+        assert!(seat.contented(), "fixture: a contented seat");
+
+        // THE DEAL. Keep the rally going so the caret stays inside the paw's
+        // reach, and on the third forward key of each round — the mend of
+        // the two Backspaces already spent on the first — read the seed knob
+        // at the key's own instant; a capital where it says gold.
+        let mut dealt: Option<(Step, (u16, u16))> = None;
+        'rounds: for _ in 0..rounds + 40 {
+            for k in 0..3 {
+                w.advance(gap);
+                let cell = w.caret;
+                let cat = w.cat().expect("fixture: the cat stays on glass");
+                let in_reach =
+                    cat.contented() && cat.columns_to(i32::from(cell.1)) <= CATCH_REACH_CELLS;
+                if k == 2
+                    && in_reach
+                    && let Some(free) = gold_capital_at(&w.eng, cell)
+                {
+                    let s = w.key(TypedClass::Capital);
+                    dealt = Some((s, free));
+                    break 'rounds;
+                }
+                w.key(TypedClass::Glyph);
+            }
+            for _ in 0..2 {
+                w.advance(gap);
+                w.backspace();
+            }
+        }
+        let (birth, free) = dealt.expect("fixture: the seed knob must read gold within 40 rounds");
+
+        // The knob was right: the capital's strike is a gold m1 at the cell
+        // the knob named, in BOTH worlds (the deal is the keystroke's, not
+        // the seam's).
+        let star = gold_born(&w.eng, birth.at).expect("the capital dealt a gold m1");
+        assert_eq!(
+            star.grid_col(g),
+            i32::from(free.1),
+            "born on the knob's cell"
+        );
+        assert!(star.in_sky_of(4, g), "born in the sky of the cat's row");
+        assert_eq!(
+            gold_born(&w.twin_eng, birth.at).map(|s| (s.x, s.y, s.born)),
+            Some((star.x, star.y, star.born)),
+            "the twin dealt the same star: the seam mints nothing"
+        );
+        assert!(
+            star.finish.is_none(),
+            "born with its whole life ahead of it"
+        );
+
+        // THE OFFER, on the birth frame: the sky names that star to the
+        // seated, purring cat — and NOTHING is acted on yet (latch, never
+        // act: the paw lands on a tick, not on a note).
+        let catch = StarCatch {
+            x: star.x,
+            y: star.y,
+            born: star.born,
+            col: star.grid_col(g),
+        };
+        assert!(
+            birth.pet.action.settled() && birth.pet.purr > 0.0,
+            "a settled, purring cat"
+        );
+        assert_eq!(
+            birth.offer.catch,
+            Some(catch),
+            "the birth frame's offer names the star"
+        );
+        assert_eq!(birth.caught, None, "noting is not catching");
+        assert!(
+            w.pet.pending_v2_offer().1,
+            "the star is latched in the brain"
+        );
+
+        // THE PAW. Frame by frame until the brain hands the star back; the
+        // star's life must not move on any frame before that one.
+        let mut contact = None;
+        for _ in 0..20 {
+            let before = w.star(catch).expect("the star lives until the paw");
+            assert_eq!(before.finish, None, "the life moved before the paw landed");
+            let s = w.next_frame();
+            if let Some((back, hit)) = s.caught {
+                assert_eq!(back, catch, "the star handed back is the star offered");
+                assert!(hit, "the sky still had the star to catch");
+                contact = Some(s);
+                break;
+            }
+        }
+        let contact = contact.expect("the paw lands inside the star's TTL");
+        let horizon = contact.at + Duration::from_secs_f32(CATCH_FINISH_MS / 1000.0);
+
+        // EXACTLY ONE LIFE MOVED, to the catch horizon, on this frame …
+        let caught = w
+            .star(catch)
+            .expect("the caught star is still on glass on the paw's frame");
+        assert_eq!(
+            caught.finish,
+            Some(Finish {
+                at: contact.at,
+                span_s: CATCH_FINISH_MS / 1000.0,
+            }),
+            "the catch spends the star on the sky's own finish"
+        );
+        assert_eq!(
+            w.twin_star(catch).map(|s| s.finish),
+            Some(None),
+            "the un-offered twin's copy keeps its whole life"
+        );
+        // … and no other star's did: every other star in the twin's pool is
+        // in the offered pool with the same life, and vice versa.
+        let others = |e: &Engine| -> Vec<(u32, u32, Instant, Option<Finish>)> {
+            let mut v: Vec<_> = e
+                .stardust
+                .live_iter()
+                .filter(|s| !(s.born == catch.born && s.x == catch.x && s.y == catch.y))
+                .map(|s| (s.x.to_bits(), s.y.to_bits(), s.born, s.finish))
+                .collect();
+            v.sort_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+            v
+        };
+        assert_eq!(
+            others(&w.eng),
+            others(&w.twin_eng),
+            "a bystander's life moved"
+        );
+        assert!(
+            !others(&w.eng).is_empty(),
+            "fixture: there were bystanders to protect"
+        );
+
+        // THE PET DREW NO LIGHT OF ITS OWN: the reach spawned no mote the
+        // twin did not, and the sky emitted exactly what the twin's did on
+        // the contact frame — quads, halos and cues — because a finish
+        // that starts at `now` has not yet taken a level off the star.
+        assert_eq!(
+            contact.pet.motes.iter().flatten().count(),
+            contact.twin_pet.motes.iter().flatten().count(),
+            "the reach spawned a mote"
+        );
+        assert_eq!(
+            contact.emitted, contact.twin_emitted,
+            "the catch drew or sounded something"
+        );
+        assert_eq!(
+            w.eng.fingerprint(),
+            w.twin_eng.fingerprint(),
+            "the contact frame's light is byte-identical to the un-offered world's"
+        );
+
+        // NO TELEPORT: the reaching cat is where the un-offered twin is, to
+        // the bit, on the contact frame.
+        assert_eq!(
+            (
+                contact.pet.col.to_bits(),
+                contact.pet.row.to_bits(),
+                contact.pet.lift.to_bits()
+            ),
+            (
+                contact.twin_pet.col.to_bits(),
+                contact.twin_pet.row.to_bits(),
+                contact.twin_pet.lift.to_bits()
+            ),
+            "the offered cat is at ({}, {}) and the un-offered twin at ({}, {})",
+            contact.pet.col,
+            contact.pet.row,
+            contact.twin_pet.col,
+            contact.twin_pet.row
+        );
+
+        // GONE BY THE HORIZON — and only in the offered world.
+        let mut catches = 1;
+        while w.t < horizon {
+            let s = w.next_frame();
+            catches += usize::from(s.caught.is_some());
+            if let Some(s) = w.star(catch) {
+                assert_eq!(
+                    s.finish.map(|f| f.at),
+                    Some(contact.at),
+                    "the finish was re-stamped after the paw"
+                );
+            }
+        }
+        let s = w.next_frame();
+        catches += usize::from(s.caught.is_some());
+        assert!(w.t >= horizon);
+        assert!(
+            w.star(catch).is_none(),
+            "the caught star is still in the sky past the horizon"
+        );
+        assert!(
+            w.twin_star(catch).is_some_and(|s| !s.dead(w.t)),
+            "fixture: the un-offered twin's star lives on past the horizon (m1 sky life 460 ms)"
+        );
+
+        // ONE CATCH. The offer stood for one star; nothing hands it back
+        // twice, and nothing else is offered while the rally's seat lasts.
+        for _ in 0..90 {
+            let s = w.next_frame();
+            catches += usize::from(s.caught.is_some());
+        }
+        assert_eq!(catches, 1, "the paw handed a star back {catches} times");
+
+        // IDLE → EXACTLY ZERO, afterwards: the sky to its exact nothing …
+        let mut t_zero = None;
+        for _ in 0..(20 * 1000 / FRAME_MS) {
+            w.next_frame();
+            if w.eng.fingerprint() == 0
+                && !w.eng.needs_frame_cadence()
+                && w.eng.next_change_deadline(w.t).is_none()
+            {
+                t_zero = Some(w.t);
+                break;
+            }
+        }
+        let t_zero = t_zero.expect("the sky idles to exactly zero within 20 s of the catch");
+        assert_eq!(w.eng.status().stars, 0);
+        assert_eq!(
+            w.eng.pet_offer(g, w.cat()),
+            PetOffer::default(),
+            "an idle sky offers the resident nothing"
+        );
+        // … and the pet's own frame train stands down (its settle ladder is
+        // its own law; what the seam owes is that it left nothing armed).
+        for _ in 0..(40 * 1000 / FRAME_MS) {
+            if !w.pet.needs_frames() {
+                break;
+            }
+            w.next_frame();
+        }
+        assert!(
+            !w.pet.needs_frames(),
+            "the pet's frame train did not stand down"
+        );
+        assert_eq!(
+            w.pet.pending_v2_offer(),
+            (false, false),
+            "a latch outlived the catch"
+        );
+        assert_eq!(w.eng.fingerprint(), 0, "the sky lit again while idle");
+        eprintln!(
+            "walk: seat after {rounds} rally rounds at col {:.2}; gold dealt at {:?} (free cell {:?}) \
+             {:.0} ms after t0; paw {:?} after birth; horizon {:?} after the paw; sky at zero {:.1} s \
+             after the catch",
+            seat.col,
+            w.caret,
+            free,
+            (birth.at - t0).as_secs_f32() * 1000.0,
+            contact.at - birth.at,
+            horizon - contact.at,
+            (t_zero - contact.at).as_secs_f32()
+        );
+    }
+
+    /// The conjunction, tallied per key: where a keystroke's chance of a
+    /// catch died.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Census {
+        keys: u32,
+        /// A gold m1 was dealt on the key (the sky's ~1-in-80, plus the
+        /// combo ladder's every-64th).
+        gold: u32,
+        /// … within `CATCH_REACH_CELLS` of the cat, in the sky of its row.
+        in_reach: u32,
+        /// … with the cat settled …
+        settled: u32,
+        /// … and purring — the offer gate, so this is `offered`.
+        purring: u32,
+        /// The paw landed and the sky still had the star.
+        caught: u32,
+    }
+
+    /// The typist's shape, for the census.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Shape {
+        /// Forward only: the cat follows.
+        Prose,
+        /// Three forward, two back: the tennis watch seats the cat.
+        Rally,
+        /// A 1.7 s pause (the seat's `SIT_AFTER` plus a breath), then five
+        /// keys: the hot resume, where the first key finds a seated cat.
+        Resume,
+    }
+
+    /// Type `keys` keystrokes at `gap` in `shape` from a cat that starts
+    /// contented on the row, and tally the conjunction on every GLYPH key
+    /// (the rally's Backspaces deal no strike and are not keys of the
+    /// census).
+    fn census(w: &mut Lockstep, gap: Duration, keys: u32, shape: Shape) -> Census {
+        let g = paw_geom();
+        let mut c = Census::default();
+        let mut k = 0u32;
+        while c.keys < keys {
+            match shape {
+                Shape::Rally if k % 5 >= 3 => {
+                    w.advance(gap);
+                    w.backspace();
+                    k += 1;
+                    continue;
+                }
+                Shape::Resume if k.is_multiple_of(5) => {
+                    w.idle(1.7);
+                }
+                _ => {}
+            }
+            let s = w.key_after(gap, TypedClass::Glyph);
+            k += 1;
+            c.keys += 1;
+            let Some(star) = gold_born(&w.eng, s.at) else {
+                continue;
+            };
+            c.gold += 1;
+            let Some(cat) = PetOnGlass::of(&s.pet, g) else {
+                continue;
+            };
+            if !(star.in_sky_of(cat.row, g)
+                && cat.columns_to(star.grid_col(g)) <= CATCH_REACH_CELLS)
+            {
+                continue;
+            }
+            c.in_reach += 1;
+            if !cat.settled {
+                continue;
+            }
+            c.settled += 1;
+            if cat.purr <= 0.0 {
+                continue;
+            }
+            c.purring += 1;
+            assert_eq!(
+                s.offer.catch.map(|o| o.born),
+                Some(star.born),
+                "the gate and the offer disagree"
+            );
+            // The paw, if it lands, lands inside the star's TTL — before the
+            // next key is due.
+            while w.t + Duration::from_millis(FRAME_MS) < s.at + gap {
+                let f = w.next_frame();
+                if f.caught.is_some_and(|(_, hit)| hit) {
+                    c.caught += 1;
+                    break;
+                }
+            }
+        }
+        c
+    }
+
+    /// **THE CATCH'S RARITY ON THE REAL ENGINE** (§23's addendum "The star
+    /// catch, walked end to end") — the owner's "will I ever see it", as a
+    /// number. 2 000 glyph keys at 8 and 12 cps from a contented cat on the
+    /// row, in three shapes: prose (forward only — the cat follows), the
+    /// typo rally (3 forward, 2 back — the tennis watch seats the cat beside
+    /// the caret) and the hot resume (a 1.7 s pause, then five keys — the
+    /// first key finds a seated cat). The table is printed; the law pinned
+    /// is the accounting: every catch is an offered gold m1 in reach of a
+    /// settled, purring cat, and the census is exactly the keys asked for.
+    #[test]
+    fn the_catch_s_rarity_on_the_real_engine() {
+        let t0 = Instant::now();
+        let mut rows = Vec::new();
+        for &(cps, shape, keys) in &[
+            (8u32, Shape::Prose, 2000u32),
+            (12, Shape::Prose, 2000),
+            (8, Shape::Rally, 2000),
+            (12, Shape::Rally, 2000),
+            (8, Shape::Resume, 1000),
+            (12, Shape::Resume, 1000),
+        ] {
+            let gap = Duration::from_micros(1_000_000 / u64::from(cps));
+            let mut w = Lockstep::solo(t0, (2, 0));
+            // A contented cat on the row: a sentence, then the rally's seat.
+            for _ in 0..30 {
+                w.key_after(gap, TypedClass::Glyph);
+            }
+            let seated = rally_until_seated(&mut w, gap, 12);
+            let c = census(&mut w, gap, keys, shape);
+            assert_eq!(c.keys, keys);
+            assert!(
+                c.caught <= c.purring
+                    && c.purring <= c.settled
+                    && c.settled <= c.in_reach
+                    && c.in_reach <= c.gold
+                    && c.gold <= c.keys,
+                "the conjunction's ledger does not nest: {c:?}"
+            );
+            rows.push((cps, shape, seated, c));
+        }
+        eprintln!(
+            "| shape | cps | keys | gold m1 dealt | in reach | cat settled | purring (= offered) | caught |"
+        );
+        eprintln!("|---|---|---|---|---|---|---|---|");
+        for (cps, shape, seated, c) in &rows {
+            eprintln!(
+                "| {shape:?} (seated after {seated} rally rounds) | {cps} | {} | {} | {} | {} | {} | {} |",
+                c.keys, c.gold, c.in_reach, c.settled, c.purring, c.caught
+            );
         }
     }
 }

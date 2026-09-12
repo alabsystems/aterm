@@ -151,7 +151,7 @@ if [ -d "$HOME/.aterm/shell.d" ]; then
     done
 fi
 
-# ─── The reroute directory, FIRST ───
+# ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
 # $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
 # stubs for the upstream Rust names (`aterm help reroute`), which the seam already
@@ -166,10 +166,22 @@ fi
 # which runs after every rc file has had its say. Inert outside a session: the
 # variable is unset, or the directory (Windows lays none) does not exist.
 #
+# $ATPKG_AGENTS — exported by the atpkg shell.d hook sourced just above — names
+# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
+# (owner decision 2026-09-10). It fails the same way, for the same reasons: measured
+# 2026-09-10 on m27 at PATH position 14, behind /opt/homebrew/bin (path_helper) and
+# ~/.local/bin (~/.zshrc), so `codex` ran a brew cask that could run no command and
+# `claude` an older native install. It is moved to the front first, then the reroute
+# directory, so PATH reads reroute, agents, … — the spawn seam's own order; the two
+# hold disjoint names, so what matters is that both precede everything else.
+#
 # `${(@)path:#…}`: `:#` matches the expanded value LITERALLY (no GLOB_SUBST), so a
 # directory named with `[` or `*` is still removed by equality; `(@)` in quotes
 # keeps an EMPTY entry ("here", to a POSIX shell) — the user's — from being dropped.
 __aterm_reroute_path_front() {
+    if [[ -n "${ATPKG_AGENTS:-}" && -d "$ATPKG_AGENTS" ]]; then
+        path=("$ATPKG_AGENTS" "${(@)path:#$ATPKG_AGENTS}")
+    fi
     if [[ -n "${ATERM_REROUTE_DIR:-}" && -d "$ATERM_REROUTE_DIR" ]]; then
         path=("$ATERM_REROUTE_DIR" "${(@)path:#$ATERM_REROUTE_DIR}")
     fi
@@ -478,7 +490,7 @@ __aterm_first_precmd() {
         __aterm_set_prompt
     fi
 
-    # The reroute directory, FIRST — for the last time: /etc/zprofile and ~/.zshrc
+    # The reroute and agents directories, FIRST — for the last time: /etc/zprofile and ~/.zshrc
     # have both run by now (see __aterm_reroute_path_front for why the load-time
     # assert above is not final).
     __aterm_reroute_path_front

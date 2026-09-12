@@ -8,7 +8,7 @@
 //!
 //! Drives the engine exactly as the seam does — `on_event` at the key's edge,
 //! the glyph probe written every tick from the typed text, one `tick` per
-//! 120 Hz frame on a deterministic clock — through three scenarios on ONE
+//! 120 Hz frame on a deterministic clock — through four scenarios on ONE
 //! continuous engine, and composites every captured frame to a PNG at the
 //! owner's retina cell (`cw 15`, `ch 28` device px) over a dark ground:
 //!
@@ -23,6 +23,16 @@
 //!   +8, +50, +100, +200, +350 and +500 ms are copied out as
 //!   `ctrl_a_T+<ms>ms.png` beside their 4× zooms).
 //! * **C — erase.** Six Backspaces at 80 ms/key; a frame every tick.
+//! * **D — Codex streaming** (§27). The engine is re-seated with the composer
+//!   on row 1; fourteen keys at 70 ms/key, then a ROW-BAND MOVE every 30 ms
+//!   for 600 ms with three more keys interleaved: the viewport — the row
+//!   above the composer down to the bottom row — slides down one row per
+//!   streamed line and the composer, its text and its light ride along
+//!   (phase A); once the composer sits on the bottom row each further line
+//!   archives the transcript above it up one row under the pinned composer
+//!   (phase B, Codex's own A→B transition). A frame every tick; the contact
+//!   sheet shows the band sliding with the caret and never vanishing — before
+//!   the band path every line reset it. `RK_FRAMES_CODEX=0` skips it.
 //!
 //! Beside the frames: `index.json` (one row per frame), `stats.csv` (one row
 //! per TICK — stream counts, live pools, fingerprint, luminance), a contact
@@ -44,7 +54,7 @@ use std::time::Duration;
 
 use aterm_time::Instant;
 
-use aterm_effects::cursor_glow::{Geom, SoundCue};
+use aterm_effects::cursor_glow::{Geom, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::timing::{flight, spring_snap};
 use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass, meteor,
@@ -366,6 +376,9 @@ struct Sim {
     tick: u64,
     typed: Vec<char>,
     caret: (u16, u16),
+    /// The row the typed text — the composer — is on: [`TEXT_ROW`] until a
+    /// band move (scenario D) slides it.
+    text_row: u16,
     sc: Scratch,
     seam: CaretSeam,
     probe: Vec<bool>,
@@ -401,6 +414,7 @@ impl Sim {
             tick: 0,
             typed: Vec::new(),
             caret: (TEXT_ROW, 0),
+            text_row: TEXT_ROW,
             sc: Scratch::default(),
             seam: CaretSeam::default(),
             probe: vec![false; COLS],
@@ -444,7 +458,7 @@ impl Sim {
 
     /// A typed key: the echo's move under the typed licence, then the glyph.
     fn key(&mut self, c: char) {
-        let to = (TEXT_ROW, self.caret.1 + 1);
+        let to = (self.text_row, self.caret.1 + 1);
         self.mv(to, Licence::Typed);
         let class = if c == ' ' {
             TypedClass::Space
@@ -466,14 +480,53 @@ impl Sim {
     /// (the host's `mv.deletion` arm), the glyph gone from the probe.
     fn backspace(&mut self) {
         self.eng.on_event(Event::Erase, self.now());
-        let to = (TEXT_ROW, self.caret.1.saturating_sub(1));
+        let to = (self.text_row, self.caret.1.saturating_sub(1));
         self.mv(to, Licence::Typed);
         self.typed.pop();
     }
 
     /// A nav-licensed same-row jump (Ctrl-A / Ctrl-E).
     fn nav(&mut self, col: u16) {
-        self.mv((TEXT_ROW, col), Licence::Nav);
+        self.mv((self.text_row, col), Licence::Nav);
+    }
+
+    /// A ROW-BAND MOVE (seam point 12, the band path) — the fixture's Codex.
+    /// While the composer is above the bottom row the inline viewport — the
+    /// row above the composer down to the bottom row — slides `d` rows, and
+    /// the composer, its text and the caret ride along (phase A: `ESC[{vt};
+    /// 57r … RI` in the capture, one row per streamed line). Once the
+    /// composer sits on the bottom row a further line cannot slide it, and
+    /// Codex archives instead: the transcript above the composer moves UP one
+    /// row under the pinned composer (phase B: `ESC[1;52r … LF`). The probe
+    /// is re-primed at once, as the host re-probes before the next deal (the
+    /// engine's band path drops the sky's probe).
+    fn band_move(&mut self, d: i16) {
+        let last = ROWS as u16 - 1;
+        let row = self.text_row;
+        let slid = i32::from(row) + i32::from(d);
+        if d > 0 && slid > i32::from(last) {
+            if row >= 1 {
+                self.eng.translate_band(0, row - 1, -1, CH as u16, 0);
+            }
+        } else {
+            let top = row.saturating_sub(1);
+            self.eng.translate_band(top, last, d, CH as u16, 0);
+            self.text_row = band_pos(row, top, last, d);
+            self.caret.0 = self.text_row;
+        }
+        self.probe_rows();
+    }
+
+    /// Re-seat the fixture for scenario D: a fresh session with the composer
+    /// on `row`, nothing typed, nothing lit — the reset the band path exists
+    /// to replace is used here on purpose, once, between scenarios, after the
+    /// gap has let everything go dark.
+    fn reseat(&mut self, row: u16) {
+        self.eng.reset();
+        self.typed.clear();
+        self.text_row = row;
+        self.caret = (row, 0);
+        self.probe.fill(false);
     }
 
     /// Write the probe for the caret's row and its neighbours from the typed
@@ -483,12 +536,11 @@ impl Sim {
             *slot = self.typed.get(col).is_some_and(|&c| c != ' ');
         }
         let blank = vec![false; COLS];
-        for row in [TEXT_ROW - 1, TEXT_ROW + 1] {
-            self.eng.probe_mut().probe_row(i32::from(row), &blank);
+        let row = i32::from(self.text_row);
+        for r in [row - 1, row + 1] {
+            self.eng.probe_mut().probe_row(r, &blank);
         }
-        self.eng
-            .probe_mut()
-            .probe_row(i32::from(TEXT_ROW), &self.probe);
+        self.eng.probe_mut().probe_row(row, &self.probe);
     }
 
     /// Seam point 3 at this tick, then the clock advances one tick.
@@ -568,7 +620,7 @@ impl Sim {
     /// is not the caret's.
     fn on_ink(&self, x: usize, y: usize) -> bool {
         let (row, col) = (y / CH, x / CW);
-        row == usize::from(TEXT_ROW)
+        row == usize::from(self.text_row)
             && col != usize::from(self.caret.1)
             && self.probe.get(col).copied().unwrap_or(false)
     }
@@ -700,7 +752,7 @@ impl Sim {
             canvas.quad(q);
         }
         for (col, &c) in self.typed.iter().enumerate() {
-            canvas.glyph(col, usize::from(TEXT_ROW), c);
+            canvas.glyph(col, usize::from(self.text_row), c);
         }
         canvas.rect(
             usize::from(self.caret.1) * CW,
@@ -731,6 +783,9 @@ enum Action {
     CtrlA,
     CtrlE,
     Backspace,
+    /// A streamed line: the viewport's row band moves `d` rows
+    /// ([`Sim::band_move`]).
+    BandMove(i16),
 }
 
 impl Action {
@@ -741,6 +796,7 @@ impl Action {
             Self::CtrlA => "ctrl-a".to_string(),
             Self::CtrlE => "ctrl-e".to_string(),
             Self::Backspace => "backspace".to_string(),
+            Self::BandMove(d) => format!("band {d:+}"),
         }
     }
 }
@@ -854,6 +910,7 @@ fn run(sim: &mut Sim, sc: &Scenario, keep: &[usize], sinks: &mut Sinks) -> RunOu
                 Action::CtrlA => sim.nav(0),
                 Action::CtrlE => sim.nav(TEXT.len() as u16),
                 Action::Backspace => sim.backspace(),
+                Action::BandMove(d) => sim.band_move(d),
             }
             if !event.is_empty() {
                 event.push(' ');
@@ -1001,8 +1058,9 @@ impl Sheet {
 }
 
 /// The scenarios, on one clock: A from tick 0, B from A's end, a silent
-/// 300 ms gap for B to go dark, then C from its first Backspace.
-fn scenarios() -> [Scenario; 4] {
+/// 300 ms gap for B to go dark, C from its first Backspace, a 1.6 s gap (the
+/// swoosh's whole life) for C to go dark, then D from its first key.
+fn scenarios() -> [Scenario; 6] {
     let keys: Vec<(u64, Action)> = TEXT
         .chars()
         .enumerate()
@@ -1030,6 +1088,26 @@ fn scenarios() -> [Scenario; 4] {
         .collect();
     let c_end = c0 + Sim::tick_of(5 * ERASE_MS + 500);
 
+    // D: fourteen keys, then a streamed line every 30 ms for 600 ms with
+    // three more keys interleaved, then 500 ms of run-out.
+    let d0 = c_end + 1 + Sim::tick_of(1_600);
+    let mut d_sched: Vec<(u64, Action)> = TEXT
+        .chars()
+        .take(14)
+        .enumerate()
+        .map(|(i, c)| (d0 + Sim::tick_of(i as u64 * key_ms()), Action::Key(c)))
+        .collect();
+    let stream0 = d0 + Sim::tick_of(14 * key_ms());
+    d_sched.extend((0..20u64).map(|k| (stream0 + Sim::tick_of(k * 30), Action::BandMove(1))));
+    d_sched.extend(TEXT.chars().skip(14).take(3).enumerate().map(|(i, c)| {
+        (
+            stream0 + Sim::tick_of(150 + i as u64 * 150) + 1,
+            Action::Key(c),
+        )
+    }));
+    d_sched.sort_by_key(|&(t, _)| t);
+    let d_end = stream0 + Sim::tick_of(600 + 500);
+
     [
         Scenario {
             name: "A",
@@ -1055,7 +1133,25 @@ fn scenarios() -> [Scenario; 4] {
             every: 1,
             end: c_end,
         },
+        Scenario {
+            name: "gap2",
+            sched: Vec::new(),
+            every: 0,
+            end: d0 - 1,
+        },
+        Scenario {
+            name: "D",
+            sched: d_sched,
+            every: 1,
+            end: d_end,
+        },
     ]
+}
+
+/// `RK_FRAMES_CODEX=0`: skip scenario D (the A/B/C frames are unchanged by
+/// it — D runs last, on a re-seated engine).
+fn codex_frames() -> bool {
+    !std::env::var("RK_FRAMES_CODEX").is_ok_and(|v| v == "0")
 }
 
 /// `RK_FRAMES_KEY_MS=<n>`: scenario A's key cadence, ms per key — [`KEY_MS`]
@@ -1143,7 +1239,7 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {dir}: {e}"));
     let mut sinks = Sinks::new(&dir);
     let mut sim = Sim::new();
-    let [a, b, gap, c] = scenarios();
+    let [a, b, gap, c, gap2, d] = scenarios();
     let t_flight = flight(TEXT.len() as f32);
     // B's pin frame: Ctrl-A's `T + 150 ms`, as a frame index from B's spawn.
     let pin_frame = ((t_flight.as_micros() as u64 + 150_000).div_ceil(TICK_US)) as usize;
@@ -1169,6 +1265,13 @@ fn main() {
     let rb = run(&mut sim, &b, &keep_b, &mut sinks);
     let _ = run(&mut sim, &gap, &[], &mut sinks);
     let rc = run(&mut sim, &c, &[2], &mut sinks);
+    let rd = codex_frames().then(|| {
+        let _ = run(&mut sim, &gap2, &[], &mut sinks);
+        // D starts with the composer on row 1, so the band has six rows to
+        // slide through before Codex's A→B transition pins it.
+        sim.reseat(1);
+        run(&mut sim, &d, &[], &mut sinks)
+    });
 
     // ---- the audit zooms ----
     let mut zooms: Vec<(String, &Canvas, String)> = Vec::new();
@@ -1354,12 +1457,48 @@ fn main() {
             f.tick, st.under, st.out, st.halos, st.stars, f.lum.1
         );
     }
+    if let Some(rd) = &rd {
+        // The law the sheet is read for: on every tick from the first band
+        // move to the last the ribbon is lit (the fingerprint is non-zero) —
+        // the band slides with the caret and never vanishes.
+        let bands: Vec<u64> = d
+            .sched
+            .iter()
+            .filter(|(_, a)| matches!(a, Action::BandMove(_)))
+            .map(|&(t, _)| t)
+            .collect();
+        let (first_band, last_band) = (
+            bands.iter().copied().min().unwrap_or(0),
+            bands.iter().copied().max().unwrap_or(0),
+        );
+        let dark_under_stream = rd
+            .ticks
+            .iter()
+            .filter(|(t, s)| *t >= first_band && *t <= last_band && s.fp == 0)
+            .count();
+        println!(
+            "D: {} frames (every tick) ticks {}..={}; band moves {} (ticks {first_band}..={last_band}); composer ends on row {}; dark ticks while streaming {dark_under_stream}; last lit tick {:?}; {}",
+            rd.frames.len(),
+            rd.ticks.first().map_or(0, |(t, _)| *t),
+            rd.ticks.last().map_or(0, |(t, _)| *t),
+            bands.len(),
+            sim.text_row,
+            rd.ticks
+                .iter()
+                .rev()
+                .find(|(_, s)| s.fp != 0)
+                .map(|(t, _)| *t),
+            over_ink(rd),
+        );
+    }
     for l in &zoom_lines {
         println!("zoom {l}");
     }
+    let rd_frames = rd.as_ref().map_or(0, |r| r.frames.len());
+    let rd_ticks = rd.as_ref().map_or(0, |r| r.ticks.len());
     println!(
         "index.json: {} frames; stats.csv: {} ticks",
-        ra.frames.len() + rb.frames.len() + rc.frames.len(),
-        ra.ticks.len() + rb.ticks.len() + rc.ticks.len()
+        ra.frames.len() + rb.frames.len() + rc.frames.len() + rd_frames,
+        ra.ticks.len() + rb.ticks.len() + rc.ticks.len() + rd_ticks
     );
 }

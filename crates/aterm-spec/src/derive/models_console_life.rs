@@ -7,6 +7,58 @@
 
 use super::*;
 
+/// Cursor-home placement at emitted frames. Ordinary text remains drawable;
+/// a moved caret carries the base home while finite local motion completes,
+/// and a wholly protected surface parks the resident. `Arrive` abstracts completion of the real follower, not one
+/// animation tick. Geometry and its pixel protection are bound separately by
+/// the real Terminal/PetBrain walk in `console_cursor_home.rs`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn console_cursor_home_model() -> Model {
+    crate::ty_model! {
+        ConsoleCursorHome {
+            const Buggy = 0;
+            var visible = 1;
+            var home = 1;
+            var moving = 0;
+            var protected = 0;
+            var hidden = 0;
+            var event = 0;
+
+            action Ink when (protected == 0) {
+                visible = if Buggy == 1 { 0 } else { 1 }; event = 1;
+            }
+            action MoveCaret when (protected == 0 && moving == 0 && hidden == 0) {
+                home = 1; moving = 1; visible = 1; event = 2;
+            }
+            action Follow when (protected == 0 && moving == 1) {
+                home = 1; visible = 1; event = 3;
+            }
+            action Arrive when (protected == 0 && moving == 1) {
+                home = if Buggy == 1 { 0 } else { 1 };
+                moving = 0; visible = 1; event = 4;
+            }
+            action ProtectAll when (protected == 0 && moving == 0) {
+                protected = 1; visible = 0; home = 0; event = 5;
+            }
+            action Release when (protected == 1) {
+                protected = 0; visible = 1; home = 1; moving = 0; event = 6;
+            }
+            action HideCursor when (protected == 0 && moving == 0 && hidden == 0) {
+                hidden = 1; visible = if Buggy == 1 { 0 } else { 1 }; event = 7;
+            }
+            action ShowCursor when (protected == 0 && moving == 0 && hidden == 1) {
+                hidden = 0; visible = 1; home = 1; event = 8;
+            }
+            invariant OrdinaryTextKeepsBody: if protected == 0 { visible == 1 } else { visible == 0 };
+            invariant BaseStaysAtCursor: if protected == 0 { home == 1 } else { home == 0 };
+            invariant ArrivesAtCursor: if event == 4 { home == 1 && moving == 0 } else { home <= 1 };
+            invariant ProtectionParks: if protected == 1 { visible == 0 && moving == 0 } else { protected == 0 };
+            invariant Bounded: visible <= 1 && home <= 1 && moving <= 1 && protected <= 1 && hidden <= 1 && event <= 8;
+        }
+    }
+}
+
 /// One input sequence is consumed once, reading protects its surface, direct
 /// input revokes retained work, and expired or displaced results never replay.
 /// Actions include the stimulus and its next tick. `Expire`/`ReleaseSelection`
@@ -179,5 +231,16 @@ pub fn console_resident_handoff_model() -> Model {
                 legacy <= 1 && resident <= 1 && handoff <= 1 && touch <= 1
                     && blocked <= 1 && wake <= 1 && event <= 8;
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_home_tests {
+    #[test]
+    fn derived_cursor_home_proves_and_catches_ink_disappearance_and_stranded_residency() {
+        crate::verify::prove_and_catch_scalar(
+            &super::console_cursor_home_model(),
+            "cursor-home placement and ordinary-text persistence",
+        );
     }
 }

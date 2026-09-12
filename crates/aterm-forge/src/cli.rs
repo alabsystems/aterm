@@ -28,10 +28,11 @@ USAGE
         which is written into the file and reprinted on every run thereafter.
 
   cargo forge attest
-        Provenance and license obligations over vendor/: upstream.lock
-        integrity, [workspace] stub, .cargo_vcs_info.json, Cargo.toml.orig,
-        retained LICENSE files, NOTICE agreement, Apache-2.0 §4(b)
-        modification notices, and the // aterm-trust: marker floor.
+        Provenance and license obligations over vendor/: patch agreement,
+        [workspace] stubs, .cargo_vcs_info.json, Cargo.toml.orig, licenses,
+        NOTICE, Apache-only pristine diffs when available, and fork markers.
+        The reviewed astream direct-path bundle checks tracked inventory,
+        reviewed hashes, supplied license text, and Cargo metadata paths.
 
   cargo forge check [--cell NAME]...
         THE GATE VERB. attest + patch-liveness + census cross-check, with no

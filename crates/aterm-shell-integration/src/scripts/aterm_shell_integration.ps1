@@ -35,6 +35,23 @@ if ($HOME) {
     }
 }
 
+# The agents directory, moved to the front ahead of the reroute block below.
+# $env:ATPKG_AGENTS - set by the atpkg shell.d hook dot-sourced just above - names
+# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
+# (owner decision 2026-09-10). An earlier PATH entry for claude or codex wins
+# otherwise (measured 2026-09-10 on macOS zsh: behind /opt/homebrew/bin and
+# ~/.local/bin, so codex ran a brew cask that could run no command) - an ORDER
+# failure, so move-to-front. aterm dot-sources this file AFTER the user's profile
+# (the -Command it passes pwsh), so this runs after a profile's own prepends; a
+# profile that dot-sources this file itself is re-fronted only at that point.
+# Asserted before the reroute block, so PATH reads reroute, agents, ... - the spawn
+# seam's own order. Inert when the variable is unset or names no directory.
+if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container)) {
+    $__aterm_sep = [string][System.IO.Path]::PathSeparator
+    $__aterm_rest = @(($env:PATH -split [regex]::Escape($__aterm_sep)) | Where-Object { $_ -ne $env:ATPKG_AGENTS })
+    $env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep
+}
+
 # The reroute directory, FIRST. $env:ATERM_REROUTE_DIR is set by aterm's spawn
 # seam: the session-scoped directory of stubs for the upstream Rust names
 # (aterm help reroute), which the seam already put first on the PATH it handed

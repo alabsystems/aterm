@@ -148,6 +148,9 @@
 // reason the shader port is trustworthy. Scoped to this module only.
 #![allow(dead_code)]
 
+#[cfg(feature = "acquire-conformance")]
+pub(crate) mod acquire_probe;
+pub(crate) mod acquire_worker;
 pub(crate) mod blit;
 pub(crate) mod encoder;
 pub(crate) mod ffi;

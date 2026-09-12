@@ -927,6 +927,12 @@ pub struct PetOnGlass {
     /// file invents no second threshold beside the pet's `PURR_GATE`, it just
     /// asks whether the cat says it is purring.
     pub purr: f32,
+    /// [`PetFrame::contented`] — the same ledger over the same `PURR_GATE`,
+    /// WHATEVER the pose. The tell above is the seat's, and a key takes the
+    /// seat away (`quiet` resets, the cat stands) on the very frame it mints
+    /// the star; without this the offer could not see a key-born star from a
+    /// happy cat at all (widened 2026-09-10, the room round).
+    pub contented: bool,
 }
 
 impl PetOnGlass {
@@ -956,6 +962,7 @@ impl PetOnGlass {
             row: u16::try_from(frame.row.round().max(0.0) as u32).unwrap_or(u16::MAX),
             settled: frame.action.settled(),
             purr: frame.purr,
+            contented: frame.contented,
         })
     }
 
@@ -966,11 +973,18 @@ impl PetOnGlass {
     }
 
     /// **THE OFFER GATE** — a cat is offered a star only while it is SETTLED
-    /// and CONTENTED (§7.2(b)'s posture, and the pet's own purr tell). Both
-    /// halves are the pet's own verdicts, restated; v2 adds no third.
+    /// and CONTENTED (§7.2(b)'s posture, and the pet's own contentment: the
+    /// purr TELL, or the ledger over the pet's own gate whatever the pose —
+    /// [`Self::contented`] the field). Every half is the pet's own verdict,
+    /// restated; v2 adds no third. WIDENED 2026-09-10 (the room round):
+    /// the tell is the seat's, and the key that mints a star also resets
+    /// the seat, so on the tell alone the catch fired only for a synthetic
+    /// star beside a parked cat — never for a keystroke's. On the ledger it
+    /// fires for the first slow key after any run of thirteen cells, which
+    /// is what "seen more than once a session" needs.
     #[must_use]
     pub fn contented(&self) -> bool {
-        self.settled && self.purr > 0.0
+        self.settled && (self.purr > 0.0 || self.contented)
     }
 
     /// Distance in COLUMNS from the body's nearest edge to grid column `col`
@@ -1307,9 +1321,9 @@ mod tests {
     }
 
     /// …and the flying head is reachable only through its OWN spelling (or the
-    /// bare `nyan`/`rainbow` aliases, which name no geometry), or through a
-    /// pet-mode sing-along, which is the singing face and not an ordinary
-    /// flight — and it escorts exactly the cell the host's duty names.
+    /// bare `nyan`/`rainbow` aliases, which name no geometry), and it
+    /// escorts exactly the cell the host's duty names. A pet-mode song
+    /// retains the full resident.
     #[test]
     fn the_flying_head_needs_its_own_spelling() {
         for spelling in [
@@ -1330,16 +1344,14 @@ mod tests {
                 "{spelling:?} must draw the flying head at the caret"
             );
         }
-        // The one way pet mode yields the head: the sing-along holds the frame.
-        assert_eq!(
-            body_for(admitted(host_duty("rainbow kitty", 0.4, Some((4, 9))))),
-            Body::Flying { cell: (4, 9) }
-        );
-        assert_eq!(
-            body_for(admitted(host_duty("rainbow kitty", 0.0, Some((4, 9))))),
-            Body::Pet,
-            "admission ends exactly when the drive drains"
-        );
+        // Singing never exchanges the resident for a floating head.
+        for drive in [1.0, 0.4, 0.329, 0.1, 0.0] {
+            assert_eq!(
+                body_for(admitted(host_duty("rainbow kitty", drive, Some((4, 9))))),
+                Body::Pet,
+                "the resident owns the song and tail at drive={drive}"
+            );
+        }
         // The head has no independent placement: no visible caret, no head.
         assert_eq!(
             body_for(admitted(host_duty("nyan", 0.0, None))),

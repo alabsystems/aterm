@@ -186,7 +186,7 @@ main merge-queue. There is exactly one way to verify, so there is exactly one
 way for a reviewer (human or AI) to be wrong about it: run this.
 
   tools/verify.sh --fast            # the per-commit gate (the merge contract)
-  tools/verify.sh --full            # --fast + differential oracle + trust-mc
+  tools/verify.sh --full            # --fast + differential oracle + trust-mc + cross-cells
   tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow build/test to one crate (+ guards)
   tools/verify.sh --fast --scope aterm-grid
@@ -197,7 +197,9 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             regress, so every gate run proves the socket still answers).
 --full    : everything in --fast, PLUS the aterm-vs-alacritty differential
             oracle and the trust-mc / Kani BMC harnesses *when those tools are
-            installed* (skipped-not-failed when absent — see docs/PROCESS.md).
+            installed* (skipped-not-failed when absent — see docs/PROCESS.md),
+            PLUS the cross-cell type-check (forge's five cells, each for its
+            own triple; ~19 s warm, ~106 s cold).
 --scope   : restrict the targo build/test to `-p <crate>`; the guards and the
             socket smoke always run whole-tree (they are cheap and global).
 --changed : THE MISSING MIDDLE — a change-scoped tier between a bare `targo

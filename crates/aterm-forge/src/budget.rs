@@ -34,7 +34,8 @@
 //!
 //! A build script is arbitrary code the compiler EXECUTES, and `targo trust`
 //! marks every one `-Ztrust-verify=off` unconditionally. While a single
-//! third-party build script remains (27 do, in the macOS shipped graph), no
+//! third-party build script remains (10 do in the macOS shipped graph, measured
+//! 2026-09-11; `tools/forge-budget.tsv` carries the ceiling per cell), no
 //! amount of source deletion retires the verification opt-out. Deleting a
 //! 60k-line leaf data crate is worth less to the campaign than deleting one
 //! build script, and a LOC-only budget mis-ranks the whole effort — so both are
@@ -253,11 +254,11 @@ pub fn render(rows: &[Row]) -> String {
 /// wasm32 ([`crate::resolve::default_cells`] records what that got wrong). It is
 /// NOT restated here, because there is no 2026-08-22 measurement of the two
 /// shipped browser modules to restate it with, and inventing one would be worse
-/// than a labelled stale number. Nothing in the product calls this —
-/// [`seed_from_live`] is what `--update` writes into an empty checkout, and it
-/// measures the live matrix. Against that matrix this body's wasm scope no
-/// longer names a cell, so [`validate_metric`] refuses it by name rather than
-/// accepting it.
+/// than a labelled stale number. Nothing in the product calls this — [`unarmed`]
+/// is what `--update` writes into an empty checkout, and it renders the LIVE
+/// matrix ([`seed_shape`] picks the rows). Against that matrix this body's wasm
+/// scope no longer names a cell, so [`validate_metric`] refuses it by name
+/// rather than accepting it.
 pub fn seed() -> String {
     let mut s = String::new();
     let cells: &[(&str, [u64; 5])] = &[
@@ -285,8 +286,11 @@ pub fn seed() -> String {
     s
 }
 
-/// The seed body measured from the LIVE tree, which is what `--update` writes
-/// when no ratchet file exists yet.
+/// The seed body measured from the LIVE tree: the same rows `--update` writes
+/// into an empty checkout, for a caller that wants the text without running the
+/// verb. The verb itself does NOT come through here — [`run`] has already
+/// measured by the time it knows the file is empty, so [`unarmed`] renders from
+/// that measurement instead of taking a second one.
 pub fn seed_from_live(root: &Path) -> Result<String, String> {
     let live = measure(root)?;
     let mut rows = Vec::new();
@@ -348,25 +352,34 @@ struct ScopeDetail {
     build_scripts: Vec<String>,
     proc_macros: Vec<String>,
     biggest: Vec<(String, u64)>,
-    /// Third-party packages this run measured from `vendor/<name>` because no
-    /// pristine checkout of that exact version was unpacked locally.
+    /// Third-party packages whose LOC this run read from the in-tree fork under
+    /// `vendor/` — the source that actually compiles — rather than from a
+    /// registry checkout of the same version.
     ///
-    /// THE ONE INPUT TO A CEILING THAT IS NOT IN THE TREE. Everything else the
-    /// ratchet compares — `Cargo.lock`, the manifests, `vendor/`, the ledger —
-    /// is committed, so two machines agree by construction. This is not:
-    /// [`crate::loc::package_dir`] prefers a pristine registry checkout and
-    /// falls back to the fork, so the same commit measures the fork's own
-    /// edits on a machine whose cargo cache never received the replaced crate.
-    /// MEASURED 2026-08-30: that is 685 lines for `winit 0.30.13` and 28 for
-    /// `smol_str 0.2.2`, i.e. 713 in every one of the four cells the matrix had
-    /// that day, which was enough to turn four `third_party_loc` rows RED
-    /// against ceilings taken on a machine that had both. It reaches THREE of
-    /// the five cells now: the wasm row was replaced by the two shipped browser
-    /// modules later the same day, and neither `aterm-wasm` nor `aterm-gpu-web`
-    /// pulls `winit` or `smol_str`. A RED row that cannot name that cause reads
-    /// as dependency drift and invites `--allow-regress`, which would record
-    /// aterm's own fork edits as third-party growth and keep the headroom
-    /// forever — so the row names it.
+    /// IT NAMES aterm'S OWN EDITS INSIDE A THIRD-PARTY NUMBER. `aterm` builds
+    /// `vendor/winit`, not the registry's winit, so the fork's lines ARE the
+    /// third-party surface this campaign is scored on — but they are lines this
+    /// repository wrote, and a RED `third_party_loc` row that cannot name that
+    /// cause reads as dependency drift and invites `--allow-regress`, which
+    /// would record aterm's own fork edits as third-party growth and keep the
+    /// headroom forever. So the row names the package AND the directory the
+    /// lines were counted in.
+    ///
+    /// IT IS NO LONGER AN INPUT THAT VARIES BY MACHINE, and that history is why
+    /// the list exists. [`crate::loc::package_dir`] USED TO prefer a pristine
+    /// registry checkout of the same version and fall through to the fork only
+    /// when this machine's `CARGO_HOME` held none, so a committed ceiling
+    /// depended on an unversioned local cache: MEASURED 2026-08-30, fork and
+    /// upstream differ by 685 lines for `winit 0.30.13` and 28 for `smol_str
+    /// 0.2.2`, i.e. 713 in every one of the four cells the matrix had that day,
+    /// which was enough to turn four `third_party_loc` rows RED against
+    /// ceilings taken on a machine that had both. (That delta would reach THREE
+    /// of the five cells now: the wasm row was replaced by the two shipped
+    /// browser modules later the same day, and neither `aterm-wasm` nor
+    /// `aterm-gpu-web` pulls `winit` or `smol_str`.) A `[patch.crates-io]`
+    /// target now resolves to the path that COMPILES before the registry is
+    /// consulted at all, so every machine reads the same lines out of the
+    /// repository.
     vendored_measured: Vec<String>,
 }
 
@@ -569,7 +582,23 @@ fn detail(root: &Path, s: &CellSurvey) -> ScopeDetail {
                     .as_ref()
                     .is_some_and(|dir| dir.starts_with(&vendor))
             })
-            .map(|(p, _)| format!("{} (vendor/{})", p.spec(), p.name))
+            // THE DIRECTORY THAT WAS MEASURED, not `vendor/<name>`. That
+            // spelling assumed ONE CRATE PER VENDOR DIRECTORY, which held while
+            // every fork was `vendor/winit`-shaped and stopped holding on
+            // 2026-09-10: `vendor/astream` carries four crates at
+            // `vendor/astream/crates/<name>`, so the line printed
+            // `vendor/astream-broker`, a path that does not exist, in a report
+            // whose whole claim is that these lines were measured from the fork
+            // rather than from upstream.
+            .map(|(p, f)| {
+                let shown = f
+                    .root_dir
+                    .as_ref()
+                    .and_then(|d| d.strip_prefix(root).ok())
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_else(|| format!("vendor/{}", p.name));
+                format!("{} ({shown})", p.spec())
+            })
             .collect(),
     }
 }
@@ -748,16 +777,11 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
     {
         let _ = writeln!(
             s,
-            "      MEASURED FROM THE FORK, NOT FROM UPSTREAM: {}. Since 2026-08-30 that is \
-             DETERMINISTIC — `loc::package_dir` resolves a patched package to the path that \
-             compiles, before the registry is consulted. It used to prefer a pristine registry \
-             checkout of the same version and fall back to `vendor/<name>` when the machine had \
-             none, silently, so the number depended on the operator's CARGO_HOME and the same \
-             commit read green on the ratcheting machine and red everywhere else. Cargo cannot \
-             fetch a pristine copy for a patched package (source-less lock entry), so that \
-             branch could never be relied on. These lines are aterm's own fork edits and they \
-             are the surface that ships; `cargo forge attest` is where fork-vs-upstream drift \
-             is audited.",
+            "      MEASURED FROM RESOLVED VENDORED SOURCE: {}. `loc::package_dir` reads the \
+             actual Cargo path for a patch or direct-path dependency before consulting the \
+             registry. These are the complete retained package sources, including tests and \
+             examples, not only local edits or reachable code. `cargo forge attest` checks \
+             fork obligations and the separately reviewed direct-bundle inventory.",
             d.vendored_measured.join(", ")
         );
     }
@@ -1315,6 +1339,59 @@ mod tests {
         );
         assert!(m.contains("git diff -- Cargo.lock"), "{m}");
         assert!(m.contains("--allow-regress"), "{m}");
+    }
+
+    /// THE DIRECTORY THAT WAS MEASURED, and it must exist. `vendor/<name>`
+    /// assumed ONE CRATE PER VENDOR DIRECTORY and printed
+    /// `vendor/astream-broker` — a path that is not in this checkout — inside
+    /// a report whose entire claim is that these lines were read from the
+    /// directory it just named.
+    ///
+    /// Asserted as an invariant over EVERY vendored row rather than against
+    /// one named crate. The incoming version of this test named
+    /// `astream-cap@0.1.0 (vendor/astream/crates/astream-cap)`, which also
+    /// asserts that astream-cap is THIRD-PARTY; it is not
+    /// (`provenance::FIRST_PARTY_VENDORED`), and that is a separate question
+    /// from the one this test exists to answer. The invariant form catches the
+    /// same defect for any nested fork and cannot be invalidated by a
+    /// provenance ruling.
+    #[test]
+    fn the_live_budget_detail_names_a_vendor_directory_that_exists() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let cell = crate::resolve::default_cells().remove(0);
+        let survey = crate::loc::survey_cell(root, &cell).expect("mac graph resolves");
+        let facts = detail(root, &survey);
+        assert!(
+            !facts.vendored_measured.is_empty(),
+            "the mac cell vendors winit, so this list is never empty"
+        );
+        for row in &facts.vendored_measured {
+            let shown = row
+                .rsplit_once(" (")
+                .and_then(|(_, dir)| dir.strip_suffix(')'))
+                .unwrap_or_else(|| panic!("{row}: no directory in the detail line"));
+            assert!(
+                shown.starts_with("vendor/"),
+                "{row}: a measured fork is under vendor/"
+            );
+            assert!(
+                root.join(shown).is_dir(),
+                "{row}: `{shown}` is not a directory in this checkout"
+            );
+        }
+        // The exact fictitious spelling the nested bundle used to produce.
+        assert!(
+            !facts
+                .vendored_measured
+                .iter()
+                .any(|s| s.contains("(vendor/astream-cap)")),
+            "{:?}",
+            facts.vendored_measured
+        );
     }
 
     #[test]

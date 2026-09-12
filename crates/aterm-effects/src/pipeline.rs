@@ -42,7 +42,7 @@ use aterm_time::Instant;
 use std::time::Duration;
 
 use aterm_core::render::RenderInput;
-use aterm_core::terminal::{ContentScrollState, Terminal};
+use aterm_core::terminal::{ContentScrollDelta, ContentScrollState, Terminal};
 use aterm_render::{
     GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
 };
@@ -129,13 +129,25 @@ pub fn lexicon_warning_applies(warning: &str, cjk_single_char: bool) -> bool {
 }
 
 /// One pipeline consumer's projection of two cumulative terminal scroll
-/// snapshots. A translation is admitted only when the whole visible content
-/// plane moved uniformly upward by an exactly representable number of rows.
+/// snapshots — the embedder-side twin of the native host's
+/// `CursorEffectScrollDecision`, and a 1:1 rename of
+/// [`ContentScrollDelta`](aterm_core::terminal::ContentScrollDelta) so the web
+/// and native paths can never drift apart. A whole-plane translation is
+/// admitted only when the visible content moved uniformly upward by an exactly
+/// representable number of rows; a `Bands` batch is the exact per-row-band
+/// transform an inline viewport's streamed line makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContentScrollDecision {
     Baseline,
     Unchanged,
     Translate(u16),
+    /// Every invalidating batch since the last snapshot was explained by the
+    /// `count` row-band moves `bands[first_seq..first_seq + count]`, replayed
+    /// OLDEST FIRST.
+    Bands {
+        first_seq: u64,
+        count: u8,
+    },
     Invalidate,
 }
 
@@ -153,25 +165,24 @@ struct CursorCoordinateSpace {
 
 /// Pure comparison kept separate from effect mutation so the web host's
 /// decision can be bound directly to the derived cursor-scroll model.
+///
+/// The comparison itself lives in `aterm-core`
+/// ([`ContentScrollState::delta_since`]): ONE table, both hosts, so the web
+/// twin can never answer a question differently from the native window. This
+/// function is only the rename into this module's enum — and it stays, because
+/// it is this crate's Tier-1 bind point onto `cursor_scroll_signal_model`.
 fn content_scroll_decision(
     previous: Option<ContentScrollState>,
     current: ContentScrollState,
 ) -> ContentScrollDecision {
-    let Some(previous) = previous else {
-        return ContentScrollDecision::Baseline;
-    };
-    if current.invalidation_epoch != previous.invalidation_epoch
-        || current.uniform_up_rows < previous.uniform_up_rows
-    {
-        return ContentScrollDecision::Invalidate;
-    }
-    let delta = current.uniform_up_rows - previous.uniform_up_rows;
-    if delta == 0 {
-        ContentScrollDecision::Unchanged
-    } else if let Ok(delta) = u16::try_from(delta) {
-        ContentScrollDecision::Translate(delta)
-    } else {
-        ContentScrollDecision::Invalidate
+    match ContentScrollState::delta_since(previous, current) {
+        ContentScrollDelta::Baseline => ContentScrollDecision::Baseline,
+        ContentScrollDelta::Unchanged => ContentScrollDecision::Unchanged,
+        ContentScrollDelta::Translate(rows) => ContentScrollDecision::Translate(rows),
+        ContentScrollDelta::Bands { first_seq, count } => {
+            ContentScrollDecision::Bands { first_seq, count }
+        }
+        ContentScrollDelta::Invalidate => ContentScrollDecision::Invalidate,
     }
 }
 
@@ -1526,9 +1537,13 @@ impl EffectsPipeline {
     ///
     /// The first observation is deliberately silent. A later exact whole-grid
     /// upward delta translates all surviving terminal-coordinate light before
-    /// either engine observes the current cursor. Any epoch change, counter
-    /// regression, or delta wider than the engines' `u16` row contract retires
-    /// both coordinate spaces wholesale.
+    /// either engine observes the current cursor. An invalidating batch whose
+    /// whole row motion is a short list of exact row bands is replayed OLDEST
+    /// FIRST onto both engines — the region scroll an inline viewport makes for
+    /// every transcript line it streams, which before 2026-09-10 reset the
+    /// engines once per line. Any other epoch change, counter regression, or
+    /// delta wider than the engines' `u16` row contract retires both coordinate
+    /// spaces wholesale.
     fn sync_content_scroll(&mut self, current: ContentScrollState) -> ContentScrollDecision {
         let decision = content_scroll_decision(self.cursor_scroll_state, current);
         self.cursor_scroll_state = Some(current);
@@ -1540,6 +1555,17 @@ impl EffectsPipeline {
                 // A row probe is content identity, not visible geometry. Even
                 // though note_scroll translates light, pre-scroll proof bytes
                 // must never compare against the newly occupying row.
+                self.glow.drop_row_probe();
+            }
+            ContentScrollDecision::Bands { first_seq, count } => {
+                for i in 0..u64::from(count) {
+                    let m = current.band(first_seq + i);
+                    self.trail.note_band_move(m.top, m.bottom, m.delta);
+                    self.glow.note_band_move(m.top, m.bottom, m.delta);
+                }
+                // Row identity changed INSIDE the band exactly as it does under
+                // a whole-plane translation, so the row probe is fenced for the
+                // same reason.
                 self.glow.drop_row_probe();
             }
             ContentScrollDecision::Invalidate => {
@@ -2347,6 +2373,17 @@ mod tests {
                 projected.insert("uniform_rows", i64::from(delta));
                 projected.insert("decision", 1);
                 projected.insert("survivor_y", 1);
+                projected.insert("proof_alive", 0);
+            }
+            ContentScrollDecision::Bands { count, .. } => {
+                assert_eq!(count, 1, "model fixture uses the one-band batch");
+                projected.insert("epoch", 1);
+                projected.insert("band_batches", 1);
+                projected.insert("decision", 3);
+                // StartY 3 + Delta 2: the band carries its marks DOWN, the
+                // direction a reverse index at a region top moves them.
+                projected.insert("survivor_y", 5);
+                projected.insert("geometry_alive", 1);
                 projected.insert("proof_alive", 0);
             }
             ContentScrollDecision::Invalidate => {
@@ -3688,8 +3725,13 @@ mod tests {
 
     #[test]
     fn pipeline_real_alt_uniform_translates_while_ambiguous_motion_invalidates() {
-        fn region_scroll(term: &mut Terminal) {
-            term.process(b"\x1b[2;4r\x1b[4;1H\n\x1b[r\x1b[3;3H");
+        // A MARGINED (DECLRMM) scroll up: a rectangle moves, not a row band, so
+        // the grid poisons its band record and this stays the ambiguous-motion
+        // case the model's `RegionInvalidation` names. The plain interior region
+        // scroll this used to be is now an EXPLAINED band — see
+        // `a_band_batch_translates_the_pipeline_engines_instead_of_resetting_them`.
+        fn margined_region_scroll(term: &mut Terminal) {
+            term.process(b"\x1b[?69h\x1b[2;6s\x1b[2;4r\x1b[3;1H\x1b[S\x1b[r\x1b[?69l\x1b[3;3H");
         }
         fn alt_scroll(term: &mut Terminal) {
             term.process(b"\x1b[5;1H\n\n\x1b[3;3H");
@@ -3715,7 +3757,7 @@ mod tests {
                 2,
                 false,
                 ContentScrollDecision::Invalidate,
-                region_scroll,
+                margined_region_scroll,
             ),
             (
                 "AltUniform",
@@ -3822,12 +3864,74 @@ mod tests {
         }
     }
 
+    /// **The embedder's half of the Codex fix** (owner, 2026-09-10: "the cursor
+    /// jumping around … in codex in particular"). An inline viewport streams one
+    /// transcript line by scrolling a DECSTBM region — an invalidating batch, so
+    /// before this round the web/headless pipeline reset both cursor engines once
+    /// per streamed line exactly as the native window did. The batch's WHOLE row
+    /// motion is one exact [`RowBandMove`](aterm_core::terminal::RowBandMove),
+    /// so the decision is `Bands` and the licensed comet MOVES WITH ITS TEXT.
+    ///
+    /// The vacuity control is the margined sibling in
+    /// `pipeline_real_alt_uniform_translates_while_ambiguous_motion_invalidates`:
+    /// a rectangle scroll still resets.
+    #[test]
+    fn a_band_batch_translates_the_pipeline_engines_instead_of_resetting_them() {
+        let mut term = Terminal::new(5, 16);
+        let mut pipeline = EffectsPipeline::new();
+        let (mut input, before_trail) = seed_pipeline_trail(&mut pipeline, &mut term, 3);
+        assert!(!before_trail.is_empty(), "fixture must own live geometry");
+        let before = term.content_scroll_state();
+
+        // Rows 1..=3 (0-based) slide UP by one: a line feed on the bottom row of
+        // an interior region, the shape a transcript line takes once the inline
+        // viewport is pinned to the screen bottom.
+        term.process(b"\x1b[2;4r\x1b[4;1H\n\x1b[r\x1b[3;3H");
+        let after = term.content_scroll_state();
+        let decision = content_scroll_decision(Some(before), after);
+        assert_eq!(
+            decision,
+            ContentScrollDecision::Bands {
+                first_seq: before.band_seq,
+                count: 1,
+            },
+            "one region scroll is one explained band move"
+        );
+        assert_eq!(
+            after.invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "the epoch still bumps: a consumer that cannot translate bands \
+             still reads discard"
+        );
+        assert_eq!(after.band(before.band_seq).delta, -1);
+        validate_cursor_scroll_action("RegionBandMove", 6, decision);
+
+        term.cell_frame_into(&mut input, 5, 16);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            pipeline.trail.is_active(),
+            "an explained band must not destroy earned light"
+        );
+        let expected: Vec<TrailCell> = before_trail
+            .iter()
+            .map(|cell| TrailCell {
+                row: cell.row - 1,
+                ..*cell
+            })
+            .collect();
+        assert_eq!(
+            input.cursor_trail, expected,
+            "every cell inside the band moves up exactly one row, cell for cell"
+        );
+    }
+
     #[test]
     fn pipeline_scroll_baseline_regressions_and_wide_deltas_fail_closed() {
         let mut pipeline = EffectsPipeline::new();
         let baseline = ContentScrollState {
             uniform_up_rows: 10,
             invalidation_epoch: 4,
+            ..Default::default()
         };
         assert_eq!(
             pipeline.sync_content_scroll(baseline),
@@ -3843,14 +3947,17 @@ mod tests {
             ContentScrollState {
                 uniform_up_rows: 9,
                 invalidation_epoch: 4,
+                ..Default::default()
             },
             ContentScrollState {
                 uniform_up_rows: 10,
                 invalidation_epoch: 3,
+                ..Default::default()
             },
             ContentScrollState {
                 uniform_up_rows: 10 + u64::from(u16::MAX) + 1,
                 invalidation_epoch: 4,
+                ..Default::default()
             },
         ] {
             assert_eq!(

@@ -1134,6 +1134,24 @@ mod tests {
     /// calls `crypto.getRandomValues` through `getrandom` and never mentions
     /// `aterm-uds`. If the census is ever taught to evaluate cfg predicates,
     /// this entry is the first one that should disappear.
+    ///
+    /// # `aterm-objc` is the SAME over-approximation, added 2026-09-11
+    ///
+    /// `aterm-gpu` reaches `aterm-objc` from a
+    /// `[target.'cfg(target_os = "macos")'.dependencies]` section — the
+    /// first-party Metal backend's demand-driven drawable acquisition. The same
+    /// fail-closed rule counts it IN here, and for the same reason: the
+    /// derivation cannot prove the edge absent, and over-scanning is the safe
+    /// direction.
+    ///
+    /// It is NOT a claim that Objective-C reaches the browser.
+    /// `wasm32-unknown-unknown` is not `macos`, so cargo never resolves that
+    /// edge for the web build. Its one visible consequence is that OB-12 now
+    /// lexically scans `crates/aterm-gpu/src/metal/`, which is why the
+    /// `AcquireWorker`'s `thread::Builder` carries an explicit
+    /// `#[cfg(not(target_arch = "wasm32"))]` that is redundant to the compiler
+    /// and load-bearing to this gate. Both this entry and that marker go away
+    /// together if the census learns to evaluate cfg predicates.
     #[test]
     fn derived_wasm_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
@@ -1154,6 +1172,7 @@ mod tests {
             "crates/aterm-lexicon/src",
             "crates/aterm-log/src",
             "crates/aterm-lz4/src",
+            "crates/aterm-objc/src",
             "crates/aterm-parser/src",
             // Entered the closure when the first-party PNG codec replaced
             // `png` and the flate2/miniz_oxide compression stack behind it:

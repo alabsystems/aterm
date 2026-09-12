@@ -10,15 +10,15 @@
 use std::sync::{Arc, Mutex};
 
 use aterm_core::grid::{MAX_GRID_COLS, MAX_GRID_ROWS};
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{RowMatch, RowRange, Terminal, first_matching_row};
 use aterm_session::Op;
 use winit::event_loop::EventLoopProxy;
 
 use super::post_input_reply;
-use crate::input::{InputEvent, InputOutcome, ScrollIntent};
-use crate::{TabAction, Wake, term_lock};
+use crate::input::{Delivery, InputEvent, InputOutcome, ScrollIntent};
+use crate::{SessionCtx, TabAction, Wake, term_lock};
 
-/// `scroll <up|down|top|bottom|N>` -> move the scrollback viewport and report
+/// `scroll <up|down|top|bottom|prev-prompt|next-prompt|N>` -> move the viewport and report
 /// the new position as `OK <display_offset> <scrollback_lines>\n`. `up`/`down`
 /// move one screen into/out of history; `top`/`bottom` jump; a signed integer
 /// `N` moves N lines into history (negative = toward the live bottom). With no
@@ -297,7 +297,7 @@ fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
 /// [`InputEvent::Key`]. Factored out of [`cmd_key`] so the additive grammar is
 /// unit-testable WITHOUT an `EventLoopProxy` (the verb can't run headless — it
 /// posts a `Wake::Input`). The SAME (Key, mods, base_layout, event_type) tuple a
-/// human's named-key press builds, so the seam (the sole encoder caller) yields
+/// human's named-key press builds, so the seam (the plain verb's encoder caller) yields
 /// byte-identical output incl. Kitty REPORT_ALTERNATE_KEYS. All trailing tokens
 /// are ADDITIVE — a bare `key up` still parses to empty mods / Press / no base.
 /// Returns `None` for an unknown key name or a malformed `type=`/`base=` value.
@@ -428,8 +428,16 @@ pub(crate) fn key_arms_own_license(rest: &str) -> bool {
     }
 }
 
+/// The usage line every malformed `key` body answers. One string, so the
+/// grammar — the two leading options and the key names — is stated in exactly
+/// one place (the plain, the guarded and both cross-session arms answer it).
+pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>] [if=<re>] \
+                                    <name> — enter tab esc space backspace delete up down \
+                                    left right home end pageup pagedown f1..f12 (opt +mods, \
+                                    e.g. ctrl+c)\n";
+
 /// `key <name> [mods=<list>]` -> build an [`InputEvent::Key`] and post it to the
-/// seam (the SOLE encoder caller, under the CURRENT keyboard mode). See
+/// seam (the plain verb's encoder caller, under the CURRENT keyboard mode). See
 /// [`parse_key`] for the grammar.
 pub(crate) fn cmd_key(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     match parse_key(rest) {
@@ -437,10 +445,261 @@ pub(crate) fn cmd_key(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         // not merely that it was enqueued. With no frontmost window the seam
         // drops the reply sender, so the caller gets ERR rather than a false OK.
         Some(ev) => input_reply_to_str(post_input_reply(proxy, Op::WriteInput, vec![ev])),
-        None => "ERR usage: key <name> — enter tab esc space backspace delete \
-                 up down left right home end pageup pagedown f1..f12 (opt +mods, e.g. ctrl+c)\n"
-            .to_string(),
+        None => KEY_USAGE.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `if=<re>` — the guarded press: ONE check-and-press under the terminal lock
+// ---------------------------------------------------------------------------
+
+/// The verbs that take a LEADING `if=<re>` guard: the two that carry the one
+/// keystroke-shaped write a driver answers a prompt with. `turn` is deliberately
+/// not one of them (its own `settle=` options own that slot), and the rest of the
+/// input verbs take no leading `if=`; of them only `feed-bin` takes a leading `id=`.
+pub(crate) const GUARDED_VERBS: &[&str] = &["send", "key"];
+
+/// Whether `verb` accepts a leading `if=<re>` guard.
+pub(crate) fn is_guarded_verb(verb: &str) -> bool {
+    GUARDED_VERBS.contains(&verb)
+}
+
+/// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the
+/// argument tail at the dispatch so every arm parses the SAME tail it always did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LeadingInputOptions {
+    /// The A6 idempotency key's raw `<epoch>:<producer>:<seq>` value.
+    pub idem: Option<String>,
+    /// The `if=<re>` guard's raw pattern — compiled later by [`compile_guard`],
+    /// so a bad regex is answered where the halt gate has already been passed.
+    pub guard: Option<String>,
+    /// A leading option that was recognized but malformed (a guard with no
+    /// pattern, an option given twice). Carried rather than answered here so the
+    /// dispatch answers it AFTER the halt gate: a halted session must say
+    /// `ERR halted` whatever the rest of the line looks like.
+    pub refusal: Option<String>,
+}
+
+/// Take the LEADING options off a keyed/guarded verb's argument tail.
+///
+/// OPTIONS LEAD, the rule `post`'s frame detector already runs on: an option is
+/// recognized only while the tail still begins with one, so `send hello id=1`
+/// sends the ten characters `hello id=1` exactly as it always did and only a
+/// leading `id=`/`if=` token changes meaning. The two options compose IN EITHER
+/// ORDER (`key id=… if=… 1` and `key if=… id=… 1` are the same request). A
+/// leading `--` ends option parsing and is dropped, so a caller that really must
+/// `send` text beginning with `id=` or `if=` writes `send -- if=…`.
+///
+/// `id=` is scanned only on [`crate::pty_idem::KEYED_VERBS`] and `if=` only on
+/// [`GUARDED_VERBS`]; every other verb's tail is returned untouched, so an `id=`
+/// or `if=` token elsewhere stays argument data (a leading `if=` on `paste` is
+/// delivered as literal text, exactly like a leading `id=` on it).
+///
+/// The regex is ONE wire token: the control line is split on whitespace and
+/// nothing quotes, so a pattern with a space in it must be written with `.` in
+/// its place (`if=Do.you.want.to.proceed`). The client says so before sending
+/// when it sees whitespace in a guard.
+///
+/// Returns the options and the remaining tail. With no leading option the tail
+/// is `rest` byte for byte (leading whitespace included — `send` bodies are raw).
+pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptions, String) {
+    let keyed = crate::pty_idem::is_keyed_verb(verb);
+    let guarded = is_guarded_verb(verb);
+    let mut opts = LeadingInputOptions::default();
+    if !keyed && !guarded {
+        return (opts, rest.to_string());
+    }
+    let mut cur = rest.trim_start();
+    let mut consumed = false;
+    loop {
+        let (head, tail) = match cur.split_once(char::is_whitespace) {
+            Some((h, t)) => (h, t.trim_start()),
+            None => (cur, ""),
+        };
+        if head == "--" {
+            cur = tail;
+            consumed = true;
+            break;
+        }
+        if keyed && let Some(value) = head.strip_prefix("id=") {
+            if opts.idem.replace(value.to_string()).is_some() {
+                opts.refusal = Some("ERR usage: id= given twice\n".to_string());
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        if guarded && let Some(pattern) = head.strip_prefix("if=") {
+            if pattern.is_empty() {
+                opts.refusal = Some(
+                    "ERR usage: if=<re> needs a pattern — ONE token, e.g. \
+                     if=Do.you.want.to.proceed\n"
+                        .to_string(),
+                );
+            } else if opts.guard.replace(pattern.to_string()).is_some() {
+                opts.refusal = Some("ERR usage: if= given twice\n".to_string());
+            }
+            cur = tail;
+            consumed = true;
+            continue;
+        }
+        break;
+    }
+    let tail = if consumed { cur } else { rest };
+    (opts, tail.to_string())
+}
+
+/// Compile a leading `if=<re>` guard, OUTSIDE the terminal lock (the same
+/// bounded `aterm_observe::row_matcher` `await match` compiles with, so a crafted
+/// pattern is refused or bounded before any lock is taken). `None` in, `None`
+/// out; a bad pattern is `ERR badregex`, the `await` spelling.
+pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowMatch>>, String> {
+    match pattern {
+        None => Ok(None),
+        Some(pattern) => match aterm_observe::row_matcher(pattern) {
+            Ok(matcher) => Ok(Some(matcher)),
+            Err(_) => Err("ERR badregex\n".to_string()),
+        },
+    }
+}
+
+/// What a guarded input attempt decided — under ONE hold of the terminal lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuardedInput {
+    /// No visible row matched the guard: NOTHING was written.
+    Skipped,
+    /// A row matched, and the bytes were handed to the kernel (or refused with
+    /// zero bytes, or accepted in part) while the lock was still held.
+    Pressed(Delivery),
+}
+
+/// THE ATOMIC CHECK-AND-PRESS. Test `guard` against the visible rows and, if some
+/// row matches, deliver `ev` — both under the SAME hold of the terminal lock.
+///
+/// WHY THE SAME LOCK. Measured: a supervisor answering a Claude Code permission
+/// prompt read the screen, saw the box, and sent `key 1`; an auto-mode rule
+/// resolved the prompt between the read and the press, and the digit landed in
+/// the composer as text. A read-then-press is two requests with a window between
+/// them, and no shorter window on the client's side closes it. The PTY reader
+/// applies output to the engine under `term` for the whole of `process(&buf)`,
+/// so a check made under `term` and a write made before it is released cannot
+/// have an output batch land between them: what the guard saw is the screen the
+/// keystroke answers.
+///
+/// WHY THE IMMEDIATE WRITE. The bytes go through the sink's bounded, non-parking,
+/// never-spilling write (`try_write_frame_immediate_with_receipt`, the operator
+/// actuator's primitive), not the spilling non-parking egress the App seam uses:
+/// a frame the kernel cannot take NOW would otherwise be queued behind the spill
+/// and delivered later, to whatever screen is up by then — the exact race the
+/// guard exists to close. So a busy sink (a spill ahead of it, another writer on
+/// the fd, a full tty buffer, or a master the spawn could not make non-blocking)
+/// answers zero bytes, which the caller reports as a transient `ERR busy`, and
+/// the driver retries against the live screen. The lock hold is bounded by that
+/// same non-parking property: nothing here waits.
+///
+/// WHAT IT BYPASSES, said out loud. This runs on the CONTROL thread against the
+/// resolved target's `(term, sink)`, like every cross-session input verb, so for
+/// the tab on screen it skips the App input seam's side effects (blink reset,
+/// viewport snap, the typing-momentum hints, the `video … keys` ledger — counted
+/// as unseamed, never silently zero) and does not arm a cursor licence of its
+/// own; the dispatch keeps the licence fence for it. A press that must ride the
+/// seam is a plain `key`.
+pub(crate) fn input_if_row_matches(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: InputEvent,
+    guard: &dyn RowMatch,
+) -> GuardedInput {
+    let terminal = term_lock(term);
+    if first_matching_row(&*terminal, guard, RowRange::All).is_none() {
+        return GuardedInput::Skipped;
+    }
+    // The encoder is read under the same lock as the guard: the keyboard mode is
+    // part of the screen state the check vouched for.
+    let bytes = match &ev {
+        InputEvent::Key {
+            key,
+            mods,
+            base_layout,
+            event_type,
+        } => aterm_types::keyboard::encode_key_with_layout(
+            key,
+            *mods,
+            terminal.keyboard_mode(),
+            *event_type,
+            *base_layout,
+        ),
+        // Raw bytes go to the PTY verbatim — the `send` policy, no encoder.
+        InputEvent::KeySequence(bytes) => bytes.clone(),
+        _ => return GuardedInput::Pressed(Delivery::BusyZero),
+    };
+    crate::note_unseamed_control_input(&ev);
+    let echo_write = ctx.output_echo.begin_event(&ev);
+    if bytes.is_empty() {
+        // A faithful no-op (a legacy release): nothing to deliver, nothing owed.
+        echo_write.finish_delivery(Delivery::Full, None, &ctx.sink);
+        return GuardedInput::Pressed(Delivery::Full);
+    }
+    let (outcome, accepted_order) = ctx.sink.try_write_frame_immediate_with_receipt(&bytes);
+    let delivery = match outcome {
+        aterm_session::sink::ImmediateWrite::Full => Delivery::Full,
+        aterm_session::sink::ImmediateWrite::BusyZero => Delivery::BusyZero,
+        aterm_session::sink::ImmediateWrite::ConflictZero => Delivery::ConflictZero,
+        aterm_session::sink::ImmediateWrite::PartialInDoubt { accepted } => {
+            Delivery::PartialInDoubt { accepted }
+        }
+    };
+    echo_write.finish_delivery(delivery, accepted_order, &ctx.sink);
+    drop(terminal);
+    GuardedInput::Pressed(delivery)
+}
+
+/// The verb reply for a [`GuardedInput`]. `OK skipped` is an ANSWER, not an
+/// error (the guard is a question and "no" is one of its answers); the dispatch
+/// stamps ` seq=<n>` on it like every other `OK` from an input verb, so the
+/// driver's next `await seq` is anchored either way. Zero bytes moved is the
+/// transient `ERR busy` class — the sequence an `id=` claimed is given back,
+/// because nothing was written; a partial write is in-doubt and says so.
+pub(crate) fn guarded_input_reply(decision: GuardedInput) -> String {
+    match decision {
+        GuardedInput::Skipped => "OK skipped\n".to_string(),
+        GuardedInput::Pressed(Delivery::Full | Delivery::FullAt { .. }) => "OK\n".to_string(),
+        GuardedInput::Pressed(Delivery::BusyZero | Delivery::ConflictZero) => {
+            "ERR busy sink\n".to_string()
+        }
+        GuardedInput::Pressed(Delivery::PartialInDoubt { accepted }) => {
+            format!("ERR write failed partial accepted={accepted}\n")
+        }
+        GuardedInput::Pressed(Delivery::Failed) => "ERR write failed\n".to_string(),
+    }
+}
+
+/// `key if=<re> <name>`: [`cmd_key`]'s guarded twin — the same [`parse_key`]
+/// grammar, delivered by [`input_if_row_matches`] instead of the seam. A
+/// malformed name is the usage line BEFORE any lock is taken.
+pub(crate) fn cmd_key_guarded(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    guard: &dyn RowMatch,
+    rest: &str,
+) -> String {
+    match parse_key(rest) {
+        Some(ev) => guarded_input_reply(input_if_row_matches(term, ctx, ev, guard)),
+        None => KEY_USAGE.to_string(),
+    }
+}
+
+/// `send if=<re> <text>`: the guarded `send` — the same [`send_bytes`] body
+/// (the literal `\n` submit form included), delivered by
+/// [`input_if_row_matches`].
+pub(crate) fn cmd_send_guarded(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    guard: &dyn RowMatch,
+    rest: &str,
+) -> String {
+    let ev = InputEvent::KeySequence(send_bytes(rest));
+    guarded_input_reply(input_if_row_matches(term, ctx, ev, guard))
 }
 
 /// `hwkey <char|name> [mods=…] [count=…] [interval=…]` -> inject the key through
@@ -591,7 +850,7 @@ pub(crate) fn cmd_signal(master: i32, rest: &str) -> String {
     "ERR signal unsupported on this platform\n".to_string()
 }
 
-const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
+pub(crate) const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
 
 /// Upper bound on a single `mouse wheelup|wheeldown` verb's `lines=N`. The seam
 /// emits ONE wheel report per line under a tracking app, so an unbounded count
@@ -786,8 +1045,9 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
 /// Phase 0.5 CONTRACT CHANGE (divergences a/b/d/i): the old `OK (mouse off)`
 /// short-circuit is GONE — a tracking-OFF press/release now runs the SAME
 /// selection machinery as the human (not a no-op), and `mods`/`count`/`side`/
-/// `block` are carried as data instead of hard-coded. The verb returns `OK\n`
-/// (fire-and-forget) once the batch is posted.
+/// `block` are carried as data instead of hard-coded. The verb is reply-bearing:
+/// `OK` once the seam has APPLIED the batch on the main thread, `ERR input
+/// dispatch failed: …` when there is no frontmost window (never a false OK).
 ///
 /// DRAG CONVERGENCE (divergence c) — SCOPE: one `mouse move` verb line posts ONE
 /// `MouseMove`, so a controller that wants intermediate motion reports under a
@@ -970,7 +1230,7 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
     rest.parse::<usize>().ok().map(TabAction::Select)
 }
 
-/// `tab new | <N> | next | prev` -> DRIVE the FRONT window's native tabs and reply
+/// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> DRIVE the FRONT window's tabs and reply
 /// `OK <active_index> <tab_count>`.
 ///
 /// MAIN-THREAD HOP (mirrors [`cmd_chrome`]): mutating `App` (its tabs) may ONLY
@@ -1373,6 +1633,103 @@ mod tests {
                 "`key {body}` arms no license of its own and must keep the fence"
             );
         }
+    }
+
+    /// OPTIONS LEAD, and the two leading options compose in either order. The
+    /// `id=` cases are the A6 contract verbatim (they used to be pinned beside
+    /// `pty_idem::take_key`, which this parser replaced): a body `id=` is body,
+    /// `--` ends options, an unkeyed verb is never scanned. The `if=` cases are
+    /// this rung's: recognized on `send`/`key` only, in either order beside
+    /// `id=`, and a guard with no pattern or given twice is carried as a refusal
+    /// rather than answered here, so the halt gate still speaks first.
+    #[test]
+    fn leading_options_compose_in_either_order_and_a_body_option_is_body() {
+        let opts = |idem: Option<&str>, guard: Option<&str>| LeadingInputOptions {
+            idem: idem.map(str::to_string),
+            guard: guard.map(str::to_string),
+            refusal: None,
+        };
+        assert_eq!(
+            take_leading_options("send", "id=a:b:c hello there"),
+            (opts(Some("a:b:c"), None), "hello there".to_string())
+        );
+        // NOT the first token ⇒ argument data, byte-identical to before.
+        assert_eq!(
+            take_leading_options("send", "hello id=a:b:c"),
+            (opts(None, None), "hello id=a:b:c".to_string())
+        );
+        // A body with no leading option is returned BYTE FOR BYTE — leading
+        // whitespace included, because `send` bodies are raw.
+        assert_eq!(
+            take_leading_options("send", "  two spaces"),
+            (opts(None, None), "  two spaces".to_string())
+        );
+        // `--` is the escape hatch for text that really does start with an option.
+        assert_eq!(
+            take_leading_options("send", "-- if=literal"),
+            (opts(None, None), "if=literal".to_string())
+        );
+        // An unkeyed, unguarded verb is never scanned.
+        assert_eq!(
+            take_leading_options("paste", "if=x id=a:b:c hi"),
+            (opts(None, None), "if=x id=a:b:c hi".to_string())
+        );
+        // A lone key with no tail is legal (`send id=…` types nothing).
+        assert_eq!(
+            take_leading_options("turn", "id=a:b:c"),
+            (opts(Some("a:b:c"), None), String::new())
+        );
+        // `if=` alone, and beside `id=` in EITHER order.
+        assert_eq!(
+            take_leading_options("key", "if=Do.you.want.to.proceed 1"),
+            (opts(None, Some("Do.you.want.to.proceed")), "1".to_string())
+        );
+        assert_eq!(
+            take_leading_options("key", "id=a:b:c if=Do.you.want 1"),
+            (opts(Some("a:b:c"), Some("Do.you.want")), "1".to_string())
+        );
+        assert_eq!(
+            take_leading_options("key", "if=Do.you.want id=a:b:c 1"),
+            (opts(Some("a:b:c"), Some("Do.you.want")), "1".to_string())
+        );
+        assert_eq!(
+            take_leading_options("send", "if=proceed id=a:b:c y\\n"),
+            (opts(Some("a:b:c"), Some("proceed")), "y\\n".to_string())
+        );
+        // `turn` takes `id=` but NOT `if=`: the guard stays in its tail, where
+        // its own option parser answers usage for it.
+        assert_eq!(
+            take_leading_options("turn", "if=x id=a:b:c hello"),
+            (opts(None, None), "if=x id=a:b:c hello".to_string())
+        );
+        assert_eq!(
+            take_leading_options("turn", "id=a:b:c if=x hello"),
+            (opts(Some("a:b:c"), None), "if=x hello".to_string())
+        );
+        // A guard with no pattern, or an option given twice, is a CARRIED refusal:
+        // the tail is still taken so the dispatch answers it after the halt gate.
+        let (o, tail) = take_leading_options("key", "if= 1");
+        assert!(
+            o.refusal
+                .as_deref()
+                .is_some_and(|r| r.starts_with("ERR usage: if="))
+        );
+        assert_eq!(tail, "1");
+        let (o, _) = take_leading_options("key", "if=a if=b 1");
+        assert_eq!(o.refusal.as_deref(), Some("ERR usage: if= given twice\n"));
+        let (o, _) = take_leading_options("key", "id=a:b:c id=d:e:f 1");
+        assert_eq!(o.refusal.as_deref(), Some("ERR usage: id= given twice\n"));
+        // The guarded set is exactly the two keystroke-shaped writes.
+        assert_eq!(GUARDED_VERBS, ["send", "key"]);
+    }
+
+    /// A bad guard is `ERR badregex` — the `await match` spelling, from the same
+    /// bounded compiler — and no guard is no guard.
+    #[test]
+    fn a_guard_compiles_outside_the_lock_and_a_bad_one_is_badregex() {
+        assert!(compile_guard(None).unwrap().is_none());
+        assert!(compile_guard(Some("Do.you.want")).unwrap().is_some());
+        assert_eq!(compile_guard(Some("(")).unwrap_err(), "ERR badregex\n");
     }
 
     /// The whole point of the reply's `-`: with no current match there is no row,

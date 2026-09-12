@@ -75,6 +75,14 @@ fn main() -> ExitCode {
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
         AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
+        AliasRoute::Link => {
+            return aterm_link::cli::dispatch(
+                &rest
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<String>>(),
+            );
+        }
         // `get(1..)` not `rest[1..]`: this arm is only reached with a first
         // token in hand, but that is an argument the verifier cannot follow
         // from here, and it refuted the index (measured 2026-09-09).
@@ -109,6 +117,17 @@ fn main() -> ExitCode {
             aterm_cli::Verb::Pkg => atpkg::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
             aterm_cli::Verb::Drive => aterm_agent::drive_cli::main_entry(forwarded),
+            // The fabric bridge. `dispatch` takes `String`s because every one of
+            // its operands is a subject, a path or a principal — all of which
+            // the control protocol already defines as UTF-8 — and lossy is the
+            // right conversion for an argument that is about to be rejected by
+            // name if it is not one of those.
+            aterm_cli::Verb::Link => aterm_link::cli::dispatch(
+                &forwarded
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<String>>(),
+            ),
             // The release tool is a separate executable — deliberately NOT carried by
             // the app bundle — so this verb execs where its siblings call a library.
             aterm_cli::Verb::Ship => {
@@ -497,6 +516,12 @@ enum AliasRoute {
     Fleet,
     /// `aterm-drive` — the agent drive CLI.
     Drive,
+    /// `aterm-link` — the fabric bridge. It is an alias and not merely a verb
+    /// because a bridge is spawned BY NAME out of `[fabric] command`, which is
+    /// split on whitespace and exec'd, so the string an operator writes has to
+    /// be a path to something executable. Without this arm that path fell
+    /// through to `FrontDoor` and opened a WINDOW.
+    Link,
     /// `aterm-gui <new-tab|new-window|split-pane> …` — a WINDOWING VERB typed at
     /// (or, far more often, committed into the jump list by) an alias copy. It is
     /// routed exactly as `aterm <verb>` is; handing it to the window's own flag
@@ -518,6 +543,7 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "atpkg" => AliasRoute::Pkg,
         "aterm-fleet" => AliasRoute::Fleet,
         "aterm-drive" => AliasRoute::Drive,
+        "aterm-link" => AliasRoute::Link,
         "aterm-gui" => match aterm_cli::Verb::from_operand(first) {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             // Every OTHER verb stays out of the alias on purpose: `aterm-gui`'s
@@ -899,7 +925,13 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     match sub.as_str() {
         "status" => {
             let Some(st) = aterm_update::status(build) else {
-                println!("auto-update is macOS-only; nothing to report on this platform");
+                // `None` on macOS too, when `HOME` is unset or the updater's private
+                // staging directory cannot be made — so the platform is not the
+                // only reason there is nothing to report, and the line says both.
+                println!(
+                    "aterm update: nothing to report — auto-update runs on macOS only, and \
+                     only where the updater's staging directory under HOME resolves"
+                );
                 return ExitCode::SUCCESS;
             };
             print_update_status(build, &st);
@@ -1207,6 +1239,10 @@ mod tests {
         assert_eq!(alias_route("atpkg", "new-tab"), AliasRoute::Pkg);
         assert_eq!(alias_route("aterm-fleet", ""), AliasRoute::Fleet);
         assert_eq!(alias_route("aterm-drive", ""), AliasRoute::Drive);
+        // A bridge is spawned by name out of `[fabric] command`; before this
+        // arm existed that name opened a window instead of serving.
+        assert_eq!(alias_route("aterm-link", ""), AliasRoute::Link);
+        assert_eq!(alias_route("aterm-link", "serve"), AliasRoute::Link);
         // And the front door is still the front door under every other name.
         for name in ["aterm", "aterm-cli", "my-renamed-aterm"] {
             assert_eq!(

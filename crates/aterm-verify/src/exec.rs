@@ -181,10 +181,40 @@ impl Run {
 ///    machine, and the `--full` Kani floor spawns three model-checking children
 ///    besides.
 ///
-/// 45 min = 2700 s is 3.75 x the worst honest child ever measured here and
-/// several times a cold full build, while still bounding a wedged run to
-/// something a human comes back to and finds RED. A deadlock does not get faster
-/// with patience; honest work does finish.
+/// RAISED 45 min -> 90 min on 2026-09-11, and the PREMISE moved rather than the
+/// tolerance. `--no-fail-fast` landed on every test argv the ladder builds that
+/// day, because `targo test --workspace` stops scheduling at the FIRST failing
+/// binary and three consecutive release gates had therefore reported on 41 of
+/// ~319 test binaries while reading like a statement about all of them. The
+/// stage now runs every binary by design, so "the worst honest child" is a
+/// different child.
+///
+/// MEASURED, not guessed. The first run under the new argv hit the 45-minute
+/// ceiling and was killed. That kill was NOT evidence the stage had outgrown
+/// the ceiling: sixty leaked `while :; do :; done` shells were eating roughly
+/// seventeen cores at the time, and they had been for 27 h 50 m, so every "the
+/// box is loaded" judgement made that day was reasoning from a number nobody
+/// had asked the cause of. On an IDLE machine, with the same argv, the stage
+/// measured ~60 min and the whole ladder 96 min across 402 green stages.
+///
+/// RAISED AGAIN, 90 min -> 3 h, hours later the same night, because 90 min was
+/// set from ONE sample and then tripped by the next run. Measured: the same
+/// stage on the same idle machine took ~60 min once and OVER 90 min the next
+/// time. Two samples an order of magnitude apart in margin is a distribution,
+/// not a number, and 1.5 x the only sample I had was a bound on my own
+/// confidence dressed up as a fact about the workload — the exact move this
+/// file's own history spends three paragraphs warning about.
+///
+/// WHAT THIS CEILING IS FOR, restated because getting it wrong twice in one
+/// night came from forgetting it: it catches a child that NEVER EXITS. It is
+/// not a performance budget and it may not be tuned like one. A false kill
+/// costs a full re-run of a 90-minute ladder and — worse — teaches whoever
+/// hits it to raise the number reflexively, which is how a backstop becomes a
+/// formality. Late detection of a real wedge costs one night. So the factor
+/// belongs on the generous side of the honest worst, and 3 h is ~2 x a
+/// measured worst that has already surprised me once.
+///
+/// A deadlock does not get faster with patience; honest work does finish.
 ///
 /// WHAT THE KILL DOES NOT DO — stated plainly, because a backstop that oversells
 /// itself is worse than none. [`std::process::Child::kill`] sends `SIGKILL` to
@@ -194,7 +224,7 @@ impl Run {
 /// not track their pids. What the ceiling guarantees is that the GATE reaches a
 /// verdict and exits; it does not guarantee the machine is idle afterwards, and
 /// the diagnostic says so where an operator will read it.
-pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(45 * 60);
+pub const DEFAULT_CHILD_CEILING: Duration = Duration::from_secs(3 * 60 * 60);
 
 /// The environment variable that moves, or removes, [`DEFAULT_CHILD_CEILING`].
 ///

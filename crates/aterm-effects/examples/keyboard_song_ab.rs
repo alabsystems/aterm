@@ -141,11 +141,15 @@ impl Cue {
     fn meta(self) -> EventMeta {
         EventMeta {
             at_ms: self.at_ms(),
-            glyph_class: typed_glyph_class(self.ch),
-            // THE ALPHABET RANK — the derived melody's one input about WHAT
-            // was typed. Through the engine's own producer, never a second
-            // copy of the table: a bench that carried its own alphabet could
-            // agree with a melody the shipping code does not derive.
+            // THE GLYPH CLASS and THE ALPHABET RANK — what the derived melody
+            // and the class voices know about WHAT was typed. Both through
+            // the engine's own producers, never a second copy of either
+            // table: a bench that carried its own alphabet (or its own idea
+            // of which marks knock) could agree with a melody the shipping
+            // code does not play.
+            glyph_class: aterm_effects::trail_sound::typed_glyph_class(
+                (self.ch != '\0').then_some(self.ch),
+            ),
             rank: aterm_effects::trail_sound::typed_glyph_rank(
                 (self.ch != '\0').then_some(self.ch),
             ),
@@ -160,21 +164,6 @@ impl Cue {
             // has no hand. 0.0 is the identity.
             flow: 0.0,
         }
-    }
-}
-
-/// [`EventMeta::glyph_class`] for a typed character: `0` letter/unknown,
-/// `1` `?`, `2` `!`, `3` digit, `4` punctuation — the struct's own table.
-///
-/// (Small enough, and host-shaped enough, to be worth a local copy; the
-/// ORDERED rank beside it is not, and comes from the engine.)
-fn typed_glyph_class(ch: char) -> u8 {
-    match ch {
-        '?' => 1,
-        '!' => 2,
-        c if c.is_ascii_digit() => 3,
-        c if c.is_ascii_punctuation() => 4,
-        _ => 0,
     }
 }
 
@@ -1011,9 +1000,12 @@ const SCENE_ONSET: (usize, f32) = (35, 1.35);
 /// old engine's echo and not the new bloom's swell; at 1.08 it counts the
 /// swell; at 1.05 it counts the tine's own partial beat. It refutes the old
 /// engine (3 ≠ 1, and the lift is 2 ≠ 1 at every ratio) and passes this one,
-/// which is what §8 asked of it — the EXACT statement is the unit pin
-/// `a_capital_is_one_lifted_onset_and_a_bare_shift_is_felt_not_pitched`
-/// (one TUNE voice, nothing at 25 ms, nothing at 2f, every Shift partial 0).
+/// which is what §8 asked of it — the EXACT statements are the unit pins
+/// `a_capital_is_one_strike_with_a_lifted_degree_and_one_ring` (one TUNE
+/// voice, nothing at 25 ms, ONE ring at 2f swelling in 60 ms on — no rise
+/// this census can count) and `a_bare_shift_is_a_pitched_pickup_that_never_steps`
+/// (one GRAFT voice, a lone P1: since 2026-09-10 the Shift IS an onset of
+/// its own, which is why the `Capital` row now reads 2 — two KEYS).
 /// At the scene detector's 35 ms the census read `Capital 1` on the old
 /// engine too — the finding that made this constant.
 ///
@@ -2589,31 +2581,52 @@ fn probe_tables(
                 p.fine.map_or("-".to_string(), |n| n.to_string())
             );
         }
-        // §8 STEP 4's PROOF, read off the table. One capital — the bare
-        // Shift's cue and the shifted letter 60 ms on, the host's whole
-        // gesture — is ONE onset by the FINE census; a bare Shift is FELT,
-        // not pitched. Under the shipped engine the same rows read
-        // `Capital 3` (the pitched lift, the letter, an octave echo 25 ms
-        // behind it) and the `Shift` row's tonality read in the hundreds of
-        // thousands; see [`FINE_ONSET`] for the measurement on both engines.
+        // §8 STEP 4, RE-RULED 2026-09-10 (the owner: "a sound effect for the
+        // shift key and shifted keys"), read off the table. A KEYSTROKE is
+        // still one onset by the FINE census (`Typed 1`; a Caps-Lock capital
+        // — the `CapsLockA` row, when the table carries it — rings but does
+        // not strike twice, its ring swelling on a 30 ms attack). The
+        // `Capital` row is TWO KEYS — the bare Shift's pickup and the shifted
+        // letter 60 ms on — and reads 2. And the bare Shift SINGS BY DESIGN:
+        // a pitched pickup on the lattice at −6 dB re the keystroke, where
+        // the 2026-09-08 felt mallet measured −61 dBFS (≈ −39 dB re Typed)
+        // and was what the owner could not hear. See [`FINE_ONSET`] for the
+        // census on both engines.
         let find = |name: &str| probes.iter().find(|p| p.name == name);
         let fine_of = |name: &str| find(name).and_then(|p| p.fine).unwrap_or(0);
         let (typed, capital) = (fine_of("Typed"), fine_of("Capital"));
-        let shift_tonality = find("Shift").map_or(f64::INFINITY, |p| p.tonality);
-        let shift_felt = shift_tonality < PITCHED_TONALITY;
+        let caps_lock = find("CapsLockA").and_then(|p| p.fine);
+        let shift_tonality = find("Shift").map_or(0.0, |p| p.tonality);
+        let shift_pitched = shift_tonality >= PITCHED_TONALITY;
+        let shift_re_typed = match (find("Shift"), find("Typed")) {
+            (Some(s), Some(t)) => s.peak_db - t.peak_db,
+            _ => f64::NAN,
+        };
+        const SHIFT_RE_TYPED_TARGET_DB: f64 = -6.0;
+        const SHIFT_RE_TYPED_TOL_DB: f64 = 1.5;
+        let shift_level_ok =
+            (shift_re_typed - SHIFT_RE_TYPED_TARGET_DB).abs() <= SHIFT_RE_TYPED_TOL_DB;
+        let caps_lock_ok = caps_lock.is_none_or(|n| n == 1);
         println!(
             "onset census (fine: {} ms, rise {}; Capital = Shift then the letter \
-             {CAPITAL_SHIFT_LEAD_MS} ms on): Typed {typed}, Capital {capital}, Shift tonality \
-             {shift_tonality:.1} ({}) — {}",
+             {CAPITAL_SHIFT_LEAD_MS} ms on): Typed {typed}, Capital {capital}{}, Shift tonality \
+             {shift_tonality:.1} ({}) at {shift_re_typed:+.2} dB re Typed (target \
+             {SHIFT_RE_TYPED_TARGET_DB:+.1} ± {SHIFT_RE_TYPED_TOL_DB}) — {}",
             FINE_ONSET.0,
             FINE_ONSET.1,
-            if shift_felt { "felt" } else { "PITCHED" },
-            if capital == 1 && typed == 1 && shift_felt {
-                "one capital is one onset and the lift is felt (§8 step 4 holds)"
-            } else if !shift_felt {
-                "§8 STEP 4 FAILS: the bare Shift sings"
+            caps_lock.map_or(String::new(), |n| format!(", CapsLockA {n}")),
+            if shift_pitched { "pitched" } else { "FELT" },
+            if typed == 1 && capital == 2 && caps_lock_ok && shift_pitched && shift_level_ok {
+                "a keystroke is one onset, a Shift+capital is two keys, and the pickup \
+                 sings under the key (§8 step 4 as re-ruled 2026-09-10 holds)"
+            } else if !shift_pitched {
+                "§8 STEP 4 (2026-09-10) FAILS: the bare Shift does not sing"
+            } else if !shift_level_ok {
+                "§8 STEP 4 (2026-09-10) FAILS: the pickup is off its −6 dB window"
+            } else if capital != 2 {
+                "§8 STEP 4 (2026-09-10) FAILS: Shift then a capital is not two onsets"
             } else {
-                "§8 STEP 4 FAILS: a keystroke is not one onset"
+                "§8 STEP 4 (2026-09-10) FAILS: a keystroke is not one onset"
             }
         );
         // §8 STEP 6's PROOF, on the same row: the bloomed Typed probe's

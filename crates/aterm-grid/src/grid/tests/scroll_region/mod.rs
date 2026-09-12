@@ -5,6 +5,7 @@
 //! Scroll region and unscroll-from-scrollback tests.
 //!
 //! Split into focused submodules to keep each test group discoverable:
+//! - `band_moves`: the numbered row-band record behind `coordinates_invalidated`
 //! - `region_ops`: IL/DL/SU/SD behavior within scroll regions
 //! - `hyperlink_regressions`: CellExtras/hyperlink regression coverage
 //! - `unscroll`: tiered scrollback unscroll behavior and attribute restoration
@@ -12,6 +13,7 @@
 
 use super::super::*;
 
+mod band_moves;
 mod hyperlink_regressions;
 mod region_ops;
 mod unscroll;

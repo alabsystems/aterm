@@ -200,6 +200,37 @@ fn paint_scanner_semantic_classifiers_keep_their_negative_controls() {
     );
 }
 
+/// The STARVATION LABEL's own pins. Three paint rows went red under load > 20
+/// and green under load < 10 on 2026-09-10 and were dismissed as "load" on that
+/// correlation alone, because `verdict=FAIL` was the whole of what the probe
+/// said. `tools/paint-conformance/starvation.py` is what lets a red say which
+/// thing failed; these self-tests hold the two properties that make the label
+/// worth having — that its floor is REACHABLE on a real machine (the first
+/// draft's 100 ms floor was not: worst lateness on a saturated 18-core box is
+/// 13.0 ms), and that no samples reads as `unknown` and never as a clean bill.
+#[cfg(target_os = "macos")]
+#[test]
+fn paint_probe_starvation_label_keeps_its_calibration_and_its_unknown() {
+    let dir = workspace_root().join("tools/paint-conformance");
+    let out = Command::new("/usr/bin/python3")
+        .args(["-m", "unittest", "-v", "starvation_test.py"])
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .current_dir(&dir)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "could not run {}: {e}",
+                dir.join("starvation_test.py").display()
+            )
+        });
+    assert!(
+        out.status.success(),
+        "paint starvation-label self-tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 /// THE MATURE RUN — the release smoke's own 29 keys, shared by every typed
 /// trail row since the 2026-08-30 key-length recalibration.
 ///

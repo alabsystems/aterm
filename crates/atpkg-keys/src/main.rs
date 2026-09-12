@@ -20,6 +20,8 @@
 //!
 //!   atpkg-keys setup --id <id> [--head-id <id>]   FIRST machine, once ever
 //!   atpkg-keys join  --id <id>                    EVERY later machine
+//!   (both also take [--pins <path>] [--roster <path>] [--key <path>], which
+//!   choose the anchor file, the roster and the machine key they write)
 //!
 //! `setup` generates the paper master, shows the 52 characters ONCE **on the terminal**
 //! (`/dev/tty`, never stdout — see below), and then does every remaining step itself: it
@@ -42,8 +44,10 @@
 //! pair of verbs exists to delete.
 //!
 //! Neither verb commits and neither pushes. Arming a trust anchor is a reviewed act, so
-//! they edit the working tree, verify what they wrote by reading it back, and print the
-//! diff to review plus exactly what is — and is not — true afterwards.
+//! they edit the working tree, verify what they wrote by reading it back, and print
+//! exactly what is — and is not — true afterwards, plus a `review: git diff -- <pins>`
+//! line whenever the anchor file changed (a `join` that changed nothing prints none;
+//! this tool never runs `git` itself).
 //!
 //! ## The remaining ceremony verbs
 //!
@@ -96,9 +100,9 @@ fn main() {
 /// argument pull stays a fixed number of `next()` calls: `collect()` on an arbitrary-length
 /// iterator is an unbounded allocation Trust cannot bound (`count-not-derivable`).
 /// (`std::env::args` itself is a hardened compat_observable boundary either way; see the
-/// artifact notes in [`atpkg_keys::fsio`].) The widest verb is `setup`, which takes six
-/// flags — twelve tokens — so this leaves room and [`vet_args`] refuses anything past it
-/// rather than silently dropping it.
+/// artifact notes in [`atpkg_keys::fsio`].) The widest verbs are `setup` and `join`,
+/// which take the five [`PROVISION_FLAGS`] — ten tokens — so this leaves room and
+/// [`vet_args`] refuses anything past it rather than silently dropping it.
 #[cfg(unix)]
 const MAX_ARGS: usize = 14;
 
@@ -553,7 +557,7 @@ fn confirm_transcription(
 
 /// `master-check` — type the phrase back and see the fingerprint again.
 ///
-/// The step that turns 64 hand-copied characters into something trustworthy. Run it while
+/// The step that turns 52 hand-copied characters into something trustworthy. Run it while
 /// the terminal still shows the original, so a mismatch is fixable; once the paper is the
 /// only copy, a bad transcription is unrecoverable.
 #[cfg(unix)]
@@ -573,7 +577,8 @@ fn master_check() -> Result<(), String> {
 /// The flags `setup` and `join` read. `--head-id` is only meaningful to `setup` (it names
 /// the incumbent on the first roster) but is accepted by both, because refusing it on
 /// `join` would be a refusal the operator has to look up rather than a fact they can act
-/// on; `join` documents that it ignores it in the closing report's roster line.
+/// on. `join` vets it and then ignores it silently: its roster must already exist, so
+/// there is no head to seed and the closing report never mentions the flag.
 #[cfg(unix)]
 const PROVISION_FLAGS: &[&str] = &["id", "pins", "roster", "key", "head-id"];
 
@@ -876,7 +881,7 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
         "atpkg-keys: '",
         id,
         "' is revoked. Publish the roster and its .sig on the next release — running \
-         clients pick it up on their next check (75s authenticated, 15min anonymous) and \
+         clients pick it up on their next check (75s authenticated, 30min anonymous) and \
          refuse that machine before any signature check. A FRESH install (no roster_seq \
          floor yet) can still be served an older, still-master-signed roster that lists \
          the revoked machine — rosters never lapse by design, so re-key entirely if that \

@@ -627,6 +627,28 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // rationale — but it is a first-class scalar an operator writes by hand, so
     // Manual must complete it, hover it, and flag a misspelled VALUE instead of
     // shrugging at an unknown key.
+    // A LIVE KEY Manual used to call "unknown to this aterm build" — the exact
+    // false diagnostic audit-2 item 9 named, still open for this table because
+    // `[fabric]` landed after it. An operator who turns the fabric on writes
+    // this by hand, and being told the key does not exist is how they conclude
+    // the bridge is not running when it is. Free-form: the value is a command
+    // line (`aterm-link serve --fleet ... --broker ...`), whitespace-split and
+    // exec'd, so there is no enum of values to offer.
+    manual(
+        "fabric.command",
+        "Fabric bridge command",
+        ConfigSchemaKind::Scalar(EditKind::Text),
+        &[
+            "fabric",
+            "bridge",
+            "inbox",
+            "post",
+            "astream",
+            "bus",
+            "aterm-link",
+        ],
+        true,
+    ),
     manual(
         "windowing_behavior",
         "Where a new terminal opens",

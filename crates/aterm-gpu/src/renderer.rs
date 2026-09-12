@@ -1727,6 +1727,8 @@ pub struct TrayQuad<'a> {
 /// until a real external stimulus asks for another frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfacePresentFailure {
+    /// Acquisition is running off-thread; wait for the surface-ready callback.
+    AcquirePending,
     /// The surface was outdated or lost and has just been reconfigured.
     Reconfigured,
     /// Drawable acquisition timed out; retrying later may succeed.
@@ -3219,6 +3221,7 @@ struct NeutralSurfaceConfig {
 }
 
 pub struct GpuSurface {
+    acquire_id: u64,
     #[cfg(not(wgpu_arm))]
     neutral: NeutralSurfaceConfig,
     #[cfg(wgpu_arm)]
@@ -3273,7 +3276,48 @@ pub struct GpuSurface {
     metal: Option<crate::metal::present::MetalWindowSurface>,
 }
 
+fn next_surface_acquire_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut id = NEXT.load(Ordering::Relaxed);
+    loop {
+        let next = id.checked_add(1).expect("surface identity exhausted");
+        match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return id,
+            Err(current) => id = current,
+        }
+    }
+}
+
 impl GpuSurface {
+    /// Stable identity used to reject late wakes after surface replacement.
+    #[must_use]
+    pub fn acquire_id(&self) -> u64 {
+        self.acquire_id
+    }
+
+    /// Install the main-loop wake before the first attached native present.
+    /// Failure is an attach failure: callers must select their CPU fallback.
+    pub fn set_acquire_ready_callback(
+        &mut self,
+        notify: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_mut() {
+            return metal.set_acquire_ready_callback(notify);
+        }
+        let _ = notify;
+        Ok(())
+    }
+
+    /// Reject a pending drawable after resize, occlusion, or surface retirement.
+    pub fn discard_pending_acquire(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some(metal) = self.metal.as_mut() {
+            metal.discard_pending_acquire();
+        }
+    }
+
     /// M3 phase B: whether this swapchain is the EDR (`Rgba16Float`
     /// extended-linear) target. This can change live on Windows as system HDR
     /// toggles; the frontend uses the current value to know whether per-window
@@ -3745,14 +3789,13 @@ pub struct WindowGpu {
     // shader execution. Keeping the stamp per-window lets the frontend drive
     // load shedding without folding FIFO/nextDrawable pacing into the signal.
     last_present_work_ns: u64,
-    // Wall time the most recent present spent BLOCKED in `get_current_texture()`
-    // (`nextDrawable` on Metal). Distinct from `last_present_work_ns`: this is
-    // pure WAITING on the swapchain/compositor, not work we did. A sustained
-    // non-trivial value is the direct, causal signal that the GPU cannot keep up
-    // with the frames being asked of it — which is exactly what shedding the
-    // bloom/shimmer relieves, and what the CPU-encode-only load-shed EMA is blind
-    // to. 0 until the first successful acquire.
+    // Wall time inside the latest completed swapchain acquisition. Attached
+    // native Metal measures this on its worker, independently of UI redraw
+    // duration. Includes nil/stale results; an empty poll adds no sample.
     last_acquire_wait_ns: u64,
+    /// One measurement from the current surface-present attempt, consumed by
+    /// the host on either success or failure. None means no acquire ran.
+    acquire_wait_sample_ns: Option<u64>,
     // The resident offscreen render target + its blit-source bind group. `None`
     // until the first frame; reused at the same `(w, h)`, recreated only on a
     // dimension change. See `Offscreen`.
@@ -4012,13 +4055,38 @@ impl WindowGpu {
         self.last_present_work_ns
     }
 
-    /// Wall time the most recent present spent BLOCKED acquiring a swapchain
-    /// drawable (`nextDrawable` on Metal). Pure waiting, not work — the causal
-    /// measure of GPU/compositor back-pressure, and the signal a CPU-encode-only
-    /// load-shed EMA cannot see. 0 before the first successful acquire.
+    /// Wall time inside the latest completed drawable acquisition, including
+    /// refusals. Native Metal measures this on its worker; it does not measure
+    /// how long the UI thread was blocked. Zero before the first completion.
     #[must_use]
     pub fn last_acquire_wait_ns(&self) -> u64 {
         self.last_acquire_wait_ns
+    }
+
+    /// Consume this surface-present attempt's acquire measurement exactly once.
+    /// An attempt rejected before acquisition produces no sample.
+    pub fn take_acquire_wait_sample_ns(&mut self) -> Option<u64> {
+        self.acquire_wait_sample_ns.take()
+    }
+
+    fn begin_surface_present(&mut self) {
+        self.acquire_wait_sample_ns = None;
+    }
+
+    /// Time the acquisition itself before inspecting its outcome. A timeout
+    /// must be measured even though its caller returns before encoding a frame.
+    fn measure_surface_acquire<T>(&mut self, acquire: impl FnOnce() -> T) -> T {
+        let started = aterm_time::Instant::now();
+        let result = acquire();
+        self.record_surface_acquire(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        result
+    }
+
+    fn record_surface_acquire(&mut self, waited_ns: u64) {
+        self.last_acquire_wait_ns = waited_ns;
+        self.acquire_wait_sample_ns = Some(waited_ns);
     }
 
     /// M3 phase B: record the screen's EDR maximum for this window (raw; the
@@ -9913,7 +9981,13 @@ impl GpuRenderer {
             live.drain_pending();
             let device = live.mint.device().clone_ref();
             let ms = surf.metal.as_mut().expect("checked above");
-            match ms.reconcile(&device, &want) {
+            let reconciled = ms.reconcile(&device, &want);
+            // Record the actual worker wait once, including nil/stale results.
+            // An empty nonblocking poll is never an acquisition measurement.
+            if let Some(waited_ns) = ms.take_completed_acquire_wait_ns() {
+                win.record_surface_acquire(waited_ns);
+            }
+            match reconciled {
                 Ok(false) => {}
                 Ok(true) => {
                     // Flip-drill diagnostic: a RECONFIGURE invalidates the
@@ -9943,8 +10017,13 @@ impl GpuRenderer {
         let hint = win.occluded_hint();
         // The swapchain facts, taken BEFORE the acquire borrows the surface.
         let (dest_w, dest_h, dest_texel) = surf.neutral_config();
-        let acquire_started = aterm_time::Instant::now();
-        let frame = match surf.metal.as_mut().expect("checked above").acquire() {
+        let ms = surf.metal.as_mut().expect("checked above");
+        let acquired = if ms.async_acquire() {
+            ms.acquire()
+        } else {
+            win.measure_surface_acquire(|| ms.acquire())
+        };
+        let frame = match acquired {
             Ok(f) => f,
             Err(refusal) => {
                 return Err(crate::metal::present::surface_present_failure(
@@ -9952,8 +10031,6 @@ impl GpuRenderer {
                 ));
             }
         };
-        win.last_acquire_wait_ns =
-            u64::try_from(acquire_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let work_started = aterm_time::Instant::now();
 
         // W6b — the M1b frac shift MUTATES the metal offscreen after this
@@ -11235,6 +11312,7 @@ impl GpuRenderer {
                  max_drawables={max_dr} edr={edr}"
             );
             Ok(GpuSurface {
+                acquire_id: next_surface_acquire_id(),
                 neutral: NeutralSurfaceConfig {
                     width,
                     height,
@@ -11341,6 +11419,7 @@ impl GpuRenderer {
                         );
                     }
                     return Ok(GpuSurface {
+                        acquire_id: next_surface_acquire_id(),
                         surface,
                         config,
                         sdr_format,
@@ -11426,6 +11505,7 @@ impl GpuRenderer {
             crate::stderr_line!("aterm-gpu: present mode = {:?}", config.present_mode);
         }
         Ok(GpuSurface {
+            acquire_id: next_surface_acquire_id(),
             surface,
             config,
             sdr_format: format,
@@ -11545,6 +11625,7 @@ impl GpuRenderer {
         };
         surface.configure(&self.ctx.device, &config);
         Ok(GpuSurface {
+            acquire_id: next_surface_acquire_id(),
             surface,
             config,
             sdr_format: format,
@@ -11882,6 +11963,10 @@ impl GpuRenderer {
             // The retained DESIRE moves; the armed present's reconcile
             // rebuilds the swapchain at the new dims before its acquire
             // (`MetalWindowSurface::reconcile` — drift on any axis).
+            if surf.neutral.width == w && surf.neutral.height == h {
+                return;
+            }
+            surf.discard_pending_acquire();
             surf.neutral.width = w;
             surf.neutral.height = h;
         }
@@ -11890,6 +11975,7 @@ impl GpuRenderer {
             if surf.config.width == w && surf.config.height == h {
                 return;
             }
+            surf.discard_pending_acquire();
             surf.config.width = w;
             surf.config.height = h;
             self.configure_surface_retagging_scrgb(win, surf, "resize");
@@ -12212,6 +12298,7 @@ impl GpuRenderer {
         source_crop: Option<PresentCrop>,
         effects_transport_shift_y: i32,
     ) -> Result<(), SurfacePresentFailure> {
+        win.begin_surface_present();
         // W6b — THE MULTI-WINDOW STALE-LAYER DISARM EDGE (W6a deferral 7,
         // closed): after a DISARM (an armed attach failure on ANY window),
         // a PREVIOUSLY armed window still holds its Metal swapchain, whose
@@ -12322,8 +12409,8 @@ impl GpuRenderer {
             // `redraw_total - compose - raster_submit`, contaminated by the post-present
             // tail. A blocking `nextDrawable` here is what queues keyDowns in the OS
             // event queue; measure it directly.
-            let acquire_started = aterm_time::Instant::now();
-            let frame = match surf.surface.get_current_texture() {
+            let acquired = win.measure_surface_acquire(|| surf.surface.get_current_texture());
+            let frame = match acquired {
                 C::Success(f) | C::Suboptimal(f) => f,
                 C::Outdated | C::Lost => {
                     self.configure_surface_retagging_scrgb(win, surf, "surface loss recovery");
@@ -12335,8 +12422,6 @@ impl GpuRenderer {
                 C::Occluded => return Err(SurfacePresentFailure::Occluded),
                 C::Validation => return Err(SurfacePresentFailure::Validation),
             };
-            win.last_acquire_wait_ns =
-                u64::try_from(acquire_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let view = frame
                 .texture
                 .create_view(&wgpu::TextureViewDescriptor::default());
@@ -25700,5 +25785,51 @@ mod pipeline_table_wgsl_tests {
                 .wire_metal_loss_latch(std::sync::Arc::new(LossLatch::new())),
             "a second wire refuses — one loss domain per context lifetime"
         );
+    }
+}
+
+#[cfg(test)]
+mod acquire_wait_failure_tests {
+    use super::{SurfacePresentFailure, WindowGpu};
+
+    #[test]
+    fn a_refused_acquire_is_measured_and_published_once() {
+        let mut window = WindowGpu::new();
+        window.begin_surface_present();
+        let mut invoked = false;
+        let result = window.measure_surface_acquire(|| {
+            invoked = true;
+            Err::<(), _>(SurfacePresentFailure::Timeout)
+        });
+        assert!(invoked);
+        assert!(matches!(result, Err(SurfacePresentFailure::Timeout)));
+        assert_eq!(
+            window.take_acquire_wait_sample_ns(),
+            Some(window.last_acquire_wait_ns())
+        );
+        assert_eq!(
+            window.take_acquire_wait_sample_ns(),
+            None,
+            "no duplicate publication"
+        );
+
+        // An early validation refusal on the next frame performs no acquire.
+        // It cannot replay the preceding frame's timeout measurement.
+        window.begin_surface_present();
+        assert_eq!(window.take_acquire_wait_sample_ns(), None);
+        assert!(matches!(
+            window.measure_surface_acquire(|| Ok::<_, SurfacePresentFailure>(7)),
+            Ok(7)
+        ));
+        assert!(window.take_acquire_wait_sample_ns().is_some());
+    }
+
+    #[test]
+    fn a_new_attempt_discards_an_unconsumed_old_sample() {
+        let mut window = WindowGpu::new();
+        window.begin_surface_present();
+        window.measure_surface_acquire(|| ());
+        window.begin_surface_present();
+        assert_eq!(window.take_acquire_wait_sample_ns(), None);
     }
 }

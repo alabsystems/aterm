@@ -163,11 +163,11 @@ pub(crate) const ADMIN_STEP_TTL: Duration = Duration::from_secs(10 * 60);
 ///
 /// # What it says, and what it deliberately does not
 ///
-/// The ASK is the title — "fewer" prompts, which is mitigation and nothing
-/// stronger — and the detail names the ONE switch macOS offers, exactly as
-/// the Security page does ("Full Disk Access is the single grant macOS offers
-/// for this"). It does NOT name a folder, does NOT say which folders the grant
-/// covers, and does NOT promise the interruptions go away. Coverage is §7 S4's
+/// The title reports unconfirmed access. The detail acknowledges that the
+/// owner may already have enabled Full Disk Access: the current process's
+/// access probe does not read the System Settings toggle. It does NOT name
+/// a folder, does NOT say which folders the grant covers, and does NOT promise
+/// the interruptions go away. Coverage is §7 S4's
 /// claim to make and S4 has not been run on this machine; scope is S1's and S1
 /// has not been run either, so no scope sentence ships at all (§3.4's own
 /// escalation). The owner's ruling is that mitigating this annoyance is
@@ -192,8 +192,8 @@ pub(crate) const ADMIN_STEP_TTL: Duration = Duration::from_secs(10 * 60);
 /// The gear is the badge glyph this widget already renders (the admin card and
 /// Robi's tips use it); like the admin card it wears [`Tone::Action`], because
 /// it carries two controls and asks for one decision.
-pub(crate) const MACOS_ACCESS_CAPTION: &str = "\u{2699} Fewer macOS file prompts \u{2014} \
-     one Full Disk Access switch in System Settings";
+pub(crate) const MACOS_ACCESS_CAPTION: &str = "\u{2699} File access not confirmed \u{2014} \
+     Full Disk Access may already be enabled";
 
 /// The access card's primary control. It opens a Settings pane; it grants
 /// nothing, and the label must not suggest otherwise.
@@ -2438,16 +2438,17 @@ mod tests {
         }
 
         // 4. It parses as the caption grammar: a pictogram for the badge, the
-        //    fact as the title, the one switch as the detail.
+        //    observed access as the title, with the owner's already-enabled
+        //    setting explicitly possible. A failed probe does not read the switch.
         let parts = caption_parts(&text);
         assert_eq!(parts.marker.as_deref(), Some("\u{2699}"));
-        assert_eq!(parts.title, "Fewer macOS file prompts");
+        assert_eq!(parts.title, "File access not confirmed");
         let detail = parts
             .detail
             .clone()
-            .expect("the detail names the one switch");
+            .expect("the detail distinguishes the switch from effective access");
         assert!(detail.contains("Full Disk Access"), "{detail}");
-        assert!(detail.contains("System Settings"), "{detail}");
+        assert!(detail.contains("may already be enabled"), "{detail}");
         assert!(
             parts.title.chars().count() + detail.chars().count() <= 75,
             "short enough to survive an ordinary window: {text:?}"
@@ -2583,8 +2584,8 @@ mod tests {
             Some(NoticeHit::NotNow)
         );
 
-        // THE ASK SURVIVES AN ORDINARY WINDOW: at 100 and 120 columns the
-        // detail — the one switch — is still on the card beside both
+        // THE QUALIFIER SURVIVES AN ORDINARY WINDOW: at 100 and 120 columns
+        // the already-enabled possibility is still on the card beside both
         // capsules. (The fit order drops the detail first, so a long caption
         // would leave a topic with two buttons and no sentence.)
         for cols in [100usize, 120] {
@@ -2598,6 +2599,14 @@ mod tests {
             let p = layout(&n, &g, hold, 0.0, 1.0);
             assert!(p.w > 0.0, "{cols} cols fits the card");
             assert!(p.detail.is_some(), "{cols} cols keeps the ask (w={})", p.w);
+            assert!(
+                p.detail
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .contains("may already be enabled"),
+                "{cols} cols preserves the qualification"
+            );
             assert!(p.buttons.is_some());
         }
         // The controls survive the fit order: a narrow window drops the

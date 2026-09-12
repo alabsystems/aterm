@@ -17,6 +17,7 @@ use winit::event_loop::EventLoopProxy;
 use super::{Scope, json_ok, json_str_field, pct_encode};
 use crate::Wake;
 use crate::app_introspect::SessionWindowRow;
+use crate::input::InputEvent;
 use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::{ExitActor, SessionHandle, Store};
 use crate::session_timeline::{
@@ -720,10 +721,27 @@ pub(crate) fn cmd_ready(
     }
 }
 
-/// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | block> [timeout <ms>]`
-/// — block until the Observation Kernel (L0) latches the predicate, then return
-/// `OK <kind> <seq>`; `OK timeout` if the overall deadline elapses; `ERR exited`
-/// if the session dies.
+/// `await <idle <ms> | seq [<n>] | match <re> [rows <a> <b>] | gone <re> [rows <a> <b>]
+/// | block | inbox since=<id> [kinds=<k,...>]> [timeout <ms>]` — block until the
+/// Observation Kernel (L0) latches the predicate, then return `OK <kind> <seq>`;
+/// `OK timeout` if the overall deadline elapses; `ERR exited` if the session dies.
+/// (`await consent [timeout=<ms>]` is dispatched to `control_privacy` before this
+/// handler is reached; the usage line names it so the alternation stays complete.)
+///
+/// `gone` is the inverse of `match` — it latches when NO visible row (in range)
+/// matches — and exists because the end of an agent's turn is often a row LEAVING
+/// (Claude Code's `esc to interrupt` busy footer) rather than one arriving: the
+/// composer glyph is on screen the whole time it thinks and the screen can sit
+/// static for seconds mid-turn, so neither `match '❯'` nor `idle` says "the turn
+/// is over". Level-triggered like `match`/`seq`: a surface with no matching row
+/// at arm latches at arm.
+///
+/// `rows <a> <b>` scopes either row predicate to an inclusive visible-row span,
+/// which must meet at least one row of the CURRENT grid (`a <= b`, `a` inside
+/// the grid) — `ERR bad rows` otherwise. A span that meets no row scans nothing:
+/// `match` could never latch on it, and `gone` must not (the kernel refuses to
+/// read an empty scan as "clear"), so without the check a typo'd range would
+/// burn the whole timeout in silence; with it the typo is named at once.
 ///
 /// This is the L1 exposure of the core primitive. The CORRECTNESS — no-silent-
 /// loss for content/match/block, and a deterministic idle deadline — lives in the
@@ -732,7 +750,7 @@ pub(crate) fn cmd_ready(
 /// is **fully event-driven, with no polling**: it registers a subscriber and
 /// parks on its wake, so it sleeps until a REAL event arrives —
 ///   * an output burst   (`Wake::Output` → `Subscribers::notify`) for content/
-///     match/block predicates,
+///     match/gone/block predicates,
 ///   * the next idle deadline (the exact `IdleFor` fire instant, via
 ///     `watch_next_deadline`) for `await idle`,
 ///   * session exit       (`Wake::Exit` → notify) → `ERR exited`,
@@ -755,8 +773,9 @@ pub(crate) fn cmd_await(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|block|\
-                         inbox since=<id> [kinds=<k,...>]> [timeout <ms>]\n";
+    const USAGE: &str = "ERR usage: await <idle <ms>|seq [<n>]|match <re> [rows <a> <b>]|\
+                         gone <re> [rows <a> <b>]|block|inbox since=<id> [kinds=<k,...>]> \
+                         [timeout <ms>] | await consent [timeout=<ms>] | await momentum <floor 0..=1> [timeout <ms>]\n";
 
     // Split off an optional `timeout <ms>` anywhere in the args; the rest is the
     // predicate + its arguments.
@@ -793,13 +812,14 @@ pub(crate) fn cmd_await(
     }
 
     let now0 = Instant::now();
-    // Arm the predicate. The `match` verb compiles an UNTRUSTED regex: that work
-    // is now bounded (row_matcher caps pattern length + NFA/DFA size) but is
-    // still non-trivial parse/compile, so do it BEFORE taking the terminal lock.
-    // Holding the Mutex across it would let a crafted (bounded) pattern stall
-    // rendering / PTY processing / other control verbs that contend for the same
-    // lock; here we lock only long enough to install the compiled matcher.
-    let armed = if kind == "match" {
+    // Arm the predicate. The `match`/`gone` verbs compile an UNTRUSTED regex:
+    // that work is now bounded (row_matcher caps pattern length + NFA/DFA size)
+    // but is still non-trivial parse/compile, so do it BEFORE taking the terminal
+    // lock. Holding the Mutex across it would let a crafted (bounded) pattern
+    // stall rendering / PTY processing / other control verbs that contend for
+    // the same lock; here we lock only long enough to install the compiled
+    // matcher. `gone` parses identically and arms the inverse predicate.
+    let armed = if kind == "match" || kind == "gone" {
         let Some(pat) = args.get(1) else {
             return USAGE.to_string();
         };
@@ -811,12 +831,27 @@ pub(crate) fn cmd_await(
             _ => RowRange::All,
         };
         // Compile the regex in `aterm-observe` (regex out of the engine core),
-        // OUTSIDE the lock; only `watch_rows` runs under it.
+        // OUTSIDE the lock; only `watch_rows`/`watch_rows_gone` runs under it.
         let matcher = match aterm_observe::row_matcher(pat) {
             Ok(m) => m,
             Err(_) => return "ERR badregex\n".to_string(),
         };
-        term_lock(term).watch_rows(matcher, range, now0)
+        let mut t = term_lock(term);
+        // The span must meet the CURRENT grid. An empty span scans nothing, so
+        // `match` could never latch on it and `gone` must not (the kernel refuses
+        // a vacuous "clear"): name the typo now rather than burn the timeout.
+        let grid_rows = t.rows() as usize;
+        if !range.covers_any(grid_rows) {
+            return format!(
+                "ERR bad rows: the span meets no visible row (grid rows 0..={})\n",
+                grid_rows.saturating_sub(1)
+            );
+        }
+        if kind == "gone" {
+            t.watch_rows_gone(matcher, range, now0)
+        } else {
+            t.watch_rows(matcher, range, now0)
+        }
     } else {
         let mut t = term_lock(term);
         match kind {
@@ -851,7 +886,7 @@ pub(crate) fn cmd_await(
 
     // Register a subscriber on THIS session: the producer's `Wake::Output` and
     // `Wake::Exit` hooks (`Subscribers::notify`) wake us the instant output lands
-    // or the session dies — so content predicates (`seq`/`match`/`block`) and
+    // or the session dies — so content predicates (`seq`/`match`/`gone`/`block`) and
     // exit detection are event-driven with NO fixed-interval poll. `await idle`
     // parks straight to the kernel's `next_deadline`. The single-slot notify is
     // lossless (a wake that arrives between two `wait`s stays pending), and the
@@ -932,10 +967,371 @@ pub(crate) struct TurnIo<'a> {
     /// Press a named key (the `key` verb vocabulary, e.g. "enter"). `false`
     /// means the name did not parse — reported as a usage error.
     pub press: &'a dyn Fn(&str) -> bool,
+    /// Press ONE pre-built key event — `turn typed=1`'s per-grapheme press,
+    /// through the SAME route `press` takes (the event-loop seam for the tab
+    /// on screen, the source-blind seam for a background target). The verb
+    /// builds the event ([`typed_key_events`]) and the route delivers it; the
+    /// seam never learns who pressed. `false` means the route refused it.
+    /// The paste-only base ([`TurnIo::paste_only`]) refuses every press, so a
+    /// caller that has no key route answers `typed=1` honestly.
+    pub key: &'a dyn Fn(InputEvent) -> bool,
+    /// ONE reading of the target's typing-momentum metric (the raw
+    /// `trail status momentum=` number) with the instant it was read — what
+    /// `turn yield=<floor>` solves the release law from. `Err` names why no
+    /// reading exists (no event loop, a dropped reply); the turn then refuses
+    /// the yield rather than typing over a ribbon it could not see.
+    pub momentum: &'a dyn Fn() -> Result<(f32, std::time::Instant), String>,
 }
 
-/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>]
-/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] <text>` — one complete HUMAN
+impl TurnIo<'static> {
+    /// The two routes a plain `turn` needs and none of the even-hand ones: a
+    /// base for `..TurnIo::paste_only()` at a site that pastes and presses only
+    /// (the durable operator, the keyed replay path). `typed=1` and `yield=`
+    /// against it answer `ERR`, never a silent downgrade to a paste.
+    pub(crate) fn paste_only() -> Self {
+        fn no_paste(_: &str) -> bool {
+            false
+        }
+        fn no_key(_: InputEvent) -> bool {
+            false
+        }
+        fn no_momentum() -> Result<(f32, std::time::Instant), String> {
+            Err("no momentum source on this route".to_string())
+        }
+        TurnIo {
+            paste: &no_paste,
+            press: &no_paste,
+            key: &no_key,
+            momentum: &no_momentum,
+        }
+    }
+}
+
+/// The typed-prefix cap of `turn typed=1`: at most this many graphemes are
+/// pressed one key at a time; the remainder is ONE paste (the remainder's
+/// voice is the paste's own — one up-strum of the music box's live chord,
+/// keyed off the event kind at the seam, never off a source). 240 graphemes at
+/// the default cadence is ~17 s of typing, inside the default 240 s deadline
+/// with room for the reply; past that a turn is a document, not a sentence.
+pub(crate) const TYPED_CAP: usize = 240;
+
+/// The default inter-key interval of `turn typed=1`, in milliseconds. A
+/// jitter-free 70 ms IOI (~14 cps, held exactly) is the typed turn's ONE
+/// honest signature: no hand holds a cadence to the millisecond, and the seam
+/// is told nothing else — every key it sees is the tuple a keyboard builds.
+pub(crate) const TYPED_CADENCE_MS: u64 = 70;
+
+/// The US-layout BASE key SHIFT composes `c` from — the inverse of
+/// `aterm_types::keyboard::shifted_character`, so a typed turn presses the
+/// same `(Key::Character(base), SHIFT)` a keyboard presses for a capital or a
+/// shifted symbol and the encoder recomposes the glyph itself. `None` when
+/// `c` is not a shifted glyph on that layout.
+fn unshift_us(c: char) -> Option<char> {
+    Some(match c {
+        'A'..='Z' => c.to_ascii_lowercase(),
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '~' => '`',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        _ => return None,
+    })
+}
+
+/// Whether `base` is a key `aterm_winit_keymap::base_layout_key_for` names —
+/// the US-QWERTY identity a physical press carries in the Kitty alternate-key
+/// field — so a typed turn's `base_layout` matches a US keyboard's exactly.
+fn has_us_base_layout(base: char) -> bool {
+    base.is_ascii_lowercase()
+        || base.is_ascii_digit()
+        || matches!(
+            base,
+            '`' | '-' | '=' | '[' | ']' | '\\' | ';' | '\'' | ',' | '.' | '/'
+        )
+}
+
+/// ONE grapheme of a typed turn as the key event a keyboard builds for it:
+/// a capital or shifted symbol is its base key under SHIFT (the encoder
+/// composes the glyph, as it does for a human), the spacebar is
+/// `NamedKey::Space`, a line break is `Enter`, a tab is `Tab`, and a
+/// multi-scalar cluster (an emoji sequence, a composed accent) is a committed
+/// `Text` run — the IME path, which is also a keyboard's. Control characters
+/// other than those three are dropped (`None`): the paste path strips them
+/// and a keyboard has no key for them.
+fn typed_key_event(g: &str) -> Option<InputEvent> {
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+    let mut chars = g.chars();
+    let (key, mods) = match (chars.next(), chars.next()) {
+        (Some('\n' | '\r'), None) => (Key::Named(NamedKey::Enter), Modifiers::empty()),
+        (Some('\r'), Some('\n')) if chars.next().is_none() => {
+            (Key::Named(NamedKey::Enter), Modifiers::empty())
+        }
+        (Some('\t'), None) => (Key::Named(NamedKey::Tab), Modifiers::empty()),
+        (Some(' '), None) => (Key::Named(NamedKey::Space), Modifiers::empty()),
+        (Some(c), None) if c.is_control() => return None,
+        (Some(c), None) => match unshift_us(c) {
+            Some(base) => (Key::Character(base), Modifiers::SHIFT),
+            None => (Key::Character(c), Modifiers::empty()),
+        },
+        (Some(_), Some(_)) => return Some(InputEvent::Text(g.to_string())),
+        (None, _) => return None,
+    };
+    let base_layout = match key {
+        Key::Character(base) if has_us_base_layout(base) => Some(base),
+        _ => None,
+    };
+    Some(InputEvent::Key {
+        key,
+        mods,
+        base_layout,
+        event_type: KeyEventType::Press,
+    })
+}
+
+/// `turn typed=1`'s press list for `text`, one event per grapheme
+/// ([`typed_key_event`]), pure so the tuple a typed turn presses is pinned
+/// beside the tuple a keyboard presses without an event loop.
+pub(crate) fn typed_key_events(text: &str) -> Vec<InputEvent> {
+    use aterm_grapheme::GraphemeClusters;
+    text.graphemes().filter_map(typed_key_event).collect()
+}
+
+/// Split `text` at the [`TYPED_CAP`]th grapheme: `(typed prefix, pasted
+/// remainder)`. The remainder is empty for a text inside the cap.
+pub(crate) fn split_typed_cap(text: &str) -> (&str, &str) {
+    use aterm_grapheme::GraphemeClusters;
+    match text.grapheme_indices().nth(TYPED_CAP) {
+        Some((at, _)) => text.split_at(at),
+        None => (text, ""),
+    }
+}
+
+/// How a park on one watcher ended. Shared by the `turn` phases and the
+/// momentum wait so every parked verb reads exit, latch and deadline alike.
+enum Phase {
+    Latched,
+    Deadline,
+    Exited,
+}
+
+/// Park until watcher `id` latches, `until` passes, or `exited()` — the ONE
+/// event-driven wait every `turn` phase and the momentum predicate use: a
+/// subscriber wake (output / exit), the kernel's next deadline, or the
+/// backstop. Disarms the watcher on every path. Zero polling: each wake is a
+/// real event or a deadline the kernel named.
+fn park_watch(
+    term: &Arc<Mutex<Terminal>>,
+    exited: &dyn Fn() -> bool,
+    sub: &crate::subscribe::Subscription,
+    id: aterm_core::terminal::WatchId,
+    until: std::time::Instant,
+) -> Phase {
+    use std::time::{Duration, Instant};
+    loop {
+        if exited() {
+            term_lock(term).watch_disarm(id);
+            return Phase::Exited;
+        }
+        let now = Instant::now();
+        let (sat, next_dl) = {
+            let mut t = term_lock(term);
+            t.watch_expire(now);
+            (t.watch_poll(id), t.watch_next_deadline())
+        };
+        if sat.is_some() {
+            term_lock(term).watch_disarm(id);
+            return Phase::Latched;
+        }
+        if now >= until {
+            term_lock(term).watch_disarm(id);
+            return Phase::Deadline;
+        }
+        let mut wake = until;
+        if let Some(dl) = next_dl {
+            wake = wake.min(dl);
+        }
+        let dur = wake
+            .saturating_duration_since(now)
+            .max(Duration::from_millis(1));
+        let _ = sub.wait(dur);
+    }
+}
+
+/// How a wait for the ribbon to exhale ended. `Below` and `Deadline` carry
+/// the last reading so the reply can say where the ribbon stood.
+pub(crate) enum MomentumWait {
+    /// The metric read at or under the floor.
+    Below(f32),
+    /// The backstop passed first; the reading is the one taken at that moment.
+    Deadline(f32),
+    /// The session died while parked.
+    Exited,
+    /// No reading could be taken (the reason), or the watcher budget was full.
+    Unreadable(String),
+}
+
+/// Classify a fresh read before another timer is armed. A satisfied reading
+/// keeps precedence; an unmet reading cannot re-park beyond the backstop even
+/// if the previous crossing latched immediately (or the GUI reply was delayed).
+/// The bounded guard contract is `momentum_wait_read_model`.
+fn momentum_read_outcome(
+    value: f32,
+    floor: f32,
+    now: std::time::Instant,
+    until: std::time::Instant,
+) -> Option<MomentumWait> {
+    if value <= floor {
+        Some(MomentumWait::Below(value))
+    } else if now >= until {
+        Some(MomentumWait::Deadline(value))
+    } else {
+        None
+    }
+}
+
+/// THE YIELD: park until the target's typing momentum has decayed to
+/// `floor`, ANALYTICALLY — one reading, one crossing solved from the spine's
+/// release law (`TypingMomentum::reading_low_crossing`, τ = 2 s), ONE kernel timer
+/// ([`WatcherSpec::MomentumBelow`]), no polling. When the timer fires the
+/// metric is read again: at or under the floor the wait is over; above it
+/// the human re-lit the ribbon while we parked, and the next crossing is
+/// solved from that reading. So every wake is a crossing of a real reading,
+/// and the human's typing is never touched — the agent yields, the human never
+/// waits. Bounded by `until` and by session exit like every other park.
+pub(crate) fn park_until_momentum_below(
+    term: &Arc<Mutex<Terminal>>,
+    exited: &dyn Fn() -> bool,
+    sub: &crate::subscribe::Subscription,
+    read: &dyn Fn() -> Result<(f32, std::time::Instant), String>,
+    floor: f32,
+    until: std::time::Instant,
+) -> MomentumWait {
+    use aterm_core::terminal::WatcherSpec;
+    use aterm_effects::typing_momentum::TypingMomentum;
+    loop {
+        let (v, at) = match read() {
+            Ok(r) => r,
+            Err(e) => return MomentumWait::Unreadable(e),
+        };
+        // Preserve the shared park's exit priority for an unmet reading.
+        if v > floor && exited() {
+            return MomentumWait::Exited;
+        }
+        if let Some(outcome) = momentum_read_outcome(v, floor, std::time::Instant::now(), until) {
+            return outcome;
+        }
+        let mut metric = TypingMomentum::default();
+        metric.set_value(at, v);
+        let crossing = metric.reading_low_crossing(floor).unwrap_or(at);
+        let armed = term_lock(term).watch(
+            WatcherSpec::MomentumBelow { floor, crossing },
+            std::time::Instant::now(),
+        );
+        let Some(id) = armed else {
+            return MomentumWait::Unreadable("watcher budget full".to_string());
+        };
+        match park_watch(term, exited, sub, id, until) {
+            // The crossing passed: confirm on a fresh reading (the loop head),
+            // which is also where a re-lit ribbon gets its next crossing.
+            Phase::Latched => {}
+            Phase::Deadline => {
+                let now_v = read().map_or(v, |(v, _)| v);
+                return MomentumWait::Deadline(now_v);
+            }
+            Phase::Exited => return MomentumWait::Exited,
+        }
+    }
+}
+
+/// `await momentum <floor> [timeout <ms>|timeout=<ms>]` — block until the
+/// typing momentum of the window hosting this session (the raw
+/// `trail status momentum=` number) has decayed to `floor` (0..=1), then
+/// `OK momentum <v>`; `OK timeout` past the deadline (default 30 s), `ERR
+/// exited` if the session dies. The wait is [`park_until_momentum_below`]:
+/// analytic, one timer per reading, no polling — an agent uses it to wait for
+/// the human's ribbon to exhale before typing into a shared session.
+pub(crate) fn cmd_await_momentum(
+    term: &Arc<Mutex<Terminal>>,
+    store: &Store,
+    session: u64,
+    rest: &str,
+    subscribers: &crate::subscribe::Subscribers,
+    read: &dyn Fn() -> Result<(f32, std::time::Instant), String>,
+) -> String {
+    use std::time::{Duration, Instant};
+
+    use crate::session_store::SessionState;
+    use crate::subscribe::SubscriberSet;
+
+    const USAGE: &str = "ERR usage: await momentum <floor 0..=1> [timeout <ms>]\n";
+    let mut floor: Option<f32> = None;
+    let mut timeout_ms = 30_000u64;
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let mut i = 0;
+    while i < toks.len() {
+        if i == 0 && toks[0] == "momentum" {
+            i += 1;
+        } else if let Some(v) = toks[i].strip_prefix("timeout=") {
+            timeout_ms = v.parse().unwrap_or(30_000);
+            i += 1;
+        } else if toks[i] == "timeout" && i + 1 < toks.len() {
+            timeout_ms = toks[i + 1].parse().unwrap_or(30_000);
+            i += 2;
+        } else if floor.is_none() {
+            match toks[i].parse::<f32>() {
+                Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => floor = Some(f),
+                _ => return USAGE.to_string(),
+            }
+            i += 1;
+        } else {
+            return USAGE.to_string();
+        }
+    }
+    let Some(floor) = floor else {
+        return USAGE.to_string();
+    };
+    let until = Instant::now() + Duration::from_millis(timeout_ms.min(600_000));
+    let sub = SubscriberSet::register(subscribers, &[session]);
+    let was_registered = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_local(session)
+        .is_some();
+    let exited = || -> bool {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        match g.by_local(session).map(|h| h.state) {
+            Some(SessionState::Exited) => true,
+            None => was_registered,
+            _ => false,
+        }
+    };
+    match park_until_momentum_below(term, &exited, &sub, read, floor, until) {
+        MomentumWait::Below(v) => format!("OK momentum {v:.2}\n"),
+        MomentumWait::Deadline(_) => "OK timeout\n".to_string(),
+        MomentumWait::Exited => "ERR exited\n".to_string(),
+        MomentumWait::Unreadable(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>|gone:<re>]
+/// [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>]
+/// [yield=<floor>] <text>` — one complete HUMAN
 /// TURN against the target session: type `<text>`, submit it with a real keypress,
 /// block until the app's response settles, and return the settled screen —
 /// `OK <rows> turn submitted=<0|1> status=<settled|timeout> seq=<n> id=<n>
@@ -990,12 +1386,46 @@ pub(crate) struct TurnIo<'a> {
 /// (a status-bar clock, a spinner, `watch -n1`) never goes idle, so an idle-settle
 /// turn against it burns the full timeout; pass `settle=match:<re>` to key settle
 /// on a screen PATTERN instead (the same regex/`RowRange` machinery as
-/// `await match`), or lower `idle=` below the repaint cadence.
+/// `await match`), `settle=gone:<re>` to key it on that pattern LEAVING the
+/// screen (`await gone` — a busy footer such as Claude Code's `esc to interrupt`
+/// disappearing), or lower `idle=` below the repaint cadence.
+///
+/// `settle=gone:` is TWO waits, not one, because `await gone` is level-triggered:
+/// arming it on a screen the busy footer has not painted yet would latch at arm
+/// and report `status=settled` over the PRE-response screen — and the verified
+/// submit can be satisfied by the input line clearing one frame before the footer
+/// lands. So phase 3 first waits (bounded by `submit_window`, the same window the
+/// submit had to move the screen) for `<re>` to APPEAR after the verified submit,
+/// and only then for it to LEAVE. A pattern that never appears inside that window
+/// degrades to the default idle settle: a wrong pattern, or a turn too quick to
+/// show its footer, behaves like a plain `turn` instead of settling instantly on
+/// a screen nothing was read from. A caller who needs certainty follows the turn
+/// with `await gone <re>` while the footer is up.
 ///
 /// Fully event-driven like `ready`/`await` (subscriber park + kernel deadlines,
 /// zero polling). Empty `<text>` skips the paste (submit-only: useful to fire a
 /// chip already sitting in the target's editor); `submit=none` skips the press
 /// (type-only). `ERR exited` if the target dies at any phase.
+///
+/// THE EVEN HAND (RAINBOW-KITTY-V2.md §28). A plain turn is a PASTE: one
+/// event, no keystroke behind any cell, so it lays no ribbon, earns no
+/// stardust and steps no melody — every light has a keystroke behind it, and
+/// a paste is not one. `typed=1` presses `<text>` one `InputEvent::Key` per
+/// grapheme through the SAME route a keyboard's presses take, at `cadence=<ms>`
+/// (default [`TYPED_CADENCE_MS`]), from an absolute schedule so the interval
+/// never drifts: an agent's typed turn lays real ribbon and earns real
+/// stardust, and its only signature is TIME — a jitter-free cadence no hand
+/// produces. The seam is told nothing else ([`typed_key_events`] builds the
+/// tuple a keyboard builds; `input.rs`'s indistinguishability invariant is
+/// untouched). The typed prefix is capped at [`TYPED_CAP`] graphemes and the
+/// remainder is ONE paste, voiced as one up-strum by the paste seam.
+/// `yield=<floor>` parks BEFORE typing until the target's typing momentum has
+/// exhaled to `floor` ([`park_until_momentum_below`]: analytic, one timer per
+/// reading, no polling); the human's own typing is never blocked — the agent
+/// yields, the human never waits. A yield that outlives the deadline answers
+/// `ERR yield timeout momentum=<v>` having typed nothing. The verdict gains
+/// `typed=<keys> pasted=<graphemes>` for a typed turn and `yielded_ms=<n>`
+/// for a yielded one; a plain turn's reply is byte-identical to before.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -1047,7 +1477,7 @@ pub(crate) fn cmd_turn_guarded(
     use crate::session_store::SessionState;
     use crate::subscribe::SubscriberSet;
 
-    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] <text>\n";
+    const USAGE: &str = "ERR usage: turn [idle=<ms>] [timeout=<ms>] [submit=<key|none>] [settle=match:<re>|gone:<re>] [submit_window=<ms>] [presses=<n>] [submit_verify=<auto|seq|block>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [yield=<floor>] <text>\n";
     /// Echo-settle window: the paste burst has been ingested and painted.
     const ECHO_SETTLE: Duration = Duration::from_millis(150);
     /// Echo phase cap — a busy app (spinner mid-turn) may never go echo-quiet;
@@ -1072,11 +1502,18 @@ pub(crate) fn cmd_turn_guarded(
     // signal, so seq is the best available). So a shell drive is sound by default.
     let mut submit_verify: Option<bool> = None;
     // `settle=match:<re>` keys phase-3 settle on a screen PATTERN instead of global
-    // idle; None => the default idle settle. Compiled below, before any input.
-    let mut settle_match: Option<String> = None;
+    // idle, `settle=gone:<re>` on that pattern LEAVING the screen (the `gone` flag);
+    // None => the default idle settle. Compiled below, before any input.
+    let mut settle_match: Option<(bool, String)> = None;
     // `trim=1` drops the settled screen's trailing blank rows from the reply (the
     // `text trim` rule); off by default so a script that counts rows sees the grid.
     let mut trim = false;
+    // THE EVEN HAND: `typed=1` presses one key per grapheme at `cadence=` ms
+    // (absolute schedule); `yield=<floor>` parks before typing until the
+    // target's typing momentum has exhaled to the floor.
+    let mut typed = false;
+    let mut cadence_ms = TYPED_CADENCE_MS;
+    let mut yield_floor: Option<f32> = None;
     let mut text = rest.trim_start();
     loop {
         let (tok, tail) = match text.split_once(char::is_whitespace) {
@@ -1114,13 +1551,31 @@ pub(crate) fn cmd_turn_guarded(
                 "auto" => submit_verify = None,
                 _ => return USAGE.to_string(),
             },
-            "settle" => match v.strip_prefix("match:") {
-                Some(pat) if !pat.is_empty() => settle_match = Some(pat.to_string()),
+            "settle" => match v.split_once(':') {
+                Some(("match", pat)) if !pat.is_empty() => {
+                    settle_match = Some((false, pat.to_string()));
+                }
+                Some(("gone", pat)) if !pat.is_empty() => {
+                    settle_match = Some((true, pat.to_string()));
+                }
                 _ => return USAGE.to_string(),
             },
             "trim" => match v {
                 "1" => trim = true,
                 "0" => trim = false,
+                _ => return USAGE.to_string(),
+            },
+            "typed" => match v {
+                "1" => typed = true,
+                "0" => typed = false,
+                _ => return USAGE.to_string(),
+            },
+            "cadence" => match v.parse::<u64>() {
+                Ok(ms) => cadence_ms = ms.clamp(1, 2_000),
+                Err(_) => return USAGE.to_string(),
+            },
+            "yield" => match v.parse::<f32>() {
+                Ok(f) if f.is_finite() && (0.0..=1.0).contains(&f) => yield_floor = Some(f),
                 _ => return USAGE.to_string(),
             },
             _ => break, // not an option: the message itself starts with `word=…`
@@ -1129,12 +1584,13 @@ pub(crate) fn cmd_turn_guarded(
     }
     let timeout_ms = timeout_ms.min(600_000);
 
-    // Compile a `settle=match:<re>` pattern up front (untrusted regex, bounded by
-    // `row_matcher`) OUTSIDE the terminal lock and BEFORE the lease/paste, so a bad
-    // pattern fails fast without ever typing into the target or holding the lease.
+    // Compile a `settle=match:<re>`/`settle=gone:<re>` pattern up front (untrusted
+    // regex, bounded by `row_matcher`) OUTSIDE the terminal lock and BEFORE the
+    // lease/paste, so a bad pattern fails fast without ever typing into the target
+    // or holding the lease.
     let settle_matcher = match &settle_match {
-        Some(pat) => match aterm_observe::row_matcher(pat) {
-            Ok(m) => Some(m),
+        Some((gone, pat)) => match aterm_observe::row_matcher(pat) {
+            Ok(m) => Some((*gone, m)),
             Err(_) => return "ERR badregex\n".to_string(),
         },
         None => None,
@@ -1215,52 +1671,70 @@ pub(crate) fn cmd_turn_guarded(
     // One subscriber for the whole turn: output/exit notifies wake every phase.
     let sub = SubscriberSet::register(subscribers, &[session]);
 
-    // Park until watcher `id` latches, `until` passes, or the session exits.
-    // Returns Some(latched seq), None on phase deadline; `ERR exited` bubbles
-    // via the Err arm. Disarms the watcher on every path.
-    enum Phase {
-        Latched,
-        Deadline,
-        Exited,
-    }
+    // Park until watcher `id` latches, `until` passes, or the session exits —
+    // `park_watch`, the one wait every phase shares. Disarms on every path.
+    let exited_now = || exited(store);
     let wait = |id: aterm_core::terminal::WatchId, until: Instant| -> Phase {
-        loop {
-            if exited(store) {
-                term_lock(term).watch_disarm(id);
-                return Phase::Exited;
-            }
-            let now = Instant::now();
-            let (sat, next_dl) = {
-                let mut t = term_lock(term);
-                t.watch_expire(now);
-                (t.watch_poll(id), t.watch_next_deadline())
-            };
-            if sat.is_some() {
-                term_lock(term).watch_disarm(id);
-                return Phase::Latched;
-            }
-            if now >= until {
-                term_lock(term).watch_disarm(id);
-                return Phase::Deadline;
-            }
-            let mut wake = until;
-            if let Some(dl) = next_dl {
-                wake = wake.min(dl);
-            }
-            let dur = wake
-                .saturating_duration_since(now)
-                .max(Duration::from_millis(1));
-            let _ = sub.wait(dur);
-        }
+        park_watch(term, &exited_now, &sub, id, until)
     };
     // Arm a watcher; None (budget full) fails the whole verb honestly.
     let arm = |spec: WatcherSpec| -> Option<aterm_core::terminal::WatchId> {
         term_lock(term).watch(spec, Instant::now())
     };
 
-    // ── phase 1: type. Paste semantics; the seam strips control bytes. ──
+    // ── phase 0: yield. Park until the human's ribbon has exhaled to the
+    // floor — analytic, one timer per reading, no polling — BEFORE any input.
+    // Nothing is typed on a timeout: an agent that could not get its turn
+    // says so rather than typing over a hand mid-sentence.
+    let mut yielded_ms: Option<u64> = None;
+    if let Some(floor) = yield_floor {
+        let yield0 = Instant::now();
+        match park_until_momentum_below(term, &exited_now, &sub, io.momentum, floor, deadline) {
+            MomentumWait::Below(_) => yielded_ms = Some(yield0.elapsed().as_millis() as u64),
+            MomentumWait::Deadline(v) => return format!("ERR yield timeout momentum={v:.2}\n"),
+            MomentumWait::Exited => return "ERR exited\n".to_string(),
+            MomentumWait::Unreadable(e) => return format!("ERR yield: {e}\n"),
+        }
+    }
+
+    // ── phase 1: type. Paste semantics by default; the seam strips control
+    // bytes. `typed=1`: one key per grapheme on an ABSOLUTE schedule (`t0 +
+    // i·cadence`, so the interval never drifts) up to the cap, then the
+    // remainder as one paste. ──
+    let mut typed_keys = 0usize;
+    let mut pasted_graphemes = 0usize;
     if !text.is_empty() {
-        if !(io.paste)(text) {
+        if typed {
+            use aterm_grapheme::GraphemeClusters;
+            let (head, remainder) = split_typed_cap(text);
+            let cadence = Duration::from_millis(cadence_ms);
+            let type0 = Instant::now();
+            for (i, ev) in typed_key_events(head).into_iter().enumerate() {
+                let due = type0 + cadence * i as u32;
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+                // The deadline bounds the typing too: a turn does not keep
+                // pressing keys into a session after its own budget is spent.
+                if Instant::now() >= deadline {
+                    break;
+                }
+                if exited(store) {
+                    return "ERR exited\n".to_string();
+                }
+                if !(io.key)(ev) {
+                    return "ERR key delivery failed\n".to_string();
+                }
+                typed_keys += 1;
+            }
+            if !remainder.is_empty() {
+                pasted_graphemes = remainder.graphemes().count();
+                if !(io.paste)(remainder) {
+                    return "ERR paste delivery failed\n".to_string();
+                }
+            }
+        } else if !(io.paste)(text) {
             return "ERR paste delivery failed\n".to_string();
         }
         // Echo settle: the editor ingested + painted the burst. Cap the phase so
@@ -1389,9 +1863,40 @@ pub(crate) fn cmd_turn_guarded(
         // assumes the app stops painting when done. `settle=match:<re>` keys on a
         // screen PATTERN instead — for a periodically-repainting TUI (clock,
         // spinner, `watch`) that never goes idle and would otherwise burn the
-        // whole timeout.
+        // whole timeout — and `settle=gone:<re>` on that pattern LEAVING (a busy
+        // footer that is the only honest "turn over" signal).
         let armed = match &settle_matcher {
-            Some(m) => term_lock(term).watch_rows(
+            Some((true, m)) => {
+                // `gone` is level-triggered, so it must not be armed before the
+                // busy pattern is ON the screen: the verified submit can be the
+                // input line clearing, with the footer landing a frame later, and
+                // a `gone` armed in that gap latches at arm over the pre-response
+                // screen. Phase 3a: wait (bounded by `submit_window`) for the
+                // pattern to APPEAR; phase 3b: for it to LEAVE. Never seen inside
+                // the window => the default idle settle, the honest degrade for a
+                // wrong pattern or a turn too quick to paint its footer.
+                let Some(seen) = term_lock(term).watch_rows(
+                    m.clone(),
+                    aterm_core::terminal::RowRange::All,
+                    Instant::now(),
+                ) else {
+                    return "ERR watcher budget full\n".to_string();
+                };
+                let appear_by =
+                    deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
+                match wait(seen, appear_by) {
+                    Phase::Exited => return "ERR exited\n".to_string(),
+                    Phase::Latched => term_lock(term).watch_rows_gone(
+                        m.clone(),
+                        aterm_core::terminal::RowRange::All,
+                        Instant::now(),
+                    ),
+                    Phase::Deadline => arm(WatcherSpec::IdleFor {
+                        dur: Duration::from_millis(idle_ms),
+                    }),
+                }
+            }
+            Some((false, m)) => term_lock(term).watch_rows(
                 m.clone(),
                 aterm_core::terminal::RowRange::All,
                 Instant::now(),
@@ -1463,11 +1968,21 @@ pub(crate) fn cmd_turn_guarded(
     // this id and the one a driver diffs across turns — not a checksum of the bytes
     // sent, so the same settled screen hashes the same whether or not the caller
     // asked for its blank tail.
-    let verdict = format!(
+    let mut verdict = format!(
         "turn submitted={} status={status} seq={seq} id={turn_id} dur_ms={dur_ms} hash={screen_hash:016x}",
         u8::from(submitted)
     );
-    super::control_query::frame_rows_reply(&screen, rows, &verdict, trim)
+    // The even hand's fields ride only the turns that asked for them, so a
+    // plain turn's verdict is byte-identical to before.
+    if typed {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " typed={typed_keys} pasted={pasted_graphemes}");
+    }
+    if let Some(ms) = yielded_ms {
+        use std::fmt::Write as _;
+        let _ = write!(verdict, " yielded_ms={ms}");
+    }
+    super::control_query::frame_rows_reply(&screen, rows, &verdict, trim, 0)
 }
 
 /// `history [<n>] [since=<id>]` -> the session's TURN LEDGER, newest-last, framed
@@ -2325,6 +2840,163 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
 mod tests {
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
+
+    /// Tier-1: every production read decision has exactly the model's guard.
+    /// The retired decision re-armed after an expired, unmet reading.
+    #[test]
+    fn momentum_wait_read_guards_conform_and_catch_expired_reparking() {
+        use std::time::{Duration, Instant};
+
+        let model = aterm_spec::derive::momentum_wait_read_model();
+        let now = Instant::now();
+        for (value, floor) in [(0.0, 0.0), (0.000_75, 0.0), (0.000_75, 0.000_7)] {
+            for expired in [false, true] {
+                let until = if expired {
+                    now
+                } else {
+                    now + Duration::from_secs(1)
+                };
+                let mut state = model.init_state();
+                let met = value <= floor;
+                let observe = match (met, expired) {
+                    (false, false) => "ReadLive",
+                    (false, true) => "ReadExpired",
+                    (true, false) => "ReadBelow",
+                    (true, true) => "ReadBelowExpired",
+                };
+                assert!(model.fire(observe, &mut state));
+                let chosen = match momentum_read_outcome(value, floor, now, until) {
+                    Some(MomentumWait::Below(v)) => {
+                        assert_eq!(v, value);
+                        "Below"
+                    }
+                    Some(MomentumWait::Deadline(v)) => {
+                        assert_eq!(v, value);
+                        "Deadline"
+                    }
+                    None => "Park",
+                    _ => panic!("a pure read cannot exit or fail"),
+                };
+                for action in ["Below", "Deadline", "Park"] {
+                    assert_eq!(model.action_enabled(action, &state), chosen == action);
+                }
+                let mut post = state.clone();
+                assert!(model.fire(chosen, &mut post));
+                let (valid, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &state,
+                    &post,
+                    Some(chosen),
+                    "real momentum read guard",
+                );
+                assert!(valid, "{why}");
+                if expired && !met {
+                    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+                    assert!(buggy.fire("Park", &mut state));
+                    assert!(!model.check_invariant("ExpiredReadingCannotRepark", &state));
+                }
+            }
+        }
+    }
+
+    /// Genuine momentum, terminal watchers and subscriber parking. The read cap
+    /// makes a reintroduced immediate-latch loop fail instead of hanging.
+    #[test]
+    fn momentum_wait_zero_and_low_floors_park_once_until_the_real_reading_matches() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        use aterm_effects::typing_momentum::TypingMomentum;
+
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let subscribers = crate::subscribe::new_registry();
+        let sub = crate::subscribe::SubscriberSet::register(&subscribers, &[0]);
+        for (value, floor) in [(0.000_51, 0.0), (0.000_51, 0.000_1), (0.000_75, 0.000_7)] {
+            let at = Instant::now();
+            let metric = Cell::new(TypingMomentum::default());
+            let reads = Cell::new(0);
+            let read = || {
+                reads.set(reads.get() + 1);
+                if reads.get() > 4 {
+                    return Err("immediate-latch read loop".to_string());
+                }
+                let now = Instant::now();
+                if reads.get() == 1 {
+                    let mut warm = TypingMomentum::default();
+                    warm.set_value(now, value);
+                    metric.set(warm);
+                }
+                Ok((metric.get().value(now), now))
+            };
+            match park_until_momentum_below(
+                &term,
+                &|| false,
+                &sub,
+                &read,
+                floor,
+                at + Duration::from_secs(2),
+            ) {
+                MomentumWait::Below(v) => assert!(v <= floor),
+                MomentumWait::Unreadable(why) => panic!("{why}"),
+                _ => panic!("the real metric must reach {floor}"),
+            }
+            assert_eq!(reads.get(), 2, "one solving read and one confirmation");
+            assert!(term_lock(&term).watch_next_deadline().is_none());
+        }
+    }
+
+    #[test]
+    fn momentum_wait_low_floor_honors_timeout_and_expired_read_backstop() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let subscribers = crate::subscribe::new_registry();
+        let sub = crate::subscribe::SubscriberSet::register(&subscribers, &[0]);
+        for floor in [0.0, 0.000_1, 0.000_7] {
+            let reads = Cell::new(0);
+            let read = || {
+                reads.set(reads.get() + 1);
+                if reads.get() > 4 {
+                    return Err("immediate-latch read loop".to_string());
+                }
+                Ok((0.000_75, Instant::now()))
+            };
+            let until = Instant::now() + Duration::from_millis(20);
+            assert!(matches!(
+                park_until_momentum_below(&term, &|| false, &sub, &read, floor, until),
+                MomentumWait::Deadline(v) if v > floor
+            ));
+            assert!(
+                (1..=2).contains(&reads.get()),
+                "at most the solving read and deadline read, without polling"
+            );
+            assert!(term_lock(&term).watch_next_deadline().is_none());
+        }
+
+        // A late GUI reply can carry a crossing already behind the backstop.
+        // Checking only park_watch is insufficient: latch precedes its timeout.
+        let now = Instant::now();
+        let reads = Cell::new(0);
+        let stale = || {
+            reads.set(reads.get() + 1);
+            if reads.get() > 4 {
+                return Err("expired reading re-parked".to_string());
+            }
+            Ok((0.000_75, now - Duration::from_secs(10)))
+        };
+        assert!(matches!(
+            park_until_momentum_below(&term, &|| false, &sub, &stale, 0.0, now),
+            MomentumWait::Deadline(v) if v > 0.0
+        ));
+        assert_eq!(reads.get(), 1);
+        assert!(term_lock(&term).watch_next_deadline().is_none());
+        assert!(matches!(
+            park_until_momentum_below(&term, &|| true, &sub, &stale, 0.0, now),
+            MomentumWait::Exited
+        ));
+    }
 
     /// A registered handle over a bare engine (sentinel `master = -1`): the same
     /// shape `control_host`'s roster tests build, so these lines are the real

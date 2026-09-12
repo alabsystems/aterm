@@ -124,7 +124,7 @@ const HELP_HEAD: &str = concat!(
     "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
     "                              this session; see `aterm help reroute`.\n",
     "    -q, --quiet               Suppress the one-line interactive startup notice\n",
-    "                              (piped/scripted runs are always silent).\n",
+    "                              (already silent unless stdin and stderr are TTYs).\n",
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
     "\n",
@@ -176,6 +176,8 @@ pub enum Verb {
     Fleet,
     /// `aterm drive` — the agent drive CLI (sugar over await/send).
     Drive,
+    /// `aterm link` — the fabric bridge (`serve`, `ls`, `hook`, `mirror`, …).
+    Link,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
     /// `aterm update` — the headless update lane (status/check, no window).
@@ -198,6 +200,7 @@ impl Verb {
         Verb::Pkg,
         Verb::Fleet,
         Verb::Drive,
+        Verb::Link,
         Verb::Ship,
         Verb::Update,
         Verb::Agents,
@@ -214,6 +217,7 @@ impl Verb {
             Verb::Pkg => "pkg",
             Verb::Fleet => "fleet",
             Verb::Drive => "drive",
+            Verb::Link => "link",
             Verb::Ship => "ship",
             Verb::Update => "update",
             Verb::Agents => "agents",
@@ -239,6 +243,7 @@ impl Verb {
             Verb::Pkg => Some("atpkg"),
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
+            Verb::Link => Some("aterm-link"),
             // The windowing verbs never were sibling binaries, and never should
             // be: `new-tab` on PATH would shadow nothing of aterm's but would be
             // a wildly generic name to install into a user's `$PATH`.
@@ -271,6 +276,7 @@ impl Verb {
             | Verb::Pkg
             | Verb::Fleet
             | Verb::Drive
+            | Verb::Link
             | Verb::Ship
             | Verb::Update
             | Verb::Agents => false,
@@ -285,6 +291,7 @@ impl Verb {
             Verb::Pkg => "aterm pkg <args>",
             Verb::Fleet => "aterm fleet <args>",
             Verb::Drive => "aterm drive <args>",
+            Verb::Link => "aterm link <args>",
             Verb::Ship => "aterm ship <args>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
@@ -312,6 +319,9 @@ impl Verb {
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &["Federate many sessions' events; dispatch commands back."],
+            Verb::Link => {
+                &["The fabric bridge: carry inbox/post between this instance and the bus."]
+            }
             Verb::Drive => &["The agent drive CLI (prompt / read / await / shot)."],
             Verb::Ship => &[
                 "Publish aterm: provision a signing machine, cut and",
@@ -652,9 +662,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 enabled / check         the silent Full Disk Access probe. It reads state that already\n\
      \x20                         exists and raises NO dialog. Off, every field reads `unknown` —\n\
      \x20                         which is not `denied`, and the report says which it is.\n\
-     \x20 notice                  the one-time macOS access card: while Full Disk Access is not\n\
-     \x20                         granted to aterm, ONE passive card offers Open Settings (the\n\
-     \x20                         Full Disk Access pane) and Not now; Not now is remembered.\n\
+     \x20 notice                  the macOS access card: when file access is not confirmed, it\n\
+     \x20                         offers Open Settings (the Full Disk Access pane) and Not now.\n\
+     \x20                         Unanswered offers may return after a day; Not now is remembered.\n\
      \x20 warmup                  \"never\" | \"on-request\". The warm-up asks macOS for the folders\n\
      \x20                         up front, which RAISES the dialogs on purpose, so it happens\n\
      \x20                         only when the owner presses the button in Settings — never at\n\
@@ -662,8 +672,8 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         inside a session asked for it.\n\
      \x20 warmup_folders          which folders that gesture asks for; warmup_hold_ms caps how\n\
      \x20                         long an in-place apply will wait for it.\n\
-     \x20 probe_interval_ms       floor on re-probing (also the worst-case lag of\n\
-     \x20                         `aterm ctl @<sid> await consent`).\n\
+     \x20 probe_interval_ms       floor on re-probing; macOS probe duration has no guaranteed bound.\n\
+     \x20                         `aterm ctl @<sid> await consent` waits for completed observations.\n\
      \x20 protected_roots         the sensitive set; empty = the containment tier's own list, so\n\
      \x20                         the two tiers cannot disagree about which paths are sensitive.\n\
      \x20 auto_accept             RESERVED, and not implemented: aterm does not answer macOS\n\
@@ -874,6 +884,7 @@ fn designated_requirement_class() -> DrClass {
 /// variant cannot silently render as an empty reason.
 fn probe_reason(label: ProbeLabel) -> String {
     match label {
+        ProbeLabel::Pending => "the access check is pending".to_string(),
         ProbeLabel::OpenOk => "the probe succeeded".to_string(),
         ProbeLabel::OpenEperm => "the probe was refused by macOS".to_string(),
         ProbeLabel::OpenErrno(errno) => format!("the probe could not complete (errno {errno})"),

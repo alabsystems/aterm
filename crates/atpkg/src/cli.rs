@@ -107,11 +107,13 @@ const VERB_USAGE: &[(&str, &str)] = &[
     ("tree-root", "atpkg tree-root <dir>"),
     (
         "verify-index",
-        "atpkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig>",
+        "atpkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig> \
+         <aterm-machines.toml> <aterm-machines.toml.sig>",
     ),
     (
         "verify-pkg",
-        "atpkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig>",
+        "atpkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> \
+         <aterm-machines.toml> <aterm-machines.toml.sig>",
     ),
     (
         "install",
@@ -127,7 +129,10 @@ const VERB_USAGE: &[(&str, &str)] = &[
     ("verify", "atpkg verify [program]"),
     ("link", "atpkg link <program> <checkout> [rel-bin…]"),
     ("unlink", "atpkg unlink <program>"),
-    ("refresh", "atpkg refresh <program>"),
+    (
+        "refresh",
+        "atpkg refresh [program…]  — bare: every dev-linked program",
+    ),
     ("run", "atpkg run <tool> [args…]"),
     (
         "relocate",
@@ -154,6 +159,23 @@ fn usage_of(verb: &str) -> Option<&'static str> {
         .iter()
         .find(|(name, _)| *name == verb)
         .map(|(_, usage)| *usage)
+}
+
+/// Whether a `-h`/`--help` in `rest` (the argv after `verb`) is a question for atpkg
+/// rather than an argument travelling to a tool. A literal `--` ends the scan for every
+/// verb; for `run`, only the FIRST operand counts — everything after `<tool>` belongs to
+/// the tool, so `atpkg run rg --help` reaches rg, and so does `aterm rg --help`, which
+/// arrives here as `run rg -- --help`. Both used to print atpkg's own usage instead.
+fn help_flag_addresses_atpkg(verb: &str, rest: &[String]) -> bool {
+    let scanned = if verb == "run" {
+        &rest[..rest.len().min(1)]
+    } else {
+        rest
+    };
+    scanned
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "-h" || a == "--help")
 }
 
 /// Answer `<verb> --help` from [`VERB_USAGE`]: the verb's own grammar, then the one
@@ -358,7 +380,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         }
         return cmd_help();
     }
-    // `<verb> --help` ANYWHERE in the argv answers for that verb and does nothing else.
+    // `<verb> --help` anywhere before a literal `--` answers for that verb and does
+    // nothing else — for `run`, only as the first operand, since everything after
+    // `<tool>` belongs to the tool ([`help_flag_addresses_atpkg`]).
     //
     // Placed before the store lock and before every verb body on purpose. Asking a
     // mutating verb how it works must never mutate: `atpkg gc --help` used to reclaim
@@ -368,7 +392,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     // thought to probe.
     if let Some(v) = verb
         && usage_of(v).is_some()
-        && args[1..].iter().any(|a| a == "-h" || a == "--help")
+        && help_flag_addresses_atpkg(v, &args[1..])
     {
         return cmd_verb_help(v);
     }
@@ -611,6 +635,18 @@ fn reassert_rustup_seam(layout: &crate::store::Layout) {
     }
 }
 
+/// The whole-set removal's companion ([`crate::seam::detach_recorded`]): detach every
+/// rustup seam atpkg recorded, never `--force` — an entry atpkg did not lay is refused
+/// and named, not removed. Nothing recorded, or no rustup home: silent.
+fn detach_rustup_seams(layout: &crate::store::Layout) {
+    let Some(home) = crate::seam::rustup_home() else {
+        return;
+    };
+    for line in crate::seam::detach_recorded(layout, &home) {
+        println!("atpkg: rustup seam: {line}");
+    }
+}
+
 /// Lay (or refresh) the reroute stubs beside the pending-stub reconcile — at seed,
 /// after each install pass, and on `repair` — and never let a failure fail the pass:
 /// the stubs are a session convenience the spawn seam re-lays anyway, while the pass
@@ -676,7 +712,7 @@ fn inside_aterm() -> bool {
 
 /// The TTY consent question: `prompt` to stdout (flushed, no newline), ONE line from
 /// stdin; `y`/`yes` in any case is consent, anything else — a bare Enter, `n`, EOF,
-/// a read error — is not. Default NO, so an accidental keystroke never moves 230 MB.
+/// a read error — is not. Default NO, so an accidental keystroke never moves 200 MB.
 fn tty_consent(prompt: &str) -> bool {
     use std::io::Write as _;
     print!("{prompt}");
@@ -1049,8 +1085,8 @@ fn print_unreachable_followup(e: &crate::FlowError, rerun: &str) {
     eprintln!("atpkg:   when the connection is back, re-run: {rerun}");
     if why.contains("403") || why.to_ascii_lowercase().contains("rate limit") {
         eprintln!(
-            "atpkg:   the anonymous GitHub limit resets within the hour; gh auth login \
-             provisions a token that lifts it"
+            "atpkg:   the anonymous GitHub limit resets within the hour; \
+             `ATPKG_TOKEN=$(gh auth token)` in the environment lifts it"
         );
     }
 }
@@ -1171,6 +1207,17 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
         Ok(guard) => Ok(Some(guard)),
         Err(e) => {
             eprintln!("atpkg: {e}");
+            // CONTENTION GETS A MARKER; every other refusal does not. An unwritable
+            // prefix or a broken lock file is a real outage and must keep reaching the
+            // GUI's refusal card. A lock held by another `atpkg` is the opposite: that
+            // process is doing this work right now, and the only honest thing to say
+            // about THIS pass is that it stood aside (see [`SEED_BUSY_MARKER`]).
+            if matches!(e, crate::lock::StoreLockError::Contended(_)) {
+                emit_marker_line(&format!(
+                    "atpkg: {SEED_BUSY_MARKER}another atpkg process holds the store lock \
+                     — that pass is doing this work and this one stood aside"
+                ));
+            }
             Err(ExitCode::from(1))
         }
     }
@@ -2851,6 +2898,10 @@ fn cmd_uninstall_all() -> ExitCode {
                 .cloned(),
         );
     }
+    // The seam goes with the set, and goes FIRST: every recorded rustup entry is
+    // detached while it still resolves into the prefix. Before the branch, so a record
+    // left on an already-empty store is dropped too.
+    detach_rustup_seams(&layout);
     if targets.is_empty() {
         // RECORD THE DECLINE ANYWAY. "Remove the ALab toolset" states an INTENT —
         // "I do not want this on my machine" — and that intent is independent of
@@ -4465,8 +4516,12 @@ fn write_removed(layout: &crate::store::Layout, all: &std::collections::BTreeSet
 /// undetected once. `aterm-gui` imports these, so a rename is a compile error on both
 /// sides instead of a string that quietly stops matching.
 ///
-/// Every marker is a TERMINAL answer to an announcement except `SEED_STARTING`, which
-/// opens one. An announcement with no answer leaves "Installing…" on screen forever.
+/// Every marker is a TERMINAL answer to an announcement except the TWO that OPEN one:
+/// `SEED_STARTING` (the local lane) and `NET_STARTING` (its twin for the wire, added
+/// after this paragraph first named only the local one). [`announcement::MARKERS`] is
+/// where that split is recorded and [`emit_marker_line`] is what keeps the ledger, so
+/// the classification lives in one table rather than in this sentence. An
+/// announcement with no answer leaves "Installing…" on screen forever.
 pub const SEED_STARTING_MARKER: &str = "seed-starting: ";
 pub const SEED_INSTALLED_MARKER: &str = "seed-installed: ";
 pub const SEED_PENDING_MARKER: &str = "seed-pending: ";
@@ -4652,6 +4707,154 @@ fn print_managed_current(
         cfg.channel(),
     )) {
         println!("atpkg: {line}");
+    }
+}
+
+/// The POSITIVE terminal: an announced pass that ran to its end and has no richer
+/// marker of its own to print.
+///
+/// Until this existed the contract had only FAILURE terminals (`seed-failed:`,
+/// `seed-partial:`, `seed-unusable:`, `net-failed:`) plus the two install rosters,
+/// so a pass that announced itself and then ended well through a path with no
+/// roster to name was SILENT — and silence is the one thing the reader of these
+/// markers cannot safely interpret. The GUI had to infer success from the ABSENCE
+/// of a terminal line, which is exactly the reading the 2026-08-20 round-9 audit
+/// proved unsafe (a child that DIES after announcing is also silent), so it read
+/// the absence as a failure and put "⚠ ALab toolchain install failed" over a clean
+/// run. An absence now means one thing only — nobody answered — and every ending
+/// has a line of its own.
+pub const SEED_DONE_MARKER: &str = "seed-done: ";
+
+/// ANOTHER `atpkg` IS ALREADY DOING THIS WORK. Printed when the store lock is
+/// CONTENDED at the dispatch edge — never for any other refusal.
+///
+/// This is the line the owner's 2026-09-11 banner needed and did not have. Two aterm
+/// processes launched sixteen seconds apart; the second one's `seed` and `update`
+/// children both lost the lock to the first one's, exited non-zero and printed no
+/// marker, and the GUI's refusal branch — correct for an unwritable prefix, correct
+/// for a bundle whose atpkg cannot exec — put "⚠ ALab toolchain install failed" on a
+/// machine where the install was at that moment RUNNING in the other process.
+///
+/// Contention is a fact about this process's timing, not about the toolchain: it is
+/// transient, self-healing, and the work is being done. Saying so costs one line and
+/// removes a warning nobody can act on.
+pub const SEED_BUSY_MARKER: &str = "seed-busy: ";
+
+/// THE ANNOUNCEMENT LEDGER — the marker contract's other half, kept by the process
+/// instead of by each verb's exits.
+///
+/// `seed-starting:` / `net-starting:` OPEN a held "Installing the ALab toolchain…"
+/// card in the GUI; every other marker CLOSES it. Nothing enforced that a verb which
+/// opened one ever closed it: `cmd_install_default_set` announces over the network
+/// and then ends through four separate `return`s, none of which prints a marker, so
+/// the card's only possible answer was the reader's guess (2026-09-11).
+///
+/// The bookkeeping lives at the ONE place a marker reaches stdout
+/// ([`emit_marker_line`]) rather than at each print site, so a lane that grows a new
+/// early return cannot forget to answer — answering is not its job.
+pub(crate) mod announcement {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static OPENED: AtomicBool = AtomicBool::new(false);
+    static ANSWERED: AtomicBool = AtomicBool::new(false);
+
+    /// Every marker in the stdout contract, and whether it OPENS an announcement
+    /// rather than answering one. The GUI's `parse_seed_line` matches the same set;
+    /// this table is what keeps the two halves from drifting.
+    ///
+    /// `seed-pending:` is an OFFER, printed only on the lane that announces nothing,
+    /// so classifying it as an answer costs nothing and keeps the table total.
+    pub(crate) const MARKERS: &[(&str, bool)] = &[
+        (super::SEED_STARTING_MARKER, true),
+        (super::NET_STARTING_MARKER, true),
+        (super::SEED_INSTALLED_MARKER, false),
+        (super::SEED_PENDING_MARKER, false),
+        (super::SEED_UNUSABLE_MARKER, false),
+        (super::SEED_FAILED_MARKER, false),
+        (super::SEED_PARTIAL_MARKER, false),
+        (super::SEED_DONE_MARKER, false),
+        (super::SEED_BUSY_MARKER, false),
+        (super::NET_INSTALLED_MARKER, false),
+        (super::NET_FAILED_MARKER, false),
+    ];
+
+    /// Record what a marker line just said. `line` is the whole stdout line,
+    /// `atpkg: ` prefix and all — the same bytes the GUI parses.
+    pub(crate) fn note(line: &str) {
+        let Some(rest) = line.strip_prefix("atpkg: ") else {
+            return;
+        };
+        for (marker, opens) in MARKERS {
+            if rest.starts_with(marker) {
+                if *opens {
+                    OPENED.store(true, Ordering::Release);
+                } else {
+                    ANSWERED.store(true, Ordering::Release);
+                }
+                return;
+            }
+        }
+    }
+
+    /// Whether this process announced a pass and has not yet answered it.
+    pub(crate) fn is_open() -> bool {
+        OPENED.load(Ordering::Acquire) && !ANSWERED.load(Ordering::Acquire)
+    }
+
+    /// Test seam: a process-global ledger would otherwise carry one test's
+    /// announcement into the next.
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        OPENED.store(false, Ordering::Release);
+        ANSWERED.store(false, Ordering::Release);
+    }
+}
+
+/// THE one way a marker reaches stdout: print it, and record it against the
+/// announcement ledger. The bytes are unchanged — `line` is already the whole
+/// `atpkg: <marker><body>` line the GUI parses — so this adds bookkeeping and
+/// nothing else.
+fn emit_marker_line(line: &str) {
+    println!("{line}");
+    announcement::note(line);
+}
+
+/// ANSWER AN ANNOUNCEMENT THIS VERB LEFT OPEN. Called at the tail of every verb that
+/// can announce; a no-op for the lanes that already printed a terminal of their own,
+/// which is why their stdout is byte-unchanged.
+///
+/// `ok` is the verb's OWN verdict, not a guess from what was printed. That matters:
+/// the reader needs a failed pass to say so, and an absence cannot distinguish
+/// "finished quietly" from "died". A verb that announced and then failed without a
+/// marker gets the failure terminal; one that announced and succeeded gets the
+/// positive one, carrying the STORE's own count — a fact about what is installed
+/// rather than a claim about what this pass did.
+fn answer_announcement(ok: bool) {
+    if !announcement::is_open() {
+        return;
+    }
+    if ok {
+        let held = layout().map_or(0, |l| crate::active_builds(&l).len());
+        if held == 0 {
+            // EXIT 0 OVER AN EMPTY STORE IS NOT A SUCCESS TO REPORT. The pass
+            // announced an install and the disk shows none — a positive fact, and a
+            // better witness than the exit code, which says only that no step
+            // errored. Reporting the tick here is how a green "toolchain installed"
+            // lands over an empty prefix.
+            emit_marker_line(&format!(
+                "atpkg: {SEED_FAILED_MARKER}the pass finished without installing \
+                 anything — see the lines above for each program's reason"
+            ));
+            return;
+        }
+        emit_marker_line(&format!(
+            "atpkg: {SEED_DONE_MARKER}the pass finished; {held} ALab program(s) are installed"
+        ));
+    } else {
+        emit_marker_line(&format!(
+            "atpkg: {SEED_FAILED_MARKER}the pass ended without installing what it announced — \
+             see the lines above for the reason"
+        ));
     }
 }
 
@@ -5278,12 +5481,23 @@ fn cmd_update(program: Option<&String>) -> ExitCode {
 /// [`install_default_set`]) — the loop verb the GUI runs every 6h finally fills an empty
 /// store instead of no-opping forever. GC runs once after the whole apply.
 fn cmd_update_all() -> ExitCode {
+    // The pass's own verdict, then the contract's other half: `install_default_set`
+    // may have announced a network install from inside this verb, and only the verb
+    // knows how it ended. A lane that already printed its terminal is unaffected.
+    let code = cmd_update_all_code();
+    answer_announcement(code == 0);
+    ExitCode::from(code)
+}
+
+/// [`cmd_update_all`]'s body, returning the raw exit code so the announcement can be
+/// answered with the pass's real verdict rather than a guess read off its output.
+fn cmd_update_all_code() -> u8 {
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
-        return ExitCode::from(1);
+        return 1;
     }
     let Some(layout) = layout() else {
-        return ExitCode::from(1);
+        return 1;
     };
     let cfg = crate::config::cached();
     // Reconcile `[packages.links]` first, so a config-declared dev-link is in place
@@ -5318,7 +5532,7 @@ fn cmd_update_all() -> ExitCode {
         should_complete_set(cfg.auto_install(), adopted(&layout), declined(&layout));
     if installed.is_empty() && !complete_the_set {
         println!("{EMPTY_UPDATE}");
-        return ExitCode::SUCCESS;
+        return 0;
     }
     let fetcher = resolve_fetcher(&layout);
     let mut failures = 0u32;
@@ -5364,7 +5578,7 @@ fn cmd_update_all() -> ExitCode {
                     },
                     format!("update failed: {e}"),
                 );
-                return ExitCode::from(1);
+                return 1;
             }
         };
         // Advance the durable anti-rollback floor to the index we just trusted (§8 gate 3).
@@ -5446,15 +5660,18 @@ fn cmd_update_all() -> ExitCode {
             .collect();
         if !arrived.is_empty() {
             arrived.sort();
-            println!("atpkg: {NET_INSTALLED_MARKER}{}", arrived.join(", "));
+            emit_marker_line(&format!(
+                "atpkg: {NET_INSTALLED_MARKER}{}",
+                arrived.join(", ")
+            ));
             println!("{SEED_FOLLOW_ON}");
         } else if announced {
             // ALWAYS ANSWER THE ANNOUNCEMENT (the seed lane's law): a pass that
             // said "installing over the network" and then installed nothing
             // must say so, or the held notice outlives its own truth.
-            println!(
+            emit_marker_line(&format!(
                 "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing —                  see the lines above for each program's reason"
-            );
+            ));
         }
         // Retire or refresh a stale `*seed*` pending-consent row against what
         // this pass just proved. The seed lane — the row's only other writer —
@@ -5510,7 +5727,7 @@ fn cmd_update_all() -> ExitCode {
                      Relaunch aterm natively and the toolset installs.",
                     current_triple()
                 );
-                return ExitCode::from(2);
+                return 2;
             }
             let serves_us = crate::resolve_verified_index(
                 &*fetcher,
@@ -5567,7 +5784,7 @@ fn cmd_update_all() -> ExitCode {
                 },
                 said,
             );
-            return ExitCode::from(2);
+            return 2;
         }
         // The toolset is present: retire any "unavailable" verdict an earlier
         // pass recorded. Only the seed lane cleared this row, and a machine
@@ -5581,9 +5798,9 @@ fn cmd_update_all() -> ExitCode {
         // A pass that resolved the index and applied it clean: THE event R3's
         // "never checked" waits for, stamped here and at no failure exit above.
         record_success(&layout);
-        ExitCode::SUCCESS
+        0
     } else {
-        ExitCode::from(1)
+        1
     }
 }
 
@@ -6090,7 +6307,7 @@ fn install_default_set_inner(
     let announcement = net_announcement(lane, &will_install);
     let announced = announcement.is_some();
     if let Some(line) = &announcement {
-        println!("{line}");
+        emit_marker_line(line);
     }
     // The pass's plan, in PLAN ORDER, with each group's freshly-installable members —
     // materialized once so the priority queue below can permute what remains between
@@ -6653,12 +6870,25 @@ fn record_bootstrap_error(layout: &crate::store::Layout, program: &str, e: &crat
 /// the config-consent-free twin of the `auto_install = true` loop arm — running it IS
 /// the consent). Exit 1 iff any member hard-failed; skips are honest and free.
 fn cmd_install_default_set() -> ExitCode {
+    // THE LANE THIS GUARD EXISTS FOR. This verb announces `net-starting:` from inside
+    // `install_default_set` and then ends through four separate returns, none of which
+    // printed a marker — so the held "Installing the ALab toolchain…" card had no
+    // answer at all, and its only reader had to guess one from an absence (2026-09-11).
+    let code = cmd_install_default_set_code();
+    answer_announcement(code == 0);
+    ExitCode::from(code)
+}
+
+/// [`cmd_install_default_set`]'s body, returning the raw exit code: exit 2 ("ran fine,
+/// installed nothing, and never will here") is neither success nor a retryable failure,
+/// and the announcement must be answered with which of the three actually happened.
+fn cmd_install_default_set_code() -> u8 {
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
-        return ExitCode::from(1);
+        return 1;
     }
     let Some(layout) = layout() else {
-        return ExitCode::from(1);
+        return 1;
     };
     let cfg = crate::config::cached();
     reconcile_links(&layout, cfg);
@@ -6712,7 +6942,7 @@ fn cmd_install_default_set() -> ExitCode {
     print_gc_abstentions("install-default-set", &report);
     crate::hooks::refresh(&layout);
     if failures > 0 {
-        return ExitCode::from(1);
+        return 1;
     }
     // The `*seed*` offer, if one was ever announced, is answered by what this
     // CLEAN pass just proved: retired when nothing remains to offer (the offer
@@ -6748,7 +6978,7 @@ fn cmd_install_default_set() -> ExitCode {
             print_managed_current(&layout, &*fetcher, cfg);
             apply_machine_settings();
             record_success(&layout);
-            return ExitCode::SUCCESS;
+            return 0;
         }
         println!(
             "atpkg: nothing was installed — the signed index pins no program with a build \
@@ -6758,7 +6988,7 @@ fn cmd_install_default_set() -> ExitCode {
         );
         // Exit 2, not 0 and not 1: the GUI maps 0 to "Succeeded" (which would be the
         // lie) and 1 to a retryable failure (which would be false hope).
-        return ExitCode::from(2);
+        return 2;
     }
     if skipped.is_empty() {
         println!("atpkg: default set complete ({activated} program(s) installed)");
@@ -6773,7 +7003,7 @@ fn cmd_install_default_set() -> ExitCode {
     print_managed_current(&layout, &*fetcher, cfg);
     apply_machine_settings();
     record_success(&layout);
-    ExitCode::SUCCESS
+    0
 }
 
 /// `atpkg seed` — the batteries-included first-run bootstrap (§9.1/§11),
@@ -6969,14 +7199,14 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     if let Some(need) = signed_bytes {
         let have = crate::freespace::available_bytes(&layout.prefix);
         if !have.is_none_or(|a| crate::cost::disk_ok(need, a, crate::cost::FREE_FLOOR)) {
-            println!(
+            emit_marker_line(&format!(
                 "atpkg: {SEED_FAILED_MARKER}the ALab toolset needs {} free (plus a \
                  {} reserve) and this disk has {} — nothing was installed, and \
                  the bundled copy is kept for when space is available",
                 crate::cost::human_bytes(need),
                 crate::cost::human_bytes(crate::cost::FREE_FLOOR),
                 crate::cost::human_bytes(have.unwrap_or(0))
-            );
+            ));
             record_status(
                 &layout,
                 "*toolset*",
@@ -6995,7 +7225,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // only honest description of a first launch was "the app silently starts
     // consuming disk". The GUI streams this child's stdout, so the notice lands
     // while it happens rather than after (crates/aterm-gui, `parse_seed_line`).
-    println!("{}", seed_announcement(wanted.len(), signed_bytes));
+    emit_marker_line(&seed_announcement(wanted.len(), signed_bytes));
     let before = crate::active_builds(&layout);
     // The SEED progress pass (R5): same writer, `pass: "seed"` — verify/extract/link
     // phases with no download rows (the fetcher is a local dir; the sealed-seed
@@ -7045,7 +7275,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         clear_seed_status(&layout);
         // The stable marker the GUI parses — change it and the first-run
         // notice goes blind (crates/aterm-gui, spawn_pkg_update_check).
-        println!("atpkg: seed-installed: {}", new.join(", "));
+        emit_marker_line(&format!("atpkg: {SEED_INSTALLED_MARKER}{}", new.join(", ")));
         // The marker above is the GUI's (byte-stable, parsed); this line is the human's:
         // an install that lands 10 commands and never says how to run one is a dead end.
         println!("{SEED_FOLLOW_ON}");
@@ -7088,11 +7318,11 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // serviceable prescan ran before the announcement), so this is the failure
     // marker the GUI needs to retire the notice honestly.
     if new.is_empty() {
-        println!(
-            "atpkg: seed-failed: no ALab program could be installed from the bundled \
+        emit_marker_line(&format!(
+            "atpkg: {SEED_FAILED_MARKER}no ALab program could be installed from the bundled \
              registry ({failures} failed) — the toolset will be retried on the next launch \
              and can also come from the network"
-        );
+        ));
     } else if failures > 0 {
         // PARTIAL. This is the likeliest real first-launch failure — a laptop
         // without ~4 GB free installs the small tools and then the disk preflight
@@ -7101,12 +7331,18 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         // A green tick over a missing compiler is worse than an error, because
         // nothing prompts the user to look. The marker carries the count so the
         // notice can say what is actually true.
-        println!(
-            "atpkg: seed-partial: {} installed, {failures} could not be installed — the \
+        emit_marker_line(&format!(
+            "atpkg: {SEED_PARTIAL_MARKER}{} installed, {failures} could not be installed — the \
              rest is retried on the next launch (Settings ▸ Packages shows which)",
             new.len()
-        );
+        ));
     }
+    // ANSWER WHAT THIS VERB ANNOUNCED. A no-op today — every path below the
+    // announcement above prints a terminal of its own — and kept precisely so it
+    // stays a no-op: a future early return between the announcement and here
+    // cannot leave the GUI's held card unanswered, because answering is no longer
+    // that return's job (2026-09-11).
+    answer_announcement(failures == 0);
     if failures == 0 {
         ExitCode::SUCCESS
     } else {
@@ -7296,12 +7532,12 @@ fn finish_unusable_seed(
         let removed = removed_programs(layout);
         permanent = false;
         if !removed.is_empty() {
-            println!(
-                "atpkg: seed-unusable: every program the bundled registry offers was \
+            emit_marker_line(&format!(
+                "atpkg: {SEED_UNUSABLE_MARKER}every program the bundled registry offers was \
                  removed on this machine ({}) — nothing to install. \
                  `aterm pkg install <program>` brings one back",
                 removed.iter().cloned().collect::<Vec<_>>().join(", ")
-            );
+            ));
         } else if !index.channels.iter().any(|c| c.name == cfg.channel()) {
             // A channel the seal does not carry. REVERSIBLE — one line of config —
             // and it used to fall through to the architecture arm below, which set
@@ -7309,8 +7545,8 @@ fn finish_unusable_seed(
             // comment on the reclaim names this exact case as one that must be kept;
             // the ladder simply had no branch for it, so the code contradicted its
             // own stated rule and destroyed ~600 MB over a typo.
-            println!(
-                "atpkg: seed-unusable: the bundled registry carries no '{}' channel \
+            emit_marker_line(&format!(
+                "atpkg: {SEED_UNUSABLE_MARKER}the bundled registry carries no '{}' channel \
                  (it has: {}) — nothing was installed. Fix [packages].channel in \
                  aterm.toml; the bundled toolchain is kept.",
                 cfg.channel(),
@@ -7320,14 +7556,14 @@ fn finish_unusable_seed(
                     .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            );
+            ));
         } else if !cfg.include().is_empty() || !cfg.exclude().is_empty() {
-            println!(
-                "atpkg: seed-unusable: [packages].include/exclude narrows the bundled \
+            emit_marker_line(&format!(
+                "atpkg: {SEED_UNUSABLE_MARKER}[packages].include/exclude narrows the bundled \
                  registry to nothing installable on this machine ({}) — widen the filters \
                  to receive the toolset",
                 current_triple()
-            );
+            ));
         } else if running_translated() {
             // NOT PERMANENT, AND NOT THIS MACHINE'S ARCHITECTURE. `current_triple()`
             // is a compile-time cfg, so the x86_64 slice of the universal binary
@@ -7348,11 +7584,11 @@ fn finish_unusable_seed(
         } else {
             // The only permanent one in this arm: the CPU will not change.
             permanent = true;
-            println!(
-                "atpkg: seed-unusable: the bundled toolchain has no build for this machine's \
+            emit_marker_line(&format!(
+                "atpkg: {SEED_UNUSABLE_MARKER}the bundled toolchain has no build for this machine's \
                  architecture ({}) — no ALab programs were installed from it",
                 current_triple()
-            );
+            ));
             // AND LEAVE A DURABLE TRACE. Without this the whole first session had no
             // status.toml at all, so Settings ▸ Packages — the surface the notice
             // sends the user to — said "atpkg has not run yet" on a machine where it
@@ -7466,11 +7702,11 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
             || !crate::active_builds(layout).is_empty()
     });
     if serves_us == Some(false) {
-        println!(
+        emit_marker_line(&format!(
             "atpkg: {SEED_UNUSABLE_MARKER}the signed index publishes no artifact for this \
              machine's architecture ({triple}) — nothing was installed, and nothing arrives \
              until one is published"
-        );
+        ));
         record_status(
             layout,
             "*toolset*",
@@ -7768,11 +8004,11 @@ fn announce_pending_seed(
     let list = missing.join(", ");
     // The stable marker the GUI parses — change it and the first-run notice
     // goes blind (crates/aterm-gui, spawn_pkg_update_check).
-    println!(
-        "atpkg: seed-pending: {} program(s) ready to install from the bundled seed: {list} \
+    emit_marker_line(&format!(
+        "atpkg: {SEED_PENDING_MARKER}{} program(s) ready to install from the bundled seed: {list} \
          (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg install --default-set`)",
         missing.len()
-    );
+    ));
     // Value-first so the offer survives the Packages card's truncation width
     // (UX review 2026-07-30: "bundled seed offers: ay · 2026-…" truncated the
     // payload away); the page's own "Install ALab toolset" button is the act.
@@ -8668,6 +8904,28 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// THE PRODUCTION HALF of this file, for the source scans below.
+    ///
+    /// The anchor is the test module's OWN attribute. `#[cfg(test)]` — what these
+    /// scans used to split on — never matched this module, which is
+    /// `#[cfg(all(test, unix))]`: the split landed on the first scan's own string
+    /// literal instead, so "production" silently included ~2 800 lines of tests, and
+    /// the first real `#[cfg(test)]` item to appear in production code (the
+    /// announcement ledger's reset seam, 2026-09-11) truncated every scan to the
+    /// first few thousand lines and turned them all vacuous at once. An anchor that
+    /// can miss is the same defect these scans exist to catch, so this one panics
+    /// rather than falling back to the whole file.
+    fn production_half(src: &str) -> &str {
+        let (before, _) = src
+            .split_once("#[cfg(all(test, unix))]")
+            .expect("this file's test module is gated `#[cfg(all(test, unix))]`");
+        assert!(
+            before.contains("fn cmd_seed") && !before.contains("mod tests {"),
+            "the production half must hold the verbs and none of the tests"
+        );
+        before
+    }
+
     /// EVERY FIXTURE PASS RUNS AGAINST AN EMPTY `PATH`.
     ///
     /// Deliberately shadowing [`super::install_default_set`] for the whole test
@@ -11181,6 +11439,24 @@ mod tests {
         }
     }
 
+    /// A `--help` that belongs to the TOOL is forwarded, not answered: `run` looks
+    /// only at its first operand, and a literal `--` ends the scan for every verb.
+    #[test]
+    fn a_tools_own_help_flag_is_forwarded_by_run_and_stopped_by_a_separator() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert!(help_flag_addresses_atpkg("run", &s(&["--help"])));
+        assert!(help_flag_addresses_atpkg("run", &s(&["-h"])));
+        assert!(!help_flag_addresses_atpkg("run", &s(&["rg", "--help"])));
+        assert!(!help_flag_addresses_atpkg(
+            "run",
+            &s(&["rg", "--", "--help"])
+        ));
+        assert!(!help_flag_addresses_atpkg("run", &s(&[])));
+        assert!(help_flag_addresses_atpkg("install", &s(&["ay", "--help"])));
+        assert!(!help_flag_addresses_atpkg("install", &s(&["--", "--help"])));
+        assert!(!help_flag_addresses_atpkg("install", &s(&[])));
+    }
+
     /// THE single-writer verb roster ([`crate::lock`]): every verb that mutates
     /// the store (stage/activate/discard, shims, links, pins, gc) takes the
     /// store-wide lock at the dispatch edge; every read-only verb stays
@@ -11437,25 +11713,42 @@ mod tests {
         // test that cannot fail is worse than no test: it is a standing claim that
         // the cross-crate contract is checked when nothing checks it.
         let src = include_str!("cli.rs");
-        let production = src
-            .split_once("#[cfg(test)]")
-            .map_or(src, |(before, _)| before);
+        let production = production_half(src);
         assert!(
             production.len() < src.len(),
             "the test module must be excluded, or this test can match itself"
         );
-        for marker in [
-            "atpkg: seed-installed: ",
-            "atpkg: seed-pending: ",
-            "atpkg: seed-unusable: ",
-            "atpkg: seed-failed: ",
-            "atpkg: seed-partial: ",
+        // EMITTED, and emitted THROUGH THE ONE PRINTER. The prefixes used to be
+        // duplicated as literals at each print site — the very duplication the marker
+        // constants' doc comment blames for breaking this contract once — so the
+        // check is now against the constant and against the call that records it in
+        // the announcement ledger. A marker printed any other way is invisible to the
+        // ledger, which is what decides whether an announcement was ever answered.
+        let emissions: Vec<String> = whole_calls(production, "emit_marker_line(");
+        for (marker, konst) in [
+            (SEED_STARTING_MARKER, "SEED_STARTING_MARKER"),
+            (SEED_INSTALLED_MARKER, "SEED_INSTALLED_MARKER"),
+            (SEED_PENDING_MARKER, "SEED_PENDING_MARKER"),
+            (SEED_UNUSABLE_MARKER, "SEED_UNUSABLE_MARKER"),
+            (SEED_FAILED_MARKER, "SEED_FAILED_MARKER"),
+            (SEED_PARTIAL_MARKER, "SEED_PARTIAL_MARKER"),
+            (SEED_DONE_MARKER, "SEED_DONE_MARKER"),
+            (SEED_BUSY_MARKER, "SEED_BUSY_MARKER"),
+            (NET_STARTING_MARKER, "NET_STARTING_MARKER"),
+            (NET_INSTALLED_MARKER, "NET_INSTALLED_MARKER"),
+            (NET_FAILED_MARKER, "NET_FAILED_MARKER"),
         ] {
             assert!(
-                production.contains(marker),
-                "the {marker:?} marker must be EMITTED by production code — \
-                 crates/aterm-gui's parse_seed_line strips exactly this prefix, and a \
-                 marker nothing prints leaves its announcement unanswered on screen"
+                emissions
+                    .iter()
+                    .any(|call| call.contains(konst) || call.contains(marker))
+                    // The two announcements are built by their own helpers and handed
+                    // to the printer as a finished line.
+                    || production.contains(&format!("{{{konst}}}")),
+                "the {marker:?} marker must be EMITTED by production code through \
+                 `emit_marker_line` — crates/aterm-gui's parse_seed_line strips exactly \
+                 this prefix, and a marker nothing prints leaves its announcement \
+                 unanswered on screen"
             );
         }
     }
@@ -11499,9 +11792,7 @@ mod tests {
         // (2) The wire marker reaches stdout through `net_announcement` alone, so
         // the `None`s above are the whole story, not one suppressed call site.
         let src = include_str!("cli.rs");
-        let production = src
-            .split_once("#[cfg(test)]")
-            .map_or(src, |(before, _)| before);
+        let production = production_half(src);
         let start = production.find("fn cmd_seed").expect("the seed verb");
         let end = production[start..]
             .find("\nfn ")
@@ -11522,6 +11813,190 @@ mod tests {
             "the wire announcement must have exactly ONE production emission site \
              (inside net_announcement), or the lane gate can be walked around"
         );
+    }
+
+    /// THE MARKER CONTRACT HAS A POSITIVE TERMINAL, and the ledger knows which half
+    /// of the contract each marker keeps.
+    ///
+    /// Until 2026-09-11 every terminal in this contract reported a PROBLEM
+    /// (`seed-failed:`, `seed-partial:`, `seed-unusable:`, `net-failed:`) beside the
+    /// two install rosters, so a pass that announced itself, ended well and had no
+    /// roster to name printed nothing at all — and its only reader, the GUI, had to
+    /// infer an outcome from that silence. It inferred "failed", and put "⚠ ALab
+    /// toolchain install failed" over a clean run on a healthy machine.
+    #[test]
+    fn the_marker_table_covers_every_marker_and_names_the_two_that_open() {
+        use super::announcement::MARKERS;
+        let opens: Vec<&str> = MARKERS
+            .iter()
+            .filter(|(_, o)| *o)
+            .map(|(m, _)| *m)
+            .collect();
+        assert_eq!(
+            opens,
+            vec![SEED_STARTING_MARKER, NET_STARTING_MARKER],
+            "exactly two markers OPEN an announcement; every other one answers"
+        );
+        assert!(
+            MARKERS.iter().any(|(m, _)| *m == SEED_DONE_MARKER),
+            "the positive terminal must be in the table or it answers nothing"
+        );
+        // NON-VACUITY: every marker const this module publishes is classified. A new
+        // marker that is not in the table silently stops answering announcements —
+        // the exact failure mode this contract's own doc comment warns about.
+        for marker in [
+            SEED_STARTING_MARKER,
+            SEED_INSTALLED_MARKER,
+            SEED_PENDING_MARKER,
+            SEED_UNUSABLE_MARKER,
+            SEED_FAILED_MARKER,
+            SEED_PARTIAL_MARKER,
+            SEED_DONE_MARKER,
+            SEED_BUSY_MARKER,
+            NET_STARTING_MARKER,
+            NET_INSTALLED_MARKER,
+            NET_FAILED_MARKER,
+        ] {
+            assert!(
+                MARKERS.iter().any(|(m, _)| *m == marker),
+                "{marker:?} is published as part of the contract but classified nowhere"
+            );
+        }
+    }
+
+    /// The ledger reads the same bytes the GUI parses, and an INFORMATIONAL row is not
+    /// an answer. `managed-current:` / `machine-settings:` are printed at the end of
+    /// every pass, announced or not; counting one as a terminal is round 9's rule read
+    /// backwards, and it would let a pass retire a card it had not finished with.
+    #[test]
+    fn only_a_terminal_marker_closes_an_announcement() {
+        use super::announcement;
+        announcement::reset();
+        assert!(!announcement::is_open(), "nothing announced, nothing open");
+
+        announcement::note("atpkg: this is an ordinary sentence");
+        assert!(!announcement::is_open());
+
+        announcement::note(&format!(
+            "atpkg: {NET_STARTING_MARKER}installing 2 program(s)"
+        ));
+        assert!(announcement::is_open(), "the announcement opened");
+
+        announcement::note("atpkg: managed-current: claude 2.1.267 (build 2026091001)");
+        announcement::note("atpkg: machine-settings: universal-control disabled");
+        assert!(
+            announcement::is_open(),
+            "an R6 row says what the machine HAS, not how the pass ended"
+        );
+
+        announcement::note(&format!("atpkg: {SEED_DONE_MARKER}the pass finished"));
+        assert!(!announcement::is_open(), "the positive terminal answers");
+        announcement::reset();
+    }
+
+    /// THE ROUND-10 PROPERTY, at its source. On a provisioned Mac the passes announce
+    /// nothing — the seal is reclaimed after the first success, so `atpkg seed` prints
+    /// a plain sentence and exits 0, and `atpkg update`'s plan is empty so
+    /// `net_announcement` returns `None`. Nothing may be printed at the end of those
+    /// passes, or the warning card is back on screen at every launch of a healthy
+    /// machine (2026-08-20 round-10 audit).
+    #[test]
+    fn a_pass_that_announced_nothing_answers_nothing() {
+        use super::announcement;
+        announcement::reset();
+        // The steady state's own words, verbatim in shape: no marker anywhere.
+        announcement::note("atpkg: the store already holds the ALab toolset");
+        assert!(!announcement::is_open());
+        // `answer_announcement` is what runs at every announcing verb's tail; with no
+        // announcement open it must be a no-op, for BOTH verdicts.
+        for ok in [true, false] {
+            answer_announcement(ok);
+            assert!(
+                !announcement::is_open(),
+                "a verb that announced nothing has nothing to answer (ok={ok})"
+            );
+        }
+        announcement::reset();
+    }
+
+    /// EVERY MARKER GOES OUT THROUGH THE ONE PRINTER. The ledger is bookkeeping done
+    /// at the moment a marker reaches stdout, so a marker printed by a bare `println!`
+    /// is invisible to it — the announcement would stay "open" after being answered,
+    /// or an announcement would open without being recorded. The contract's own doc
+    /// comment already records that duplicating these strings broke it once.
+    #[test]
+    fn no_production_line_prints_a_marker_outside_the_one_printer() {
+        let src = include_str!("cli.rs");
+        let production = production_half(src);
+        // Whole macro invocations, not single lines: these calls wrap, and the marker
+        // is usually on the line after `println!(`.
+        for call in whole_calls(production, "println!(")
+            .into_iter()
+            .chain(whole_calls(production, "print!("))
+        {
+            for (marker, _) in super::announcement::MARKERS {
+                let konst = format!("{}_MARKER", marker.trim_end_matches(": ").to_uppercase())
+                    .replace('-', "_");
+                assert!(
+                    !call.contains(marker) && !call.contains(&konst),
+                    "a marker must reach stdout through `emit_marker_line`, not this: {call}"
+                );
+            }
+        }
+        // NON-VACUITY of the scan itself: it must actually be finding the print
+        // macros, or the loop above passes by seeing nothing.
+        assert!(
+            whole_calls(production, "println!(").len() > 100,
+            "the scanner found almost no println! calls — it is not reading this file"
+        );
+        // …and the one printer really is used.
+        assert!(
+            production.matches("emit_marker_line(").count() >= 9,
+            "every marker site must go through the one printer"
+        );
+    }
+
+    /// Every `<head>…)` invocation in `src`, brace/paren-matched so a wrapped macro
+    /// call is returned whole. String literals are skipped so a `)` inside one cannot
+    /// close the call early.
+    fn whole_calls(src: &str, head: &str) -> Vec<String> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = src[from..].find(head) {
+            let start = from + rel;
+            let mut i = start + head.len();
+            let mut depth = 1usize;
+            let mut in_str = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if in_str {
+                    if c == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                i += 1;
+            }
+            out.push(src[start..i.min(bytes.len())].to_string());
+            from = start + head.len();
+        }
+        out
     }
 
     /// ONE INSTALL, ONE SIZE. A single first run used to quote three figures for
@@ -11559,9 +12034,7 @@ mod tests {
         // The ad-hoc decimal spellings (`as f64 / 1e9` under a "GB" label) are
         // exactly what let the figures drift apart across surfaces.
         let src = include_str!("cli.rs");
-        let production = src
-            .split_once("#[cfg(test)]")
-            .map_or(src, |(before, _)| before);
+        let production = production_half(src);
         assert!(
             !production.contains("1e9"),
             "no ad-hoc byte rendering in the CLI — every size goes through \
@@ -13252,7 +13725,10 @@ mod tests {
     fn the_toolset_verb_changes_its_mind_before_its_pass() {
         let src = include_str!("cli.rs");
         let start = src
-            .find("fn cmd_install_default_set")
+            // The BODY, not the one-line wrapper that answers the announcement:
+            // `find` takes the first match, and the wrapper has neither the clears
+            // nor the pass call in it.
+            .find("fn cmd_install_default_set_code")
             .expect("the toolset verb");
         let end = src[start..]
             .find("\nfn ")

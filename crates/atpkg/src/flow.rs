@@ -566,6 +566,35 @@ pub struct InstallRequest<'a> {
     pub installed: Option<u64>,
 }
 
+/// Re-write `store/<program>/current` and `channels/<channel>/current` at `build` unless
+/// the prefix already proves that build live for `program` ([`crate::gc::live_builds`]).
+///
+/// The up-to-date path's one write. `installed` is what the shims run, so on this path
+/// the pin and the shims agree — but a prefix last written by a manager older than the
+/// per-program link, a `current` that dangles because its build was removed, or a channel
+/// link left at a superseded build has NO witness for the program: GC abstains on it
+/// forever and `doctor` names it diverged with `update` as the remedy. Until this existed,
+/// that remedy did nothing, because the program was "already current". A healthy store is
+/// not touched; a build that is not on disk is left for `doctor` to name.
+fn reassert_witness(
+    layout: &Layout,
+    channel: &str,
+    program: &str,
+    build: u64,
+) -> Result<(), FlowError> {
+    if crate::gc::live_builds(layout)
+        .get(program)
+        .is_some_and(|w| w.build() == build)
+    {
+        return Ok(());
+    }
+    let build_dir = layout.build_dir(program, build);
+    if !build_dir.is_dir() {
+        return Ok(());
+    }
+    activate_channel(layout, channel, &build_dir).map_err(|e| FlowError::Activate(e.to_string()))
+}
+
 /// Install (or force-upgrade) the program named by `req`, using `fetcher` for all network
 /// I/O, `anchor` as the pinned paper-master keyset + durable roster ratchet, and `floor`
 /// as the durable index high-water **paired with the roster generation that recorded it**
@@ -674,6 +703,8 @@ fn install_inner(
     // 3. The apply decision.
     match decide(ch, program, installed) {
         ApplyDecision::UpToDate => {
+            // No fetch, no stage — but the no-op pass still owns the liveness witness.
+            reassert_witness(layout, channel, program, pinned)?;
             return Ok(InstallReport {
                 program: program.to_string(),
                 build: pinned,
@@ -5463,6 +5494,55 @@ mod tests {
         };
         let r = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(r.already_current && r.shimmed.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An up-to-date pass re-points a MISSING `current` witness at the build the pin and
+    /// the shims already agree on — the `doctor` remedy for a program that is on PATH
+    /// with no link selecting it (`NoLiveWitness`). No fetch happens, and a second pass
+    /// over the now-healthy store is a no-op.
+    #[test]
+    fn an_up_to_date_pass_reasserts_a_missing_current_witness() {
+        let dir = scratch("witness");
+        let fake = fixture(&dir);
+        let layout = layout(&dir);
+        // Build 18 on disk and shimmed, exactly as an older manager left it: no
+        // `store/ay/current`, no channel link.
+        let build_dir = layout.build_dir("ay", 18);
+        std::fs::create_dir_all(build_dir.join("bin")).unwrap();
+        std::fs::write(build_dir.join("bin").join("ay"), b"#!/bin/true\n").unwrap();
+        crate::activate::install_shims(&layout, &build_dir, &["ay".to_string()], Aliases::Off)
+            .unwrap();
+        crate::store::mark_build_ready(&build_dir).unwrap();
+        assert!(
+            crate::gc::live_builds(&layout).get("ay").is_none(),
+            "no witness before the pass"
+        );
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: Some(18),
+        };
+        let r = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert!(r.already_current && r.shimmed.is_empty());
+        let live = crate::gc::live_builds(&layout);
+        assert_eq!(
+            live.get("ay").map(|w| w.build()),
+            Some(18),
+            "diverged: {:?}",
+            live.diverged()
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            build_dir
+        );
+        assert_eq!(
+            std::fs::read_link(layout.channel_current("stable")).unwrap(),
+            build_dir
+        );
+        let r = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert!(r.already_current);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

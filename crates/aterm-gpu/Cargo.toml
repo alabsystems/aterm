@@ -10,6 +10,8 @@ repository.workspace = true
 description = "aterm GPU renderer (wgpu/Metal): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
 
 [features]
+# Native drawable starvation conformance only; absent from shipped builds.
+acquire-conformance = []
 default = []
 # THE FLIP (map §5 W6): the wgpu ORACLE arm, OFF in every production build.
 # On macOS the wgpu dependency below is OPTIONAL and this feature is its only
@@ -148,6 +150,7 @@ aterm-spec = { workspace = true, optional = true }
 # documented fail-soft arm for device loss; this makes it the first fallback
 # rather than the second. Reverting is one feature name per row.
 [target.'cfg(target_os = "macos")'.dependencies]
+aterm-objc = { workspace = true }
 # THE FLIP: optional — the first-party Metal renderer is the macOS backend,
 # and wgpu compiles on this cell ONLY as the differential oracle (see the
 # `wgpu-oracle` feature above). `cargo tree -e normal --target

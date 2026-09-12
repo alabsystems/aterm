@@ -61,15 +61,24 @@ impl Scene {
         if let Some((x0, x1, y0, y1)) = frame.body_px(CELL_W, CELL_H, COLS, ROWS) {
             let mut world = PetWorld::default();
             assert!(world.observe(&input, &facts, PetPane::full(&input)));
-            assert!(world.clear(
-                PetRect::new(
-                    y0 as f32 / f32::from(CELL_H),
-                    x0 as f32 / f32::from(CELL_W),
-                    (y1 - y0) as f32 / f32::from(CELL_H),
-                    (x1 - x0) as f32 / f32::from(CELL_W),
-                ),
-                0.0,
-            ));
+            let rect = PetRect::new(
+                y0 as f32 / f32::from(CELL_H),
+                x0 as f32 / f32::from(CELL_W),
+                (y1 - y0) as f32 / f32::from(CELL_H),
+                (x1 - x0) as f32 / f32::from(CELL_W),
+            );
+            // THE CARET'S OWN KEEP-OFF RING IS NOT "PROTECTED PIXELS" TO ITS
+            // ESCORT. `STATION_LEAD` seats the pet one cell past the caret,
+            // inside that 3x3 ring by construction — that is the shipped
+            // escort law and what the pet looked like at v0.76.0. Read
+            // strictly this assertion says the escort may never take its own
+            // station. Everything else the strict reading guards — a
+            // selection, an image, a row with no certified cell-to-pixel
+            // projection — still fails here, and the caret CELL itself stays
+            // uncovered at rest because the station law puts the body beside
+            // it, not on it.
+            assert!(world.under_text_clearance_past_caret(rect, 0.0) == Some(true));
+            assert!(frame.under_ink || world.clear(rect, 0.0));
         }
         frame
     }
@@ -149,24 +158,36 @@ fn retained_perch_translates_once_with_real_full_screen_output_scroll() {
 }
 
 #[test]
-fn in_flight_perch_translation_preserves_progress_and_finishes() {
+fn hidden_cursor_home_stays_put_while_real_output_scrolls() {
     let mut s = Scene::new(false);
+    let mut before = s.tick(16);
     for _ in 0..30 {
-        s.tick(100);
+        before = s.tick(100);
     }
     s.work();
     let moving = s.tick(16);
+    // A new output interest directs the gaze instead of commissioning a
+    // distant perch trip. Actual flight/landing ownership is separately
+    // exercised by console_handoff_conformance's real local-hop fixture.
     assert!(
-        s.brain.needs_frames(),
-        "fixture must exercise actual transit"
+        !s.brain.needs_frames(),
+        "output interest must not move the base"
     );
+    assert_eq!((moving.col, moving.row), (before.col, before.row));
     assert!(moving.alpha > 0);
     let anchor = s.brain.console_anchor_id().expect("real executing block");
+    let old_top = PetWorldFacts::read(&s.term, 7).stamp.top_absolute_row;
     s.term.process(b"\x1b[24;1H\n");
+    assert_eq!(
+        PetWorldFacts::read(&s.term, 7).stamp.top_absolute_row,
+        old_top + 1
+    );
     let scrolled = s.tick(0);
     assert_eq!(s.brain.console_anchor_id(), Some(anchor));
     assert!((scrolled.col - moving.col).abs() < 0.001);
-    assert!((scrolled.row - (moving.row - 1.0)).abs() < 0.001);
+    // The last real cursor is still home while DECTCEM hides it. Output
+    // scrolls its own anchor; it cannot carry the resident away from input.
+    assert!((scrolled.row - moving.row).abs() < 0.001);
     let duplicate = s.tick(0);
     assert_eq!(duplicate.fp(), scrolled.fp());
     let settled = s.settle();
@@ -178,7 +199,7 @@ fn in_flight_perch_translation_preserves_progress_and_finishes() {
 }
 
 #[test]
-fn output_that_occludes_the_old_perch_recovers_without_unrelated_redraws() {
+fn output_over_the_old_perch_keeps_the_full_body_and_settles_without_polling() {
     let mut s = Scene::new(false);
     s.work();
     let before = s.settle();
@@ -193,20 +214,25 @@ fn output_that_occludes_the_old_perch_recovers_without_unrelated_redraws() {
     assert!(PetWorldFacts::read(&s.term, 7).stamp.top_absolute_row > old_top);
     let occluded = s.tick(16);
     assert_eq!(s.brain.console_anchor_id(), Some(anchor));
-    assert_eq!(occluded.alpha, 0, "an occluded body cannot jump opaquely");
-    let deadline = s.brain.next_change_deadline(s.now);
     assert!(
-        s.brain.needs_frames() || deadline.is_some(),
-        "a known clear destination must have a finite re-entry wake"
+        occluded.alpha > 0,
+        "ordinary output must not make the body blink out"
     );
-    if !s.brain.needs_frames() {
-        let until = deadline.unwrap().saturating_duration_since(s.now);
-        s.tick(until.as_millis() as u64 + 1);
-    }
     let recovered = s.settle();
+    let input = s.term.cell_frame(usize::from(ROWS), usize::from(COLS));
+    let facts = PetWorldFacts::read(&s.term, 7);
+    let mut world = PetWorld::default();
+    assert!(world.observe(&input, &facts, PetPane::full(&input)));
+    let (x0, x1, y0, y1) = before.body_px(CELL_W, CELL_H, COLS, ROWS).unwrap();
+    let old_body = PetRect::new(
+        y0 as f32 / f32::from(CELL_H),
+        x0 as f32 / f32::from(CELL_W),
+        (y1 - y0) as f32 / f32::from(CELL_H),
+        (x1 - x0) as f32 / f32::from(CELL_W),
+    );
     assert!(
-        (recovered.col - before.col).abs() > 1.0,
-        "fixture must exercise a new clear output-side placement"
+        !world.clear(old_body, 0.0),
+        "fixture must actually draw output over the old full-body footprint"
     );
     assert_eq!(s.brain.console_anchor_id(), Some(anchor));
     assert_eq!(s.brain.next_change_deadline(s.now), None);
@@ -215,20 +241,24 @@ fn output_that_occludes_the_old_perch_recovers_without_unrelated_redraws() {
 }
 
 #[test]
-fn fully_occupied_output_never_reenters_or_polls_for_a_perch() {
+fn fully_occupied_output_keeps_the_resident_under_text_without_polling() {
     let mut s = Scene::new(false);
     s.work();
     s.settle();
     s.term.process(b"\x1b[H");
     s.term
         .process(&vec![b'X'; usize::from(ROWS) * usize::from(COLS)]);
-    let hidden = s.tick(16);
-    assert_eq!(hidden.alpha, 0);
-    assert_eq!(s.brain.console_attention(), PetAttention::Yielding);
+    let resident = s.settle();
+    assert!(resident.alpha > 0);
+    assert!(
+        resident.under_ink,
+        "ordinary output draws in front of the pet"
+    );
+    assert_ne!(s.brain.console_attention(), PetAttention::Yielding);
     assert!(!s.brain.needs_frames());
     assert_eq!(s.brain.next_change_deadline(s.now), None);
     let later = s.tick(30_000);
-    assert_eq!(later.alpha, 0);
+    assert_eq!(later.fp(), resident.fp());
     assert!(!s.brain.needs_frames());
     assert_eq!(s.brain.next_change_deadline(s.now), None);
 }

@@ -55,6 +55,11 @@ enum PatchState {
     ForkVersionUnreadable { path: String },
     /// Ordinary registry code, no fork of this name.
     Registry,
+    /// aterm's OWN code, vendored in-tree and reached by a path dependency —
+    /// `provenance::FIRST_PARTY_VENDORED`. Not a fork and not registry code,
+    /// and saying "registry" here was a WRONG ANSWER rather than a rough one:
+    /// it named crates.io as the source of a directory aterm owns.
+    FirstPartyVendored { path: String },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -142,8 +147,8 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
         );
     }
 
-    versions_block(&mut log, &found, &surveys, &forks);
-    liveness_block(&mut log, &want_name, &found, &surveys, &forks);
+    versions_block(&mut log, root, &found, &surveys, &forks);
+    liveness_block(&mut log, root, &want_name, &found, &surveys, &forks);
     for (id, cells_with) in &found {
         package_block(&mut log, root, id, cells_with, &surveys, &forks);
     }
@@ -155,6 +160,7 @@ pub fn run(root: &Path, pkg: &str, cells: &[String]) -> Result<Outcome, String> 
 
 fn versions_block(
     log: &mut String,
+    root: &Path,
     found: &BTreeMap<PkgId, Vec<usize>>,
     surveys: &[CellSurvey],
     forks: &BTreeMap<String, VendorFork>,
@@ -165,12 +171,14 @@ fn versions_block(
             .iter()
             .map(|i| surveys[*i].cell.name.as_str())
             .collect::<Vec<_>>();
-        let state = patch_state(forks, id);
+        let facts = cells_with.iter().find_map(|i| surveys[*i].facts.get(id));
+        let state = patch_state(root, facts, forks, id);
         let tag = match &state {
             PatchState::Fork { path } => format!("FORKED   {path}"),
             PatchState::UnpatchedBesideFork { .. } => "UNPATCHED (registry)".to_string(),
             PatchState::ForkVersionUnreadable { path } => format!("fork? {path}"),
             PatchState::Registry => "registry".to_string(),
+            PatchState::FirstPartyVendored { .. } => "first-party (vendored)".to_string(),
         };
         let line = versions_row(&id.name, &id.version.to_string(), &tag, &where_.join(", "));
         let _ = writeln!(log, "{line}");
@@ -207,6 +215,7 @@ fn versions_block(
 /// THE load-bearing check: a fork that only covers one of the resolved versions.
 fn liveness_block(
     log: &mut String,
+    root: &Path,
     name: &str,
     found: &BTreeMap<PkgId, Vec<usize>>,
     surveys: &[CellSurvey],
@@ -214,12 +223,14 @@ fn liveness_block(
 ) {
     let stale: Vec<(&PkgId, String, &Vec<usize>)> = found
         .iter()
-        .filter_map(|(id, cells_with)| match patch_state(forks, id) {
-            PatchState::UnpatchedBesideFork { fork_version, .. } => {
-                Some((id, fork_version, cells_with))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |(id, cells_with)| match patch_state(root, None, forks, id) {
+                PatchState::UnpatchedBesideFork { fork_version, .. } => {
+                    Some((id, fork_version, cells_with))
+                }
+                _ => None,
+            },
+        )
         .collect();
     if stale.is_empty() {
         return;
@@ -323,7 +334,7 @@ fn package_block(
     let _ = writeln!(log, "{}", "-".repeat(W_LINE));
 
     let facts = cells_with.iter().find_map(|i| surveys[*i].facts.get(id));
-    let state = patch_state(forks, id);
+    let state = patch_state(root, facts, forks, id);
     match &state {
         PatchState::Fork { path } => {
             let _ = writeln!(
@@ -357,6 +368,23 @@ fn package_block(
                 "  source        crates.io registry (not forked, not owned)"
             );
         }
+        PatchState::FirstPartyVendored { path } => {
+            // Three lines, not one: a first-party vendored path is
+            // `vendor/<root>/crates/<name>` and the sentence that has to
+            // accompany it does not fit beside it inside 100 columns.
+            let _ = writeln!(
+                log,
+                "  source        {path} — FIRST-PARTY, vendored in-tree."
+            );
+            let _ = writeln!(
+                log,
+                "                aterm WROTE this code; it is under vendor/ so a clean clone"
+            );
+            let _ = writeln!(
+                log,
+                "                builds, not because it is a redistribution."
+            );
+        }
     }
     if let Some(f) = facts {
         let lic = if f.license.is_empty() {
@@ -377,9 +405,9 @@ fn package_block(
             log,
             "                {}",
             if f.is_third_party {
-                "THIRD-PARTY (not under crates/)"
+                "THIRD-PARTY (aterm did not write it)"
             } else {
-                "first-party"
+                "first-party (aterm's own code)"
             }
         );
         if let Some(dir) = &f.root_dir {
@@ -811,7 +839,22 @@ fn read_forks(root: &Path) -> Result<BTreeMap<String, VendorFork>, String> {
     Ok(out)
 }
 
-fn patch_state(forks: &BTreeMap<String, VendorFork>, id: &PkgId) -> PatchState {
+fn patch_state(
+    root: &Path,
+    facts: Option<&crate::model::PkgFacts>,
+    forks: &BTreeMap<String, VendorFork>,
+    id: &PkgId,
+) -> PatchState {
+    // The roster is asked FIRST, off the measured directory: a first-party
+    // vendored crate has no patch entry, so the fork map cannot see it and the
+    // fall-through below would call it registry code.
+    if let Some(dir) = facts.and_then(|f| f.root_dir.as_ref())
+        && crate::provenance::is_first_party_vendored(root, dir)
+    {
+        return PatchState::FirstPartyVendored {
+            path: dir_line(root, dir),
+        };
+    }
     let Some(f) = forks.get(&id.name) else {
         return PatchState::Registry;
     };
@@ -1054,8 +1097,9 @@ mod tests {
             .version
             .clone()
             .expect("vendor/indexmap/Cargo.toml carries a literal version");
+        let root = repo_root();
         assert_eq!(
-            patch_state(&forks, &PkgId::new("indexmap", v.clone())),
+            patch_state(&root, None, &forks, &PkgId::new("indexmap", v.clone())),
             PatchState::Fork {
                 path: "vendor/indexmap".into()
             }
@@ -1064,13 +1108,43 @@ mod tests {
         // for. Asserted on a SYNTHETIC id on purpose: the shipped graph carries
         // no unpatched sibling today, and the detector must stay proved anyway.
         assert!(matches!(
-            patch_state(&forks, &PkgId::new("indexmap", "3.0.0")),
+            patch_state(&root, None, &forks, &PkgId::new("indexmap", "3.0.0")),
             PatchState::UnpatchedBesideFork { .. }
         ));
         assert_eq!(
-            patch_state(&forks, &PkgId::new("serde", "1.0.0")),
+            patch_state(&root, None, &forks, &PkgId::new("serde", "1.0.0")),
             PatchState::Registry
         );
+        // THE THIRD ANSWER, and the one this verb used to get WRONG rather
+        // than roughly: a first-party vendored crate has no patch entry, so
+        // the fork map cannot see it and the fall-through called it
+        // `crates.io registry (not forked, not owned)` — naming crates.io as
+        // the source of a directory aterm owns. The measured directory is what
+        // decides it, so the facts are what the roster is asked about.
+        let own = crate::model::PkgFacts {
+            root_dir: Some(root.join("vendor/astream/crates/astream-cap")),
+            ..crate::model::PkgFacts::default()
+        };
+        assert_eq!(
+            patch_state(
+                &root,
+                Some(&own),
+                &forks,
+                &PkgId::new("astream-cap", "0.1.0")
+            ),
+            PatchState::FirstPartyVendored {
+                path: "vendor/astream/crates/astream-cap".into()
+            }
+        );
+        // A REAL fork's directory must not be swallowed by the same arm.
+        let fork = crate::model::PkgFacts {
+            root_dir: Some(root.join("vendor/winit")),
+            ..crate::model::PkgFacts::default()
+        };
+        assert!(matches!(
+            patch_state(&root, Some(&fork), &forks, &PkgId::new("winit", "0.30.13")),
+            PatchState::Fork { .. }
+        ));
     }
 
     /// THE DIR LINE'S WIDTH IS THE CONTENT'S, NEVER THE ENVIRONMENT'S.

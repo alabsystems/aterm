@@ -207,7 +207,7 @@ if test -d "$HOME/.aterm/shell.d"
     end
 end
 
-# ─── The reroute directory, FIRST ───
+# ─── The reroute directory, FIRST — and the agents directory beside it ───
 #
 # $ATERM_REROUTE_DIR is set by aterm's spawn seam: the session-scoped directory of
 # stubs for the upstream Rust names (`aterm help reroute`), which the seam already
@@ -225,15 +225,28 @@ end
 # An explicit equality loop rather than `string match -v`: `string match` reads its
 # pattern as a wildcard, so a directory named with `*` or `[` would not be removed
 # by equality. The quoted `"$d"` keeps an EMPTY entry — the user's — intact.
-function __aterm_reroute_path_front
-    if test -n "$ATERM_REROUTE_DIR"; and test -d "$ATERM_REROUTE_DIR"
-        set -l rest
-        for d in $PATH
-            if test "$d" != "$ATERM_REROUTE_DIR"
-                set -a rest "$d"
-            end
+#
+# $ATPKG_AGENTS — set by the atpkg shell.d hook sourced just above — names
+# <prefix>/agents, which holds ONLY the claude and codex shims aterm keeps current
+# (owner decision 2026-09-10). It fails the same way (measured 2026-09-10 on m27:
+# behind /opt/homebrew/bin and ~/.local/bin), so it is moved to the front first,
+# then the reroute directory, so PATH reads reroute, agents, … — the spawn seam's
+# own order.
+function __aterm_path_front --argument-names dir
+    set -l rest
+    for d in $PATH
+        if test "$d" != "$dir"
+            set -a rest "$d"
         end
-        set -gx PATH "$ATERM_REROUTE_DIR" $rest
+    end
+    set -gx PATH "$dir" $rest
+end
+function __aterm_reroute_path_front
+    if test -n "$ATPKG_AGENTS"; and test -d "$ATPKG_AGENTS"
+        __aterm_path_front "$ATPKG_AGENTS"
+    end
+    if test -n "$ATERM_REROUTE_DIR"; and test -d "$ATERM_REROUTE_DIR"
+        __aterm_path_front "$ATERM_REROUTE_DIR"
     end
 end
 __aterm_reroute_path_front

@@ -54,6 +54,7 @@
 //! * LOAD-SHED — notes ride the sparkle emission branch, so the shed latch
 //!   sheds them with every other decoration.
 
+use std::fmt;
 use std::time::Duration;
 
 use aterm_time::Instant;
@@ -109,6 +110,157 @@ pub fn song_signature(ch: char) -> u32 {
 /// Pinned against the synth's decode by `trail_sound`'s
 /// `neutral_signature_is_the_reference_voicing`.
 pub const NEUTRAL_SIGNATURE: u32 = 12;
+
+// ---------------------------------------------------------------------------
+// The ARMED celebration (RAINBOW-KITTY-V2.md §27)
+// ---------------------------------------------------------------------------
+
+/// The most bars an armed celebration may run. Four bars is 6.4 s — one
+/// phrase's worth of the riff's build, and the point past which a celebration
+/// nobody is holding a key for becomes a broadcast.
+pub const CELEBRATE_MAX_BARS: u8 = 4;
+
+/// The cooldown between two arms of one window's detector, measured from the
+/// ARM (not the fire): an agent may schedule one celebration, then wait.
+pub const CELEBRATE_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Fan stars on the FIRST bar of any sing-along (armed or held).
+pub const BAR_FAN_BASE: u8 = 5;
+
+/// Fan stars added per bar: 5, 7, 9, 11, …
+pub const BAR_FAN_STEP: u8 = 2;
+
+/// The bar fan's ceiling — half the sky's `STAR_CAP`, so a fan on a busy
+/// sky lands on the eviction finish and never on a pop.
+pub const BAR_FAN_CAP: u8 = 18;
+
+/// The shockwave ring rides every fourth bar (bars 3, 7, …), so a four-bar
+/// celebration ends under its ring.
+pub const BAR_RING_EVERY: u64 = 4;
+
+/// The "drop" fan thrown on the armed celebration's release, with the outro.
+pub const DROP_FAN_N: u8 = 9;
+
+/// The outro's length in seconds — the pulse lead on *do*, its sub and the
+/// faraway bell, so the song ENDS on the bar line instead of fading
+/// mid-phrase. Pinned equal to `trail_sound::CELEBRATION_OUTRO_S` there.
+pub const OUTRO_SECONDS: f32 = 1.2;
+
+/// Which keystroke-caused edge an armed celebration fires on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CelebrateOn {
+    /// The session's next exit-0 command block (OSC 133/633 `D` with status
+    /// 0) — the verdict's own edge, which the host only reports for a `D`
+    /// that a keyed Enter armed.
+    Green,
+    /// The session's next keyed Enter (a real key event, or raw bytes ending
+    /// in a newline — an agent's `send` counts, program output never does).
+    Enter,
+}
+
+impl CelebrateOn {
+    /// The wire spelling (`on=green|enter`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Enter => "enter",
+        }
+    }
+}
+
+/// One armed, not-yet-fired celebration: what `fx celebrate` latched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmedCelebration {
+    /// The song signature ([`song_signature`] of the chosen key).
+    pub sig: u32,
+    /// Bars to run, `1..=CELEBRATE_MAX_BARS`.
+    pub bars: u8,
+    /// The edge it fires on.
+    pub on: CelebrateOn,
+    /// The session the arm is bound to: a green block in another tab of the
+    /// same window is not this session's block.
+    pub session: u64,
+}
+
+/// Why an arm was refused. Every refusal is a wire-visible sentence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmRefusal {
+    /// `bars` outside `1..=CELEBRATE_MAX_BARS`.
+    Bars(u8),
+    /// An arm is already pending on this window; one arm at a time.
+    AlreadyArmed,
+    /// Inside [`CELEBRATE_COOLDOWN`] of the last arm.
+    Cooldown {
+        /// Milliseconds until the next arm is admitted.
+        remaining_ms: u64,
+    },
+}
+
+impl fmt::Display for ArmRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bars(b) => write!(f, "bars={b} is outside 1..={CELEBRATE_MAX_BARS}"),
+            Self::AlreadyArmed => f.write_str("a celebration is already armed (one arm at a time)"),
+            Self::Cooldown { remaining_ms } => {
+                write!(
+                    f,
+                    "cooldown: {remaining_ms} ms until the next arm is admitted"
+                )
+            }
+        }
+    }
+}
+
+/// One bar's fan, decided by the detector and thrown by the glow engine on
+/// the frame that first sees the bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BarFan {
+    /// The bar index since the arm.
+    pub bar: u64,
+    /// Star count: `min(5 + 2·bar, 18)`.
+    pub n: u8,
+    /// Whether this bar carries the shockwave ring (every fourth bar).
+    pub ring: bool,
+}
+
+/// The fan a bar earns: `5 + 2·bar` stars under [`BAR_FAN_CAP`], the ring
+/// on every [`BAR_RING_EVERY`]th bar. A pure function, so the host and the
+/// tests read one law.
+#[must_use]
+pub fn bar_fan(bar: u64) -> BarFan {
+    let steps = u8::try_from(bar.min(u64::from(u8::MAX))).unwrap_or(u8::MAX);
+    let n = BAR_FAN_BASE
+        .saturating_add(BAR_FAN_STEP.saturating_mul(steps))
+        .min(BAR_FAN_CAP);
+    BarFan {
+        bar,
+        n,
+        ring: (bar + 1).is_multiple_of(BAR_RING_EVERY),
+    }
+}
+
+/// The armed celebration's release: the drop fan and the outro's signature,
+/// handed to the host exactly once on the first frame at or after the run's
+/// last bar line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Outro {
+    /// The signature the outro resolves in — the same key the bars sang.
+    pub sig: u32,
+    /// The drop fan's star count ([`DROP_FAN_N`]).
+    pub drop: u8,
+}
+
+/// A FIRED armed celebration: the run the detector is driving with no key
+/// under it. Its end is a bar line by construction (`bars × SING_BAR_SECONDS`
+/// after the fire), which is what makes the outro beat-quantised.
+#[derive(Clone, Copy, Debug)]
+struct ExternalRun {
+    sig: u32,
+    bars: u8,
+    ends_at: Instant,
+    outro_taken: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Detector
@@ -193,12 +345,33 @@ pub struct KittySing {
     /// the DEPARTURE stored here, so ordinary typing loses exactly what it
     /// lost before this existed.
     handover_from: Option<Instant>,
+    /// An ARMED, not-yet-fired celebration (`fx celebrate`): latched here and
+    /// spent by the first keystroke-caused edge it named (§27). Latch, don't
+    /// act — nothing lights until that edge.
+    armed_external: Option<ArmedCelebration>,
+    /// The fired run, while it plays and winds down; cleared by `settle`, or
+    /// by a human hold that re-earns the stage inside the wind-down.
+    external: Option<ExternalRun>,
+    /// The last ARM instant — the cooldown's anchor. Survives `settle`.
+    last_external_arm: Option<Instant>,
+    /// The bar-fan latch: the last bar a fan was thrown for (one per bar).
+    fan_bar: Option<u64>,
 }
 
 impl KittySing {
     /// Bind the run to `session`, winding down on a switch.
     fn rekey(&mut self, now: Instant, session: u64) {
         if self.session != Some(session) {
+            // A fired celebration belongs to the session it fired in: the
+            // switch cuts it into its wind-down (the outro still speaks, so it
+            // ends rather than vanishes). The PENDING arm is session-bound by
+            // its own field and waits.
+            if let Some(ext) = self.external
+                && self.wind_from.is_none()
+                && now < ext.ends_at
+            {
+                self.wind_from = Some(now);
+            }
             self.release(now);
             self.session = Some(session);
         }
@@ -207,6 +380,16 @@ impl KittySing {
     /// End the current run at `at`: an armed run starts its crossfade there
     /// (never a hard cut); an unarmed run just clears.
     fn release(&mut self, at: Instant) {
+        // A FIRED celebration has no key under it to let go of: typing over
+        // it clears the run bookkeeping and leaves the bars playing to their
+        // line. Only `settle` (drive 0) or a session switch ends it early.
+        if self.external.is_some() && self.wind_from.is_none() {
+            self.run = None;
+            self.count = 0;
+            self.last = None;
+            self.handover_from = None;
+            return;
+        }
         if self.armed_at.is_some() && self.wind_from.is_none() {
             // A lazy release may already have begun the fade earlier than
             // this eager event; keep the EARLIER instant so the crossfade
@@ -241,6 +424,9 @@ impl KittySing {
     /// over the same uninterrupted bar grid.
     #[must_use]
     pub fn signature(&self) -> u32 {
+        if let Some(ext) = self.external {
+            return ext.sig;
+        }
         self.run.map_or(NEUTRAL_SIGNATURE, song_signature)
     }
 
@@ -255,6 +441,11 @@ impl KittySing {
     fn wind_start(&self, now: Instant) -> Option<Instant> {
         if self.wind_from.is_some() {
             return self.wind_from;
+        }
+        // A fired celebration winds down on its LAST BAR LINE — derived, like
+        // the lazy release, so no event is needed and the outro is quantised.
+        if let Some(ext) = self.external {
+            return (now >= ext.ends_at).then_some(ext.ends_at);
         }
         self.lazy_release().filter(|release| now >= *release)
     }
@@ -281,6 +472,15 @@ impl KittySing {
         // materialize that before deciding whether this press extends it.
         if self.lazy_release().is_some_and(|release| now > release) {
             self.release(now);
+        }
+        // A fired celebration past its bar line is winding down — materialize
+        // that stamp, exactly as the lazy release is, so a held key inside the
+        // wind-down can re-earn the stage under the forgiveness law below.
+        if let Some(ext) = self.external
+            && self.wind_from.is_none()
+            && now >= ext.ends_at
+        {
+            self.wind_from = Some(ext.ends_at);
         }
         if self.run != Some(ch)
             && self.armed_at.is_some()
@@ -359,6 +559,11 @@ impl KittySing {
         if self.count >= threshold && (self.armed_at.is_none() || self.wind_from.is_some()) {
             self.armed_at = Some(now);
             self.wind_from = None;
+            // The hand owns the stage now: the fired run's signature and bar
+            // line give way to the held key's, and the bar-fan latch reopens
+            // on the new grid.
+            self.external = None;
+            self.fan_bar = None;
         }
     }
 
@@ -422,7 +627,17 @@ impl KittySing {
         if !self.is_armed(now) {
             return None;
         }
-        self.raw_bar(now)
+        let bar = self.raw_bar(now)?;
+        // A fired run plays exactly `bars` bars: `ends_at` is `bars ×
+        // SING_BAR_SECONDS` in f32, and a frame can land inside that last
+        // rounding epsilon still "armed" with the raw index already at
+        // `bars` — which would push one bar of riff and one fan too many.
+        if let Some(ext) = self.external
+            && bar >= u64::from(ext.bars)
+        {
+            return None;
+        }
+        Some(bar)
     }
 
     /// A drained detector at rest is byte-identical off — the idle contract.
@@ -432,7 +647,173 @@ impl KittySing {
             self.armed_at = None;
             self.wind_from = None;
             self.handover_from = None;
+            self.external = None;
+            self.fan_bar = None;
         }
+    }
+
+    // -- the armed celebration (§27) ------------------------------------------
+
+    /// ARM a one-shot celebration (`fx celebrate`): LATCHED, never acted on —
+    /// it fires on the next keystroke-caused edge `on` names, in `session`.
+    /// Refused outside `1..=CELEBRATE_MAX_BARS`, while an arm is pending, or
+    /// inside [`CELEBRATE_COOLDOWN`] of the last arm. The cooldown is stamped
+    /// on the ARM, so a refused arm costs nothing and an admitted one costs
+    /// thirty seconds whether or not its edge ever comes.
+    pub fn arm_external(
+        &mut self,
+        now: Instant,
+        session: u64,
+        sig: u32,
+        bars: u8,
+        on: CelebrateOn,
+    ) -> Result<ArmedCelebration, ArmRefusal> {
+        if !(1..=CELEBRATE_MAX_BARS).contains(&bars) {
+            return Err(ArmRefusal::Bars(bars));
+        }
+        if self.armed_external.is_some() {
+            return Err(ArmRefusal::AlreadyArmed);
+        }
+        let remaining = self.cooldown_remaining(now);
+        if !remaining.is_zero() {
+            return Err(ArmRefusal::Cooldown {
+                remaining_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        let arm = ArmedCelebration {
+            sig,
+            bars,
+            on,
+            session,
+        };
+        self.last_external_arm = Some(now);
+        self.armed_external = Some(arm);
+        Ok(arm)
+    }
+
+    /// The pending arm, if any (a pure read — `fx status`).
+    #[must_use]
+    pub fn armed_external(&self) -> Option<ArmedCelebration> {
+        self.armed_external
+    }
+
+    /// Time left on the arm cooldown at `now`; zero when an arm is admissible.
+    #[must_use]
+    pub fn cooldown_remaining(&self, now: Instant) -> Duration {
+        self.last_external_arm.map_or(Duration::ZERO, |t| {
+            (t + CELEBRATE_COOLDOWN).saturating_duration_since(now)
+        })
+    }
+
+    /// True while a fired celebration is on the stage (playing or winding
+    /// down, until `settle`).
+    #[must_use]
+    pub fn external_live(&self) -> bool {
+        self.external.is_some()
+    }
+
+    /// The next external-run event that a host must consume: the initial bar,
+    /// the next bar, the outro, or final settlement. Held-key songs and pending
+    /// arms add no deadline. A due unconsumed event answers `now`; after its
+    /// take/settle call the answer advances, so static hosts need no frame train.
+    #[must_use]
+    pub fn next_external_deadline(&self, now: Instant) -> Option<Instant> {
+        let ext = self.external?;
+        if let Some(bar) = self.bar(now) {
+            if self.fan_bar != Some(bar) {
+                return Some(now);
+            }
+            let anchor = self.armed_at?;
+            let next = anchor + Duration::from_secs_f32(SING_BAR_SECONDS * (bar + 1) as f32);
+            // The bar API and its authored clock use f32. If the nanosecond
+            // conversion lands just before a quotient's rounding boundary,
+            // one microsecond crosses it without rearming a passed instant.
+            return Some(next.min(ext.ends_at).max(now + Duration::from_micros(1)));
+        }
+        let release = self.wind_start(now).unwrap_or(ext.ends_at);
+        if !ext.outro_taken {
+            return Some(release.max(now));
+        }
+        Some((release + Duration::from_secs_f32(SING_WIND_DOWN)).max(now))
+    }
+
+    /// THE GREEN EDGE: the host's verdict path reports `session`'s exit-0
+    /// block here — only for a `D` a keyed Enter armed (the verdict's own
+    /// law), so the light this fires has that Enter behind it. Fires a
+    /// pending [`CelebrateOn::Green`] arm bound to this session; anything
+    /// else is a no-op. A block in another session leaves the arm waiting.
+    pub fn note_green_block(&mut self, now: Instant, session: u64) {
+        if let Some(arm) = self.armed_external
+            && arm.on == CelebrateOn::Green
+            && arm.session == session
+        {
+            self.fire_external(now, session, arm);
+        }
+    }
+
+    /// THE ENTER EDGE: a keyed Enter in `session` (a key event, or raw bytes
+    /// ending in a newline from the control socket — an agent's keypress is
+    /// a keypress). Fires a pending [`CelebrateOn::Enter`] arm bound to this
+    /// session; anything else is a no-op.
+    pub fn note_keyed_enter(&mut self, now: Instant, session: u64) {
+        if let Some(arm) = self.armed_external
+            && arm.on == CelebrateOn::Enter
+            && arm.session == session
+        {
+            self.fire_external(now, session, arm);
+        }
+    }
+
+    /// Spend the arm: anchor the beat clock at `now` and run `bars` bars with
+    /// no key under them. A live human hold is re-anchored onto this grid (the
+    /// celebration was asked for; the hand joins it).
+    fn fire_external(&mut self, now: Instant, session: u64, arm: ArmedCelebration) {
+        self.armed_external = None;
+        self.session = Some(session);
+        self.run = None;
+        self.count = 0;
+        self.last = None;
+        self.handover_from = None;
+        self.armed_at = Some(now);
+        self.wind_from = None;
+        self.fan_bar = None;
+        self.external = Some(ExternalRun {
+            sig: arm.sig,
+            bars: arm.bars,
+            ends_at: now + Duration::from_secs_f32(SING_BAR_SECONDS * f32::from(arm.bars)),
+            outro_taken: false,
+        });
+    }
+
+    /// THE BAR FAN: `Some` exactly once per bar while ARMED (armed run or held
+    /// key alike — the fans ride the bars, whoever is singing), on the first
+    /// frame that sees the bar; `None` on every other frame and throughout the
+    /// wind-down. The host throws it through the glow engine's party seam.
+    pub fn take_bar_fan(&mut self, now: Instant) -> Option<BarFan> {
+        let bar = self.bar(now)?;
+        if self.fan_bar == Some(bar) {
+            return None;
+        }
+        self.fan_bar = Some(bar);
+        Some(bar_fan(bar))
+    }
+
+    /// THE OUTRO: `Some` exactly once, on the first frame at or after a fired
+    /// celebration's release — its last bar line by construction, so the
+    /// outro lands on the downbeat and the song ends rather than fades. The
+    /// host throws the drop fan and pushes the outro gesture. `None` for a
+    /// human's hold: letting go keeps its plain crossfade.
+    pub fn take_outro(&mut self, now: Instant) -> Option<Outro> {
+        let started = self.wind_start(now).is_some();
+        let ext = self.external.as_mut()?;
+        if ext.outro_taken || !started {
+            return None;
+        }
+        ext.outro_taken = true;
+        Some(Outro {
+            sig: ext.sig,
+            drop: DROP_FAN_N,
+        })
     }
 }
 
@@ -769,6 +1150,126 @@ mod tests {
     use super::*;
 
     const S: u64 = 7;
+
+    fn external_deadline_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            ExternalCelebrationDeadline {
+                const Buggy = 0;
+                const Bars = 4;
+                var phase = 0;
+                var consumed = 0;
+                var deadline = 0;
+                action Consume when (phase <= Bars + 1 && consumed == 0) {
+                    consumed = 1;
+                    deadline = if Buggy == 1 { phase } else { phase + 1 };
+                }
+                action Advance when (phase <= Bars && consumed == 1) {
+                    phase = phase + 1;
+                    consumed = 0;
+                }
+                invariant AConsumedEventCannotRearmNow: consumed == 0 || deadline > phase;
+                invariant Bounded: phase <= Bars + 1 && deadline <= Bars + 2 && consumed <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn external_deadline_model_proves_and_catches_a_rearmed_consumed_event() {
+        let model = external_deadline_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn external_deadline_conforms_through_bars_outro_and_settle() {
+        let model = external_deadline_model();
+        let mut expected = model.init_state();
+        let mut sing = KittySing::default();
+        let start = Instant::now();
+        assert_eq!(sing.next_external_deadline(start), None);
+        sing.arm_external(start, S, song_signature('C'), 4, CelebrateOn::Green)
+            .unwrap();
+        assert_eq!(
+            sing.next_external_deadline(start),
+            None,
+            "a pending arm is inert"
+        );
+        sing.note_green_block(start, S);
+        let end = start + Duration::from_secs_f32(4.0 * SING_BAR_SECONDS);
+        let mut now = start;
+        for phase in 0..=5 {
+            assert_eq!(
+                sing.next_external_deadline(now),
+                Some(now),
+                "the current edge is due"
+            );
+            if phase < 4 {
+                assert_eq!(sing.take_bar_fan(now).unwrap().bar, phase);
+            } else if phase == 4 {
+                assert!(sing.take_outro(now).is_some());
+                assert!(sing.take_outro(now).is_none(), "the outro is consumed once");
+            } else {
+                sing.settle(now);
+            }
+            assert!(model.fire("Consume", &mut expected));
+            let next = sing.next_external_deadline(now);
+            let mut actual = expected.clone();
+            actual.insert(
+                "deadline",
+                match next {
+                    Some(at) if at > now => phase as i64 + 1,
+                    Some(_) => phase as i64,
+                    None => 6,
+                },
+            );
+            assert_eq!(
+                actual, expected,
+                "the real consumer advances its offered deadline"
+            );
+            let mut stuck = actual.clone();
+            stuck.insert("deadline", phase as i64);
+            assert!(!model.check_invariant("AConsumedEventCannotRearmNow", &stuck));
+            if phase < 5 {
+                let at = next.expect("a finite run still owes an event");
+                let exact = if phase < 4 {
+                    start + Duration::from_secs_f32((phase + 1) as f32 * SING_BAR_SECONDS)
+                } else {
+                    end + Duration::from_secs_f32(SING_WIND_DOWN)
+                };
+                assert_eq!(at, exact);
+                assert_eq!(
+                    sing.next_external_deadline(now + Duration::from_millis(1)),
+                    Some(at),
+                    "unrelated parks retain the same future offer"
+                );
+                now = at;
+                assert!(model.fire("Advance", &mut expected));
+            } else {
+                assert_eq!(next, None, "settled runs owe no idle wake");
+            }
+        }
+    }
+
+    #[test]
+    fn external_deadline_does_not_schedule_held_keys_or_replay_missed_bars() {
+        let start = Instant::now();
+        let mut held = KittySing::default();
+        let now = hold(&mut held, start, 'a', SING_ARM_REPEATS, 30);
+        assert!(held.is_armed(now));
+        assert_eq!(held.next_external_deadline(now), None);
+        let mut external = KittySing::default();
+        external
+            .arm_external(start, S, song_signature('C'), 4, CelebrateOn::Enter)
+            .unwrap();
+        external.note_keyed_enter(start, S);
+        let late = start + Duration::from_secs_f32(2.5 * SING_BAR_SECONDS);
+        assert_eq!(external.next_external_deadline(late), Some(late));
+        assert_eq!(external.take_bar_fan(late).unwrap().bar, 2);
+        assert!(external.next_external_deadline(late).unwrap() > late);
+        assert!(
+            external.take_bar_fan(late).is_none(),
+            "missed bars are not replayed"
+        );
+    }
 
     /// Hold `ch` for `n` presses at `gap_ms` cadence starting at `t0`;
     /// returns the instant of the last press.
@@ -1613,6 +2114,249 @@ mod tests {
         assert!(
             !d.is_armed(again),
             "after the glow is gone, three reps are just typing again"
+        );
+    }
+
+    // -- the armed celebration (§27) ------------------------------------------
+
+    /// A green block is the OSC 133/633 `D` (status 0) the host's verdict
+    /// path reports for a keyed Enter; a frame loop drives the detector the
+    /// way the host does, at ~60 Hz.
+    fn frames(
+        d: &mut KittySing,
+        from: Instant,
+        until: Instant,
+        mut each: impl FnMut(Instant, &mut KittySing),
+    ) {
+        let mut t = from;
+        while t <= until {
+            each(t, d);
+            t += Duration::from_millis(16);
+        }
+    }
+
+    /// AN ARMED CELEBRATION FIRES ON THE NEXT GREEN BLOCK, AND ONLY ONCE: the
+    /// arm lights nothing by itself (latch, don't act); a green block in
+    /// ANOTHER session leaves it waiting; this session's green block fires it
+    /// at full drive with the chosen key's signature; a second green block
+    /// while it plays re-anchors nothing, and one after it settles starts
+    /// nothing — the arm was spent.
+    #[test]
+    fn an_armed_celebration_fires_on_the_next_green_block_and_only_once() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        let sig = song_signature('C');
+        let arm = d
+            .arm_external(t0, S, sig, 2, CelebrateOn::Green)
+            .expect("the first arm is admitted");
+        assert_eq!(arm.bars, 2);
+        assert_eq!(d.drive(t0), 0.0, "an arm lights nothing by itself");
+        assert!(!d.is_armed(t0));
+        assert_eq!(d.armed_external(), Some(arm), "…it is latched");
+
+        let other = t0 + Duration::from_millis(100);
+        d.note_green_block(other, S + 1);
+        assert_eq!(
+            d.drive(other),
+            0.0,
+            "another session's green block is not this one's"
+        );
+        assert_eq!(d.armed_external(), Some(arm), "the arm still waits");
+
+        let green = t0 + Duration::from_millis(500);
+        d.note_green_block(green, S);
+        assert_eq!(d.armed_external(), None, "the arm is spent by the edge");
+        assert!(d.is_armed(green), "the green block fires the celebration");
+        assert_eq!(d.drive(green), 1.0, "…at full drive");
+        assert_eq!(d.signature(), sig, "…in the chosen key");
+        assert_eq!(
+            d.beat(green),
+            Some(0.0),
+            "the beat clock anchors at the fire"
+        );
+
+        // A second green block one bar in: no re-anchor, no second run.
+        let again = green + Duration::from_secs_f32(SING_BAR_SECONDS + 0.2);
+        d.note_green_block(again, S);
+        assert_eq!(d.bar(again), Some(1), "the grid did not move");
+
+        // Two bars, then the wind-down; then settled, a green block starts nothing.
+        let end = green + Duration::from_secs_f32(2.0 * SING_BAR_SECONDS);
+        assert!(d.is_armed(end - Duration::from_millis(1)));
+        assert!(!d.is_armed(end), "the run ends on its last bar line");
+        let done = end + Duration::from_secs_f32(SING_WIND_DOWN) + Duration::from_millis(1);
+        assert_eq!(d.drive(done), 0.0);
+        d.settle(done);
+        assert!(!d.external_live());
+        d.note_green_block(done + Duration::from_secs(1), S);
+        assert_eq!(
+            d.drive(done + Duration::from_secs(1)),
+            0.0,
+            "spent arms never fire twice"
+        );
+    }
+
+    /// A CELEBRATION'S FANS RIDE THE BARS AND THE OUTRO ENDS ON *DO*: a
+    /// four-bar run hands the host exactly one fan per bar, on the first frame
+    /// that sees the bar — 5, 7, 9, 11 stars, the ring on the fourth — and
+    /// then, once, on the first frame at or after the last bar line, the
+    /// outro in the run's own signature with its drop fan. The synth's half
+    /// (the lead resolves on degree 0) is `trail_sound`'s
+    /// `the_outro_s_lead_is_do_and_holds_the_sing_duck`.
+    #[test]
+    fn a_celebration_s_fans_ride_the_bars_and_the_outro_ends_on_do() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        let sig = song_signature('G');
+        d.arm_external(t0, S, sig, 4, CelebrateOn::Enter)
+            .expect("admitted");
+        d.note_keyed_enter(t0, S);
+        assert!(d.is_armed(t0), "the keyed Enter fires an `on=enter` arm");
+
+        let mut fans = Vec::new();
+        let mut outros = Vec::new();
+        let end = t0 + Duration::from_secs_f32(4.0 * SING_BAR_SECONDS);
+        let until = end + Duration::from_secs_f32(SING_WIND_DOWN) + Duration::from_millis(50);
+        frames(&mut d, t0, until, |t, d| {
+            if let Some(fan) = d.take_bar_fan(t) {
+                fans.push((t, fan));
+            }
+            if let Some(o) = d.take_outro(t) {
+                outros.push((t, o));
+            }
+        });
+        let shape: Vec<(u64, u8, bool)> = fans.iter().map(|(_, f)| (f.bar, f.n, f.ring)).collect();
+        assert_eq!(
+            shape,
+            vec![(0, 5, false), (1, 7, false), (2, 9, false), (3, 11, true)],
+            "one fan per bar, 5/7/9/11 stars, the ring on the fourth bar"
+        );
+        for (t, f) in &fans {
+            let line = t0 + Duration::from_secs_f32(f.bar as f32 * SING_BAR_SECONDS);
+            // `line` is `bar × 1.6` through f32 — up to a few ns off the
+            // frame clock's exact millisecond — so the early side has a 1 ms
+            // tolerance and the late side the frame's own 16 ms.
+            assert!(
+                line.saturating_duration_since(*t) <= Duration::from_millis(1)
+                    && t.saturating_duration_since(line) < Duration::from_millis(17),
+                "bar {} fan born on the first frame after its bar line ({:?} late)",
+                f.bar,
+                t.saturating_duration_since(line)
+            );
+        }
+        assert_eq!(outros.len(), 1, "exactly one outro");
+        let (at, o) = outros[0];
+        assert_eq!(o.sig, sig, "the outro resolves in the run's own key");
+        assert_eq!(o.drop, DROP_FAN_N);
+        assert!(
+            end.saturating_duration_since(at) <= Duration::from_millis(1)
+                && at.saturating_duration_since(end) < Duration::from_millis(17),
+            "the outro lands on the last bar line, not mid-phrase"
+        );
+        assert_eq!(
+            bar_fan(20).n,
+            BAR_FAN_CAP,
+            "the fan count caps at {BAR_FAN_CAP}"
+        );
+        assert!(
+            bar_fan(7).ring && !bar_fan(4).ring,
+            "the ring rides every fourth bar"
+        );
+    }
+
+    /// AN UNARMED SESSION NEVER CELEBRATES ON A GREEN BLOCK — nor on a keyed
+    /// Enter: with nothing latched, both edges are no-ops, the detector stays
+    /// byte-identical off, and no fan or outro is ever handed out.
+    #[test]
+    fn an_unarmed_session_never_celebrates_on_a_green_block() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        d.note_green_block(t0, S);
+        d.note_keyed_enter(t0 + Duration::from_millis(10), S);
+        let t = t0 + Duration::from_millis(20);
+        assert_eq!(d.drive(t), 0.0);
+        assert!(!d.is_armed(t));
+        assert_eq!(d.bar(t), None);
+        assert_eq!(d.beat(t), None);
+        assert_eq!(d.signature(), NEUTRAL_SIGNATURE);
+        assert_eq!(d.take_bar_fan(t), None);
+        assert_eq!(d.take_outro(t), None);
+        assert!(!d.external_live());
+        // A HELD KEY still sings — the human path is untouched — and its bars
+        // now carry fans too, while the outro stays the armed run's alone.
+        let armed = hold(&mut d, t, 'a', SING_ARM_REPEATS, 30);
+        assert!(d.is_armed(armed));
+        assert_eq!(d.take_bar_fan(armed).map(|f| f.n), Some(BAR_FAN_BASE));
+        assert_eq!(
+            d.take_bar_fan(armed + Duration::from_millis(16)),
+            None,
+            "one fan per bar"
+        );
+        let gone = armed + SING_REPEAT_GAP + Duration::from_millis(100);
+        assert!(d.drive(gone) < 1.0, "letting go winds down");
+        assert_eq!(
+            d.take_outro(gone),
+            None,
+            "a hold's release keeps its plain crossfade"
+        );
+    }
+
+    /// THE COOLDOWN REFUSES A SECOND ARM FOR THIRTY SECONDS: a second arm
+    /// straight after the first is `AlreadyArmed`; once the first has fired
+    /// and settled, a new arm inside thirty seconds of the FIRST ARM is
+    /// `Cooldown` with the honest remainder; at thirty seconds it is admitted.
+    /// Out-of-range bars are refused before either check and cost nothing.
+    #[test]
+    fn the_cooldown_refuses_a_second_arm_for_thirty_seconds() {
+        let mut d = KittySing::default();
+        let t0 = Instant::now();
+        let sig = song_signature('E');
+        assert_eq!(
+            d.arm_external(t0, S, sig, 0, CelebrateOn::Green),
+            Err(ArmRefusal::Bars(0))
+        );
+        assert_eq!(
+            d.arm_external(t0, S, sig, CELEBRATE_MAX_BARS + 1, CelebrateOn::Green),
+            Err(ArmRefusal::Bars(CELEBRATE_MAX_BARS + 1))
+        );
+        assert_eq!(
+            d.cooldown_remaining(t0),
+            Duration::ZERO,
+            "a refused arm costs nothing"
+        );
+        d.arm_external(t0, S, sig, 1, CelebrateOn::Green)
+            .expect("admitted");
+        assert_eq!(
+            d.arm_external(t0 + Duration::from_millis(5), S, sig, 1, CelebrateOn::Green),
+            Err(ArmRefusal::AlreadyArmed)
+        );
+        // Fire, run one bar, wind down, settle.
+        let fire = t0 + Duration::from_secs(1);
+        d.note_green_block(fire, S);
+        let done = fire
+            + Duration::from_secs_f32(SING_BAR_SECONDS + SING_WIND_DOWN)
+            + Duration::from_millis(1);
+        d.settle(done);
+        assert_eq!(d.drive(done), 0.0);
+        let early = t0 + Duration::from_secs(10);
+        assert_eq!(
+            d.arm_external(early, S, sig, 1, CelebrateOn::Green),
+            Err(ArmRefusal::Cooldown {
+                remaining_ms: 20_000
+            }),
+            "the cooldown is measured from the ARM"
+        );
+        let ok = t0 + CELEBRATE_COOLDOWN;
+        assert!(
+            d.arm_external(ok, S, sig, 1, CelebrateOn::Green).is_ok(),
+            "admitted at thirty seconds"
+        );
+        assert_eq!(
+            ArmRefusal::Cooldown {
+                remaining_ms: 20_000
+            }
+            .to_string(),
+            "cooldown: 20000 ms until the next arm is admitted"
         );
     }
 }

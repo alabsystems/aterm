@@ -308,7 +308,18 @@ impl Grid {
         // that is the damage. A selection in scrollback — or anywhere outside the
         // region — is untouched, where the old sentinel killed every selection
         // anywhere on any of these ops.
-        self.damage_selection_scroll_region();
+        //
+        // Recorded AS A BAND: rows `cursor_row..=region.bottom` went DOWN by the
+        // clamped count, the bottom rows left the band — the same shape as a region
+        // scroll down, so a host translating bands keeps its marks on their lines
+        // (a vim `:set scrolloff` insert, a tmux pane). A count past `i16` is not a
+        // program's shape; it takes the poisoning path.
+        match i16::try_from(count.min(end_row - start_row)) {
+            Ok(delta) => {
+                self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, delta);
+            }
+            Err(_) => self.damage_selection_scroll_region(),
+        }
 
         // Mark only affected rows: cursor_row through region bottom.
         self.storage
@@ -532,7 +543,16 @@ impl Grid {
         // that is the damage. A selection in scrollback — or anywhere outside the
         // region — is untouched, where the old sentinel killed every selection
         // anywhere on any of these ops.
-        self.damage_selection_scroll_region();
+        //
+        // Recorded AS A BAND: rows `cursor_row..=region.bottom` went UP by the
+        // clamped count (the deleted rows left the band, the vacated bottom rows are
+        // blank) — the mirror of `insert_lines` above.
+        match i16::try_from(count.min(end_row - start_row)) {
+            Ok(rows) => {
+                self.damage_selection_scroll_region_as_band(cursor_row, region.bottom, -rows);
+            }
+            Err(_) => self.damage_selection_scroll_region(),
+        }
 
         // Mark only affected rows: cursor_row through region bottom.
         self.storage

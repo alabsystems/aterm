@@ -191,10 +191,10 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-W             Close the active tab; closing the last tab quits.\n",
     "    Cmd-Shift-T       Reopen the most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
-    "                      Tab state shows in the title as [active/total].\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
-    "    This is the common set; the menu bar lists them ALL (splits, pane focus,\n",
-    "    move-tab, and more) with their live chords.\n\n",
+    "    This is the common set; the menu bar lists them ALL (splits, move-tab, and\n",
+    "    more) with their live chords. Pane focus (focus_pane_*) has no menu item and\n",
+    "    no default macOS chord: bind it under [keybindings].\n\n",
 );
 
 /// See [`KEYS_HELP`] (macOS) — the non-macOS KEYS section, GENERATED from
@@ -444,8 +444,8 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
 # cursor_trail_intensity = 0.7         # aurora brightness 0.0..=1.0
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
-# cursor_trail_wake_ms = 300           # rainbow-kitty TYPING WAKE: ms of recent travel the
-#                                      # plume under your words shows (0 = off, max 1500)
+# cursor_trail_wake_ms = 300           # PARSED BUT INERT since 2026-09-06 (the retired v1
+#                                      # rainbow-kitty wake dial; kept loading, 0..=1500)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # --- sound (Settings > Cursor & Motion > Sound) -------------------------------
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)

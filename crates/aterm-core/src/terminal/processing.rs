@@ -513,15 +513,51 @@ impl Terminal {
         // row-MOVING ops set. Without it, removing the sentinel would have silently
         // broken the documented `ContentScrollState::invalidation_epoch` contract for
         // every host caching grid coordinates.
+        // The NUMBERS behind the flag: which screen-row bands moved, and by how
+        // much. Drained with the flag so neither can speak for a previous batch.
+        let bands = self.grid.take_row_band_moves();
+        // Drain independently: a splice is already an invalidation, but must
+        // not short-circuit the flag's take and carry it into a later batch.
+        let coordinates_invalidated = self.grid.take_coordinates_invalidated();
         let invalidates_coordinates = selection_row_update.is_some()
-            || self.grid.take_coordinates_invalidated()
+            || coordinates_invalidated
             || scroll_delta == i32::MAX
             || scroll_delta < 0;
         if invalidates_coordinates {
             self.content_scroll_state.invalidate();
-        } else if scroll_delta > 0 {
-            self.content_scroll_state
-                .record_uniform_up(u64::try_from(scroll_delta).unwrap_or(u64::MAX));
+            // The epoch bumped exactly as before. ADDITIONALLY, when the grid's band
+            // record fully explains this batch's row motion, publish it: a consumer
+            // that can translate bands (the cursor effects under a Codex composer)
+            // keeps its marks on their lines; every other consumer still reads the
+            // epoch step as "discard". The conditions are each a way the record
+            // could be true but incomplete: an EXACT non-empty record; no
+            // whole-screen scroll in the same batch (`scroll_delta == 0` — a uniform
+            // translation mixed with a band is not one transform, the pin
+            // `content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches`);
+            // the batch did not switch screens (the record was drained from the
+            // INCOMING grid and says nothing about the outgoing one); and no
+            // non-composable splice degraded to `Invalidate`.
+            let explained = bands.len > 0
+                && !bands.inexact
+                && scroll_delta == 0
+                && was_alt == self.modes.alternate_screen
+                && !matches!(
+                    selection_row_update,
+                    Some(aterm_grid::AbsoluteRowUpdate::Invalidate)
+                );
+            if explained {
+                self.content_scroll_state
+                    .record_band_batch(bands.as_slice());
+            }
+        } else {
+            debug_assert!(
+                bands.len == 0 && !bands.inexact,
+                "a band move must set the coordinate flag or a splice: every grid producer records the band beside the flag, never instead of it"
+            );
+            if scroll_delta > 0 {
+                self.content_scroll_state
+                    .record_uniform_up(u64::try_from(scroll_delta).unwrap_or(u64::MAX));
+            }
         }
         let max_rows = i32::from(self.grid.rows());
         // Lower clear bound is the retained-history floor, not the visible
@@ -1024,6 +1060,20 @@ mod tests {
             after_interior.invalidation_epoch,
             before_interior.invalidation_epoch + 1
         );
+        // ...and the epoch step is EXPLAINED: the 0-based band [1..=2] went up one.
+        assert_eq!(
+            after_interior.band_batches,
+            before_interior.band_batches + 1
+        );
+        assert_eq!(after_interior.band_seq, before_interior.band_seq + 1);
+        assert_eq!(
+            after_interior.band(before_interior.band_seq),
+            aterm_grid::RowBandMove {
+                top: 1,
+                bottom: 2,
+                delta: -1
+            }
+        );
 
         let before_top_anchored = after_interior;
         // Top-anchored archival region: the upper band enters history while
@@ -1042,6 +1092,20 @@ mod tests {
         assert!(
             term.grid().scrollback_lines() > 0,
             "the top-anchored case closes the scrollback-growth false positive"
+        );
+        // The archival splice is ALSO an explained band: rows [0..=2] up by one,
+        // the footer row 3 untouched.
+        assert_eq!(
+            after_top_anchored.band_batches,
+            before_top_anchored.band_batches + 1
+        );
+        assert_eq!(
+            after_top_anchored.band(before_top_anchored.band_seq),
+            aterm_grid::RowBandMove {
+                top: 0,
+                bottom: 2,
+                delta: -1
+            }
         );
     }
 
@@ -1414,6 +1478,135 @@ mod tests {
         let mixed = term.content_scroll_state();
         assert_eq!(mixed.uniform_up_rows, uniform.uniform_up_rows);
         assert_eq!(mixed.invalidation_epoch, uniform.invalidation_epoch + 1);
+        assert_eq!(
+            mixed.band_batches, uniform.band_batches,
+            "a uniform scroll mixed with a band is not one transform: the epoch step stays unexplained"
+        );
+    }
+
+    /// The real Codex Enter (capture byte records 112–113: `ESC[?2026h ESC[12;1H
+    /// ESC[J` then `ESC[12;57r ESC[12;1H (ESC M)x5 ESC[r ESC[1;16r ESC[11;1H \r\n`)
+    /// on a 57x151 terminal is ONE explained epoch step whose single band is the
+    /// 0-based region `[11..=56]` moved down five rows: the five reverse indices
+    /// compose in the grid, the ED is inert, and the trailing LF starts above the
+    /// `[0..=15]` region's bottom so it scrolls nothing.
+    #[test]
+    fn a_codex_enter_batch_is_one_composed_band_batch() {
+        let mut term = TerminalBuilder::new()
+            .size(57, 151)
+            .ring_buffer_size(1000)
+            .build();
+        term.process(b"\x1b[14;3Hhello");
+        let before = term.content_scroll_state();
+        term.process(
+            b"\x1b[?2026h\x1b[12;1H\x1b[J\x1b[12;57r\x1b[12;1H\x1bM\x1bM\x1bM\x1bM\x1bM\x1b[r\x1b[1;16r\x1b[11;1H\r\n",
+        );
+        let after = term.content_scroll_state();
+        assert_eq!(after.uniform_up_rows, before.uniform_up_rows);
+        assert_eq!(after.invalidation_epoch, before.invalidation_epoch + 1);
+        assert_eq!(after.band_batches, before.band_batches + 1);
+        assert_eq!(
+            after.band_seq,
+            before.band_seq + 1,
+            "five RIs compose into one move"
+        );
+        assert_eq!(
+            after.band(before.band_seq),
+            aterm_grid::RowBandMove {
+                top: 11,
+                bottom: 56,
+                delta: 5
+            }
+        );
+        assert_eq!(
+            super::super::state::ContentScrollState::delta_since(Some(before), after),
+            super::super::state::ContentScrollDelta::Bands {
+                first_seq: before.band_seq,
+                count: 1
+            }
+        );
+    }
+
+    /// The real Codex streamed line with the viewport pinned at the bottom
+    /// (capture byte record 720: `ESC[1;52r ESC[52;1H \r\n`) is the top-anchored
+    /// archival scroll — one explained epoch step whose band is the transcript
+    /// `[0..=51]` moved up one row while the footer rows 52..=56 stay, and one
+    /// line enters history.
+    #[test]
+    fn a_codex_phase_b_line_is_an_explained_top_anchored_band() {
+        let mut term = TerminalBuilder::new()
+            .size(57, 151)
+            .ring_buffer_size(1000)
+            .build();
+        term.process(b"\x1b[1;1Htranscript row zero");
+        let before = term.content_scroll_state();
+        let history_before = term.grid().scrollback_lines();
+        term.process(b"\x1b[?2026h\x1b[1;52r\x1b[52;1H\r\nx");
+        let after = term.content_scroll_state();
+        assert_eq!(after.uniform_up_rows, before.uniform_up_rows);
+        assert_eq!(after.invalidation_epoch, before.invalidation_epoch + 1);
+        assert_eq!(after.band_batches, before.band_batches + 1);
+        assert_eq!(
+            after.band(before.band_seq),
+            aterm_grid::RowBandMove {
+                top: 0,
+                bottom: 51,
+                delta: -1
+            }
+        );
+        assert_eq!(term.grid().scrollback_lines(), history_before + 1);
+        term.process(b"y");
+        assert_eq!(
+            term.content_scroll_state(),
+            after,
+            "plain output after a splice cannot replay its coordinate flag"
+        );
+    }
+
+    /// Every coordinate move the band record cannot describe still bumps the
+    /// epoch and is NOT counted as a band batch, so a band-translating host falls
+    /// back to today's discard: a margined (DECLRMM) SU is a rectangle, RIS is a
+    /// wholesale reset, an alt-screen switch replaces the coordinate space.
+    #[test]
+    fn a_poisoned_or_mixed_batch_advances_the_epoch_without_a_band_batch() {
+        let mut term = TerminalBuilder::new()
+            .size(10, 20)
+            .ring_buffer_size(8)
+            .build();
+        term.process(b"\x1b[3;1Hsome text here");
+
+        let before = term.content_scroll_state();
+        term.process(b"\x1b[?69h\x1b[2;6s\x1b[2;5r\x1b[3;1H\x1b[S");
+        let after_margined = term.content_scroll_state();
+        assert_eq!(
+            after_margined.invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "a margined SU moves rows"
+        );
+        assert_eq!(
+            after_margined.band_batches, before.band_batches,
+            "a rectangle scroll is not a row-band translate"
+        );
+
+        term.process(b"\x1bc");
+        let after_ris = term.content_scroll_state();
+        assert_eq!(
+            after_ris.invalidation_epoch,
+            after_margined.invalidation_epoch + 1
+        );
+        assert_eq!(after_ris.band_batches, after_margined.band_batches);
+
+        term.process(b"\x1b[?1049h");
+        let after_alt = term.content_scroll_state();
+        assert_eq!(
+            after_alt.invalidation_epoch,
+            after_ris.invalidation_epoch + 1
+        );
+        assert_eq!(after_alt.band_batches, after_ris.band_batches);
+        assert_eq!(
+            after_alt.band_seq, before.band_seq,
+            "no move was published by any of the three"
+        );
     }
 
     /// SCR-1: while the user is scrolled back into history, live output (e.g.

@@ -8,6 +8,96 @@
 
 use super::*;
 
+/// One demand-driven native drawable acquisition. `active` includes a queued
+/// request that has not entered the OS yet; `ready` includes an unclaimed result.
+/// Retirement must follow that request, never wait on the calling UI thread.
+/// `AcceptResult` is the pure generation/closed guard, called only with an owned
+/// completed result by the host; it does not manufacture drawable ownership.
+///
+/// Tier-1 binds the real channel worker and both admission/acceptance helpers in
+/// `aterm-gpu/src/metal/acquire_worker.rs`. Buggy restores duplicate admission,
+/// accepting stale/closed results, early retirement, and caller-side waiting.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn metal_drawable_acquire_model() -> Model {
+    crate::ty_model! {
+        MetalDrawableAcquire {
+            const Buggy = 0;
+            const MaxRequests = 2;
+            const MaxEpoch = 2;
+            var closed = 0;
+            var pending = 0;
+            var active = 0;
+            var ready = 0;
+            var epoch = 0;
+            var request_epoch = 0;
+            var retiring = 0;
+            var retired = 0;
+            var requests = 0;
+            var completed = 0;
+            var published = 0;
+            var wakes = 0;
+            var invalid_accept = 0;
+            var main_wait = 0;
+            action Request when (
+                closed == 0 && requests <= MaxRequests - 1 &&
+                (pending == 0 || Buggy == 1)
+            ) {
+                pending = pending + 1;
+                active = active + 1;
+                request_epoch = epoch;
+                requests = requests + 1;
+            }
+            action Complete when (active > 0) {
+                active = active - 1;
+                completed = completed + 1;
+                ready = if closed == 0 { ready + 1 } else { ready };
+                pending = if closed == 0 { pending } else { pending - 1 };
+                published = if closed == 0 { published + 1 } else { published };
+                wakes = if closed == 0 { wakes + 1 } else { wakes };
+            }
+            action Take when (closed == 0 && ready > 0) {
+                ready = ready - 1;
+                pending = pending - 1;
+            }
+            action Invalidate when (epoch <= MaxEpoch - 1) {
+                epoch = epoch + 1;
+            }
+            action AcceptResult when (
+                Buggy == 1 || (closed == 0 && request_epoch == epoch)
+            ) {
+                invalid_accept = if closed == 0 && request_epoch == epoch {
+                    invalid_accept
+                } else { 1 };
+            }
+            action MainProgress {
+                main_wait = if Buggy == 1 && pending > 0 { 1 } else { main_wait };
+            }
+            action Close when (closed == 0) {
+                closed = 1;
+                retiring = 1;
+                pending = active;
+                ready = 0;
+            }
+            action Retire when (
+                retiring == 1 && (active == 0 || Buggy == 1)
+            ) {
+                retiring = 0;
+                retired = 1;
+            }
+            invariant OneOutstanding: pending <= 1;
+            invariant OutstandingAccounted: pending == active + ready;
+            invariant CallsBounded: requests <= MaxRequests && completed <= requests;
+            invariant PublicationsBounded: published <= completed;
+            invariant OnlyPublicationWakes: wakes == published;
+            invariant ClosedHasNoReadyResult: closed == 0 || ready == 0;
+            invariant RetirementFollowsAcquisition: retired == 0 || active == 0;
+            invariant NoInvalidAcceptance: invalid_accept == 0;
+            invariant NoCallerWait: main_wait == 0;
+        }
+    }
+}
+
 /// COLOUR-PRESENTATION GATE — a code point that defaults to TEXT presentation is
 /// never resolved to the colour-emoji face. The abstract twin of aterm-render's
 /// `select_face` (the real-code binding is aterm-render's

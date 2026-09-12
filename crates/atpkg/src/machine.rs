@@ -11,15 +11,19 @@
 //! (`docs/SESSION-watchdog-noindex-2026-09-02.md`: `Disable = 1`), and a fresh machine
 //! sits at the OS default with neither key set. The switch is per-host and per-user
 //! (`defaults -currentHost`), no sudo — so a first-open pass can apply it, and one
-//! command reverts it: [`UNIVERSAL_CONTROL_REVERT`].
+//! pasted line reverts it: [`UNIVERSAL_CONTROL_REVERT`].
 
 use crate::config::UniversalControlPolicy;
 
 /// The one-line revert every surface that mentions the change must print (pull-down
-/// row, doctor, this pass's log). Deleting `Disable` puts the feature back at the OS
-/// default; `DisableMagicEdges` is the screen-edge hand-off and follows it.
-pub const UNIVERSAL_CONTROL_REVERT: &str =
-    "defaults -currentHost delete com.apple.universalcontrol Disable";
+/// row, doctor, this pass's log). The pass writes BOTH per-host keys
+/// (`platform::universal_control_disable`), so the revert deletes both: `Disable` is
+/// the feature, `DisableMagicEdges` the screen-edge hand-off, and deleting one leaves
+/// the other set. Joined by `;`, not `&&`: `defaults delete` exits 1 on a key that is
+/// already absent, and the second delete must run regardless.
+pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
+    com.apple.universalcontrol Disable; defaults -currentHost delete \
+    com.apple.universalcontrol DisableMagicEdges";
 
 /// The `machine-settings:` entry for a Universal Control change (contract string).
 pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
@@ -285,7 +289,8 @@ mod tests {
         assert!(line.contains(UNIVERSAL_CONTROL_REVERT), "{line}");
         assert_eq!(
             UNIVERSAL_CONTROL_REVERT,
-            "defaults -currentHost delete com.apple.universalcontrol Disable"
+            "defaults -currentHost delete com.apple.universalcontrol Disable; \
+             defaults -currentHost delete com.apple.universalcontrol DisableMagicEdges"
         );
         let default = UniversalControlState::default();
         let line = default.doctor_line(UniversalControlPolicy::Off);

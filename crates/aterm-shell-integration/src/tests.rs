@@ -232,6 +232,10 @@ fn shell_command(shell: &str) -> Command {
         // `$ATERM_NO_REROUTE` is that session's choice, not this fixture's.
         "ATERM_REROUTE_DIR",
         "ATERM_NO_REROUTE",
+        // The agents dir (2026-09-10): exported by a live session's atpkg shell.d
+        // hook, and every script moves it to the front beside the reroute dir, so an
+        // inherited one would re-order the test shell's PATH the same way.
+        "ATPKG_AGENTS",
     ] {
         cmd.env_remove(var);
     }
@@ -521,6 +525,210 @@ fn test_reroute_dir_is_moved_to_the_front_of_path_by_each_shell() {
         }
     }
     let _ = std::fs::remove_dir(&reroute);
+}
+
+/// The agents directory (`$ATPKG_AGENTS`, exported by the atpkg shell.d hook) ends up
+/// FIRST beside the reroute directory — PATH reads reroute, agents, … (the spawn
+/// seam's order) — MOVED there from wherever it was listed, exactly once, the rest
+/// kept in order; inert when the variable is unset or names nothing on disk. The
+/// measured failure it answers (2026-09-10, m27): path_helper and a ~/.zshrc prepend
+/// left it at PATH position 14 behind /opt/homebrew/bin and ~/.local/bin, so `codex`
+/// and `claude` ran foreign copies. Same live-shell lanes as the reroute test above.
+#[cfg(unix)]
+#[test]
+fn test_agents_dir_is_moved_to_the_front_beside_the_reroute_dir_by_each_shell() {
+    let base = std::env::temp_dir().join(format!("aterm-si-agents-{}", std::process::id()));
+    let reroute = base.join("reroute");
+    let agents = base.join("Application Support/pkg/agents");
+    std::fs::create_dir_all(&reroute).expect("mk reroute dir");
+    std::fs::create_dir_all(&agents).expect("mk agents dir");
+    let reroute = reroute.to_str().expect("UTF-8 temp dir").to_owned();
+    let agents = agents.to_str().expect("UTF-8 temp dir").to_owned();
+    let stale = "/nonexistent/aterm-agents";
+    let mut lanes: Vec<(&str, Vec<&str>, &str, &str, bool)> = vec![(
+        bash_shell(),
+        vec!["--noprofile", "--norc", "-i", "-c"],
+        "aterm_shell_integration.bash",
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\"",
+        true,
+    )];
+    if let Some(zsh) = zsh_shell() {
+        lanes.push((
+            zsh,
+            vec!["-f", "-i", "-c"],
+            "aterm_shell_integration.zsh",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\"",
+            true,
+        ));
+    }
+    if let Some(fish) = fish_shell() {
+        lanes.push((
+            fish,
+            vec!["-i", "-c"],
+            "aterm_shell_integration.fish",
+            "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' (string join : -- $PATH)",
+            false,
+        ));
+    }
+    for (shell, args, script_name, command, exact) in lanes {
+        let script = format!("{}/src/scripts/{script_name}", env!("CARGO_MANIFEST_DIR"));
+        let run = |agents_dir: Option<&str>, path: &str| -> String {
+            let mut cmd = shell_command(shell);
+            cmd.args(&args)
+                .arg(command)
+                .env("ATERM_TEST_SCRIPT", &script)
+                .env("ATERM_REROUTE_DIR", &reroute)
+                .env("PATH", path);
+            if let Some(dir) = agents_dir {
+                cmd.env("ATPKG_AGENTS", dir);
+            }
+            let out = cmd
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("PATH="),
+                "{shell}: no PATH line; stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // The LAST `PATH=` is the printf's (see the reroute test above).
+            stdout
+                .rsplit("PATH=")
+                .next()
+                .expect("rsplit yields at least one piece")
+                .chars()
+                .take_while(|c| !c.is_control())
+                .collect()
+        };
+        // Buried behind system and foreign entries, listed twice, with the reroute
+        // dir after it: reroute first, agents second, each once, the rest in order.
+        let got = run(
+            Some(&agents),
+            &format!("/usr/bin:{agents}:/bin:{reroute}:{agents}"),
+        );
+        assert!(
+            got.starts_with(&format!("{reroute}:{agents}:")),
+            "{shell}: reroute then agents must lead PATH: {got:?}"
+        );
+        assert_eq!(
+            got.matches(&agents).count(),
+            1,
+            "{shell}: agents once: {got:?}"
+        );
+        assert_eq!(
+            got.matches(&reroute).count(),
+            1,
+            "{shell}: reroute once: {got:?}"
+        );
+        if exact {
+            assert_eq!(
+                got,
+                format!("{reroute}:{agents}:/usr/bin:/bin"),
+                "{shell}: move-to-front"
+            );
+        }
+        let again = run(Some(&agents), &got);
+        assert_eq!(again, got, "{shell}: idempotent");
+        // A sole EMPTY entry ("here") beside the agents dir survives both moves
+        // (review finding 2026-09-10). PATH is set INSIDE the shell so the harness
+        // still finds the shell binary through the real PATH.
+        if exact {
+            let print = if script_name.ends_with(".zsh") {
+                "PATH=\"$ATERM_TEST_PATH\"; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; print -r -- \"PATH=$PATH\""
+            } else {
+                "PATH=\"$ATERM_TEST_PATH\"; source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; printf 'PATH=%s\\n' \"$PATH\""
+            };
+            let out = shell_command(shell)
+                .args(&args)
+                .arg(print)
+                .env("ATERM_TEST_SCRIPT", &script)
+                .env("ATERM_REROUTE_DIR", &reroute)
+                .env("ATPKG_AGENTS", &agents)
+                .env("ATERM_TEST_PATH", format!(":{agents}"))
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let sole: String = stdout
+                .rsplit("PATH=")
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| !c.is_control())
+                .collect();
+            assert_eq!(
+                sole,
+                format!("{reroute}:{agents}:"),
+                "{shell}: a sole empty entry survives"
+            );
+        }
+        // THE CALL THAT MATTERS INSIDE aterm (review finding 2026-09-10): the zsh
+        // load-time assert runs from the .zshenv wrapper, BEFORE path_helper and
+        // ~/.zshrc, so only __aterm_first_precmd's re-front survives them. Bury both
+        // dirs behind /opt/homebrew/bin after load, fire the real hook, and require
+        // reroute then agents to lead again.
+        if script_name.ends_with(".zsh") {
+            let out = shell_command(shell)
+                .args(&args)
+                .arg("source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; path=(/opt/homebrew/bin \"${path[@]}\"); __aterm_first_precmd >/dev/null 2>&1; print -r -- \"PATH=$PATH\"")
+                .env("ATERM_TEST_SCRIPT", &script)
+                .env("ATERM_REROUTE_DIR", &reroute)
+                .env("ATPKG_AGENTS", &agents)
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap_or_else(|error| panic!("spawn {shell}: {error}"));
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let after: String = stdout
+                .rsplit("PATH=")
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| !c.is_control())
+                .collect();
+            assert_eq!(
+                after,
+                format!("{reroute}:{agents}:/opt/homebrew/bin:/usr/bin:/bin"),
+                "{shell}: the first-precmd re-front restores reroute, agents after rc files buried them"
+            );
+        }
+        // Unset, or naming nothing on disk: only the reroute dir moves.
+        let unset = run(None, "/usr/bin:/bin");
+        let missing = run(Some(stale), "/usr/bin:/bin");
+        assert!(
+            !missing.contains(stale),
+            "{shell}: a missing agents dir is never prepended: {missing:?}"
+        );
+        if exact {
+            assert_eq!(
+                unset,
+                format!("{reroute}:/usr/bin:/bin"),
+                "{shell}: inert when unset"
+            );
+            assert_eq!(
+                missing,
+                format!("{reroute}:/usr/bin:/bin"),
+                "{shell}: inert for a missing directory"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The PowerShell integration re-fronts `$env:ATPKG_AGENTS` (move-to-front, by
+/// equality) BEFORE the reroute block, so PATH reads reroute, agents, … as in the
+/// POSIX scripts. Static, because no pwsh runs on the unix lanes (review finding
+/// 2026-09-10: the block was otherwise untested).
+#[test]
+fn test_powershell_moves_the_agents_dir_to_the_front_before_the_reroute_block() {
+    let ps = scripts::POWERSHELL;
+    let agents = ps
+        .find("if ($env:ATPKG_AGENTS -and (Test-Path -LiteralPath $env:ATPKG_AGENTS -PathType Container))")
+        .expect("agents block present");
+    let reroute = ps
+        .find("if ($env:ATERM_REROUTE_DIR -and (Test-Path -LiteralPath $env:ATERM_REROUTE_DIR -PathType Container))")
+        .expect("reroute block present");
+    assert!(agents < reroute, "agents is fronted first, reroute last");
+    assert!(ps.contains("Where-Object { $_ -ne $env:ATPKG_AGENTS }"));
+    assert!(ps.contains("$env:PATH = (@($env:ATPKG_AGENTS) + $__aterm_rest) -join $__aterm_sep"));
 }
 
 #[test]

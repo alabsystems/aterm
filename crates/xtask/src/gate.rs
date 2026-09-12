@@ -492,11 +492,17 @@
 //!   the driver's notes. A broken parse contract goes RED as "PARSE CONTRACT
 //!   BROKEN"; it never degrades to a pass. Skips only when NEITHER a stage2
 //!   `trustc` nor a rustup `trust` toolchain exists.
+//! - `help-surfaces`: every CLI help surface in the workspace (a source file
+//!   carrying usage/help text, discovered mechanically) has a dated row saying it
+//!   was READ against its handler, and a surface that appears or changes after
+//!   that read is refused until it is read again. Roster and rules in
+//!   `crates/xtask/src/help_surfaces.rs`.
 //! - `nonvacuity`: the meta-obligation over [`ALL_ROSTER`] on its own, cheap
 //!   enough (a few file reads) to run without paying for the roster it audits.
 //!   Described in full below; `all` runs it too, at the end.
 //! - `all`: the [`ALL_ROSTER`] gates — drift, dormant, mainloop, lockorder,
-//!   wasmloop, scope, lazyinit, fault, forge, counts, perf, lint — plus
+//!   wasmloop, scope, lazyinit, fault, forge, counts, perf, lint, help-surfaces
+//!   — plus
 //!   `nonvacuity` at the end. That is every check above EXCEPT the four the
 //!   roster deliberately omits: `linux` (needs the Linux target), `web` (needs
 //!   the wasm32 target), `miri` (needs a nightly miri toolchain) and
@@ -598,6 +604,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         Some("counts") => gate_counts(),
         Some("miri") => gate_miri(),
         Some("perf") => gate_perf(),
+        Some("help-surfaces") => crate::help_surfaces::gate_help_surfaces(),
         // The meta-obligation on its own: cheap (a few file reads), so it can
         // be run without paying for the roster it audits. `all` runs it too.
         Some("nonvacuity") => report_non_vacuity(),
@@ -633,7 +640,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         }
         other => {
             eprintln!(
-                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|lazyinit|fault|forge|linux|web|cells|certified|lint|counts|miri|perf|nonvacuity>\n\
+                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|lazyinit|fault|forge|linux|web|cells|certified|lint|counts|miri|perf|help-surfaces|nonvacuity>\n\
                  (unknown check {other:?})"
             );
             false
@@ -670,9 +677,10 @@ const ALL_ROSTER: &[RosterEntry] = &[
     ("counts", gate_counts),
     ("perf", gate_perf),
     ("lint", gate_lint),
+    ("help-surfaces", crate::help_surfaces::gate_help_surfaces),
 ];
 
-fn roster_names() -> Vec<&'static str> {
+pub(crate) fn roster_names() -> Vec<&'static str> {
     ALL_ROSTER.iter().map(|(name, _)| *name).collect()
 }
 
@@ -731,6 +739,19 @@ const MIN_GAP_REASON: usize = 120;
 
 /// One entry per [`ALL_ROSTER`] gate — fail-closed in both directions.
 const NON_VACUITY_REGISTRY: &[RedFixture] = &[
+    RedFixture {
+        gate: "help-surfaces",
+        proof: RedProof::Fixture {
+            test: "a_changed_or_unrostered_help_surface_fails_the_help_surfaces_verb",
+            file: "crates/xtask/src/help_surfaces.rs",
+            drives: "the VERB's implementation: help_surfaces_check() over a temp tree \
+                     whose one usage const is edited after its row, then left with no \
+                     row, then aged past the limit, then deleted (GREEN before, RED \
+                     with the rule tag after; a code-only edit stays GREEN)",
+            calls: "help_surfaces_check",
+            verb_level: true,
+        },
+    },
     RedFixture {
         gate: "drift",
         proof: RedProof::Fixture {

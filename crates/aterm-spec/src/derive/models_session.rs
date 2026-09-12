@@ -8,6 +8,50 @@
 
 use super::*;
 
+/// One fresh read in the momentum wait: accept an actual satisfied floor,
+/// time out an unmet reading past the backstop, otherwise arm one crossing.
+/// A latched timer is only a reason to re-read, never permission to ignore the
+/// backstop. `Buggy=1` replays the retired expired-reading re-park decision.
+/// Tier-1 drives `control_session::momentum_read_outcome`; separate production
+/// wait regressions bind the timer to the genuine snapping momentum metric.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn momentum_wait_read_model() -> Model {
+    crate::ty_model! {
+        MomentumWaitRead {
+            const Buggy = 0;
+            var read = 0;
+            var met = 0;
+            var expired = 0;
+            var decision = 0; // 1=below, 2=deadline, 3=park
+
+            action ReadLive when (read == 0) {
+                read = 1; met = 0; expired = 0;
+            }
+            action ReadExpired when (read == 0) {
+                read = 1; met = 0; expired = 1;
+            }
+            action ReadBelow when (read == 0) {
+                read = 1; met = 1; expired = 0;
+            }
+            action ReadBelowExpired when (read == 0) {
+                read = 1; met = 1; expired = 1;
+            }
+            action Below when (read == 1 && met == 1) {
+                decision = 1;
+            }
+            action Deadline when (read == 1 && met == 0 && expired == 1) {
+                decision = 2;
+            }
+            action Park when (read == 1 && met == 0 && (expired == 0 || Buggy == 1)) {
+                decision = 3;
+            }
+            invariant ExpiredReadingCannotRepark:
+                if expired == 1 { decision <= 2 } else { decision <= 3 };
+        }
+    }
+}
+
 /// SPAWN-TIME LOCALE GUARANTEE — the child process aterm launches must run under a
 /// UTF-8 `LC_CTYPE` whatever locale aterm inherited. `LC_CTYPE` is the POSIX
 /// character-encoding category; under a non-UTF-8 one, locale-aware programs (emacs,

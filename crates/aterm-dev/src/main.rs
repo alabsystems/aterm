@@ -59,7 +59,8 @@ impl Group {
 /// workspace source via the alias — never a stale installed binary (release
 /// spec decision 13) and never a wrapper reimplementing dispatch.
 const SHIP_NAME: &str = "ship";
-const SHIP_ABOUT: &str = "Release cutter passthrough: `cargo ship <cut|status|verify|yank> ...`";
+const SHIP_ABOUT: &str =
+    "Release cutter passthrough: `cargo ship <cut|status|verify|yank|provision|recover> ...`";
 
 /// The full registry of subcommands. Adding a new dev script is a one-line
 /// edit here. (The former release-script entries — build-app / make-dmg /
@@ -359,9 +360,10 @@ fn print_help() {
     println_str("");
     println_str("Each command wraps an existing project tool (`ship` -> `cargo ship`, the rest ->");
     println_str(
-        "repo scripts) and forwards your arguments to it. Run `aterm-dev <command> --help`",
+        "repo scripts) and forwards your arguments to it verbatim, `--help` included: `ship`",
     );
-    println_str("to forward to that tool's own help/usage.");
+    println_str("and `visual-judge` answer it with their own usage; `audit` and `verify-proofs`");
+    println_str("run their script regardless of arguments.");
 }
 
 /// Build one help row: 4-space indent, `value` left-aligned in a `name_width`

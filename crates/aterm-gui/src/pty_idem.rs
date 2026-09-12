@@ -41,7 +41,7 @@
 //!   (§6.5's first row). A monotone sequence is what makes the mark O(1): at or
 //!   below the mark is consumed, above it is new.
 //!
-//! ## What an attempt can end as, and why there are four answers
+//! ## What an attempt can end as, and why there are five answers
 //!
 //! | Outcome | Answer | Meaning |
 //! |---|---|---|
@@ -50,8 +50,9 @@
 //! | at/below the mark, applied | `OK dup=1` | already typed; nothing written |
 //! | at the mark, still running | `ERR busy idem=<seq>` | another connection holds it; transient |
 //! | at the mark, outcome unknown | `ERR in-doubt seq=<seq>` | it may have typed; DO NOT replay |
+//! | above the mark, guard missed | `OK skipped` | nothing written; the sequence is given back |
 //!
-//! Five rows, four answers: `ERR busy idem=` is given twice, and the SECOND row
+//! Six rows, five answers: `ERR busy idem=` is given twice, and the SECOND row
 //! is a bound rather than an outcome. A producer may have only ONE attempt in
 //! flight, because a claim that displaced a still-`Running` mark left the
 //! displaced attempt unable to settle its own outcome and, on release, could
@@ -69,14 +70,25 @@
 //! `timeline` carries an `in-doubt` row a human can read. The alternative — free
 //! the mark and let the retry type again — is the silent duplicate.
 //!
-//! **The two carve-outs.** `ERR busy` (the drive lease) and `ERR denied`
-//! (authority) release the mark instead of clouding it. For all four verbs both
+//! **The carve-outs.** `ERR busy` (the drive lease — and, for a guarded press,
+//! `ERR busy sink`, a sink that accepted ZERO bytes) and `ERR denied`
+//! (authority) release the mark instead of clouding it — and so does `OK
+//! skipped`, a guarded (`if=<re>`) attempt whose guard matched no row: it is an
+//! `OK` that wrote nothing, so a retry of the same sequence is a FIRST attempt,
+//! re-evaluated against the live screen, rather than a `dup=1` the driver could
+//! not tell from a press. The same rule keeps a crash inside the window
+//! resolvable: a replay of an attempt that PRESSED is `dup=1`; a replay of one
+//! that skipped asks the screen again. For all four verbs both
 //! are decided before the first byte: the dispatch fast-fail and op-scope gate,
-//! `cmd_turn`'s read-authority check and its authoritative lease acquire (its
-//! first act after option parsing), and `run_feed_bin_routed`'s edge check and
-//! lease mirror, both of which precede its write. `ERR busy` is also the reply a
-//! well-behaved driver retries most, so making it sticky would be a nuisance for
-//! no safety. NOTHING ELSE is carved out — in particular NOT `ERR usage`,
+//! the `turn` arm's read-authority check and `cmd_turn`'s authoritative lease
+//! acquire (after its option parsing and `settle=` compile, before any paste),
+//! and `run_feed_bin_routed`'s edge check and lease mirror, both of which
+//! precede its write. `ERR busy sink` alone is decided AT a write — one that
+//! moved nothing, which is why it is carved out and a PARTIAL write is answered
+//! `ERR write failed`, not `ERR busy` (`control_input::guarded_input_reply`).
+//! `ERR busy` is also the reply a well-behaved driver retries most, so making
+//! it sticky would be a nuisance for no safety. NOTHING ELSE is carved out — in
+//! particular NOT `ERR usage`,
 //! because `cmd_turn_guarded` answers its own USAGE string when a submit press
 //! fails, which happens AFTER the text has been typed (`control_session.rs`, the
 //! `io.press` arm). A reply string is not evidence about the PTY.
@@ -267,36 +279,6 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
         return Err("ERR epoch\n".to_string());
     }
     Ok(Key { producer, seq })
-}
-
-/// Take a LEADING `id=<key>` option off a keyed verb's argument tail.
-///
-/// OPTIONS LEAD, the rule `post`'s frame detector already runs on: the key is
-/// recognized only as the FIRST token, so `send hello id=1` sends the eight
-/// characters `hello id=1` exactly as it always did and only a first token
-/// spelled `id=` changes meaning. A leading `--` ends option parsing and is
-/// dropped, so a caller that really must `send` text beginning with `id=` writes
-/// `send -- id=…`.
-///
-/// Returns `(the key value, the remaining tail)`. Only [`KEYED_VERBS`] are
-/// scanned; every other verb's tail is returned untouched, so an `id=` token
-/// elsewhere stays argument data.
-pub(crate) fn take_key(verb: &str, rest: &str) -> (Option<String>, String) {
-    if !is_keyed_verb(verb) {
-        return (None, rest.to_string());
-    }
-    let trimmed = rest.trim_start();
-    let (head, tail) = match trimmed.split_once(char::is_whitespace) {
-        Some((h, t)) => (h, t.trim_start()),
-        None => (trimmed, ""),
-    };
-    if head == "--" {
-        return (None, tail.to_string());
-    }
-    match head.strip_prefix("id=") {
-        Some(value) => (Some(value.to_string()), tail.to_string()),
-        None => (None, rest.to_string()),
-    }
 }
 
 /// The claim one attempt holds while it runs. Settled by [`guarded`]; a drop
@@ -579,13 +561,25 @@ impl Drop for Claim<'_> {
 /// module header: this is two prefixes, deliberately, and widening it further is
 /// how a silent duplicate gets in.
 fn refused_before_any_write(reply: &str) -> bool {
-    // `ERR busy` — the drive lease. `ERR denied` — authority. For all four keyed
-    // verbs both are decided before the first byte: the dispatch fast-fail and
-    // op-scope gate, `turn`'s own read-authority check at the top of its arm and
-    // its authoritative lease acquire, and `run_feed_bin_routed`'s edge check and
-    // lease mirror, which both precede its write. Neither can be reached again
-    // once a verb has started typing.
+    // `ERR busy` — the drive lease, and a guarded press's `ERR busy sink` (a
+    // sink that accepted ZERO bytes). `ERR denied` — authority. For all four
+    // keyed verbs both are decided before the first byte: the dispatch fast-fail
+    // and op-scope gate, `turn`'s own read-authority check at the top of its arm
+    // and its authoritative lease acquire, and `run_feed_bin_routed`'s edge check
+    // and lease mirror, which both precede its write — or, for `ERR busy sink`,
+    // at a write that moved nothing. Neither can be reached again once a verb
+    // has started typing.
     reply.starts_with("ERR busy") || reply.starts_with("ERR denied")
+}
+
+/// `OK skipped` — a guarded attempt (`key if=<re>`, `send if=<re>`) whose guard
+/// matched no visible row. It is an `OK` (a skipped guard is an answer, not an
+/// error) that WROTE NOTHING, decided under the terminal lock before any byte
+/// could move, so the sequence is given back: the driver's retry is re-evaluated
+/// against the live screen instead of being told `dup=1` for a press that never
+/// happened. Checked before the plain `OK` arm, which would settle it.
+fn skipped_by_guard(reply: &str) -> bool {
+    reply.starts_with("OK skipped")
 }
 
 /// The `OK` a duplicate is answered with, in the FRAMING the verb declares.
@@ -645,7 +639,9 @@ where
         Claimed::Answer(reply) => return reply,
     };
     let reply = attempt();
-    if reply.starts_with("OK") {
+    if skipped_by_guard(&reply) {
+        claim.released();
+    } else if reply.starts_with("OK") {
         claim.applied();
     } else if refused_before_any_write(&reply) {
         claim.released();
@@ -664,8 +660,9 @@ where
 /// Append the `in-doubt` row. Deliberately NOT a fabric event kind: the five
 /// `EVENT` names of §11.2 are pinned, and this is a per-session record of an
 /// input whose fate is unknown, not a fabric message. It carries the producer,
-/// the sequence and the refusal's FIRST token only — never the input bytes, and
-/// never the reply's tail (a `turn` reply is a whole screen).
+/// the sequence and the refusal's first TWO tokens only, joined with `-`
+/// (`ERR-write` for `ERR write failed`) — never the input bytes, and never the
+/// reply's tail (a `turn` reply is a whole screen).
 fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
     let why = reply
         .trim_end_matches(['\r', '\n'])
@@ -694,11 +691,12 @@ mod tests {
     /// bound to [`KEYED_VERBS`] — because the previous wording, "the key, which
     /// every input verb shares", was FALSE in the dangerous direction: a driver
     /// that believed it and stamped `id=` on a `paste` had the key delivered as
-    /// LITERAL TEXT into the terminal (pinned below by
-    /// `unkeyed_verbs_deliver_a_leading_id_as_content`), with no exactly-once
-    /// protection at all. The entry must name every keyed verb, must not use
-    /// the "every input verb" wording, and must state that the others take no
-    /// key.
+    /// LITERAL TEXT into the terminal (pinned by `control.rs`'s
+    /// `unkeyed_verbs_deliver_a_leading_id_as_content`, which pastes one through
+    /// a pipe-backed session and reads the key back off the PTY), with no
+    /// exactly-once protection at all. The entry must name every keyed verb,
+    /// must not use the "every input verb" wording, and must state that the
+    /// others take no key.
     #[test]
     fn the_turn_help_names_exactly_the_keyed_verbs() {
         let detail = aterm_types::control_verbs::spec("turn")
@@ -889,34 +887,5 @@ mod tests {
                 "must not parse: {bad}"
             );
         }
-    }
-
-    #[test]
-    fn feed_idempotent_options_lead_so_a_body_id_is_body() {
-        assert_eq!(
-            take_key("send", "id=a:b:c hello there"),
-            (Some("a:b:c".to_string()), "hello there".to_string())
-        );
-        // NOT the first token ⇒ argument data, byte-identical to before.
-        assert_eq!(
-            take_key("send", "hello id=a:b:c"),
-            (None, "hello id=a:b:c".to_string())
-        );
-        // `--` is the escape hatch for text that really does start with `id=`.
-        assert_eq!(
-            take_key("send", "-- id=literal"),
-            (None, "id=literal".to_string())
-        );
-        // An unkeyed verb is never scanned.
-        assert_eq!(
-            take_key("paste", "id=a:b:c hi"),
-            (None, "id=a:b:c hi".to_string())
-        );
-        // A lone key with no tail is legal (`key id=… enter` has a tail; `send
-        // id=…` types nothing, which is what `send` with no text already does).
-        assert_eq!(
-            take_key("turn", "id=a:b:c"),
-            (Some("a:b:c".to_string()), String::new())
-        );
     }
 }

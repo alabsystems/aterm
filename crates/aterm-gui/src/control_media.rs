@@ -802,7 +802,7 @@ struct VideoArgs {
     budget_bytes: usize,
 }
 
-const VIDEO_USAGE: &str = "usage: video <seconds> [full] [keys] [pace] [fps=<n>] [budget=<MiB>] | video status|stop | video frames [count=N]";
+const VIDEO_USAGE: &str = "usage: video [<seconds>] [full|half] [keys] [pace] [fps=<n>] [budget=<MiB>] (seconds default 3) | video status|stop | video frames [count=N]";
 
 /// Default / max frames returned by `video frames` (the top-delta key frames).
 const VIDEO_FRAMES_DEFAULT: usize = 8;
@@ -1709,10 +1709,13 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
     // `open <target> close` is the symmetric half: native Settings targets close
     // through the tab lifecycle and the transient palette uses its overlay exit.
+    // The one roster both refusals below quote: two hand-typed copies had drifted
+    // (`tab-menu` was accepted and advertised by one and missing from the other).
+    const AUX_TARGETS: &str = "prefs|about|menu|tab-menu|connections|update";
     let (target_tok, close) = match trimmed.split_once(char::is_whitespace) {
         Some((t, r)) if r.trim() == "close" => (t, true),
         Some(_) => {
-            return "ERR usage: open <prefs|about|menu|connections|update> [close]\n".to_string();
+            return format!("ERR usage: open <{AUX_TARGETS}> [close] | open app <…>\n");
         }
         None => (trimmed, false),
     };
@@ -1734,9 +1737,7 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             | AuxTarget::Update),
         ) => t,
         _ => {
-            return format!(
-                "ERR unsupported target {target_tok:?} (use: prefs | about | menu | tab-menu | connections | update)\n"
-            );
+            return format!("ERR unsupported target {target_tok:?} (use: {AUX_TARGETS})\n");
         }
     };
     match call_main(proxy, |tx| Wake::OpenAuxWindow {
@@ -1876,7 +1877,8 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
         "close" | "off" | "hide" => Some(false),
         other => {
             return format!(
-                "ERR unsupported {other:?} (use: open | close | toggle | section <name>)\n"
+                "ERR unsupported {other:?} (use: open|on|show | close|off|hide | toggle | \
+                 section <name> | set <key> <value…> | unset <key>)\n"
             );
         }
     };
@@ -1940,6 +1942,86 @@ pub(crate) fn cmd_rain(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         }
     };
     match call_main(proxy, |tx| Wake::RainControl { op, reply: tx }) {
+        Ok(Ok(msg)) => format!("OK {msg}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// Parse the `fx` verb's tail into its op: `""`/`status` reads; `celebrate`
+/// takes `sig=<char>` (default `C`), `bars=<1..4>` (default 2) and
+/// `on=green|enter` (default `green`) in any order, each at most once. A
+/// pure parse so the vocabulary is provable without an event loop; `Err`
+/// carries the whole usage line, so the refusal teaches the grammar.
+pub(crate) fn parse_fx_form(rest: &str) -> Result<crate::FxCtlOp, String> {
+    use aterm_effects::kitty_sing::{CELEBRATE_MAX_BARS, CelebrateOn, song_signature};
+    const USAGE: &str = "usage: fx [status|celebrate [sig=<char>] [bars=<1..4>] [on=green|enter]]";
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        None | Some("status") => {
+            return if words.next().is_none() {
+                Ok(crate::FxCtlOp::Status)
+            } else {
+                Err(format!("{USAGE} (got {:?})", rest.trim()))
+            };
+        }
+        Some("celebrate") => {}
+        Some(_) => return Err(format!("{USAGE} (got {:?})", rest.trim())),
+    }
+    let (mut sig, mut bars, mut on) = (None, None, None);
+    for w in words {
+        let Some((k, v)) = w.split_once('=') else {
+            return Err(format!("{USAGE} (got {w:?})"));
+        };
+        let dup = match k {
+            "sig" => {
+                let mut chars = v.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => sig.replace(song_signature(c)).is_some(),
+                    _ => {
+                        return Err(format!(
+                            "{USAGE} (sig= wants exactly one character, got {v:?})"
+                        ));
+                    }
+                }
+            }
+            "bars" => match v.parse::<u8>() {
+                Ok(b) if (1..=CELEBRATE_MAX_BARS).contains(&b) => bars.replace(b).is_some(),
+                _ => {
+                    return Err(format!(
+                        "{USAGE} (bars= wants 1..={CELEBRATE_MAX_BARS}, got {v:?})"
+                    ));
+                }
+            },
+            "on" => match v {
+                "green" => on.replace(CelebrateOn::Green).is_some(),
+                "enter" => on.replace(CelebrateOn::Enter).is_some(),
+                _ => return Err(format!("{USAGE} (on= wants green|enter, got {v:?})")),
+            },
+            _ => return Err(format!("{USAGE} (got {w:?})")),
+        };
+        if dup {
+            return Err(format!("{USAGE} ({k}= given twice)"));
+        }
+    }
+    Ok(crate::FxCtlOp::Celebrate {
+        sig: sig.unwrap_or_else(|| song_signature('C')),
+        bars: bars.unwrap_or(2),
+        on: on.unwrap_or(CelebrateOn::Green),
+    })
+}
+
+/// `fx [status|celebrate …]` -> one status line for the focused window's
+/// one-shot celebration ([`crate::App::fx_control`]): `status` reads,
+/// `celebrate` ARMS. Main-thread hop like `rain`, since the detector is
+/// per-window App state. Every form answers the same post-state line, so a
+/// driver reads what it armed without a second round trip.
+pub(crate) fn cmd_fx(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let op = match parse_fx_form(rest) {
+        Ok(op) => op,
+        Err(usage) => return format!("ERR {usage}\n"),
+    };
+    match call_main(proxy, |tx| Wake::FxControl { op, reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -2680,6 +2762,84 @@ mod trail_parse_tests {
                 "the usage line echoes the input: {err}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fx_parse_tests {
+    use super::parse_fx_form;
+    use crate::FxCtlOp;
+    use aterm_effects::kitty_sing::{CelebrateOn, song_signature};
+
+    /// The `fx` grammar: the bare and `status` forms read; `celebrate` takes
+    /// its three keys in any order with the documented defaults (`C`, 2 bars,
+    /// the green edge).
+    #[test]
+    fn fx_celebrate_parses_its_keys_in_any_order_with_defaults() {
+        assert_eq!(parse_fx_form(""), Ok(FxCtlOp::Status));
+        assert_eq!(parse_fx_form(" status "), Ok(FxCtlOp::Status));
+        assert_eq!(
+            parse_fx_form("celebrate"),
+            Ok(FxCtlOp::Celebrate {
+                sig: song_signature('C'),
+                bars: 2,
+                on: CelebrateOn::Green
+            })
+        );
+        assert_eq!(
+            parse_fx_form("celebrate bars=4 on=enter sig=g"),
+            Ok(FxCtlOp::Celebrate {
+                sig: song_signature('g'),
+                bars: 4,
+                on: CelebrateOn::Enter
+            })
+        );
+        assert_eq!(
+            parse_fx_form("celebrate sig=C bars=2"),
+            Ok(FxCtlOp::Celebrate {
+                sig: song_signature('C'),
+                bars: 2,
+                on: CelebrateOn::Green
+            })
+        );
+    }
+
+    /// Every refusal is ONE usage line that names the grammar and echoes the
+    /// offending token: an unknown form, an unknown key, a bare word, a
+    /// multi-character `sig`, bars outside 1..=4, a bad edge, a repeated key.
+    #[test]
+    fn fx_refusals_teach_the_grammar() {
+        for bad in [
+            "fire",
+            "status now",
+            "celebrate loud",
+            "celebrate key=C",
+            "celebrate sig=CD",
+            "celebrate sig=",
+            "celebrate bars=0",
+            "celebrate bars=5",
+            "celebrate bars=two",
+            "celebrate on=red",
+            "celebrate bars=2 bars=3",
+        ] {
+            let err = parse_fx_form(bad).expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                err.starts_with(
+                    "usage: fx [status|celebrate [sig=<char>] [bars=<1..4>] [on=green|enter]]"
+                ),
+                "{bad:?} -> {err}"
+            );
+        }
+        assert!(
+            parse_fx_form("celebrate bars=5")
+                .unwrap_err()
+                .contains("1..=4")
+        );
+        assert!(
+            parse_fx_form("celebrate bars=2 bars=3")
+                .unwrap_err()
+                .contains("given twice")
+        );
     }
 }
 

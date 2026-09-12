@@ -1338,24 +1338,14 @@ pub fn cursor_cat_earn_floor_model() -> Model {
     }
 }
 
-/// Reduced-motion custody handoff from the static singing cursor cat back to
-/// the resident pet. The full song owns the glass first. Its first wind-down
-/// sample keeps the already-ready resident suppressed behind the still-opaque
-/// singer; the singer remains visible through the inclusive 0.50 down to 0.33
-/// static band, and the resident takes over below the 0.33 face-swap threshold.
+/// The resident pet retains pixel and caret custody through every sampled
+/// song phase, including direct jumps from the held song into its tail or
+/// fully drained state. The historical public model name is retained for
+/// registry compatibility; there is no longer a handoff to a replacement head.
 ///
-/// `SampleCadencedBelowHalf` is the ordinary sequence through an observed 0.50
-/// sample. `SampleLateBelowHalf` is the equally valid direct 1.0 -> 0.49
-/// observation after an occluded/delayed callback. `SampleLateBelowFaceSwap`
-/// and `SampleLateDrained` cover stronger direct 1.0 -> 0.30 / 0.0 callbacks
-/// with no intermediate tick. Every route must preserve visible custody.
-/// `Buggy=1` restores the historical handoff blackout: the resident is ready
-/// but its draw gate has not opened, while the singer is already cut.
-/// `LiveTailKeepsCompanionVisible` catches the live-tail gap and exclusive
-/// custody catches the fully drained all-transparent sample.
-///
-/// Tier-0 lives in `derived_ring_ty.rs`. Tier-1 binds these sample actions to
-/// the real `flying_kitty_admitted` / `pet_companion_admitted` custody gates.
+/// `Buggy=1` replays the former singing-head takeover, followed by the former
+/// late-frame blackout. Tier-1 binds the real host/capture admission helpers
+/// and resident alpha to each transition; the pet must remain the one body.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn reduced_motion_companion_handoff_model() -> Model {
@@ -1374,27 +1364,27 @@ pub fn reduced_motion_companion_handoff_model() -> Model {
                 phase = 1;
                 started = 1;
                 song_tail_live = 1;
-                singer_visible = 1;
+                singer_visible = if Buggy == 1 { 1 } else { 0 };
                 pet_ready = 1;
-                pet_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
             }
             action SampleAtHalfCutoff when (phase == 1) {
                 phase = 2;
-                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                singer_visible = 0;
                 pet_ready = 1;
-                pet_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
             }
             action SampleCadencedBelowHalf when (phase == 2) {
                 phase = 3;
-                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                singer_visible = 0;
                 pet_ready = 1;
-                pet_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
             }
             action SampleLateBelowHalf when (phase == 1) {
                 phase = 3;
-                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                singer_visible = 0;
                 pet_ready = 1;
-                pet_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
             }
             action SampleLateBelowFaceSwap when (phase == 1) {
                 phase = 4;
@@ -1423,6 +1413,8 @@ pub fn reduced_motion_companion_handoff_model() -> Model {
                 if song_tail_live == 1 {
                     singer_visible + pet_visible > 0
                 } else { song_tail_live == 0 };
+            invariant ResidentAlwaysOwnsPetMode:
+                singer_visible == 0 && pet_ready == 1 && pet_visible == 1;
             invariant GlassCustodyIsExclusive:
                 singer_visible + pet_visible == 1;
             invariant ResidentOwnsBelowSwap:
@@ -1866,6 +1858,352 @@ pub fn cursor_hint_license_model() -> Model {
     }
 }
 
+/// THE ECHO LEDGER'S LAW (`docs/design/RAINBOW-KITTY-V2.md`, "The late echo's
+/// one-press case", 2026-09-10): the rainbow-kitty v2 engine banks every
+/// typed press and lets a LICENSED typed move pay a hole the seam refused —
+/// the cells between the engine's mirror and the move's `from` — out of the
+/// presses that could have produced it, one press one cell, and nothing else
+/// (`EchoLedger`, `Engine::echo_bridge` in `aterm-effects`).
+///
+/// The ledger is two buckets and a stale lane, partitioned by the LICENSING
+/// KEY — the press whose clock the host's sweep for the move carries:
+/// `older` (presses banked before that key, whose glyphs lie in the hole),
+/// `younger` (the key and the presses still in flight behind it, whose glyphs
+/// lie at and past `from`), `stale` (presses past `ECHO_PATIENCE_S`, which the
+/// next move drops as swallowed). `hole` is the caret's unlicensed advance
+/// since the mirror — a late echo the seam refused, or program output; the
+/// engine cannot tell which, and that is the whole point: only the ledger can.
+///
+/// WHAT THE MODEL CLAIMS, each claim with its own `Buggy = 1` counterexample:
+///
+/// * `BridgedNeverExceedsOlderPresses` — the cells a move lays for a hole never
+///   exceed the presses banked before its licensing key. The mutant is the
+///   FIRST ledger, the one the adversarial review broke: any banked press pays
+///   any cell, so a program nudge followed by a fast burst lights the nudge's
+///   cell with the burst's in-flight presses (three presses, four cells).
+/// * `AProgramGapIsNeverBridged` — a hole is laid only when the older presses
+///   explain it EXACTLY; a program nudge beside a real late echo (older 1,
+///   hole 2), or two swallowed keys before a one-cell nudge (older 2, hole 1),
+///   lays nothing. Same mutant, the other half of the partition.
+/// * `ForfeitedCreditsNeverReturn` — a refused bridge empties the ledger, so
+///   the presses it held can never fund a later cell (a swallowed press would
+///   otherwise roll forward behind the hand as a phantom credit). The mutant
+///   keeps them.
+/// * `NoBridgeOutsideALicensedMove` — every bridged cell is a press a licensed
+///   move spent; T1 in the ledger's terms: a keydown never pre-draws its cell
+///   (the mutant lays the cell on the press).
+/// * `OnePressOneCell` — conservation: every banked press is exactly one of
+///   waiting, stale, spent, forfeited or expired. The mutant bills a
+///   two-cell unswept echo against a single press.
+/// * `ExpiredPressesBuyNothing` — a press that crossed the patience line is
+///   only ever dropped, never spent. The mutant counts stale presses as
+///   payment.
+/// * `NoBridgeOnARefusedMove` — a refused bridge lays nothing: the move's
+///   bridged delta is zero whenever the ledger was just forgotten. The
+///   mutant lays a cell for the hop it refused.
+///
+/// Abstractions, stated so the Tier-1 twin can be read against them: a press
+/// is one cell (the engine banks a wide glyph as two — the same arithmetic,
+/// twice); a swept move is the per-key shape, one cell of advance under the
+/// host's own sweep; an unswept move is a `Batch`-cell echo the host licensed
+/// but did not sweep. `Depth` conflates the ledger's ENTRY cap
+/// (`ECHO_LEDGER_DEPTH` presses) with the paid move's CELL cap (the same
+/// constant, in cells), which is exact only for one-cell presses. The
+/// one-cell unswept shape is outside the action vocabulary because the host
+/// sweeps every typed same-row forward echo except a non-coalesced
+/// re-anchor, which is the `Batch` shape. Outside the bounded space, stated
+/// rather than modelled: the ledger's overflow (the engine drops the OLDEST
+/// press past `ECHO_LEDGER_DEPTH`), and the two clockless clears — `reset`
+/// (which also zeroes `bridged`) and `translate_scroll`. Patience elapses per
+/// press in the engine, oldest first (`OnePressGoesStale`), and all at once
+/// as the closed form (`TimePasses`). A backward typed move re-anchors the
+/// mirror, drops the stale presses (the engine expires before it looks) and
+/// keeps the fresh ones. Every other clearing edge is one of two: the
+/// move-shaped clears (a non-typed licence, a row change, a hop that landed
+/// behind the mirror) are `LedgerForgotten`, which also re-anchors the mirror
+/// so the hole is zero; the in-place clears (erase, kill, focus loss) are
+/// `LedgerClearedInPlace`, which leaves the mirror — and so the hole — where
+/// it is. Tier-1
+/// (`rainbow_kitty::tests::the_real_engine_conforms_to_the_echo_ledger_model`)
+/// drives the REAL `Engine` through press, refused echo, licensed echo with
+/// the host's sweep on the press's clock, the nudge-then-burst break, the
+/// swallowed-press phantom, the navigation clear, the vim-`w` re-anchor the
+/// host does not sweep, the unswept batch, the fresh and the stale retreat,
+/// the patience expiry whole and per press, and the three in-place clears,
+/// projecting the ledger's live buckets and tallies off the engine.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn echo_ledger_bridge_model() -> Model {
+    crate::ty_model! {
+        EchoLedgerBridge {
+            const Buggy = 0;
+            // The most presses one move can pair with (`ECHO_LEDGER_DEPTH`,
+            // scaled down): the ledger's live capacity and the largest hole.
+            const Depth = 3;
+            // Presses one bounded run banks.
+            const BankCap = 4;
+            // Cells of the unswept echo the host licensed on its credits but
+            // did not sweep (the two-cell shape of the 2026-09-10 report).
+            const Batch = 2;
+
+            // The ledger, partitioned by the licensing key.
+            var older = 0;
+            var younger = 0;
+            var stale = 0;
+            // The caret's unlicensed advance past the mirror.
+            var hole = 0;
+            // Tallies: every banked press reaches exactly one of spent,
+            // forfeited, expired, or is still waiting (`older`/`younger`) or
+            // stale. `stale_gone` counts the presses that crossed the patience
+            // line, dropped or not.
+            var banked = 0;
+            var spent = 0;
+            var forfeited = 0;
+            var expired = 0;
+            var stale_gone = 0;
+            // `Status::bridged` — cells the ledger laid.
+            var bridged = 0;
+            // The last licensed move, as the bridge saw it: the hole cells it
+            // laid, the older presses it found, and every cell it bridged
+            // (the hole, or the unswept batch).
+            var laid_hole = 0;
+            var last_older = 0;
+            var bridged_delta = 0;
+            // The last move was a refused bridge and no press has been banked
+            // since — the ledger must be empty.
+            var just_refused = 0;
+
+            // A press the host will clock its next sweep at: everything
+            // banked before it is OLDER than the key. `Buggy=1` pre-draws the
+            // key's cell on the keydown — T1's failure in ledger terms.
+            action KeyPressed when (
+                banked <= BankCap - 1 && older + younger + stale <= Depth - 1
+            ) {
+                older = older + younger;
+                younger = 1;
+                banked = banked + 1;
+                just_refused = 0;
+                bridged = if Buggy == 1 { bridged + 1 } else { bridged };
+            }
+            // A press behind the key, still in flight: its glyph lies to the
+            // RIGHT of the key's cell.
+            action PressInFlight when (
+                banked <= BankCap - 1 && older + younger + stale <= Depth - 1
+            ) {
+                younger = younger + 1;
+                banked = banked + 1;
+                just_refused = 0;
+            }
+            // The caret advanced one cell and no licensed move arrived: a
+            // late echo the seam refused, or program output. The engine sees
+            // neither; it reads the hole off the next move's `from`.
+            action UnlicensedAdvance when (hole <= Depth - 1) {
+                hole = hole + 1;
+            }
+            // The patience elapses on every waiting press: swallowed, not
+            // late. They stay on the ledger until a move drops them.
+            action TimePasses when (1 <= older + younger) {
+                stale = stale + older + younger;
+                stale_gone = stale_gone + older + younger;
+                older = 0;
+                younger = 0;
+            }
+            // The patience elapses on ONE press — the oldest waiting one, as
+            // the engine expires: presses are banked in clock order, so the
+            // stale prefix is always an oldest-first prefix, older before
+            // younger.
+            action OnePressGoesStale when (1 <= older + younger) {
+                older = if 1 <= older { older - 1 } else { older };
+                younger = if older <= 0 { younger - 1 } else { younger };
+                stale = stale + 1;
+                stale_gone = stale_gone + 1;
+            }
+            // THE PAID BRIDGE. A licensed typed move on the mirror's row,
+            // forward, one cell of advance under the host's own sweep on the
+            // key's clock: stale presses are dropped first; the hole is the
+            // older presses', exactly, and the advance is the key's. Spent
+            // oldest-first, the hole laid, counted for `trail status`.
+            // `Buggy=1` is the partition-blind, patience-blind first ledger:
+            // any press on the ledger pays any cell.
+            action SweptMovePays when (
+                (Buggy == 0 && older == hole && 1 <= younger)
+                    || (Buggy == 1 && hole + 1 <= older + younger + stale)
+            ) {
+                expired = if Buggy == 1 { expired } else { expired + stale };
+                // `Buggy=1` spends the hole and the key's cell oldest-first
+                // across every bucket, stale presses included.
+                stale = if Buggy == 1 && hole + 1 <= stale - 1 {
+                    stale - hole - 1
+                } else {
+                    0
+                };
+                older = if Buggy == 0 {
+                    0
+                } else if hole + 1 <= stale {
+                    older
+                } else if hole + 1 - stale <= older {
+                    older - (hole + 1 - stale)
+                } else {
+                    0
+                };
+                younger = if Buggy == 1 {
+                    if hole + 1 <= stale + older {
+                        younger
+                    } else {
+                        younger - (hole + 1 - stale - older)
+                    }
+                } else {
+                    younger - 1
+                };
+                spent = spent + hole + 1;
+                bridged = bridged + hole;
+                bridged_delta = hole;
+                laid_hole = hole;
+                last_older = older;
+                hole = 0;
+            }
+            // THE REFUSED BRIDGE: the same move when the older presses do not
+            // explain the hole exactly, or the key itself is not on the
+            // ledger. Nothing is laid (the host's sweep lit its own cell) and
+            // the ledger is FORGOTTEN: the presses no longer describe the row.
+            // `Buggy=1` keeps them for the next hole, and lays a cell for
+            // the hop it refused — once per press, so the mutant space stays
+            // bounded: the first refusal after a press, with presses held.
+            action SweptMoveRefuses when (
+                older <= hole - 1 || hole <= older - 1 || younger <= 0
+            ) {
+                expired = expired + stale;
+                stale = 0;
+                forfeited = if Buggy == 1 { forfeited } else { forfeited + older + younger };
+                older = if Buggy == 1 { older } else { 0 };
+                younger = if Buggy == 1 { younger } else { 0 };
+                bridged = if Buggy == 1 && just_refused == 0 && 1 <= older + younger {
+                    bridged + 1
+                } else {
+                    bridged
+                };
+                bridged_delta = if Buggy == 1 && just_refused == 0 && 1 <= older + younger {
+                    1
+                } else {
+                    0
+                };
+                laid_hole = 0;
+                last_older = older;
+                hole = 0;
+                just_refused = 1;
+            }
+            // THE UNSWEPT ECHO: a licensed `Batch`-cell typed move the host
+            // did not sweep — a non-coalesced re-anchor, or a batch its press
+            // credits (which age out at 2 s, `RAINBOW_COALESCE_CREDIT_LIFE`)
+            // could not pay for. With no key clock there is no partition:
+            // only a move starting AT the mirror is attributed, to the oldest
+            // presses, and every cell is laid.
+            // `Buggy=1` bills the batch against a single press — one press,
+            // two cells.
+            action UnsweptMovePays when (
+                hole == 0
+                    && ((Buggy == 0 && Batch <= older + younger)
+                        || (Buggy == 1 && 1 <= older + younger))
+            ) {
+                expired = expired + stale;
+                stale = 0;
+                older = if Buggy == 1 {
+                    0
+                } else if Batch <= older {
+                    older - Batch
+                } else {
+                    0
+                };
+                younger = if Buggy == 1 {
+                    0
+                } else if Batch <= older {
+                    younger
+                } else {
+                    younger - (Batch - older)
+                };
+                spent = spent + Batch;
+                bridged = bridged + Batch;
+                bridged_delta = Batch;
+                laid_hole = 0;
+                last_older = older;
+            }
+            // The unswept echo refused: a hole before it (no clock to
+            // partition by), or too few presses. Forgotten, like every refusal.
+            action UnsweptMoveRefuses when (1 <= hole || older + younger <= Batch - 1) {
+                expired = expired + stale;
+                stale = 0;
+                forfeited = forfeited + older + younger;
+                older = 0;
+                younger = 0;
+                bridged_delta = 0;
+                laid_hole = 0;
+                last_older = older;
+                hole = 0;
+                just_refused = 1;
+            }
+            // THE MOVE-SHAPED CLEARS: a non-typed licence, a row change, a
+            // hop that landed behind the mirror. The presses no longer
+            // describe the row under the hand, and the move re-anchors the
+            // mirror, so the hole is gone with them.
+            action LedgerForgotten when (1 <= older + younger + stale + hole) {
+                expired = expired + stale;
+                stale = 0;
+                forfeited = forfeited + older + younger;
+                older = 0;
+                younger = 0;
+                hole = 0;
+                bridged_delta = 0;
+                laid_hole = 0;
+                last_older = older;
+            }
+            // THE IN-PLACE CLEARS: an erase, a kill, a focus loss. The
+            // presses are dropped (the stale ones as expired — the engine
+            // expires before it clears) but nothing moved the mirror, so the
+            // hole is exactly what it was.
+            action LedgerClearedInPlace when (1 <= older + younger + stale) {
+                expired = expired + stale;
+                stale = 0;
+                forfeited = forfeited + older + younger;
+                older = 0;
+                younger = 0;
+                bridged_delta = 0;
+                laid_hole = 0;
+            }
+            // A backward typed move — a retreat, a re-anchor, a rewrite
+            // landing left of its launch: not an echo's shape. The mirror
+            // moves; the fresh presses keep waiting, the stale ones are
+            // dropped (the engine expires before it looks at the shape).
+            action RetreatKeepsPresses when (1 <= hole || 1 <= stale) {
+                expired = expired + stale;
+                stale = 0;
+                hole = 0;
+                bridged_delta = 0;
+                laid_hole = 0;
+                last_older = older;
+            }
+
+            invariant BridgedNeverExceedsOlderPresses: laid_hole <= last_older;
+            invariant AProgramGapIsNeverBridged:
+                laid_hole == 0 || laid_hole == last_older;
+            invariant ForfeitedCreditsNeverReturn:
+                just_refused == 0 || older + younger == 0;
+            invariant NoBridgeOutsideALicensedMove: bridged <= spent;
+            invariant NoBridgeOnARefusedMove: just_refused == 0 || bridged_delta == 0;
+            invariant OnePressOneCell:
+                older + younger + stale + spent + forfeited + expired == banked;
+            invariant ExpiredPressesBuyNothing: stale_gone == expired + stale;
+            invariant StateBounded:
+                older <= Depth && younger <= Depth && stale <= Depth
+                    && older + younger + stale <= Depth && hole <= Depth
+                    && banked <= BankCap && spent <= banked + banked
+                    && forfeited <= banked && expired <= banked
+                    && stale_gone <= banked && bridged <= spent + banked + banked
+                    && laid_hole <= Depth && last_older <= Depth
+                    && bridged_delta <= Depth && just_refused <= 1;
+        }
+    }
+}
+
 /// Cursor-owned pixels/cells live in the active viewport coordinate space.
 /// Entering retained history must immediately suppress the DEC cursor, both
 /// trail engines, every cursor body/companion overlay, and a later Retain
@@ -2254,6 +2592,19 @@ pub fn cursor_effect_scroll_model() -> Model {
 /// invalidation and drop all geometry/proof. `Buggy=1` is the former
 /// GUI policy: infer motion from the unchanged retained count and preserve the
 /// stranded effect state.
+///
+/// `RegionBandMove` (event 6) is the THIRD answer, added 2026-09-10 for the
+/// inline viewports Codex and friends stream through: the epoch still steps —
+/// `band_batches` counts it as a SUBSET, so every consumer that cannot
+/// translate bands still reads "discard" — but the whole row motion of that
+/// batch is one exact `RowBandMove`, so the host translates the band's light
+/// DOWN by `Delta` (`survivor_y == StartY + Delta`: a region scroll down, the
+/// reverse index a streamed transcript line writes) and keeps its geometry
+/// alive. Row-bound PROOF still dies: the rows inside the band hold different
+/// content than the bytes that proof was measured against. `Buggy=1` is the
+/// pre-2026-09-10 policy for this event — `decision = 2` and every mark
+/// destroyed, the per-line reset the owner reported as "the rainbow
+/// disappears".
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_scroll_signal_model() -> Model {
@@ -2262,11 +2613,12 @@ pub fn cursor_scroll_signal_model() -> Model {
             const StartY = 3;
             const Delta = 2;
             const Buggy = 0;
-            var event = 0;              // 0 initial, 1 primary uniform, 2 region, 3 alt uniform, 4 reset, 5 restore
+            var event = 0;              // 0 initial, 1 primary uniform, 2 region, 3 alt uniform, 4 reset, 5 restore, 6 explained band
             var retained_history = 0;   // capped: deliberately unchanged
             var uniform_rows = 0;       // cumulative composable scroll clock
             var epoch = 0;              // cumulative invalidation clock
-            var decision = 0;           // 0 none, 1 translate, 2 invalidate
+            var band_batches = 0;       // epoch steps whose whole row motion is an exact band
+            var decision = 0;           // 0 none, 1 translate, 2 invalidate, 3 translate the band
             var survivor_y = 3;
             var geometry_alive = 1;
             var proof_alive = 1;
@@ -2307,6 +2659,15 @@ pub fn cursor_scroll_signal_model() -> Model {
                 geometry_alive = if Buggy == 1 { 1 } else { 0 };
                 proof_alive = if Buggy == 1 { 1 } else { 0 };
             }
+            action RegionBandMove when (event == 0) {
+                event = 6;
+                epoch = 1;
+                band_batches = 1;
+                decision = if Buggy == 1 { 2 } else { 3 };
+                survivor_y = if Buggy == 1 { StartY } else { StartY + Delta };
+                geometry_alive = if Buggy == 1 { 0 } else { 1 };
+                proof_alive = 0;
+            }
 
             invariant RetainedCountIsNotAuthority:
                 if event == 1 || event == 3 {
@@ -2318,6 +2679,9 @@ pub fn cursor_scroll_signal_model() -> Model {
                 if event == 1 || event == 3 {
                     survivor_y == StartY - Delta && geometry_alive == 1
                         && proof_alive == 0
+                } else if event == 6 {
+                    survivor_y == StartY + Delta && geometry_alive == 1
+                        && proof_alive == 0
                 } else {
                     survivor_y == StartY
                 };
@@ -2325,8 +2689,16 @@ pub fn cursor_scroll_signal_model() -> Model {
                 if event == 2 || event == 4 || event == 5 {
                     epoch == 1 && decision == 2
                         && geometry_alive == 0 && proof_alive == 0
+                } else if event == 6 {
+                    epoch == 1
                 } else {
                     epoch == 0
+                };
+            invariant ExplainedMotionTranslatesWithinItsBand:
+                if event == 6 {
+                    epoch == band_batches && decision == 3
+                } else {
+                    band_batches == 0
                 };
         }
     }

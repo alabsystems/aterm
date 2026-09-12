@@ -741,6 +741,59 @@ pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<
     command_detail(&text)
 }
 
+/// Wrappers unwrapped ONE level: the interesting program is the next word.
+/// `exec` is one: it replaces the shell with the program it names, so
+/// `exec claude` is `claude` running, not `exec`.
+const WRAPPERS: [&str; 7] = ["sudo", "env", "time", "nice", "command", "nohup", "exec"];
+/// Wrapper flags that consume the following word (`sudo -u me`, `nice -n 5`,
+/// `env -u VAR`, `exec -a argv0`), so that word is never mistaken for the
+/// program.
+const WRAPPER_FLAGS_WITH_VALUE: [&str; 4] = ["-u", "-n", "-g", "-a"];
+/// Shell keywords that open a compound command this deliberately does not
+/// parse: the segment reads as the keyword, and its `;`s are the keyword's
+/// grammar (`for …; do …; done`), not list operators to cut at.
+const KEYWORD_OPENERS: [&str; 6] = ["for", "while", "if", "until", "case", "{"];
+/// The punctuation the shell's quoting or a list cut leaves attached to a word
+/// (`'claude'`, `(for`, `claude)`): trimmed before any word is read.
+const WORD_TRIM: [char; 8] = ['\'', '"', '`', ';', '(', ')', '&', '|'];
+
+/// `FOO=1` in front of a program: environment, not the program.
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// The raw word in a segment's PROGRAM slot: past env assignments, past the
+/// prompt glyph a scrape leaves in front (`$`, `❯`: no letter or digit — `{`
+/// is the one keyword with none), and past ONE wrapper with its flags, so
+/// `time for …` shows `for` exactly as `time make` shows `make`. The same slot
+/// [`command_detail`] reads the program from; here it says whether a segment
+/// opens a compound command.
+fn leading_word(segment: &str) -> Option<&str> {
+    let mut words = segment
+        .split_whitespace()
+        .map(|w| w.trim_matches(WORD_TRIM))
+        .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)))
+        .peekable();
+    let first = words.next()?;
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    if !WRAPPERS.contains(&base) {
+        return Some(first);
+    }
+    while let Some(next) = words.peek() {
+        if WRAPPER_FLAGS_WITH_VALUE.contains(next) {
+            words.next();
+            words.next();
+        } else if next.starts_with('-') {
+            words.next();
+        } else {
+            break;
+        }
+    }
+    words.next()
+}
+
 /// The most a `detail=` may say about a command line: the program's basename,
 /// plus its first subcommand when that word is in the program's CLOSED
 /// vocabulary ([`SUBCOMMANDS`]) — never an argument. This is the RFC §4 privacy
@@ -756,46 +809,74 @@ pub(crate) fn executing_detail(term: &aterm_core::terminal::Terminal) -> Option<
 /// values are not, so a value that itself spells a vocabulary word passes as
 /// the subcommand (`git -C status log` → `git status`) — a wrong reading, and
 /// still a word from the closed list. Env-assignment prefixes
-/// are skipped and one wrapper (`sudo`/`env`/`time`/`nice`/…, matched by its
-/// basename, so `/usr/bin/env` is `env`) is unwrapped, so `FOO=1 sudo -u me
-/// targo --unverified test -p x` still reads `targo test`.
-/// Empty or whitespace input is `None`.
+/// are skipped and one wrapper (`sudo`/`env`/`time`/`nice`/`exec`/…, matched by
+/// its basename, so `/usr/bin/env` is `env`) is unwrapped, so `FOO=1 sudo -u me
+/// targo --unverified test -p x` still reads `targo test` and `exec claude
+/// --resume` reads `claude`. Empty or whitespace input is `None`.
 ///
-/// The first word is taken as the program on its face, so a COMPOUND command
-/// line reads as the shell KEYWORD that opens it — measured: `for i in 1 2 3;
-/// do sleep 1; done` is `detail=for`, and `if`/`while`/`case`/`until` behave the
-/// same (a `{`/`(` group is the exception the prompt-glyph skip already covers,
-/// because neither word carries an alphanumeric). That is not a wrong answer to
-/// hide: `for` IS what the block is executing, and unwrapping it would mean
+/// A COMPOUND command line names the program of the segment that is RUNNING,
+/// not the word the line happens to open with — measured: `cd ~/ay && claude`
+/// read `detail=cd`, in exactly the launch shape the supervise-agent skill
+/// recommends, while the house rule tells an agent to read `detail=` to learn
+/// whether a peer is another agent before typing into it. So the RAW line is
+/// cut at its top-level list operators before any word is looked at
+/// ([`split_list`]: quote- and backslash-aware, so `claude -p "a; b"` is one
+/// segment), and the segment is the one the shell would still be running
+/// ([`running_segment`]): `;` (and a newline) binds loosest, so the LAST
+/// non-blank `;`-group is read; inside it `&&`/`||` chain left to right, the
+/// right operand of `&&` runs once the left SUCCEEDED and the right operand of
+/// `||` runs only if the left FAILED — so trailing `|| …` alternatives are
+/// dropped and the last operand left is the answer. `cd ~/ay && exec claude`
+/// → `claude`, `cd /tmp; codex` → `codex`, `make || echo failed` → `make`,
+/// `cd x && claude || echo failed` → `claude`. A pipeline's `|` and a
+/// background `&` are not list operators here, so the first command of a
+/// pipeline still names it, as before; subshell parentheses are not tracked,
+/// so `(cd ~/ay && claude)` reads `claude` — the operators cut the same way
+/// inside them.
+///
+/// A shell keyword in a segment's program slot is the exception:
+/// `for i in 1 2 3; do sleep 1; done` is `detail=for`, and `if`/`while`/
+/// `case`/`until`/`{` behave the same. Its `;`s belong to the keyword's grammar
+/// (`for …; do`), not to a list — cutting there answers a CLOSER (`done`, `fi`,
+/// `esac`, `}`), which is never a program — and reading the body would mean
 /// parsing shell grammar here, where the rule is deliberately word-shaped and
-/// privacy-bounded. The `status`/`sessions` verb entries say so in the same
-/// words, so the wire promise matches what this returns.
+/// privacy-bounded. `for` IS what the block is executing, so that is not a
+/// wrong answer to hide. The keyword need not open the LINE: `cd x && for …;
+/// done` and `time for …; done` cut to `done` while only the first word was
+/// looked at, so the segments are scanned left to right and the FIRST whose
+/// program slot ([`leading_word`]: past assignments, a prompt glyph and one
+/// wrapper) holds an opener is read — `for`, `if`, `for` — before the running
+/// segment is considered at all. The `status`/`sessions` verb entries say all
+/// three rules in the same words, so the wire promise matches what this
+/// returns.
 ///
 /// `title_summary/description.rs`'s `short_command` is the precedent the RFC
 /// names, but not this transform: it hides every program outside its own
 /// allow-list as "a command", which is exactly the answer F5 found insufficient.
 pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
-    /// Wrappers unwrapped ONE level: the interesting program is the next word.
-    const WRAPPERS: [&str; 6] = ["sudo", "env", "time", "nice", "command", "nohup"];
-    /// Wrapper flags that consume the following word (`sudo -u me`, `nice -n 5`,
-    /// `env -u VAR`), so that word is never mistaken for the program.
-    const WRAPPER_FLAGS_WITH_VALUE: [&str; 3] = ["-u", "-n", "-g"];
     /// The bound on the reply: enough for `kubectl port-forward`, never a
     /// screen-scraped line.
     const MAX_CHARS: usize = 48;
 
     let clean = |word: &str| -> String {
-        word.trim_matches(|c: char| matches!(c, '\'' | '"' | '`' | ';' | '(' | ')' | '&' | '|'))
+        word.trim_matches(WORD_TRIM)
             .chars()
             .filter(|c| !c.is_control())
             .collect()
     };
-    let is_assignment = |word: &str| {
-        word.split_once('=').is_some_and(|(name, _)| {
-            !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
-        })
-    };
-    let mut words = cmdline
+    // Which part of the line to read: the FIRST segment whose program slot
+    // holds a keyword opener, else the segment that is running. A keyword's
+    // `;`s are its own grammar, so the running-segment cut of `for …; do …;
+    // done` — wherever the `for` sits on the line — is a closer (`done`,
+    // `fi`, `esac`, `}`), never a program. The one line whose running segment
+    // opens with a closer and has no opener before it is a syntax error the
+    // shell never runs, so that shape is left to the cut.
+    let segment = split_list(cmdline)
+        .into_iter()
+        .map(|(_, text)| text)
+        .find(|text| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&w)))
+        .unwrap_or_else(|| running_segment(cmdline));
+    let mut words = segment
         .split_whitespace()
         .map(clean)
         .filter(|w| !w.is_empty())
@@ -856,6 +937,112 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
         }
     }
     Some(detail.chars().take(MAX_CHARS).collect())
+}
+
+/// A list operator between two segments of a command line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListOp {
+    /// `;` or a newline: the right side runs after the left, whatever it did.
+    Seq,
+    /// `&&`: the right side runs only after the left SUCCEEDED.
+    And,
+    /// `||`: the right side runs only if the left FAILED.
+    Or,
+}
+
+/// `cmdline` cut at its top-level list operators — `;` and newline
+/// ([`ListOp::Seq`]), `&&` ([`ListOp::And`]), `||` ([`ListOp::Or`]) — each
+/// segment paired with the operator that PRECEDES it (the first with `Seq`).
+/// Single and double quotes, backticks and backslash escapes are honoured, so
+/// an operator inside an argument (`claude -p "a; b"`) does not cut. Nothing
+/// more of the grammar is modelled: a single `|` (pipeline) or `&` (background
+/// job) stays inside its segment, and `(`/`$(` nesting is not tracked. Every
+/// cut lands on an ASCII operator byte, so the slices are always on char
+/// boundaries.
+fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
+    let bytes = cmdline.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut op = ListOp::Seq;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            // Inside quotes only the matching quote ends them; a backslash
+            // escapes the next byte except inside single quotes.
+            if c == b'\\' && q != b'\'' {
+                i += 2;
+            } else {
+                if c == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let cut = match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' | b'"' | b'`' => {
+                quote = Some(c);
+                i += 1;
+                continue;
+            }
+            b';' | b'\n' => Some((ListOp::Seq, 1)),
+            b'&' if bytes.get(i + 1) == Some(&b'&') => Some((ListOp::And, 2)),
+            b'|' if bytes.get(i + 1) == Some(&b'|') => Some((ListOp::Or, 2)),
+            _ => None,
+        };
+        match cut {
+            Some((next, width)) => {
+                segments.push((op, &cmdline[start..i]));
+                op = next;
+                i += width;
+                start = i;
+            }
+            None => i += 1,
+        }
+    }
+    segments.push((op, &cmdline[start..]));
+    segments
+}
+
+/// The segment of a command line that is RUNNING once its predecessors have
+/// had their say — the one [`command_detail`] reads. `;`/newline bind loosest,
+/// so the last `;`-group with any content is taken; within it `&&`/`||` chain
+/// left to right, and a trailing `|| …` is the alternative that runs only on
+/// failure, so it is dropped and the last operand left is the answer. A line
+/// with no list operator (or nothing but blank ones) is its own segment.
+fn running_segment(cmdline: &str) -> &str {
+    let mut groups: Vec<Vec<(ListOp, &str)>> = Vec::new();
+    for (op, text) in split_list(cmdline) {
+        if op == ListOp::Seq || groups.is_empty() {
+            groups.push(Vec::new());
+        }
+        groups
+            .last_mut()
+            .expect("a group was just pushed")
+            .push((op, text));
+    }
+    let mut chain = groups
+        .into_iter()
+        .rev()
+        .find(|group| group.iter().any(|(_, text)| !text.trim().is_empty()))
+        .unwrap_or_default();
+    // `a && b || c`: `c` runs only if `a && b` failed, so it is not the running
+    // segment; `a && b` is left, and its last operand is. A blank operand (a
+    // trailing `&&`) is dropped the same way.
+    while chain.len() > 1
+        && chain
+            .last()
+            .is_some_and(|(op, text)| *op == ListOp::Or || text.trim().is_empty())
+    {
+        chain.pop();
+    }
+    chain.last().map_or(cmdline, |(_, text)| text)
 }
 
 /// The programs whose first subcommand a `detail=` may name, each with the
@@ -3635,11 +3822,65 @@ mod tests {
             ("yarn build --token abc", Some("yarn build")),
             // A subcommand slot holding a path or an assignment is dropped.
             ("make ./target/x", Some("make")),
+            // A COMPOUND line names the program of the segment that is RUNNING,
+            // not the word it opens with: `cd x && claude` is the launch shape
+            // the supervise-agent skill recommends, and it read `cd`. The last
+            // of an `&&`/`;` chain; a trailing `|| …` runs only on failure, so
+            // the operand before it; `exec` is a wrapper.
+            ("cd ~/ay && claude", Some("claude")),
+            ("cd ~/ay && exec claude", Some("claude")),
+            ("exec claude --resume", Some("claude")),
+            ("cd /tmp; codex", Some("codex")),
+            ("make || echo failed", Some("make")),
+            ("FOO=1 cd x && targo test", Some("targo test")),
+            (
+                "git pull && targo --unverified test -p aterm-gui",
+                Some("targo test"),
+            ),
+            ("cd x && claude || echo failed", Some("claude")),
+            ("cd x; claude;", Some("claude")),
+            ("cd x &&", Some("cd")),
+            ("(cd ~/ay && claude)", Some("claude")),
+            ("cd x\nclaude", Some("claude")),
+            // A pipeline is still named by its first command.
+            ("cd x && cat log | grep err", Some("cat")),
+            // An operator inside quotes or behind a backslash is an argument,
+            // not a cut.
+            ("claude -p \"fix a; then b\"", Some("claude")),
+            ("echo 'x && y' && codex", Some("codex")),
+            ("echo a \\; codex", Some("echo")),
+            // A keyword opener stays the keyword: the body is not parsed, and
+            // the `;` in `for …; do` is the keyword's grammar, not a list
+            // operator (cutting there would answer `done`). `{` opens a group
+            // the same way, so it keeps the first-word reading.
+            ("for i in 1 2 3; do sleep 1; done", Some("for")),
+            ("$ for i in 1 2 3; do sleep 1; done", Some("for")),
+            ("while true; do claude; done", Some("while")),
+            ("if [ -f x ]; then claude; fi", Some("if")),
+            ("{ cd x; claude; }", Some("cd")),
+            // The keyword need not open the LINE: behind a `cd x &&` or a
+            // wrapper the first-word reading fell through to the running
+            // segment, whose `;`-cut is the CLOSER — `done`, `fi` — and a
+            // closer is never a program. The first segment whose program slot
+            // holds an opener is read instead.
+            ("cd x && for i in 1 2 3; do sleep 1; done", Some("for")),
+            ("cd x && if true; then claude; fi", Some("if")),
+            ("time for i in 1 2 3; do sleep 1; done", Some("for")),
             ("", None),
             ("   \t ", None),
+            (";", None),
         ];
+        // A keyword that CLOSES a compound command is never a program, so no
+        // row may read one, whatever its `;`-cut would have answered.
+        const KEYWORD_CLOSERS: [&str; 8] =
+            ["done", "fi", "esac", "}", "then", "do", "else", "elif"];
         for (cmd, want) in cases {
-            assert_eq!(command_detail(cmd).as_deref(), *want, "{cmd:?}");
+            let got = command_detail(cmd);
+            assert_eq!(got.as_deref(), *want, "{cmd:?}");
+            assert!(
+                !got.as_deref().is_some_and(|d| KEYWORD_CLOSERS.contains(&d)),
+                "{cmd:?} reads a closer, which is never a program: {got:?}"
+            );
         }
         // Every program in the table is exercised above, so a vocabulary
         // change cannot land without a row that shows what it does.

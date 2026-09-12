@@ -862,10 +862,32 @@ impl Grid {
         // — including one anchored far up in scrollback that this scroll never
         // touched.) History and `absolute_row_counter` are untouched here, so the
         // batch's row-advance accounting is unaffected by dropping the sentinel.
+        //
+        // And record the move WITH NUMBERS beside the flag: the region's rows went
+        // UP by `n`, its top `n` rows left the band (see `RowBandMove`). An `n` past
+        // `i16` is not a shape any program emits (the region is at most the screen);
+        // it poisons the record rather than recording a wrong displacement.
+        self.record_row_band_move_or_poison(top_u16, bottom_u16, n, false);
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
+    }
+
+    /// Record rows `top..=bottom` moving by `n` rows — DOWN the screen when `down`,
+    /// UP otherwise — on this batch's band record, or poison the record when `n`
+    /// does not fit an `i16` displacement (see
+    /// `GridPresentationState::record_row_band_move`).
+    fn record_row_band_move_or_poison(&mut self, top: u16, bottom: u16, n: usize, down: bool) {
+        match i16::try_from(n) {
+            Ok(rows) => {
+                let delta = if down { rows } else { -rows };
+                self.storage
+                    .presentation
+                    .record_row_band_move(top, bottom, delta);
+            }
+            Err(_) => self.storage.presentation.poison_row_band_moves(),
+        }
     }
 
     /// Length of the LEADING run of blank rows among the `n` viewport rows a
@@ -949,6 +971,12 @@ impl Grid {
         self.storage
             .presentation
             .record_absolute_row_splice(insertion_at, u64::try_from(n).unwrap_or(u64::MAX));
+        // On the SCREEN this is one band move: rows `0..=bottom` went up by `n`
+        // (the top `n` entered history — gone from the screen), the footer below
+        // `bottom` did not move. The splice above carries the history insertion
+        // point for durable absolute-row metadata; this carries the screen-row
+        // transform a cursor-effects host needs, which the splice cannot express.
+        self.record_row_band_move_or_poison(0, row_u16(bottom), n, false);
 
         // The whole-grid archival step cannot be presented as a hardware scroll:
         // the footer was restored in place. Force ordinary content invalidation.
@@ -1020,6 +1048,11 @@ impl Grid {
 
         // SELECTION CUSTODY Phase 4: the region's rows are the damage. A reverse
         // region scroll adds nothing to history, so the counter is untouched.
+        //
+        // The band record beside the flag: the region's rows went DOWN by `n`, its
+        // bottom `n` rows left the band. Five reverse indices at a Codex region top
+        // (its Enter) compose here into one `+5` entry.
+        self.record_row_band_move_or_poison(top_u16, bottom_u16, n, true);
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
@@ -1120,6 +1153,11 @@ impl Grid {
         // the lattice is row-granular, so the band is the region's rows — the same
         // rows marked dirty below. Wider than the rectangle in the column direction,
         // which fails SAFE (over-clear, never a stale highlight).
+        //
+        // A rectangle is NOT a row translate (the cells outside the margins stayed),
+        // so the band record is poisoned: the batch reaches hosts as today's
+        // invalidation, never as a band they could replay.
+        self.storage.presentation.poison_row_band_moves();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1215,6 +1253,11 @@ impl Grid {
         // the lattice is row-granular, so the band is the region's rows — the same
         // rows marked dirty below. Wider than the rectangle in the column direction,
         // which fails SAFE (over-clear, never a stale highlight).
+        //
+        // A rectangle is NOT a row translate (the cells outside the margins stayed),
+        // so the band record is poisoned: the batch reaches hosts as today's
+        // invalidation, never as a band they could replay.
+        self.storage.presentation.poison_row_band_moves();
         self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));

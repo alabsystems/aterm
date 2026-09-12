@@ -52,6 +52,9 @@ pub(crate) use stderr_line;
 
 use aterm_render::Frame;
 
+#[cfg(all(target_os = "macos", feature = "acquire-conformance"))]
+pub use metal::acquire_probe::{AcquireProbe, install_acquire_probe};
+
 mod device_layer;
 mod format_plan;
 // THE PIPELINE TABLE: the one declaration of all eighteen render pipelines —

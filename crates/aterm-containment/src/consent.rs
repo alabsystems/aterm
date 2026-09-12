@@ -171,10 +171,13 @@ impl FdaScope {
     }
 }
 
-/// What the one probe syscall did. Kept separate from [`FdaState`] so the
-/// classification is a pure table and the reason survives into the report.
+/// The observation's progress or outcome. Kept separate from [`FdaState`] so
+/// an unfinished observation cannot be mistaken for a completed denial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProbeLabel {
+    /// No current result: an asynchronous observer is waiting or refreshing.
+    /// This is not a denial or a claim that a syscall completed.
+    Pending,
     /// The open succeeded.
     OpenOk,
     /// The open returned [`ERRNO_EPERM`].
@@ -207,6 +210,7 @@ impl ProbeLabel {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::OpenOk => "open_ok",
             Self::OpenEperm => "open_eperm",
             Self::OpenErrno(_) => "open_errno",
@@ -219,8 +223,10 @@ impl ProbeLabel {
         }
     }
 
-    /// `true` when no syscall was performed. Every `Refused*` label and
-    /// [`ProbeLabel::UnsupportedPlatform`] answer `true`.
+    /// `true` for a deliberate refusal to consult the probe, including an
+    /// unsupported platform. These labels guarantee no probe syscall ran.
+    /// `false` does not guarantee completion: [`ProbeLabel::Pending`] may be
+    /// queued or executing on a worker and is not a refusal.
     #[must_use]
     pub const fn refused(self) -> bool {
         matches!(
@@ -240,11 +246,20 @@ impl ProbeLabel {
 pub struct FdaProbe {
     /// The classified state.
     pub state: FdaState,
-    /// What the probe actually did.
+    /// The observation's progress, refusal, or completed outcome.
     pub label: ProbeLabel,
 }
 
 impl FdaProbe {
+    /// No current observation. This is neither a denial nor a refusal.
+    #[must_use]
+    pub const fn pending() -> Self {
+        Self {
+            state: FdaState::Unknown,
+            label: ProbeLabel::Pending,
+        }
+    }
+
     /// A refusal: [`FdaState::Unknown`] with the given reason.
     #[must_use]
     pub const fn refused(label: ProbeLabel) -> Self {

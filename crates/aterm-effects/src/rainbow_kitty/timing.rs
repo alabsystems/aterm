@@ -204,6 +204,32 @@ pub const MINI_FAN_MIN_CELLS: u16 = 2;
 /// (§6.12: no flight, no train, 1 m2 + 2 m3, gone by 245 ms).
 pub const MINI_FAN_MAX_CELLS: u16 = JUMP_MIN_CELLS - 1;
 
+/// **THE ECHO PATIENCE**, seconds — how long a typed press stays on the
+/// engine's echo ledger (`super::EchoLedger`) waiting for the caret advance
+/// that is its echo, before it is forgotten as swallowed.
+///
+/// The host's licence window is `0.25 s` (`CursorGlow::TYPE_HINT_FRESH`), and
+/// an echo judged later than that is refused at the seam — correctly, for
+/// program output, and at the cost of the glyph cell when the echo was merely
+/// LATE: a TUI whose render loop stalled. Measured on the owner's machine
+/// (2026-09-10): a scripted typist on an idle Claude Code prompt saw echoes of
+/// 2-31 ms, but the instance's own echo ledger held a `1373 ms` worst case from
+/// real use, and `input_p99 = 268 ms`. Two seconds covers that worst case with
+/// margin and stays well inside the ribbon's own chain window
+/// (`ribbon::CHAIN_GAP_MAX`, 5 s), the rhythm the mark already treats as one
+/// burst; a press older than this has no echo coming that the eye would still
+/// pair with the key. It is the same two seconds the host gives an unpaid
+/// press credit (`CursorGlow::RAINBOW_COALESCE_CREDIT_LIFE`): one patience
+/// for one press, whichever layer is asked.
+pub const ECHO_PATIENCE_S: f32 = 2.0;
+
+/// The most cells one observed move may lay from the echo ledger — the host's
+/// own coalesced-sweep cap (`CursorGlow::RAINBOW_TYPED_SWEEP_MAX`, which is
+/// `TYPED_STAMP_DEPTH`, 32 since the host's own ledger fix of 2026-09-09):
+/// more presses than that cannot be paired with any one move, so the ledger
+/// never holds more either.
+pub const ECHO_LEDGER_DEPTH: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
+
 // ---------------------------------------------------------------------------
 // 2. THE SHARED COUNTS (§8.1, "plus two shared counts")
 // ---------------------------------------------------------------------------

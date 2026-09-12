@@ -499,35 +499,123 @@ pub struct Baseline {
 //
 //     Console-life integration adds a direct aterm-effects -> aterm-types
 //     dependency, but core/render already resolve it normally; this adds no node.
+//
+// (10) 2026-09-10, THE FABRIC IN THE WORKSPACE — v0.81.0's headline change,
+//     and the first round in this file that GROWS the surface. `crates/
+//     aterm-link` carried its own `[workspace]` table and path-depended on
+//     `../../astream`, a sibling checkout most clones do not have, so
+//     `cargo build` never built it and no release ever shipped the bridge. It
+//     is an ordinary member now and the astream crates it needs are vendored
+//     under `vendor/astream/crates/` (wire, cap, broker; aead is vendored too,
+//     but the `sealed` feature that reaches it is off by default, so no cipher
+//     tree is in any cell). See CHANGELOG.md `[0.81.0]`.
+//
+//     SEVEN THIRD-PARTY PACKAGES ENTER — NOT TEN, and the difference is a
+//     CLASSIFIER FIX, not a re-measurement of the same question. The first
+//     pass of this note read ten, because `loc::measure` decided
+//     `is_third_party` from a DIRECTORY PREFIX: everything not under `crates/`
+//     was somebody else's code. `vendor/astream` is a copy of
+//     `github.com/alabsystems/astream`, whose owner is this repository's
+//     owner — the same account, not a similar name — vendored for a BUILD
+//     reason and reached by `path = …`, so the prefix rule billed 3 packages
+//     and 11,122 lines of ATERM'S OWN CODE to the surface this crate exists to
+//     shrink, and `[OB-1]` demanded a `[patch.crates-io]` entry that cannot
+//     exist (a patch entry replaces a REGISTRY package; these are not
+//     published). [`crate::provenance`] is the third shape, and the question
+//     is asked of it now: `crates/` OR a roster row is first-party, and the
+//     five real forks under `vendor/` (winit, indexmap, libm, pkg-config,
+//     smol_str) are third-party exactly as before.
+//
+//     What genuinely crossed the line is the `sha2` chain `astream-cap` mints
+//     capabilities with: sha2, digest, block-buffer, crypto-common,
+//     generic-array, typenum and cpufeatures, priced as ONE prize by
+//     `blame sha2 --cell mac-arm` at dom 7 packages / 48,869 LOC because
+//     `astream-cap` is sha2's only parent here. `sha2` was already a
+//     Cargo.lock entry; this is the first time it has been in a shipped GRAPH,
+//     and `crates/aterm-digest` exists precisely because sha2 + hmac cost
+//     eight packages to expose four methods. The campaign has re-bought seven
+//     of them, and one edge — routing the mint through aterm-digest — takes
+//     all seven and all 48,869 lines back off every cell at once.
+//
+//       mac-arm  110 -> 121 resolved, 70 -> 74 workspace, 40 -> 47
+//                third-party, 391,458 -> 440,327 LOC, 9 -> 10 build scripts
+//       linux    260 -> 271, 72 -> 76, 188 -> 195,
+//                2,739,667 -> 2,788,536, 31 -> 32
+//       win      161 -> 172, 70 -> 74, 91 -> 98,
+//                3,586,896 -> 3,635,765, 19 -> 20
+//
+//     +48,869 LOC to the line on all three, which is the evidence it is one
+//     edit and not three: every one of the seven is target-independent source.
+//     `workspace` gains FOUR on each cell, not one — `aterm-link` plus the
+//     three astream crates, which are aterm's own and are counted as such.
+//     `resolved` therefore moves by 11 while `third_party` moves by 7. The one
+//     added build script is `generic-array`'s (checked against the registry
+//     sources: none of the other six carries one, and no astream crate does).
+//     Proc macros and duplicate names do not move on any cell. The two browser
+//     modules are rooted at `aterm-wasm` and `aterm-gpu-web`, never reach
+//     `aterm-link`, and are UNCHANGED to the line — which is why [`WASM_CPU`]
+//     and [`WASM_GPU`] are not touched in this round.
+//
+//     ONE ROW ENTERS [`MAC_ARM_DOMINATORS`]: `sha2` at four, displacing
+//     `serde` (3 / 38,412). `rustybuzz` did not move by a line and is still
+//     there, one rank lower. `astream-cap` is NOT a row — `dominator::ranked`
+//     ranks third-party packages, and the mint is aterm's own; what it drags
+//     in is what gets billed. `winit`, `rustls` and `syn` are unchanged.
+//
+//     THE RATCHET REFUSED THIS, WHICH IS THE RATCHET WORKING, and the raise it
+//     eventually recorded is the NARROW one. `budget` only ever lowers a
+//     ceiling on its own, so the ten rows that grew were raised through
+//     `budget --update --allow-regress`, each carrying the reason in the
+//     file's fourth column where every run reprints it. Nine are the three
+//     shipped cells x (third_party_packages, third_party_loc, build_scripts),
+//     at +7 / +48,869 / +1 — not the +10 / +59,991 / +1 the prefix rule
+//     produced, because a ceiling raised to cover first-party code stays loose
+//     forever and this is the number this repository is least willing to let
+//     drift. The tenth is `lock third_party_packages`, 499 -> 520, and none of
+//     that 21 is first-party either: measured against
+//     `git show 38f61d5be^:Cargo.lock`, the fabric added 26 lock entries, of
+//     which 5 are source-less path packages that already counted as aterm's
+//     own (the four astream crates and aterm-link) and 21 are the SEALED
+//     TRANSPORT in full — chacha20poly1305 and the x25519/ed25519/curve25519
+//     stack — which a lockfile records because it records every OPTIONAL
+//     resolution and which no default build compiles. The `sha2` chain is
+//     notably NOT among them: it was already in the lock, which is exactly how
+//     it could enter a cell without moving that row.
+//
+//     THESE TWELVE WERE RED FOR TWO DAYS, for the reason note (9) records one
+//     round earlier: the gate's test stage stopped at the first failing binary
+//     and never reached aterm-forge. That hole is closed (`--no-fail-fast`,
+//     merged 2026-09-10), which is the only reason this round happened before
+//     a cut instead of after one.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 110,
-    workspace: 70,
-    third_party: 40,
-    third_party_loc: 391_458,
-    build_scripts: 9,
+    resolved: 121,
+    workspace: 74,
+    third_party: 47,
+    third_party_loc: 440_327,
+    build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
 };
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 260,
-    workspace: 72,
-    third_party: 188,
-    third_party_loc: 2_739_667,
-    build_scripts: 31,
+    resolved: 271,
+    workspace: 76,
+    third_party: 195,
+    third_party_loc: 2_788_536,
+    build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
 };
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 161,
-    workspace: 70,
-    third_party: 91,
-    third_party_loc: 3_586_896,
-    build_scripts: 19,
+    resolved: 172,
+    workspace: 74,
+    third_party: 98,
+    third_party_loc: 3_635_765,
+    build_scripts: 20,
     proc_macros: 7,
     duplicate_names: 1,
 };
@@ -748,6 +836,18 @@ pub struct Dom {
 /// +288 for the port that took them out. `rustybuzz` and `serde` move up into
 /// the anchor list; neither moved by a line. +22 more on 2026-09-07 (note (8)):
 /// comment lines only, for the macOS 14 launch fix.
+///
+/// RE-PINNED AT THE FABRIC MOVE (2026-09-10, note (10)): ONE row entered,
+/// `sha2` (7 / 48,869), and `serde` (3 / 38,412) is what it displaced.
+/// `rustybuzz` is still here at exactly the cost it was pinned at, one rank
+/// lower. This is the first round in which the head grew rather than being
+/// collected — the campaign re-bought a chain it had once paid to retire, which
+/// is what `crates/aterm-digest` exists to keep out.
+///
+/// `astream-cap` (8 / 49,759) is NOT a row, and the reason is the provenance
+/// ruling rather than the graph. It matters for reading this list at all:
+/// sha2's dominator is NESTED inside the mint's, so these totals must never
+/// be summed blindly.
 pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
     Dom {
         name: "winit",
@@ -772,17 +872,30 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
         pkgs: 1,
         loc: 64_931,
     },
+    // RE-PINNED 2026-09-10 by the fabric-in-the-workspace round, note (10).
+    // ONE row entered, not two, and which one it is was decided by the
+    // provenance ruling rather than by the graph: `astream-cap` is aterm's own
+    // code, `dominator::ranked` ranks third-party packages only, so the
+    // capability mint itself is not a row here and what it DRAGS IN is.
+    // dom(sha2) is the whole chain — sha2, digest, block-buffer,
+    // crypto-common, generic-array, typenum, cpufeatures — because astream-cap
+    // is sha2's only parent on this cell, which is also what makes the fix a
+    // single edge rather than a port.
+    Dom {
+        name: "sha2",
+        version: None,
+        pkgs: 7,
+        loc: 48_869,
+    },
+    // `serde` (3 / 38,412) is what `sha2` displaced. `rustybuzz` did not move
+    // by a line and is still here, one rank lower.
+    // `serde` (3 / 38,412) is what `sha2` displaced. `rustybuzz` did not move
+    // by a line and is still here, one rank lower.
     Dom {
         name: "rustybuzz",
         version: None,
         pkgs: 7,
         loc: 47_712,
-    },
-    Dom {
-        name: "serde",
-        version: None,
-        pkgs: 3,
-        loc: 38_412,
     },
 ];
 
@@ -811,6 +924,22 @@ pub const LINUX_DOMINATORS: [Dom; 1] = [Dom {
 }];
 
 /// `ureq` on mac-arm, and the figure the design note recorded for it.
+///
+/// RETIRED IN FACT, 2026-09-10, and left standing as the record rather than
+/// deleted. `ureq` IS IN NO CELL'S GRAPH and is not even a Cargo.lock entry
+/// any more: `crates/aterm-http` replaced it and the stack behind it
+/// (ureq-proto, http, bytes, httparse, utf8-zero, percent-encoding,
+/// webpki-roots), and `blame ureq --cell mac-arm` answers NOT RESOLVED, naming
+/// the package as being in no surveyed cell's shipped graph. The three
+/// constants below therefore describe a graph this checkout does not have.
+///
+/// THEY WENT STALE IN SILENCE, WHICH IS THE PART WORTH RECORDING: nothing in
+/// this repository reads [`MAC_ARM_UREQ`], [`UREQ_RE_PARENTED`] or
+/// [`UREQ_DESIGN_NOTE`] — `grep -rn` over `crates/` finds no use outside this
+/// file — so the retirement moved no test, and the equality pin that is this
+/// module's whole purpose never applied to them. A pinned number with no
+/// reader is documentation, and documentation rots; the dominator anchors
+/// above are pinned by `dominator::tests` and did not.
 ///
 /// The design note says 8 packages / 71,834 LOC; this checkout measures FOUR
 /// packages and 17,246 lines more, and every one of them is accounted for:

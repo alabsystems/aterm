@@ -336,6 +336,35 @@ fn labels_with(ladder: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
+/// THE PIN for the 80-minute gate killed on an untested hypothesis (2026-09-10).
+///
+/// The run was aborted because two readers believed `verify.sh` resolved its
+/// compiler through a mutable rustup symlink and that a peer's mid-run re-seal
+/// had split the gate across two toolchains. It had not — the shim resolves a
+/// PHYSICAL path once and prepends it for the whole run — but the ladder said
+/// nothing about which toolchain it used, so neither reader could check without
+/// reading the code, and neither did. The FIRST line of every ladder now names
+/// it, so the question is answered by the record a gate already produces.
+#[test]
+fn the_ladder_opens_by_naming_the_toolchain_every_stage_below_will_run() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let (ladder, _) = repo.run(Mode::Fast, Scope::workspace(), true);
+    let first = ladder.lines().next().unwrap_or("<empty ladder>");
+    assert!(
+        first.starts_with("verify: toolchain "),
+        "the ladder must open by naming its compiler, not by a stage: {first}"
+    );
+    assert!(
+        first.contains(&repo.stage2.display().to_string()),
+        "and it must be the directory this run actually resolved: {first}"
+    );
+    assert!(
+        first.contains("absolute and resolved once"),
+        "a bare path is not the claim — the line exists to say the pin held: {first}"
+    );
+}
+
 #[test]
 fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let repo = FakeRepo::new();

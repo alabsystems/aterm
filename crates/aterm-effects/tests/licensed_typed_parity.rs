@@ -754,7 +754,21 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
         // captured with `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came
         // back byte-identical. Nothing visual moved at all — this commit
         // touches no paint.
-        10_546_526_808_721_960_741,
+        // RE-CAPTURED 2026-09-10 — THE STARBURST. The landing's shockwave
+        // ring and its two rainbow bands are replaced by
+        // `meteor::draw_burst`, an isotropic set of tapered lances at true
+        // SCREEN angles plus jets along the flight line (the owner: *"I want
+        // more a starburst versus the bands effect"*). This script's jump
+        // lands one, so entry 2 alone moves: captured with
+        // `ATERM_CAPTURE_TYPED_PARITY=1`, the other EIGHT came back
+        // byte-identical — the burst is v2-only and no other style's landing
+        // can reach it, which is this re-capture's control.
+        // RE-CAPTURED 2026-09-10 — the starburst's lance grew a third,
+        // shorter, thinner section so it closes toward a POINT instead of a
+        // blunt end (design section 7's falsifier 3, judged on captured
+        // frames at 5x). Entry 2 alone moves again; the other EIGHT came back
+        // byte-identical.
+        88_705_757_032_532_170,
         12_359_376_227_302_100_357,
         17_288_162_128_308_037_669,
         13_741_658_660_564_044_123,

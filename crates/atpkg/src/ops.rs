@@ -157,7 +157,14 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
         //
         // `list`, `which` and `doctor` must not disagree about whether the product
         // is installed, and the honest answer is the one that stats the target.
-        if !target.exists() {
+        //
+        // ONLY A STAT THAT PROVED ABSENCE DROPS THE PROGRAM. This was `!exists()`,
+        // which is `fs::metadata(..).is_ok()` and so spends EACCES, macOS's EPERM and
+        // EIO on the same `false` it gives a path that is genuinely gone — so a store
+        // an admin laid down and this user may execute but not stat read as deleted,
+        // and `list`, `which` and Settings ▸ Packages all reported a working toolchain
+        // missing. `presence` keeps the third answer apart ([`crate::store::Presence`]).
+        if crate::store::presence(&target).is_absent() {
             continue;
         }
         if let Some((program, build)) = program_build_of_target(&target) {
@@ -494,6 +501,53 @@ mod tests {
             "a shim whose target no longer exists must not be reported live"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE MIRROR OF THE TEST ABOVE, AND THE DEFECT THAT MIRROR HID.
+    ///
+    /// `Path::exists()` is `fs::metadata(..).is_ok()`: it answers `false` for a target
+    /// that is THERE but cannot be stat'd — EACCES on a parent directory, EPERM from
+    /// macOS privacy consent, EIO, ELOOP. `active_builds` asked it and reported the
+    /// program as not live, so `atpkg list`, `which` and Settings ▸ Packages all said
+    /// the toolchain was gone on a machine whose store was intact and whose shims
+    /// worked. The remedy that reads off that answer — reinstall — repairs nothing.
+    ///
+    /// The store tree and the shim are both untouched here; only the permission to
+    /// LOOK is removed. Nothing about the world changed, so the answer must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_shim_whose_target_cannot_be_stat_ed_is_still_live() {
+        let l = layout("unstattable");
+        install(&l, "ay", 17);
+        assert_eq!(
+            active_builds(&l).get("ay").copied(),
+            Some(17),
+            "precondition: a real install is live"
+        );
+        let target = crate::platform::resolve_shim(&l.bin_dir().join("ay")).unwrap();
+        let holder = target.parent().unwrap().to_path_buf();
+        let saved = std::fs::metadata(&holder).unwrap().permissions();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stat = std::fs::metadata(&target);
+        if stat.is_ok() {
+            // root (or a filesystem that ignores mode) — the probe could not be armed.
+            std::fs::set_permissions(&holder, saved).unwrap();
+            let _ = std::fs::remove_dir_all(&l.prefix);
+            return;
+        }
+        assert_eq!(
+            stat.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the fixture must fail the stat for the reason under test"
+        );
+        let live = active_builds(&l).get("ay").copied();
+        std::fs::set_permissions(&holder, saved).unwrap();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        assert_eq!(
+            live,
+            Some(17),
+            "a target we merely could not LOOK at is not a target that is gone"
+        );
     }
 
     #[test]

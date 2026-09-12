@@ -1674,12 +1674,28 @@ mod macos {
                     "-[NSApplication sendEvent:] no longer lands in AppKit (it is in {image})"
                 ),
             );
-            let exe = std::env::current_exe()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // SAME FILE, NOT SAME SPELLING. `image` is what dladdr resolved —
+            // a real path, symlinks already followed. `current_exe` is the path
+            // this process was LAUNCHED through. Those differ whenever anything
+            // between them is a link, and one is: the Spotlight-noindex
+            // migration leaves `target` a symlink to `target.noindex`, so the
+            // two names for the one executable are
+            // `…/target/debug/examples/objc_window_drive` and
+            // `…/target.noindex/debug/examples/objc_window_drive`. A string
+            // compare called that a swizzle landing in the wrong binary.
+            // Canonicalise both and the question becomes the one being asked.
+            let exe = std::env::current_exe().unwrap_or_default();
+            let real = |p: &std::path::Path| {
+                std::fs::canonicalize(p)
+                    .unwrap_or_else(|_| p.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let exe_real = real(&exe);
+            let image_real = real(std::path::Path::new(&image));
             self.report.check(
-                !exe.is_empty() && image == exe,
-                &format!("…it lands in this executable ({image} vs {exe})"),
+                !exe_real.is_empty() && image_real == exe_real,
+                &format!("…it lands in this executable ({image_real} vs {exe_real})"),
             );
 
             // THE PURPOSE, end to end. Needs the window to be key; if the

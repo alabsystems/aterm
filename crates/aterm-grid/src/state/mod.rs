@@ -10,5 +10,5 @@ mod presentation;
 pub use cursor::GridCursorState;
 pub use presentation::{
     AbsoluteRowUpdate, BandSet, GridPresentationState, MAX_SELECTION_DAMAGE_BANDS, OutputOrigin,
-    SelectionDamage,
+    ROW_BAND_MOVES_PER_BATCH, RowBandMove, RowBandMoves, SelectionDamage,
 };

@@ -17,6 +17,222 @@ const REACTION_TTL: f32 = 2.0;
 const CLEARANCE: f32 = 0.10;
 const CONTACT_MARGIN: f32 = 0.45;
 const PERCH_REACH: f32 = 24.0;
+/// The caret is home. Located output may direct the gaze, but must not park
+/// the resident across the pane. Rows cost twice a column in this bound.
+const HOME_REACH: f32 = 6.0;
+// Leave two cells for a newly typed character and the follower's acceleration.
+// A station exactly touching the cursor's protected halo would blink out on
+// the next key before a physical body could move away.
+const HOME_BREATHING_ROOM: f32 = 2.0;
+
+/// How long a SPENT interest — a content perch with no live event left to
+/// react to — may hold the resident before the pet is handed back its own
+/// life. The perch is a visit, not a tenancy: without this the console layer
+/// answers `console_frames() == Some(false)` and `console_deadline() == None`
+/// forever, which is a pet with no future at all — it can never breathe,
+/// blink, settle, sleep, or notice that the caret has walked away.
+const PERCH_DWELL: f32 = 3.0;
+
+/// THE VISIBILITY HOLD's dwell, in BOTH directions.
+///
+/// v0.81.0 made the pet's presence a per-frame boolean function of screen
+/// content. Measured on glass over one 1.67 s typing burst, the cat's alpha
+/// ran 1.00, 0.00, 0.17, 0.29, 0.57, 0.43, 0.37, 0.29, 0.67, 0.45, 0.67,
+/// 0.51, 0.00 — six direction reversals in 950 ms, a half-period of ~158 ms.
+/// A hold shorter than that half-period does not remove the strobe, it only
+/// slows it; this is 1.6x longer. It is also the budget the pet has to WALK
+/// out of the way before it has to fade instead, which is why it is not
+/// longer still.
+const VETO_DWELL: f32 = 0.25;
+/// A HARD CUT is what the owner saw. When an obstruction is real and
+/// sustained the pet yields over a RAMP instead — a fifth of a second, which
+/// reads as the cat stepping aside and is short enough that it is not
+/// painting over the user's text for half a second first. The ramp back IN
+/// is normally the pet's own 0.30 s arrival fade, because a body hidden long
+/// enough to be reseated returns at a NEW station (see
+/// `reseat_unshown_console_body`), and a station change retires the verdict
+/// this envelope was holding.
+const VETO_FADE: f32 = 0.20;
+/// Blindness is not a licence to stay forever. "I cannot see there" keeps the
+/// previous verdict — that is the entire point of the three-valued answer —
+/// but an unbroken run of unknowns this long (a surface that never regains
+/// coherence) finally counts as obstruction, so a retired world can never
+/// strand an opaque pet on glass.
+///
+/// This counts only unknowns about a body THAT IS BEING EMITTED. A frame with
+/// no body at all goes to [`VisibilityHold::idle`] and never reaches here.
+const VETO_BLIND: f32 = 0.50;
+
+/// The pet's presence as a HELD STATE rather than a per-frame boolean.
+///
+/// Fed the three-valued clearance verdict for the emitted sprite rectangle,
+/// it answers with a 0..=1 cover factor. Two properties do the work:
+///
+///  * an `Unknown` verdict neither flips the state nor resets a run in
+///    progress — it is not evidence, so it cannot blank the pet;
+///  * contrary evidence must persist for [`VETO_DWELL`] before the held
+///    verdict changes, and the cover then RAMPS over [`VETO_FADE`].
+///
+/// A single obstructed frame therefore cannot blank the pet, and a single
+/// clear frame cannot snap it back on.
+#[derive(Clone, Copy, Debug)]
+struct VisibilityHold {
+    /// The held verdict: may the pet be on glass at all?
+    shown: bool,
+    /// Start of the current unbroken run of evidence contrary to `shown`.
+    contrary_since: Option<Instant>,
+    /// Start of the current unbroken run of "I cannot see there".
+    blind_since: Option<Instant>,
+    /// 0..=1, multiplied into the emitted alpha. Ramps toward `shown`.
+    cover: f32,
+    /// The instant the ramp last advanced; `None` before the first frame.
+    at: Option<Instant>,
+    /// Was the hidden state entered BY FIAT — a selection, or a placement
+    /// search that came back empty — rather than by perception?
+    ///
+    /// Those two paths yield AT ONCE by design, and the dwell exists to
+    /// discount perception WOBBLE, which neither of them is. So neither may
+    /// they be charged the dwell on the way back: a selection that ends is
+    /// the user's act ending, and a placement search that succeeds has
+    /// SEARCHED, not guessed. Without this the pet stayed dark for 0.25 s
+    /// after a selection was cleared, which the cursor-home suite catches
+    /// (`full_selection_still_protects_the_console_and_explains_the_hidden_body`).
+    by_fiat: bool,
+}
+
+impl Default for VisibilityHold {
+    fn default() -> Self {
+        // Shown and opaque: the pet's OWN arrival fade owns the ramp-in, and
+        // a hold that started hidden would fight it.
+        Self {
+            shown: true,
+            contrary_since: None,
+            blind_since: None,
+            cover: 1.0,
+            at: None,
+            by_fiat: false,
+        }
+    }
+}
+
+impl VisibilityHold {
+    /// Advance one emitted frame. `verdict` is [`PetWorld::clearance`] over
+    /// the sprite rectangle: `Some(true)` clear, `Some(false)` obstructed,
+    /// `None` unobservable.
+    fn update(&mut self, now: Instant, verdict: Option<bool>) -> f32 {
+        let dt = self.advance(now);
+        // A YIELD BY FIAT IS NOT PAID FOR TWICE. `hide_now`'s two callers cut
+        // at once on purpose; the first verdict that says the ground is free
+        // again therefore restores at once too, rather than spending a dwell
+        // meant for perception wobble on the end of a user's selection.
+        if self.by_fiat {
+            if verdict != Some(true) {
+                return self.cover;
+            }
+            self.by_fiat = false;
+            self.shown = true;
+            self.cover = 1.0;
+            self.contrary_since = None;
+            self.blind_since = None;
+            return self.cover;
+        }
+        let observed = match verdict {
+            Some(clear) => {
+                self.blind_since = None;
+                Some(clear)
+            }
+            None => {
+                let since = *self.blind_since.get_or_insert(now);
+                (now.saturating_duration_since(since).as_secs_f32() >= VETO_BLIND).then_some(false)
+            }
+        };
+        match observed {
+            Some(observed) if observed == self.shown => self.contrary_since = None,
+            Some(_) => {
+                let since = *self.contrary_since.get_or_insert(now);
+                if now.saturating_duration_since(since).as_secs_f32() >= VETO_DWELL {
+                    self.shown = !self.shown;
+                    self.contrary_since = None;
+                }
+            }
+            // An unknown is not evidence either way: it neither advances a
+            // run nor cancels one already under way.
+            None => {}
+        }
+        self.ramp(dt)
+    }
+
+    /// NOTHING WAS DRAWN AT ALL, which is not the same `None` as "I cannot
+    /// see there" and must not be spent as one.
+    ///
+    /// The emitter produces no body of its own accord all the time: an
+    /// arrival fade that has not started, a resident that has finished its
+    /// own 0.30 s retirement, a capture with no caret. There is no rectangle
+    /// for the map to be blind ABOUT, so this advances the ramp and touches
+    /// no run — in particular it may not feed [`VETO_BLIND`], which exists
+    /// for the opposite case (a body IS being emitted and the map cannot
+    /// certify the ground under it). Conflating the two latched `shown =
+    /// false` on a pet that had merely faded out, and then charged it a
+    /// [`VETO_DWELL`] it never owed when it came back.
+    fn idle(&mut self, now: Instant) -> f32 {
+        let dt = self.advance(now);
+        self.ramp(dt)
+    }
+
+    /// Seconds since the last advance, clamped, with the clock moved on.
+    fn advance(&mut self, now: Instant) -> f32 {
+        let dt = self
+            .at
+            .map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f32())
+            .clamp(0.0, 2.0);
+        self.at = Some(now);
+        dt
+    }
+
+    /// Move the cover one step toward the held verdict.
+    fn ramp(&mut self, dt: f32) -> f32 {
+        let target = if self.shown { 1.0 } else { 0.0 };
+        let step = dt / VETO_FADE;
+        self.cover = if self.cover < target {
+            (self.cover + step).min(target)
+        } else {
+            (self.cover - step).max(target)
+        };
+        self.cover
+    }
+
+    /// Put the envelope where the glass already is: hidden and settled, with
+    /// no run in flight. For the paths that yield AT ONCE by design.
+    fn hide_now(&mut self, now: Instant) {
+        self.shown = false;
+        self.cover = 0.0;
+        self.contrary_since = None;
+        self.blind_since = None;
+        self.at = Some(now);
+        self.by_fiat = true;
+    }
+
+    /// Nothing further will change without new evidence: no ramp in flight,
+    /// no dwell counting down, and no blind run that could still time out.
+    fn settled(&self) -> bool {
+        let target = if self.shown { 1.0 } else { 0.0 };
+        self.cover == target
+            && self.contrary_since.is_none()
+            && !(self.blind_since.is_some() && self.shown)
+    }
+}
+
+/// Fold the hold's cover into an emitted opacity byte. Floored at 1 while
+/// any cover remains, for the reason the arrival ramp is floored: hosts gate
+/// "is the pet on glass" on `alpha > 0`, and rounding a faint-but-present
+/// body to zero would drop the sprite, its hit box and its motes for a frame
+/// — the exact cut this envelope exists to remove.
+fn cover_alpha(alpha: u8, cover: f32) -> u8 {
+    if alpha == 0 || cover <= 0.0 {
+        return 0;
+    }
+    ((f32::from(alpha) * cover.min(1.0)).round() as u8).max(1)
+}
 
 /// An admitted user-input intent, never a claim that the PTY displayed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,9 +361,23 @@ pub(super) struct ConsoleLife {
     completion_seq: u64,
     failure_quiet_until: Option<Instant>,
     last_body: Option<PetRect>,
+    /// THE ONE EXPLICIT FACT the reseat needs: did the last emission actually
+    /// put pixels on glass? This used to be inferred from `last_body` being
+    /// `None`, which the visibility veto ALSO wrote — so a vetoed frame read
+    /// as "never drawn", teleported the pet and restarted its fade from zero.
+    on_glass: bool,
+    hold: VisibilityHold,
+    /// Last real visible caret on this coherent coordinate surface. This is
+    /// placement memory only; it never enters the keyboard/motion sensor.
+    cursor_home: Option<(u16, u16)>,
     contact_changed: bool,
     observed_seq: u64,
     progress_seq: u64,
+    /// When the SETTLED spent perch was taken. `Some` only while the content
+    /// perch owns the resident with nothing live to attend; the dwell it
+    /// starts is offered by [`PetBrain::console_deadline`] so the wake that
+    /// releases it actually happens.
+    perched_since: Option<Instant>,
 }
 
 impl PetBrain {
@@ -290,6 +520,11 @@ impl PetBrain {
     /// Ownership/custody is independent of whether a live caret exists.
     /// This permits a valid reading anchor without manufacturing a caret.
     pub fn set_console_presentable(&mut self, presentable: bool) {
+        if self.console.presentable != presentable {
+            // Custody changed hands. A frozen ramp and a stale verdict from
+            // the previous custodian are not evidence about this one.
+            self.console.hold = VisibilityHold::default();
+        }
         self.console.presentable = presentable;
     }
 
@@ -366,18 +601,36 @@ impl PetBrain {
         PetRect::new(y / ch, x / cw, h / ch, w / cw)
     }
 
+    /// An EXAMINED obstruction under the pet's natural body. `clear` would
+    /// answer the same `false` for "outside the coverage window", and this
+    /// predicate authorizes a teleport — so it takes the three-valued answer
+    /// and acts only on a certified `Some(false)`.
+    ///
+    /// THE CARET IS NOT AN OBSTRUCTION TO ITS OWN ESCORT, which is why this
+    /// reads past it. The strict reading counts the caret's 3x3 keep-off
+    /// ring as protected, and [`STATION_LEAD`] seats the escort one cell
+    /// past the caret — inside that ring by construction. With this
+    /// predicate in the eviction disjunct (`kitty_pet.rs`, beside the
+    /// v0.76 `ink_overlaps` test) the strict reading evicted a settled cat
+    /// for sitting exactly where the escort law puts it, and every escort
+    /// station restored above would have been given straight back. Glyphs
+    /// are still `ink_overlaps`'s to judge; selections, images and
+    /// uncertified geometry are still this one's.
     pub(super) fn console_obstructed(&self, sense: PetSense) -> bool {
         self.console.presentable
             && self.console.world.as_ref().is_some_and(|world| {
-                world.stamp().is_some() && !world.clear(self.console_body(sense), CLEARANCE)
+                world.under_text_clearance_past_caret(self.console_body(sense), CLEARANCE)
+                    == Some(false)
             })
     }
 
     pub(super) fn reseat_unshown_console_body(&mut self, sense: PetSense, width: f32) {
-        // The previous emission contained no body. A first appearance or a
-        // clearance-hidden resident may therefore start its finite fade at a
-        // current safe station; a still-visible body must use locomotion.
-        if self.console.last_body.is_some()
+        // NOTHING WAS ON GLASS last emission. A first appearance or a fully
+        // faded-out resident may therefore start its finite fade at a current
+        // safe station; a body the user can still SEE must use locomotion.
+        // This used to key on `last_body.is_some()`, which the visibility
+        // veto cleared on every vetoed frame — so a visible pet teleported.
+        if self.console.on_glass
             || self.console.resident
             || self.flight.is_some()
             || !self.console_obstructed(sense)
@@ -391,6 +644,15 @@ impl PetBrain {
                 self.row = row;
                 self.alpha = 0.0;
                 self.last_caret = None;
+                // A HELD VERDICT IS A FACT ABOUT A PLACE. This body just
+                // moved to a different one, chosen because it is safe, so
+                // the accumulated "obstructed" evidence belongs to the
+                // station it left. Retiring it here is also what keeps the
+                // recovery to ONE fade: without it the pet paid this
+                // envelope's dwell and ramp a second time on top of its own
+                // 0.30 s arrival, and stayed invisible for half a second
+                // after it had already stepped somewhere clear.
+                self.console.hold = VisibilityHold::default();
             }
         }
     }
@@ -399,6 +661,18 @@ impl PetBrain {
     /// located reading/output interest. No host classifies pet behavior.
     pub(super) fn begin_console_tick(&mut self, sense: PetSense, width: f32) {
         let contact_changed = core::mem::take(&mut self.console.contact_changed);
+        // Taken, not read: only the spent-perch arm below re-establishes it,
+        // so every other verdict — a key, a selection, output, a result, a
+        // surface change, an incoherent read — restarts the dwell by simply
+        // not claiming it.
+        let perched_since = self.console.perched_since.take();
+        // A body still gliding to its station has not settled yet, so the
+        // dwell measures SETTLED time and a long trip cannot eat it.
+        let settled_since = if self.console.moving {
+            sense.now
+        } else {
+            perched_since.unwrap_or(sense.now)
+        };
         self.console.pose = None;
         self.console.still = false;
         self.console.lift = 0.0;
@@ -407,6 +681,7 @@ impl PetBrain {
         self.console.reason = "quiet";
         let body = self.console_body(sense);
         let Some(stamp) = self.console.world.as_ref().and_then(|w| w.stamp()) else {
+            self.console.cursor_home = None;
             self.console.resident = false;
             self.console.trip = None;
             return;
@@ -414,6 +689,9 @@ impl PetBrain {
         let prior = self.console.tick_stamp.replace(stamp);
         let same_surface = prior.is_some_and(|p| p.surface == stamp.surface);
         let new_content = same_surface && prior.is_some_and(|p| p.content_seq != stamp.content_seq);
+        if !prior.is_some_and(|previous| stamp.preserves_cursor_home(previous)) {
+            self.console.cursor_home = None;
+        }
         if !same_surface {
             self.console.anchor = None;
             self.console.target = None;
@@ -426,6 +704,7 @@ impl PetBrain {
             self.console.contact_armed = true;
         }
         if !self.console.presentable {
+            self.console.cursor_home = None;
             self.console.resident = false;
             self.console.trip = None;
             self.console.anchor = None;
@@ -436,6 +715,9 @@ impl PetBrain {
             self.console.consumed = self.console.seq;
             self.console.last_body = None;
             return;
+        }
+        if let Some(caret) = sense.caret {
+            self.console.cursor_home = Some(caret);
         }
 
         let pending_input = self
@@ -482,6 +764,7 @@ impl PetBrain {
             self.vigil_cheer = None;
         }
         let world = self.console.world.as_ref().expect("observed above");
+        let home = self.console_caret_home(sense, width);
         let selection = world.selection_target();
         // Surface protection outranks everything. A new key still cancels the
         // old trip, but cannot license a performance over a held selection.
@@ -491,10 +774,12 @@ impl PetBrain {
             self.console.source_seq = self.console.observed_seq;
             self.console.gaze = Some(gaze);
             self.console.anchor = None;
-            self.console.target = if world.clear(body, CLEARANCE) {
+            self.console.target = if Self::near_console_home(body, home)
+                && Self::console_may_stand(world, body, CLEARANCE)
+            {
                 Some(body)
             } else {
-                world.perch_near(gaze, body, CLEARANCE, PERCH_REACH)
+                world.home_perch(home.unwrap_or(body), CLEARANCE, HOME_REACH)
             };
             self.console.resident = true;
             self.console.result_at = None;
@@ -546,7 +831,8 @@ impl PetBrain {
             } else {
                 PetGlyphId::PetStandEar
             });
-            if repairing && world.clear(body, CLEARANCE) && self.flight.is_none() {
+            if repairing && Self::console_may_stand(world, body, CLEARANCE) && self.flight.is_none()
+            {
                 self.console.target = Some(body);
                 self.console.resident = true;
                 self.console.still = true;
@@ -567,8 +853,12 @@ impl PetBrain {
             }
             // The clearance margin is real contact geometry. Never brace on
             // input alone or on a duplicate frame of the same displayed ink.
-            let safe = world.clear(body, CLEARANCE);
-            let roomy = world.clear(body, CONTACT_MARGIN);
+            // ADVANCING INK, and the caret's blank ring is not ink. Read
+            // strictly, a cat seated at the caret's shoulder is never
+            // `roomy`, so `contact_armed` can never re-arm and the whole
+            // brace fires once per surface and then never again.
+            let safe = world.clear_past_caret(body, CLEARANCE);
+            let roomy = world.clear_past_caret(body, CONTACT_MARGIN);
             if roomy
                 && self
                     .console
@@ -697,7 +987,7 @@ impl PetBrain {
             } else {
                 PetGlyphId::PetEdgeLean
             });
-            self.choose_console_perch(subject, body, stamp, prior);
+            self.choose_console_perch(subject, body, home, stamp, prior);
             self.console.resident = true;
             self.console.still = true;
         } else if let Some((_, failed)) = result {
@@ -712,7 +1002,7 @@ impl PetBrain {
             } else {
                 PetGlyphId::PetStretchHind
             });
-            self.console.target = world.clear(body, CLEARANCE).then_some(body);
+            self.console.target = Self::console_may_stand(world, body, CLEARANCE).then_some(body);
             self.console.resident = true;
             self.console.still = true;
         } else if let Some(anchor) = self.console.anchor.and_then(|a| {
@@ -729,13 +1019,39 @@ impl PetBrain {
         }) {
             // One existing content anchor may survive a completed command.
             // No timer grants another excursion around the same old screen.
-            self.console.attention = PetAttention::Exploring;
-            self.console.reason = "content-perch";
-            self.console.gaze = Some((anchor.row, anchor.col));
-            self.console.pose = Some(PetGlyphId::PetEdgePerch);
-            self.choose_console_perch(anchor, body, stamp, prior);
-            self.console.resident = true;
-            self.console.still = true;
+            //
+            // THE PERCH IS A VISIT, NOT A TENANCY. This interest has no live
+            // event behind it — the command is over, the anchor merely still
+            // resolves — so it is the one resident state nothing can ever
+            // end. Held forever it made the pet a decal: the resident branch
+            // pins pose, scale, lift and motes every frame, `console_frames`
+            // answers `Some(false)` and `console_deadline` answered `None`,
+            // so the brain owned NO FUTURE — no frame train and no wake
+            // instant — and could not breathe, blink, settle, sleep or
+            // notice the caret walking away. [`PERCH_DWELL`] bounds the
+            // visit; `console_deadline` offers its end, so the wake that
+            // releases it is real, and the pet goes back to its own life.
+            if sense
+                .now
+                .saturating_duration_since(settled_since)
+                .as_secs_f32()
+                < PERCH_DWELL
+            {
+                self.console.perched_since = Some(settled_since);
+                self.console.attention = PetAttention::Exploring;
+                self.console.reason = "content-perch";
+                self.console.gaze = Some((anchor.row, anchor.col));
+                self.console.pose = Some(PetGlyphId::PetEdgePerch);
+                self.choose_console_perch(anchor, body, home, stamp, prior);
+                self.console.resident = true;
+                self.console.still = true;
+            } else {
+                self.console.resident = false;
+                self.console.anchor = None;
+                self.console.target = None;
+                self.console.trip = None;
+                self.console.reason = "perch-spent";
+            }
         } else {
             self.console.resident = false;
             self.console.anchor = None;
@@ -751,6 +1067,7 @@ impl PetBrain {
         &mut self,
         subject: PetAnchor,
         mut body: PetRect,
+        home: Option<PetRect>,
         stamp: PetWorldStamp,
         prior: Option<PetWorldStamp>,
     ) {
@@ -788,19 +1105,25 @@ impl PetBrain {
                     return;
                 }
             }
-            if world.clear(target, CLEARANCE) && !leaving_view {
+            if Self::near_console_home(target, home)
+                && world.under_text_clear(target, CLEARANCE)
+                && !leaving_view
+            {
                 self.console.anchor = Some(anchor);
                 self.console.target = Some(target);
                 return;
             }
         }
-        // Aim just beyond the coalesced output edge, not at every new line.
-        let next = world.perch_near(
-            (subject.row, subject.col + 2.0),
-            body,
-            CLEARANCE,
-            PERCH_REACH,
-        );
+        // Output directs attention; the caret remains home. A certified
+        // resident is retained even on ordinary ink, avoiding a fresh search
+        // for every identical frame of a busy console.
+        let next = if Self::near_console_home(body, home)
+            && Self::console_may_stand(world, body, CLEARANCE)
+        {
+            Some(body)
+        } else {
+            world.home_perch(home.unwrap_or(body), CLEARANCE, HOME_REACH)
+        };
         self.console.anchor = Some(subject);
         self.console.target = next;
         self.console.trip = None;
@@ -832,6 +1155,35 @@ impl PetBrain {
         width: f32,
         dt: f32,
     ) -> Option<PetFrame> {
+        // Coding consoles hide the logical cursor while repainting. Preserve
+        // the resident's last real home without inventing a caret for the move
+        // sensor. Admission happens AFTER begin_console_tick has handled real
+        // selection, input, and OSC command facts: hidden pixels do not erase
+        // attention ownership or lose a completion.
+        if self.console.presentable
+            && sense.caret.is_none()
+            && self.console.cursor_home.is_some()
+            && self.alpha > 0.0
+        {
+            if let Some(held) = self.console.last_body {
+                self.col = held.col;
+                self.row = held.foot_row();
+            }
+            self.flight = None;
+            self.bound2 = None;
+            self.land_t = 0.0;
+            self.retired_flight_lift = None;
+            self.deferred_hidden_landing = None;
+            self.console.resident = true;
+            self.console.target = Some(self.console_body(sense));
+            self.console.trip = None;
+            if self.console.attention == PetAttention::Rest {
+                self.console.reason = "cursor-hidden-home";
+                self.console.pose = Some(PetGlyphId::PetLoaf);
+            }
+            self.console.still = true;
+            self.last_caret = None;
+        }
         if !self.console.resident || !self.console.presentable {
             self.console.resident_handoff = false;
             return None;
@@ -851,19 +1203,44 @@ impl PetBrain {
         self.pet_at = None;
         let body = self.console_body(sense);
         let world = self.console.world.as_ref()?;
-        let mut target = self.console.target;
-        if target.is_none_or(|r| !world.clear(r, CLEARANCE)) {
-            target = if world.clear(body, CLEARANCE) {
+        let home = self.console_caret_home(sense, width);
+        if !sense.reduced_motion && self.alpha > 0.0 && !Self::near_console_home(body, home) {
+            // A moved caret has first claim on a visible resident. Let the
+            // existing cursor follower carry it home, including its normal
+            // row-hop path. A blocked direct perch corridor must not keep an
+            // old output anchor parked on the other side of the console.
+            self.console.resident = false;
+            self.console.target = None;
+            self.console.trip = None;
+            return None;
+        }
+        let mut target = self
+            .console
+            .target
+            .filter(|r| Self::near_console_home(*r, home));
+        if target.is_none_or(|r| !world.under_text_clear(r, CLEARANCE)) {
+            target = if Self::near_console_home(body, home)
+                && Self::console_may_stand(world, body, CLEARANCE)
+            {
                 Some(body)
             } else {
-                world.nearest_perch(body, CLEARANCE, PERCH_REACH)
+                world.home_perch(
+                    home.unwrap_or(body),
+                    CLEARANCE,
+                    if home.is_some() {
+                        HOME_REACH
+                    } else {
+                        PERCH_REACH
+                    },
+                )
             };
         }
+        self.console.target = target;
         let Some(target) = target else {
             self.console.clipped = true;
             self.console.moving = false;
             self.console.attention = PetAttention::Yielding;
-            self.console.reason = "no-clear-footprint";
+            self.console.reason = "protected-surface";
             self.console.trip = None;
             self.speed = 0.0;
             self.last_caret = sense.caret;
@@ -918,21 +1295,20 @@ impl PetBrain {
             .max((self.row - destination.1).abs())
             > 0.02
         {
-            if !world.corridor_clear(body, target, CLEARANCE) {
+            if !world.under_text_corridor_clear_past_caret(body, target, CLEARANCE) {
                 // Watching from here is enough; a refused trip is never retried
                 // by an idle timer. New displayed facts may choose another.
                 self.console.trip = None;
-                if world.clear(body, CLEARANCE) {
+                if Self::console_may_stand(world, body, CLEARANCE) {
                     self.console.target = Some(body);
                 } else {
-                    // The old body was consumed by output or left the
-                    // viewport. Emit one hidden frame, then let the existing
-                    // finite fade place it at this certified destination.
-                    // Alpha zero supplies the next wake; a dense map with no
-                    // destination takes the quiet no-target branch instead.
+                    // The caret or selection just claimed the old cells.
+                    // Keep presence intact: the final footprint resolver
+                    // displaces the body to nearby protected-free ground.
+                    // Zeroing the envelope here used to insert a blink before
+                    // that resolver could act.
                     self.console.target = Some(target);
-                    self.alpha = 0.0;
-                    self.console.reason = "perch-reentry";
+                    self.console.reason = "protected-displacement";
                 }
             } else {
                 if self.console.trip.is_some_and(|trip| trip.to != destination) {
@@ -969,7 +1345,7 @@ impl PetBrain {
                     body.rows + (body.row - target.row).abs() + 0.25,
                     body.cols + (body.col - target.col).abs(),
                 );
-                self.console.lift = if trip.hop && world.clear(arc, CLEARANCE) {
+                self.console.lift = if trip.hop && Self::console_may_stand(world, arc, CLEARANCE) {
                     0.25 * (core::f32::consts::PI * u).sin()
                 } else {
                     0.0
@@ -1020,6 +1396,60 @@ impl PetBrain {
         Some(self.emit(sense, width))
     }
 
+    /// MAY THE PET BE WHERE IT NOW IS? Every console arm that asks this of
+    /// the pet's CURRENT body asks it through here, and the answer never
+    /// counts the caret's own keep-off ring.
+    ///
+    /// [`STATION_LEAD`] seats the escort one cell past the caret, inside
+    /// that 3x3 ring by construction — that is the shipped escort law and
+    /// what the pet looked like at v0.76.0. Read strictly, every one of
+    /// these arms answers "no" for the escort's own station and reaches for
+    /// a perch clear of the ring: the resident trips to a target two cells
+    /// out and owes frames forever, placement relocates a walking cat, the
+    /// repair inspection never engages. That is a bound on the reading
+    /// returned as a fact about the place.
+    ///
+    /// CHOOSING a new station is the opposite question and keeps the strict
+    /// reading (`home_perch`, `nearest_under_text_perch`, the rounding
+    /// re-check in [`Self::place_console_body_at_home`]), so the pet can
+    /// still never be PARKED on the cursor.
+    fn console_may_stand(world: &PetWorld, rect: PetRect, margin: f32) -> bool {
+        world.under_text_clearance_past_caret(rect, margin) == Some(true)
+    }
+
+    /// THE ESCORT'S OWN STATION, CORRECTED ONLY WHERE THE LADDER IS BLIND.
+    ///
+    /// This layer used to REPLACE the baseline station: it took the caret's
+    /// desired column, ran it through [`Self::console_home_rect`] — which
+    /// adds [`HOME_BREATHING_ROOM`] — and answered with a `home_perch`
+    /// search around THAT, discarding the ladder's answer. Every station the
+    /// escort chose was therefore two cells further from the caret than the
+    /// shipped escort law puts it, on every frame, for the pet's whole life.
+    /// That constant displacement is what "it no longer sits with me" was.
+    ///
+    /// The layer's real contribution is narrower, and it is kept: the ink
+    /// ladder knows about GLYPHS and nothing else, so it can seat the escort
+    /// on a selection, an image, or a row with no certified cell-to-pixel
+    /// projection — places the pet must not stand. So this answers `Some`
+    /// for exactly those, and `None` everywhere else, which hands the caret
+    /// its escort back.
+    ///
+    /// Three things are deliberately NOT a reason to move the escort:
+    ///
+    ///  * THE CARET'S OWN KEEP-OFF RING. The pet is the caret's escort and
+    ///    [`STATION_LEAD`] seats it one cell past the caret, inside that
+    ///    ring by construction. Treating the ring as an obstruction is how
+    ///    the standoff was paid twice over.
+    ///  * ORDINARY INK. A resident may stand behind text — that is a
+    ///    Z-ORDER fact (`frame.under_ink`), settled in 259649fe2, and the
+    ///    ladder already owns the glyph rules the escort actually follows.
+    ///  * AN UNKNOWN. `None` from the three-valued reading is a bound on
+    ///    this map, never a claim about the terminal.
+    ///
+    /// And the correction searches with [`PetWorld::nearest_under_text_perch`],
+    /// not `home_perch`: the escort must take the CLOSEST place it may
+    /// stand, never travel to distant blank sky to avoid ink it is allowed
+    /// to stand behind.
     pub(super) fn console_station(
         &self,
         desired: (f32, f32),
@@ -1031,15 +1461,185 @@ impl PetBrain {
         }
         let world = self.console.world.as_ref()?;
         world.stamp()?;
-        let body = PetRect::new(
-            (desired.1 + 1.0 - ART_ROWS).max(CLEARANCE),
+        let body = Self::console_stand_rect(desired, sense_dims.0, width);
+        if world.under_text_clearance_past_caret(body, CLEARANCE) != Some(false) {
+            return None;
+        }
+        // NO PERCH IN REACH IS NOT AN OPINION. This used to answer
+        // `(self.col, self.row)` — "stay exactly where you are" — which is a
+        // BOUND ON WHAT THIS LAYER KNOWS returned as a fact about where the
+        // pet belongs, and it retired the caret escort outright: every
+        // baseline station (`station_safe`'s ink ladder, the reduced-motion
+        // pin) was replaced by the pet's own current position, so the pet
+        // stopped following the caret at all. `None` is the honest answer,
+        // and both callers already have the baseline to fall back to.
+        let next = world.nearest_under_text_perch(body, CLEARANCE, HOME_REACH)?;
+        Some((next.col, next.foot_row()))
+    }
+
+    /// The body rect the escort's own station puts the pet in — the station
+    /// exactly as the ladder chose it, with no breathing room added.
+    /// [`Self::console_home_rect`] is the RESIDENT's home and keeps its
+    /// buffer; this is the escort's stand and must not.
+    fn console_stand_rect(desired: (f32, f32), rows: u16, width: f32) -> PetRect {
+        PetRect::new(
+            (desired.1 + 1.0 - ART_ROWS).clamp(
+                CLEARANCE,
+                (f32::from(rows) - ART_ROWS - CLEARANCE).max(CLEARANCE),
+            ),
             desired.0,
             ART_ROWS,
             width,
-        );
-        let next = world.nearest_perch(body, CLEARANCE, PERCH_REACH);
-        let _ = sense_dims;
-        Some(next.map_or((self.col, self.row), |r| (r.col, r.foot_row())))
+        )
+    }
+
+    fn console_caret_home(&self, sense: PetSense, width: f32) -> Option<PetRect> {
+        sense.caret.or(self.console.cursor_home).map(|(r, c)| {
+            // Side choice includes the same breathing room as placement.
+            // Otherwise a nominal right station fits but its buffer hangs
+            // off-screen, beyond reach of the valid left-side body.
+            let left = f32::from(c) + STATION_LEAD + HOME_BREATHING_ROOM + width + CLEARANCE
+                > f32::from(sense.cols);
+            let col = if left {
+                (f32::from(c) - width - STATION_LEAD).max(0.0)
+            } else {
+                f32::from(c) + STATION_LEAD
+            };
+            Self::console_home_rect((col, f32::from(r)), sense.rows, width, left)
+        })
+    }
+
+    fn near_console_home(rect: PetRect, home: Option<PetRect>) -> bool {
+        home.is_none_or(|home| {
+            (rect.col - home.col)
+                .abs()
+                .max((rect.row - home.row).abs() * 2.0)
+                <= HOME_REACH
+        })
+    }
+
+    fn console_home_rect(desired: (f32, f32), rows: u16, width: f32, left: bool) -> PetRect {
+        PetRect::new(
+            (desired.1 + 1.0 - ART_ROWS).clamp(
+                CLEARANCE,
+                (f32::from(rows) - ART_ROWS - CLEARANCE).max(CLEARANCE),
+            ),
+            if left {
+                (desired.0 - HOME_BREATHING_ROOM).max(CLEARANCE)
+            } else {
+                desired.0 + HOME_BREATHING_ROOM
+            },
+            ART_ROWS,
+            width,
+        )
+    }
+
+    /// Cursor home and protected cells constrain every emitted body, including
+    /// a pose hold or flight. Resolve a moved caret with one bounded local
+    /// placement, preserving the full body and alpha. Translate the existing
+    /// motion coordinates together so the next tick cannot restore an old
+    /// output perch. Ordinary ink permits residency; protected surfaces yield.
+    fn place_console_body_at_home(&mut self, frame: &mut PetFrame, sense: PetSense) {
+        if self.console.clipped || frame.alpha == 0 {
+            return;
+        }
+        let rect_of = |frame: PetFrame| {
+            frame
+                .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+                .map(|(x0, x1, y0, y1)| {
+                    PetRect::new(
+                        y0 as f32 / f32::from(sense.cell_h.max(1)),
+                        x0 as f32 / f32::from(sense.cell_w.max(1)),
+                        (y1 - y0) as f32 / f32::from(sense.cell_h.max(1)),
+                        (x1 - x0) as f32 / f32::from(sense.cell_w.max(1)),
+                    )
+                })
+        };
+        let Some(world) = self.console.world.as_ref() else {
+            return;
+        };
+        let Some(rect) = rect_of(*frame) else { return };
+        let home = self
+            .console_caret_home(sense, rect.cols)
+            .map(|home| PetRect {
+                row: (home.foot_row() + 1.0 - rect.rows).clamp(
+                    CLEARANCE,
+                    (f32::from(sense.rows) - rect.rows - CLEARANCE).max(CLEARANCE),
+                ),
+                rows: rect.rows,
+                ..home
+            });
+        // A BODY ALREADY WHERE IT MAY BE STAYS THERE, and the caret's own
+        // keep-off ring is not a reason to move it. [`STATION_LEAD`] seats
+        // the escort one cell past the caret — inside that 3x3 ring by
+        // construction — so the strict reading refused the escort's own
+        // station on every frame and relocated a WALKING cat to a perch
+        // clear of the ring, two cells further out. That relocation, not
+        // the search below it, is half of the standoff the owner reported.
+        // Everything the strict reading actually protects — a selection, an
+        // image, a row with no certified projection — still relocates here,
+        // and the DESTINATION search below stays strict, so the pet can
+        // still never be PARKED on the cursor.
+        if Self::near_console_home(rect, home) && Self::console_may_stand(world, rect, 0.0) {
+            return;
+        }
+        let Some(safe) =
+            world.nearest_under_text_perch(home.unwrap_or(rect), CLEARANCE, HOME_REACH)
+        else {
+            self.console.clipped = true;
+            self.console.reason = "protected-home-unavailable";
+            return;
+        };
+        // Invert body_px's pixel projection instead of adding a delta to a
+        // possibly viewport-clamped source. After a line wrap the raw flight
+        // can be beyond the right edge: shifting its CLAMPED box left by dx
+        // would leave the raw body several cells short of the certified spot.
+        let cw = f32::from(sense.cell_w.max(1));
+        let ch = f32::from(sense.cell_h.max(1));
+        let natural_h = (ART_ROWS * ch).round();
+        let natural_w = ((natural_h * ART_ASPECT).round() as i32).clamp(1, i32::from(u16::MAX));
+        let dest_w = (rect.cols * cw).round() as i32;
+        let dest_h = (rect.rows * ch).round();
+        let shifted = PetFrame {
+            col: ((safe.col * cw).round() - (natural_w / 2) as f32 + (dest_w / 2) as f32) / cw,
+            row: ((safe.row * ch).round() + dest_h + (frame.lift * ch).round()) / ch - 1.0,
+            ..*frame
+        };
+        if rect_of(shifted).is_none_or(|r| !world.under_text_clear(r, 0.0)) {
+            self.console.clipped = true;
+            self.console.reason = "protected-home-rounding";
+            return;
+        }
+        let (dx, dy) = (shifted.col - frame.col, shifted.row - frame.row);
+        *frame = shifted;
+        self.console.reason = "cursor-home";
+        self.col += dx;
+        self.row += dy;
+        self.col_at_tick += dx;
+        if let Some(flight) = self.flight.as_mut() {
+            flight.from_col += dx;
+            flight.to_col += dx;
+            flight.from_row += dy;
+            flight.to_row += dy;
+        }
+        if let Some((col, row, _)) = self.bound2.as_mut() {
+            *col += dx;
+            *row += dy;
+        }
+        if let Some((col, row)) = self.deferred_hidden_landing.as_mut() {
+            *col += dx;
+            *row += dy;
+        }
+        if let Some(target) = self.console.target.as_mut() {
+            target.col += dx;
+            target.row += dy;
+        }
+        if let Some(trip) = self.console.trip.as_mut() {
+            trip.from.0 += dx;
+            trip.to.0 += dx;
+            trip.from.1 += dy;
+            trip.to.1 += dy;
+        }
     }
 
     pub(super) fn finish_console_frame(&mut self, frame: &mut PetFrame, sense: PetSense) {
@@ -1049,11 +1649,27 @@ impl PetBrain {
         if let Some(pose) = self.console.pose {
             // The contact is a pose over the existing displacement. Flights
             // keep their own silhouette unless this is the console's trip.
+            //
+            // A SETTLED CAT'S OWN ANIMATION IS ITS OWN. `|| self.action
+            // .settled()` used to stand here, and `settled()` is
+            // Sleep|Sit|Loaf|Purr|Groom|Perk|Stand — so one keystroke, which
+            // sets `console.pose = Some(PetStandEar)` and leaves `resident`
+            // FALSE, pinned a sitting, loafing, grooming or sleeping cat
+            // into a single stand-ear silhouette with `scale = 1` and
+            // `purr = 0` for the whole of INPUT_HOLD, while its own action
+            // still said Loaf. Measured on a Sit: one pose for 36 frames,
+            // against a tail-flicking cat with the layer off. That is the
+            // pet losing its own life the moment you type, and it is exactly
+            // the state where this layer has the LEAST to say — the cat is
+            // doing nothing that needs correcting.
+            //
+            // Contact stays: advancing ink running into the body is a real
+            // located event with a 0.40 s hold, not a standing claim on the
+            // silhouette, and it is one of the features this restoration
+            // keeps.
             if !self.console_legacy_motion_pending()
                 && self.action != PetAction::Land
-                && (self.console.resident
-                    || self.console.attention == PetAttention::Contact
-                    || self.action.settled())
+                && (self.console.resident || self.console.attention == PetAttention::Contact)
             {
                 frame.pose = self.species.skin(pose);
                 self.last_pose = pose;
@@ -1069,10 +1685,23 @@ impl PetBrain {
             frame.motes = [None; PET_MOTES_MAX];
             frame.departures = [None; PET_DEPARTURES_MAX];
         }
+        self.place_console_body_at_home(frame, sense);
         let Some(world) = self.console.world.as_ref() else {
             return;
         };
         if world.stamp().is_none() {
+            // NO CERTIFIED MAP AT ALL — not "I cannot see this rectangle" but
+            // "I cannot see anything". The pet is drawn only over pixels this
+            // observation certified, so an incoherent surface draws nothing.
+            // That is the shipped rule and it stays: reflow, a mid-scroll
+            // fractional offset and a stale snapshot all land here, and none
+            // of them can vouch for the position the pet is standing in.
+            //
+            // It deliberately does NOT reach the visibility hold below. A
+            // surface that went momentarily incoherent is not evidence of
+            // INK, and must not spend the dwell that keeps a real
+            // obstruction honest — nor may it clear `on_glass`, which would
+            // hand the next tick's reseat a teleport it has not earned.
             frame.alpha = 0;
             frame.lane_alpha = 0;
             frame.motes = [None; PET_MOTES_MAX];
@@ -1082,27 +1711,122 @@ impl PetBrain {
             self.console.reason = "incoherent-surface";
             return;
         }
-        if let Some((x0, x1, y0, y1)) =
-            frame.body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
-        {
-            let cw = f32::from(sense.cell_w.max(1));
-            let ch = f32::from(sense.cell_h.max(1));
-            let rect = PetRect::new(
-                y0 as f32 / ch,
-                x0 as f32 / cw,
-                (y1 - y0) as f32 / ch,
-                (x1 - x0) as f32 / cw,
-            );
+        let body = frame
+            .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
+            .map(|(x0, x1, y0, y1)| {
+                let cw = f32::from(sense.cell_w.max(1));
+                let ch = f32::from(sense.cell_h.max(1));
+                PetRect::new(
+                    y0 as f32 / ch,
+                    x0 as f32 / cw,
+                    (y1 - y0) as f32 / ch,
+                    (x1 - x0) as f32 / cw,
+                )
+            });
+        // THE BODY IS STILL EXACTLY WHERE IT IS, whatever the veto decides.
+        // v0.81.0 cleared this on a vetoed frame; the next tick's
+        // `reseat_unshown_console_body` then read the absence as "the
+        // previous emission contained no body", TELEPORTED the pet to a new
+        // station and set `alpha = 0`, restarting the 0.30 s fade. The veto
+        // and the reseat retriggering each other is the self-sustaining
+        // blink the owner reported. `on_glass`, set below, is the separate
+        // and explicit fact the reseat actually wanted.
+        if let Some(rect) = body {
             self.console.last_body = Some(rect);
-            if self.console.clipped || !world.clear(rect, 0.0) {
-                frame.alpha = 0;
-                frame.lane_alpha = 0;
-                frame.motes = [None; PET_MOTES_MAX];
-                frame.departures = [None; PET_DEPARTURES_MAX];
-                self.console.clipped = true;
-                self.console.last_body = None;
+        }
+        // SELECTED TEXT SUBORDINATES THE PET AT ONCE, and is deliberately
+        // NOT held: a selection is a user act, not a per-frame perception
+        // wobble, and the whole point of selecting text is to read or copy
+        // it right now. The union of the examined selected cells is a
+        // conservative box — over-yielding here is the safe direction, and
+        // selections do not change at the keystroke rate, so it cannot
+        // strobe. (Shipped rule, carried by the resident-handoff and
+        // landing-wake conformance suites, kept exactly.)
+        let selected = body
+            .zip(world.selection_rect())
+            .is_some_and(|(b, s)| b.overlaps(s));
+        if self.console.clipped || selected {
+            // PLACEMENT ALREADY SEARCHED THE WHOLE REACH this tick and found
+            // nowhere safe to stand — a dense screen. That is a SEARCHED
+            // result, not a bound on perception, and the shipped rule (the
+            // derived resident-handoff model carries it) is that it yields
+            // at once. The envelope is moved to where the glass already is
+            // rather than left to fight it.
+            frame.alpha = 0;
+            frame.lane_alpha = 0;
+            self.console.hold.hide_now(sense.now);
+            self.console.clipped = true;
+            if !self.console.reason.starts_with("protected-") {
+                self.console.reason = "protected-footprint";
+            }
+        } else {
+            // THE VISIBILITY VERDICT, THREE-VALUED. `None` means "I cannot
+            // see there" — a body outside the caret-centred coverage window,
+            // which SLIDES AS THE USER TYPES, or no body to certify at all —
+            // and it is NOT evidence of ink. The hold spends it as such: an
+            // unknown keeps whatever verdict was already held.
+            //
+            // `under_text_clearance_past_caret`, and each half of that name
+            // is one of the two sides this reconciliation had to keep:
+            //
+            //  * UNDER TEXT — ordinary ink in front of the body is a Z-ORDER
+            //    fact, not an identity one, so it can no longer switch a
+            //    resident off. `frame.under_ink` below is what the renderer
+            //    does with it instead.
+            //  * PAST CARET — PLACEMENT keeps the caret protected so the pet
+            //    never comes to REST on the cursor, but a pet merely walking
+            //    PAST the caret must not be deleted for the two frames it
+            //    overlaps that one cell. The pet is the caret's ESCORT, and
+            //    with the pet now HOMED on the caret (HOME_REACH) that ring
+            //    is exactly where it lives.
+            //
+            // A frame with NO BODY goes to `idle`, not to `update`: the
+            // emitter is drawing nothing of its own accord (an arrival fade
+            // that has not started, no caret, a finished retirement), which
+            // is neither evidence about the place the pet stands nor
+            // blindness about it — there is no rectangle to be blind about.
+            let verdict = body.map(|rect| world.under_text_clearance_past_caret(rect, 0.0));
+            let cover = match verdict {
+                Some(verdict) => self.console.hold.update(sense.now, verdict),
+                None => self.console.hold.idle(sense.now),
+            };
+            let verdict = verdict.flatten();
+            if cover < 1.0 {
+                frame.alpha = cover_alpha(frame.alpha, cover);
+                frame.lane_alpha = cover_alpha(frame.lane_alpha, cover);
+            }
+            if verdict == Some(false) {
+                if !self.console.reason.starts_with("protected-") {
+                    self.console.reason = "protected-footprint";
+                }
+                // THE FOOTPRINT IS REFUSED ONLY ONCE THE YIELD HAS COMPLETED.
+                // While the ramp is still running the pet is genuinely on
+                // glass and still owes frames, so `clipped` — which
+                // `console_frames` reads as "nothing further to draw" — must
+                // not be latched until the cover has actually reached zero.
+                self.console.clipped |= frame.alpha == 0;
+            }
+            // ORDINARY TERMINAL INK IS IN FRONT OF THE FULL BODY. A busy
+            // prompt must not switch a resident off or shrink it — it
+            // changes the z-order and nothing else. The strict (two-valued)
+            // reading is the right one to ask here: an unobserved rectangle
+            // answers `false` and draws under the text, which is the safe
+            // direction for a layering decision.
+            if body.is_some_and(|rect| !world.clear(rect, 0.0)) {
+                frame.under_ink = true;
             }
         }
+        if frame.alpha == 0 {
+            frame.motes = [None; PET_MOTES_MAX];
+            frame.departures = [None; PET_DEPARTURES_MAX];
+        }
+        // `clipped` is set by the two branches above, which are the only ones
+        // that REFUSE a footprint. It is deliberately NOT set here: a frame
+        // can be transparent because the pet is still FADING IN — its own
+        // 0.30 s arrival ramp, or a first capture — and latching the refusal
+        // on that turned the very next frame, with a certified-clear verdict
+        // under it, into a permanent blank.
+        self.console.on_glass = frame.alpha > 0;
         // The whole emitted sprite, including motes and departing bodies,
         // is subordinate to selected text and the current occupancy map.
         for mote in &mut frame.motes {
@@ -1152,20 +1876,25 @@ impl PetBrain {
     }
 
     pub(super) fn console_frames(&self) -> Option<bool> {
-        if self.console.resident
-            && self.console.presentable
-            && !self.console_legacy_motion_pending()
-        {
-            Some(
-                self.console.resident_handoff
-                    || self.console.completion.is_some()
-                    || self.console.seq != self.console.consumed
-                    || self.pending_pet > 0
-                    || (!self.console.clipped && (self.console.moving || self.alpha < 1.0)),
-            )
-        } else {
-            None
+        if !self.console.presentable || self.console_legacy_motion_pending() {
+            return None;
         }
+        // A visibility hold in transit is a FADE ON GLASS and a dwell still
+        // counting: it owes frames whatever else the pet is doing, or the
+        // ramp stalls until some unrelated repaint happens to tick it.
+        if !self.console.hold.settled() {
+            return Some(true);
+        }
+        if !self.console.resident {
+            return None;
+        }
+        Some(
+            self.console.resident_handoff
+                || self.console.completion.is_some()
+                || self.console.seq != self.console.consumed
+                || self.pending_pet > 0
+                || (!self.console.clipped && (self.console.moving || self.alpha < 1.0)),
+        )
     }
 
     pub(super) fn console_deadline(&self, now: Instant) -> Option<Instant> {
@@ -1192,12 +1921,21 @@ impl PetBrain {
             .console
             .progress_at
             .map(|at| at + Duration::from_millis(350));
+        // THE SPENT PERCH'S OWN EDGE. Without this the resident that has
+        // nothing left to react to offers nothing at all, and the release
+        // below can never be reached — the dwell would be a timer nothing
+        // ticks. Finite by construction: one dwell per perch.
+        let perch = self
+            .console
+            .perched_since
+            .map(|at| at + Duration::from_secs_f32(PERCH_DWELL));
         [
             input,
             contact_recover,
             contact,
             result,
             progress,
+            perch,
             self.console.repair_until,
             self.console.failure_quiet_until,
         ]
@@ -1485,6 +2223,88 @@ mod tests {
         assert_ne!(s.pet.console_attention(), PetAttention::Result);
     }
 
+    /// THE FROZEN DECAL. A content perch taken after a command finished has
+    /// no live event left to react to, yet `console_frames()` answers
+    /// `Some(false)` and `console_deadline()` answers `None`: the resident is
+    /// left with NO FUTURE AT ALL — no frame train, and no wake instant
+    /// either — so it can never breathe, blink, settle or sleep, and it can
+    /// never notice that the caret has walked away. A pet that cannot be
+    /// ticked again is a decal.
+    #[test]
+    fn a_spent_content_perch_hands_the_pet_back_its_own_life() {
+        let mut s = Scene::new();
+        s.term
+            .process(b"\x1b[8;1H\x1b]133;A\x07> \x1b]133;B\x07build\r\n\x1b]133;C\x07working");
+        s.frame(0.1);
+        assert_eq!(s.pet.console_attention(), PetAttention::Output);
+        s.term.process(b"\x1b]133;D;0\x07");
+        s.frame(0.1);
+        assert_eq!(
+            s.pet.console_attention(),
+            PetAttention::Exploring,
+            "fixture: the surviving anchor is the content perch"
+        );
+        // Let the perch trip finish, then hold the screen perfectly still.
+        for _ in 0..40 {
+            s.frame(0.016);
+        }
+        assert!(
+            s.pet.needs_frames() || s.pet.next_change_deadline(s.now).is_some(),
+            "a resident with nothing left to react to must still own a future"
+        );
+        // …and that future is its own life: the perch is spent, so the pet
+        // goes back to escorting the caret and running the idle ladder.
+        for _ in 0..(3 * 62) {
+            s.frame(0.016);
+        }
+        assert_eq!(
+            s.pet.console_attention(),
+            PetAttention::Rest,
+            "a spent perch is released, not held forever"
+        );
+        assert!(
+            !s.pet.console.resident,
+            "a released perch is no longer a console resident"
+        );
+    }
+
+    /// THE ESCORT. When no perch is in reach the console layer knows nothing
+    /// about where the pet belongs — that is not the same as "stay exactly
+    /// where you are", which is what it used to answer, and which stops the
+    /// pet following the caret at all.
+    ///
+    /// THE FIXTURE IS DOUBLE-WIDTH LINES, not dense ink, and the change is
+    /// part of this reconciliation. A screen packed with `X` used to offer
+    /// nowhere to stand; a resident may now stand UNDER ordinary ink
+    /// (`under_text_clear`), so dense text is no longer a screen with no
+    /// perch on it. DECDWL is: a non-single-width line has no certified
+    /// cell-to-pixel projection, so every cell is `Protected` and the
+    /// under-text reading refuses it too. The subject of the test is
+    /// unchanged — what `console_station` answers when the search genuinely
+    /// comes back empty.
+    #[test]
+    fn no_perch_in_reach_is_not_an_opinion_about_where_the_pet_belongs() {
+        let mut s = Scene::new();
+        for row in 1..=20 {
+            let line = format!("\x1b[{row};1H\x1b#6{}", "X".repeat(40));
+            s.term.process(line.as_bytes());
+        }
+        s.term.process(b"\x1b[6;17H");
+        s.frame(0.016);
+        let width = art_cols(10, 20);
+        assert_eq!(
+            s.pet.console_station((70.0, 5.0), (20, 80), width),
+            None,
+            "a dense screen offers no perch, and that is not a station"
+        );
+        let here = (s.pet.col, s.pet.row);
+        assert_ne!(
+            s.pet.station_safe((5, 70), 80, 20, width),
+            here,
+            "the baseline escort must still answer when the console cannot"
+        );
+    }
+
     #[test]
     fn a_late_wake_read_still_offers_the_unconsumed_expiry() {
         let mut s = Scene::new();
@@ -1499,5 +2319,168 @@ mod tests {
         assert!(deadline >= late && deadline <= late + Duration::from_millis(20));
         s.frame(5.0);
         assert_ne!(s.pet.console_attention(), PetAttention::Editing);
+    }
+
+    fn hidden_home_continuity_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            HiddenCursorHomeContinuity {
+                const Buggy = 0;
+                var home = 1;
+                var hidden = 0;
+                var event = 0;
+                action KnownMove when (home == 1) {
+                    hidden = 1;
+                    home = if Buggy == 1 { 0 } else { 1 };
+                    event = 1;
+                }
+                action UnknownMove when (home <= 1) {
+                    hidden = 1; home = 0; event = 2;
+                }
+                action Observe when (home <= 1) {
+                    hidden = 0; home = 1; event = 0;
+                }
+                invariant Bounds: home <= 1 && hidden <= 1 && event <= 2;
+                invariant KnownKeepsHome: event == 0 || event == 2 || home == 1;
+                invariant UnknownClearsHome: event <= 1 || home == 0;
+                invariant VisibleHasHome: hidden == 1 || home == 1;
+            }
+        }
+    }
+
+    /// Tier 1 checks the genuine retained brain field, not just a body that
+    /// might happen to remain nearby after losing its owner. Every snapshot
+    /// comes from a real Terminal; no input intent is manufactured.
+    #[test]
+    fn hidden_cursor_home_continuity_conforms_to_real_terminal_motion() {
+        use aterm_core::terminal::{ContentScrollDelta, ContentScrollState};
+        use std::collections::BTreeMap;
+        let model = hidden_home_continuity_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+        let known: &[&[u8]] = &[
+            b"", // hiding alone preserves the existing home
+            b"\x1b[1;18r\x1b[18;1H\n",
+            b"\x1b[3;18r\x1b[8;1H\x1b[2L",
+            b"\x1b[3;18r\x1b[8;1H\x1b[2M",
+            b"\x1b[3;18r\x1b[3;1H\x1bM",
+            b"\x1b[20;1H\n", // ordinary full-screen uniform scroll
+        ];
+        for motion in known {
+            let mut s = Scene::new();
+            let home = s
+                .pet
+                .console
+                .cursor_home
+                .expect("the visible fixture has a home");
+            let input_seq = s.pet.console_input_seq();
+            let before = s.term.content_scroll_state();
+            let mut bytes = b"\x1b[?25l\x1b7".to_vec();
+            bytes.extend_from_slice(motion);
+            bytes.extend_from_slice(b"\x1b[r\x1b8");
+            s.term.process(&bytes);
+            assert!(!matches!(
+                ContentScrollState::delta_since(Some(before), s.term.content_scroll_state()),
+                ContentScrollDelta::Invalidate | ContentScrollDelta::Baseline
+            ));
+            s.frame(0.016);
+            let actual = BTreeMap::from([
+                ("home", i64::from(s.pet.console.cursor_home.is_some())),
+                ("hidden", i64::from(!s.term.cursor_visible())),
+                ("event", 1),
+            ]);
+            assert!(
+                model
+                    .successors("KnownMove", &model.init_state())
+                    .contains(&actual)
+            );
+            assert_eq!(
+                s.pet.console.cursor_home,
+                Some(home),
+                "home must not follow moved text"
+            );
+            assert_eq!(s.pet.console_input_seq(), input_seq);
+            let mut historical = actual.clone();
+            historical.insert("home", 0);
+            assert!(!model.check_invariant("KnownKeepsHome", &historical));
+            assert!(
+                !model
+                    .successors("KnownMove", &model.init_state())
+                    .contains(&historical)
+            );
+        }
+        for fault in 0..7 {
+            let mut s = Scene::new();
+            let before = s.term.content_scroll_state();
+            s.term.process(b"\x1b[?25l");
+            match fault {
+                0 => s.term.process(b"\x1bc\x1b[?25l"),
+                1 => s.term.process(b"\x1b[?1049h\x1b[?25l"),
+                // SU scrolls the rectangular margins even when the cursor is
+                // outside them; LF at that column would be a no-op.
+                2 => s
+                    .term
+                    .process(b"\x1b[?69h\x1b[2;6s\x1b[2;18r\x1b[18;1H\x1b[S"),
+                3 => {
+                    for _ in 0..17 {
+                        s.term.process(b"\x1b[1;18r\x1b[18;1H\n");
+                    }
+                }
+                4 => s.term.resize(21, 81),
+                5 => {
+                    s.term = Terminal::new(20, 80);
+                    s.term.process(b"\x1b[?25l");
+                }
+                _ => {} // a different session owns the same terminal snapshot
+            }
+            if fault <= 3 {
+                assert!(
+                    matches!(
+                        ContentScrollState::delta_since(
+                            Some(before),
+                            s.term.content_scroll_state()
+                        ),
+                        ContentScrollDelta::Invalidate
+                    ),
+                    "fault {fault} must actually invalidate the terminal motion reader"
+                );
+            }
+            // Observe coherent resized geometry too; rejecting an incoherent
+            // pane would not prove the durable-geometry fence.
+            let rows = s.term.grid().rows();
+            let cols = s.term.grid().cols();
+            let input = s.term.cell_frame(usize::from(rows), usize::from(cols));
+            let facts = PetWorldFacts::read(&s.term, if fault == 6 { 18 } else { 17 });
+            s.pet.observe_console(&input, &facts, PetPane::full(&input));
+            assert!(s.pet.console.world.as_ref().unwrap().stamp().is_some());
+            s.pet.set_console_presentable(true);
+            s.now += Duration::from_millis(16);
+            let input_seq = s.pet.console_input_seq();
+            s.pet.tick(PetSense {
+                now: s.now,
+                caret: None,
+                wrapped: false,
+                rows,
+                cols,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: true,
+                output_burst: false,
+                pointer: None,
+            });
+            let actual = BTreeMap::from([
+                ("home", i64::from(s.pet.console.cursor_home.is_some())),
+                ("hidden", i64::from(!s.term.cursor_visible())),
+                ("event", 2),
+            ]);
+            assert!(
+                model
+                    .successors("UnknownMove", &model.init_state())
+                    .contains(&actual),
+                "fault {fault}: {actual:?}"
+            );
+            assert_eq!(s.pet.console_input_seq(), input_seq);
+            let mut leaked = actual;
+            leaked.insert("home", 1);
+            assert!(!model.check_invariant("UnknownClearsHome", &leaked));
+        }
     }
 }

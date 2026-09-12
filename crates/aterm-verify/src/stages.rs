@@ -76,17 +76,37 @@ pub fn build_args(scope: &Scope) -> Vec<String> {
     a
 }
 
-/// `targo --unverified test <scope>`
+/// `targo --unverified test <scope> --no-fail-fast`
+///
+/// `--no-fail-fast` IS THE COVERAGE FLAG, the exact analogue of `--keep-going`
+/// on [`tippy_args`] below, and for the same reason: without it cargo stops the
+/// moment ONE test binary fails, so the stage reports on a PREFIX of the
+/// workspace while reading like a statement about all of it. MEASURED
+/// 2026-09-10: `aterm-conformance` sorts early and its paint rows are
+/// load-sensitive, so three consecutive gates (0.79, 0.80, and the first
+/// re-gate) reported on 41 of ~319 test binaries. Everything behind it —
+/// including `aterm-forge`'s six baseline tests, which had been RED for two
+/// days from a commit that had already landed — never ran, and their silence
+/// read as green. An absence of failure is not a pass.
+///
+/// It widens what the stage SEES and softens nothing: cargo still exits
+/// non-zero when any test failed, so `Report::decide` reaches the same FAIL it
+/// always did — only now with the other 278 binaries' results printed beside
+/// the first one's.
 #[must_use]
 pub fn test_args(scope: &Scope) -> Vec<String> {
     let mut a = vec!["--unverified".to_string(), "test".to_string()];
     a.extend(scope.args());
+    a.push("--no-fail-fast".to_string());
     a
 }
 
-/// `targo --unverified test --doc <scope>` — run explicitly, because the unit
+/// `targo --unverified test --doc <scope> --no-fail-fast` — run explicitly,
+/// because the unit
 /// stage's `targo test` can skip documentation examples when scoped or under a
-/// nextest-style runner, and doctests then rot silently.
+/// nextest-style runner, and doctests then rot silently. `--no-fail-fast` for
+/// the reason [`test_args`] gives: one crate's failing doctest must not hide
+/// every crate cargo had not reached yet.
 #[must_use]
 pub fn doctest_args(scope: &Scope) -> Vec<String> {
     let mut a = vec![
@@ -95,10 +115,11 @@ pub fn doctest_args(scope: &Scope) -> Vec<String> {
         "--doc".to_string(),
     ];
     a.extend(scope.args());
+    a.push("--no-fail-fast".to_string());
     a
 }
 
-/// `targo --unverified test -p aterm-search --features regex`
+/// `targo --unverified test -p aterm-search --features regex --no-fail-fast`
 #[must_use]
 pub fn regex_lane_args() -> Vec<String> {
     [
@@ -108,6 +129,7 @@ pub fn regex_lane_args() -> Vec<String> {
         "aterm-search",
         "--features",
         "regex",
+        "--no-fail-fast",
     ]
     .into_iter()
     .map(String::from)
@@ -2314,14 +2336,51 @@ mod tests {
         assert_eq!(doc_driver_from(false, false, false), DocDriver::Absent);
     }
 
+    /// THE PIN for the truncating test stage (2026-09-10). `targo test` stops
+    /// scheduling the moment ONE test binary fails, so a workspace run reports
+    /// on a PREFIX of the tree while reading like a statement about all of it.
+    /// Measured: three consecutive gates reported on 41 of ~319 binaries
+    /// because `aterm-conformance` sorts early and its paint rows are
+    /// load-sensitive — `aterm-forge`'s six failing baseline tests never ran,
+    /// and their silence read as green for two days. `--no-fail-fast` is the
+    /// coverage flag, exactly as `--keep-going` is for tippy; it widens what
+    /// the stage sees and changes nothing about the verdict, because cargo
+    /// still exits non-zero when anything failed.
+    #[test]
+    fn every_test_argv_carries_no_fail_fast_so_one_binary_cannot_hide_the_rest() {
+        for argv in [
+            test_args(&Scope::workspace()),
+            test_args(&Scope::crate_only("aterm-grid")),
+            test_args(&Scope::changed("main", vec!["aterm-gui".into()], true)),
+            doctest_args(&Scope::workspace()),
+            doctest_args(&Scope::crate_only("aterm-grid")),
+            regex_lane_args(),
+        ] {
+            assert!(
+                argv.iter().any(|a| a == "--no-fail-fast"),
+                "a test argv without --no-fail-fast reports a PREFIX of its \
+                 scope: {argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_workspace_argv_is_what_the_script_ran() {
         let s = Scope::workspace();
         assert_eq!(build_args(&s), ["--unverified", "build", "--workspace"]);
-        assert_eq!(test_args(&s), ["--unverified", "test", "--workspace"]);
+        assert_eq!(
+            test_args(&s),
+            ["--unverified", "test", "--workspace", "--no-fail-fast"]
+        );
         assert_eq!(
             doctest_args(&s),
-            ["--unverified", "test", "--doc", "--workspace"]
+            [
+                "--unverified",
+                "test",
+                "--doc",
+                "--workspace",
+                "--no-fail-fast"
+            ]
         );
         assert_eq!(
             regex_lane_args(),
@@ -2331,7 +2390,8 @@ mod tests {
                 "-p",
                 "aterm-search",
                 "--features",
-                "regex"
+                "regex",
+                "--no-fail-fast"
             ]
         );
         assert_eq!(
@@ -2393,10 +2453,20 @@ mod tests {
             build_args(&s),
             ["--unverified", "build", "-p", "aterm-grid"]
         );
-        assert_eq!(test_args(&s), ["--unverified", "test", "-p", "aterm-grid"]);
+        assert_eq!(
+            test_args(&s),
+            ["--unverified", "test", "-p", "aterm-grid", "--no-fail-fast"]
+        );
         assert_eq!(
             doctest_args(&s),
-            ["--unverified", "test", "--doc", "-p", "aterm-grid"]
+            [
+                "--unverified",
+                "test",
+                "--doc",
+                "-p",
+                "aterm-grid",
+                "--no-fail-fast"
+            ]
         );
         assert_eq!(
             tippy_args(&s),
@@ -2419,7 +2489,8 @@ mod tests {
                 "-p",
                 "aterm-search",
                 "--features",
-                "regex"
+                "regex",
+                "--no-fail-fast"
             ],
             "the regex lane is always that crate, or it is not run at all"
         );
@@ -2447,7 +2518,8 @@ mod tests {
                 "-p",
                 "aterm-grid",
                 "-p",
-                "aterm-gui"
+                "aterm-gui",
+                "--no-fail-fast"
             ]
         );
         assert_eq!(
@@ -2459,7 +2531,8 @@ mod tests {
                 "-p",
                 "aterm-grid",
                 "-p",
-                "aterm-gui"
+                "aterm-gui",
+                "--no-fail-fast"
             ]
         );
         assert_eq!(

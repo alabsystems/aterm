@@ -123,11 +123,11 @@ pub fn is_agent_program(name: &str) -> bool {
 pub const AGENT_STUB_NAMES: &[(&str, &str)] = &[
     (
         "claude",
-        "Anthropic Claude Code — proprietary, ~230 MB, downloaded from downloads.claude.ai",
+        "Anthropic Claude Code — proprietary, ~200 MB, downloaded from downloads.claude.ai",
     ),
     (
         "codex",
-        "OpenAI Codex CLI — Apache-2.0, ~90 MB, downloaded from github.com/openai/codex",
+        "OpenAI Codex CLI — Apache-2.0, ~110 MB (~290 MB on disk), downloaded from github.com/openai/codex",
     ),
 ];
 

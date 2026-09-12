@@ -98,7 +98,7 @@ pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
 pub use state::{
     AbsoluteRowUpdate, BandSet, GridCursorState, GridPresentationState, MAX_SELECTION_DAMAGE_BANDS,
-    OutputOrigin, SelectionDamage,
+    OutputOrigin, ROW_BAND_MOVES_PER_BATCH, RowBandMove, RowBandMoves, SelectionDamage,
 };
 
 // Terminal style types shared with checkpoint system.

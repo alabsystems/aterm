@@ -4355,6 +4355,396 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<std::process::Chi
         .map_err(|error| Error::new(format!("spawn exact GitHub asset-ID download: {error}")))
 }
 
+// ---------------------------------------------------------------------------
+// THE TRANSPORT HICCUP THAT KILLED TWO CUTS
+//
+// Twice in the week of 2026-09-08 the cutter built BOTH architectures, signed,
+// notarized, stapled and passed its paint self-check — and then died on
+//
+//   download exact release asset aterm-appcast.toml from alabsystems/aterm
+//   failed: unexpected end of JSON input
+//
+// `ship cut --resume` cleared it in 1m37s with no rebuild, which is the whole
+// diagnosis: nothing was wrong with the release, the tree or the credential.
+// A truncated HTTP body ended a run that had already done every expensive
+// thing it would ever do.
+//
+// The download could not simply be routed through `gh_retry`, and that is the
+// point of the classifier below rather than a bare loop. `gh_retry` repeats on
+// ANY non-zero exit, so it cannot tell a lost body from a server that answered
+// "no": pointed at this call it would spend seven seconds of backoff re-asking
+// for an asset that is genuinely absent and then report the 404 as an
+// exhausted retry — which is exactly the confusion this fix exists to remove.
+// A 404, a 401 and a permission refusal are ANSWERS. Only a failure of the
+// transport itself is worth repeating, because only that one can come out
+// differently the second time.
+// ---------------------------------------------------------------------------
+
+/// Whether repeating a bounded asset transfer can possibly change its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetTransferFault {
+    /// The bytes did not arrive intact — a truncated body, a reset socket, a
+    /// name that would not resolve, a 5xx. The request never got an answer, so
+    /// asking again is the remedy.
+    Transport,
+    /// The server answered and the answer was no — 404, 401/403, a bound the
+    /// asset genuinely exceeds, `gh` not on PATH. Repeating this re-asks a
+    /// question that has already been decided.
+    Answered,
+}
+
+/// One failed attempt: its class, and the sentence a human needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransferAttemptFailure {
+    pub(crate) fault: AssetTransferFault,
+    pub(crate) message: String,
+}
+
+impl TransferAttemptFailure {
+    pub(crate) fn transport(message: impl Into<String>) -> Self {
+        Self {
+            fault: AssetTransferFault::Transport,
+            message: message.into(),
+        }
+    }
+    pub(crate) fn answered(message: impl Into<String>) -> Self {
+        Self {
+            fault: AssetTransferFault::Answered,
+            message: message.into(),
+        }
+    }
+}
+
+/// Sleeps BETWEEN attempts, so the number of attempts is one more than this.
+/// The same 2s/5s shape `gh_retry` already uses, for the same reason: long
+/// enough to outlast a blip, short enough that a genuine outage is not
+/// discovered five minutes later.
+pub(crate) const ASSET_TRANSFER_BACKOFFS: &[u64] = &[2, 5];
+
+/// Decide, from a `gh` diagnostic, whether the transport failed or the server
+/// answered.
+///
+/// UNRECOGNISED IS `Answered`, deliberately. This function can only ever widen
+/// what gets retried; defaulting the unknown case to `Transport` would make
+/// every novel failure cost a full backoff ladder before it is reported, and
+/// would report it wearing the wrong label. A new transport symptom belongs in
+/// the table below, added by someone who saw it.
+///
+/// The answered markers are tested FIRST because a 404 body can carry wording
+/// that looks transport-ish; an explicit "no" always wins.
+#[must_use]
+pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransferFault {
+    let d = diagnostic.to_ascii_lowercase();
+    const ANSWERED: &[&str] = &[
+        "http 401",
+        "http 403",
+        "http 404",
+        "http 410",
+        "http 422",
+        "not found",
+        "bad credentials",
+        "requires authentication",
+        "resource not accessible",
+        "must have admin rights",
+        "forbidden",
+        "permission",
+        "gh auth login",
+        "no such release",
+        "saml enforcement",
+    ];
+    const TRANSPORT: &[&str] = &[
+        // THE MEASURED ONE: `gh` read a body that stopped mid-object.
+        "unexpected end of json input",
+        "unexpected eof",
+        "unexpected end of stream",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "broken pipe",
+        "i/o timeout",
+        "timed out",
+        "timeout",
+        "tls handshake",
+        "handshake failure",
+        "temporary failure in name resolution",
+        "no such host",
+        "network is unreachable",
+        "network is down",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "server error",
+        "goaway",
+        "stream error",
+    ];
+    if ANSWERED.iter().any(|m| d.contains(m)) {
+        return AssetTransferFault::Answered;
+    }
+    if TRANSPORT.iter().any(|m| d.contains(m)) {
+        return AssetTransferFault::Transport;
+    }
+    AssetTransferFault::Answered
+}
+
+/// The bounded retry itself, with the transfer injected so the LOOP — the part
+/// that decides how many times and how long — is testable without a network.
+///
+/// The final message always names WHICH class the failure was judged to be, so
+/// a reader never has to guess whether the cutter gave up early or gave up
+/// after trying.
+pub(crate) fn retry_transport_failures<T>(
+    what: &str,
+    backoffs: &[u64],
+    sleep: &mut dyn FnMut(u64),
+    mut attempt: impl FnMut(u32) -> std::result::Result<T, TransferAttemptFailure>,
+) -> Result<T> {
+    let attempts = backoffs.len() + 1;
+    let mut last = String::new();
+    for index in 0..attempts {
+        let n = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
+        match attempt(n) {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                last = failure.message;
+                if failure.fault == AssetTransferFault::Answered {
+                    return Err(Error::new(format!(
+                        "{what} failed: {last} — the server answered, so this is not \
+                         a transport fault and was NOT retried"
+                    )));
+                }
+                if let Some(backoff) = backoffs.get(index) {
+                    eprintln!(
+                        "    {what} hit a transport fault (attempt {n}/{attempts}): \
+                         {last} — retrying in {backoff}s"
+                    );
+                    sleep(*backoff);
+                }
+            }
+        }
+    }
+    Err(Error::new(format!(
+        "{what} failed after {attempts} attempts: {last} — a transport fault that \
+         did not clear; `cargo ship cut --resume` re-enters here without rebuilding"
+    )))
+}
+
+/// ONE bounded transfer of the asset with the given immutable ID, classified.
+fn attempt_exact_release_asset_transfer(
+    slug: &str,
+    id: u64,
+    expected_size: u64,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, TransferAttemptFailure> {
+    let mut child = exact_release_asset_download(slug, id)
+        .map_err(|error| TransferAttemptFailure::answered(error.to_string()))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        TransferAttemptFailure::answered("exact GitHub asset-ID download has no stdout pipe")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        TransferAttemptFailure::answered("exact GitHub asset-ID download has no stderr pipe")
+    })?;
+    let stderr_reader = std::thread::spawn(move || drain_bounded_diagnostic(stderr, 64 * 1024));
+    let bytes = match read_bounded_release_asset(stdout, limit) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            let text = error.to_string();
+            // A read that DIED is transport; a read that ran out of BOUND is an
+            // answer about the asset, and repeating it returns the same bytes.
+            return Err(if text.contains("exceeded its") {
+                TransferAttemptFailure::answered(text)
+            } else {
+                TransferAttemptFailure::transport(text)
+            });
+        }
+    };
+    let status = child.wait().map_err(|error| {
+        TransferAttemptFailure::answered(format!(
+            "wait for exact GitHub asset-ID download: {error}"
+        ))
+    })?;
+    let (stderr, stderr_truncated) = match stderr_reader.join() {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error)) => return Err(TransferAttemptFailure::transport(error.to_string())),
+        Err(_) => {
+            return Err(TransferAttemptFailure::answered(
+                "exact GitHub asset-ID stderr reader panicked",
+            ));
+        }
+    };
+    if !status.success() {
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&stderr).trim(),
+            if stderr_truncated {
+                " [diagnostic truncated at 65536 bytes]"
+            } else {
+                ""
+            }
+        );
+        return Err(TransferAttemptFailure {
+            fault: classify_asset_transfer_failure(&diagnostic),
+            message: diagnostic,
+        });
+    }
+    let downloaded_size = u64::try_from(bytes.len()).map_err(|_| {
+        TransferAttemptFailure::answered("downloaded release-asset length does not fit u64")
+    })?;
+    if downloaded_size != expected_size {
+        // A body that ended early but exited 0. Same fault, quieter symptom.
+        return Err(TransferAttemptFailure::transport(format!(
+            "API size {expected_size} differs from bounded download size {downloaded_size}"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod asset_transport_retry_tests {
+    //! THE PIN for the two cuts that died after all the expensive work.
+    //!
+    //! Both times the cutter had already built both architectures, signed,
+    //! notarized, stapled and passed its paint self-check, and then reported
+    //!
+    //!   download exact release asset aterm-appcast.toml from alabsystems/aterm
+    //!   failed: unexpected end of JSON input
+    //!
+    //! `ship cut --resume` cleared it in 1m37s with no rebuild — proof that the
+    //! body, not the release, was what went missing. The transfer is injected
+    //! here so the LOOP is measured without a network: how many times it asks,
+    //! how long it waits, and above all WHICH failures it declines to repeat.
+
+    use super::*;
+    use std::cell::RefCell;
+
+    /// The exact stderr both dead cuts carried.
+    const TRUNCATED: &str = "unexpected end of JSON input";
+
+    fn run(
+        script: Vec<std::result::Result<&'static str, TransferAttemptFailure>>,
+    ) -> (Result<&'static str>, Vec<u32>, Vec<u64>) {
+        let script = RefCell::new(script.into_iter());
+        let seen = RefCell::new(Vec::new());
+        let slept = RefCell::new(Vec::new());
+        let out = retry_transport_failures(
+            "download exact release asset aterm-appcast.toml from alabsystems/aterm",
+            ASSET_TRANSFER_BACKOFFS,
+            &mut |s| slept.borrow_mut().push(s),
+            |n| {
+                seen.borrow_mut().push(n);
+                script
+                    .borrow_mut()
+                    .next()
+                    .expect("the loop asked more times than the script allows")
+            },
+        );
+        (out, seen.into_inner(), slept.into_inner())
+    }
+
+    #[test]
+    fn the_truncated_body_that_killed_two_cuts_is_a_transport_fault_and_a_404_is_not() {
+        assert_eq!(
+            classify_asset_transfer_failure(TRUNCATED),
+            AssetTransferFault::Transport,
+            "the measured killer must be the retried class, or this fix is inert"
+        );
+        for answered in [
+            "gh: Not Found (HTTP 404)",
+            "HTTP 403: Resource not accessible by integration",
+            "gh: Bad credentials (HTTP 401)",
+            "To get started with GitHub CLI, please run: gh auth login",
+        ] {
+            assert_eq!(
+                classify_asset_transfer_failure(answered),
+                AssetTransferFault::Answered,
+                "{answered}"
+            );
+        }
+        for transport in [
+            "read tcp 10.0.0.2:443: connection reset by peer",
+            "Post \"https://api.github.com\": net/http: TLS handshake timeout",
+            "gh: Server Error (HTTP 502)",
+        ] {
+            assert_eq!(
+                classify_asset_transfer_failure(transport),
+                AssetTransferFault::Transport,
+                "{transport}"
+            );
+        }
+        // An unrecognised diagnostic is reported, not ground through the whole
+        // ladder wearing a label nobody established.
+        assert_eq!(
+            classify_asset_transfer_failure("something nobody has seen yet"),
+            AssetTransferFault::Answered
+        );
+    }
+
+    #[test]
+    fn an_injected_truncated_response_is_retried_with_backoff_and_the_cut_survives() {
+        let (out, seen, slept) = run(vec![
+            Err(TransferAttemptFailure::transport(TRUNCATED)),
+            Ok("appcast bytes"),
+        ]);
+        assert_eq!(
+            out.expect(
+                "a transport hiccup must not end a cut that has already \
+                        built, signed, notarized and stapled"
+            ),
+            "appcast bytes"
+        );
+        assert_eq!(seen, vec![1, 2], "the second ask is what saves the cut");
+        assert_eq!(slept, vec![2], "and it waits before it");
+    }
+
+    #[test]
+    fn a_truncated_response_that_never_clears_is_bounded_and_names_its_class() {
+        let (out, seen, slept) = run(vec![
+            Err(TransferAttemptFailure::transport(TRUNCATED)),
+            Err(TransferAttemptFailure::transport(TRUNCATED)),
+            Err(TransferAttemptFailure::transport(TRUNCATED)),
+        ]);
+        let message = out
+            .expect_err("three truncated bodies is a failure")
+            .to_string();
+        assert!(
+            message.contains("failed after 3 attempts"),
+            "the retry must be BOUNDED and say how many: {message}"
+        );
+        assert!(
+            message.contains(TRUNCATED) && message.contains("transport fault"),
+            "and must name the class it decided: {message}"
+        );
+        assert_eq!(seen, vec![1, 2, 3]);
+        assert_eq!(slept, ASSET_TRANSFER_BACKOFFS.to_vec());
+    }
+
+    #[test]
+    fn a_real_404_fails_fast_and_says_it_was_not_retried() {
+        let (out, seen, slept) = run(vec![Err(TransferAttemptFailure::answered(
+            "gh: Not Found (HTTP 404)",
+        ))]);
+        let message = out.expect_err("a 404 is a failure").to_string();
+        assert_eq!(
+            seen,
+            vec![1],
+            "re-asking for an asset that is not there burns seven seconds and \
+             then reports the 404 as an exhausted retry"
+        );
+        assert!(slept.is_empty(), "and it must not wait to do it");
+        assert!(
+            message.contains("NOT retried") && message.contains("the server answered"),
+            "the message must say WHICH class it was: {message}"
+        );
+        assert!(
+            message.contains("download exact release asset aterm-appcast.toml"),
+            "and keep the operation's own name: {message}"
+        );
+    }
+}
+
 pub fn download_release_asset_for_release_id(
     slug: &str,
     release_id: u64,
@@ -4379,51 +4769,15 @@ pub(crate) fn download_release_asset_with_identity_and_recheck(
     let limit = validate_small_release_asset_size(name, before.1)?;
     // Pin the transfer to the immutable asset ID observed above. A name-based
     // `gh release download` can race a delete/re-upload and return bytes from a
-    // different object even when the name is unchanged.
-    let mut child = exact_release_asset_download(slug, before.0)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stdout pipe"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stderr pipe"))?;
-    let stderr_reader = std::thread::spawn(move || drain_bounded_diagnostic(stderr, 64 * 1024));
-    let bytes = match read_bounded_release_asset(stdout, limit) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stderr_reader.join();
-            return Err(Error::new(format!("release asset {name}: {error}")));
-        }
-    };
-    let status = child
-        .wait()
-        .map_err(|error| Error::new(format!("wait for exact GitHub asset-ID download: {error}")))?;
-    let (stderr, stderr_truncated) = stderr_reader
-        .join()
-        .map_err(|_| Error::new("exact GitHub asset-ID stderr reader panicked"))??;
-    if !status.success() {
-        return Err(Error::new(format!(
-            "download exact release asset {name} from {slug} failed: {}{}",
-            String::from_utf8_lossy(&stderr).trim(),
-            if stderr_truncated {
-                " [diagnostic truncated at 65536 bytes]"
-            } else {
-                ""
-            }
-        )));
-    }
-    let downloaded_size = u64::try_from(bytes.len())
-        .map_err(|_| Error::new("downloaded release-asset length does not fit u64"))?;
-    if downloaded_size != before.1 {
-        return Err(Error::new(format!(
-            "release asset {name} API size {} differs from bounded download size {downloaded_size}",
-            before.1
-        )));
-    }
+    // different object even when the name is unchanged. The ID being immutable
+    // is also what makes the retry below sound: every attempt asks for the same
+    // object, so a repeat can only ever return the same bytes or fail.
+    let bytes = retry_transport_failures(
+        &format!("download exact release asset {name} from {slug}"),
+        ASSET_TRANSFER_BACKOFFS,
+        &mut |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)),
+        |_attempt| attempt_exact_release_asset_transfer(slug, before.0, before.1, limit),
+    )?;
     let after = recheck()?;
     if after != before {
         return Err(Error::new(format!(

@@ -6,7 +6,7 @@
 //! surface: `cut [--dry-run] [--resume] [--abandon vX.Y.Z]
 //! [--set-version X.Y.Z]
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
-//! [--strand-pre-roster-clients]`,
+//! [--release-credentials <profile.toml>] [--strand-pre-roster-clients]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
 //! `verify [vX.Y.Z]`,
 //! `yank <build> [--release-credentials <profile.toml>]
@@ -22,7 +22,8 @@ pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release
 USAGE
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
-                 [--arm64-only] [--no-paint-smoke] [--strand-pre-roster-clients]
+                 [--arm64-only] [--no-paint-smoke] [--release-credentials <profile.toml>]
+                 [--strand-pre-roster-clients]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
@@ -56,6 +57,11 @@ USAGE
                            Refused on a notarized real cut unless
                            ATERM_NO_PAINT_SMOKE_ACK=this-cut-may-ship-dark is
                            also set
+        --release-credentials <profile.toml>
+                           the ONE signing input: the credentials profile this
+                           cut signs with. Omitted, the machine key provisioned
+                           at ~/.aterm/machine.key is used; a signature-required
+                           cut with neither refuses before it claims
         --strand-pre-roster-clients
                            OPERATOR ASSERTION, only meaningful once the paper
                            master is armed: no client running a build older than

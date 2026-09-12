@@ -163,6 +163,22 @@ impl TypingMomentum {
         let elapsed = TYPING_MOMENTUM_TAU * (self.value / threshold).ln();
         Some(at + std::time::Duration::from_secs_f32(elapsed.max(0.0)))
     }
+
+    /// A deadline at which a fresh [`Self::value`] reads at/below `threshold`
+    /// (finite, in `0..=1`). Unlike the unsnapped analytic [`Self::low_crossing`],
+    /// this includes zero: a floor below [`SNAP_ZERO`] is reached at the snap.
+    /// One millisecond past the analytic boundary handles both its strict `<`
+    /// and f32 rounding. This is one solved deadline, never periodic polling.
+    #[must_use]
+    pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
+        debug_assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold));
+        let at = self.at?;
+        if self.value(at) <= threshold {
+            return Some(at);
+        }
+        self.low_crossing(threshold.max(SNAP_ZERO))
+            .map(|crossing| crossing + std::time::Duration::from_millis(1))
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +302,50 @@ mod tests {
         assert_eq!(m.low_crossing(0.14), Some(t0));
         // Unstamped ⇒ no crossing to report.
         assert_eq!(TypingMomentum::default().low_crossing(0.14), None);
+    }
+
+    #[test]
+    fn reading_crossing_reaches_the_actual_floor_including_the_zero_snap() {
+        let at = Instant::now();
+        for (value, floor) in [
+            (0.000_75, 0.0),
+            (0.000_75, 0.000_1),
+            (0.000_75, 0.000_49),
+            (0.000_75, SNAP_ZERO),
+            (0.000_75, 0.000_7),
+            (SNAP_ZERO, 0.0),
+            (0.4, 0.3),
+            (1.0, 0.0),
+        ] {
+            let mut metric = TypingMomentum::default();
+            metric.set_value(at, value);
+            let crossing = metric.reading_low_crossing(floor).unwrap();
+            assert!(metric.value(at) > floor);
+            assert!(
+                crossing > at,
+                "an unmet floor must not re-arm the same instant"
+            );
+            assert!(metric.value(crossing) <= floor, "{value} -> {floor}");
+            let analytic = metric.low_crossing(floor.max(SNAP_ZERO)).unwrap();
+            assert_eq!(crossing - analytic, Duration::from_millis(1));
+        }
+
+        let mut metric = TypingMomentum::default();
+        metric.set_value(at, 0.000_75);
+        let retired = metric.low_crossing(0.001).unwrap();
+        assert_eq!(retired, at);
+        assert!(
+            metric.value(retired) > 0.0,
+            "the old timer fires before dark"
+        );
+
+        metric.set_value(at, 0.0);
+        assert_eq!(metric.reading_low_crossing(0.0), Some(at));
+        metric.set_value(at, 0.000_4);
+        assert_eq!(metric.reading_low_crossing(0.0), Some(at));
+        metric.set_value(at, 0.3);
+        assert_eq!(metric.reading_low_crossing(0.3), Some(at));
+        assert_eq!(TypingMomentum::default().reading_low_crossing(0.0), None);
     }
 
     /// A delete flood walks an earned run to zero (never below), and the

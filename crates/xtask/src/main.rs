@@ -4,8 +4,10 @@
 
 //! aterm build-graph tasks — the ALWAYS-RUN nodes of TRUST_VACUITY_GATE §2.
 //!
-//! Two subcommands, both independent of any one crate's `cargo test` binary
-//! (finding 5 — "the teeth are there, the wiring isn't"):
+//! Four subcommands, all independent of any one crate's `cargo test` binary
+//! (finding 5 — "the teeth are there, the wiring isn't"). The two always-run
+//! nodes are described below; `gate <check>` (see `gate.rs`) and `verify` (the
+//! `tools/verify.sh` driver) are the other two:
 //!
 //!   * `harness-manifest` (§2.1 / finding 1a): enumerate every REAL
 //!     `#[kani::proof] fn` across the workspace `crates/` and write a
@@ -42,6 +44,7 @@ use aterm_spec::tla_check::TlaSpec;
 use aterm_spec::xref::{self, SpecModule};
 
 mod gate;
+mod help_surfaces;
 mod perf;
 
 // Force the proof-anchor-bearing rlibs into the link graph: `inventory` only collects
@@ -75,12 +78,15 @@ fn main() -> ExitCode {
         ),
         Some("verify") => verify(&args[2..]),
         _ => {
+            // The roster is `gate.rs`'s own; a hand-typed subset sat here for months.
+            let roster = gate::roster_names().join("|");
             eprintln!(
                 "usage: xtask <harness-manifest|spec-link|gate <check>|verify [args…]>\n\
                  \n\
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
-                 gate <check>      local enforcement gate (NO CI): all|drift|dormant|lint|perf\n\
+                 gate <check>      local enforcement gate (NO CI): all|{roster}|nonvacuity,\n\
+                                   plus the five `all` leaves out: linux|web|cells|certified|miri\n\
                                    `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt +\n\
                                    guards; --no-fmt drops the formatter lane and\n\
                                    --fmt-only keeps only it (both passes, no compiler,\n\

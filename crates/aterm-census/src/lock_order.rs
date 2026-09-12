@@ -338,6 +338,16 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         identity: "fleet_fault",
         def_file: "crates/aterm-gui/src/operator_host.rs",
     },
+    GuardHelper {
+        // `fabric attach`'s supervisor latch. `supervise` loops forever with no
+        // stop handle, so `arm` must check-and-set under ONE hold or a second
+        // attach would stack a second relaunch loop over the same instance;
+        // this free fn returns that hold, so its callers' acquires are
+        // invisible at their call sites and the census cannot place them.
+        symbol: "supervisor",
+        identity: "SUPERVISOR",
+        def_file: "crates/aterm-gui/src/fabric_launch.rs",
+    },
 ];
 
 /// The INTERIOR of the acquisition vocabulary itself: a fn that IMPLEMENTS one
@@ -1869,13 +1879,32 @@ struct FnLockFacts {
 }
 
 /// Lexical guard-return detection over the signature region (the def line up
-/// to the line that opens the body): a `->` whose return type mentions
-/// `Guard`. Multi-line rustfmt signatures put `) -> Type {` on its own line,
-/// which this covers.
+/// to the line that opens the body): a `->` whose return type names a type
+/// whose IDENTIFIER ends with `Guard`. Multi-line rustfmt signatures put
+/// `) -> Type {` on its own line, which this covers.
+///
+/// WHY AN IDENTIFIER SUFFIX AND NOT `contains("Guard")`, which is what this
+/// was. A substring match reads the NAME and reports a conclusion about the
+/// CODE: `-> GuardedInput` was flagged as an acquire-and-return helper, and
+/// `GuardedInput` is a `#[derive(Clone, Copy)]` enum with no lifetime, which
+/// cannot hold a `MutexGuard` at all — the fn's guard drops at its own `}`
+/// and its callers hold nothing. That false positive is not free: the only
+/// remedy the diagnostic offers is registration in [`GUARD_HELPERS`], and
+/// registering a non-guard would tell the graph that every caller holds a
+/// lock it does not hold — which can MASK a real cycle rather than find one.
+/// A checker that cannot be satisfied honestly gets satisfied dishonestly.
+///
+/// The suffix is per-IDENTIFIER, not over the whole return type, so a guard
+/// wrapped in anything — `Option<MutexGuard<'_, T>>`,
+/// `io::Result<RwLockReadGuard<'_, T>>` — is still caught: those contain the
+/// segment `MutexGuard`/`RwLockReadGuard`, each of which ends in `Guard`.
+/// Every std guard is spelled this way (`MutexGuard`, `RwLockReadGuard`,
+/// `RwLockWriteGuard`, `MappedMutexGuard`, `ReentrantLockGuard`), so the
+/// check stays fail-closed on the shape it exists for.
 fn returns_guard(body: &[String]) -> bool {
     for line in body {
         if let Some(p) = line.rfind("->")
-            && line[p..].contains("Guard")
+            && return_type_names_a_guard(&line[p + 2..])
         {
             return true;
         }
@@ -1884,6 +1913,14 @@ fn returns_guard(body: &[String]) -> bool {
         }
     }
     false
+}
+
+/// Does any Rust identifier in `ret` end with `Guard`? Splits on everything
+/// that cannot appear inside an identifier, so paths, generic arguments,
+/// references and lifetimes are all traversed.
+fn return_type_names_a_guard(ret: &str) -> bool {
+    ret.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|ident| ident.ends_with("Guard"))
 }
 
 /// Lexical method-shape detection over the signature region: does the first
@@ -3214,6 +3251,15 @@ mod tests {
                 .to_string(),
         ));
         files.push((
+            // `fabric attach`'s supervisor latch. Spelled with the
+            // poison-recovering closure the shipping helper uses, so the
+            // fixture exercises the same acquisition token.
+            "crates/aterm-gui/src/fabric_launch.rs".to_string(),
+            "fn supervisor() -> std::sync::MutexGuard<'static, Supervisor> {\n    \
+             SUPERVISOR.lock().unwrap_or_else(|p| p.into_inner())\n}\n"
+                .to_string(),
+        ));
+        files.push((
             // Mirrors the shipping helpers and their static ring identities;
             // this fixture makes a stale singular registration fail closed.
             // BOTH control_query.rs helpers live here — one file, one fixture
@@ -4219,6 +4265,58 @@ mod tests {
             "rebound/out-of-scope receivers must fall back to UNKNOWN; log:\n{}",
             out.log
         );
+    }
+
+    /// A GUARD-RETURNING helper is one whose return type NAMES a guard, not one
+    /// whose return type merely CONTAINS the letters. `-> GuardedInput` was
+    /// flagged OB-7 by a `contains("Guard")` check, and `GuardedInput` is a
+    /// `#[derive(Clone, Copy)]` enum with no lifetime — it cannot hold a
+    /// `MutexGuard`, so the fn's own guard drops at its `}` and its callers
+    /// hold nothing. The only remedy OB-7 offers is registration, and
+    /// registering a non-guard would tell the graph that every caller holds a
+    /// lock it does not hold, which MASKS cycles rather than finding them.
+    ///
+    /// Both directions, because a detector that stops flagging is worse than
+    /// one that over-flags: a guard wrapped in anything must still be caught.
+    #[test]
+    fn a_return_type_must_name_a_guard_not_merely_contain_the_letters() {
+        // The exact defect, pinned in one line so it cannot rot: the old check
+        // was `contains("Guard")`, and this is the string that fooled it.
+        assert!(
+            "GuardedInput".contains("Guard"),
+            "the substring the old check matched on"
+        );
+        assert!(
+            !super::return_type_names_a_guard("GuardedInput"),
+            "and which this check must refuse"
+        );
+        for ret in [
+            "std::sync::MutexGuard<'static, Supervisor>",
+            "MutexGuard<'_, T>",
+            "Option<MutexGuard<'_, T>>",
+            "io::Result<RwLockReadGuard<'_, T>>",
+            "TermGuard<'_>",
+            "RwLockWriteGuard<'a, Store>",
+            "MappedMutexGuard<'_, T>",
+        ] {
+            assert!(
+                super::return_type_names_a_guard(ret),
+                "a real guard must still be detected: {ret}"
+            );
+        }
+        for ret in [
+            "GuardedInput",
+            "Guarded<T>",
+            "Vec<GuardedInput>",
+            "Result<GuardedInput, Error>",
+            "GuardRail",
+            "bool",
+        ] {
+            assert!(
+                !super::return_type_names_a_guard(ret),
+                "a type that is not a guard must not be flagged: {ret}"
+            );
+        }
     }
 
     #[test]

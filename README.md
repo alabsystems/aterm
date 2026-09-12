@@ -309,13 +309,16 @@ sid=$(aterm ctl spawn window=1 | cut -d' ' -f2)   # a fresh tab in window 1, imm
 #   (an unknown id is refused by name; a --headless instance owns logical window 0, the one `ls` and `windows` show)
 aterm ctl "@$sid" turn 'make test'
 aterm ctl "@$sid" await match 'result:'        # block until a regex appears (one token)
+aterm ctl "@$sid" await gone esc.to.interrupt   # block until NO row matches (an agent's busy footer leaving = its turn is over); one token — the wire never quotes
 aterm ctl subscribe "@$sid" events,cursor      # targets follow the verb here; add screen,cells,bytes as needed
 aterm ctl "@$sid" close
 ```
 
 `turn` types, submits, verifies the submit landed, settles, and returns the
-screen plus a deterministic hash. `await` takes one of four predicates —
-`idle <ms>`, `seq [<n>]`, `match <re>`, `block` — with an optional
+screen plus a deterministic hash. `await` takes one of five predicates —
+`idle <ms>`, `seq [<n>]`, `match <re>`, `gone <re>` (no visible row matches:
+the inverse of `match`, for a turn whose end is a busy footer leaving), `block`
+— with an optional
 `timeout=<ms>`; `await seq` is level-triggered, so `await seq <n> timeout=0` is
 a cheap one-shot "did anything change?" check, and any timeout exits with code
 124 so a script can tell "not yet" from "failed".

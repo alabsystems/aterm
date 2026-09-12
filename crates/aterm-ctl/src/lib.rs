@@ -21,7 +21,7 @@
 //! # Usage
 //!
 //! ```text
-//! aterm-ctl [--sock PATH | --pid PID] <verb> [args...]
+//! aterm-ctl [--sock PATH | --pid PID] [--timeout SECS] <verb> [args...]
 //! ```
 //!
 //! The socket path is resolved as: `--sock PATH` if given, else `--pid PID`
@@ -59,7 +59,12 @@
 //!   is the DECSCUSR style, lowercase: `blinking_block`, `steady_block`,
 //!   `blinking_underline`, `steady_underline`, `blinking_bar`, `steady_bar`,
 //!   `hidden`, `hollow_block`).
-//! * `cell <r> <c>`    — print `OK <codepoint> <fg> <bg>`.
+//! * `cell <r> <c>`    — print `OK <grapheme> <fg> <bg> <attrs>[ link=<url>]`: the
+//!   cell's pct-encoded GRAPHEME (empty for a blank cell or a wide glyph's
+//!   right-half spacer), `rrggbb` foreground and background, then `none` or a
+//!   comma list of attributes (`bold`, `dim`, `italic`, `underline`, `blink`,
+//!   `inverse`, `strike`, plus the `wide` / `wide_cont` width markers), and a
+//!   trailing ` link=<url>` only when the cell carries an OSC 8 hyperlink.
 //! * `search <pat>`    — print one `"<row> <col> <len>"` line per match. A hit
 //!   that straddles a SOFT WRAP is one match, reported at the row and column it
 //!   starts on, with `col + len` running past the grid width — the overflow
@@ -151,18 +156,36 @@
 //!   it takes no argument: a trailing word is `ERR usage: <verb>` (exit 1).
 //!
 //!   `ls`/`instances`/`windows` are answered CLIENT-side, but they still honour
-//!   `--sock`/`--pid`, which SCOPE the listing to the addressed instance. That
+//!   `--sock`/`--pid`, which SCOPE the listing to the addressed instance — and
+//!   ONLY those flags do: `$ATERM_CONTROL_SOCK` never narrows discovery. That
 //!   matters for isolation: an automated caller that launched its own instance
-//!   under a private `$ATERM_CONTROL_SOCK` gets back only that instance, never
-//!   the user's real terminals. A scoped listing that finds nothing says so
-//!   distinctly instead of degrading to "no live instances".
+//!   under a private socket passes `--sock` (or `--pid`) and gets back only that
+//!   instance, never the user's real terminals. A scoped listing that finds
+//!   nothing says so distinctly instead of degrading to "no live instances".
 //!
-//! For `text`, `search`, `modes`, `selection`, `chrome`, and `controls` the
-//! response is `"OK <n>\n"` followed by `<n>` data lines, and those data lines are
-//! what gets printed.
-//! For every other verb the single `OK …` status line itself is printed. An
-//! `ERR …` response is written to stderr and yields exit code 1; so does any
-//! connection failure.
+//! ## Response framing
+//!
+//! What gets printed follows the verb's framing, defined ONCE in
+//! [`aterm_types::control_verbs::framing_of`] (the table the server answers from,
+//! so client and server cannot disagree):
+//!
+//! * LINES — `text`, `search`, `modes`, `selection`, `chrome`, `controls`, `screen`,
+//!   `help`, `verbs`, `privacy`, `sessions`, `who`, `inbox`, `turn`, `history` and
+//!   the other listing/inspection verbs, the `image read` / `cast frames` /
+//!   `video frames` sub-forms, and every `--json` read: the response is
+//!   `"OK <n>\n"` followed by `<n>` data lines, and those data lines are what
+//!   gets printed. The header reaches stderr only as a diagnostic (a zero
+//!   count, `search`'s ` incomplete` marker, `turn`'s verdict, `inbox`'s hold
+//!   summary).
+//! * BYTES — bare `cast`, bare `temporal`, `inbox get`, `outbox`: `"OK <nbytes>\n"`
+//!   followed by an `<nbytes>` body, copied to stdout verbatim.
+//! * PUSH — `subscribe`: the `OK subscribe <n>` ack goes to stderr and the frames
+//!   that follow are relayed to stdout until the watch ends.
+//! * STATUS — every other verb: the single `OK …` line itself is printed.
+//!
+//! An `ERR …` response is written to stderr and yields exit code 1; so does any
+//! connection failure. A server-reported timeout (`OK timeout`, or a `turn`
+//! verdict carrying `status=timeout`) prints as usual but exits 124.
 
 use std::collections::HashSet;
 use std::env;
@@ -291,14 +314,21 @@ PUSH FRAMES (subscribe):
                                  caret move; matches the poll `cursor` verb)
       DELTA <local> seq=<n> cells <nbytes>   then <nbytes> bytes of styled-cell
                                  JSON + a trailing newline — a lossless state delta.
-      EVENT <local> <kind> ...   a lifecycle digest line: `turn <id> submitted=
-                                 status= dur_ms=`, `block-complete <id> exit=<n>`,
-                                 or `exited`.
+      EVENT <local> <kind> ...   a lifecycle digest line — `turn <id> submitted=
+                                 status= dur_ms=`, `block-complete <id> exit=<code|->`,
+                                 `meta`, `title`, `bell total=<n>`, the fabric kinds
+                                 (`inbox`, `inbox-seen`, `post`, `post-landed`, `hold`),
+                                 `closing reason= by=`, then `exited`; the `sessions`
+                                 stream adds `EVENT * session-created|session-exited`.
+                                 `subscribe --help` prints the full contract.
       BYTES <local> <len>        then <len> RAW PTY bytes + a trailing newline.
       GAP <local> ...            a discontinuity marker: `bytes-dropped=<n>`
-                                 (queue overflow) or `resync=<seq>` (engine reset —
+                                 (queue overflow), `resync=<seq>` (engine reset —
                                  state was dropped; treat the next DELTA as a fresh
-                                 snapshot / re-read with `screen`).
+                                 snapshot / re-read with `screen`), or
+                                 `events-resync=<floor>` (a `since-turn=` anchor
+                                 older than the retained turn ledger; records
+                                 below <floor> are gone).
 
 VERBS (generated from the protocol verb table — always current, cannot drift):
 ";
@@ -365,7 +395,9 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     These HONOUR --sock/--pid, which SCOPE the listing to the addressed
     instance instead of the whole fleet. Use that to keep an automated
     caller's own instance isolated from the user's real terminals. A
-    scoped listing that finds nothing reports that distinctly (exit 1).
+    scoped listing whose instance does not answer reports that distinctly
+    (exit 2, or 124 when every probe timed out); `--pid` naming a pid no
+    live instance has is a usage error (exit 1).
     `help ls` / `help instances` / `help windows` / `help mux` print the
     entry from this block, answered here as well (the server's `help`
     knows only the protocol table, so it cannot).
@@ -3436,6 +3468,14 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     // so an embedded '\n'/'\r' would inject a second authenticated verb.
     validate_request_parts(&request_parts)?;
 
+    // The wire never quotes (see `split_pattern_note`): say which pattern element
+    // the join below is about to split into several tokens, BEFORE it is sent —
+    // and still send it. A failure to write the note is ignored; the exchange's
+    // own outcome is what this call is for.
+    if let Some(note) = split_pattern_note(&request_parts) {
+        let _ = stderr_line(&note);
+    }
+
     // One request per line: "VERB [args...]\n". Args are joined with single
     // spaces; for `send`/`search` this reconstructs the free-form rest-of-line
     // payload (modulo collapsed inter-arg whitespace).
@@ -3710,6 +3750,82 @@ fn validate_request_parts(parts: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// The request from its verb token on — an optional leading proxy selector
+/// (`@<sid>` / `@.`) and the `dial <name> [@<sid>]` head skipped by the same rule
+/// [`forwarded_verb`] applies. Empty when there is no verb.
+fn forwarded_request(parts: &[String]) -> &[String] {
+    match parts.first() {
+        Some(d) if d == "dial" => match parts.get(2) {
+            Some(t) if t.starts_with('@') => parts.get(3..).unwrap_or(&[]),
+            _ => parts.get(2..).unwrap_or(&[]),
+        },
+        Some(sel) if sel.starts_with('@') => &parts[1..],
+        _ => parts,
+    }
+}
+
+/// The leading `key=value` option elements of a verb's argument list: every
+/// element up to the first that carries no `=` (the payload begins there) or is
+/// the `--` that ends options. A SUPERSET of what the server takes as options —
+/// `turn` (control_session.rs) also stops at the first key it does not know, and
+/// `key`/`send` (control_input.rs `take_leading_options`) recognise only `id=` /
+/// `if=` — so [`split_pattern_note`] can over-fire on a pattern that sits behind
+/// an unknown `word=…` (the server types that tail as text), never miss one.
+fn leading_options(args: &[String]) -> impl Iterator<Item = &str> {
+    args.iter()
+        .map(String::as_str)
+        .take_while(|a| *a != "--" && a.contains('='))
+}
+
+/// THE WIRE NEVER QUOTES. The request line is the argv joined with single spaces
+/// (see the join in [`real_main`]) and re-split on whitespace server-side, so a pattern
+/// the shell delivered as ONE element with spaces in it arrives as several tokens.
+/// Measured: `await gone 'esc to interrupt'` armed the regex `esc` and silently
+/// ignored the rest; `turn settle=match:'BUILD SUCCESSFUL' …` armed `BUILD` and
+/// TYPED `SUCCESSFUL …` into the session, because the option parser stops at the
+/// first token without `=`. This names the element that is about to be split, for
+/// the verb shapes whose argument is a pattern: `await match|gone <re>` (with the
+/// server's `timeout=<ms>` / `timeout <ms>` peel mirrored, so the regex is found
+/// wherever the timeout sits), `turn`'s leading `settle=match:<re>` /
+/// `settle=gone:<re>` option, and `key`/`send`'s leading `if=<re>` guard. A NOTE,
+/// not a refusal: the caller still sends the request unchanged, since a stale
+/// server build may rely on the old behaviour. `None` when nothing will be split.
+fn split_pattern_note(parts: &[String]) -> Option<String> {
+    let rest = forwarded_request(parts);
+    let verb = rest.first()?.as_str();
+    let args = &rest[1..];
+    let has_ws = |s: &str| s.contains(char::is_whitespace);
+    let arg = match verb {
+        "await" => {
+            let mut predicate: Vec<&str> = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                if args[i].starts_with("timeout=") {
+                    i += 1;
+                } else if args[i] == "timeout" && i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    predicate.push(args[i].as_str());
+                    i += 1;
+                }
+            }
+            match predicate.as_slice() {
+                ["match" | "gone", re, ..] if has_ws(re) => Some(*re),
+                _ => None,
+            }
+        }
+        "turn" => leading_options(args).find(|a| {
+            (a.starts_with("settle=match:") || a.starts_with("settle=gone:")) && has_ws(a)
+        }),
+        "key" | "send" => leading_options(args).find(|a| a.starts_with("if=") && has_ws(a)),
+        _ => None,
+    }?;
+    Some(format!(
+        "note: '{arg}' contains whitespace and is split on the wire; \
+         write the pattern as ONE token (e.g. esc.to.interrupt)"
+    ))
+}
+
 /// The verb that determines response framing (whether to read `OK <n>` follow-up
 /// lines, and `image read` detection), skipping an optional leading PROXY SELECTOR
 /// (`@<sid>` / `@.`; `@self` is already expanded upstream). Without this, a
@@ -3824,13 +3940,16 @@ const MAX_LINE_BYTES: usize = aterm_types::control_verbs::MAX_CONTROL_REPLY_LINE
 
 /// Hard deadline on each socket read/write in [`exchange`]. This CANNOT be
 /// [`probe_lines`]' 2 s discovery deadline: the blocking verbs (`await`,
-/// `ready`, `wait`) legitimately hold their reply until the server-side
-/// timeout, and the server clamps that timeout to 600 000 ms
-/// (control_session.rs / control_selection.rs); `update check` is answered
-/// synchronously too, with its own curl budget of 30 s (API `--max-time`) +
-/// 600 s (download `--max-time`) plus verify/stage disk work. So the client
-/// deadline sits ABOVE the worst legitimate synchronous verb (~650 s), with
-/// margin. It exists so a SILENTLY wedged server stalls aterm-ctl at most one
+/// `ready`, `wait`, `turn`) legitimately hold their reply until the server-side
+/// timeout, and the server clamps that timeout to 600 000 ms (aterm-gui
+/// control_session.rs; the selection wait in aterm-control/src/selection.rs).
+/// So the client deadline sits ABOVE that clamp, with margin. `update check` is
+/// answered synchronously too but is NOT bounded by it: its curl lanes carry
+/// 30 s (API) / 60 s (manifest) `--max-time` budgets with retries, and the asset
+/// download's `--max-time` is derived from the size cap
+/// (`download_max_time_secs` in aterm-update-core: a 600 s floor, up to
+/// 21 600 s) — a slow link needs an explicit `--timeout` (`0` disables it). The
+/// deadline exists so a SILENTLY wedged server stalls aterm-ctl at most one
 /// deadline per read — a byte-trickling peer instead runs into the
 /// [`MAX_LINE_BYTES`] accumulation cap, which bounds memory and total bytes
 /// (not wall-clock); between the two, never unbounded on either axis.
@@ -5064,6 +5183,192 @@ mod tests {
         assert!(validate_request_parts(&clean).is_ok());
     }
 
+    /// The exact line the client prints for a pattern element the join will
+    /// split — `aterm-ctl: ` is [`stderr_line`]'s prefix, the rest is this.
+    fn split_note(arg: &str) -> String {
+        format!(
+            "note: '{arg}' contains whitespace and is split on the wire; \
+             write the pattern as ONE token (e.g. esc.to.interrupt)"
+        )
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// `await match|gone <re>`: a regex element with whitespace is the measured
+    /// `await gone 'esc to interrupt'` — the server armed `esc` and ignored the
+    /// rest. The note names the element wherever the timeout sits (the server
+    /// peels `timeout=<ms>` and `timeout <ms>` from anywhere), and stays quiet for
+    /// a one-token regex, the other predicates and a missing pattern.
+    #[test]
+    fn split_pattern_note_names_an_await_regex_with_whitespace() {
+        assert_eq!(
+            split_pattern_note(&argv(&["await", "gone", "esc to interrupt"])),
+            Some(split_note("esc to interrupt"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "await",
+                "match",
+                "BUILD SUCCESSFUL",
+                "rows",
+                "0",
+                "5"
+            ])),
+            Some(split_note("BUILD SUCCESSFUL"))
+        );
+        // The timeout peel is mirrored: both spellings, before or after the regex.
+        assert_eq!(
+            split_pattern_note(&argv(&["await", "timeout=5000", "gone", "a b"])),
+            Some(split_note("a b"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&["await", "gone", "a b", "timeout", "5000"])),
+            Some(split_note("a b"))
+        );
+        // A tab is whitespace on the wire exactly like a space.
+        assert_eq!(
+            split_pattern_note(&argv(&["await", "match", "a\tb"])),
+            Some(split_note("a\tb"))
+        );
+        // ONE token: the documented spelling earns no note.
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "await",
+                "gone",
+                "esc.to.interrupt",
+                "timeout=600000"
+            ])),
+            None
+        );
+        for quiet in [
+            &["await", "idle", "500"][..],
+            &["await", "seq"][..],
+            &["await", "block"][..],
+            &["await", "inbox", "since=0"][..],
+            &["await", "match"][..],
+            &["await"][..],
+        ] {
+            assert_eq!(split_pattern_note(&argv(quiet)), None, "{quiet:?}");
+        }
+    }
+
+    /// `turn settle=match:<re>|gone:<re>`: the measured shape — the server's
+    /// option parser stops at the first token without `=`, so the tail of a
+    /// split pattern is TYPED into the session. Only a LEADING option counts:
+    /// the turn's own text may carry all the whitespace it likes, and an element
+    /// after the text (or after `--`) is text, not an option.
+    #[test]
+    fn split_pattern_note_names_a_turn_settle_pattern_with_whitespace() {
+        assert_eq!(
+            split_pattern_note(&argv(&["turn", "settle=match:BUILD SUCCESSFUL", "make"])),
+            Some(split_note("settle=match:BUILD SUCCESSFUL"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "turn",
+                "settle=gone:esc to interrupt",
+                "timeout=600000",
+                "fix the test",
+            ])),
+            Some(split_note("settle=gone:esc to interrupt"))
+        );
+        // Still leading after the exactly-once key and other options.
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "turn",
+                "id=1:me:7",
+                "idle=500",
+                "settle=gone:a b",
+                "hello",
+            ])),
+            Some(split_note("settle=gone:a b"))
+        );
+        // The text is the payload; whitespace there is the point of a turn.
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "turn",
+                "settle=match:BUILD.SUCCESSFUL",
+                "hello world"
+            ])),
+            None
+        );
+        // Not leading: after the text, or after `--`, it is text.
+        assert_eq!(
+            split_pattern_note(&argv(&["turn", "fix it", "settle=match:a b"])),
+            None
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&["turn", "--", "settle=match:a b"])),
+            None
+        );
+        // Another option with whitespace is not a pattern.
+        assert_eq!(
+            split_pattern_note(&argv(&["turn", "submit=none x", "hi"])),
+            None
+        );
+    }
+
+    /// `key`/`send` with a leading `if=<re>` guard: the same rule, the same
+    /// note; a guard after the payload is payload, and `send`'s free-form text
+    /// keeps its whitespace unremarked (the join collapses it, which `send`'s
+    /// documentation already says).
+    #[test]
+    fn split_pattern_note_names_a_key_or_send_if_guard_with_whitespace() {
+        assert_eq!(
+            split_pattern_note(&argv(&["key", "if=esc to interrupt", "enter"])),
+            Some(split_note("if=esc to interrupt"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&["send", "id=1:me:2", "if=a b", "hi"])),
+            Some(split_note("if=a b"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&["key", "if=quit.now", "enter"])),
+            None
+        );
+        assert_eq!(split_pattern_note(&argv(&["send", "hello world"])), None);
+        assert_eq!(split_pattern_note(&argv(&["send", "hi", "if=a b"])), None);
+        assert_eq!(split_pattern_note(&argv(&["key", "enter"])), None);
+    }
+
+    /// The verb is found where [`forwarded_verb`] finds it — behind a proxy
+    /// selector and behind `dial <name> [@<sid>]` — and every other verb, an
+    /// empty request included, earns nothing.
+    #[test]
+    fn split_pattern_note_follows_the_forwarded_verb_and_is_quiet_elsewhere() {
+        assert_eq!(
+            split_pattern_note(&argv(&["@s-1a2b", "await", "gone", "a b"])),
+            Some(split_note("a b"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&["dial", "host", "await", "gone", "a b"])),
+            Some(split_note("a b"))
+        );
+        assert_eq!(
+            split_pattern_note(&argv(&[
+                "dial",
+                "host",
+                "@s-r",
+                "turn",
+                "settle=gone:a b",
+                "x"
+            ])),
+            Some(split_note("settle=gone:a b"))
+        );
+        for quiet in [
+            &["search", "a b"][..],
+            &["text", "trim"][..],
+            &["help", "await"][..],
+            &["@s-1"][..],
+            &["dial", "host"][..],
+            &[][..],
+        ] {
+            assert_eq!(split_pattern_note(&argv(quiet)), None, "{quiet:?}");
+        }
+    }
+
     #[test]
     fn resolve_refuses_both_sock_and_pid() {
         let err = resolve_path(Some("/tmp/a.sock".into()), Some(7), None, None, None).unwrap_err();
@@ -5219,16 +5524,18 @@ mod tests {
         }
     }
 
-    /// The `exchange` deadline must clear every legitimate synchronous verb,
-    /// or the CLIENT deadline kills a healthy reply first: the blocking verbs'
-    /// server-side clamp (`await`/`ready`/`wait` cap their timeout at
-    /// 600 000 ms in control_session.rs / control_selection.rs) AND `update
-    /// check`'s synchronous curl budget (30 s API `--max-time` + 600 s
-    /// download `--max-time`, before verify/stage disk work).
+    /// The `exchange` deadline must clear the blocking verbs' server-side clamp
+    /// (`await`/`ready`/`wait`/`turn` cap their timeout at 600 000 ms in
+    /// control_session.rs; the selection wait in aterm-control/src/selection.rs),
+    /// or the CLIENT deadline kills a healthy reply first — and clear it by
+    /// enough that `update check`'s FLOOR (30 s API + 600 s download
+    /// `--max-time`, before verify/stage disk work) fits too. Its size-derived
+    /// ceiling does not, which is what `--timeout` is for (see
+    /// [`EXCHANGE_DEADLINE`]).
     #[test]
     fn exchange_deadline_clears_the_server_blocking_clamp() {
         assert!(EXCHANGE_DEADLINE > std::time::Duration::from_millis(600_000));
-        // update check: 30 s + 600 s of curl, plus real margin for staging.
+        // update check's floor: 30 s + 600 s of curl, plus real margin for staging.
         assert!(EXCHANGE_DEADLINE >= std::time::Duration::from_secs(650 + 60));
     }
 

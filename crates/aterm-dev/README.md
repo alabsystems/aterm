@@ -20,7 +20,7 @@ available operational levers at a glance.
 aterm-dev <command> [args...]
 aterm-dev --help        # grouped overview of every command
 aterm-dev --version     # workspace version
-aterm-dev <command> --help   # forwards to that tool's own help
+aterm-dev <command> --help   # forwarded verbatim: ship/visual-judge answer it, audit/verify-proofs just run
 ```
 
 An unknown subcommand prints `aterm-dev: unknown command <x> (try --help)` to
@@ -33,7 +33,7 @@ and exits `1`.
 
 | Command | Wraps | Description |
 | --- | --- | --- |
-| `ship` | `targo --unverified ship` (crate `aterm-release`) | Release cutter passthrough: `cut` / `status` / `verify` / `yank` — the whole build → sign → publish → verify pipeline is `aterm-dev ship cut` (see `docs/RELEASING.md`) |
+| `ship` | `targo --unverified ship` (crate `aterm-release`) | Release cutter passthrough: `cut` / `status` / `verify` / `yank` / `provision` / `recover` — the whole build → sign → publish → verify pipeline is `aterm-dev ship cut` (see `docs/RELEASING.md`) |
 
 ### Quality & Verify
 
@@ -52,5 +52,5 @@ package index, and `aterm pkg doctor` names the store it filled.)
 ```sh
 aterm-dev visual-judge --judges claude
 aterm-dev ship cut --dry-run
-aterm-dev audit --help
+aterm-dev visual-judge --help
 ```

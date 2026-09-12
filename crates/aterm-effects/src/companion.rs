@@ -506,58 +506,32 @@ pub fn pet_pointer_cell(
 
 // ── the custody law (app_render.rs) ─────────────────────────────────────────
 
-/// The SINGING FACE is LIVE: the sing drive at/above the S115 face-swap
-/// threshold (0.33 — `CatFrame::render_look` swaps to the authored open-mouth
-/// meow head there). ONE predicate for both FULL-MOTION render paths' pet
-/// caret feeds: while the face is live the pet's caret is withheld, so the pet
-/// fades out HOLDING POSITION and the singing face takes the caret; the moment
-/// the drive drops back below the threshold the caret re-feeds, and the pet's
-/// return is a fresh sighting at its keep-ahead station — never a flinch.
-/// Reduced motion uses [`pet_caret_admitted`]'s always-fed hidden resident.
-/// A non-finite drive reads as "not live" so a poisoned detector can never
-/// starve the pet of its caret.
+/// Whether the authored open-mouth singing face is live. This expression
+/// threshold does not transfer custody away from the resident pet.
+/// A non-finite drive reads as not live.
 #[must_use]
 pub fn sing_face_live(drive: f32) -> bool {
     drive >= 0.33
 }
 
-/// Whether the resident pet may track the caret while a song winds down.
-///
-/// Full-motion presentation starts the pet's return at the authored 0.33 face
-/// swap. Reduced motion has a stepped singer, so it keeps the pet caret-fed for
-/// the ENTIRE song while pixel custody remains exclusively with the singer.
-/// An already-visible resident therefore stays opaque, and a new resident can
-/// finish its 0.30 s fade-in behind the still. Most importantly, a late render
-/// may sample drive 1.0 -> 0.0 directly without depending on intermediate
-/// wind-down ticks: the cutoff reveals a ready pet instead of a blank frame.
+/// A presentable resident keeps tracking the caret throughout a song.
+/// Singing effects never change its caret or pixel ownership.
 #[must_use]
-pub fn pet_caret_admitted(pet_visible: bool, drive: f32, reduced_motion: bool) -> bool {
+pub fn pet_caret_admitted(pet_visible: bool, _drive: f32, _reduced_motion: bool) -> bool {
     pet_visible
-        && if reduced_motion {
-            true
-        } else {
-            !sing_face_live(drive)
-        }
 }
 
-/// THE SONG'S CUSTODY LAW: may the FLYING companion be drawn this frame?
-/// Outside pet mode an earned flight always may. In pet mode the resident pet
-/// owns the caret, and the flying kitty — the singing face — is admitted ONLY
-/// while the sing-along holds the frame (`sing > 0`: the armed hold plus the
-/// whole wind-down crossfade). Admission ends exactly when the drive drains
-/// to 0. In full motion the pet is already padding back because its caret
-/// re-fed at the 0.33 face swap ([`sing_face_live`]); reduced motion keeps the
-/// hidden resident caret-fed for the entire song ([`pet_caret_admitted`]).
+/// The flying companion is admitted outside pet mode. In pet mode the full
+/// resident owns the frame throughout the song and its tail.
 #[must_use]
-pub fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
-    !pet_mode || sing > 0.0
+pub fn flying_kitty_admitted(pet_mode: bool, _sing: f32) -> bool {
+    !pet_mode
 }
 
-/// The pet half of [`flying_kitty_admitted`]: exactly one companion owns a
-/// pet-mode frame, including the song's wind-down.
+/// A presentable pet owns the frame throughout singing and wind-down.
 #[must_use]
-pub fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
-    pet_visible && !flying_kitty_admitted(true, sing)
+pub fn pet_companion_admitted(pet_visible: bool, _sing: f32) -> bool {
+    pet_visible
 }
 
 /// Resolve [`CompanionDuty`] from this frame's two already-gated alphas.
@@ -586,7 +560,29 @@ pub fn cursor_companion_presentable(decoration_presentable: bool, live_viewport:
     decoration_presentable && live_viewport
 }
 
-/// The load-shed half of companion admission: a presentable companion stays
+/// The resident retains its body while accessibility policy or load pressure
+/// reduces motion. A shed fade remains static until full amplitude returns.
+#[inline]
+#[must_use]
+pub fn resident_pet_reduced_motion(policy_reduced: bool, shed_active: bool, envelope: f32) -> bool {
+    policy_reduced || shed_active || !envelope.is_finite() || envelope < 1.0
+}
+
+/// Real surface custody for the full resident. Pressure affects its posture,
+/// never whether the body belongs to this surface.
+#[inline]
+#[must_use]
+pub fn resident_pet_surface_presentable(
+    focused: bool,
+    companions_allowed: bool,
+    unobscured: bool,
+    live_viewport: bool,
+    reading_interest: bool,
+) -> bool {
+    focused && companions_allowed && unobscured && (live_viewport || reading_interest)
+}
+
+/// The load-shed half of flying-head admission: a presentable head stays
 /// admitted while the envelope is finite and above zero.
 #[inline]
 #[must_use]
@@ -624,14 +620,8 @@ pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
     }
 }
 
-/// Pin a PET-MODE episode's exit flourish to Plain, on the frame copy the
-/// host is about to draw (the state machine's roll becomes presentation-dead;
-/// no engine state changes). In pet mode the flying companion exists solely
-/// for the sing-along, and its admission ([`flying_kitty_admitted`]) ends the
-/// instant the drive drains — a rolled heart/star would either play over the
-/// pet's return or be chopped mid-flourish when admission cuts `kitty_alpha`
-/// to 0 (the exit emitter gates on it). The song's goodbye is the pet padding
-/// back, not a firework.
+/// Suppress the flying companion's exit flourish on a pet-mode frame copy.
+/// The resident keeps custody even when the hidden flying episode winds down.
 pub fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
     if pet_mode {
         frame.exit = crate::kitty_cursor::CatExit::Plain;
@@ -687,7 +677,7 @@ pub struct PetFacts<'a> {
 /// the custody verdict, and the yield box the word engine avoids.
 #[derive(Clone, Copy, Debug)]
 pub struct CompanionFrame {
-    /// The brain's frame, its alpha already attenuated by the shed envelope.
+    /// The brain's resident frame, retaining its alpha under load pressure.
     pub pet: PetFrame,
     pub duty: CompanionDuty,
     /// The pet is drawn this frame: owned, presentable, custody won, alpha > 0.
@@ -752,6 +742,9 @@ pub struct CompanionOwner {
     hit_rect: Option<(i32, i32, i32, i32)>,
     /// The alpha the last `sense` put on glass (`0` = nothing).
     last_alpha: u8,
+    /// The resolved posture of the last frame. Static presentation does not
+    /// inherit the brain's full-motion settle clocks or animation offers.
+    last_static: bool,
     /// The grid the last `sense` resolved against — what `emit` bakes with.
     geom: EffectGeom,
     /// The pair and mapped arrival the last `emit` synced — the hello seam's
@@ -775,6 +768,7 @@ impl Default for CompanionOwner {
             pointer_px: None,
             hit_rect: None,
             last_alpha: 0,
+            last_static: false,
             geom: EffectGeom::default(),
             last_sync: None,
         }
@@ -886,23 +880,19 @@ impl CompanionOwner {
         if host.visibility == Visibility::Hidden {
             self.retire_surface();
         }
-        let decoration_presentable = focused && host.visibility != Visibility::Hidden;
         // Ownership: the host's opt-in, serious mode (the glass belongs to
         // the work), and the trail owner's three terms.
         let owned = self.enabled
             && !host.serious
             && resident_pet_owner_present(pet_mode, trail_master, glow.style);
-        // THE PET IS NOT EARNED. The flying kitty is a reward for a sustained
-        // typing run and fades out when the run ends; the pet is a resident
-        // — that is the whole point of a creature that *sleeps*, and an
-        // earned companion can never be seen doing it. So the pet takes the
-        // PRESENTATION gate (focused, master on, the trail style actually
-        // selected, and the shared soft-shed envelope) and none of the
-        // momentum gate. Its own fade envelope, driven by whether the caret
-        // is visible at all, is the only thing that turns it off.
-        let pet_surface_presentable = shed_companion_presentable(
-            decoration_presentable && (facts.live_viewport || self.pet.has_reading_interest()),
-            host.shed_envelope,
+        // The full pet is a resident. Real focus/visibility gates decide
+        // whether it is presentable; load pressure only reduces its motion.
+        let pet_surface_presentable = resident_pet_surface_presentable(
+            focused,
+            true,
+            host.visibility != Visibility::Hidden,
+            facts.live_viewport,
+            self.pet.has_reading_interest(),
         );
         let pet_visible = owned
             && resident_pet_presentation_enabled(
@@ -992,21 +982,11 @@ impl CompanionOwner {
             self.retire_surface();
         }
         prepare_resident_pet_tick(decos, &mut self.pet, self.species, None);
-        // THE MOTION POLICY ONLY — never the performance shed. The host's
-        // stable preference × focus (an unfocused surface resolves Reduced,
-        // the native `MotionPolicy::resolve`); the shed is applied to the
-        // presented alpha below and never rewrites the resident's position
-        // model mid-walk.
-        let reduced_motion = host.reduced_motion || !focused;
-        // The FLYING companion's animation gate, the native `animate_cat =
-        // cursor_motion.animate(CursorGlow) && shed_envelope > 0.0`: the
-        // motion policy AND the shed. It is the caret law's third argument
-        // below (`!animate_cat`, exactly as native feeds it) and NOTHING
-        // else — the brain's `reduced_motion` above stays the policy alone,
-        // because a shed that flipped the resident's motion model would weld
-        // a walking body to the caret (`a_performance_shed_never_puts_the_
-        // pet_into_reduced_motion` in aterm-gui pins that half).
-        let animate_cat = !reduced_motion && host.shed_envelope > 0.0;
+        // The host carries its policy and the effective shed envelope. The
+        // resident becomes static under pressure while keeping its full body.
+        let reduced_motion =
+            resident_pet_reduced_motion(host.reduced_motion || !focused, false, host.shed_envelope);
+        self.last_static = reduced_motion;
         // THE BRAIN TICKS UNCONDITIONALLY: the scheduler asks `needs_frames()`
         // whether to keep the frame lane armed, and that is a pure read of
         // brain state which only `tick` advances. Ticking inside the draw
@@ -1019,17 +999,11 @@ impl CompanionOwner {
         // truth (there is no caret it could be chasing on this surface):
         // it fades out, settles, and releases the lane on its own.
         //
-        // THE SONG'S CARET LAW ([`pet_caret_admitted`]): full motion
-        // withholds the caret through the 0.33 face swap, so the pet fades
-        // out holding position and returns as a fresh sighting. Reduced
-        // motion keeps the resident caret-fed behind the opaque static
-        // singer, so a stepped or late cutoff always reveals an opaque pet.
-        // The third argument is the SINGER's stillness (`!animate_cat`, the
-        // shed included): a shed frame freezes the singing face, and a frozen
-        // singer is the stepped one the always-fed arm exists for.
+        // Singing never changes the resident's caret custody. Visibility
+        // still follows the real surface and user settings.
         let sense = PetSense {
             now,
-            caret: if pet_caret_admitted(pet_visible, sing.drive, !animate_cat) {
+            caret: if pet_caret_admitted(pet_visible, sing.drive, reduced_motion) {
                 facts.caret
             } else {
                 None
@@ -1041,33 +1015,23 @@ impl CompanionOwner {
             cell_h: geom.cell_h,
             reduced_motion,
             output_burst: pet_burst,
-            // Caret prewarming behind the singing face is not a touchable
-            // body. Preserve that lifecycle but only admit pointer contact
-            // when the last body was drawn and current pixel custody allows
-            // it; an envelope that rounds even opaque alpha dark admits none.
-            pointer: if self.last_alpha > 0
-                && pet_companion_admitted(pet_visible, sing.drive)
-                && shed_companion_alpha(255, host.shed_envelope) > 0
-            {
+            // Pointer contact requires a previously drawn body and current
+            // pixel custody; a fully suppressed resident cannot be touched.
+            pointer: if self.last_alpha > 0 && pet_companion_admitted(pet_visible, sing.drive) {
                 pet_pointer
             } else {
                 None
             },
         };
-        self.pet.set_console_presentable(
-            pet_companion_admitted(pet_visible, sing.drive)
-                && shed_companion_alpha(255, host.shed_envelope) > 0,
-        );
-        let mut pet_frame = match host.capture {
+        self.pet
+            .set_console_presentable(pet_companion_admitted(pet_visible, sing.drive));
+        let pet_frame = match host.capture {
             CaptureMode::Present => self.pet.tick(sense),
             CaptureMode::StaticCapture => self.pet.tick_static_capture(sense),
         };
-        pet_frame.alpha = shed_companion_alpha(pet_frame.alpha, host.shed_envelope);
-        // The brain can begin returning below the face-swap threshold, but
-        // only one companion is put on glass.
+        // The resident owns every pet-mode frame, including song and tail.
         let pet_on_glass = pet_companion_admitted(pet_visible, sing.drive) && pet_frame.alpha > 0;
-        // The flying head's admission: outside pet mode an earned flight
-        // always may; in pet mode only while the sing-along holds the frame.
+        // The flying head is admitted only outside pet mode.
         let kitty_alpha = if flying_kitty_admitted(pet_mode, sing.drive) {
             shed_companion_alpha(sing.flying_alpha, host.shed_envelope)
         } else {
@@ -1300,6 +1264,7 @@ impl CompanionOwner {
         self.pet.retire_unowned();
         self.hit_rect = None;
         self.last_alpha = 0;
+        self.last_static = false;
     }
 
     /// Retire only the pet's frozen contrast sample (a theme or palette
@@ -1309,19 +1274,24 @@ impl CompanionOwner {
     }
 
     /// THE CADENCE LAW: [`PetBrain::needs_frames`] — something is moving —
-    /// never `is_active()` — a cat exists.
+    /// never `is_active()` — a cat exists. Static presentation excludes the
+    /// brain's motion clocks, matching the native scheduler's motion gate.
     #[must_use]
     pub fn needs_frames(&self) -> bool {
-        self.pet.needs_frames()
+        !self.last_static && self.pet.needs_frames()
     }
 
     /// THE COARSE OFFER (Rainbow Kitty v2 A/B #19): a settled resident owes
     /// no frames but names the instant of its next VISIBLE step — a breath
     /// pixel, a blink, a tail beat — [`PetBrain::next_change_deadline`].
-    /// `None` when nothing will change (deep asleep, hidden, gone).
+    /// `None` when nothing will change (static posture, deep asleep, hidden, gone).
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
-        self.pet.next_change_deadline(now)
+        if self.last_static {
+            None
+        } else {
+            self.pet.next_change_deadline(now)
+        }
     }
 
     /// THE GRIEF GATE's read (gauntlet F4a): the brain's failure droop is on
@@ -1937,9 +1907,8 @@ mod law_tests {
         }
     }
 
-    /// The pet yields exactly at the S115 face-swap threshold — below it the
-    /// pet keeps the caret, at/above it the singing face owns it — and a
-    /// poisoned (NaN) drive must read "not live" so the pet never starves.
+    /// The face expression changes at the authored threshold; this does not
+    /// change the companion that owns the cursor.
     #[test]
     fn face_goes_live_at_the_swap_threshold() {
         assert!(!sing_face_live(0.0));
@@ -1951,7 +1920,7 @@ mod law_tests {
     }
 
     #[test]
-    fn reduced_song_keeps_pet_ready_under_singer_and_late_cutoffs_never_blank() {
+    fn reduced_song_keeps_full_pet_present_and_late_cutoffs_never_blank() {
         use crate::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
         use crate::kitty_cursor::{CursorCat, SingSync};
 
@@ -1971,8 +1940,7 @@ mod law_tests {
         let mut pet = PetBrain::default();
         let mut now = t0;
 
-        // The ordinary resident is fully present before the song earns its
-        // opaque still singer.
+        // The ordinary resident is fully present before the song starts.
         for _ in 0..30 {
             now += Duration::from_millis(16);
             let _ = pet.tick(sense(now, Some((4, 12))));
@@ -1999,10 +1967,10 @@ mod law_tests {
         );
         let held = singer.static_frame(now);
         assert_eq!(held.alpha, 255);
-        assert!(flying_kitty_admitted(true, held.sing));
-        assert!(!pet_companion_admitted(true, held.sing));
-        // Caret custody and pixel custody are deliberately separate: keeping
-        // the resident fed under the still never puts two bodies on glass.
+        assert!(!flying_kitty_admitted(true, held.sing));
+        assert!(pet_companion_admitted(true, held.sing));
+        // A fully opaque singing head is present in the episode, so excluding
+        // it proves the resident's ownership is an admission decision.
         pet_frame = pet.tick(sense(now, Some((4, 12))));
         assert_eq!(pet_frame.alpha, 255);
 
@@ -2034,7 +2002,7 @@ mod law_tests {
         let started = bind_handoff(
             &handoff_model.init_state(),
             "StartReducedSong",
-            held.alpha > 0,
+            held.alpha > 0 && flying_kitty_admitted(true, held.sing),
             pet_frame.alpha == 255 && pet_caret_admitted(true, 1.0, true),
             pet_companion_admitted(true, held.sing) && pet_frame.alpha > 0,
         );
@@ -2097,7 +2065,7 @@ mod law_tests {
         }
 
         // Tier-1 for the ordinary cadence too: half cutoff -> sampled tail ->
-        // below-face handoff -> drain, with every action driven by the same
+        // below-face expression -> drain, with every action driven by the same
         // runtime gates as the direct-late branches above.
         let mut cadenced = started.clone();
         for (drive, action) in [
@@ -2133,7 +2101,7 @@ mod law_tests {
         // A cold/new reduced-motion resident becomes an opaque still on its
         // first live-caret sample. Reduced motion owns no frame-cadence lane,
         // so leaving the ordinary 0.30 s appearance ramp here could strand a
-        // transparent pet behind the singer until an unrelated redraw.
+        // transparent resident until an unrelated redraw.
         let mut cold_pet = PetBrain::default();
         let first = cold_pet.tick(sense(now, Some((4, 12))));
         assert_eq!(first.alpha, 255);
@@ -2141,50 +2109,33 @@ mod law_tests {
             now += Duration::from_millis(16);
             let frame = cold_pet.tick(sense(now, Some((4, 12))));
             assert!(pet_caret_admitted(true, 1.0, true));
-            assert!(!pet_companion_admitted(true, 1.0));
+            assert!(pet_companion_admitted(true, 1.0));
             assert_eq!(frame.alpha, 255, "the reduced still stays opaque");
             pet_frame = frame;
         }
-        assert_eq!(pet_frame.alpha, 255, "pet remains ready under singer");
+        assert_eq!(pet_frame.alpha, 255, "the resident remains on glass");
 
-        // Full motion deliberately keeps the authored 0.33 caret swap.
-        assert!(!pet_caret_admitted(true, 0.4, false));
+        // Full motion preserves the same caret ownership at every threshold.
+        assert!(pet_caret_admitted(true, 0.4, false));
         assert!(pet_caret_admitted(true, 0.329, false));
         assert!(pet_caret_admitted(true, f32::NAN, true));
     }
 
-    /// The swap, end to end at the gate level: an armed song in pet mode
-    /// admits the flying kitty's alpha and withholds the pet's caret; a
-    /// drained song (drive 0) cuts admission and restores the caret in the
-    /// same frame; outside pet mode nothing changes.
+    /// Songs retain the full resident in both motion postures, through held
+    /// song and tail. Real visibility gates still suppress a hidden pet, and
+    /// outside pet mode the earned flying episode remains admitted.
     #[test]
-    fn armed_song_swaps_the_companions_and_the_drain_swaps_back() {
-        let (pet_mode, kitty_enabled, cat_alpha) = (true, true, 200u8);
-        // Armed (drive 1): the singing face is the companion.
-        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 1.0) {
-            cat_alpha
-        } else {
-            0
-        };
-        assert!(kitty_alpha > 0, "armed drive must admit the singing face");
-        assert!(
-            sing_face_live(1.0),
-            "armed drive must withhold the pet caret (fed None)"
-        );
-        // Drained (drive 0): admission ends, the pet's caret is restored.
-        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 0.0) {
-            cat_alpha
-        } else {
-            0
-        };
-        assert_eq!(kitty_alpha, 0, "drained drive must cut admission");
-        assert!(
-            !sing_face_live(0.0),
-            "drained drive must re-feed the pet caret"
-        );
-        // Outside pet mode the earned flight is untouched by the song.
-        assert!(flying_kitty_admitted(false, 0.0));
-        assert!(flying_kitty_admitted(false, 1.0));
+    fn armed_song_and_drain_keep_the_full_resident_in_pet_mode() {
+        for reduced_motion in [false, true] {
+            for drive in [0.0, 0.1, 0.3299, 0.33, 0.5, 1.0, f32::NAN] {
+                assert!(pet_caret_admitted(true, drive, reduced_motion));
+                assert!(pet_companion_admitted(true, drive));
+                assert!(!flying_kitty_admitted(true, drive));
+                assert!(!pet_caret_admitted(false, drive, reduced_motion));
+                assert!(!pet_companion_admitted(false, drive));
+                assert!(flying_kitty_admitted(false, drive));
+            }
+        }
     }
 
     /// Single-pane rendering used to admit both companions during wind-down.
@@ -2678,11 +2629,11 @@ mod owner_tests {
 
     #[test]
     fn only_a_presented_resident_can_receive_pointer_strokes() {
-        for (sing_drive, shed, visible) in [
-            (0.0, 1.0, true),
-            (0.2, 1.0, false), // caret-fed prewarm behind the singing face
-            (0.0, 0.0, false),
-            (0.0, 0.001, false), // even opaque alpha rounds to zero
+        for (sing_drive, shed, focused, visible) in [
+            (0.0, 1.0, true, true),
+            (0.2, 1.0, true, true), // singing keeps the resident pettable
+            (0.0, 1.0, false, false),
+            (0.2, 0.0, false, false),
         ] {
             let mut decos = WordDecorations::default();
             let mut owner = an_enabled_owner();
@@ -2716,7 +2667,7 @@ mod owner_tests {
                             drive: sing_drive,
                             ..SingFacts::default()
                         },
-                        focused: true,
+                        focused,
                     },
                     &mut decos,
                 );
@@ -3036,10 +2987,9 @@ mod owner_tests {
 
     /// The level rules that hide or retire the pet: a style that stops naming
     /// it retires it outright; serious mode retires it; the Hidden edge and
-    /// history hide it (identity kept); the shed attenuates the presented
-    /// alpha without touching the brain.
+    /// history hide it (identity kept); load pressure keeps a static resident.
     #[test]
-    fn the_level_rules_retire_hide_and_attenuate_as_ruled() {
+    fn the_level_rules_retire_hide_and_preserve_a_static_resident_under_load() {
         let mut decos = WordDecorations::default();
 
         // 'lumen' — the style stopped naming the pet.
@@ -3141,7 +3091,7 @@ mod owner_tests {
             "…while the brain is still fading"
         );
 
-        // The shed: half the presented alpha, the brain untouched.
+        // The shed: a static resident retains its full opacity.
         let mut owner = an_enabled_owner();
         let now = materialize(&mut owner, &mut decos);
         for _ in 0..40 {
@@ -3165,69 +3115,278 @@ mod owner_tests {
             &mut decos,
         );
         assert!(t.on_glass);
-        assert_eq!(t.pet.alpha, 128, "the presented alpha is attenuated");
-        assert_eq!(owner.alpha(), 128);
+        assert_eq!(t.pet.alpha, 255, "the full resident remains visible");
+        assert_eq!(owner.alpha(), 255);
         assert!(
             owner.brain().is_active(),
-            "the brain keeps its unscaled state"
+            "the resident remains active while static"
         );
     }
 
-    /// The custody law through the owner: while a song holds the frame in
-    /// pet mode the flying head owns the duty and the pet is off glass; the
-    /// drain hands the frame back to the pet.
+    fn resident_shed_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            ResidentShed {
+                const Buggy = 0;
+                var phase = 0;
+                var visible = 1;
+                var home = 1;
+                var idle = 0;
+                action Shed when (phase == 0) {
+                    phase = 1;
+                    visible = if Buggy == 0 { 1 } else { 0 };
+                    idle = 1;
+                }
+                action Move when (phase == 1) { phase = 2; }
+                action Idle when (phase == 2) { phase = 3; }
+                action Recover when (phase == 3) { phase = 4; idle = 0; }
+                invariant FullResident: visible == 1 && home == 1;
+                invariant StaticHasNoFrameDebt: phase == 0 || phase == 4 || idle == 1;
+                invariant Bounds: phase <= 4 && visible <= 1 && home <= 1 && idle <= 1;
+            }
+        }
+    }
+
     #[test]
-    fn a_song_hands_custody_to_the_flying_head_and_the_drain_hands_it_back() {
+    fn resident_shed_model_proves_and_catches_the_old_alpha_fade() {
+        let model = resident_shed_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    /// Tier-1 drives the shipping owner from a moving resident into load
+    /// shedding, across a distant cursor jump and through idle. The exact
+    /// body, emitter and scheduler must all agree with the derived contract.
+    #[test]
+    fn load_keeps_a_cursor_local_full_body_without_idle_frame_debt() {
+        let model = resident_shed_model();
+        let mut controls = 0;
+        for envelope in [0.0, 0.001, 0.5, f32::NAN] {
+            for capture in [CaptureMode::Present, CaptureMode::StaticCapture] {
+                let mut decos = WordDecorations::default();
+                let mut owner = an_enabled_owner();
+                let mut now = materialize(&mut owner, &mut decos);
+                let moving_claimed_frames = owner.needs_frames();
+                assert!(
+                    moving_claimed_frames,
+                    "control: the prior resident was moving"
+                );
+                let mut state = model.init_state();
+                for (phase, action, caret) in [
+                    (1, "Shed", (4, 12)),
+                    (2, "Move", (20, 70)),
+                    (3, "Idle", (20, 70)),
+                    (4, "Recover", (20, 71)),
+                ] {
+                    now += Duration::from_millis(50);
+                    let facts = facts_with(Some(caret));
+                    let mut host = host_at(now);
+                    host.shed_envelope = if action == "Recover" { 1.0 } else { envelope };
+                    host.capture = capture;
+                    let result = owner.sense(
+                        PetFacts {
+                            facts: &facts,
+                            host: &host,
+                            glow: pet_glow(),
+                            sing: SingFacts {
+                                drive: 1.0,
+                                flying_alpha: 255,
+                            },
+                            focused: true,
+                        },
+                        &mut decos,
+                    );
+                    let at_home = |row: f32, col: f32| {
+                        (row - f32::from(caret.0)).abs() <= 0.01
+                            && (col - f32::from(caret.1)).abs() <= 6.0
+                    };
+                    let mut free = Vec::new();
+                    owner.emit(&result, &[], BLACK_FALLBACK, &mut decos, &mut free);
+                    let observed = std::collections::BTreeMap::from([
+                        ("phase", phase),
+                        (
+                            "visible",
+                            i64::from(
+                                result.duty == CompanionDuty::Pet
+                                    && result.on_glass
+                                    && result.pet.alpha == 255
+                                    && result.body_px.is_some()
+                                    && !free.is_empty(),
+                            ),
+                        ),
+                        ("home", i64::from(at_home(result.pet.row, result.pet.col))),
+                        (
+                            "idle",
+                            i64::from(
+                                !owner.needs_frames() && owner.next_change_deadline(now).is_none(),
+                            ),
+                        ),
+                    ]);
+                    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                        &model,
+                        &[],
+                        &state,
+                        &observed,
+                        Some(action),
+                        "real resident under load",
+                    );
+                    assert!(
+                        ok,
+                        "{action} envelope={envelope:?}: {observed:?}, frame={result:?}, needs_frames={}, deadline={:?}: {why}",
+                        owner.needs_frames(),
+                        owner.next_change_deadline(now)
+                    );
+                    if action != "Recover" {
+                        assert_eq!(result.pet.lift, 0.0);
+                    } else {
+                        assert!(owner.needs_frames(), "full motion resumes on the new move");
+                    }
+                    assert!(owner.hit_rect().is_some());
+
+                    // Reject the historical alpha scaling, a stale pre-jump
+                    // home, and a frozen pre-shed scheduler on the SAME frames.
+                    let fault = match action {
+                        "Shed" => (
+                            "visible",
+                            i64::from(shed_companion_alpha(result.pet.alpha, envelope) == 255),
+                        ),
+                        "Move" => ("home", i64::from(at_home(4.0, 12.0))),
+                        "Idle" => ("idle", i64::from(!moving_claimed_frames)),
+                        _ => ("idle", 1), // a stale static posture hides restored motion
+                    };
+                    let mut broken = observed.clone();
+                    broken.insert(fault.0, fault.1);
+                    assert_ne!(
+                        broken, observed,
+                        "the negative control must change a real fact"
+                    );
+                    assert!(!model.successors(action, &state).contains(&broken));
+                    controls += 1;
+                    state = observed;
+                }
+            }
+        }
+        assert_eq!(controls, 32);
+    }
+
+    /// Capture follows the caller's existing motion policy; it must not
+    /// introduce a static scheduler posture merely because it is a capture.
+    /// Disabling retires the remembered posture, and a fresh live frame
+    /// resolves it again on re-enable.
+    #[test]
+    fn capture_and_reenable_do_not_leave_stale_static_scheduler_custody() {
         let mut decos = WordDecorations::default();
         let mut owner = an_enabled_owner();
-        let now = materialize(&mut owner, &mut decos);
+        let mut now = materialize(&mut owner, &mut decos);
         let facts = facts_with(Some((4, 12)));
-        let host = host_at(now + Duration::from_millis(16));
-        let sung = owner.sense(
+        let mut host = host_at(now);
+        host.capture = CaptureMode::StaticCapture;
+        owner.sense(
             PetFacts {
                 facts: &facts,
                 host: &host,
                 glow: pet_glow(),
-                sing: SingFacts {
-                    drive: 1.0,
-                    flying_alpha: 200,
-                },
+                sing: SingFacts::default(),
                 focused: true,
             },
             &mut decos,
-        );
-        assert_eq!(sung.duty, CompanionDuty::FlyingHead { cell: (4, 12) });
-        assert!(!sung.on_glass);
-        assert_eq!(
-            owner.hit_rect(),
-            None,
-            "the head is not pettable through the pet's rect"
         );
         assert!(
-            sung.companion.is_some_and(|c| c.guards_caret),
-            "the yield box is the head's caret band"
+            owner.brain().needs_frames(),
+            "the captured owner still has live motion"
         );
+        assert!(
+            owner.needs_frames(),
+            "capture alone must not cancel that motion"
+        );
+        assert!(!owner.last_static);
+        // The rejected capture implementation remembers 'static' from the
+        // capture mode, despite the full-motion sense it actually ticked.
+        owner.last_static = true;
+        assert!(
+            !owner.needs_frames(),
+            "control: the wrong cached fact loses real debt"
+        );
+        owner.last_static = false;
 
-        let host = host_at(now + Duration::from_millis(32));
-        let drained = owner.sense(
+        now += Duration::from_millis(16);
+        host.now = now;
+        host.capture = CaptureMode::Present;
+        host.shed_envelope = 0.0;
+        owner.sense(
             PetFacts {
                 facts: &facts,
                 host: &host,
                 glow: pet_glow(),
-                sing: SingFacts {
-                    drive: 0.0,
-                    flying_alpha: 200,
-                },
+                sing: SingFacts::default(),
                 focused: true,
             },
             &mut decos,
         );
-        assert_eq!(
-            drained.duty,
-            CompanionDuty::Pet,
-            "drive 0 cuts the head's admission; the pet is the resident"
+        assert!(owner.last_static && !owner.needs_frames());
+        owner.set_enabled_seed(false, 0x5EED);
+        assert!(!owner.last_static && !owner.needs_frames());
+        assert_eq!(owner.hit_rect(), None);
+        owner.set_enabled_seed(true, 0x5EED);
+        now += Duration::from_millis(16);
+        host.now = now;
+        host.shed_envelope = 1.0;
+        owner.sense(
+            PetFacts {
+                facts: &facts,
+                host: &host,
+                glow: pet_glow(),
+                sing: SingFacts::default(),
+                focused: true,
+            },
+            &mut decos,
         );
-        assert!(drained.on_glass);
+        assert!(!owner.last_static);
+        assert!(
+            owner.brain().needs_frames(),
+            "the new appearance owes live frames"
+        );
+        assert!(
+            owner.needs_frames(),
+            "re-enable must expose the new motion debt"
+        );
+    }
+
+    /// The shipping owner retains a full, pettable resident for the held
+    /// song and every tail cutoff, even when a competing head has live alpha.
+    #[test]
+    fn a_song_and_its_tail_keep_full_resident_custody() {
+        for reduced_motion in [false, true] {
+            let mut decos = WordDecorations::default();
+            let mut owner = an_enabled_owner();
+            let mut now = materialize(&mut owner, &mut decos);
+            let facts = facts_with(Some((4, 12)));
+            for drive in [1.0, 0.5, 0.4, 0.329, 0.1, 0.0] {
+                now += Duration::from_millis(16);
+                let mut host = host_at(now);
+                host.reduced_motion = reduced_motion;
+                let result = owner.sense(
+                    PetFacts {
+                        facts: &facts,
+                        host: &host,
+                        glow: pet_glow(),
+                        sing: SingFacts {
+                            drive,
+                            flying_alpha: 200,
+                        },
+                        focused: true,
+                    },
+                    &mut decos,
+                );
+                assert_eq!(result.duty, CompanionDuty::Pet, "drive={drive}");
+                assert!(result.on_glass);
+                assert_eq!(result.pet.alpha, 255);
+                assert!(result.body_px.is_some(), "the full body owns geometry");
+                assert!(owner.hit_rect().is_some(), "the resident stays pettable");
+                assert!(
+                    result.companion.is_some_and(|c| !c.guards_caret),
+                    "word companions yield to the resident body, not a head's caret band"
+                );
+            }
+        }
     }
 
     /// Reduced motion pins the resident at its station: it is drawn, and a

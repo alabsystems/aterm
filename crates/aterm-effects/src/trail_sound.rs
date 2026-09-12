@@ -308,6 +308,18 @@ pub enum SoundKind {
     /// one glint, one token, one column, one frame. m2/m3 births never mint
     /// this — a grain is silent — and neither does an erase-born star
     /// (Backspace is unpitched, ruled twice).
+    /// A PASTE landed — THE UP-STRUM (RAINBOW-KITTY-V2.md §28, the even
+    /// hand): one gesture, four tines of the music box's LIVE chord swept
+    /// upward at 0 / 22 / 44 / 66 ms. Keyed off the event KIND at the input
+    /// seam (`App::input_paste` cues it for a human's Cmd-V and an agent's
+    /// `paste`/`turn` remainder alike — never off a source), and voiced by
+    /// the music box ALONE: the host mints it only while the rainbow kitty
+    /// engine owns the frame, so the nine other voices never see it and the
+    /// arms below are silent by construction. The verse does NOT advance —
+    /// a paste is text arriving, not text being played — and the strum
+    /// banks the one echo credit a keystroke would, so the paste's own echo
+    /// cascade is the strum, not a brrrring on top of it.
+    Strum,
     Stardust {
         /// The star's own seeded scintillation rate in Hz, integer-stepped in
         /// `[8, 12]` (D12) — the glint twinkles at the rate of the star it
@@ -362,6 +374,14 @@ pub enum CelebrationGesture {
     /// mid-hold key change simply changes the payload the NEXT bar carries,
     /// over the same uninterrupted bar grid.
     RiffBar { bar: u16, sig: u32 },
+    /// THE OUTRO (RAINBOW-KITTY-V2.md §27): the armed celebration's ending,
+    /// pushed ONCE by the host on the run's last bar line — the pulse lead on
+    /// *do*, its sub, and the faraway ice bell, [`CELEBRATION_OUTRO_S`] long
+    /// — so the song ENDS on the downbeat instead of fading mid-phrase.
+    /// `sig` is the run's own signature: the outro resolves in the key the
+    /// bars sang. A human's release keeps the plain sing-duck crossfade; the
+    /// host never pushes this for a held key.
+    Outro { sig: u32 },
 }
 
 impl CelebrationGesture {
@@ -372,6 +392,13 @@ impl CelebrationGesture {
     #[must_use]
     pub fn riff_bar(bar: u16, sig: u32) -> Self {
         Self::RiffBar { bar, sig }
+    }
+
+    /// Build the outro gesture for a run in `sig`'s key — the stable
+    /// constructor, like [`Self::riff_bar`].
+    #[must_use]
+    pub fn outro(sig: u32) -> Self {
+        Self::Outro { sig }
     }
 }
 
@@ -721,12 +748,36 @@ pub struct EventMeta {
     /// cues delivered in one buffer must not be able to reorder a phrase
     /// boundary. `0` = unknown; see [`TrailSynth::clock_s`].
     pub at_ms: u32,
-    /// WHAT KIND OF GLYPH landed (§16 row 8), filled at the keyed seam only:
-    /// `0` letter/unknown, `1` `?`, `2` `!`, `3` digit, `4` punctuation.
+    /// WHAT KIND OF GLYPH landed (§16 row 8), filled at the keyed seam only —
+    /// the twelve-way keyboard table of [`glyph_class`], produced by
+    /// [`typed_glyph_class`] and nowhere else:
     ///
-    /// Reads the §10.4 "optional glyph grafts" (owner taste, off by default)
-    /// and the `!` hero request. An echo-born cue has no key behind it and
-    /// must carry `0`, exactly as it must carry `shifted: false`.
+    /// | class | glyphs | name |
+    /// |---|---|---|
+    /// | `0` | letters, space, IME runs, non-ASCII, no key | `LETTER` |
+    /// | `1` | `?` | `QMARK` |
+    /// | `2` | `!` | `BANG` |
+    /// | `3` | `0`..`9` | `DIGIT` |
+    /// | `4` | `.` `,` `;` `:` | `STOP` |
+    /// | `5` | `(` `[` `{` | `OPEN` |
+    /// | `6` | `)` `]` `}` | `CLOSE` |
+    /// | `7` | `'` `"` `` ` `` | `QUOTE` |
+    /// | `8` | `-` `_` `~` `\` `\|` | `LINE` |
+    /// | `9` | `/` | `RISE` |
+    /// | `10` | `+` `=` `*` `%` `^` `<` `>` | `MATH` |
+    /// | `11` | `@` `#` `$` `&` | `SIGIL` |
+    ///
+    /// Classes `0..=3` keep the meaning they had under the five-way split;
+    /// `4` NARROWED from "any punctuation" to the four stops when the table
+    /// grew on the owner's request of 2026-09-10 ("a sound effect for the
+    /// shift key and shifted keys and for numbers and punctuation"). Read by
+    /// `v2_typed` for the class voices (§10.4): a digit is a wood bar whose
+    /// sparkle counts, every other mark a knock with one literal gesture per
+    /// bucket. Still LOSSY — twelve classes beside eight rank buckets cannot
+    /// reconstruct text — and ASCII-only on purpose: the voices this picks
+    /// are keyboard-shaped taste, not Unicode categories. An echo-born cue
+    /// has no key behind it and must carry `0`, exactly as it must carry
+    /// `shifted: false`.
     pub glyph_class: u8,
     /// THE TYPED GLYPH'S ALPHABET RANK (§3.1's R2), filled at the keyed seam
     /// only — the one input the DERIVED melody has about *what* you wrote.
@@ -836,6 +887,77 @@ pub fn typed_glyph_rank(typed: Option<char>) -> u8 {
         '/' | '\\' | '|' => 43,
         c if c.is_ascii_punctuation() => 44,
         _ => 45,
+    }
+}
+
+/// [`EventMeta::glyph_class`]'s names — the twelve buckets of the ONE class
+/// table. The host seam (`app_input::typed_glyph_class`), the offline
+/// `keyboard_song_ab` bench and the engine's own tests all call
+/// [`typed_glyph_class`], so no consumer can carry a second copy of this
+/// table that disagrees about what a glyph is: a synth that heard a knock
+/// where the host meant a digit would not be the synth the host was
+/// driving. The values are the wire format of a `u8` field and are part of
+/// §16 row 8's identity column (`0` = letter/unknown), so they are stated as
+/// named constants rather than an enum — the field stays a plain `u8` on the
+/// side-car and an unknown value still lands on the letter path.
+pub mod glyph_class {
+    /// Letters, the space, an IME run, anything non-ASCII, and "no key".
+    pub const LETTER: u8 = 0;
+    /// `?` — the question that rises.
+    pub const QMARK: u8 = 1;
+    /// `!` — the bang.
+    pub const BANG: u8 = 2;
+    /// `0`..`9` — the wood bar that counts.
+    pub const DIGIT: u8 = 3;
+    /// `.` `,` `;` `:` — the stops: a knock and a breath.
+    pub const STOP: u8 = 4;
+    /// `(` `[` `{` — the brackets that open (not a knock: they open).
+    pub const OPEN: u8 = 5;
+    /// `)` `]` `}` — the brackets that close.
+    pub const CLOSE: u8 = 6;
+    /// `'` `"` `` ` `` — the quotes.
+    pub const QUOTE: u8 = 7;
+    /// `-` `_` `~` `\` `|` — a line drawn.
+    pub const LINE: u8 = 8;
+    /// `/` — the slash that rises.
+    pub const RISE: u8 = 9;
+    /// `+` `=` `*` `%` `^` `<` `>` — the operators; `<` `>` are comparisons
+    /// here, not an open/close pair.
+    pub const MATH: u8 = 10;
+    /// `@` `#` `$` `&` — every other ASCII mark.
+    pub const SIGIL: u8 = 11;
+}
+
+/// [`EventMeta::glyph_class`] for a typed character — the ONE producer of the
+/// twelve-way class table ([`glyph_class`]), beside [`typed_glyph_rank`] for
+/// the same reason: three consumers read it (the host seam, the bench, these
+/// tests) and a class stamped from two disagreeing copies is not a class.
+///
+/// `None` (an IME run, a bare modifier, an echo-born cue) is `LETTER`, as is
+/// every letter, the space and every non-ASCII glyph: the class voices are
+/// keyboard-shaped taste and the letter path is the fallback that every
+/// unknown lands on. The buckets are the keyboard's own groups, total over
+/// ASCII punctuation (`@ # $ &` are what is left once every named bucket has
+/// taken its marks), and LOSSY by design — see the field's own doc.
+#[must_use]
+pub fn typed_glyph_class(typed: Option<char>) -> u8 {
+    use glyph_class::*;
+    match typed {
+        None => LETTER,
+        Some('?') => QMARK,
+        Some('!') => BANG,
+        Some(c) if c.is_ascii_digit() => DIGIT,
+        Some('.' | ',' | ';' | ':') => STOP,
+        Some('(' | '[' | '{') => OPEN,
+        Some(')' | ']' | '}') => CLOSE,
+        Some('\'' | '"' | '`') => QUOTE,
+        Some('-' | '_' | '~' | '\\' | '|') => LINE,
+        Some('/') => RISE,
+        Some('+' | '=' | '*' | '%' | '^' | '<' | '>') => MATH,
+        // `@ # $ &` — the four ASCII marks no bucket above names.
+        Some(c) if c.is_ascii_punctuation() => SIGIL,
+        // Letters, the space, non-ASCII: the letter path.
+        Some(_) => LETTER,
     }
 }
 
@@ -2014,6 +2136,18 @@ pub const CELEBRATION_BAR_SECONDS: f32 = 1.6;
 /// One riff eighth-note in seconds (8 per bar).
 const CELEBRATION_EIGHTH: f32 = CELEBRATION_BAR_SECONDS / 8.0;
 
+/// The OUTRO's length (§27) — three beats at the sing-along tempo: the lead
+/// on *do* rings for the whole of it, the bell inside it. Pinned equal to
+/// `kitty_sing::OUTRO_SECONDS` by `the_outro_matches_the_visual_clock`.
+pub const CELEBRATION_OUTRO_S: f32 = 1.2;
+
+/// The outro lead's decay τ: a held *do* that is still sounding at the
+/// three-beat line and gone within the sing duck's handback.
+const CELEBRATION_OUTRO_DECAY_S: f32 = 0.34;
+
+/// The outro's sub — the bass *do* (C3, `CELEBRATION_BASS`'s `-10`).
+const CELEBRATION_OUTRO_SUB_DEG: i32 = -10;
+
 /// A grid slot that HOLDS — no new note; the previous one sustains through it.
 /// A sentinel rather than `Option<i32>` so the tables stay the flat `[i32; 8]`
 /// literals this module reads at a glance, and the const-table, zero-allocation
@@ -2824,6 +2958,8 @@ fn bed_kick(kind: SoundKind) -> f32 {
         | SoundKind::Meteor { .. }
         | SoundKind::Enter { .. }
         | SoundKind::Stardust { .. } => 0.0,
+        // A paste is typing cadence arriving at once: the Typed row.
+        SoundKind::Strum => 0.3,
     }
 }
 
@@ -2837,6 +2973,20 @@ fn bed_kick(kind: SoundKind) -> f32 {
 /// callback.
 #[derive(Clone, Debug)]
 pub struct TrailSynth {
+    /// **TEST ONLY — A GAIN TRIM ON §22's FLOW ECHO.** A scalar the
+    /// measurement harness sets to 0.0 to take the echo's AUDIO out while
+    /// leaving everything else about it identical: the same four rng draws,
+    /// the same slot, the same lane census. Every other voice in the take
+    /// then renders bit-for-bit, so the difference between the two takes is
+    /// the echo and nothing else.
+    ///
+    /// It exists because the obvious A/B — not spawning the echo — is NOT a
+    /// controlled one: `spawn` draws a tremolo phase and three oscillator
+    /// phases, so removing a voice re-rolls the seeded stream for every voice
+    /// after it. Measured on `word_ring_out`, that artefact alone is worth
+    /// 1.2 dB, which is larger than anything the echo does.
+    #[cfg(test)]
+    pub(crate) echo_trim: f32,
     inv_sr: f32,
     rng: u32,
     voices: [Voice; MAX_VOICES],
@@ -3222,6 +3372,8 @@ fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
 impl TrailSynth {
     pub fn new(sample_rate: f32, seed: u32) -> Self {
         Self {
+            #[cfg(test)]
+            echo_trim: 1.0,
             inv_sr: 1.0 / sample_rate.max(8_000.0),
             rng: seed | 1,
             voices: [Voice::default(); MAX_VOICES],
@@ -3517,8 +3669,30 @@ impl TrailSynth {
         // `MIN_GAP`. Routing a v2 event through any of that would mean editing
         // shared arithmetic to make room for it — and shared arithmetic is
         // exactly what the eight v1 palettes are pinned on.
+        // RAIN GLINTS ARE MUTED UNDER THE SING (§27): while the riff owns the
+        // room (`sing > 0`, a bar or the outro still holding) the typing
+        // rain's stardust chime is dropped rather than ducked — it is the one
+        // voice in the same register as the riff's shimmer, and a glint
+        // through a bar line reads as a wrong note. Music box only: every
+        // other palette never sets `sing`, so the nine stay byte-identical.
+        if self.sing > 0.0
+            && matches!(ev.kind, SoundGesture::Trail(SoundKind::Stardust { .. }))
+            && self.v2_engaged(&ev)
+        {
+            return;
+        }
         if self.v2_engaged(&ev) {
             return self.push_v2(ev, meta);
+        }
+        // THE STRUM IS THE MUSIC BOX'S ALONE (RAINBOW-KITTY-V2.md §28): under
+        // the nine other voices a paste keeps the sound it always had — its
+        // echo's own Jump — so the gesture is dropped AT THE DOOR, before the
+        // governor, the rate estimate, the bed and the melody could see it.
+        // The host never mints one outside the music box (`cue_paste`), and
+        // this is the synth's own half of that promise, pinned by
+        // `the_remainder_past_the_cap_is_one_strum_not_a_verse`.
+        if matches!(ev.kind, SoundGesture::Trail(SoundKind::Strum)) {
+            return;
         }
         // A v1 TRAIL EVENT RESOLVES A PENDING HANDBACK BY SNAPPING. §10.2's
         // word-boundary handback is detected on the v2 path alone
@@ -3754,6 +3928,10 @@ impl TrailSynth {
             SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, sig }) => {
                 self.latch_song_key(sig);
                 self.design_celebration(ev, bar, sig);
+            }
+            SoundGesture::Celebration(CelebrationGesture::Outro { sig }) => {
+                self.latch_song_key(sig);
+                self.design_celebration_outro(ev, sig);
             }
         }
     }
@@ -4217,7 +4395,7 @@ impl TrailSynth {
             // keep the ladder total, and each names the tier its v2 gesture
             // actually occupies so the table still reads as one ladder.
             SoundKind::MeteorArm { .. } => SHIFT_KIND_GAIN,
-            SoundKind::Meteor { .. } | SoundKind::Enter { .. } => JUMP_KIND_GAIN,
+            SoundKind::Meteor { .. } | SoundKind::Enter { .. } | SoundKind::Strum => JUMP_KIND_GAIN,
             SoundKind::Stardust { .. } => POOF_KIND_GAIN,
         };
         let g = g * kg;
@@ -5384,6 +5562,63 @@ impl TrailSynth {
         // keep arriving, exponential handback once they stop.
         self.sing = 1.0;
         self.sing_hold = CELEBRATION_BAR_SECONDS + 0.1;
+    }
+
+    /// THE OUTRO (§27): the armed celebration's ending, on the bar line the
+    /// host pushes it at. One lead voice on *do* — the riff's own pulse
+    /// timbre, its octave shimmer and the bass *do* as its third partial —
+    /// held for [`CELEBRATION_OUTRO_S`], and the faraway ice bell
+    /// ([`rainbow_kitty_v2::cad_bell_voice`], the Return cadence's) ringing
+    /// over it, so the song resolves where a cadence resolves. `shift` is
+    /// the run's root + mode, exactly as the bars had it, so *do* is THIS
+    /// key's *do*. Every celebration voice still sounding rides out under it
+    /// (no damp: same key, the pedal stays down). The sing duck holds for the
+    /// outro and hands back on its own τ — the crossfade — after.
+    fn design_celebration_outro(&mut self, ev: SoundEvent, sig: u32) {
+        self.last_riff_sig = Some(sig);
+        let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
+        let shift = celebration_root(sig) + celebration_mode(sig);
+        let duty = celebration_duty(sig);
+        let hz = self.melody_hz(CELEBRATION_BASE_HZ, shift);
+        let sub = self.melody_hz(CELEBRATION_BASE_HZ, CELEBRATION_OUTRO_SUB_DEG + shift);
+        let lead = Voice {
+            dur: CELEBRATION_OUTRO_S,
+            attack: 0.004,
+            decay: CELEBRATION_OUTRO_DECAY_S,
+            p: [
+                Partial {
+                    lvl: 0.55,
+                    f0: hz,
+                    f1: hz,
+                    wave: Wave::Pulse { duty },
+                    ..Partial::default()
+                },
+                Partial {
+                    lvl: 0.22,
+                    f0: hz * 2.0,
+                    f1: hz * 2.0,
+                    wave: Wave::Pulse { duty: 0.5 },
+                    ..Partial::default()
+                },
+                Partial {
+                    lvl: 0.42,
+                    f0: sub,
+                    f1: sub,
+                    ..Partial::default()
+                },
+            ],
+            lp_cut: 4200.0,
+            duck_exempt: true,
+            celebration: true,
+            ..Voice::default()
+        };
+        self.spawn(lead, g * CELEBRATION_GROOVE[0], celebration_sway(ev.pan, 0));
+        let (mut bell, trim) = rainbow_kitty_v2::cad_bell_voice(0.0);
+        bell.duck_exempt = true;
+        bell.celebration = true;
+        self.spawn(bell, ev.gain * trim, -0.5 * ev.pan);
+        self.sing = 1.0;
+        self.sing_hold = CELEBRATION_OUTRO_S;
     }
 
     // -- rendering ----------------------------------------------------------
@@ -7573,6 +7808,7 @@ impl Palette for MechPalette {
             | SoundKind::MeteorArm { .. }
             | SoundKind::Meteor { .. }
             | SoundKind::Enter { .. }
+            | SoundKind::Strum
             | SoundKind::Stardust { .. } => {}
         }
     }
@@ -7837,6 +8073,7 @@ impl Palette for TypewriterPalette {
             | SoundKind::MeteorArm { .. }
             | SoundKind::Meteor { .. }
             | SoundKind::Enter { .. }
+            | SoundKind::Strum
             | SoundKind::Stardust { .. } => {}
         }
     }
@@ -8000,6 +8237,7 @@ impl Palette for MarimbaPalette {
             | SoundKind::MeteorArm { .. }
             | SoundKind::Meteor { .. }
             | SoundKind::Enter { .. }
+            | SoundKind::Strum
             | SoundKind::Stardust { .. } => {}
         }
     }
@@ -8154,6 +8392,7 @@ impl Palette for FeltPalette {
             | SoundKind::MeteorArm { .. }
             | SoundKind::Meteor { .. }
             | SoundKind::Enter { .. }
+            | SoundKind::Strum
             | SoundKind::Stardust { .. } => {}
         }
     }
@@ -8495,6 +8734,70 @@ mod tests {
         for u in 0u32..0x3000 {
             if let Some(c) = char::from_u32(u) {
                 assert!(typed_glyph_rank(Some(c)) <= 45, "{c:?} ranked out of range");
+            }
+        }
+    }
+
+    /// **THE GLYPH CLASS IS ONE TABLE** (§16 row 8) for the host seam, the
+    /// `keyboard_song_ab` bench and the engine — the twelve keyboard buckets
+    /// of [`glyph_class`], stated glyph by glyph so a bucket cannot quietly
+    /// gain or lose a mark. TOTAL over ASCII punctuation (every one of the 32
+    /// marks lands in a named bucket, `@ # $ &` in `SIGIL`), `LETTER` for
+    /// every letter, the space, `None` and every non-ASCII glyph, and nothing
+    /// above `SIGIL` for any `char` at all.
+    #[test]
+    fn the_glyph_class_table_is_one_for_host_bench_and_engine() {
+        use glyph_class::*;
+        assert_eq!(typed_glyph_class(None), LETTER, "no key behind the cue");
+        assert_eq!(typed_glyph_class(Some('?')), QMARK);
+        assert_eq!(typed_glyph_class(Some('!')), BANG);
+        for c in '0'..='9' {
+            assert_eq!(typed_glyph_class(Some(c)), DIGIT, "{c:?}");
+        }
+        let table: [(&str, u8); 8] = [
+            (".,;:", STOP),
+            ("([{", OPEN),
+            (")]}", CLOSE),
+            ("'\"`", QUOTE),
+            ("-_~\\|", LINE),
+            ("/", RISE),
+            ("+=*%^<>", MATH),
+            ("@#$&", SIGIL),
+        ];
+        let mut named = 2; // `?` and `!`
+        for (glyphs, class) in table {
+            for c in glyphs.chars() {
+                assert_eq!(typed_glyph_class(Some(c)), class, "{c:?}");
+                named += 1;
+            }
+        }
+        // Every ASCII mark is named exactly once.
+        let marks: Vec<char> = (0x21u8..0x7f)
+            .map(char::from)
+            .filter(char::is_ascii_punctuation)
+            .collect();
+        assert_eq!(marks.len(), 32, "ASCII has 32 punctuation marks");
+        assert_eq!(named, marks.len(), "a mark is in two buckets, or in none");
+        for c in marks {
+            assert!(
+                (QMARK..=SIGIL).contains(&typed_glyph_class(Some(c))),
+                "{c:?} fell out of the mark buckets"
+            );
+        }
+        // LETTER — letters of either case, the space, and anything non-ASCII.
+        for c in ('a'..='z')
+            .chain('A'..='Z')
+            .chain([' ', 'é', '漢', '٣', '£', '\t'])
+        {
+            assert_eq!(typed_glyph_class(Some(c)), LETTER, "{c:?}");
+        }
+        // TOTAL — no input panics, and nothing exceeds the last named class.
+        for u in 0u32..0x3000 {
+            if let Some(c) = char::from_u32(u) {
+                assert!(
+                    typed_glyph_class(Some(c)) <= SIGIL,
+                    "{c:?} classed out of range"
+                );
             }
         }
     }
@@ -10715,6 +11018,112 @@ mod tests {
         assert_eq!(
             CELEBRATION_EIGHTH,
             crate::kitty_sing::SING_BEAT_SECONDS / 2.0
+        );
+    }
+
+    /// §27: the outro's length is one number on both sides of the seam.
+    #[test]
+    fn the_outro_matches_the_visual_clock() {
+        assert_eq!(CELEBRATION_OUTRO_S, crate::kitty_sing::OUTRO_SECONDS);
+        // Both are consts, so this is a compile-time law, not a runtime one.
+        const _: () = assert!(
+            CELEBRATION_OUTRO_S < CELEBRATION_BAR_SECONDS,
+            "the outro is shorter than a bar: it ends the song, it is not one more bar"
+        );
+    }
+
+    fn outro_sig(sig: u32) -> SoundEvent {
+        SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::outro(sig)),
+            ..riff_sig(GlowStyle::RainbowKitty, 0, sig)
+        }
+    }
+
+    /// §27, THE OUTRO ENDS ON *DO*: the outro spawns exactly two voices — the
+    /// lead and the bell — and the lead's fundamental is degree 0 in the
+    /// run's own key (`root + mode` of its signature, the same shift every
+    /// bar carried), with the bass *do* as its sub; it is duck-exempt and
+    /// holds the sing duck for the outro's own length, so the typed melody
+    /// stays under it until it has ended, and then hands back to exact rest.
+    #[test]
+    fn the_outro_s_lead_is_do_and_holds_the_sing_duck() {
+        let sig = crate::kitty_sing::song_signature('G');
+        let mut s = TrailSynth::new(48_000.0, 9);
+        s.push(riff_sig(GlowStyle::RainbowKitty, 0, sig));
+        let before = s.live_voices();
+        s.push(outro_sig(sig));
+        assert_eq!(
+            s.live_voices(),
+            before + 2,
+            "the outro is one lead and one bell"
+        );
+        let shift = celebration_root(sig) + celebration_mode(sig);
+        let want = s.melody_hz(CELEBRATION_BASE_HZ, shift);
+        let sub = s.melody_hz(CELEBRATION_BASE_HZ, CELEBRATION_OUTRO_SUB_DEG + shift);
+        let lead = s
+            .voices
+            .iter()
+            .filter(|v| v.on && v.celebration && v.duck_exempt)
+            .find(|v| (v.p[0].f0 - want).abs() < 1e-3)
+            .expect("the outro's lead sounds on do in the run's key");
+        assert!((lead.p[2].f0 - sub).abs() < 1e-3, "…over the bass do");
+        assert!(
+            (lead.dur - CELEBRATION_OUTRO_S).abs() < 1e-6,
+            "…for the outro's length"
+        );
+        assert_eq!(s.sing, 1.0, "the outro holds the sing duck");
+        assert!(
+            (s.sing_hold - CELEBRATION_OUTRO_S).abs() < 1e-6,
+            "…for exactly its own length, then hands back"
+        );
+        // Render past the outro + the handback: the duck rests at exact zero.
+        let mut buf = [0.0f32; 960];
+        for _ in 0..400 {
+            s.render(&mut buf);
+        }
+        assert_eq!(
+            s.sing, 0.0,
+            "the sing duck hands back to exact rest after the outro"
+        );
+    }
+
+    /// §27, RAIN GLINTS ARE MUTED UNDER THE SING: a music-box stardust chime
+    /// pushed while a bar (or the outro) holds the sing duck spawns no voice;
+    /// the same chime with the duck at rest spawns its glint, and the nine
+    /// other palettes' glints are untouched either way.
+    #[test]
+    fn rain_glints_are_muted_under_the_sing() {
+        let glint = |style| SoundEvent {
+            bed: false,
+            ..ev(style, SoundKind::Stardust { twinkle_hz: 0 })
+        };
+        let mut s = TrailSynth::new(48_000.0, 9);
+        let quiet = s.live_voices();
+        s.push(glint(GlowStyle::RainbowKitty));
+        assert!(
+            s.live_voices() > quiet,
+            "precondition: a glint sounds when nothing sings"
+        );
+
+        let mut s = TrailSynth::new(48_000.0, 9);
+        s.push(riff(GlowStyle::RainbowKitty, 0));
+        assert!(s.sing > 0.0);
+        let under = s.live_voices();
+        s.push(glint(GlowStyle::RainbowKitty));
+        assert_eq!(
+            s.live_voices(),
+            under,
+            "under the sing the glint is dropped"
+        );
+
+        let mut s = TrailSynth::new(48_000.0, 9);
+        s.sing = 1.0;
+        s.sing_hold = 10.0;
+        let other = s.live_voices();
+        s.push(glint(GlowStyle::Sparkle));
+        assert!(
+            s.live_voices() > other,
+            "another palette's glint is not the music box's"
         );
     }
 
@@ -12978,8 +13387,23 @@ mod tests {
     /// the keystroke it undoes, the comma stays at or under the letters it
     /// separates, and the lift whispers under all of them. Relative pins on
     /// purpose — the law is the ORDER, not a dBFS figure per palette.
+    ///
+    /// **RE-PINNED 2026-09-10 FOR THE MUSIC BOX ONLY** (the owner: *"a sound
+    /// effect for the shift key"*). Under the eight v1 palettes the clause is
+    /// verbatim: the lift is the quietest of the family. Under the voices
+    /// that engage the music box (`TrailSynth::v2_engaged`) the bare Shift
+    /// is a PICKUP that is meant to be HEARD under the key — `LIFT_LEVEL` in
+    /// `rainbow_kitty_v2.rs` — so its clause becomes a window, −12 to −5 dB
+    /// re the keystroke: still under the correction, never at the note. The
+    /// prototype measured 0.43 of the Typed peak; the window is a pin on the
+    /// order and the audibility, not on a palette's dBFS.
     #[test]
     fn the_ladder_holds_for_the_key_family() {
+        /// The music-box pickup's window re the keystroke: −5 dB (heard under
+        /// the note, never at it) …
+        const LIFT_LADDER_CEIL: f32 = 0.56;
+        /// … and −12 dB (heard at all: the −17 dB felt lift was not).
+        const LIFT_LADDER_FLOOR: f32 = 0.25;
         fn peak(voice: SoundVoice, kind: SoundKind) -> f32 {
             let mut s = TrailSynth::new(48_000.0, 0x5EED_1234);
             let mut e = voiced(voice, GlowStyle::RainbowKitty, kind);
@@ -13008,11 +13432,26 @@ mod tests {
                 "{voice:?}: the comma must not rise over the letters \
                  (space {space} vs typed {typed})"
             );
-            assert!(
-                shift < back && shift < space,
-                "{voice:?}: the lift is the quietest of the family \
-                 (shift {shift} vs backspace {back} / space {space})"
-            );
+            let music_box = TrailSynth::new(48_000.0, 1).v2_engaged(&voiced(
+                voice,
+                GlowStyle::RainbowKitty,
+                SoundKind::Typed,
+            ));
+            if music_box {
+                assert!(
+                    shift < back
+                        && shift <= typed * LIFT_LADDER_CEIL
+                        && shift >= typed * LIFT_LADDER_FLOOR,
+                    "{voice:?}: the pickup is heard under the key (shift {shift} vs typed \
+                     {typed}: window [{LIFT_LADDER_FLOOR}, {LIFT_LADDER_CEIL}]; backspace {back})"
+                );
+            } else {
+                assert!(
+                    shift < back && shift < space,
+                    "{voice:?}: the lift is the quietest of the family \
+                     (shift {shift} vs backspace {back} / space {space})"
+                );
+            }
         }
     }
 
@@ -13933,6 +14372,7 @@ mod tests {
                     | SoundKind::Meteor { .. }
                     | SoundKind::Enter { .. }
                     | SoundKind::Stardust { .. } => 0.0,
+                    SoundKind::Strum => 0.3,
                 };
                 self.bed.energy = (self.bed.energy + kick).min(1.0);
                 self.bed.gain += (gain - self.bed.gain) * 0.3;
@@ -14122,7 +14562,9 @@ mod tests {
                     // drift; `unreachable!` is deliberately NOT used — a
                     // panic in the oracle would report as a v0.56 deviation.
                     SoundKind::MeteorArm { .. } => SHIFT_KIND_GAIN,
-                    SoundKind::Meteor { .. } | SoundKind::Enter { .. } => JUMP_KIND_GAIN,
+                    SoundKind::Meteor { .. } | SoundKind::Enter { .. } | SoundKind::Strum => {
+                        JUMP_KIND_GAIN
+                    }
                     SoundKind::Stardust { .. } => POOF_KIND_GAIN,
                 };
                 let g = g * kg;
@@ -15793,7 +16235,39 @@ mod tests {
         /// the bed's exact-zero floor. `BRRRRING_FOLD` did not move at all:
         /// six Jumps spawn no typed key, so the sparkle cannot reach it
         /// either. Previous: `0xc771_4d38_1246_a3aa`.
-        pub const ORACLE_SCRIPT_FOLD: u64 = 0x78f6_6fed_25f0_3fbc;
+        ///
+        /// **RE-BAKED 2026-09-10, from a run on the MERGED tree, for TWO
+        /// independent changes that both ride this script's fifty typed keys.**
+        /// Two lanes each re-baked this constant from the same parent
+        /// (`0x78f6_6fed_25f0_3fbc`), each having measured its own change
+        /// alone — `0x1ec3_5ecf_4b77_a7c6` for the mallet and
+        /// `0xfbd8_48f4_4758_8024` for the sparkle. A fold is a claim about ONE
+        /// tree, so on the tree that carries both, neither is the answer and
+        /// this value comes from a fresh run rather than from either lane.
+        ///
+        /// 1. THE FELT MALLET'S OCTAVE (`rainbow_kitty_v2::MALLET_HZ0` /
+        ///    `MALLET_HZ1`, 900 → 3200 becoming 1800 → 6400, on the owner's
+        ///    "higher pitch shift sound"). The mallet rides every one of the
+        ///    fifty keys and a band-pass whose cutoff moved is a different
+        ///    waveform on each of them by construction — not a drift.
+        /// 2. THE SPARKLE'S LOUDNESS ARC (`rainbow_kitty_v2::KEY_GLINT_LEVEL_MUL`).
+        ///    The per-key glint's level was a constant, so it was the one
+        ///    per-key voice whose energy per SECOND grew with the typing rate:
+        ///    -64.21 / -60.68 / -58.26 dBFS at 4 / 10 / 20 cps while the tune
+        ///    fell 5.66 dB and the bloom 3.71 under §9.6's `g_IOI`. It now
+        ///    takes the same `g` and the layer is flat (-64.21 / -64.36 /
+        ///    -64.68). This script's flood is fifty keys at 40 ms — 25 cps,
+        ///    where `g_ioi` sits at its 0.45 floor — so every glint here is
+        ///    6.9 dB down. Its five SPACED kinds are untouched, and that
+        ///    narrowness is the evidence it is the arc and not a trim.
+        ///
+        /// Neither change can reach the shifted-key scoop or the capital's
+        /// lift: both are behind `SoundEvent::shifted` and every event in this
+        /// script is `shifted: false`. The eight v1 palettes are still within
+        /// `V056_TOLERANCE` of the v0.56 oracle on the same run, which is what
+        /// says the change stayed inside v2.
+        /// Previous: `0x78f6_6fed_25f0_3fbc`.
+        pub const ORACLE_SCRIPT_FOLD: u64 = 0xb3e4_328d_02dc_ab46;
         /// `brrrring_of_rapid_line_feeds_is_pinned`'s script (six Jumps at
         /// 30 ms, a 1 s ring-out), seed `0x5EED_50FD`.
         pub const BRRRRING_SAMPLES: usize = 113_280;
@@ -15826,7 +16300,17 @@ mod tests {
         /// truncation take out. `BRRRRING_ONSETS` is unchanged at 6: the
         /// cascade is untouched, again.
         /// Previous: `0x8f4c_7088_3ba4_04fb`.
-        pub const BRRRRING_FOLD: u64 = 0xcbd2_c6b8_d155_65bb;
+        ///
+        /// **RE-BAKED 2026-09-10, from a run, for the FELT MALLET'S OCTAVE.**
+        /// This is the narrow case again and it moved this time: the cascade
+        /// is built from `rainbow_kitty_v2::tine`, so all four of its notes
+        /// carry the mallet, and its sweep is now 1800 → 6400 Hz. The melody
+        /// rulings still cannot reach a six-Jump script and neither can the
+        /// shifted-key work in the same commit. `BRRRRING_ONSETS` is
+        /// unchanged at 6: D18's cap is what this pin is about, and a
+        /// band-pass cutoff cannot change how many notes speak.
+        /// Previous: `0xcbd2_c6b8_d155_65bb`.
+        pub const BRRRRING_FOLD: u64 = 0xe93f_d713_843e_3442;
         /// Pitched onsets the six-jump burst spawns under the music box (D18:
         /// one four-note cascade, then at most one quiet top-note re-strike per
         /// 60 ms).

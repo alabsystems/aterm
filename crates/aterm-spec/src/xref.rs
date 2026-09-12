@@ -1171,6 +1171,11 @@ pub fn model_registry() -> Vec<Model> {
         reduced_motion_companion_handoff_model(),
         cursor_cat_motion_pulse_routing_model(),
         cursor_hint_license_model(),
+        // The rainbow-kitty echo ledger: a licensed typed move pays the hole
+        // the seam refused out of the presses older than its licensing key,
+        // exactly, and a refusal forgets them. Tier-1 drives the real
+        // `Engine` in aterm-effects/src/rainbow_kitty/mod.rs.
+        echo_ledger_bridge_model(),
         cursor_viewport_lifecycle_model(),
         // Resident cursor companions retain personality across a pane/tab
         // owner edge, but never coordinates or hit targets. A truly

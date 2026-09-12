@@ -155,10 +155,6 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Run the health surface, printing the report. Returns `true` iff there were NO structural
-/// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
-/// + the `[packages]` config account + the token chain's SOURCE label — never the token).
-#[must_use]
 /// What the WORKSPACE the operator is standing in demands of the installed Trust
 /// toolchain, as decided by the installed `targo` itself (`targo locate-project
 /// --workspace` parses the manifest, compiles nothing, and refuses a `[trust]` policy
@@ -247,11 +243,16 @@ fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicy
         .into_iter()
         .find(|(p, _)| p == "trust")
         .map(|(_, b)| b)?;
-    let targo = layout.build_dir("trust", trust_build).join("bin").join("targo");
+    let targo = layout
+        .build_dir("trust", trust_build)
+        .join("bin")
+        .join("targo");
     if !targo.is_file() {
         return Some(WorkspacePolicyProbe {
             workspace,
-            policy: WorkspacePolicy::ProbeFailed { why: format!("no targo at {}", targo.display()) },
+            policy: WorkspacePolicy::ProbeFailed {
+                why: format!("no targo at {}", targo.display()),
+            },
         });
     }
     let probe = std::process::Command::new(&targo)
@@ -275,11 +276,19 @@ fn probe_workspace_policy(layout: &Layout, cwd: &Path) -> Option<WorkspacePolicy
     Some(WorkspacePolicyProbe { workspace, policy })
 }
 
-/// Where rustup's `trust` channel points, when that is NOT inside the atpkg store.
+/// Where rustup's `trust` channel points, when that is NOT inside the atpkg store. The
+/// rustup home is the one rustup itself resolves — `$RUSTUP_HOME`, else `<home>/.rustup`
+/// ([`crate::seam::rustup_home_with`]) — so a relocated home is probed, not skipped.
 fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealProbe> {
-    let link = home?.join(".rustup").join("toolchains").join("trust");
+    let link = crate::seam::rustup_home_with(std::env::var_os("RUSTUP_HOME").as_deref(), home)?
+        .join("toolchains")
+        .join("trust");
     let target = std::fs::read_link(&link).ok()?;
-    let target = if target.is_absolute() { target } else { link.parent()?.join(target) };
+    let target = if target.is_absolute() {
+        target
+    } else {
+        link.parent()?.join(target)
+    };
     let canonical_target = std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
     let canonical_prefix =
         std::fs::canonicalize(&layout.prefix).unwrap_or_else(|_| layout.prefix.clone());
@@ -299,9 +308,16 @@ fn probe_local_seal(layout: &Layout, home: Option<&Path>) -> Option<LocalSealPro
             })
         })
         .unwrap_or_else(|| "unknown".to_string());
-    Some(LocalSealProbe { link_target: target, trustc: commit })
+    Some(LocalSealProbe {
+        link_target: target,
+        trustc: commit,
+    })
 }
 
+/// Run the health surface, printing the report. Returns `true` iff there were NO structural
+/// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
+/// + the `[packages]` config account + the token chain's SOURCE label — never the token).
+#[must_use]
 pub fn run(layout: &Layout, prefix: &str) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
@@ -413,9 +429,11 @@ pub fn run_with(
         None => {
             let _ = writeln!(
                 out,
-                "{p}: ok — no GitHub token provisioned (anonymous API: fine for public \
-             repos, rate-limited; `gh auth login` provisions one; private fetch overrides \
-             need one)"
+                "{p}: ok — no GitHub token in use (anonymous API: fine for public repos, \
+             rate-limited; `$ATPKG_TOKEN` is always honoured, and a repointed account or a \
+             private `[packages.links]` override also consults the app updater's chain — \
+             `$ATERM_UPDATE_TOKEN`, keychain, 0600 file, `$GITHUB_TOKEN`/`$GH_TOKEN`, \
+             `gh auth token`)"
             );
         }
     }
@@ -523,14 +541,40 @@ pub fn run_with(
     // symlink on Unix; on Windows a `.cmd` forwarding to a missing exe, which no symlink
     // scan could ever catch). `resolve_shim` reads the target cross-platform; a tombstone
     // (deliberately target-less) yields `None` and is never flagged.
+    //
+    // A SHIM WE COULD NOT STAT IS NOT A BROKEN SHIM. This asked `Path::exists()`, which
+    // is `fs::metadata(..).is_ok()` and so answers `false` for a target that is there
+    // and merely unreadable — EACCES on a parent directory, macOS privacy consent's
+    // EPERM, EIO. Every one of those printed FAIL and pushed the exit code non-zero
+    // over a shim that runs, and `tools/install.sh` hands that exit code to every
+    // failed-seed installer as THE diagnostic to trust. The implied remedy, reinstall,
+    // repairs nothing — the same expensive wrong the speaker line at (0) exists to make
+    // verifiable.
+    //
+    // The blindness is not swallowed either: silently passing would make the check
+    // claim a health it did not observe, which is the same defect pointed the other
+    // way. It is REPORTED, as a warn that names the cause — and a warn, not a fault,
+    // because nothing here is evidence of one.
     if let Ok(entries) = std::fs::read_dir(&bin_dir) {
         for e in entries.flatten() {
             let shim = e.path();
-            if let Some(target) = crate::platform::resolve_shim(&shim)
-                && !target.exists()
-            {
-                fails += 1;
-                let _ = writeln!(err, "{p}: FAIL — broken bin shim {}", shim.display());
+            let Some(target) = crate::platform::resolve_shim(&shim) else {
+                continue;
+            };
+            match crate::store::presence(&target) {
+                crate::store::Presence::Present => {}
+                crate::store::Presence::Absent => {
+                    fails += 1;
+                    let _ = writeln!(err, "{p}: FAIL — broken bin shim {}", shim.display());
+                }
+                crate::store::Presence::Unknown(why) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — bin shim {} could not be checked ({why}); its target                          {} is unreadable by this user, which is a permission to look, not                          a broken shim",
+                        shim.display(),
+                        target.display()
+                    );
+                }
             }
         }
     }
@@ -646,7 +690,8 @@ pub fn run_with(
             .unwrap_or_else(|| "?".to_string());
         match &ws.policy {
             WorkspacePolicy::Accepted => {
-                let _ = writeln!(out,
+                let _ = writeln!(
+                    out,
                     "{p}: ok — workspace {} declares a [trust] policy the installed trust \
                      build {trust_build} accepts",
                     ws.workspace.display()
@@ -655,7 +700,8 @@ pub fn run_with(
             WorkspacePolicy::UnknownField { field } => {
                 fails += 1;
                 next_publish = true;
-                let _ = writeln!(err,
+                let _ = writeln!(
+                    err,
                     "{p}: FAIL — workspace {} declares a [trust] policy key the installed \
                      trust build {trust_build} does not know: `{field}`. Whoever committed \
                      it built on a NEWER Trust seal that atpkg has not published, so this \
@@ -666,7 +712,8 @@ pub fn run_with(
                 );
             }
             WorkspacePolicy::ProbeFailed { why } => {
-                let _ = writeln!(out,
+                let _ = writeln!(
+                    out,
                     "{p}: warn — could not ask the installed targo about workspace {} \
                      ({why})",
                     ws.workspace.display()
@@ -679,7 +726,8 @@ pub fn run_with(
     // machine; the warning exists so that machine can see the seal is still local
     // only — the other half of (5d), seen from the side that causes it.
     if let Some(seal) = &probes.local_seal {
-        let _ = writeln!(out,
+        let _ = writeln!(
+            out,
             "{p}: warn — rustup's trust channel resolves to a LOCAL toolchain, not the \
              atpkg store: {} (trustc {}). Commits made against features only it has \
              will not build on atpkg-managed machines until that seal is published \
@@ -704,7 +752,8 @@ pub fn run_with(
                 let _ = writeln!(
                     err,
                     "{p}: FAIL — {}: the channel selects build {channel_says} but its bin/ \
-                     shims run build {shims_say} (re-run `aterm pkg update {}`)",
+                     shims run build {shims_say} (re-run `aterm pkg update {}`: it installs \
+                     the pinned build, or re-points the links when the shims already run it)",
                     d.program, d.program
                 );
             }
@@ -714,7 +763,9 @@ pub fn run_with(
                 let _ = writeln!(
                     err,
                     "{p}: FAIL — {}: its bin/ shims are split across builds {} — one \
-                     program's tools must all point into one build (re-run `aterm pkg update {}`)",
+                     program's tools must all point into one build (run `aterm pkg repair` \
+                     to re-lay every shim from one build, then `aterm pkg update {}` to \
+                     re-point the links)",
                     d.program,
                     build_list(builds),
                     d.program
@@ -739,7 +790,7 @@ pub fn run_with(
                     out,
                     "{p}: warn — {}: build {shims_say} is on PATH but no `current` link \
                      selects it, so gc keeps every superseded {} build. Run \
-                     `aterm pkg update {}` to re-activate it and clear this.",
+                     `aterm pkg update {}` to write the link and clear this.",
                     d.program, d.program, d.program
                 );
             }
@@ -1918,7 +1969,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut std::io::sink());
+                &mut std::io::sink(),
+            );
             let text = String::from_utf8_lossy(&out);
             assert!(
                 text.contains("is NOT the managed store"),
@@ -1998,7 +2050,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut std::io::sink());
+                &mut std::io::sink(),
+            );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         // Nothing laid and the reroute dir absent from PATH (a shell outside a session):
@@ -2392,6 +2445,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A SHIM WE COULD NOT STAT IS NOT A BROKEN SHIM.
+    ///
+    /// Check (4) asked `Path::exists()`, which is `fs::metadata(..).is_ok()` and so
+    /// answers `false` for a target that is THERE and merely unreadable — EACCES on a
+    /// parent directory, EPERM from macOS privacy consent, EIO. doctor then printed
+    /// `FAIL — broken bin shim` and exited non-zero about a shim that works, and
+    /// `tools/install.sh` hands that exit code to every failed-seed installer as THE
+    /// diagnostic to trust. The remedy it implies — reinstall — repairs nothing.
+    ///
+    /// Nothing about the store changes here; only the permission to LOOK at it. The
+    /// health check must not invent a fault out of its own blindness — and it must not
+    /// silently pass either, so the Unknown is REPORTED, as a warn that names the cause.
+    #[cfg(unix)]
+    #[test]
+    fn a_shim_whose_target_cannot_be_stat_ed_is_not_reported_broken() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if crate::platform::our_uid() == 0 {
+            return; // root reads through mode 0; the case does not exist.
+        }
+        let l = layout("unstattable-shim");
+        install(&l, "ay", 18);
+        let home = synthetic_home("unstattable-shim");
+        let holder = l.build_dir("ay", 18).join("bin");
+        let saved = std::fs::metadata(&holder).unwrap().permissions();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let target = crate::platform::resolve_shim(&l.shim(&tool("ay"))).unwrap();
+        let armed = std::fs::metadata(&target).is_err();
+        let mut err = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            None,
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut std::io::sink(),
+            &mut err,
+        );
+        std::fs::set_permissions(&holder, saved).unwrap();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            armed,
+            "the fixture must make the stat fail, or it proves nothing"
+        );
+        let err = String::from_utf8_lossy(&err).into_owned();
+        assert!(
+            !err.contains("broken bin shim"),
+            "a shim we could not look at was condemned as broken: {err}"
+        );
+    }
+
+    /// AND IT MUST SAY SO. The sibling above pins that blindness is not a FAULT; this
+    /// one pins that it is not SILENCE either. Dropping the unstattable shim on the
+    /// floor would make check (4) report a clean bill it never observed — the same
+    /// defect as the FAIL, pointed the other way — and this is the check a user runs
+    /// precisely when something is wrong. The line names the shim, the target and the
+    /// errno, so the reader can tell a permission problem from a missing file without
+    /// reading source.
+    #[cfg(unix)]
+    #[test]
+    fn doctor_says_when_it_could_not_check_a_shim() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if crate::platform::our_uid() == 0 {
+            return; // root reads through mode 0; the case does not exist.
+        }
+        let l = layout("unchecked-shim");
+        install(&l, "ay", 18);
+        let home = synthetic_home("unchecked-shim");
+        let holder = l.build_dir("ay", 18).join("bin");
+        let saved = std::fs::metadata(&holder).unwrap().permissions();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let target = crate::platform::resolve_shim(&l.shim(&tool("ay"))).unwrap();
+        let armed = std::fs::metadata(&target).is_err();
+        let mut out = Vec::new();
+        let _ = run_with(
+            &l,
+            Some(&home),
+            None,
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut std::io::sink(),
+        );
+        std::fs::set_permissions(&holder, saved).unwrap();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            armed,
+            "the fixture must make the stat fail, or it proves nothing"
+        );
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            out.contains("could not be checked"),
+            "a shim the scan could not look at must be reported, not skipped: {out}"
+        );
+    }
+
     #[test]
     fn active_build_with_missing_store_fails() {
         let l = layout("missing-store");
@@ -2591,7 +2747,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut err);
+                &mut err,
+            );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let (ok, out) = run(&l);
@@ -2677,7 +2834,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut err);
+                &mut err,
+            );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let (ok, out) = run(&l);
@@ -2769,7 +2927,8 @@ mod tests {
             "doctor",
             &Probes::default(),
             &mut out,
-            &mut err);
+            &mut err,
+        );
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(
             ok,
@@ -2816,7 +2975,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut err);
+                &mut err,
+            );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let ahead = std::env::join_paths([foreign.clone(), l.bin_dir()]).unwrap();
@@ -2905,7 +3065,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut err);
+                &mut err,
+            );
             (ok, String::from_utf8_lossy(&out).into_owned())
         };
         let managed_only = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -2991,7 +3152,8 @@ mod tests {
             "doctor",
             &Probes::default(),
             &mut out,
-            &mut err);
+            &mut err,
+        );
         let out = String::from_utf8_lossy(&out).into_owned();
         assert!(ok, "a shadow is a warning, not a structural fault:\n{out}");
         let state = crate::state::shadowed(6808, &exe);
@@ -3312,7 +3474,8 @@ mod tests {
                 "doctor",
                 &Probes::default(),
                 &mut out,
-                &mut err);
+                &mut err,
+            );
             (
                 ok,
                 String::from_utf8_lossy(&out).into_owned(),
@@ -3406,7 +3569,8 @@ mod tests {
             "doctor",
             &Probes::default(),
             &mut out,
-            &mut err);
+            &mut err,
+        );
         let out = String::from_utf8_lossy(&out).into_owned();
         let err = String::from_utf8_lossy(&err).into_owned();
         assert!(ok, "{out}");
@@ -3429,19 +3593,41 @@ mod tests {
         let probes = Probes {
             workspace: Some(WorkspacePolicyProbe {
                 workspace: PathBuf::from("/work/ty"),
-                policy: WorkspacePolicy::UnknownField { field: "compiler_timeout_secs".into() },
+                policy: WorkspacePolicy::UnknownField {
+                    field: "compiler_timeout_secs".into(),
+                },
             }),
             local_seal: None,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        assert!(!run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &probes, &mut out, &mut err));
+        assert!(!run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            None,
+            "doctor",
+            &probes,
+            &mut out,
+            &mut err
+        ));
         let err = String::from_utf8(err).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert!(err.contains("`compiler_timeout_secs`"), "names the refused key: {err}");
-        assert!(err.contains("build 6808"), "names the installed build: {err}");
+        assert!(
+            err.contains("`compiler_timeout_secs`"),
+            "names the refused key: {err}"
+        );
+        assert!(
+            err.contains("build 6808"),
+            "names the installed build: {err}"
+        );
         assert!(err.contains(PUBLISH_RUSTC_GROUP), "names the cure: {err}");
-        assert!(out.contains("next — publish the newer Trust coherence group"), "next act: {out}");
+        assert!(
+            out.contains("next — publish the newer Trust coherence group"),
+            "next act: {out}"
+        );
     }
 
     #[test]
@@ -3462,10 +3648,27 @@ mod tests {
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        assert!(run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &probes, &mut out, &mut err));
+        assert!(run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            None,
+            "doctor",
+            &probes,
+            &mut out,
+            &mut err
+        ));
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("[trust] policy the installed trust build 6808 accepts"), "{out}");
-        assert!(out.contains("warn — rustup's trust channel resolves to a LOCAL toolchain"), "{out}");
+        assert!(
+            out.contains("[trust] policy the installed trust build 6808 accepts"),
+            "{out}"
+        );
+        assert!(
+            out.contains("warn — rustup's trust channel resolves to a LOCAL toolchain"),
+            "{out}"
+        );
         assert!(out.contains("trust-d3866677"), "{out}");
         assert!(out.contains("healthy"), "{out}");
     }
@@ -3474,15 +3677,25 @@ mod tests {
     fn targo_refusal_text_yields_the_field_name() {
         let stderr = "error: unknown field `compiler_timeout_secs`, expected one of `enabled`, \
                       `level`\n    --> Cargo.toml:3151:1\n";
-        assert_eq!(unknown_field_in(stderr).as_deref(), Some("compiler_timeout_secs"));
-        assert_eq!(unknown_field_in("warning: unused manifest key: trust\n"), None);
+        assert_eq!(
+            unknown_field_in(stderr).as_deref(),
+            Some("compiler_timeout_secs")
+        );
+        assert_eq!(
+            unknown_field_in("warning: unused manifest key: trust\n"),
+            None
+        );
         assert_eq!(unknown_field_in(""), None);
     }
 
     #[test]
     fn the_trust_table_is_found_on_the_nearest_ancestor_manifest() {
         let root = synthetic_home("wstable");
-        std::fs::write(root.join("Cargo.toml"), "[workspace]\n\n[trust]\ncompiler_timeout_secs = 1\n").unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\n[trust]\ncompiler_timeout_secs = 1\n",
+        )
+        .unwrap();
         let nested = root.join("crates").join("x");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();

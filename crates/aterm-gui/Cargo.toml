@@ -190,7 +190,7 @@ a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
 # verb matrix into a NON-test build — the only way a target with its own `fn main`
 # can run the suite (a bin gets no dev-dependencies). OFF by default: the shipped
 # GUI carries neither the gate nor the suite.
-control-conformance = ["aterm-control/conformance"]
+control-conformance = ["aterm-control/conformance", "aterm-gpu/acquire-conformance"]
 # Bench-only observation seam (src/bench_support.rs), the `test-open-probe`
 # precedent applied to this crate: `benches/frame_latency.rs` is an EXTERNAL
 # target, so it sees only the crate's public surface — but the frame-path
@@ -626,6 +626,10 @@ required-features = ["bench-support"]
 [[test]]
 name = "styled_frame_alloc"
 required-features = ["bench-support"]
+
+[[example]]
+name = "drawable_acquire_drive"
+required-features = ["control-conformance"]
 
 [lints]
 workspace = true

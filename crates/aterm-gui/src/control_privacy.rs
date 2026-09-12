@@ -23,6 +23,12 @@
 //! probe was deliberately not consulted, which is a different fact from a
 //! denial and is spelled differently.
 //!
+//! Live reads are asynchronous: a cold, invalidated or expired observation
+//! reports `full_disk_access=unknown probe=pending probe_age_ms=-` (JSON age
+//! `null`). One instance-owned worker refreshes it and wakes the GUI; even a
+//! stalled probe cannot create additional workers. Freshness and retry spacing
+//! have a 500 ms floor, including when the configured interval is zero.
+//!
 //! # No protected-folder literal lives here
 //!
 //! Every protected path comes from `aterm_containment::consent` as already
@@ -40,13 +46,13 @@
 //! can see, not a sentence that drifts.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aterm_containment::consent::{
-    self, Attribution, ConsentCache, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaState,
-    Folder, FsConsent, PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError,
-    SpikeEvidence,
+    self, Attribution, ConsentKey, ConsentPosture, DrClass, FdaProbe, FdaState, Folder, FsConsent,
+    PostureInputs, ProbeGate, ProbeLabel, Responsible, ResponsibleError, SpikeEvidence,
 };
 use aterm_control::wire::{json_ok, json_str_field, pct_encode};
 use winit::event_loop::EventLoopProxy;
@@ -54,8 +60,9 @@ use winit::event_loop::EventLoopProxy;
 use crate::{App, Wake};
 
 /// The TCC service classes a Full Disk Access grant is claimed — by Apple, not
-/// by measurement — to subsume. Every one of them is reported `uncovered`
-/// until §7 S4 measures it; see [`covers_split`].
+/// by measurement — to subsume. Until §7 S4 measures them they are reported
+/// `unmeasured`, never `uncovered` — except the [`NEVER_COVERED`] class, which
+/// is `uncovered` measured or not: see [`covers_split`].
 const SERVICES: &[&str] = &[
     "documents",
     "desktop",
@@ -65,6 +72,12 @@ const SERVICES: &[&str] = &[
     "app-data",
     "file-provider-domains",
 ];
+
+/// The service classes Full Disk Access does NOT reliably cover, by the
+/// design's own record (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §3.4:
+/// EPERM despite FDA has been reported under `~/Library/CloudStorage` /
+/// FileProvider domains). Always `uncovered`, measured or not.
+const NEVER_COVERED: &[&str] = &["file-provider-domains"];
 
 /// The two volume classes that appear on the `folder` row beside the three
 /// [`Folder`] variants. They have no `$HOME`-relative path, so they carry no
@@ -86,6 +99,11 @@ const AWAIT_CONSENT_TICK: Duration = Duration::from_millis(500);
 
 /// The refusal for a selector on an instance-wide verb.
 const NO_SELECTOR: &str = "ERR privacy is instance-wide and takes no selector\n";
+
+/// Internal main-thread reply only; never emitted by the public privacy verb.
+/// An absent row still means the target exited, distinct from an unfinished
+/// observation. A complete tuple always begins with `fs_consent=`.
+const PENDING_CONSENT_TUPLE: &str = "consent-probe-pending";
 
 // ---------------------------------------------------------------------------
 // The injected probes
@@ -111,8 +129,11 @@ pub(crate) struct ConsentProbes {
     /// TCC or `WindowServer` contact, but it is still an OS call made once per
     /// live session, so it takes the same fence.
     responsible: fn(i32) -> Result<i32, ResponsibleError>,
-    /// Whether these are the live arms. Reported as the `observer` row's third
-    /// value: a probe that was never consulted is not a probe that answered no.
+    /// Whether these are the live arms. Read only by the `Debug` impl and the
+    /// tests: the `observer` row never carries it, because the inert arms
+    /// answer with labels the row already renders as `off` (`RefusedDisabled`,
+    /// `Unsupported` — see [`observer_fda_value`]) — a probe that was never
+    /// consulted is not a probe that answered no.
     live: bool,
 }
 
@@ -135,15 +156,41 @@ impl ConsentProbes {
         }
     }
 
-    /// `live()` for a windowed instance, `inert()` for a headless one — the
-    /// same shape the `lock_modifiers` / `user_input_recent` injections use.
+    /// Only a windowed macOS instance gets live arms. Other platforms report
+    /// unsupported directly, without launching a worker for a nonexistent TCC.
+    /// A headless instance remains deliberately disabled on every platform.
     pub(crate) const fn for_instance(headless: bool) -> Self {
         if headless {
             Self::inert()
-        } else {
+        } else if cfg!(target_os = "macos") {
             Self::live()
+        } else {
+            Self {
+                fda: unsupported_fda_probe,
+                responsible: inert_responsible,
+                live: false,
+            }
         }
     }
+
+    /// Called only after the live gate was refused. Non-live function pointers
+    /// are inert by construction; a disabled live instance never invokes one.
+    fn inactive_fda(self, gate: ProbeGate) -> FdaProbe {
+        if !gate.permits() {
+            inert_fda_probe(gate)
+        } else {
+            debug_assert!(!self.live);
+            (self.fda)(gate)
+        }
+    }
+}
+
+fn unsupported_fda_probe(gate: ProbeGate) -> FdaProbe {
+    FdaProbe::refused(if gate.permits() {
+        ProbeLabel::UnsupportedPlatform
+    } else {
+        ProbeLabel::RefusedDisabled
+    })
 }
 
 /// The inert Full Disk Access arm: the probe was deliberately not consulted.
@@ -162,64 +209,247 @@ fn inert_responsible(_pid: i32) -> Result<i32, ResponsibleError> {
 // Instance-owned consent state
 // ---------------------------------------------------------------------------
 
-/// The instance's consent state: its injected probes and its probe cache.
+/// Minimum freshness and timer spacing. A zero configured interval must not
+/// turn completion wakes into an endless probe/complete/probe loop. A blocked
+/// request owns its worker slot until it returns; timers cannot replace it.
+const PROBE_RETRY_FLOOR: Duration = Duration::from_millis(500);
+
+type ProbeWake = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Debug)]
+struct ProbeRequest {
+    key: ConsentKey,
+    epoch: u64,
+}
+
+#[derive(Debug)]
+struct ProbeEntry {
+    request: ProbeRequest,
+    probe: FdaProbe,
+    completed_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ProbeSlot {
+    key: Option<ConsentKey>,
+    request_epoch: u64,
+    in_flight: bool,
+    entry: Option<ProbeEntry>,
+    /// Admission floor survives every invalidation, even a changed identity.
+    retry_after: Option<Instant>,
+}
+
+#[derive(Default)]
+struct SharedProbe {
+    /// Invalidation never waits for the worker or its publication mutex.
+    epoch: AtomicU64,
+    /// A spawn failure can be published without waiting for the slot mutex.
+    failed_request: AtomicU64,
+    slot: Mutex<ProbeSlot>,
+    wake: OnceLock<ProbeWake>,
+}
+
+impl SharedProbe {
+    /// Both real workers and the conformance tests publish through this seam.
+    /// No syscall or callback executes under the publication lock.
+    fn complete(&self, request: &ProbeRequest, probe: FdaProbe, now: Instant) {
+        {
+            let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+            if !slot.in_flight || slot.request_epoch != request.epoch {
+                return;
+            }
+            slot.in_flight = false;
+            if request.epoch == self.epoch.load(Ordering::Acquire)
+                && slot.key.as_ref() == Some(&request.key)
+            {
+                slot.entry = Some(ProbeEntry {
+                    request: request.clone(),
+                    probe,
+                    completed_at: now,
+                });
+            }
+        }
+        // Even a stale completion releases the one worker slot. Wake the
+        // observer so it can ask for the new epoch, rather than staying pending.
+        if let Some(wake) = self.wake.get() {
+            wake();
+        }
+    }
+}
+
+/// Instance-owned, nonblocking Full Disk Access observation. Only the worker
+/// invokes the live FDA probe. Reads return Unknown/Pending until a current
+/// result exists; an expired grant is never served while refreshing.
 ///
-/// There is deliberately NO process-global here. A successor started by an
-/// in-place apply constructs a fresh `App`, so it inherits an EMPTY cache and
-/// re-probes on first demand — a stale `granted` cannot survive an apply that
-/// changed the signing identity (design §3.3).
+/// There is at most one in-flight worker per instance, including across
+/// activation, identity and policy invalidation. A stuck syscall therefore
+/// cannot multiply threads. A successor starts with no cached observation.
 pub(crate) struct ConsentState {
     probes: ConsentProbes,
-    cache: ConsentCache,
+    shared: Arc<SharedProbe>,
 }
 
 impl ConsentState {
-    /// Wire the arms for this instance.
     pub(crate) fn new(headless: bool) -> Self {
         Self {
             probes: ConsentProbes::for_instance(headless),
-            cache: ConsentCache::new(),
+            shared: Arc::new(SharedProbe::default()),
         }
     }
 
-    /// The headless / unit-test instance.
     pub(crate) fn inert() -> Self {
         Self::new(true)
     }
 
-    /// The cached Full Disk Access probe, taking a fresh one at most once per
-    /// `interval`. `(probe, age)`.
-    ///
-    /// `dr` is the designated requirement the grant is bound to; it is part of
-    /// the key because a rebuild that changes the identity must invalidate a
-    /// cached `granted`. A caller that must not block — the `status` poll,
-    /// which runs on the event loop and may not spawn `codesign` — passes the
-    /// empty string until the identity is warm, which costs at most one extra
-    /// `open()` per process and never a stale answer.
-    ///
-    /// `gate` is `[privacy] enabled`/`check` as the consent module's OWN gate
-    /// type, so the switched-off case is refused inside the module, before any
-    /// syscall, and comes back labelled `refused_disabled` rather than as a
-    /// denial. `interval` is `[privacy] probe_interval_ms`.
-    fn fda(&self, gate: ProbeGate, interval: Duration, dr: &str) -> (FdaProbe, Duration) {
-        let key = ConsentKey::new(cache_bundle().clone(), dr.to_owned());
-        let probes = self.probes;
-        let cached = self
-            .cache
-            .get_or_probe(&key, interval, || (probes.fda)(gate));
-        (cached.probe, cached.age)
+    /// Install once after the GUI event-loop proxy exists. Completion never
+    /// retains App or invokes the callback while holding its publication lock.
+    pub(crate) fn set_completion_wake(&self, wake: ProbeWake) {
+        let _ = self.shared.wake.set(wake);
     }
 
-    /// The responsibility SPI's answer for one pid, unclassified so the
-    /// `observer` row can tell an absent symbol from a refusal.
+    /// Activation/policy changes retire every cached or in-flight answer.
+    /// The in-flight slot and admission floor survive: focus churn cannot
+    /// bypass the worker limit or repeatedly launch quickly completed probes.
+    pub(crate) fn invalidate(&self) {
+        self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut slot) = self.shared.slot.try_lock() {
+            slot.entry = None;
+        }
+    }
+
+    /// A future-only deadline for an active observer. Completion normally
+    /// wakes it sooner; a stalled worker gets at most this bounded polling rate.
+    pub(crate) fn next_refresh_deadline(
+        &self,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<Instant> {
+        if !self.probes.live {
+            return None;
+        }
+        let interval = interval.max(PROBE_RETRY_FLOOR);
+        let retry = now + interval;
+        let Ok(slot) = self.shared.slot.try_lock() else {
+            return Some(retry);
+        };
+        if slot.in_flight {
+            return Some(retry);
+        }
+        if let Some(entry) = &slot.entry
+            && entry.request.epoch == self.shared.epoch.load(Ordering::Acquire)
+            && let Some(expires) = entry.completed_at.checked_add(interval)
+            && expires > now
+        {
+            return Some(expires);
+        }
+        if let Some(at) = slot.retry_after
+            && at > now
+        {
+            return Some(at);
+        }
+        Some(retry)
+    }
+
+    /// Prepare a request without running it. This is the production admission
+    /// seam, exercised directly by the bounded-model conformance tests.
+    fn read_at(
+        &self,
+        gate: ProbeGate,
+        interval: Duration,
+        key: ConsentKey,
+        now: Instant,
+    ) -> ((FdaProbe, Duration), Option<ProbeRequest>) {
+        let interval = interval.max(PROBE_RETRY_FLOOR);
+        let pending = (FdaProbe::pending(), Duration::ZERO);
+        // Policy wins BEFORE reading a warm grant, without consulting an OS
+        // probe. Invalidation is atomic even if a publisher owns the mutex.
+        if !gate.permits() || !self.probes.live {
+            self.invalidate();
+            return ((self.probes.inactive_fda(gate), Duration::ZERO), None);
+        }
+        let Ok(mut slot) = self.shared.slot.try_lock() else {
+            return (pending, None);
+        };
+        let failed = self.shared.failed_request.swap(0, Ordering::AcqRel);
+        if failed != 0 && slot.in_flight && slot.request_epoch == failed {
+            slot.in_flight = false;
+            slot.retry_after = Some(now + interval);
+        }
+        if slot.key.as_ref() != Some(&key) {
+            self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+            slot.key = Some(key.clone());
+            slot.entry = None;
+        }
+        let epoch = self.shared.epoch.load(Ordering::Acquire);
+        if let Some(entry) = &slot.entry {
+            let age = now.saturating_duration_since(entry.completed_at);
+            if entry.request.epoch == epoch && age < interval {
+                return ((entry.probe, age), None);
+            }
+        }
+        slot.entry = None;
+        if slot.in_flight || slot.retry_after.is_some_and(|at| now < at) {
+            return (pending, None);
+        }
+        slot.in_flight = true;
+        slot.request_epoch = epoch;
+        slot.retry_after = Some(now + PROBE_RETRY_FLOOR);
+        (pending, Some(ProbeRequest { key, epoch }))
+    }
+
+    /// GUI-thread reads never call the live probe or wait for its result.
+    fn fda(&self, gate: ProbeGate, interval: Duration, dr: &str) -> (FdaProbe, Duration) {
+        if !gate.permits() || !self.probes.live {
+            self.invalidate();
+            return (self.probes.inactive_fda(gate), Duration::ZERO);
+        }
+        let key = ConsentKey::new(cache_bundle().clone(), dr.to_owned());
+        let (answer, request) = self.read_at(gate, interval, key, Instant::now());
+        if let Some(request) = request {
+            let shared = Arc::clone(&self.shared);
+            let probe = self.probes.fda;
+            let request_epoch = request.epoch;
+            let spawned = std::thread::Builder::new()
+                .name("aterm-consent-probe".to_owned())
+                .spawn(move || {
+                    let answer = probe(gate);
+                    shared.complete(&request, answer, Instant::now());
+                });
+            if spawned.is_err() {
+                // Thread creation failed, so no worker owns the slot. Retire
+                // it with a backoff; repeated GUI reads cannot spawn in a loop.
+                self.shared
+                    .failed_request
+                    .store(request_epoch, Ordering::Release);
+            }
+        }
+        answer
+    }
+
     fn responsible_answer(&self, pid: i32) -> Result<i32, ResponsibleError> {
         (self.probes.responsible)(pid)
+    }
+
+    /// Synthetic cached verdict for host tests. Even a later refresh uses the
+    /// inert function pointer, so this helper cannot contact the OS.
+    #[cfg(test)]
+    pub(crate) fn with_cached_probe_for_test(probe: FdaProbe) -> Self {
+        let mut state = Self::inert();
+        state.probes.live = true;
+        let key = ConsentKey::new(
+            cache_bundle().clone(),
+            signing_identity_if_warm().dr_text.clone(),
+        );
+        let (_, request) =
+            state.read_at(ProbeGate::on(), Duration::from_secs(5), key, Instant::now());
+        state
+            .shared
+            .complete(&request.expect("fresh request"), probe, Instant::now());
+        state
     }
 }
 
 impl Default for ConsentState {
-    /// Default-safe: the inert arms. A construction that forgets to choose
-    /// gets the arms that cannot reach the OS.
     fn default() -> Self {
         Self::inert()
     }
@@ -227,9 +457,15 @@ impl Default for ConsentState {
 
 impl std::fmt::Debug for ConsentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let empty = self
+            .shared
+            .slot
+            .try_lock()
+            .ok()
+            .is_none_or(|s| s.entry.is_none());
         f.debug_struct("ConsentState")
             .field("probes_live", &self.probes.live)
-            .field("cache_empty", &self.cache.is_empty())
+            .field("cache_empty", &empty)
             .finish()
     }
 }
@@ -503,6 +739,11 @@ pub(crate) struct PrivacySnapshot {
     platform: &'static str,
     os: Option<String>,
     identity: SigningIdentity,
+    /// The install posture the first-open doctor classifies
+    /// (`aterm_update::which_copy::posture_from`), as a token.
+    install: &'static str,
+    /// The canonical path this process runs from, when it can be read.
+    running: Option<String>,
     fda: FdaState,
     probe: ProbeLabel,
     probe_age_ms: Option<u128>,
@@ -519,17 +760,66 @@ pub(crate) struct PrivacySnapshot {
     reset_command: Option<String>,
 }
 
-/// The `covers=` / `uncovered=` split. Under today's evidence NOTHING is
-/// measured as covered, so `covers` is empty and every service is listed as
-/// uncovered — the honest rendering of "a grant removes this class of
-/// interruption for the folders it covers, and which those are is not measured
-/// here".
-fn covers_split(evidence: SpikeEvidence) -> (Vec<&'static str>, Vec<&'static str>) {
+/// The `covers=` / `uncovered=` / `unmeasured=` split — THREE buckets, because
+/// "not measured" is not "measured as not covered" (2026-09-10). Until §7 S4
+/// runs, nothing is measured, so `covers` is empty and every service except
+/// the permanently-uncovered ones sits in `unmeasured`. The earlier rendering
+/// put them all in `uncovered`, which told the owner — and any agent parsing
+/// the JSON — that Full Disk Access covers nothing, app-data included: the
+/// exact opposite of Apple's documented order of evaluation, and an argument
+/// against the one switch that stops the prompts they were seeing. And when
+/// the measurement flips, the bucket [`NEVER_COVERED`] stays put instead of
+/// being swept into `covers` with everything else.
+pub(crate) fn covers_split(evidence: SpikeEvidence) -> CoverageSplit {
+    let never = |s: &&&str| NEVER_COVERED.contains(s);
+    let uncovered: Vec<&'static str> = SERVICES.iter().filter(never).copied().collect();
+    let rest: Vec<&'static str> = SERVICES.iter().filter(|s| !never(s)).copied().collect();
     if evidence.fda_coverage_measured {
-        (SERVICES.to_vec(), Vec::new())
+        CoverageSplit {
+            covers: rest,
+            uncovered,
+            unmeasured: Vec::new(),
+        }
     } else {
-        (Vec::new(), SERVICES.to_vec())
+        CoverageSplit {
+            covers: Vec::new(),
+            uncovered,
+            unmeasured: rest,
+        }
     }
+}
+
+/// The three coverage buckets of [`covers_split`]. Shared with the Security
+/// panel, so the verb and the panel can never disagree about a service.
+pub(crate) struct CoverageSplit {
+    pub(crate) covers: Vec<&'static str>,
+    pub(crate) uncovered: Vec<&'static str>,
+    pub(crate) unmeasured: Vec<&'static str>,
+}
+
+/// [`install_posture_rows`], computed once: the executable path of a running
+/// process does not change, and the Security panel reads this on every park
+/// while it is open.
+fn install_posture_once() -> &'static (&'static str, Option<String>) {
+    static ONCE: std::sync::OnceLock<(&'static str, Option<String>)> = std::sync::OnceLock::new();
+    ONCE.get_or_init(install_posture_rows)
+}
+
+/// The `install=` token and `running=` path: the same classification the
+/// first-open doctor makes (`aterm_update::which_copy::posture_from`), read
+/// off this process's canonical executable path. Pure path work; no TCC.
+fn install_posture_rows() -> (&'static str, Option<String>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return ("unknown", None);
+    };
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let token = match aterm_update::which_copy::posture_from(&exe) {
+        aterm_update::which_copy::InstallPosture::Installed => "installed",
+        aterm_update::which_copy::InstallPosture::MountedImage => "mounted-image",
+        aterm_update::which_copy::InstallPosture::Translocated => "translocated",
+        aterm_update::which_copy::InstallPosture::NotABundle => "not-a-bundle",
+    };
+    (token, Some(exe.to_string_lossy().into_owned()))
 }
 
 /// The `observer fda=` value: `off` when the probe was deliberately not
@@ -539,9 +829,14 @@ fn covers_split(evidence: SpikeEvidence) -> (Vec<&'static str>, Vec<&'static str
 fn observer_fda_value(probe: ProbeLabel) -> &'static str {
     match probe {
         ProbeLabel::RefusedDisabled => "off",
+        ProbeLabel::Pending => "pending",
         label if label.refused() => "unavailable",
         _ => "ok",
     }
+}
+
+fn completed_probe_age_ms(label: ProbeLabel, age: Duration) -> Option<u128> {
+    (!label.refused() && label != ProbeLabel::Pending).then_some(age.as_millis())
 }
 
 /// The `observer responsible=` value, on the same three-valued vocabulary.
@@ -580,7 +875,11 @@ fn opt(value: Option<&str>) -> String {
 }
 
 /// The closing prose row. It states the two things a reader otherwise infers
-/// wrongly, and it promises nothing about elimination.
+/// wrongly, and it promises nothing about elimination. Its `covers is empty`
+/// clause is written for the `SpikeEvidence::UNMEASURED` every `read_privacy`
+/// report carries today; the measured arm of [`PrivacySnapshot::lines`] (reached
+/// only from the tests) renders a `covers=` list above this same sentence, so the
+/// row must turn evidence-conditional when §7 S4 lands.
 const NOTE: &str = "per-folder state is unknown by construction: reading a folder is the act \
                     that raises the prompt; which services a grant covers is not measured here, \
                     so covers is empty and prompt_possible stays yes";
@@ -628,6 +927,15 @@ impl PrivacySnapshot {
                 .dev_build
                 .map_or_else(|| "-".to_string(), |d| d.to_string()),
         ));
+        // WHERE THIS PROCESS IS RUNNING FROM (2026-09-10): a grant is keyed to
+        // the bundle at a path, so an install posture the doctor would flag —
+        // translocated, a mounted image — is a grant that cannot apply, and
+        // the owner deserves to read that on the same report as the grant.
+        out.push(format!(
+            "install={} running={}",
+            self.install,
+            opt(self.running.as_deref())
+        ));
         out.push(format!(
             "full_disk_access={} probe={} probe_age_ms={} fda_scope={}",
             self.fda.as_str(),
@@ -636,9 +944,10 @@ impl PrivacySnapshot {
                 .map_or_else(|| "-".to_string(), |ms| ms.to_string()),
             self.evidence.fda_scope.as_str(),
         ));
-        let (covers, uncovered) = covers_split(self.evidence);
-        out.push(format!("covers={}", list_or_dash(&covers)));
-        out.push(format!("uncovered={}", list_or_dash(&uncovered)));
+        let split = covers_split(self.evidence);
+        out.push(format!("covers={}", list_or_dash(&split.covers)));
+        out.push(format!("uncovered={}", list_or_dash(&split.uncovered)));
+        out.push(format!("unmeasured={}", list_or_dash(&split.unmeasured)));
         let mut folder = String::from("folder");
         for name in folder_names() {
             folder.push(' ');
@@ -714,6 +1023,15 @@ impl PrivacySnapshot {
             row.attribution.as_str(),
         )
     }
+
+    /// Internal control bridge: unfinished probes have no consent tuple yet.
+    fn observed_tuple_line(row: &SessionRow, probe: FdaProbe) -> String {
+        if probe.label == ProbeLabel::Pending {
+            PENDING_CONSENT_TUPLE.to_string()
+        } else {
+            Self::tuple_line(row, probe.state)
+        }
+    }
 }
 
 /// Every name on the `folder` row: the three `$HOME` folders the consent
@@ -744,7 +1062,7 @@ fn list_or_dash(items: &[&str]) -> String {
 fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     use std::fmt::Write as _;
 
-    let (covers, uncovered) = covers_split(snapshot.evidence);
+    let split = covers_split(snapshot.evidence);
     let mut body = String::from("{\"schema\":1,");
     let _ = write!(body, "{},", json_str_field("platform", snapshot.platform));
     let _ = write!(body, "\"os\":{},", json_opt(snapshot.os.as_deref()));
@@ -765,6 +1083,12 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     );
     let _ = write!(
         body,
+        "{},\"running\":{},",
+        json_str_field("install", snapshot.install),
+        json_opt(snapshot.running.as_deref()),
+    );
+    let _ = write!(
+        body,
         "{},{},\"probe_age_ms\":{},{},",
         json_str_field("full_disk_access", snapshot.fda.as_str()),
         json_str_field("probe", snapshot.probe.as_str()),
@@ -775,9 +1099,10 @@ fn cmd_privacy_json(snapshot: &PrivacySnapshot) -> String {
     );
     let _ = write!(
         body,
-        "\"covers\":{},\"uncovered\":{},",
-        json_str_array(&covers),
-        json_str_array(&uncovered),
+        "\"covers\":{},\"uncovered\":{},\"unmeasured\":{},",
+        json_str_array(&split.covers),
+        json_str_array(&split.uncovered),
+        json_str_array(&split.unmeasured),
     );
     let _ = write!(body, "\"folders\":{{\"source\":\"none\"");
     for name in folder_names() {
@@ -946,18 +1271,21 @@ impl App {
             return sessions
                 .iter()
                 .find(|row| self.session_sid_matches(target, &row.sid))
-                .map(|row| vec![PrivacySnapshot::tuple_line(row, probe.state)])
+                .map(|row| vec![PrivacySnapshot::observed_tuple_line(row, probe)])
                 .unwrap_or_default();
         }
 
         let mode = aterm_containment::mode_or_containment();
+        let (install, running) = install_posture_once().clone();
         let snapshot = PrivacySnapshot {
             platform: std::env::consts::OS,
             os: os_version().map(str::to_owned),
             identity: identity.clone(),
+            install,
+            running,
             fda: probe.state,
             probe: probe.label,
-            probe_age_ms: (!probe.label.refused()).then_some(age.as_millis()),
+            probe_age_ms: completed_probe_age_ms(probe.label, age),
             evidence: SpikeEvidence::UNMEASURED,
             attribution_root: policy.adoption(self.instance_attribution()),
             sessions,
@@ -999,22 +1327,39 @@ impl App {
     ///
     /// The SAME state `privacy` reports — the cached probe, the identity only
     /// if a control-thread verb already warmed it, and the `[privacy]` master
-    /// switch — assembled for a renderer instead of for a wire. It performs no
-    /// syscall of its own and never spawns `codesign`, so it is legal on the
-    /// event loop; a cold identity degrades to `DrClass::Unknown`, which
+    /// switch — assembled for a renderer instead of for a wire. Consent probes
+    /// run on the worker, executable posture is cached once, and this never
+    /// spawns `codesign`; a cold identity degrades to `DrClass::Unknown`, which
     /// suppresses no repair and promises no durability.
     pub(crate) fn consent_panel_facts(&self) -> ConsentPanelFacts {
-        let policy = self.consent_policy();
         let identity = signing_identity_if_warm();
-        let (probe, _age) = self
-            .consent
-            .fda(policy.gate, policy.interval, &identity.dr_text);
+        let enabled = self.config.privacy_enabled();
+        let (probe, _age) = self.consent.fda(
+            self.config.privacy_probe_gate(),
+            Duration::from_millis(self.config.privacy_probe_interval_ms()),
+            &identity.dr_text,
+        );
+        let (install, running) = install_posture_once();
+        let sessions_total = self.pool.iter().count();
+        // This hot Settings read needs no protected-root resolution. Preserve
+        // the report's master-switch rule for the adoption count directly.
+        let sessions_adopted = self
+            .pool
+            .iter()
+            .filter(|session| {
+                enabled && matches!(session_attribution(session), Attribution::Adopted)
+            })
+            .count();
         ConsentPanelFacts {
-            enabled: policy.enabled,
+            enabled,
             fda: probe.state,
             probe: probe.label,
             dr: identity.dr,
             bundle_id: identity.bundle_id.clone(),
+            install,
+            running: running.clone(),
+            sessions_total,
+            sessions_adopted,
         }
     }
 
@@ -1050,9 +1395,9 @@ impl App {
 
 /// What the Security panel needs from the consent model, as pure data.
 ///
-/// Deliberately NOT the whole [`PrivacySnapshot`]: the panel renders no session
-/// rows, no containment mode and no `covers=` list, and handing it those would
-/// invite a claim it is not entitled to make.
+/// A compact projection of [`PrivacySnapshot`]: the panel needs installation
+/// posture and session counts, not individual session/cwd rows or containment
+/// paths. Its service coverage comes from the shared [`covers_split`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConsentPanelFacts {
     /// `[privacy] enabled`. `false` means aterm asked nothing.
@@ -1066,6 +1411,15 @@ pub(crate) struct ConsentPanelFacts {
     /// The RUNNING bundle's id, never a literal and never the release
     /// channel's when this build is not it.
     pub(crate) bundle_id: Option<String>,
+    /// The install posture token the doctor would classify (`installed`,
+    /// `mounted-image`, `translocated`, `not-a-bundle`, `unknown`).
+    pub(crate) install: &'static str,
+    /// The canonical path this process runs from, when it can be read.
+    pub(crate) running: Option<String>,
+    /// Live sessions, and how many of them this process took over from a
+    /// predecessor across an in-place apply.
+    pub(crate) sessions_total: usize,
+    pub(crate) sessions_adopted: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1140,12 +1494,25 @@ impl App {
         }
     }
 
+    /// Only a watching card/panel should ask for this scheduling hint.
+    pub(crate) fn next_consent_probe_deadline(&self, now: Instant) -> Option<Instant> {
+        if !self.config.privacy_probe_gate().permits() {
+            return None;
+        }
+        self.consent.next_refresh_deadline(
+            now,
+            Duration::from_millis(self.config.privacy_probe_interval_ms()),
+        )
+    }
+
     /// The consent fields for one session's `status` record.
     ///
     /// Runs on the event loop under a poll, so it never blocks: it takes the
-    /// CACHED probe and the identity only if already warm, and `cwd` is passed
-    /// in by the caller — which already holds (or failed to take) that
-    /// session's terminal lock, and must not be asked to take it twice.
+    /// cached probe — refreshed by one `open(TCC.db)` at most once per
+    /// `probe_interval_ms`, never by `codesign` — and the identity only if
+    /// already warm, and `cwd` is passed in by the caller — which already holds
+    /// (or failed to take) that session's terminal lock, and must not be asked
+    /// to take it twice.
     pub(crate) fn session_consent(&self, session: u64, cwd: Option<&str>) -> SessionConsent {
         let Some(pooled) = self.pool.get(session) else {
             return SessionConsent::unknown();
@@ -1277,14 +1644,72 @@ pub(crate) const fn no_selector_error() -> &'static str {
     NO_SELECTOR
 }
 
-/// `await consent [timeout=<ms>]` — park until THIS session's consent tuple
-/// changes.
-///
-/// The predicate ARMS at the moment the request is received, taking that tuple
-/// as its baseline, and latches on the first observed change from THAT
-/// baseline. It never latches on a value that was already true when the call
-/// was made, and never compares against a baseline captured earlier — the
-/// `needs_arm_eval` edge-trigger bug class, by name.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsentObservation {
+    Pending,
+    Complete(String),
+    Exited,
+}
+
+fn consent_observation(lines: Vec<String>) -> ConsentObservation {
+    match lines.into_iter().next() {
+        Some(line) if line == PENDING_CONSENT_TUPLE => ConsentObservation::Pending,
+        Some(line) => ConsentObservation::Complete(line),
+        None => ConsentObservation::Exited,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConsentWaitDecision {
+    Wait,
+    Changed(String),
+    Exited,
+    TimedOut,
+}
+
+struct ConsentWait {
+    baseline: Option<String>,
+    deadline: Instant,
+}
+
+impl ConsentWait {
+    fn new(armed: Instant, timeout: Duration) -> Self {
+        Self {
+            baseline: None,
+            deadline: armed + timeout,
+        }
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    /// Pending is not an observed change or an exit. A cold wait arms at its
+    /// first completed observation; a refresh retains that same baseline.
+    /// Neither operation extends the original request's deadline.
+    fn observe_at(&mut self, observation: ConsentObservation, now: Instant) -> ConsentWaitDecision {
+        if self.expired_at(now) {
+            return ConsentWaitDecision::TimedOut;
+        }
+        match observation {
+            ConsentObservation::Pending => ConsentWaitDecision::Wait,
+            ConsentObservation::Exited => ConsentWaitDecision::Exited,
+            ConsentObservation::Complete(line) => match &self.baseline {
+                Some(baseline) if baseline != &line => ConsentWaitDecision::Changed(line),
+                Some(_) => ConsentWaitDecision::Wait,
+                None => {
+                    self.baseline = Some(line);
+                    ConsentWaitDecision::Wait
+                }
+            },
+        }
+    }
+}
+
+/// `await consent [timeout=<ms>]` — wait for THIS session's observed tuple to
+/// change. A pending refresh is not a change. On a cold cache, the first
+/// completed observation establishes the baseline; it cannot itself satisfy
+/// the wait. The timeout remains anchored to the original request.
 ///
 /// A latch says aterm's own posture CHANGED. It does NOT say a human answered
 /// a dialog: aterm cannot observe the answer.
@@ -1293,41 +1718,40 @@ pub(crate) fn cmd_await_consent(proxy: &EventLoopProxy<Wake>, session: u64, rest
         Ok(ms) => ms,
         Err(usage) => return usage,
     };
+    let armed = Instant::now();
+    let mut wait = ConsentWait::new(armed, Duration::from_millis(timeout_ms));
     let _ = signing_identity();
-    let sample = |proxy: &EventLoopProxy<Wake>| -> Result<Option<String>, String> {
+    let sample = |proxy: &EventLoopProxy<Wake>| -> Result<ConsentObservation, String> {
         match crate::control::control_media::call_main(proxy, |tx| Wake::ReadPrivacy {
             form: PrivacyForm::Tuple(session),
             reply: tx,
         }) {
-            Ok(lines) => Ok(lines.into_iter().next()),
+            Ok(lines) => Ok(consent_observation(lines)),
             Err(e) => Err(format!("ERR {e}\n")),
         }
     };
-    // ARM: the baseline is taken now, from this request.
-    let baseline = match sample(proxy) {
-        Ok(Some(line)) => line,
-        Ok(None) => return "ERR exited\n".to_string(),
-        Err(e) => return e,
-    };
-    let armed = Instant::now();
-    let deadline = armed + Duration::from_millis(timeout_ms);
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        if wait.expired_at(Instant::now()) {
             return "OK timeout\n".to_string();
         }
-        std::thread::sleep(AWAIT_CONSENT_TICK.min(deadline.saturating_duration_since(now)));
-        match sample(proxy) {
-            Ok(Some(line)) if line != baseline => {
+        let observation = match sample(proxy) {
+            Ok(observation) => observation,
+            Err(error) => return error,
+        };
+        match wait.observe_at(observation, Instant::now()) {
+            ConsentWaitDecision::Changed(line) => {
                 return format!(
                     "OK consent {line} elapsed_ms={}\n",
                     armed.elapsed().as_millis()
                 );
             }
-            Ok(Some(_)) => {}
-            Ok(None) => return "ERR exited\n".to_string(),
-            Err(e) => return e,
+            ConsentWaitDecision::Exited => return "ERR exited\n".to_string(),
+            ConsentWaitDecision::TimedOut => return "OK timeout\n".to_string(),
+            ConsentWaitDecision::Wait => {}
         }
+        std::thread::sleep(
+            AWAIT_CONSENT_TICK.min(wait.deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -1378,6 +1802,8 @@ mod tests {
                 dr_text: "designated => identifier \"com.aterm.aterm\"".to_string(),
                 dev_build: Some(false),
             },
+            install: "installed",
+            running: Some("/Applications/aterm.app/Contents/MacOS/aterm".to_string()),
             fda,
             probe: ProbeLabel::OpenEperm,
             probe_age_ms: Some(1840),
@@ -1457,7 +1883,8 @@ mod tests {
     #[test]
     fn the_line_body_is_the_documented_shape_and_ok_n_counts_it() {
         let lines = snapshot(4, FdaState::Denied, SpikeEvidence::UNMEASURED).lines();
-        assert_eq!(lines.len(), 4 + 14, "14 fixed rows plus one per session");
+        // 16 fixed rows (2026-09-10: `install=` and `unmeasured=` joined the 14).
+        assert_eq!(lines.len(), 4 + 16, "16 fixed rows plus one per session");
         assert_eq!(lines[0], "schema=1");
         assert_eq!(lines[1], "platform=macos os=26.6.2");
         assert_eq!(
@@ -1467,10 +1894,21 @@ mod tests {
         );
         assert_eq!(
             lines[3],
-            "full_disk_access=denied probe=open_eperm probe_age_ms=1840 fda_scope=unknown"
+            "install=installed running=/Applications/aterm.app/Contents/MacOS/aterm"
         );
         assert_eq!(
-            lines[8],
+            lines[4],
+            "full_disk_access=denied probe=open_eperm probe_age_ms=1840 fda_scope=unknown"
+        );
+        assert_eq!(lines[5], "covers=-");
+        assert_eq!(lines[6], "uncovered=file-provider-domains");
+        assert!(
+            lines[7].starts_with("unmeasured=documents,"),
+            "{}",
+            lines[7]
+        );
+        assert_eq!(
+            lines[10],
             "attribution_root=live sessions_total=4 sessions_adopted=1"
         );
         let session_rows: Vec<&String> =
@@ -1487,7 +1925,7 @@ mod tests {
         assert!(session_rows[1].as_str().contains("attribution=adopted"));
         assert!(lines.last().expect("a note row").starts_with("note "));
         // The header the handler writes is the row count.
-        assert_eq!(format!("OK {}", lines.len()), "OK 18");
+        assert_eq!(format!("OK {}", lines.len()), "OK 20");
     }
 
     /// A big instance is still exact: no cap, no ellipsis, no "…and N more".
@@ -1508,7 +1946,8 @@ mod tests {
 
     /// THE HONESTY POSTURE, as a table. Under today's evidence — spikes S1 and
     /// S4 unrun — holding the grant changes NOTHING about what is claimed:
-    /// `covers` stays empty, every service is `uncovered`, `fda_scope` stays
+    /// `covers` stays empty, every service but the never-covered class is
+    /// `unmeasured`, `fda_scope` stays
     /// `unknown`, and `prompt_possible` stays `yes`. The only thing that moves
     /// any of it is a NAMED `SpikeEvidence` field, which a reviewer sees.
     #[test]
@@ -1516,8 +1955,22 @@ mod tests {
         for fda in [FdaState::Granted, FdaState::Denied, FdaState::Unknown] {
             let lines = snapshot(1, fda, SpikeEvidence::UNMEASURED).lines();
             assert!(lines.contains(&"covers=-".to_string()), "{fda:?}");
+            // Unmeasured is NOT uncovered: only the permanently-uncovered class
+            // is called uncovered before the measurement has run.
             assert!(
-                lines.contains(&format!("uncovered={}", SERVICES.join(","))),
+                lines.contains(&"uncovered=file-provider-domains".to_string()),
+                "{fda:?}: {lines:?}"
+            );
+            assert!(
+                lines.contains(&format!(
+                    "unmeasured={}",
+                    SERVICES
+                        .iter()
+                        .filter(|s| !NEVER_COVERED.contains(s))
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )),
                 "{fda:?}"
             );
             assert!(
@@ -1536,8 +1989,25 @@ mod tests {
             fda_scope: FdaScope::ThisProcess,
         };
         let lines = snapshot(1, FdaState::Granted, measured).lines();
-        assert!(lines.contains(&format!("covers={}", SERVICES.join(","))));
-        assert!(lines.contains(&"uncovered=-".to_string()));
+        // Measured: everything moves to `covers` EXCEPT the class the design
+        // records as not reliably covered, which stays `uncovered`.
+        assert!(lines.contains(&format!(
+            "covers={}",
+            SERVICES
+                .iter()
+                .filter(|s| !NEVER_COVERED.contains(s))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(",")
+        )));
+        assert!(lines.contains(&"uncovered=file-provider-domains".to_string()));
+        assert!(lines.contains(&"unmeasured=-".to_string()));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("install=installed running=/Applications/")),
+            "the install posture rides on the same report: {lines:?}"
+        );
         assert!(lines.contains(&"prompt_possible=no".to_string()));
         assert!(lines.iter().any(|l| l.contains("fda_scope=this_process")));
     }
@@ -1699,11 +2169,27 @@ mod tests {
             "with the lane ON the adoption record shows"
         );
 
+        let panel = app.consent_panel_facts();
+        assert!(panel.enabled);
+        assert_eq!((panel.sessions_total, panel.sessions_adopted), (1, 1));
+
         app.config.privacy = Some(crate::app_config::PrivacyConfig {
             enabled: Some(false),
             ..Default::default()
         });
         let off = app.session_consent(0, None);
+        let panel_off = app.consent_panel_facts();
+        assert!(!panel_off.enabled);
+        assert_eq!(panel_off.probe, ProbeLabel::RefusedDisabled);
+        assert_eq!(panel_off.fda, FdaState::Unknown);
+        assert_eq!(
+            (panel_off.sessions_total, panel_off.sessions_adopted),
+            (1, 0)
+        );
+        assert_eq!(
+            (panel_off.install, panel_off.running),
+            (panel.install, panel.running)
+        );
         assert_eq!(
             off.attribution,
             Attribution::Unknown,
@@ -1784,6 +2270,16 @@ mod tests {
         assert!(json.contains("\"sessions_total\":2"), "{json}");
         assert!(json.contains("\"prompt_possible\":true"), "{json}");
         assert!(json.contains("\"covers\":[]"), "{json}");
+        assert!(
+            json.contains("\"uncovered\":[\"file-provider-domains\"]"),
+            "unmeasured is not uncovered: {json}"
+        );
+        assert!(json.contains("\"unmeasured\":[\"documents\","), "{json}");
+        assert!(json.contains("\"install\":\"installed\""), "{json}");
+        assert!(
+            json.contains("\"running\":\"/Applications/aterm.app/Contents/MacOS/aterm\""),
+            "{json}"
+        );
         let opens = json.chars().filter(|c| *c == '{').count();
         let closes = json.chars().filter(|c| *c == '}').count();
         assert_eq!(opens, closes, "balanced object braces: {json}");
@@ -1959,7 +2455,7 @@ mod tests {
         let probe = (probes.fda)(ProbeGate::on());
         assert_eq!(probe.state, FdaState::Unknown);
         assert_eq!(probe.label, ProbeLabel::RefusedDisabled);
-        assert!(probe.label.refused(), "`refused` means no syscall ran");
+        assert!(probe.label.refused(), "the inert arm refuses the probe");
         assert_eq!(
             (probes.responsible)(1),
             Err(ResponsibleError::Unsupported),
@@ -1967,7 +2463,10 @@ mod tests {
         );
         // `for_instance` picks the arm from the one bit that decides it.
         assert!(!ConsentProbes::for_instance(true).live);
-        assert!(ConsentProbes::for_instance(false).live);
+        assert_eq!(
+            ConsentProbes::for_instance(false).live,
+            cfg!(target_os = "macos")
+        );
         // Sanity on the module's own classifier, so this file's `ok` label is
         // pinned to a real probe outcome and not to a guess.
         assert_eq!(
@@ -1985,5 +2484,649 @@ mod tests {
         assert!(err.starts_with("ERR "), "{err}");
         assert!(err.ends_with('\n'), "{err}");
         assert!(err.contains("instance-wide"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod asynchronous_probe_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn synthetic_state() -> ConsentState {
+        let mut state = ConsentState::inert();
+        state.probes.live = true;
+        state
+    }
+
+    fn key() -> ConsentKey {
+        ConsentKey::new("synthetic.app", "synthetic requirement")
+    }
+
+    fn grant() -> FdaProbe {
+        consent::classify_probe(consent::ProbeOutcome::Ok)
+    }
+
+    fn probe_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AsyncConsentProbePublication {
+                const Buggy = 0;
+                var epoch = 0;
+                var request_epoch = 0;
+                var flight = 0;
+                var cached = 0;
+                var cached_epoch = 0;
+                var ready = 1;
+                action Start when (flight == 0 && cached == 0 && ready == 1) {
+                    flight = 1;
+                    request_epoch = epoch;
+                    ready = 0;
+                }
+                action Cooldown when (ready == 0) {
+                    ready = 1;
+                }
+                action Invalidate when (epoch <= 1) {
+                    epoch = epoch + 1;
+                    cached = 0;
+                    cached_epoch = 0;
+                }
+                action Complete when (flight == 1) {
+                    flight = 0;
+                    cached = if request_epoch == epoch || Buggy == 1 { 1 } else { 0 };
+                    cached_epoch = if request_epoch == epoch || Buggy == 1 { request_epoch } else { 0 };
+                }
+                action Expire when (cached == 1) {
+                    cached = 0;
+                    cached_epoch = 0;
+                }
+                invariant Bounds: epoch <= 2 && request_epoch <= 2 && flight <= 1 && cached <= 1 && ready <= 1;
+                invariant CurrentPublication: cached == 0 || cached_epoch == epoch;
+                invariant OneWorkerOrCache: flight + cached <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn async_probe_model_proves_and_catches_stale_publication() {
+        let model = probe_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    fn admission_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AsyncConsentProbeAdmission {
+                const Buggy = 0;
+                var flight = 0;
+                var ready = 1;
+                var elapsed = 1;
+                action Start when (flight == 0 && ready == 1) {
+                    flight = 1;
+                    ready = 0;
+                    elapsed = 0;
+                }
+                action Complete when (flight == 1) { flight = 0; }
+                action Invalidate when (ready == 0) {
+                    ready = if Buggy == 1 { 1 } else { 0 };
+                }
+                action Cooldown when (elapsed == 0) {
+                    ready = 1;
+                    elapsed = 1;
+                }
+                invariant FloorSurvivesInvalidation: ready == 0 || elapsed == 1;
+                invariant Bounds: flight <= 1 && ready <= 1 && elapsed <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn admission_model_proves_and_catches_focus_churn_bypassing_the_floor() {
+        let model = admission_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn focus_and_identity_churn_conform_to_the_admission_floor() {
+        let model = admission_model();
+        for change_identity in [false, true] {
+            let state = synthetic_state();
+            let now = Instant::now();
+            let mut expected = model.init_state();
+            let ttl = Duration::from_secs(5);
+            let (_, request) = state.read_at(ProbeGate::on(), ttl, key(), now);
+            assert!(model.fire("Start", &mut expected));
+            state.shared.complete(&request.unwrap(), grant(), now);
+            assert!(model.fire("Complete", &mut expected));
+            for index in 0..100 {
+                let at = now + Duration::from_millis(index);
+                state.invalidate();
+                assert!(model.fire("Invalidate", &mut expected));
+                let current_key = if change_identity {
+                    ConsentKey::new("synthetic.app", format!("requirement-{index}"))
+                } else {
+                    key()
+                };
+                let (answer, request) = state.read_at(ProbeGate::on(), ttl, current_key, at);
+                assert_eq!(answer.0.label, ProbeLabel::Pending);
+                assert_eq!(request.is_some(), model.action_enabled("Start", &expected));
+                assert!(!state.shared.slot.lock().unwrap().in_flight);
+                assert_eq!(
+                    state.next_refresh_deadline(at, ttl),
+                    Some(now + PROBE_RETRY_FLOOR)
+                );
+                // Historical invalidation cleared the deadline. Projecting
+                // that implementation makes the model fail before another
+                // worker could even be admitted.
+                let mut cleared_floor = expected.clone();
+                cleared_floor.insert("ready", 1);
+                assert!(!model.check_invariant("FloorSurvivesInvalidation", &cleared_floor));
+            }
+            assert!(model.fire("Cooldown", &mut expected));
+            let (_, request) = state.read_at(ProbeGate::on(), ttl, key(), now + PROBE_RETRY_FLOOR);
+            assert_eq!(request.is_some(), model.action_enabled("Start", &expected));
+            assert!(request.is_some());
+        }
+    }
+
+    fn wait_model() -> aterm_spec::derive::Model {
+        aterm_spec::ty_model! {
+            AsyncConsentWaitObservation {
+                const Buggy = 0;
+                var baseline = 0;
+                var result = 0;
+                var expired = 0;
+                var complete = 0;
+                var armed = 0;
+                action Pending when (result == 0 && expired == 0) {
+                    complete = 0;
+                    armed = if baseline == 0 { 0 } else { 1 };
+                    result = if Buggy == 1 && baseline > 0 { 1 } else { 0 };
+                }
+                action ObserveA when (result == 0 && expired == 0) {
+                    complete = 1;
+                    armed = if baseline == 0 { 0 } else { 1 };
+                    result = if baseline == 2 { 1 } else { 0 };
+                    baseline = if baseline == 0 { 1 } else { baseline };
+                }
+                action ObserveB when (result == 0 && expired == 0) {
+                    complete = 1;
+                    armed = if baseline == 0 { 0 } else { 1 };
+                    result = if baseline == 1 { 1 } else { 0 };
+                    baseline = if baseline == 0 { 2 } else { baseline };
+                }
+                action Exit when (result == 0 && expired == 0) { result = 2; }
+                action Expire when (result == 0 && expired == 0) { expired = 1; }
+                action Timeout when (result == 0 && expired == 1) { result = 3; }
+                invariant OnlyCompletedChanges: result == 0 || result > 1 || (complete == 1 && armed == 1);
+                invariant DeadlineWins: expired == 0 || result == 0 || result == 3;
+                invariant Bounds: baseline <= 2 && result <= 3 && expired <= 1 && complete <= 1 && armed <= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn wait_model_proves_and_catches_pending_refresh_as_a_false_change() {
+        let model = wait_model();
+        aterm_spec::verify::prove_and_catch_scalar(&model, model.name);
+    }
+
+    #[test]
+    fn real_await_guards_conform_for_cold_warm_pending_and_deadline_observations() {
+        let model = wait_model();
+        for sequence in 0..256 {
+            for expire_at in 0..=4 {
+                let now = Instant::now();
+                let deadline = now + Duration::from_millis(10);
+                let mut wait = ConsentWait::new(now, Duration::from_millis(10));
+                let mut expected = model.init_state();
+                for index in 0..4 {
+                    let choice = (sequence >> (index * 2)) & 3;
+                    let (action, observation) = match choice {
+                        0 => ("Pending", ConsentObservation::Pending),
+                        1 => ("ObserveA", ConsentObservation::Complete("A".into())),
+                        2 => ("ObserveB", ConsentObservation::Complete("B".into())),
+                        _ => ("Exit", ConsentObservation::Exited),
+                    };
+                    let at = if index >= expire_at { deadline } else { now };
+                    if index >= expire_at {
+                        assert!(model.fire("Expire", &mut expected));
+                        assert!(model.fire("Timeout", &mut expected));
+                    } else {
+                        assert!(model.fire(action, &mut expected));
+                    }
+                    let result = wait.observe_at(observation, at);
+                    let projected = match result {
+                        ConsentWaitDecision::Wait => 0,
+                        ConsentWaitDecision::Changed(_) => 1,
+                        ConsentWaitDecision::Exited => 2,
+                        ConsentWaitDecision::TimedOut => 3,
+                    };
+                    assert_eq!(projected, expected["result"]);
+                    assert_eq!(
+                        match wait.baseline.as_deref() {
+                            None => 0,
+                            Some("A") => 1,
+                            Some("B") => 2,
+                            other => panic!("unexpected baseline: {other:?}"),
+                        },
+                        expected["baseline"]
+                    );
+                    assert_eq!(wait.deadline, deadline, "pending cannot extend the request");
+                    assert!(model.check_invariant("OnlyCompletedChanges", &expected));
+                    assert!(model.check_invariant("DeadlineWins", &expected));
+                    if action == "Pending" && expected["baseline"] != 0 && projected == 0 {
+                        let mut old_string_comparison = expected.clone();
+                        old_string_comparison.insert("result", 1);
+                        assert!(
+                            !model.check_invariant("OnlyCompletedChanges", &old_string_comparison)
+                        );
+                    }
+                    if projected != 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expiring_real_cache_never_completes_await_until_the_observed_tuple_changes() {
+        let state = synthetic_state();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let row = SessionRow {
+            sid: "s-synthetic".into(),
+            attribution: Attribution::Live,
+            responsible_pid: None,
+            responsible: Responsible::Unknown,
+            fs_consent: FsConsent::Unknown,
+            cwd: None,
+        };
+        let sample =
+            |probe| consent_observation(vec![PrivacySnapshot::observed_tuple_line(&row, probe)]);
+        let mut wait = ConsentWait::new(now, ttl * 4);
+        let ((pending, _), request) = state.read_at(ProbeGate::on(), ttl, key(), now);
+        assert_eq!(
+            wait.observe_at(sample(pending), now),
+            ConsentWaitDecision::Wait
+        );
+        assert!(wait.baseline.is_none(), "cold pending is not the baseline");
+        let denied = consent::classify_probe(consent::ProbeOutcome::Errno(consent::ERRNO_EPERM));
+        state.shared.complete(&request.unwrap(), denied, now);
+        let ((probe, _), _) = state.read_at(ProbeGate::on(), ttl, key(), now);
+        assert_eq!(
+            wait.observe_at(sample(probe), now),
+            ConsentWaitDecision::Wait
+        );
+        let baseline = wait.baseline.clone();
+        for (at, refreshed) in [(now + ttl, denied), (now + ttl * 2, grant())] {
+            let ((pending, _), request) = state.read_at(ProbeGate::on(), ttl, key(), at);
+            assert_eq!(pending.label, ProbeLabel::Pending);
+            assert_eq!(
+                wait.observe_at(sample(pending), at),
+                ConsentWaitDecision::Wait
+            );
+            assert_eq!(wait.baseline, baseline, "refresh retains the armed tuple");
+            state.shared.complete(&request.unwrap(), refreshed, at);
+            let ((probe, _), _) = state.read_at(ProbeGate::on(), ttl, key(), at);
+            let result = wait.observe_at(sample(probe), at);
+            if refreshed == denied {
+                assert_eq!(result, ConsentWaitDecision::Wait);
+            } else {
+                assert_eq!(
+                    result,
+                    ConsentWaitDecision::Changed(PrivacySnapshot::tuple_line(
+                        &row,
+                        FdaState::Granted
+                    ))
+                );
+            }
+        }
+    }
+
+    /// Tier-1: admission and publication are the exact shipping seams. Replay
+    /// every placement of two invalidations around two requests, including an
+    /// invalidation while the first worker is held. A stale worker retains its
+    /// slot and cannot publish a grant when it eventually finishes.
+    #[test]
+    fn async_probe_real_publication_conforms_to_the_bounded_model() {
+        for invalidations_before in 0..=2 {
+            for invalidations_during in 0..=2 - invalidations_before {
+                let state = synthetic_state();
+                // Establish the key without changing the model's initial epoch.
+                state.shared.slot.lock().unwrap().key = Some(key());
+                let now = Instant::now();
+                let ttl = Duration::from_secs(5);
+                let model = probe_model();
+                let mut expected = model.init_state();
+                let observed_at = std::cell::Cell::new(now);
+                let check = |expected: &std::collections::BTreeMap<&'static str, i64>| {
+                    let slot = state.shared.slot.lock().unwrap();
+                    let epoch = state.shared.epoch.load(Ordering::Acquire);
+                    assert_eq!(epoch as i64, expected["epoch"]);
+                    assert_eq!(slot.request_epoch as i64, expected["request_epoch"]);
+                    assert_eq!(i64::from(slot.in_flight), expected["flight"]);
+                    assert_eq!(i64::from(slot.entry.is_some()), expected["cached"]);
+                    assert_eq!(
+                        i64::from(slot.retry_after.is_none_or(|at| at <= observed_at.get())),
+                        expected["ready"]
+                    );
+                    assert_eq!(
+                        slot.entry.as_ref().map_or(0, |e| e.request.epoch) as i64,
+                        expected["cached_epoch"]
+                    );
+                    assert!(model.check_invariant("CurrentPublication", expected));
+                    assert!(model.check_invariant("OneWorkerOrCache", expected));
+                };
+                for _ in 0..invalidations_before {
+                    state.invalidate();
+                    assert!(model.fire("Invalidate", &mut expected));
+                    check(&expected);
+                }
+                let (pending, request) = state.read_at(ProbeGate::on(), ttl, key(), now);
+                assert_eq!(pending.0.label, ProbeLabel::Pending);
+                let request = request.unwrap();
+                assert!(model.fire("Start", &mut expected));
+                check(&expected);
+                for _ in 0..invalidations_during {
+                    state.invalidate();
+                    assert!(model.fire("Invalidate", &mut expected));
+                    check(&expected);
+                }
+                for _ in 0..100 {
+                    let (pending, next) = state.read_at(ProbeGate::on(), ttl, key(), now);
+                    assert_eq!(pending.0.label, ProbeLabel::Pending);
+                    assert!(next.is_none());
+                    assert!(!model.action_enabled("Start", &expected));
+                    check(&expected);
+                }
+                let mut old_unchecked_publisher = expected.clone();
+                old_unchecked_publisher.insert("flight", 0);
+                old_unchecked_publisher.insert("cached", 1);
+                old_unchecked_publisher.insert("cached_epoch", request.epoch as i64);
+                if invalidations_during != 0 {
+                    assert!(!model.check_invariant("CurrentPublication", &old_unchecked_publisher));
+                }
+                state.shared.complete(&request, grant(), now);
+                assert!(model.fire("Complete", &mut expected));
+                check(&expected);
+                if invalidations_during != 0 {
+                    let (pending, blocked) = state.read_at(ProbeGate::on(), ttl, key(), now);
+                    assert_eq!(pending.0.label, ProbeLabel::Pending);
+                    assert!(
+                        blocked.is_none(),
+                        "invalidation retains the admission floor"
+                    );
+                    assert!(!model.action_enabled("Start", &expected));
+                    observed_at.set(now + PROBE_RETRY_FLOOR);
+                    assert!(model.fire("Cooldown", &mut expected));
+                    let (pending, current) =
+                        state.read_at(ProbeGate::on(), ttl, key(), observed_at.get());
+                    assert_eq!(pending.0.state, FdaState::Unknown);
+                    assert!(model.fire("Start", &mut expected));
+                    check(&expected);
+                    state
+                        .shared
+                        .complete(&current.unwrap(), grant(), observed_at.get());
+                    assert!(model.fire("Complete", &mut expected));
+                    check(&expected);
+                }
+                assert_eq!(
+                    state
+                        .read_at(ProbeGate::on(), ttl, key(), observed_at.get())
+                        .0
+                        .0,
+                    grant()
+                );
+                // A real expired cache is retired by the same read that admits
+                // its refresh. Model the two decisions separately.
+                observed_at.set(observed_at.get() + ttl);
+                assert!(model.fire("Cooldown", &mut expected));
+                let (pending, refresh) =
+                    state.read_at(ProbeGate::on(), ttl, key(), observed_at.get());
+                assert_eq!(pending.0.state, FdaState::Unknown);
+                assert!(refresh.is_some());
+                assert!(model.fire("Expire", &mut expected));
+                assert!(model.fire("Start", &mut expected));
+                check(&expected);
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_gates_override_warm_grants_and_late_workers() {
+        for gate in [
+            ProbeGate {
+                enabled: false,
+                check: true,
+            },
+            ProbeGate {
+                enabled: true,
+                check: false,
+            },
+            ProbeGate {
+                enabled: false,
+                check: false,
+            },
+        ] {
+            for finish_before_disable in [false, true] {
+                let state = synthetic_state();
+                let now = Instant::now();
+                let ttl = Duration::from_secs(5);
+                let (_, request) = state.read_at(ProbeGate::on(), ttl, key(), now);
+                let request = request.unwrap();
+                if finish_before_disable {
+                    state.shared.complete(&request, grant(), now);
+                }
+                let (disabled, next) = state.read_at(gate, ttl, key(), now);
+                assert_eq!(disabled.0.label, ProbeLabel::RefusedDisabled);
+                assert_eq!(disabled.0.state, FdaState::Unknown);
+                assert!(next.is_none());
+                if !finish_before_disable {
+                    assert!(state.shared.slot.lock().unwrap().in_flight);
+                    state.shared.complete(&request, grant(), now);
+                }
+                let (reenabled, request) =
+                    state.read_at(ProbeGate::on(), ttl, key(), now + PROBE_RETRY_FLOOR);
+                assert_eq!(reenabled.0.label, ProbeLabel::Pending);
+                assert!(request.is_some(), "reenabling requires a new probe");
+            }
+        }
+    }
+
+    #[test]
+    fn identity_changes_and_contended_invalidation_refuse_old_grants() {
+        let state = synthetic_state();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let (_, old) = state.read_at(ProbeGate::on(), ttl, key(), now);
+        let other = ConsentKey::new("another.app", "another requirement");
+        assert!(
+            state
+                .read_at(ProbeGate::on(), ttl, other.clone(), now)
+                .1
+                .is_none()
+        );
+        state.shared.complete(&old.unwrap(), grant(), now);
+        let now = now + PROBE_RETRY_FLOOR;
+        let (answer, request) = state.read_at(ProbeGate::on(), ttl, other.clone(), now);
+        assert_eq!(answer.0.label, ProbeLabel::Pending);
+        state.shared.complete(&request.unwrap(), grant(), now);
+        let guard = state.shared.slot.lock().unwrap();
+        // Neither operation can wait on this held lock, including the policy
+        // invalidation. The old answer stays physically cached until unlocked.
+        assert_eq!(
+            state
+                .read_at(ProbeGate::on(), ttl, other.clone(), now)
+                .0
+                .0
+                .label,
+            ProbeLabel::Pending
+        );
+        state.invalidate();
+        drop(guard);
+        assert_eq!(
+            state.read_at(ProbeGate::on(), ttl, other, now).0.0.label,
+            ProbeLabel::Pending
+        );
+    }
+
+    #[test]
+    fn pending_deadlines_stay_future_and_cold_inert_reads_stay_inert() {
+        let state = synthetic_state();
+        let now = Instant::now();
+        let (_, request) = state.read_at(ProbeGate::on(), Duration::from_millis(1), key(), now);
+        assert!(request.is_some());
+        for step in 0..100 {
+            let at = now + Duration::from_millis(step);
+            assert_eq!(
+                state.next_refresh_deadline(at, Duration::from_millis(1)),
+                Some(at + PROBE_RETRY_FLOOR)
+            );
+            assert!(
+                state
+                    .read_at(ProbeGate::on(), Duration::from_millis(1), key(), at)
+                    .1
+                    .is_none()
+            );
+        }
+        let inert = ConsentState::inert();
+        assert_eq!(
+            inert.fda(ProbeGate::on(), Duration::ZERO, "dr").0.label,
+            ProbeLabel::RefusedDisabled
+        );
+        assert_eq!(inert.next_refresh_deadline(now, Duration::ZERO), None);
+        assert_eq!(ProbeLabel::Pending.as_str(), "pending");
+        assert!(!ProbeLabel::Pending.refused());
+        assert_eq!(observer_fda_value(ProbeLabel::Pending), "pending");
+        assert_eq!(
+            completed_probe_age_ms(ProbeLabel::Pending, Duration::ZERO),
+            None
+        );
+        assert_eq!(
+            completed_probe_age_ms(ProbeLabel::OpenOk, Duration::ZERO),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn zero_interval_cannot_turn_completion_into_a_probe_wake_loop() {
+        let state = synthetic_state();
+        let now = Instant::now();
+        let (_, request) = state.read_at(ProbeGate::on(), Duration::ZERO, key(), now);
+        state.shared.complete(&request.unwrap(), grant(), now);
+        for elapsed in [Duration::ZERO, PROBE_RETRY_FLOOR - Duration::from_nanos(1)] {
+            let (answer, next) =
+                state.read_at(ProbeGate::on(), Duration::ZERO, key(), now + elapsed);
+            assert_eq!(answer.0, grant());
+            assert!(next.is_none(), "completion must not immediately re-arm");
+            assert_eq!(
+                state.next_refresh_deadline(now + elapsed, Duration::ZERO),
+                Some(now + PROBE_RETRY_FLOOR)
+            );
+        }
+        let (expired, refresh) = state.read_at(
+            ProbeGate::on(),
+            Duration::ZERO,
+            key(),
+            now + PROBE_RETRY_FLOOR,
+        );
+        assert_eq!(expired.0.label, ProbeLabel::Pending);
+        assert!(refresh.is_some(), "minimum freshness still expires");
+    }
+
+    #[test]
+    fn failed_worker_creation_releases_its_slot_with_bounded_backoff() {
+        let state = synthetic_state();
+        let now = Instant::now();
+        let (_, request) = state.read_at(ProbeGate::on(), Duration::ZERO, key(), now);
+        let request = request.unwrap();
+        state
+            .shared
+            .failed_request
+            .store(request.epoch, Ordering::Release);
+        for offset in [Duration::ZERO, PROBE_RETRY_FLOOR - Duration::from_nanos(1)] {
+            let (answer, next) =
+                state.read_at(ProbeGate::on(), Duration::ZERO, key(), now + offset);
+            assert_eq!(answer.0.label, ProbeLabel::Pending);
+            assert!(next.is_none());
+            assert!(!state.shared.slot.lock().unwrap().in_flight);
+        }
+        assert!(
+            state
+                .read_at(
+                    ProbeGate::on(),
+                    Duration::ZERO,
+                    key(),
+                    now + PROBE_RETRY_FLOOR
+                )
+                .1
+                .is_some()
+        );
+    }
+
+    struct BlockedProbe {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    static BLOCKED_PROBE: Mutex<Option<BlockedProbe>> = Mutex::new(None);
+    static BLOCKED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn blocked_probe(_gate: ProbeGate) -> FdaProbe {
+        BLOCKED_CALLS.fetch_add(1, Ordering::SeqCst);
+        let fixture = BLOCKED_PROBE
+            .lock()
+            .unwrap()
+            .take()
+            .expect("only one worker");
+        fixture.entered.send(()).unwrap();
+        fixture
+            .release
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        grant()
+    }
+
+    #[test]
+    fn a_blocked_real_worker_cannot_block_reads_or_multiply_on_invalidation() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        *BLOCKED_PROBE.lock().unwrap() = Some(BlockedProbe {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let mut state = synthetic_state();
+        state.probes.fda = blocked_probe;
+        let weak = Arc::downgrade(&state.shared);
+        state.set_completion_wake(Arc::new(move || {
+            assert!(
+                weak.upgrade().unwrap().slot.try_lock().is_ok(),
+                "wake runs unlocked"
+            );
+            done_tx.send(()).unwrap();
+        }));
+        let ttl = Duration::from_secs(5);
+        assert_eq!(
+            state.fda(ProbeGate::on(), ttl, "dr").0.label,
+            ProbeLabel::Pending
+        );
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // There is no elapsed-time assertion: reaching the release below while
+        // the worker waits is the nonblocking witness, even on a loaded box.
+        for _ in 0..100 {
+            assert_eq!(
+                state.fda(ProbeGate::on(), ttl, "dr").0.label,
+                ProbeLabel::Pending
+            );
+            state.invalidate();
+        }
+        assert!(state.shared.slot.lock().unwrap().in_flight);
+        assert_eq!(BLOCKED_CALLS.load(Ordering::SeqCst), 1);
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(!state.shared.slot.lock().unwrap().in_flight);
+        assert!(
+            state.shared.slot.lock().unwrap().entry.is_none(),
+            "stale grant refused"
+        );
     }
 }

@@ -125,7 +125,26 @@ pub const VERB_DEPTH: usize = 6;
 /// Directory names never descended into. `Library` and `Applications` hold no cargo output
 /// and are large; `node_modules` is the other cheap prune. (`.Trash` is already covered by
 /// the dot rule; it is listed because the reader should not have to derive that.)
-const SKIP_DIRS: &[&str] = &["Library", "Applications", "node_modules", ".Trash"];
+///
+/// THE macOS-PROTECTED FOLDERS ARE PRUNED TOO (2026-09-10). `Documents`, `Desktop`,
+/// `Downloads`, `Pictures`, `Movies` and `Music` are the folders macOS guards with a
+/// per-folder consent dialog, and it attributes that dialog to the terminal — so the
+/// automatic pass at the end of every seed/update walked `$HOME` three levels deep and
+/// raised, in aterm's own name, exactly the prompts the consent design exists to
+/// consolidate. No cargo `target/` the automatic pass should touch lives in any of them;
+/// a user who keeps one there names it to the verb, which is deliberate and may prompt.
+const SKIP_DIRS: &[&str] = &[
+    "Library",
+    "Applications",
+    "node_modules",
+    ".Trash",
+    "Documents",
+    "Desktop",
+    "Downloads",
+    "Pictures",
+    "Movies",
+    "Music",
+];
 
 /// Ceiling on the `CACHEDIR.TAG` read. Cargo's is 177 bytes; anything larger is not
 /// cargo's, and reading it as "no tag" is the fail-closed direction — [`migrate`] then
@@ -3176,5 +3195,62 @@ mod tests {
              module measures: {v}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE AUTOMATIC WALK NEVER OPENS A macOS-PROTECTED FOLDER (2026-09-10): the
+    /// pass at the end of every seed/update walks `$HOME`, and macOS attributes
+    /// the per-folder consent dialog to the terminal — so pruning these is what
+    /// keeps aterm from raising, in its own name, the prompts its consent design
+    /// exists to consolidate. A root the user NAMES is still walked.
+    #[test]
+    fn the_home_walk_prunes_every_macos_protected_folder() {
+        let tmp = std::env::temp_dir().join(format!("aterm-noindex-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for name in [
+            "Documents",
+            "Desktop",
+            "Downloads",
+            "Pictures",
+            "Movies",
+            "Music",
+            "src",
+        ] {
+            let target = tmp.join(name).join("proj").join("target");
+            std::fs::create_dir_all(&target).unwrap();
+            std::fs::write(target.join("CACHEDIR.TAG"), CACHEDIR_TAG_SIGNATURE).unwrap();
+        }
+        let walked = scan(&tmp, 4, &Budget::VERB);
+        let found: Vec<String> = walked
+            .targets
+            .iter()
+            .map(|t| {
+                t.path
+                    .strip_prefix(&tmp)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            found.iter().any(|p| p.starts_with("src/")),
+            "an ordinary directory is still walked: {found:?}"
+        );
+        for name in [
+            "Documents",
+            "Desktop",
+            "Downloads",
+            "Pictures",
+            "Movies",
+            "Music",
+        ] {
+            assert!(
+                !found.iter().any(|p| p.starts_with(name)),
+                "{name} must never be descended into by the automatic pass: {found:?}"
+            );
+        }
+        // Named directly, the same folder IS walked — the user asked.
+        let named = scan(&tmp.join("Documents"), 4, &Budget::VERB);
+        assert!(!named.targets.is_empty(), "a named root is deliberate");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -2382,6 +2382,7 @@ fn pet_layer(
                     scale_x: 1.0,
                     scale_y: 1.0,
                     purr: 0.0,
+                    contented: false,
                     under_ink: false,
                     motes: [None; PET_MOTES_MAX],
                     departures: [None; PET_DEPARTURES_MAX],

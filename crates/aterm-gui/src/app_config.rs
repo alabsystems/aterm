@@ -8162,6 +8162,63 @@ impl App {
         self.set_session_rain_override(sid, Some(!effective));
     }
 
+    /// The `fx` control-socket verb ([`crate::Wake::FxControl`]), acting on the
+    /// focused window's FRONT session: `Status` reads, `Celebrate` ARMS the
+    /// window's sing-along detector (`kitty_sing::KittySing::arm_external`)
+    /// for that session — latched here, spent by the session's next keyed
+    /// edge in the render path (the green verdict, or a keyed Enter through
+    /// the input seam). `Ok` carries the post-state line every form answers:
+    /// `armed=<none|green|enter> sig=<hex> bars=<n> live=<bool> bar=<n|none>
+    /// drive=<f> cooldown_ms=<n> style=<rainbow-kitty|other>`. `Err` when no
+    /// window is focused, the front content is not a terminal, the trail is
+    /// not the rainbow kitty (an arm that could never light is refused, not
+    /// swallowed), or the detector refuses (pending arm, cooldown, bars).
+    pub(crate) fn fx_control(&mut self, op: crate::FxCtlOp) -> Result<String, String> {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no focused window".to_string());
+        };
+        let Some(sid) = self.front_terminal(wid).map(|t| t.session) else {
+            return Err("front content is not a terminal (no session to arm)".to_string());
+        };
+        let glow = self.glow_config();
+        let rainbow = matches!(glow.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+        let allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::CursorCat);
+        let now = std::time::Instant::now();
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return Err("no focused window".to_string());
+        };
+        if let crate::FxCtlOp::Celebrate { sig, bars, on } = op {
+            if !allowed {
+                return Err("Serious Mode suppresses cursor companions".to_string());
+            }
+            if !glow.enabled {
+                return Err("cursor trail is disabled (nothing to celebrate with)".to_string());
+            }
+            if !rainbow {
+                return Err(
+                    "cursor trail is not the rainbow kitty (nothing to celebrate with)".to_string(),
+                );
+            }
+            ws.kitty_sing
+                .arm_external(now, sid, sig, bars, on)
+                .map_err(|refusal| refusal.to_string())?;
+        }
+        let sing = &ws.kitty_sing;
+        let (armed, sig, bars) = sing
+            .armed_external()
+            .map_or(("none", 0, 0), |arm| (arm.on.as_str(), arm.sig, arm.bars));
+        Ok(format!(
+            "armed={armed} sig={sig:08x} bars={bars} live={} bar={} drive={:.2} cooldown_ms={} style={}",
+            sing.external_live(),
+            sing.bar(now).map_or("none".to_string(), |b| b.to_string()),
+            sing.drive(now),
+            sing.cooldown_remaining(now).as_millis(),
+            if rainbow { "rainbow-kitty" } else { "other" },
+        ))
+    }
+
     /// The `rain` control-socket verb ([`crate::Wake::RainControl`]), acting on
     /// the focused window's FRONT session. `Ok` carries the wire tail after
     /// `OK ` — every op (including the writes) answers with the same one-line
@@ -9912,6 +9969,11 @@ impl App {
         // `dark:…,light:…` split theme without re-reading disk (see
         // `App::sync_app_theme_to_appearance`). Resolve the engine/renderer theme for
         // the CURRENT OS appearance so a reload preserves the active light/dark side.
+        if self.config.privacy_probe_gate() != config.privacy_probe_gate() {
+            // Retire an in-flight answer even if an off/on pair of reloads
+            // arrives before any card/status read sees the intermediate state.
+            self.consent.invalidate();
+        }
         self.config = config.clone();
         // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
         // config commit records the wish here, once, beside the swap — not per
@@ -16189,6 +16251,96 @@ mod matrix_rain_app_tests {
                  engine=none active=false scope=window focused=true animating=true"),
             "off is idempotent"
         );
+    }
+
+    /// The `fx` control-verb face ([`crate::App::fx_control`]): `status` is a
+    /// pure read; `celebrate` ARMS once and answers the post-state; a second
+    /// arm is refused with the detector's own sentence; a non-rainbow trail
+    /// refuses the arm outright. Nothing here drives the detector: `live`
+    /// stays false because no keyed edge ever came.
+    #[test]
+    fn fx_control_verb_arms_once_and_reports() {
+        let mut app = crate::App::headless_for_test();
+        app.config = cfg("cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"");
+        let status = app
+            .fx_control(crate::FxCtlOp::Status)
+            .expect("status reads");
+        assert!(
+            status.starts_with(
+                "armed=none sig=00000000 bars=0 live=false bar=none drive=0.00 cooldown_ms=0 style="
+            ),
+            "{status}"
+        );
+        assert!(
+            status.ends_with("style=rainbow-kitty"),
+            "positive fixture must enable the real style"
+        );
+        let sig = aterm_effects::kitty_sing::song_signature('C');
+        let arm = app.fx_control(crate::FxCtlOp::Celebrate {
+            sig,
+            bars: 2,
+            on: aterm_effects::kitty_sing::CelebrateOn::Green,
+        });
+        let line = arm.expect("the first arm is admitted");
+        assert!(
+            line.starts_with(&format!(
+                "armed=green sig={sig:08x} bars=2 live=false bar=none drive=0.00 cooldown_ms="
+            )),
+            "{line}"
+        );
+        let again = app.fx_control(crate::FxCtlOp::Celebrate {
+            sig,
+            bars: 1,
+            on: aterm_effects::kitty_sing::CelebrateOn::Enter,
+        });
+        assert_eq!(
+            again.as_deref().map_err(String::as_str),
+            Err("a celebration is already armed (one arm at a time)")
+        );
+        let status = app
+            .fx_control(crate::FxCtlOp::Status)
+            .expect("status reads");
+        assert!(
+            status.starts_with("armed=green"),
+            "status is a pure read: {status}"
+        );
+    }
+
+    #[test]
+    fn fx_control_refuses_inactive_visual_policies_without_spending_an_arm() {
+        for (config, refusal) in [
+            (
+                "cursor_trail = false\ncursor_trail_style = \"rainbow kitty pet\"",
+                "cursor trail is disabled (nothing to celebrate with)",
+            ),
+            (
+                "cursor_trail = true\ncursor_trail_style = \"laser\"",
+                "cursor trail is not the rainbow kitty (nothing to celebrate with)",
+            ),
+            (
+                "cursor_trail = true\ncursor_trail_style = \"rainbow kitty pet\"\nserious_mode = true",
+                "Serious Mode suppresses cursor companions",
+            ),
+        ] {
+            let mut app = crate::App::headless_for_test();
+            app.config = cfg(config);
+            app.apply_serious_mode(app.config.serious_mode_or_default());
+            let arm = app.fx_control(crate::FxCtlOp::Celebrate {
+                sig: aterm_effects::kitty_sing::song_signature('C'),
+                bars: 2,
+                on: aterm_effects::kitty_sing::CelebrateOn::Green,
+            });
+            assert_eq!(arm.as_deref().map_err(String::as_str), Err(refusal));
+            let status = app
+                .fx_control(crate::FxCtlOp::Status)
+                .expect("status still reads");
+            assert!(
+                status.starts_with(
+                    "armed=none sig=00000000 bars=0 live=false bar=none drive=0.00 cooldown_ms=0 "
+                ),
+                "refusal spends no arm or cooldown: {status}"
+            );
+        }
     }
 
     /// Hot reload: the dirty gate re-resolves; a live engine receives the new

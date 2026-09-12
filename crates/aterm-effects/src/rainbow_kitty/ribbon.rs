@@ -249,7 +249,7 @@ use aterm_time::Instant;
 
 use aterm_render::{BeamVertex, GlowBlend, RibbonVertex, comet_beam, ribbon_beam};
 
-use crate::cursor_glow::InkRole;
+use crate::cursor_glow::{InkRole, band_pos, band_row};
 use crate::effect_util::lerp_rgb;
 use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
@@ -1225,6 +1225,28 @@ impl FieldIndex {
         }
     }
 
+    /// [`FieldIndex::translate`]'s ROW-BAND twin (seam point 12, the band
+    /// path): a lane on a row outside `top..=bottom` keeps its row, a lane
+    /// inside takes its row moved by `delta`, and a lane whose row leaves the
+    /// band retires into the spare pool cleared over its own `touched` list
+    /// — the same O(marks) retirement, so no lane is minted again on the next
+    /// plan and [`FieldIndex::at`] answers for the MOVED cell between the
+    /// band move and the next plan (the law [`crate::cursor_glow::band_row`]
+    /// states; the edge row is a real cell that does not own this light).
+    fn translate_band(&mut self, top: u16, bottom: u16, delta: i16) {
+        let mut i = 0;
+        while i < self.lanes.len() {
+            if let Some(row) = band_row(self.lanes[i].row, top, bottom, delta) {
+                self.lanes[i].row = row;
+                i += 1;
+            } else {
+                let mut dark = self.lanes.swap_remove(i);
+                dark.clear();
+                self.spare.push(dark);
+            }
+        }
+    }
+
     /// Write one cell's field. **FIRST WRITER WINS**, and the plan feeds this
     /// NEWEST-FIRST — which is the index's whole contract, stated in exactly
     /// the terms v1's reverse scan of `sparks` answered it in: the newest cell
@@ -1663,6 +1685,15 @@ struct Run {
     at_caret: bool,
     /// The newest typing cell's birth, the emit order's second key.
     born: Instant,
+    /// **WHICH WAY THE STREAM RUNS** from the head: `−1` toward lower
+    /// columns — every typed run and every rightward wake, whose tail is
+    /// their left end — or `+1` toward higher columns, which is a LEFTWARD
+    /// wake's (the caret landed on the run's FIRST cell and the corridor it
+    /// crossed lies to its right; see [`Ribbon::head_col`]'s wake clause).
+    /// The hot edge reaches from the head this way only — behind the hand,
+    /// never over the cells it has erased — and [`Run::head`] is the run's
+    /// `lo` boundary when it is `+1`.
+    stream_dir: i8,
 }
 
 /// THE RIBBON producer: the laid cells, their cohorts, this frame's plan, and
@@ -2172,8 +2203,13 @@ impl Ribbon {
         let cov0_new = BODY_COLD_SHARE + (1.0 - BODY_COLD_SHARE) * birth_disp;
         let (anchor_col, t0) = self.wake_origin(row, to, at);
         let minted = takeover.then(|| self.mint_cohort(row, to, anchor_col, t0, at, true));
-        // Far end first, landing LAST: the landing is the newest cell, so it
-        // is the run's head (`head_col`) and the hot edge sits by the caret.
+        // Far end first, landing LAST — the pool is append-ordered and the
+        // index's last-writer-wins rule reads it so. Birth order does NOT
+        // make the landing the head: every new cell here shares one
+        // `born_new`, and a newest-born head would resolve to the far end
+        // of a leftward corridor. The landing is the head by `head_col`'s
+        // WAKE clause (the caret standing on a wake run's first cell), which
+        // is what puts the hot edge by the caret after a Ctrl-A.
         for k in (0..=span).rev() {
             let col = if leftward { to + k } else { to - k };
             // The cell that owns this column now: its newest un-retracting
@@ -2833,9 +2869,30 @@ impl Ribbon {
     /// fading erased cells for up to half a second after a backspace and then
     /// jumped it left.
     ///
+    /// **THE HEAD OF A LEFTWARD WAKE IS ITS LANDING** (2026-09-10, the
+    /// stream round). When the caret stands ON the run's FIRST cell and that
+    /// run is a WAKE cohort ([`Cohort::wake`]) — a same-row jump to a lower
+    /// column laid the corridor it crossed and the landing cell is under the
+    /// block — the landing is the head and the stream runs toward HIGHER
+    /// columns (`stream_dir` `+1`). Before this clause the own-cell branch
+    /// failed at the landing (`caret − 1` is not laid, or underflows at col
+    /// 0) and the run fell to `newest`: [`Ribbon::wake`] lays every new cell
+    /// with ONE `born_new`, the taken-over typed cells keep their older
+    /// births, and `max_by` returns the LAST equal maximum of a
+    /// column-ascending run — the HIGHEST-column new cell, the FAR end of
+    /// the corridor — so after every Ctrl-A the standing hot edge came up
+    /// where the caret LEFT, up to 32 cells from the hand, 100 ms after the
+    /// jump. `wake()`'s own comment stated the intent the code missed. The
+    /// typed-cohort rule ([`Run::head`]: "the head is always the run's
+    /// right-hand side") is not touched: a typed cohort is `wake == false`,
+    /// so a Backspace can never reach this clause, and a rightward wake —
+    /// the caret on its LAST cell — keeps the own-cell head.
+    ///
     /// `at caret` is the emit-order key (the run the hand is on goes first)
     /// and is true whenever the caret is in or beside the run, wet or not.
-    fn head_col(&self, ctx: &Ctx<'_>, run: &[(u16, u16, u32)]) -> (u16, bool, bool) {
+    /// The fourth value is the run's `stream_dir`: `+1` from the wake clause,
+    /// `−1` from every other branch.
+    fn head_col(&self, ctx: &Ctx<'_>, run: &[(u16, u16, u32)]) -> (u16, bool, bool, i8) {
         let row = run[0].0;
         let (col0, col1) = (run[0].1, run[run.len() - 1].1);
         let (crow, ccol) = ctx.caret;
@@ -2850,7 +2907,18 @@ impl Ribbon {
             && (col0..=col1).contains(&own)
             && live(own)
         {
-            return (own, true, true);
+            return (own, true, true, -1);
+        }
+        if at_caret
+            && ccol == col0
+            && live(col0)
+            && self
+                .cells
+                .get(run[0].2 as usize)
+                .and_then(|c| self.cohorts.iter().find(|k| k.id == c.cohort))
+                .is_some_and(|k| k.wake)
+        {
+            return (col0, true, true, 1);
         }
         let newest = run
             .iter()
@@ -2859,8 +2927,8 @@ impl Ribbon {
             .max_by(|a, b| a.born.cmp(&b.born))
             .map(|c| c.col);
         match newest {
-            Some(col) => (col, at_caret, true),
-            None => (col1, at_caret, false),
+            Some(col) => (col, at_caret, true, -1),
+            None => (col1, at_caret, false, -1),
         }
     }
 
@@ -2873,7 +2941,7 @@ impl Ribbon {
             return;
         };
         let slabs = self.slabs_per_cell();
-        let (head_col, at_caret, wet) = self.head_col(ctx, run);
+        let (head_col, at_caret, wet, stream_dir) = self.head_col(ctx, run);
         let born = run
             .iter()
             .filter_map(|e| self.cells.get(e.2 as usize))
@@ -2953,9 +3021,15 @@ impl Ribbon {
         let hi = self.plan.len();
         if hi > lo {
             // The head BOUNDARY: the head cell's RIGHT edge. Boundary `b` of
-            // the run sits at `lo + (b − col0) · slabs`.
+            // the run sits at `lo + (b − col0) · slabs`. A LEFTWARD wake's
+            // head is the landing's LEFT edge — the run's first boundary —
+            // and its stream runs the other way (`Run::stream_dir`).
             let head_boundary = usize::from(head_col - col0) + 1;
-            let head = (lo + head_boundary * slabs).min(hi - 1);
+            let head = if stream_dir > 0 {
+                lo
+            } else {
+                (lo + head_boundary * slabs).min(hi - 1)
+            };
             self.runs.push(Run {
                 row,
                 col0,
@@ -2967,6 +3041,7 @@ impl Ribbon {
                 wet,
                 at_caret,
                 born,
+                stream_dir,
             });
         }
     }
@@ -3130,7 +3205,11 @@ impl Ribbon {
         if gain <= 0.0 {
             return;
         }
-        let head_x = self.plan[run.head].x;
+        let mouth_x = self.plan[run.head].x;
+        // WHICH WAY IS BEHIND: `−1` (a typed run, a rightward wake) puts the
+        // tail at lower x, `+1` (a leftward wake, `Run::stream_dir`) at
+        // higher x — `behind` is positive on the tail side either way.
+        let dir = f32::from(run.stream_dir);
         // THE HEAD CELL'S OWN REACH ([`edge_cells`]), priced when it was laid:
         // the hairline is the head's property, and the key that bought a
         // longer streak keeps it for as long as that key is the head.
@@ -3143,9 +3222,9 @@ impl Ribbon {
             .iter()
             .step_by(self.slabs_per_cell())
         {
-            // Only the TAIL side of the head — its left (see `Run::head`):
+            // Only the TAIL side of the head (see `Run::head`, `stream_dir`):
             // behind the hand, never over the cells it has erased.
-            let behind = head_x - seg.x;
+            let behind = (mouth_x - seg.x) * (-dir);
             if !(0.0..=reach).contains(&behind) {
                 continue;
             }
@@ -3500,6 +3579,66 @@ impl Ribbon {
             .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
         self.caret = self.caret.map(|(row, col)| (row.saturating_sub(rows), col));
         self.index.translate(rows);
+        self.plan.clear();
+        self.runs.clear();
+    }
+
+    /// **A ROW BAND CARRIES ITS RIBBON WITH ITS TEXT** (seam point 12, the
+    /// band path) — [`Ribbon::translate_scroll`] restated for the motion a
+    /// whole-grid scroll cannot express: screen rows `top..=bottom` moved by
+    /// `delta` rows and every other row stood still. Codex's inline viewport
+    /// sliding DOWN one row per streamed line under the hand that is typing
+    /// into it (`[vt..56] +1`), its pinned transcript archiving UP under a
+    /// fixed composer (`[0..51] −1`), an Enter's `RI×k`, a tmux pane or a
+    /// vim status row scrolling inside its DECSTBM region, IL/DL — before
+    /// this fence every one of them reached the engine as a reset, and the
+    /// measured Codex session read `ribbon_segments 16 → 0` on the first
+    /// streamed line (docs/measured/codex-on-glass-2026-09-10.md).
+    ///
+    /// The law is [`crate::cursor_glow::band_row`]'s, member by member: a
+    /// cell or cohort outside the band is untouched, one inside moves by
+    /// `delta` with every clock and price it carries, and one carried past
+    /// the band's edge is DROPPED rather than clamped — the edge row is a
+    /// real cell nobody typed this light on. The two orphan sweeps then keep
+    /// "a cohort has cells" and "a cell has a cohort" true, exactly as the
+    /// scroll twin does. The caret is a POSITION ([`crate::cursor_glow::
+    /// band_pos`]): saturated at the band's edge, re-observed by the host's
+    /// next move. The field index is translated lane by lane so
+    /// [`Ribbon::field_at`] / [`Ribbon::field_at_caret`] answer for the
+    /// MOVED cell between this call and the next plan (the engine seeds the
+    /// tick's `caret_t` from the caret's field BEFORE it plans). No pixel is
+    /// taken, for the reason the scroll twin gives: every piece of ribbon
+    /// STATE is a grid row and a clock; the pixel geometry is this frame's
+    /// scratch, dropped here and rebuilt by the next [`Ribbon::plan`].
+    pub fn translate_band(&mut self, top: u16, bottom: u16, delta: i16) {
+        if delta == 0 || top > bottom {
+            return;
+        }
+        self.cells
+            .retain_mut(|c| match band_row(c.row, top, bottom, delta) {
+                Some(row) => {
+                    c.row = row;
+                    true
+                }
+                None => false,
+            });
+        self.cohorts
+            .retain_mut(|c| match band_row(c.row, top, bottom, delta) {
+                Some(row) => {
+                    c.row = row;
+                    true
+                }
+                None => false,
+            });
+        let cells = &self.cells;
+        self.cohorts
+            .retain(|coh| cells.iter().any(|c| c.cohort == coh.id));
+        self.cells
+            .retain(|c| self.cohorts.iter().any(|coh| coh.id == c.cohort));
+        self.caret = self
+            .caret
+            .map(|(row, col)| (band_pos(row, top, bottom, delta), col));
+        self.index.translate_band(top, bottom, delta);
         self.plan.clear();
         self.runs.clear();
     }
@@ -5338,6 +5477,122 @@ mod tests {
         assert_eq!(newest, Some(110));
     }
 
+    /// **THE HEAD OF A LEFTWARD WAKE IS ITS LANDING** (2026-09-10, the
+    /// stream round; the owner: the trail "needs more edge case handling
+    /// for when the cursor is jumping around"). After a Ctrl-A the standing
+    /// hot edge must come up WHERE THE CARET IS — over the landing cell and
+    /// reaching rightward over the corridor — not where the caret left.
+    ///
+    /// FAILING BEFORE (measured on `9c67b4769`): `wake()` lays the far end
+    /// first and the landing last, every NEW cell with the one
+    /// `born_new = at + WAKE_BORN_LAG_S`, and the taken-over typed cells keep
+    /// their older births; `head_col`'s own-cell branch fails at the landing
+    /// (`caret.col − 1` underflows at col 0) and falls to `max_by(born)`,
+    /// which returns the LAST equal maximum of a column-ascending run — the
+    /// HIGHEST-column new cell, i.e. the far end of the corridor the jump
+    /// crossed. On this fixture (a 40-cell word at cols 2..41, Ctrl-A to
+    /// col 0) the new cells are cols 0 and 1, so the head resolved to col 1
+    /// and the hairline lay at `x ∈ [0, 2·cw]` — BEHIND the caret, never
+    /// over the corridor; in the deletion script's 20 → 0 jump the new
+    /// cells span the whole corridor and the edge lit its FAR end, 20 cells
+    /// from the hand. `wake()`'s own comment ("the landing is the newest
+    /// cell, so it is the run's head") stated the intent the code missed.
+    ///
+    /// Now `head_col` has a WAKE clause: the caret standing ON the first cell
+    /// of a `Cohort::wake` run makes that cell the head and the run's
+    /// `stream_dir` +1, and the hot edge is measured from the landing's LEFT
+    /// edge rightward. The typed-cohort rule (`Run::head`: "the head is always
+    /// the run's right-hand side") is untouched — a Backspace cannot reach
+    /// the clause (typed cohorts are `wake == false`). The rightward mirror
+    /// (a Ctrl-E) is unchanged: its head is the caret's own cell, and the
+    /// edge ends at the caret's left edge as it did.
+    #[test]
+    fn a_leftward_wake_s_hot_edge_sits_at_the_landing_not_where_the_caret_left() {
+        let c = cfg(true, true);
+        let g = geom();
+        let cw = g.cw as f32;
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 2, 40, &c, 0.9);
+        let last = at(t0, 39 * 60);
+        let jump = at(last, 8);
+        let cx = ctx(jump, &c, (2, 0), 0.9);
+        rib.on_event(&nav((2, 42), (2, 0)), jump, &cx);
+        rib.plan(&cx);
+        let mut sink = Sink::default();
+        let now = at(jump, 150);
+        let cx = ctx(now, &c, (2, 0), 0.9);
+        rib.plan(&cx);
+        {
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+        }
+        assert!(
+            !sink.out.is_empty(),
+            "a hot hand's wake must carry a hot edge once its cells are born"
+        );
+        let landing_x = f32::from(g.origin_x);
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for q in &sink.out {
+            let x = f32::from(q.x);
+            let x1 = x + f32::from(q.w);
+            lo = lo.min(x);
+            hi = hi.max(x1);
+            assert!(
+                x >= landing_x - 1.0,
+                "the hot edge lies BEHIND the landing after a Ctrl-A (x = {x})"
+            );
+            assert!(
+                x <= landing_x + HOT_EDGE_CELLS_MAX * cw + f32::from(q.w) + 1.0,
+                "the hot edge reached further than {HOT_EDGE_CELLS_MAX} cells from the landing (x = {x})"
+            );
+        }
+        println!("leftward wake hot edge: x ∈ [{lo}, {hi}] (landing {landing_x}, cw {cw})");
+        // It REACHES over the corridor: past the landing cell's own right
+        // edge and at least the base reach, so the eye finds it at the hand.
+        assert!(
+            hi >= landing_x + HOT_EDGE_CELLS * cw - 1.0,
+            "the hot edge does not reach rightward from the landing (right end {hi}, want ≥ {})",
+            landing_x + HOT_EDGE_CELLS * cw - 1.0
+        );
+        assert_eq!(
+            rib.runs.first().map(|r| (r.head_col, r.stream_dir)),
+            Some((0, 1)),
+            "the landing is the head and the stream runs rightward"
+        );
+        // THE MIRROR: a cold Ctrl-E lays its wake ending AT the landing; the
+        // caret stands ON the landing cell, so the head is the caret's own
+        // cell (`caret.col − 1`) and the edge ends at the caret's left edge —
+        // within five cells left of col 43's left edge, unchanged today.
+        let mut rib = Ribbon::new();
+        let cx = ctx(t0, &c, (2, 42), 0.9);
+        rib.on_event(&nav((2, 2), (2, 42)), t0, &cx);
+        let now = at(t0, 150);
+        let cx = ctx(now, &c, (2, 42), 0.9);
+        rib.plan(&cx);
+        {
+            let mut f = sink.frame();
+            rib.emit(&cx, &mut f);
+        }
+        assert!(
+            !sink.out.is_empty(),
+            "the Ctrl-E's wake must carry a hot edge"
+        );
+        let edge = 43.0 * cw;
+        for q in &sink.out {
+            let x = f32::from(q.x);
+            assert!(
+                x <= edge + 1.0 && edge - x <= HOT_EDGE_CELLS_MAX * cw + f32::from(q.w) + 1.0,
+                "a rightward wake's hot edge left the five cells before the landing's right edge (x = {x})"
+            );
+        }
+        assert_eq!(
+            rib.runs.first().map(|r| (r.head_col, r.stream_dir)),
+            Some((41, -1)),
+            "a rightward wake keeps the own-cell head and a leftward stream"
+        );
+    }
+
     #[test]
     fn a_wake_cell_is_dark_until_it_is_born_then_takes_the_one_attack() {
         let c = cfg(true, true);
@@ -6399,6 +6654,217 @@ mod tests {
         assert!(rib.cells().iter().all(|l| l.row == 1));
         rib.translate_scroll(4);
         assert!(rib.at_rest(), "light on a line nobody typed is not kept");
+    }
+
+    /// Codex's 57-row screen (`ESC[{vt};57r`), the fixture the band tests
+    /// are stated on: the measured viewport tops and the pinned composer
+    /// row 54 all need rows the 40-row fixture does not have.
+    fn geom_codex() -> Geom {
+        Geom {
+            cw: 9,
+            ch: 18,
+            rows: 57,
+            cols: 151,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 1359,
+            win_h: 1026,
+            head: 0,
+        }
+    }
+
+    /// Type `n` cells on `row` from `col0`, one key per 60 ms, on the Codex
+    /// geometry.
+    fn type_row(rib: &mut Ribbon, t0: Instant, row: u16, col0: u16, n: u16, c: &Config) {
+        type_keys(
+            rib,
+            t0,
+            Keys {
+                g: geom_codex(),
+                row,
+                col0,
+                n,
+                period_ms: 60,
+                disp: 0.5,
+            },
+            c,
+        );
+    }
+
+    /// **A ROW BAND CARRIES ITS RIBBON WITH ITS TEXT** (seam point 12, the
+    /// band path) — Codex phase A: the inline viewport `[vt..56]` slides
+    /// DOWN one row per streamed line with the composer inside it, while the
+    /// transcript above `vt` stands still. Six cells typed on the composer
+    /// row 20 must land on row 21 with their column, field stop, birth and
+    /// cohort untouched; three cells on transcript row 5 must not move; and
+    /// BETWEEN the band move and the next plan the field index must already
+    /// answer for the moved cells (the engine seeds `caret_t` from the
+    /// caret's field before it plans) and for nothing on the vacated row.
+    /// Before the fix this batch reached the engine as a reset and the
+    /// measured session read `ribbon_segments 16 → 0` on the first line.
+    #[test]
+    fn a_band_move_carries_the_composer_band_down_and_leaves_the_transcript_alone() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_row(&mut rib, t0, 5, 10, 3, &c);
+        type_row(&mut rib, at(t0, 500), 20, 10, 6, &c);
+        let before: Vec<Cell> = rib.cells().to_vec();
+        assert_eq!(before.iter().filter(|l| l.row == 20).count(), 6);
+        assert_eq!(before.iter().filter(|l| l.row == 5).count(), 3);
+        let composer: Vec<Option<f32>> = (10..16).map(|col| rib.field_at(20, col)).collect();
+        assert!(
+            composer.iter().all(Option::is_some),
+            "fixture: the composer is lit"
+        );
+        let transcript: Vec<Option<f32>> = (10..13).map(|col| rib.field_at(5, col)).collect();
+        assert!(
+            transcript.iter().all(Option::is_some),
+            "fixture: the transcript is lit"
+        );
+        assert_eq!(rib.caret(), Some((20, 16)));
+
+        rib.translate_band(19, 56, 1);
+
+        let after = rib.cells();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a band move loses no cell inside its band"
+        );
+        for b in &before {
+            let want = if b.row == 20 { 21 } else { b.row };
+            assert!(
+                after.iter().any(|a| a.row == want
+                    && a.col == b.col
+                    && a.t == b.t
+                    && a.born == b.born
+                    && a.cohort == b.cohort
+                    && a.retract_at == b.retract_at),
+                "cell ({}, {}) did not arrive on row {want} with its clocks and prices",
+                b.row,
+                b.col
+            );
+        }
+        assert!(
+            after.iter().all(|a| a.row != 20),
+            "the vacated row keeps no light"
+        );
+        for (i, col) in (10..16).enumerate() {
+            assert_eq!(
+                rib.field_at(21, col),
+                composer[i],
+                "the field moved with its cell"
+            );
+            assert_eq!(
+                rib.field_at(20, col),
+                None,
+                "the vacated cell answers nothing"
+            );
+        }
+        for (i, col) in (10..13).enumerate() {
+            assert_eq!(
+                rib.field_at(5, col),
+                transcript[i],
+                "the transcript stood still"
+            );
+        }
+        assert_eq!(rib.caret(), Some((21, 16)), "the caret rides its band");
+    }
+
+    /// Codex phase B: the viewport is pinned at the bottom and every
+    /// streamed line archives the transcript `[0..51]` UP one row under a
+    /// fixed composer. Light on transcript row 3 rides to row 2; the
+    /// composer's light on row 54 and its caret do not move; light on row 0
+    /// leaves through the top of the band — dropped, not parked on row 0.
+    #[test]
+    fn a_top_anchored_band_moves_the_transcript_up_and_pins_the_footer() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_row(&mut rib, t0, 0, 4, 2, &c);
+        type_row(&mut rib, at(t0, 300), 3, 10, 4, &c);
+        type_row(&mut rib, at(t0, 900), 54, 13, 5, &c);
+        let footer: Vec<Option<f32>> = (13..18).map(|col| rib.field_at(54, col)).collect();
+        let t3 = rib.field_at(3, 11).expect("fixture: row 3 is lit");
+        assert_eq!(rib.caret(), Some((54, 18)));
+
+        rib.translate_band(0, 51, -1);
+
+        assert!(rib.cells().iter().all(|l| l.row != 0 && l.row != 3));
+        assert_eq!(
+            rib.cells().iter().filter(|l| l.row == 2).count(),
+            4,
+            "row 3 rode up to row 2"
+        );
+        assert_eq!(rib.field_at(2, 11), Some(t3));
+        assert!(
+            rib.cells().iter().all(|l| l.row != u16::MAX),
+            "nothing wrapped around the top"
+        );
+        assert_eq!(
+            rib.cells().iter().filter(|l| l.row == 54).count(),
+            5,
+            "the pinned composer is outside the band and untouched"
+        );
+        for (i, col) in (13..18).enumerate() {
+            assert_eq!(rib.field_at(54, col), footer[i]);
+        }
+        assert_eq!(
+            rib.caret(),
+            Some((54, 18)),
+            "a caret outside the band stays put"
+        );
+        assert_eq!(
+            rib.cells().len(),
+            9,
+            "row 0's two cells left through the top; nothing else was lost"
+        );
+    }
+
+    /// What leaves the band is GONE: a ribbon on the bottom row 56 pushed
+    /// down by the viewport's slide has no row to land on, so its cells and
+    /// its cohort retire, the field index answers `None` on both the old row
+    /// and the row past the edge, and the ribbon is at rest. The caret is a
+    /// position and saturates at the band's edge instead.
+    #[test]
+    fn a_band_move_drops_what_leaves_the_band_and_retires_its_cohort() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_row(&mut rib, t0, 56, 10, 6, &c);
+        assert!(rib.live_cells() == 6 && !rib.cohorts.is_empty());
+        assert_eq!(rib.index.live_rows(), 1);
+
+        rib.translate_band(50, 56, 1);
+
+        assert!(
+            rib.at_rest(),
+            "light carried off the band's edge is not kept"
+        );
+        assert!(
+            rib.cohorts.is_empty(),
+            "a cohort with no cells retires with them"
+        );
+        for col in 10..16 {
+            assert_eq!(rib.index.at(56, col), None);
+            assert_eq!(rib.index.at(57, col), None);
+        }
+        assert_eq!(
+            rib.index.live_rows(),
+            0,
+            "the lane retired into the spare pool"
+        );
+        assert_eq!(
+            rib.index.spare.len(),
+            1,
+            "…and is there for the next row that lights"
+        );
+        assert_eq!(
+            rib.caret(),
+            Some((56, 16)),
+            "the caret saturates at the edge"
+        );
     }
 
     /// **A SCROLL CARRIES THE RIBBON WITH ITS TEXT** (seam point 12 — the

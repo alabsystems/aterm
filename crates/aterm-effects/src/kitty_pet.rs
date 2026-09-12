@@ -1268,31 +1268,53 @@ const PET_LATCH_MAX: u8 = 3;
 /// **THE V2 PERK'S LATE BOUND** (Rainbow Kitty v2 panel #10(a)) — how far
 /// past the offered arrival edge `t₀ + T` that edge is still the arrival.
 ///
-/// One frame at 30 fps. The perk is the pet's answer to a LANDING, and a
-/// landing is a place on the clock, not a mood: a cat that notices it two
-/// frames late is a cat noticing something else. Nothing can hold the latch
-/// open — the offer buys no wake ([`PetBrain::needs_frames`]) — so this is
-/// what retires an edge the pet's own work ticked straight past.
-const V2_PERK_LATE: f32 = 0.033;
+/// DERIVED (2026-09-10, the room round) from the design's own cadence, not
+/// from taste: the effect lane presents at HALF panel rate
+/// (`EFFECT_PRESENT_PANEL_PERIODS = 2`, `RAINBOW-KITTY-V2.md` T7 — "2–4
+/// effect frames on a 60 Hz panel"), so ONE LANE TICK on the slowest panel
+/// the design names is `2 / 60` s = 33.3 ms. The perk edge is latched
+/// during the flight (the impulse is minted at the meteor's birth with
+/// `at = t₀ + T`, `Engine::pet_offer`), and the first tick at or after
+/// `at` takes it — a tick that is at most one lane tick late. The tick
+/// after THAT is a whole further lane tick away, so this bound admits the
+/// arrival's own frame and refuses the next: a cat that notices two ticks
+/// late is a cat noticing something else. The wiring round's `0.033` was
+/// "one frame at 30 fps" by taste; the derivation lands on the same number
+/// (`2 / 60`), so the value is unchanged and the reason is now the lane's.
+/// Nothing can hold the latch open — the offer buys no wake
+/// ([`PetBrain::needs_frames`]) — so this is what retires an edge the
+/// pet's own work ticked straight past.
+const V2_PERK_LATE: f32 = 2.0 / 60.0;
 /// **THE OFFERED STAR'S TTL** (panel #10(b)) — how long a latched
-/// [`StarCatch`] stays actionable, on the injected clock.
+/// [`StarCatch`] stays actionable, measured from the star's OWN birth.
 ///
-/// A sky m1 lives 0.46 s at most (`stardust::StarClass::life_s`), and v2
-/// re-mints the offer on every frame the star is still in reach, so a latch
-/// this old names a star that is either gone or about to be — and the fresh
-/// one is already waiting. Short by design: the cat reaches for the star it
-/// just saw, or not at all (`note_flow`'s law).
-const V2_CATCH_TTL: f32 = 0.25;
+/// DERIVED (2026-09-10) from the sky's numbers: a sky m1 lives
+/// `HOLD_M1_SKY_MS + 2.32 · TAU_M1_SKY_MS` = `120 + 2.32 · 146` = 458.7 ms
+/// (`stardust::StarClass::life_s`, the published 460 ms), and a catch puts
+/// the star on a `CATCH_FINISH_MS` = 40 ms finish. A catch therefore
+/// CHANGES something only while the star has more than that finish still
+/// to live: `0.4587 − 0.040` = **0.4187 s**. Past it the sky would be told
+/// to shorten a star that is already ending — nothing visible, and a paw
+/// out for nothing. The wiring round's `0.25` was taste ("short by
+/// design"), and it retired a latch while the star it named was still
+/// catchable for another 170 ms: a cat one wash-stroke from its feet lost
+/// a reach the sky was still offering. Changed to the derived bound;
+/// `the_catch_ttl_is_the_sky_m1_s_catchable_life` pins it to the sky's own
+/// constants so a retuned star retunes the cat.
+const V2_CATCH_TTL: f32 = 0.4187;
 /// **ONE REACH PER GESTURE** — the cooldown a spent catch owes, on the
 /// brain's own clock.
 ///
-/// A hand at 12 cps deals a gold m1 about one key in eighty, but a hot sky
-/// can put two inside a second; without this a purring cat would bat at the
-/// air in a flurry, and the reach reads as a moment only if it is one. Twice
-/// [`BAT_HOLD`], so the previous reach is over and its pose has resolved
-/// before another can start — and, since a star lives well under it, this is
-/// also what makes it impossible for one star's life to be shortened twice.
-const V2_CATCH_COOL: f32 = 1.2;
+/// DERIVED: twice [`BAT_HOLD`], written as such. The previous reach is over
+/// and its pose has resolved before another can start (one hold to play
+/// the swipe, one hold's worth of ground before the next), and since a
+/// star lives well under it ([`V2_CATCH_TTL`]) this is also what makes it
+/// impossible for one star's life to be shortened twice. A hand at 12 cps
+/// deals a gold m1 about one key in eighty, but a hot sky can put two
+/// inside a second; without this a purring cat would bat at the air in a
+/// flurry, and the reach reads as a moment only if it is one. The wiring
+/// round's `1.2` was this product typed out; the value is unchanged.
+const V2_CATCH_COOL: f32 = 2.0 * BAT_HOLD;
 /// How long a latched FLOW ENTRY stays actionable ([`PetBrain::note_flow`]).
 ///
 /// Short on purpose, and the shortest of the wave-1 TTLs bar the bell: the
@@ -1302,6 +1324,41 @@ const V2_CATCH_COOL: f32 = 1.2;
 /// lane awake (idle → zero holds without the latch ever appearing in
 /// `needs_frames`: flow buys no frame of its own).
 const FLOW_LATCH_TTL: f32 = 0.9;
+// ── THE ROOM (Rainbow Kitty v2 panel #9) ───────────────────────────────────
+//
+// Session FACTS — who is driving, whether a job is running, how a turn
+// ended, whether a sibling pane is talking, what the inbox holds — reach the
+// pet through the `note_*` idiom: a LEVEL is restated by the host on frames
+// it already draws (`note_executing`'s shape), an EDGE is diffed by the brain
+// itself (the own-sensor doctrine) and LATCHED, never acted. No fact is a
+// light, and no fact buys a wake: nothing here appears in `needs_frames` or
+// moves `next_change_deadline` sooner, a latched cue rides the frames the
+// pet was already drawing and retires unconsumed at its TTL, and the
+// caret-travel latch drops every cue while the human types.
+
+/// **THE FAR STAND** (panel #9(a)): cells added to the station's lead while
+/// a CONTROLLER LEASE is held — an agent is driving the session, and the
+/// cat keeps its distance from a hand that is not its owner's.
+///
+/// DERIVED: [`LEAD_MAX`] — the furthest the keep-ahead lead ever stations
+/// the cat from a hand at full speed. "Not my hand" stands exactly where
+/// the fastest human hand would have put it, so the far stand is a place
+/// the cat already knows how to walk to and back from, never a new one.
+const LEASE_STANDOFF: f32 = LEAD_MAX;
+/// How long a latched ROOM CUE (a sibling's burst, a turn's end, new mail)
+/// stays actionable. DERIVED: [`FLOW_LATCH_TTL`] — the same class of
+/// stimulus, something the cat NOTICED, charming only at the moment it
+/// happens; a latch the pet's work outlasted expires unconsumed, and
+/// because it expires it can never strand the lane.
+const ROOM_CUE_TTL: f32 = FLOW_LATCH_TTL;
+/// **THE EAR-FLAT BEAT** (panel #9(c)/(e)): a turn timed out, or a
+/// deadline passed on unread mail — the droop's own frame (flat ears, head
+/// hung) for one beat, with none of the grief: no ledger, no sulk.
+/// DERIVED: twice [`PERK_HOLD`] — a notice is one hold, and a
+/// disappointment is read in two; well under [`DROOP_HOLD`], which is the
+/// sulk's and takes a failed command to earn.
+const EAR_FLAT_HOLD: f32 = 2.0 * PERK_HOLD;
+
 /// The petting hold: a purr-flavored beat per consumption, whatever the
 /// contentment says — affection is answered even by a cold cat.
 const PET_HOLD: f32 = 1.1;
@@ -2243,6 +2300,16 @@ pub struct PetFrame {
     /// can render faster than the body swell (audio, a glow pulse) has the real
     /// signal rather than the animation's stand-in.
     pub purr: f32,
+    /// **CONTENTED, WHATEVER THE POSE** — the ledger over [`PURR_GATE`],
+    /// exported for the sky's offer gate (`rainbow_kitty::companion::
+    /// PetOnGlass::contented`, panel #10(b)). [`Self::purr`] is the TELL,
+    /// which the seat owns and every caret move takes away (`quiet` resets,
+    /// the cat stands): a star is born by a key, and the key stands the
+    /// cat, so a gate on the tell alone could never see a key-born star
+    /// from a happy cat. This is the same contentment the tell reads,
+    /// before the pose has its say — the pet's own word, not a second
+    /// threshold.
+    pub contented: bool,
     /// HIDE-BEHIND-WORDS (wave 4c): draw the pet UNDER the glyphs this
     /// frame — the word in front stays readable, the cat peers out from
     /// behind it (the ink law's under-exception).
@@ -2284,6 +2351,7 @@ impl PetFrame {
             q(self.row, 64.0),
             q(self.lift, 256.0),
             u64::from(self.facing_left),
+            u64::from(self.under_ink),
             q(self.scale_x, 256.0),
             q(self.scale_y, 256.0),
             q(self.purr, 64.0),
@@ -2400,6 +2468,41 @@ enum PlayLand {
     /// A batted word-cat peek: face the head at `(col, row)`, swipe (the
     /// bat pose) for [`BAT_HOLD`], and puff one Dust mote at the peek cell.
     BatSwipe { col: f32, row: f32 },
+}
+
+/// **A ROOM CUE** (panel #9) — one latched, not-yet-acted answer to a fact
+/// about the session, waiting for the ground like every other stimulus.
+/// One slot, newest wins (the offered star's precedent): a cat that has
+/// been ignoring one for most of a second should answer the fresh one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RoomCue {
+    /// A SIBLING pane began streaming (#9(d)): one look toward its caret
+    /// column, in this pet's pane cells — off-grid is fine, it is a
+    /// direction to face, never a place to go.
+    Look { col: f32 },
+    /// A turn SETTLED (#9(c)): the notice — the fast success's nudge, the
+    /// ledger already moved at note time.
+    Nod,
+    /// A turn TIMED OUT, or unread mail's deadline passed (#9(c)/(e)): the
+    /// ear-flat beat.
+    EarFlat,
+    /// UNREAD MAIL (#9(e)): perk, one ear, one ♪.
+    Mail,
+}
+
+/// **THE INBOX AS THE PET SEES IT** (panel #9(e)) — three facts the host
+/// restates on frames it already draws; the brain diffs them itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomInbox {
+    /// The newest row above the HANDLED watermark (`inbox seen`), by its
+    /// per-session id — `0` when every row is handled. Monotone, so a new
+    /// row is exactly "this went up".
+    pub unseen: u64,
+    /// Some unread row's advisory deadline (`dl=`, ms from its arrival) has
+    /// passed.
+    pub overdue: bool,
+    /// A standing `hold on` — the fleet halted this session.
+    pub hold: bool,
 }
 
 /// The airborne phase of a pounce or hop.
@@ -2914,6 +3017,40 @@ pub struct PetBrain {
     /// the droop then keeps its seat instead of sinking onto its belly.
     /// One bit, latched where the droop is entered.
     droop_seated: bool,
+    /// The live [`PetAction::Droop`] is the EAR-FLAT BEAT (panel #9), not
+    /// the sulk: held [`EAR_FLAT_HOLD`] instead of [`DROOP_HOLD`], no
+    /// ledger moved, no forgiveness dated. Cleared when a real sulk enters.
+    droop_brief: bool,
+    /// **THE ROOM'S LEVELS** (panel #9) — restated by the host on frames it
+    /// already draws, never a wake:
+    /// * `room_lease` — a CONTROLLER LEASE is held (an agent is driving):
+    ///   the station is the far stand and the seat is worn as the perk;
+    /// * `room_quiet` — the session's status phase is `Quiet` (a job is
+    ///   running, nothing printing): the watch heat does not fall, so the
+    ///   stare caps and the vigil follows instead of the ladder's sleep;
+    /// * `room_hold` — a standing `hold on`: the cat sits tight — no games,
+    ///   no long dwell.
+    room_lease: bool,
+    room_quiet: bool,
+    room_hold: bool,
+    /// **THE ROOM'S EDGE DETECTORS** — the brain is its own sensor (the
+    /// own-sensor doctrine): the last turn id noted, whether a sibling was
+    /// talking on the last note, the newest unread row noted, and whether
+    /// the overdue flag stood on the last note.
+    room_turn: u64,
+    room_sibling: bool,
+    room_unseen: u64,
+    room_overdue: bool,
+    /// The turn and inbox detectors have been SEEDED: a fresh brain's first
+    /// note of either is a watermark, not an event (`pet_last_cmd`'s silent
+    /// re-baseline), and this is what tells the first note from the second.
+    room_turn_seeded: bool,
+    room_inbox_seeded: bool,
+    /// The one latched room cue and when it was noted (its
+    /// [`ROOM_CUE_TTL`] clock). Absent from [`Self::needs_frames`] and
+    /// [`Self::next_change_deadline`] by law.
+    pending_room: Option<RoomCue>,
+    room_at: Option<Instant>,
     /// A jump was seen; pounce as soon as the pet is free to act on it.
     pending_pounce: bool,
     /// A SCREEN-CROSSING jump was seen (or earned by joy); play the full
@@ -3181,6 +3318,18 @@ impl Default for PetBrain {
             twitch_up: false,
             last_burst: false,
             droop_seated: false,
+            droop_brief: false,
+            room_lease: false,
+            room_quiet: false,
+            room_hold: false,
+            room_turn: 0,
+            room_sibling: false,
+            room_unseen: 0,
+            room_overdue: false,
+            room_turn_seeded: false,
+            room_inbox_seeded: false,
+            pending_room: None,
+            room_at: None,
             pending_pounce: false,
             pending_big_jump: false,
             big_gather: false,
@@ -3276,7 +3425,7 @@ impl PetBrain {
         if f32::from(cols) - width <= 0.0 {
             return false; // grid narrower than the cat: no sides to keep
         }
-        let edge = f32::from(caret_col) + STATION_LEAD + self.lead() + width;
+        let edge = f32::from(caret_col) + STATION_LEAD + self.lead() + self.standoff() + width;
         let was = self.wall_side;
         if !was && edge > f32::from(cols) {
             self.wall_side = true;
@@ -3297,9 +3446,34 @@ impl PetBrain {
         }
         if self.wall_side {
             // Parked wall-side: no lead — there is nowhere ahead to lead to.
-            return (f32::from(caret_col) - width - STATION_LEAD).max(0.0);
+            // The far stand keeps its distance on this side too.
+            return (f32::from(caret_col) - width - STATION_LEAD - self.standoff()).max(0.0);
         }
-        (f32::from(caret_col) + STATION_LEAD + self.lead()).clamp(0.0, limit)
+        (f32::from(caret_col) + STATION_LEAD + self.lead() + self.standoff()).clamp(0.0, limit)
+    }
+
+    /// **THE FAR STAND** (panel #9(a)): [`LEASE_STANDOFF`] while a controller
+    /// lease is held, zero otherwise — folded into the live station, so the
+    /// shipped chase walks the cat out at acquisition and home at release.
+    fn standoff(&self) -> f32 {
+        if self.room_lease { LEASE_STANDOFF } else { 0.0 }
+    }
+
+    /// **WAITING UP** (panel #9(b)): the job is quiet and the cat's vigil is
+    /// armed — the stare capped while the shell was executing — so the
+    /// ladder's sleep is withheld and the vigil crouch follows instead.
+    /// Without an armed vigil a silent job is slept through exactly as it
+    /// always was (the verdict wakes the cat), which keeps the no-fact path
+    /// byte-identical and the never-printing job free of any wake.
+    fn waiting_up(&self) -> bool {
+        self.room_quiet && self.vigil_armed && self.exec_since.is_some()
+    }
+
+    /// **A FROZEN HEAT** (panel #9(b)): under `Quiet` with no burst this
+    /// tick, the watch heat is exactly what it was — not motion, so it pins
+    /// no lane; the cap it waits for is offered instead.
+    fn heat_frozen(&self) -> bool {
+        self.room_quiet && !self.last_burst
     }
 
     /// Choose which animal the pet is drawn as ([`PetSpecies`]).
@@ -3754,11 +3928,18 @@ impl PetBrain {
     /// belongs.
     fn station_safe(&self, caret: (u16, u16), cols: u16, rows: u16, width: f32) -> (f32, f32) {
         let want = self.station_now(caret.1, cols, width);
-        if let Some(station) = self.console_station((want, f32::from(caret.0)), (rows, cols), width)
-        {
+        // THE LADDER'S ANSWER IS THE ESCORT'S, AND IT IS THE DEFAULT. The
+        // console layer used to be asked FIRST and its answer returned
+        // whole, so `want` — the caret's own claim on where the pet belongs
+        // — was discarded on every frame. It is asked LAST now, and about
+        // the stand the escort actually chose: it may correct a stand that
+        // lands somewhere the ladder cannot see (a selection, an image, a
+        // row with no certified projection) and it may not do anything else.
+        let stand = self.ink_stand(want, f32::from(caret.0), width, cols, rows);
+        if let Some(station) = self.console_station(stand, (rows, cols), width) {
             return station;
         }
-        self.ink_stand(want, f32::from(caret.0), width, cols, rows)
+        stand
     }
 
     /// The live output edge as a row coordinate — `None` until the host
@@ -4006,6 +4187,109 @@ impl PetBrain {
     #[must_use]
     pub fn pending_v2_offer(&self) -> (bool, bool) {
         (self.pending_perk.is_some(), self.pending_catch.is_some())
+    }
+
+    /// **THE ROOM, (a): A CONTROLLER LEASE** (panel #9) — an agent is driving
+    /// this session (`SessionCtx::turn_lease` live: a `turn` in flight, or a
+    /// cooperative `lease acquire` inside its TTL), restated as a LEVEL by
+    /// the host on the frames it already composes (`note_executing`'s
+    /// idiom). While it holds, the station is the FAR stand
+    /// ([`LEASE_STANDOFF`] past the lead — "not my hand") and the seat's
+    /// stand and sit are worn as the perk, ears on the caret. At release the
+    /// station shrinks back and the shipped chase walks the cat home on its
+    /// next tick — never a teleport. A fact, not a stimulus: no pose is
+    /// struck here, no clock started, and it buys no wake.
+    pub fn note_room_lease(&mut self, held: bool) {
+        self.room_lease = held;
+    }
+
+    /// **THE ROOM, (b): THE JOB IS QUIET** — the session status phase is
+    /// `Quiet` (a foreground job exists, nothing has printed recently),
+    /// restated as a LEVEL. While it holds the watch heat does not fall
+    /// ([`WATCH_FALL`] is suspended): a stare the stream earned is kept
+    /// until it caps, the vigil arms off the cap as it always did, and the
+    /// ladder does not put a cat with an armed vigil to sleep at
+    /// [`SLEEP_AFTER`] — it waits WITH you. A frozen heat is not motion, so
+    /// it pins no lane; the cap and the vigil's entry are named to the
+    /// coarse offer instead. Two wakes, and then the held crouch.
+    pub fn note_room_quiet(&mut self, quiet: bool) {
+        self.room_quiet = quiet;
+    }
+
+    /// **THE ROOM, (c): A TURN ENDED** — the newest record of the session's
+    /// turn ledger (`TurnRecord::id`, `status == "settled"`), restated every
+    /// frame; the brain diffs the id. `settled` moves the ledger NOW by the
+    /// fast success's nudge ([`CHEER_FAST_CONTENT`] — bookkeeping, so it
+    /// moves under reduced motion too) and latches the notice; `timeout`
+    /// latches the ear-flat beat. Latch, never act: both wait for the
+    /// ground under every caret intent and retire at [`ROOM_CUE_TTL`].
+    pub fn note_room_turn(&mut self, now: Instant, id: u64, settled: bool) {
+        // A fresh brain on an old ledger is not an ending: the first note
+        // only seeds the watermark, exactly like `pet_last_cmd`'s silent
+        // re-baseline on a tab switch.
+        let seeded = core::mem::replace(&mut self.room_turn_seeded, true);
+        if id == self.room_turn || !seeded {
+            self.room_turn = id;
+            return;
+        }
+        self.room_turn = id;
+        if settled {
+            self.content = (self.content + CHEER_FAST_CONTENT).min(1.0);
+            self.pending_room = Some(RoomCue::Nod);
+        } else {
+            self.pending_room = Some(RoomCue::EarFlat);
+        }
+        self.room_at = Some(now);
+    }
+
+    /// **THE ROOM, (d): A SIBLING PANE IS TALKING** — in a split, whether
+    /// any OTHER pane is genuinely streaming this frame (the focused pane's
+    /// own `output_burst` conjunction, applied to a sibling), with that
+    /// pane's caret in THIS pet's pane cells (fractional; off-grid is
+    /// expected). Restated every frame; the brain keeps the level and
+    /// latches ONE look on the rising edge — a live pointer to who is
+    /// talking, never a trip.
+    pub fn note_room_sibling(&mut self, now: Instant, talking: Option<(f32, f32)>) {
+        let level = talking.is_some_and(|(c, r)| c.is_finite() && r.is_finite());
+        let edge = level && !self.room_sibling;
+        self.room_sibling = level;
+        if edge && let Some((col, _)) = talking {
+            self.pending_room = Some(RoomCue::Look { col });
+            self.room_at = Some(now);
+        }
+    }
+
+    /// **THE ROOM, (e): THE INBOX** — [`RoomInbox`], restated every frame.
+    /// A row above the handled watermark that was not there on the last
+    /// note latches MAIL (perk, one ear, one ♪); the overdue flag's rising
+    /// edge latches the ear-flat beat; `hold` is a level — the cat sits
+    /// tight while it stands (no games, no long dwell). A watermark that
+    /// catches up re-arms the next row; a fresh brain's first note only
+    /// seeds, like the turn's.
+    pub fn note_room_inbox(&mut self, now: Instant, inbox: RoomInbox) {
+        self.room_hold = inbox.hold;
+        let seeded = core::mem::replace(&mut self.room_inbox_seeded, true);
+        let mail = inbox.unseen > self.room_unseen;
+        let overdue = inbox.overdue && !self.room_overdue;
+        self.room_unseen = inbox.unseen;
+        self.room_overdue = inbox.overdue;
+        if !seeded {
+            return;
+        }
+        if overdue {
+            self.pending_room = Some(RoomCue::EarFlat);
+            self.room_at = Some(now);
+        } else if mail {
+            self.pending_room = Some(RoomCue::Mail);
+            self.room_at = Some(now);
+        }
+    }
+
+    /// **THE ROOM'S LEVELS**, `(lease, quiet, hold)` — host observability on
+    /// [`Self::pending_v2_offer`]'s precedent. Reads nothing else.
+    #[must_use]
+    pub fn room_levels(&self) -> (bool, bool, bool) {
+        (self.room_lease, self.room_quiet, self.room_hold)
     }
 
     /// Queued, not-yet-consumed pets — host observability (the click seam's
@@ -4289,6 +4573,7 @@ impl PetBrain {
                     scale_x: 1.0,
                     scale_y: 1.0,
                     purr: 0.0,
+                    contented: false,
                     under_ink: self.hiding,
                     motes: [None; PET_MOTES_MAX],
                     departures: [None; PET_DEPARTURES_MAX],
@@ -4581,16 +4866,21 @@ impl PetBrain {
             // one thing this arm exists to refuse
             // (`reduced_motion_pins_the_pet_at_its_station_with_no_arc_or_gait`).
             //
-            // That makes this arm safe ONLY for a stable preference. A caller
-            // that raises the flag on a VISIBLE walking cat gets a teleport by
-            // construction — see `app_render`'s `pet_reduced_motion`, which is
-            // why the performance shed is no longer allowed to reach it.
+            // Performance shedding also uses this still posture: a visible
+            // moving pet snaps home instead of vanishing or owing more frames.
+            // `app_render`'s `pet_reduced_motion` keeps that host policy shared
+            // by native rendering and capture.
             let base = (Self::station(cc, sense.cols, width), f32::from(cr));
             let (col, row) = self
                 .console_station(base, (sense.rows, sense.cols), width)
                 .unwrap_or(base);
             self.col = col;
             self.row = row;
+            // This assignment is the completed static placement, not a glide
+            // towards the previous normal-motion home. Synchronize the motion
+            // sensor too, or needs_frames mistakes the snap for unfinished travel.
+            self.home = col;
+            self.col_at_tick = col;
             self.speed = 0.0;
             self.flight = None;
             self.land_t = 0.0;
@@ -4759,6 +5049,16 @@ impl PetBrain {
         }) {
             self.pending_catch = None;
         }
+        // THE ROOM'S CUE retires on the same terms (panel #9): absent from
+        // `needs_frames` by law, so an unconsumed one must retire on the
+        // ticks the pet was already running.
+        if self
+            .room_at
+            .is_some_and(|at| sense.now.saturating_duration_since(at).as_secs_f32() > ROOM_CUE_TTL)
+        {
+            self.pending_room = None;
+            self.room_at = None;
+        }
         // The reach's cooldown, spent in WALL TIME like `bored_cool` and
         // `pursuit_cool` below — a cat that sat for a second has sat for a
         // second whether the lane ticked sixty times or three, and a cooldown
@@ -4798,8 +5098,16 @@ impl PetBrain {
         // PERK-AND-WATCH heat (wave 2): pure per-tick bookkeeping, integrated
         // unconditionally (like the flinch envelope) so a burst that lands
         // mid-hold still charges the watch the pet enters once it is free.
+        // …EXCEPT under THE ROOM's `Quiet` (panel #9(b)): a job is running
+        // and simply not printing, so the stare the stream earned is KEPT —
+        // [`WATCH_FALL`] is suspended — and the cat waits with you instead
+        // of drifting down the ladder to sleep. A frozen heat is not
+        // motion: `needs_frames` knows it (`heat_frozen`), and the cap it
+        // is waiting for is named to the coarse offer.
         self.watch_heat = if sense.output_burst {
             (self.watch_heat + dt * WATCH_RISE).min(1.0)
+        } else if self.room_quiet {
+            self.watch_heat
         } else {
             (self.watch_heat - dt * WATCH_FALL).max(0.0)
         };
@@ -4898,6 +5206,7 @@ impl PetBrain {
                 };
                 let range = (px - (self.col + width * 0.5)).abs();
                 if self.pointer_armed
+                    && !self.room_hold
                     && stroke_point.is_none()
                     && self.dash_t >= DASH_MIN_T
                     && self.content >= PLAY_CONTENT
@@ -4925,6 +5234,7 @@ impl PetBrain {
                 match self.pursuit_t {
                     None => {
                         if self.pursuit_cool <= 0.0
+                            && !self.room_hold
                             && stroke_point.is_none()
                             && self.pointer_heat >= PURSUIT_HEAT
                             && (PURSUIT_MIN_SPEED..DASH_SPEED).contains(&speed)
@@ -5758,6 +6068,21 @@ impl PetBrain {
                 // the watch down into the ordinary settle.
                 if (self.clock - self.tennis_last) as f32 <= TENNIS_LAPSE {
                     self.speed = 0.0;
+                    // …BUT THE SKY STILL REACHES IT (2026-09-10). The rally
+                    // seat is the ONE posture that stays `Sit` and purring
+                    // while the caret moves, which makes it the only seat a
+                    // gold star is ever born in reach of: the hot resume
+                    // stands the cat up on the first key of a run (the purr
+                    // tell down with it), and no star outlives the 1.4 s it
+                    // takes to sit again. Returning here before the arrived
+                    // branch's ladder meant the offer was latched and never
+                    // spent — measured, the paw NEVER landed, and the
+                    // feature existed only in its two halves' tests. The
+                    // star's own reach law and the catch's cooldown do the
+                    // gating; the watch simply stops swallowing it.
+                    if self.consume_v2_offer(&sense, width) {
+                        return self.emit(sense, width);
+                    }
                     return self.emit(sense, width);
                 }
                 self.tennis = false;
@@ -5939,7 +6264,7 @@ impl PetBrain {
                 self.speed = 0.0;
                 return self.emit(sense, width);
             }
-            PetAction::Droop if self.action_t < DROOP_HOLD => {
+            PetAction::Droop if self.action_t < self.droop_hold() => {
                 // The sulk: feet planted through the whole hold, no motes.
                 self.speed = 0.0;
                 return self.emit(sense, width);
@@ -6342,6 +6667,13 @@ impl PetBrain {
             if self.consume_v2_offer(&sense, width) {
                 return self.emit(sense, width);
             }
+            // THE ROOM'S CUE (panel #9) — below the sky's offer (a star is
+            // rarer than a neighbour talking) and above every toy: a turn
+            // ending, a sibling's burst and new mail are things that
+            // happened in the room this animal lives in.
+            if self.consume_room(cc, width) {
+                return self.emit(sense, width);
+            }
             // THE WORD-CAT BAT (wave 2): below caret work by construction
             // (this ladder never runs while travel is pending), above
             // pointer play — the peek is the rarer toy.
@@ -6536,7 +6868,13 @@ impl PetBrain {
             // PERK-AND-WATCH (wave 2): an ambient hold, ranked below every
             // latched stimulus (events beat heat) and above the settle
             // ladder it borrows the ground from.
-            if self.consume_watch(dt, cc) {
+            // ON WALL TIME (the prologue's law, applied 2026-09-10): the
+            // stare's cap measures how long the cat has been staring, and
+            // under THE ROOM's `Quiet` the lane is parked between the offer
+            // that names the cap and the tick that takes it — a `dt`-fed
+            // clock would advance a tenth of a second per wake and never
+            // cap. At frame cadence `elapsed == dt`, byte for byte.
+            if self.consume_watch(elapsed, cc) {
                 return self.emit(sense, width);
             }
             // THE BORED-CAT VIGNETTES (wave 4b): a content cat in boredom's
@@ -6544,7 +6882,12 @@ impl PetBrain {
             // The serial deals the act: bat the cursor, ATTACK the cursor
             // (two swipes), or roll around on its back. One per cooldown,
             // never during a game, never over a live toy.
+            // …and never in THE ROOM's two stillnesses (panel #9): under a
+            // lease the cursor is not its owner's to bat at, and under a
+            // hold the cat sits tight.
             if self.bored_cool <= 0.0
+                && !self.room_lease
+                && !self.room_hold
                 && self.wriggle_t <= 0.0
                 && !self.tennis
                 && self.pursuit_t.is_none()
@@ -6596,6 +6939,7 @@ impl PetBrain {
             // threshold (~6.7 cells/s), and a creep never gets there — that
             // is exactly what makes it a creep.
             if !self.stakeout
+                && !self.room_hold
                 && stroke_point.is_none()
                 && self.pursuit_t.is_none()
                 && self.pursuit_cool <= 0.0
@@ -7019,8 +7363,14 @@ impl PetBrain {
             self.settle_seed = self.settle_serial.wrapping_add(self.mote_serial);
         }
 
-        let next = if self.quiet >= SLEEP_AFTER {
+        let next = if self.quiet >= SLEEP_AFTER && !self.waiting_up() {
             PetAction::Sleep
+        } else if self.quiet >= SIT_AFTER && self.room_hold {
+            // SITS TIGHT (panel #9(e)): a standing `hold on` keeps the seat
+            // at the sit — no wash, no loaf, no purr — until the ladder's
+            // sleep, which a halt does not withhold (idle-to-zero outranks
+            // vigilance; a fleet halt can stand all night).
+            PetAction::Sit
         } else if self.quiet >= SIT_AFTER {
             let since_sit = self.quiet - SIT_AFTER;
             // One wash per groom cycle, deterministically placed — the
@@ -8331,6 +8681,7 @@ impl PetBrain {
                 self.action,
                 PetAction::Sit | PetAction::Purr | PetAction::Groom
             );
+            self.droop_brief = false;
             self.set_action(PetAction::Droop);
             return true;
         }
@@ -8418,6 +8769,10 @@ impl PetBrain {
         // anybody: v2 re-mints the offer every frame the star is still in
         // reach, so nothing is lost that the next frame will not offer again.
         self.pending_catch = None;
+        // THE ROOM'S CUE goes the same way (panel #9): the human is typing,
+        // and every vignette yields to the caret.
+        self.pending_room = None;
+        self.room_at = None;
         self.pending_pointer_pounce = None;
         self.play_to = None;
         self.play_land = None;
@@ -8558,6 +8913,109 @@ impl PetBrain {
         true
     }
 
+    /// **THE ROOM'S CUE, CONSUMED** (panel #9) — from the arrived branch
+    /// only, below the sky's offer and above every toy. One cue, one beat,
+    /// nothing that moves the cat: a look and a nod are the perk in place
+    /// (the v2 perk's idiom — no quiet reset, no station, no flight), new
+    /// mail adds one ear and one ♪ off the chest, and the ear-flat beat is
+    /// the droop's own frame for [`EAR_FLAT_HOLD`] with none of the grief.
+    /// A sleeper is not woken for the room (the flow latch's law): its cue
+    /// is dropped, not kept. A cat one tick from its feet keeps it. Returns
+    /// whether it acted.
+    fn consume_room(&mut self, caret_col: u16, width: f32) -> bool {
+        let Some(cue) = self.pending_room else {
+            return false;
+        };
+        if matches!(self.action, PetAction::Sleep | PetAction::Waking) {
+            self.pending_room = None;
+            self.room_at = None;
+            return false;
+        }
+        if !self.action.settled() {
+            return false;
+        }
+        self.pending_room = None;
+        self.room_at = None;
+        let mid = self.col + width * 0.5;
+        match cue {
+            RoomCue::Look { col } => {
+                self.facing_left = col < mid;
+                self.perk_in_place();
+            }
+            RoomCue::Nod => {
+                self.facing_left = f32::from(caret_col) < mid;
+                self.perk_in_place();
+            }
+            RoomCue::Mail => {
+                self.facing_left = f32::from(caret_col) < mid;
+                self.perk_in_place();
+                // One ear (the pulse twitch's own beat, its parity dealt the
+                // same way) and one ♪ off the chest, in the ribbon's colour
+                // under the cat when there is one.
+                self.twitch_t = TWITCH_DUR;
+                self.twitch_up = self.mote_serial.is_multiple_of(2);
+                let seed = self.mote_serial;
+                self.mote_serial = self.mote_serial.wrapping_add(1);
+                let chest_x = if self.facing_left { 0.38 } else { 0.62 };
+                self.spawn_mote(Mote {
+                    kind: PetMoteKind::Note,
+                    born: self.clock,
+                    life: PURR_MOTE_LIFE,
+                    col: self.col + width * chest_x + 0.23,
+                    row: self.row - 0.27,
+                    dir: if self.facing_left { -1.0 } else { 1.0 },
+                    seed,
+                    rgb: self.mote_rgb,
+                });
+            }
+            RoomCue::EarFlat => {
+                // The sulk's seat rule, verbatim: a seated cat keeps its
+                // seat, a cat on its feet sinks — and it is BRIEF.
+                self.droop_seated = matches!(
+                    self.action,
+                    PetAction::Sit | PetAction::Purr | PetAction::Groom | PetAction::Loaf
+                );
+                self.droop_brief = true;
+                self.speed = 0.0;
+                self.set_action(PetAction::Droop);
+            }
+        }
+        true
+    }
+
+    /// The perk taken IN PLACE — the v2 perk edge's idiom: not a quiet
+    /// reset (the room is not a caret event, so a long-settled cat comes
+    /// back to exactly the ladder rung it was on), and a perk already up
+    /// restarts its hold rather than stacking a second.
+    fn perk_in_place(&mut self) {
+        if self.action == PetAction::Perk {
+            self.action_t = 0.0;
+        } else {
+            self.set_action(PetAction::Perk);
+        }
+        self.speed = 0.0;
+    }
+
+    /// The live droop's hold: the sulk's [`DROOP_HOLD`], or the ear-flat
+    /// beat's [`EAR_FLAT_HOLD`] (panel #9).
+    fn droop_hold(&self) -> f32 {
+        if self.droop_brief {
+            EAR_FLAT_HOLD
+        } else {
+            DROOP_HOLD
+        }
+    }
+
+    /// **A STARE HELD STILL** (panel #9(b)): the watch is live — heat over
+    /// the gate, cap unspent, cat awake — under a frozen heat. Nothing about
+    /// it changes until the cap, which `next_change_secs` names.
+    fn watch_still(&self) -> bool {
+        self.heat_frozen()
+            && self.watch_heat >= WATCH_GATE
+            && !self.watch_spent
+            && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
+    }
+
     /// THE WORD-CAT BAT (wave 2): consume a noted peek, on the ground —
     /// crouch, fly to the standoff beside the head, and owe the swipe on
     /// landing. Returns whether it acted.
@@ -8646,14 +9104,14 @@ impl PetBrain {
     /// past [`SLEEP_AFTER`], and a pet that woke for every burst of an
     /// all-night build would never idle to zero. (Waking finishes its
     /// stretch through the one-shot ladder before this is ever reached.)
-    fn consume_watch(&mut self, dt: f32, caret_col: u16) -> bool {
+    fn consume_watch(&mut self, elapsed: f32, caret_col: u16) -> bool {
         if self.watch_spent || self.watch_heat < WATCH_GATE {
             return false;
         }
         if matches!(self.action, PetAction::Sleep | PetAction::Waking) {
             return false;
         }
-        self.watch_t += dt;
+        self.watch_t += elapsed;
         if self.watch_t >= WATCH_MAX {
             // The hard cap: one bounded stare per stream. Falling through to
             // the settle ladder drops the pet to the sit with `settle_gaze`
@@ -9020,6 +9478,11 @@ impl PetBrain {
                     PetGlyphId::PetStretchHind
                 }
             }
+            // NOT MY HAND (panel #9(a)): under a controller lease the stand
+            // and the sit are WORN as the perk — ears up on the caret — a
+            // pose-only override, so the ladder, its clocks and its offers
+            // are untouched and the seat costs the lane nothing it did not.
+            PetAction::Stand | PetAction::Sit if self.room_lease => PetGlyphId::PetPerk,
             PetAction::Stand => {
                 // The last beats of the stand gather down toward the fold
                 // ([`SIT_FOLD`]), so the sit does not snap on.
@@ -9305,7 +9768,7 @@ impl PetBrain {
                 // hung — in the two readings the grief can find the animal
                 // in: still seated when it was sitting, down on its belly
                 // when it was on its feet.
-                let u = (self.action_t / DROOP_HOLD).clamp(0.0, 1.0);
+                let u = (self.action_t / self.droop_hold()).clamp(0.0, 1.0);
                 scale_y -= 0.06 * u;
                 scale_x += 0.03 * u;
                 if self.droop_seated {
@@ -9646,6 +10109,7 @@ impl PetBrain {
             scale_x,
             scale_y,
             purr,
+            contented: self.content >= PURR_GATE,
             under_ink: self.hiding,
             motes: self.resolve_motes(),
             departures: self.resolve_departures(),
@@ -9925,7 +10389,10 @@ impl PetBrain {
         // decay is bounded by construction: heat ≤ 1.0 falls at
         // [`WATCH_FALL`]/s once the stream ends — under a second of ticks —
         // and during the stream its own redraws pay for the bookkeeping.
-        if self.watch_heat > 0.0 {
+        // …unless THE ROOM says the job is quiet (panel #9(b)): a frozen
+        // heat changes nothing frame to frame, and the cap a live stare is
+        // waiting for is named by `next_change_secs`.
+        if self.watch_heat > 0.0 && !self.heat_frozen() {
             return true;
         }
         // The wave-2 play envelopes: live pointer attention decays to zero
@@ -10073,7 +10540,12 @@ impl PetBrain {
         //     what keeps a body pinned against a wall, or jittering a
         //     thousandth of a cell between the scoot and the ease, from
         //     reading as motion.
-        if self.action == PetAction::Perk || self.flinch_t > 0.0 || self.evicting {
+        // A PERK HELD BY A FROZEN WATCH is a still (panel #9(b)): its only
+        // edge is the cap, and that is offered.
+        if (self.action == PetAction::Perk && !self.watch_still())
+            || self.flinch_t > 0.0
+            || self.evicting
+        {
             return true;
         }
         if self.col != self.col_at_tick
@@ -10234,6 +10706,17 @@ impl PetBrain {
         if self.vigil && self.action == PetAction::Crouch {
             return soon.0;
         }
+        // THE ROOM'S TWO WAITS (panel #9(b)): a stare held under a frozen
+        // heat caps at [`WATCH_MAX`], and an armed vigil gets up at
+        // [`VIGIL_AFTER`] — both instants of the brain's own clocks, both
+        // named here so a quiet job costs two wakes and then the held
+        // crouch, never a train.
+        if self.watch_still() {
+            soon.at(WATCH_MAX - self.watch_t);
+        }
+        if self.waiting_up() && !self.vigil {
+            soon.at(VIGIL_AFTER - self.vigil_t);
+        }
         if self.last_reduced {
             // Reduced motion draws one still per pose; the only edge left is
             // the ladder's sleep (the reduced arm of `tick` verdicts it).
@@ -10294,8 +10777,11 @@ impl PetBrain {
             }
             return soon.0;
         }
-        // AWAKE AND SETTLED: the ladder's sleep is always coming.
-        soon.at(SLEEP_AFTER - q);
+        // AWAKE AND SETTLED: the ladder's sleep is always coming — unless
+        // the cat is waiting up (panel #9(b)), when it is withheld.
+        if !self.waiting_up() {
+            soon.at(SLEEP_AFTER - q);
+        }
         // The tell: the swell stops (and the ♪/♥ with it) when the ledger,
         // spent at [`CONTENT_DECAY`] a second, crosses the gate — unless the
         // pose IS the purr, which purrs whatever the ledger says.
@@ -10324,7 +10810,8 @@ impl PetBrain {
         if matches!(
             self.action,
             PetAction::Sit | PetAction::Loaf | PetAction::Purr
-        ) {
+        ) && !self.room_hold
+        {
             let since = q - SIT_AFTER;
             let groom_after = self.groom_after();
             let cycle = groom_after + GROOM_DUR;
@@ -10361,11 +10848,17 @@ impl PetBrain {
             }
             PetAction::Sit => {
                 let since = q - SIT_AFTER;
-                soon.at(self.loaf_after() - q);
-                if self.settle_seed.is_multiple_of(2) {
-                    soon.at(self.loaf_after() - YAWN_DUR - q);
+                // A cat sitting tight (panel #9(e)) never melts; a cat
+                // wearing the perk (#9(a)) deals no seat beats.
+                if !self.room_hold {
+                    soon.at(self.loaf_after() - q);
+                    if self.settle_seed.is_multiple_of(2) {
+                        soon.at(self.loaf_after() - YAWN_DUR - q);
+                    }
                 }
-                self.sit_beat_edges(&mut soon);
+                if !self.room_lease {
+                    self.sit_beat_edges(&mut soon);
+                }
                 let fold_live = since < SIT_FOLD;
                 if fold_live || tell {
                     let (fx, fy) = if fold_live {
@@ -12928,6 +13421,7 @@ mod tests {
             scale_x: 1.0,
             scale_y: 1.0,
             purr: 0.0,
+            contented: false,
             under_ink: false,
             motes: [None; PET_MOTES_MAX],
             departures: [None; PET_DEPARTURES_MAX],
@@ -12960,6 +13454,15 @@ mod tests {
                 assert!(matches!(f.action, PetAction::Sit | PetAction::Sleep));
                 assert!((f.col - PetBrain::station(col, 100, w)).abs() < 1e-3);
                 assert_eq!(f.alpha, 255, "a static pet appears in one sample");
+                assert_eq!(
+                    pet.home, pet.col,
+                    "the static placement is its completed home"
+                );
+                assert_eq!(pet.col_at_tick, pet.col, "no unfinished glide is recorded");
+                assert!(
+                    !pet.needs_frames(),
+                    "a jump or idle still owes no animation"
+                );
                 fps.insert(f.fp());
             }
         }
@@ -12968,6 +13471,20 @@ mod tests {
             "a reduced-motion pet must SETTLE (one still frame per caret cell), \
              not animate: {} distinct frames",
             fps.len()
+        );
+
+        // Negative control: normal live motion must retain its frame debt.
+        // Re-enable it on this same brain, then reduce during the owed reaction.
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((3, 90))));
+        assert!(pet.needs_frames(), "re-enabled motion remains owed");
+        t += Duration::from_millis(16);
+        let mut reduced = sense(t, Some((3, 90)));
+        reduced.reduced_motion = true;
+        assert_eq!(pet.tick(reduced).alpha, 255);
+        assert!(
+            !pet.needs_frames(),
+            "reducing a moving brain settles its debt"
         );
     }
 
@@ -25481,5 +25998,377 @@ mod tests {
             reached |= pet.note_v2_offer(&offer).is_some();
         }
         assert!(reached, "a latch that buys no wake is still a latch");
+    }
+
+    // ── THE ROOM (panel #9) ─────────────────────────────────────────────
+
+    /// Drive `pet` the way the host does — an offer while it is parked, the
+    /// 16 ms train while `needs_frames` holds the lane — restating the room's
+    /// levels on every wake, for `secs` or until it offers nothing. Returns
+    /// the wake count, whether it ever slept, when the vigil crouch was
+    /// entered, and the clock.
+    fn drive_room(
+        pet: &mut PetBrain,
+        start: Instant,
+        caret: (u16, u16),
+        secs: f32,
+        executing: bool,
+    ) -> (u32, bool, Option<Instant>, Instant) {
+        let end = start + Duration::from_secs_f32(secs);
+        let (mut wakes, mut slept, mut crouched) = (0u32, false, None);
+        let mut t = start;
+        while t < end {
+            let next = if pet.needs_frames() {
+                t + Duration::from_millis(16)
+            } else {
+                let Some(d) = pet.next_change_deadline(t) else {
+                    break;
+                };
+                assert!(d > t, "a deadline at `now` is a busy re-arm");
+                d
+            };
+            t = next;
+            wakes += 1;
+            pet.note_executing(t, executing);
+            let f = pet.tick(sense(t, Some(caret)));
+            slept |= f.action == PetAction::Sleep;
+            if pet.vigil && pet.action == PetAction::Crouch && crouched.is_none() {
+                crouched = Some(t);
+            }
+        }
+        (wakes, slept, crouched, t)
+    }
+
+    /// **(a) NOT MY HAND.** Under a controller lease the cat WALKS to the
+    /// far stand — [`LEASE_STANDOFF`] past where it would have stood — and
+    /// wears the perk where the un-leased twin sits; at release it walks
+    /// back on the shipped chase. Never a jump: every frame's step is a
+    /// walking step. Before: the leased cat stood exactly where the twin
+    /// did and sat down beside a hand that was not its owner's.
+    #[test]
+    fn a_driven_session_s_cat_keeps_its_distance_and_walks_back_at_release() {
+        let start = Instant::now();
+        let (mut pet, mut twin, t0) = settled_pair(start, 3.0);
+        pet.note_room_lease(true);
+        // The agent types six keys over the control socket — keys are keys
+        // — and both cats follow the same caret.
+        let mut t = t0;
+        let mut step_max = 0.0f32;
+        let mut last = pet.col;
+        for k in 1..=6u16 {
+            let until = t + Duration::from_millis(120);
+            while t < until {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 12 + k - 1))));
+                let _ = twin.tick(sense(t, Some((4, 12 + k - 1))));
+                step_max = step_max.max((f.col - last).abs());
+                last = f.col;
+            }
+        }
+        let (t, f) = idle(&mut pet, t, (4, 18), 3.0);
+        let (_, g) = idle(&mut twin, t, (4, 18), 3.0);
+        assert!(
+            (f.col - g.col - LEASE_STANDOFF).abs() < 0.6,
+            "the leased cat stands {} cells past the twin (wanted {LEASE_STANDOFF})",
+            f.col - g.col
+        );
+        assert_eq!(
+            f.pose,
+            PetSpecies::Cat.skin(PetGlyphId::PetPerk),
+            "…wearing the perk on the caret, not the seat ({:?} / {:?})",
+            f.action,
+            f.pose
+        );
+        assert!(
+            g.action.settled() && g.pose != PetGlyphId::PetPerk,
+            "the twin sits"
+        );
+        assert!(
+            step_max <= 1.0 && pet.flight.is_none(),
+            "the far stand is walked to, never jumped: max step {step_max} cells"
+        );
+        // Release: the station shrinks back and the chase walks the cat
+        // home. On its feet the whole way.
+        pet.note_room_lease(false);
+        let mut t = t;
+        let mut walked = false;
+        let mut airborne = false;
+        let mut step_max = 0.0f32;
+        let mut last = pet.col;
+        let end = t + Duration::from_secs(3);
+        while t < end {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 18))));
+            let _ = twin.tick(sense(t, Some((4, 18))));
+            walked |= matches!(f.action, PetAction::Walk | PetAction::Run);
+            airborne |= f.action.airborne();
+            step_max = step_max.max((f.col - last).abs());
+            last = f.col;
+        }
+        assert!(
+            walked && !airborne,
+            "the walk home is a walk (walked {walked}, airborne {airborne})"
+        );
+        assert!(
+            (pet.col - twin.col).abs() < 0.3,
+            "…and it arrives beside the twin: {} vs {}",
+            pet.col,
+            twin.col
+        );
+        assert!(
+            step_max <= 1.0,
+            "no teleport on the way home: max step {step_max}"
+        );
+    }
+
+    /// **(b) IT WAITS WITH YOU.** A job that printed for a second, then went
+    /// quiet and kept running: with the status phase `Quiet` restated, the
+    /// stare the stream earned is kept until it caps, the vigil arms, the
+    /// ladder's sleep is withheld and the cat is at the door in its held
+    /// crouch by [`VIGIL_AFTER`] — for a counted handful of wakes and then
+    /// none. Before: the heat drained in under a second and the cat slept
+    /// at [`SLEEP_AFTER`] with the job still running.
+    #[test]
+    fn a_running_job_keeps_the_cat_awake_with_you() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let (mut t, _) = type_run(&mut pet, start, 10, 20, 6, 0.12);
+        let launched = t;
+        for _ in 0..60 {
+            t += Duration::from_millis(16);
+            pet.note_executing(t, true);
+            let mut s = sense(t, Some((10, 20)));
+            s.output_burst = true;
+            let _ = pet.tick(s);
+        }
+        assert!(
+            pet.watch_heat >= WATCH_GATE,
+            "fixture: the stream earned the stare"
+        );
+        pet.note_room_quiet(true);
+        let (wakes, slept, crouched, t) = drive_room(&mut pet, t, (10, 20), 40.0, true);
+        assert!(!slept, "the cat slept on a running job");
+        let at = crouched.expect("the vigil crouch was never entered");
+        let since = at.saturating_duration_since(launched).as_secs_f32();
+        assert!(
+            since <= VIGIL_AFTER + 1.5,
+            "the vigil is taken at the half-minute mark, not {since:.1} s"
+        );
+        assert!(
+            pet.vigil && pet.action == PetAction::Crouch,
+            "…and held ({:?})",
+            pet.action
+        );
+        assert!(
+            !pet.needs_frames() && pet.next_change_deadline(t).is_none(),
+            "the held crouch claims no frame and offers nothing"
+        );
+        assert!(
+            wakes <= 120,
+            "a quiet job is a handful of wakes and then the crouch, not a train: {wakes}"
+        );
+        // The verdict wakes it, as ever — green, forty seconds, so it pounces.
+        pet.note_command_done(t, false, Some(40_000));
+        pet.note_room_quiet(false);
+        let mut t = t;
+        let mut left_the_ground = false;
+        for _ in 0..200 {
+            t += Duration::from_millis(16);
+            pet.note_executing(t, false);
+            left_the_ground |= pet.tick(sense(t, Some((10, 20)))).action.airborne();
+        }
+        assert!(left_the_ground, "the verdict still buys the strike");
+    }
+
+    /// **(d) WHO IS TALKING.** In a split, a sibling pane's burst rising
+    /// edge earns exactly ONE look — the perk, facing that pane's caret —
+    /// and the level held for a second earns no second one; the body does
+    /// not move. Before: a sibling's stream was nothing to the pet.
+    #[test]
+    fn a_sibling_pane_s_burst_earns_one_look() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = settled_pair(start, 5.0);
+        let mut looks = 0u32;
+        let mut first_facing = None;
+        let mut was_perk = false;
+        let mut f = pet.tick(sense(t, Some((4, 12))));
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            // A pane to the LEFT of this one, on row 3, is printing.
+            pet.note_room_sibling(t, Some((-20.0, 3.0)));
+            f = pet.tick(sense(t, Some((4, 12))));
+            let g = twin.tick(sense(t, Some((4, 12))));
+            if f.action == PetAction::Perk && !was_perk {
+                looks += 1;
+                first_facing.get_or_insert(f.facing_left);
+            }
+            was_perk = f.action == PetAction::Perk;
+            assert!(
+                (f.col - g.col).abs() < 0.05 && f.row.to_bits() == g.row.to_bits(),
+                "a look is not a trip"
+            );
+        }
+        assert_eq!(looks, 1, "one rising edge, one look ({looks})");
+        assert_eq!(first_facing, Some(true), "…toward the pane that is talking");
+        assert!(
+            f.action.settled() && f.action != PetAction::Perk,
+            "and then back to its seat"
+        );
+    }
+
+    /// **(e) MAIL, AND A HALT.** An unread inbox row perks the cat — one
+    /// ear, one ♪ the twin never floats — exactly once however many frames
+    /// it stays unread; a passed deadline is the ear-flat beat with none of
+    /// the sulk's ledger; and a standing `hold on` sits the cat tight: no
+    /// long dwell while the twin melts into its loaf, and still asleep at
+    /// the ladder's hour. Before: the inbox was nothing to the pet.
+    #[test]
+    fn an_unseen_inbox_row_perks_the_cat_and_a_hold_on_sits_it() {
+        let start = Instant::now();
+        let (mut pet, mut twin, mut t) = settled_pair(start, 2.0);
+        pet.note_room_inbox(t, RoomInbox::default());
+        let mail = RoomInbox {
+            unseen: 7,
+            overdue: false,
+            hold: false,
+        };
+        let (mut perks, mut notes, mut twitched, mut was_perk) = (0u32, 0u32, false, false);
+        for _ in 0..60 {
+            t += Duration::from_millis(16);
+            pet.note_room_inbox(t, mail);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            let g = twin.tick(sense(t, Some((4, 12))));
+            if f.action == PetAction::Perk && !was_perk {
+                perks += 1;
+            }
+            was_perk = f.action == PetAction::Perk;
+            let note = |f: &PetFrame| {
+                f.motes
+                    .iter()
+                    .flatten()
+                    .filter(|m| m.kind == PetMoteKind::Note)
+                    .count()
+            };
+            notes = notes.max((note(&f).saturating_sub(note(&g))) as u32);
+            twitched |= pet.twitch_t > 0.0;
+        }
+        assert_eq!(perks, 1, "one letter, one perk ({perks})");
+        assert_eq!(notes, 1, "…and one ♪ of its own ({notes})");
+        assert!(twitched, "…with one ear");
+        // The deadline passes on it: the ear-flat beat, no grief.
+        let ledger = pet.content;
+        let overdue = RoomInbox {
+            overdue: true,
+            ..mail
+        };
+        let mut flat = false;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            pet.note_room_inbox(t, overdue);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            let _ = twin.tick(sense(t, Some((4, 12))));
+            flat |= f.action == PetAction::Droop && pet.droop_brief;
+        }
+        assert!(flat, "a passed deadline flattens the ears");
+        assert!(
+            (pet.content - ledger).abs() < 1e-6 && !pet.pending_sulk,
+            "…with none of the sulk: ledger {ledger} → {}",
+            pet.content
+        );
+        // `hold on`: sits tight — the twin melts into its long dwell, the
+        // cat keeps its seat — and idle-to-zero still wins at the ladder's
+        // sleep.
+        let hold = RoomInbox {
+            hold: true,
+            ..overdue
+        };
+        pet.note_room_inbox(t, hold);
+        let (t, f) = idle(&mut pet, t, (4, 12), 10.0);
+        let (_, g) = idle(&mut twin, t, (4, 12), 10.0);
+        assert_eq!(f.action, PetAction::Sit, "sits tight ({:?})", f.action);
+        assert_ne!(
+            g.action,
+            PetAction::Sit,
+            "fixture: the twin has melted ({:?})",
+            g.action
+        );
+        let (t, f) = idle(&mut pet, t, (4, 12), SLEEP_AFTER);
+        assert_eq!(f.action, PetAction::Sleep, "a halt does not withhold sleep");
+        let (t, _) = idle(&mut pet, t, (4, 12), BREATH_WINDOW + 1.0);
+        assert!(
+            !pet.needs_frames() && pet.next_change_deadline(t).is_none(),
+            "idle → zero, hold or no hold"
+        );
+    }
+
+    /// **NO FACT IS A WAKE.** Each of the room's five facts, noted on a
+    /// parked cat, leaves the frame train untouched (`needs_frames`) and
+    /// never moves the coarse offer SOONER (`next_change_deadline`) — the
+    /// `note_flow` / `note_v2_offer` law, held to for facts from the
+    /// session layer. And the latches are real: the next frame the cat was
+    /// already going to draw answers them.
+    #[test]
+    fn the_room_s_facts_buy_no_wake() {
+        let start = Instant::now();
+        let (mut pet, _twin, t) = settled_pair(start, 5.0);
+        assert!(!pet.needs_frames(), "fixture: a parked cat");
+        let horizon = pet
+            .next_change_deadline(t)
+            .expect("fixture: a settled cat names its next step");
+        pet.note_room_turn(t, 3, true);
+        pet.note_room_inbox(t, RoomInbox::default());
+        let check = |pet: &PetBrain, what: &str| {
+            assert!(!pet.needs_frames(), "{what} pinned the frame train");
+            let d = pet.next_change_deadline(t);
+            assert!(
+                d.is_none_or(|d| d >= horizon),
+                "{what} moved the idle horizon sooner: {:?} vs {horizon:?}",
+                d
+            );
+        };
+        pet.note_room_lease(true);
+        check(&pet, "a lease");
+        pet.note_room_quiet(true);
+        check(&pet, "a quiet job");
+        pet.note_room_turn(t, 4, true);
+        check(&pet, "a settled turn");
+        pet.note_room_sibling(t, Some((30.0, 2.0)));
+        check(&pet, "a talking sibling");
+        pet.note_room_inbox(
+            t,
+            RoomInbox {
+                unseen: 9,
+                overdue: false,
+                hold: true,
+            },
+        );
+        check(&pet, "unread mail under a hold");
+        assert!(pet.pending_room.is_some(), "…and the latch is real");
+        let mut t = t;
+        let mut answered = false;
+        for _ in 0..40 {
+            t += Duration::from_millis(16);
+            answered |= pet.tick(sense(t, Some((4, 12)))).action == PetAction::Perk;
+        }
+        assert!(answered, "a latch that buys no wake is still a latch");
+    }
+
+    /// The reach constants are DERIVED (the room round): the catch TTL is
+    /// the sky m1's catchable life — its whole life less the finish a catch
+    /// puts it on — read off the sky's own constants, so a retuned star
+    /// retunes the cat; the perk's late bound is one lane tick on a 60 Hz
+    /// panel; the cooldown is two swipes.
+    #[test]
+    fn the_catch_ttl_is_the_sky_m1_s_catchable_life() {
+        use crate::rainbow_kitty::stardust::{CATCH_FINISH_MS, StarClass, StarLane};
+        let life = StarClass::M1.life_s(StarLane::Strike);
+        let catchable = life - CATCH_FINISH_MS / 1000.0;
+        assert!(
+            (V2_CATCH_TTL - catchable).abs() < 1e-3,
+            "V2_CATCH_TTL {V2_CATCH_TTL} is not the sky m1's catchable life {catchable} \
+             (life {life}, finish {CATCH_FINISH_MS} ms)"
+        );
+        assert!((V2_PERK_LATE - 2.0 / 60.0).abs() < 1e-6);
+        assert!((V2_CATCH_COOL - 2.0 * BAT_HOLD).abs() < 1e-6);
     }
 }

@@ -1681,12 +1681,18 @@ mod tests {
         let codex = row("codex").facts.clone().expect("codex facts");
         assert_eq!(codex.vendor, "OpenAI Codex CLI");
         assert_eq!(codex.license.as_deref(), Some("Apache-2.0"));
-        assert_eq!(codex.size.as_deref(), Some("~90 MB"));
-        assert_eq!(codex.line(), "OpenAI Codex CLI  ·  Apache-2.0  ·  ~90 MB");
+        // The authored fact moved to "~110 MB (~290 MB on disk)" in atpkg's
+        // stub table (1f6d9332d) without this pin following it.
+        assert_eq!(codex.size.as_deref(), Some("~110 MB (~290 MB on disk)"));
+        assert_eq!(
+            codex.line(),
+            "OpenAI Codex CLI  ·  Apache-2.0  ·  ~110 MB (~290 MB on disk)"
+        );
         let claude = row("claude").facts.clone().expect("claude facts");
         assert_eq!(claude.vendor, "Anthropic Claude Code");
         assert_eq!(claude.license.as_deref(), Some("proprietary"));
-        assert_eq!(claude.size.as_deref(), Some("~230 MB"));
+        // Same drift for Claude Code: the stub table says "~200 MB" now.
+        assert_eq!(claude.size.as_deref(), Some("~200 MB"));
         let odd = ExtraFacts::parse("Some Tool without the grammar");
         assert_eq!(odd.vendor, "Some Tool without the grammar");
         assert_eq!(odd.license, None);

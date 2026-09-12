@@ -13,8 +13,10 @@
 //!
 //! This file is a GATE, not a report. It drives the v2 [`Engine`] through the
 //! §21 gestures — 12 cps prose, a burst with a same-row 40-cell nav meteor
-//! every 500 ms, an 80-cell Ctrl-E ping-pong, and a held Backspace — at a
-//! 120 Hz tick, and drives `CursorGlow` (style `RainbowKitty`, i.e. v2
+//! every 500 ms, an 80-cell Ctrl-E ping-pong, a held Backspace, and §27's
+//! Codex streaming (12 cps under a viewport that slides down one row per
+//! streamed line and then archives the transcript up under the pinned
+//! composer) — at a 120 Hz tick, and drives `CursorGlow` (style `RainbowKitty`, i.e. v2
 //! through the real seam) through the SAME script in the same harness, then
 //! asserts:
 //!
@@ -51,7 +53,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue};
+use aterm_effects::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, SoundCue, band_pos};
 use aterm_effects::rainbow_kitty::{
     CaretSeam, Config, Dir, Engine, Event, Frame, Licence, TypedClass,
 };
@@ -212,6 +214,12 @@ enum Action {
     Nav(i32),
     /// One Backspace: the caret retreats one cell.
     Backspace,
+    /// A ROW-BAND MOVE the host replays before the tick (seam point 12, the
+    /// band path): screen rows `top..=bottom` moved by `delta` — Codex's
+    /// inline viewport sliding down one row per streamed line, its pinned
+    /// transcript archiving up. The caret is a position and rides its band
+    /// (`band_pos`), exactly as the host observes it on the next present.
+    BandMove(u16, u16, i16),
 }
 
 /// A gesture on a tick.
@@ -357,6 +365,59 @@ fn held_backspace() -> Scenario {
     }
 }
 
+/// §27, the owner's Codex session: 12 cps prose into the composer while the
+/// program streams an answer under the hand. PHASE A (the first ~1.5 s): the
+/// inline viewport — the band from the row above the caret to the bottom
+/// row — slides DOWN one row per streamed line every 120 ms (the measured
+/// gaps run 9.1–233 ms), and the caret rides each one, from [`ROW`] to the
+/// penultimate row. PHASE B (the rest): the composer is pinned at the bottom
+/// and every streamed line archives the transcript above it — rows
+/// `0..=caret−2` — UP one row every 30 ms; the caret stands still. Before
+/// the band path every one of those lines was a reset: the measured session
+/// read `ribbon_segments 16 → 0` on the first line and the momentum
+/// restarted per line. The scenario holds the fence to the same laws as the
+/// other four — zero allocations on every steady tick, idle → exactly zero,
+/// and the §18 budget in the release twin.
+fn codex_streaming_12cps() -> Scenario {
+    let ticks = ticks_in_ms(3_000);
+    let bottom = geometry().rows as u16 - 1;
+    let line_a = ticks_in_ms(120);
+    let line_b = ticks_in_ms(30);
+    let phase_b_from = ticks_in_ms(1_700);
+    let mut steps = Vec::new();
+    let mut row = ROW;
+    let mut prose = PROSE.chars().cycle();
+    for tick in 0..ticks {
+        // The host replays the batch BEFORE the tick's typed echo is judged,
+        // so a band move on a key's tick is pushed first.
+        if tick > 0 && tick < phase_b_from && tick.is_multiple_of(line_a) && row + 1 < bottom {
+            steps.push(Step {
+                tick,
+                action: Action::BandMove(row - 1, bottom, 1),
+            });
+            row += 1;
+        } else if tick >= phase_b_from && tick.is_multiple_of(line_b) && row >= 2 {
+            steps.push(Step {
+                tick,
+                action: Action::BandMove(0, row - 2, -1),
+            });
+        }
+        if tick.is_multiple_of(KEY_TICKS) {
+            steps.push(Step {
+                tick,
+                action: Action::Typed(prose.next().unwrap_or(' ')),
+            });
+        }
+    }
+    Scenario {
+        name: "codex streaming: 12 cps under a sliding then pinned viewport",
+        start: (ROW, 4),
+        ticks,
+        measure_from: 0,
+        steps,
+    }
+}
+
 fn scenarios() -> Vec<Scenario> {
     let only = std::env::var("RK_FRAME_COST_ONLY").unwrap_or_default();
     let needle = only.split(':').nth(1).unwrap_or("").to_string();
@@ -365,6 +426,7 @@ fn scenarios() -> Vec<Scenario> {
         burst_with_nav_meteor(),
         ctrl_e_ping_pong(),
         held_backspace(),
+        codex_streaming_12cps(),
     ]
     .into_iter()
     .filter(|sc| needle.is_empty() || sc.name.contains(&needle))
@@ -472,6 +534,10 @@ struct V2 {
     eng: Engine,
     cfg: Config,
     geom: Geom,
+    /// A blank probe row, minted once: the host re-probes the caret's rows
+    /// after every band move (the band path drops the sky's probe), and the
+    /// harness must do so without allocating on the tick.
+    blank: Vec<bool>,
     under: Vec<GlowQuad>,
     out: Vec<GlowQuad>,
     halos: Vec<RainHalo>,
@@ -501,6 +567,7 @@ impl V2 {
             eng,
             cfg: Config::from_glow(&glow_config(), false),
             geom,
+            blank,
             under: Vec::with_capacity(MAX_QUADS),
             out: Vec::with_capacity(MAX_QUADS),
             halos: Vec::with_capacity(MAX_HALOS),
@@ -558,6 +625,20 @@ impl Driver for V2 {
                 caret.1 = caret.1.saturating_sub(1);
                 self.eng.on_event(mv(from, *caret, Licence::Typed), now);
                 self.eng.on_event(Event::Erase, now);
+            }
+            Action::BandMove(top, bottom, delta) => {
+                self.eng.translate_band(
+                    top,
+                    bottom,
+                    delta,
+                    self.geom.ch as u16,
+                    self.geom.origin_y,
+                );
+                caret.0 = band_pos(caret.0, top, bottom, delta);
+                // The host re-probes the caret's rows before the next deal.
+                for r in [caret.0.saturating_sub(1), caret.0, caret.0 + 1] {
+                    self.eng.probe_mut().probe_row(i32::from(r), &self.blank);
+                }
             }
         }
     }
@@ -650,6 +731,10 @@ impl Driver for Host {
             Action::Backspace => {
                 caret.1 = caret.1.saturating_sub(1);
                 self.glow.note_backspace(now);
+            }
+            Action::BandMove(top, bottom, delta) => {
+                self.glow.note_band_move(top, bottom, delta);
+                caret.0 = band_pos(caret.0, top, bottom, delta);
             }
         }
     }

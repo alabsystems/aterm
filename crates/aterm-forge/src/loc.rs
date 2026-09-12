@@ -428,12 +428,19 @@ pub fn measure(root: &Path, id: &PkgId, printed: Option<&Path>) -> PkgFacts {
         has_build_rs: dir.join("build.rs").is_file(),
         is_proc_macro,
         license,
-        // The contract's test, verbatim: a package is third-party iff its
-        // manifest is NOT under `<root>/crates/`. The six `[patch.crates-io]`
-        // path packages under `vendor/` are therefore third-party, which is
-        // correct — they are upstream code aterm now maintains, not code aterm
-        // wrote.
-        is_third_party: !dir.starts_with(root.join("crates")),
+        // A package is third-party iff it is not aterm's OWN code, and that
+        // question is asked of [`crate::provenance`] rather than of the path.
+        //
+        // IT USED TO BE THE PATH, verbatim: "third-party iff its manifest is
+        // NOT under `<root>/crates/`". That was right while `vendor/` held
+        // nothing but redistributed forks, and on 2026-09-10 it stopped being
+        // right — v0.81.0 vendored `vendor/astream`, which is aterm's own code
+        // (same owner as this repository, in `vendor/` for a build reason), and
+        // the prefix rule billed 11,122 lines of it to the third-party surface
+        // this crate exists to shrink. The five REAL forks under `vendor/`
+        // (winit, indexmap, libm, pkg-config, smol_str) are still third-party,
+        // and `provenance::FIRST_PARTY_VENDORED` is what separates them.
+        is_third_party: !crate::provenance::is_first_party(root, &dir),
         root_dir: Some(dir),
     }
 }
@@ -948,6 +955,49 @@ mod tests {
         assert!(
             core.1.loc > 0,
             "workspace crates are measured too, just not billed"
+        );
+    }
+
+    /// THE DISCRIMINATION `vendor/` NOW REQUIRES, held on the real graph.
+    ///
+    /// Until 2026-09-10 `is_third_party` was a directory prefix, and this
+    /// assertion could not have failed for the right reason: everything under
+    /// `vendor/` answered the same way. It is a provenance question now, and
+    /// this is the test that can refute it — `astream-broker` and
+    /// `astream-cap` are aterm's own code vendored so a clean clone builds,
+    /// `winit` is upstream source aterm forked and must keep reviewing, and
+    /// both live under `vendor/`. A rule that gets either one wrong moves
+    /// `third_party_loc`: calling astream third-party bills 11,122 lines of
+    /// ours to the surface, and calling winit first-party hides 83,309 of
+    /// somebody else's.
+    #[test]
+    fn a_first_party_vendored_crate_is_not_third_party_but_a_fork_still_is() {
+        let s = survey(0);
+        let by_name = |name: &str| {
+            s.facts
+                .iter()
+                .find(|(id, _)| id.name == name)
+                .unwrap_or_else(|| panic!("`{name}` must be in the mac-arm graph"))
+                .1
+        };
+        for own in ["astream-broker", "astream-cap", "astream-wire"] {
+            assert!(
+                !by_name(own).is_third_party,
+                "`{own}` is aterm's own code (provenance::FIRST_PARTY_VENDORED), vendored under \
+                 vendor/ for a build reason, and must not be billed to the third-party surface"
+            );
+        }
+        assert!(
+            by_name("winit").is_third_party,
+            "`vendor/winit` is a REDISTRIBUTED fork and must stay third-party — a provenance \
+             rule that exempts everything under vendor/ would hide the largest single \
+             dependency in this cell"
+        );
+        // And the chain the first-party crate DRAGS IN is still billed: being
+        // aterm's own buys the crate's own lines, never its dependencies'.
+        assert!(
+            by_name("sha2").is_third_party,
+            "sha2 is third-party no matter who reaches it"
         );
     }
 

@@ -517,6 +517,10 @@ pub(crate) struct SettingsViewState {
     /// `App::sync_settings_consent_posture`. It saturates at one: a second
     /// press while one is outstanding must not queue a second worker.
     consent_warmup_requests: u8,
+    /// The Security page's *Open Privacy & Security…* was pressed: the host
+    /// records the `opened` marker for it exactly as it does for the card's
+    /// own button, so the one-time ✓ acknowledgement follows this path too.
+    consent_open_requests: u8,
 }
 
 impl SettingsViewState {
@@ -593,6 +597,7 @@ impl SettingsViewState {
             macos_access: None,
             consent_gestures: ConsentGestures::inert(),
             consent_warmup_requests: 0,
+            consent_open_requests: 0,
         }
     }
 
@@ -820,6 +825,11 @@ impl SettingsViewState {
     /// Draining is the host's job, and it is the only caller.
     pub(crate) fn take_consent_warmup_request(&mut self) -> bool {
         std::mem::take(&mut self.consent_warmup_requests) > 0
+    }
+
+    /// Drain the *Open Privacy & Security…* press (see `consent_open_requests`).
+    pub(crate) fn take_consent_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.consent_open_requests) > 0
     }
 
     fn is_explicit(&self, key: &str) -> bool {
@@ -2425,6 +2435,9 @@ impl SettingsApp {
                     crate::menu::PrivacyPane::FilesAndFolders
                 };
                 let words = crate::menu::privacy_settings_path_words(pane);
+                if action == MACOS_ACCESS_OPEN_FDA {
+                    view.consent_open_requests = 1;
+                }
                 // `openURL:` reports that System Settings TOOK the URL, never
                 // that it scrolled to the row — so the route in words goes out
                 // on every outcome, not only the degraded ones.
@@ -10234,6 +10247,10 @@ struct LandscapeResults<'slice, 'field> {
     manual_matches: usize,
     manual_overrides: &'slice [ManualOverride],
     show_renderer_preview: bool,
+    /// The macOS access block, when the Security page carries one. The
+    /// landscape pager never showed it at all (measured at 624x348 on
+    /// 2026-09-10): it is a slice of its own now, first after the preview.
+    macos_access: Option<&'slice MacosAccess>,
 }
 
 fn settings_fields_landscape_page(
@@ -10248,10 +10265,16 @@ fn settings_fields_landscape_page(
         manual_matches,
         manual_overrides,
         show_renderer_preview,
+        macos_access,
     } = results;
     let preview_slices = usize::from(show_renderer_preview);
+    let access_slices = usize::from(macos_access.is_some());
     let manual_search_slices = usize::from(manual_matches > 0);
-    let total = preview_slices + manual_search_slices + manual_overrides.len() + fields.len();
+    let total = preview_slices
+        + access_slices
+        + manual_search_slices
+        + manual_overrides.len()
+        + fields.len();
     if total == 0 {
         return vec![
             UiNode::new(
@@ -10295,7 +10318,19 @@ fn settings_fields_landscape_page(
         );
     }
 
-    let mut cursor = offset.saturating_sub(preview_slices);
+    if let Some(access) = macos_access
+        && offset == preview_slices
+    {
+        return compact_landscape_result_page(
+            label,
+            offset,
+            total,
+            macos_access_card(access, true),
+            macos_access_height(access, true),
+            budget,
+        );
+    }
+    let mut cursor = offset.saturating_sub(preview_slices + access_slices);
     if manual_matches > 0 {
         if cursor == 0 {
             let (node, height) = manual_search_result_landscape_node(manual_matches);
@@ -10414,6 +10449,11 @@ fn settings_fields_page(
     let compact_macos_access = show_macos_access
         && width == SettingsWidth::Compact
         && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
+    // A COMPACT block is a page-0 disclosure, like the renderer preview: on a
+    // short window it led EVERY virtual page, and with no one-row floor a
+    // 700x420 window paged "1–0 of N" — the block and no toggle, on every page.
+    let show_macos_access_now =
+        show_macos_access && (!compact_macos_access || state.page_scroll == 0);
     let display_faces_showcase =
         display_faces_showcase_eligible.then(|| display_faces_card(state, width));
     // THE CURSOR KITTY CARD. Unlike the Display Faces showcase it can never be
@@ -10556,6 +10596,7 @@ fn settings_fields_page(
                 manual_matches,
                 manual_overrides: &manual_overrides,
                 show_renderer_preview,
+                macos_access: state.macos_access.as_ref().filter(|_| show_macos_access),
             },
             budget,
         );
@@ -10636,7 +10677,11 @@ fn settings_fields_page(
         renderer_preview_height(width)
     } else if show_smart_title_health {
         smart_title_health_height(compact_smart_title_health)
-    } else if let Some(access) = state.macos_access.as_ref().filter(|_| show_macos_access) {
+    } else if let Some(access) = state
+        .macos_access
+        .as_ref()
+        .filter(|_| show_macos_access_now)
+    {
         macos_access_height(access, compact_macos_access)
     } else {
         0.0
@@ -10881,7 +10926,11 @@ fn settings_fields_page(
     if show_smart_title_health {
         out.push(smart_title_health_card(state, compact_smart_title_health));
     }
-    if let Some(access) = state.macos_access.as_ref().filter(|_| show_macos_access) {
+    if let Some(access) = state
+        .macos_access
+        .as_ref()
+        .filter(|_| show_macos_access_now)
+    {
         out.push(macos_access_card(access, compact_macos_access));
     }
     if let Some((card, _height)) = display_faces_showcase {
@@ -13003,6 +13052,21 @@ pub(crate) struct MacosAccess {
     /// The RUNNING bundle's id. `None` outside a `.app` — and then there is no
     /// reset to offer, because a reset needs a subject.
     pub(crate) bundle_id: Option<String>,
+    /// The install posture token (`installed`, `mounted-image`, `translocated`,
+    /// `not-a-bundle`, `unknown`): a grant is keyed to the bundle at a path.
+    pub(crate) install: &'static str,
+    /// The canonical path this process runs from.
+    pub(crate) running: Option<String>,
+    /// Live sessions, and how many of them this process took over from a
+    /// predecessor — those are attributed to that previous copy.
+    pub(crate) sessions_total: usize,
+    pub(crate) sessions_adopted: usize,
+    /// The per-service coverage buckets, from the ONE split the verb uses
+    /// (`control_privacy::covers_split`), so the panel and the verb cannot
+    /// disagree about a service.
+    pub(crate) covers: Vec<&'static str>,
+    pub(crate) uncovered: Vec<&'static str>,
+    pub(crate) unmeasured: Vec<&'static str>,
     /// Whether `/usr/bin/tccutil` is a runnable file. Unknown fails closed: a
     /// destructive button is never shown on an unproven tool.
     pub(crate) tccutil: TccutilPresence,
@@ -13026,6 +13090,13 @@ impl Default for MacosAccess {
             dr: DrClass::Unknown,
             evidence: SpikeEvidence::UNMEASURED,
             bundle_id: None,
+            install: "unknown",
+            running: None,
+            sessions_total: 0,
+            sessions_adopted: 0,
+            covers: Vec::new(),
+            uncovered: Vec::new(),
+            unmeasured: Vec::new(),
             tccutil: TccutilPresence::Unknown,
             warmup_offered: false,
             warmup_live: false,
@@ -13041,7 +13112,11 @@ impl MacosAccess {
     /// a prompt possible, and the panel says so.
     pub(crate) fn prompt_possible(&self) -> bool {
         aterm_containment::ConsentPosture::join(aterm_containment::PostureInputs {
-            adoption: aterm_containment::Attribution::Live,
+            adoption: if self.sessions_adopted > 0 {
+                aterm_containment::Attribution::Adopted
+            } else {
+                aterm_containment::Attribution::Live
+            },
             fda: self.fda,
             responsible: aterm_containment::Responsible::Unknown,
             observed_eperm: self
@@ -13293,6 +13368,14 @@ pub(crate) struct MacosAccessCopy {
     pub(crate) route: String,
     /// aterm reports its own probe and never the System Settings switch.
     pub(crate) observation: String,
+    /// Where this process runs from, and what that means for a grant.
+    pub(crate) identity: String,
+    /// Why a dialog about a tool run here names aterm — and which sessions are
+    /// attributed to a previous copy.
+    pub(crate) responsible: String,
+    /// One line per service class, in the verb's order, each saying exactly
+    /// what has been measured about it: nothing, or a verdict.
+    pub(crate) services: Vec<String>,
     /// The rebuild explanation, when the grant is bound to an identity that
     /// does not survive one. `None` otherwise — it is not a general caveat.
     pub(crate) rebuild: Option<String>,
@@ -13315,7 +13398,10 @@ impl MacosAccessCopy {
             self.prompt.as_str(),
             self.route.as_str(),
             self.observation.as_str(),
+            self.identity.as_str(),
+            self.responsible.as_str(),
         ];
+        out.extend(self.services.iter().map(String::as_str));
         out.extend(self.rebuild.as_deref());
         out.extend(self.folders.iter().map(String::as_str));
         out.extend(self.repair.iter().map(String::as_str));
@@ -13332,6 +13418,22 @@ fn macos_access_folder_label(folder: Folder) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
     })
+}
+
+/// A service class in words, from the verb's token. The three folder classes
+/// go through [`macos_access_folder_label`] so this file still holds no
+/// protected-folder literal of any shape (`tools/grep_guard.sh` B13).
+fn macos_access_service_label(service: &str) -> String {
+    match Folder::parse(service) {
+        Some(folder) => macos_access_folder_label(folder),
+        None => match service {
+            "network-volumes" => "Network drives".to_string(),
+            "removable-volumes" => "Removable drives".to_string(),
+            "app-data" => "Other applications' data".to_string(),
+            "file-provider-domains" => "Cloud-storage folders (File Provider)".to_string(),
+            other => other.to_string(),
+        },
+    }
 }
 
 /// One warm-up row in words. `Denied` is the only one that carries a verdict,
@@ -13359,11 +13461,17 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     } else {
         match access.fda {
             FdaState::Granted => "Full disk access \u{2014} granted to aterm.",
-            FdaState::Denied => "Full disk access \u{2014} not granted to aterm.",
+            FdaState::Denied => {
+                "File access \u{2014} not confirmed. Full Disk Access may already be enabled."
+            }
+            FdaState::Unknown if access.probe == ProbeLabel::Pending => {
+                "File access \u{2014} checking\u{2026}"
+            }
             FdaState::Unknown => "Full disk access \u{2014} unknown.",
         }
     };
     let probe_detail = match access.probe {
+        ProbeLabel::Pending => "aterm is checking access in the background.".to_string(),
         ProbeLabel::OpenOk => "aterm's own check succeeded.".to_string(),
         ProbeLabel::OpenEperm => "aterm's own check was refused by macOS.".to_string(),
         ProbeLabel::OpenErrno(errno) => {
@@ -13392,17 +13500,90 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
     // everywhere on this tree, so the first arm is what ships; the second names
     // the verb that would then hold the measured list rather than inventing one
     // here. Neither arm names a folder.
+    // WHAT THE GRANT IS FOR, said the way Apple documents it (2026-09-10). The
+    // earlier sentence ended "so it claims none", which told the owner the one
+    // switch that stops the "access data from other applications" dialogs was
+    // unproven for exactly that — an argument against the fix, on the screen
+    // that exists to confirm it. What is documented is stated as documented;
+    // what is measured is stated per service in the rows below; nothing is
+    // claimed as covered while the measurement is unrun.
     let coverage = if access.evidence.fda_coverage_measured {
         "Full Disk Access is the single grant macOS offers for this, and its reach was measured on \
-         this Mac: aterm ctl privacy lists exactly what the measurement found."
+         this Mac: the rows below and aterm ctl privacy list exactly what the measurement found."
     } else {
-        "Full Disk Access is the single grant macOS offers for this. aterm has not measured on this \
-         Mac which folders that grant covers, so it claims none."
+        "Full Disk Access is the single grant macOS offers for this. Apple documents it as the \
+         grant behind the \"access data from other applications\" request a program run in aterm \
+         can raise; aterm has not measured on this Mac what it reaches, and it does not reach \
+         cloud-storage folders."
+    };
+    let identity = {
+        let posture = match access.install {
+            "installed" => "installed in Applications",
+            "mounted-image" => "on a mounted disk image",
+            "translocated" => "in a quarantined copy macOS made",
+            "not-a-bundle" => "outside an application bundle",
+            _ => "at a location aterm could not read",
+        };
+        let consequence = match access.install {
+            "installed" => "a grant made for this path applies to it.",
+            _ => {
+                "a grant made for the copy in Applications does not reach this one; move it \
+                  there and open that copy."
+            }
+        };
+        match access.running.as_deref() {
+            Some(path) => format!("Running from {path} ({posture}) \u{2014} {consequence}"),
+            None => format!("Running {posture} \u{2014} {consequence}"),
+        }
+    };
+    let responsible = {
+        let mut text = String::from(
+            "Programs run in aterm ask macOS as aterm, so a dialog about a tool you ran here \
+             names aterm.",
+        );
+        if access.sessions_adopted > 0 {
+            text.push_str(&format!(
+                " {} of {} sessions were taken over from a previous aterm copy and are attributed \
+                 to it.",
+                access.sessions_adopted, access.sessions_total
+            ));
+        }
+        text
+    };
+    let services = {
+        let mut rows = Vec::new();
+        for service in access.covers.iter() {
+            rows.push(format!(
+                "{} \u{2014} measured: Full Disk Access applies",
+                macos_access_service_label(service)
+            ));
+        }
+        for service in access.unmeasured.iter() {
+            rows.push(format!(
+                "{} \u{2014} not measured",
+                macos_access_service_label(service)
+            ));
+        }
+        for service in access.uncovered.iter() {
+            rows.push(format!(
+                "{} \u{2014} Full Disk Access does not apply",
+                macos_access_service_label(service)
+            ));
+        }
+        rows
     };
     let trade = "Full disk access on a terminal is broad: everything you run in aterm could then \
                  read everything this account can read. The value is that you decide that once, \
                  knowingly \u{2014} not quietly.";
-    let prompt = if access.prompt_possible() {
+    // A HELD GRANT READS DIFFERENTLY FROM A MISSING ONE (2026-09-10). With the
+    // coverage measurement unrun, `prompt_possible` stays true after the owner
+    // grants Full Disk Access, and the line used to stay byte-identical — so
+    // the screen meant to confirm the fix could not show it working.
+    let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
+        "Granted: Apple documents this grant as the one that stops the \"access data from other \
+         applications\" request; aterm has not measured that on this Mac, so an interruption \
+         cannot be ruled out."
+    } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
     } else {
         "For the services measured as covered, macOS is not expected to interrupt a program run in \
@@ -13455,6 +13636,9 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         prompt: prompt.to_string(),
         route,
         observation: observation.to_string(),
+        identity,
+        responsible,
+        services,
         rebuild,
         folders,
         repair,
@@ -13545,7 +13729,10 @@ fn macos_access_height(access: &MacosAccess, compact: bool) -> f32 {
         // rest.
         3 + usize::from(copy.rebuild.is_some())
     } else {
-        7 + usize::from(copy.rebuild.is_some()) + copy.folders.len() + copy.repair.len()
+        9 + usize::from(copy.rebuild.is_some())
+            + copy.services.len()
+            + copy.folders.len()
+            + copy.repair.len()
     };
     heading_height + lines as f32 * line_height + scaled_control_height() + 12.0 + 24.0
 }
@@ -13641,6 +13828,30 @@ fn macos_access_card(access: &MacosAccess, compact: bool) -> UiNode {
             SemanticRole::Text,
             StyleRef::Quiet,
         ));
+        children.push(line(
+            "settings/macos-access/identity".to_string(),
+            copy.identity.clone(),
+            SemanticRole::Status,
+            if access.install == "installed" {
+                StyleRef::Quiet
+            } else {
+                StyleRef::Danger
+            },
+        ));
+        children.push(line(
+            "settings/macos-access/responsible".to_string(),
+            copy.responsible.clone(),
+            SemanticRole::Text,
+            StyleRef::Quiet,
+        ));
+        for (index, service) in copy.services.iter().enumerate() {
+            children.push(line(
+                format!("settings/macos-access/service/{index}"),
+                service.clone(),
+                SemanticRole::Status,
+                StyleRef::Primary,
+            ));
+        }
     }
     if let Some(rebuild) = copy.rebuild.clone() {
         children.push(line(
@@ -20350,6 +20561,20 @@ mod tests {
                 ..SpikeEvidence::UNMEASURED
             },
             bundle_id: Some("com.example.fixture".to_string()),
+            install: "installed",
+            running: Some("/Applications/fixture.app/Contents/MacOS/fixture".to_string()),
+            sessions_total: 2,
+            sessions_adopted: 1,
+            covers: Vec::new(),
+            uncovered: vec!["file-provider-domains"],
+            unmeasured: vec![
+                "documents",
+                "desktop",
+                "downloads",
+                "network-volumes",
+                "removable-volumes",
+                "app-data",
+            ],
             tccutil: TccutilPresence::Executable,
             warmup_offered: true,
             warmup_live: false,
@@ -20446,6 +20671,7 @@ mod tests {
                 DrClass::Unknown,
             ] {
                 for probe in [
+                    ProbeLabel::Pending,
                     ProbeLabel::OpenOk,
                     ProbeLabel::OpenEperm,
                     ProbeLabel::OpenErrno(13),
@@ -20514,6 +20740,11 @@ mod tests {
             }
         }
         assert!(!seen.is_empty());
+        // The service rows say what is MEASURED about each class and nothing
+        // more: with the measurement unrun, none may say the grant applies.
+        for line in seen.iter().filter(|l| l.contains(" \u{2014} not measured")) {
+            assert!(!line.contains("applies"), "{line}");
+        }
         for line in &seen {
             let lower = line.to_ascii_lowercase();
             for banned in BANNED_PANEL_PHRASES {
@@ -20546,6 +20777,103 @@ mod tests {
         }
     }
 
+    /// THE BLOCK IS REACHABLE ON THE WINDOW IT WAS MEASURED ABSENT ON
+    /// (2026-09-10): 624x348 logical takes the landscape pager, which never
+    /// carried it; and on a short compact page it is a page-0 disclosure, so
+    /// page 1 shows a control row instead of the block again.
+    #[test]
+    fn the_macos_access_block_is_reachable_on_a_short_landscape_window() {
+        use aterm_containment::FdaScope;
+        let access = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Security);
+            assert!(state.replace_macos_access(access.clone()));
+        }
+        let cx = view_cx_at(624.0, 348.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/macos-access/heading"))
+                .is_some(),
+            "page 0 of the landscape pager is the block"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(MACOS_ACCESS_OPEN_FDA))
+                .is_some(),
+            "and its Open Privacy & Security button is a hit target there"
+        );
+        // Page 1 is a control row, not the block again.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.page_scroll = 1;
+        }
+        let next = compile_settings_view(&runtime, instance, view, &cx);
+        next.validate_parity().unwrap();
+        assert!(
+            next.semantic(&UiKey::new("settings/macos-access/heading"))
+                .is_none(),
+            "the block is a page-0 slice"
+        );
+        assert!(
+            next.semantics
+                .iter()
+                .any(|node| node.key.as_str().starts_with("settings/row/")),
+            "page 1 reaches a permission toggle"
+        );
+        // A tall page carries the complete block: identity, attribution and
+        // every service class in words.
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.page_scroll = 0;
+        }
+        let tall = compile_settings_view(&runtime, instance, view, &view_cx_at(1_280.0, 900.0));
+        tall.validate_parity().unwrap();
+        for key in [
+            "settings/macos-access/identity",
+            "settings/macos-access/responsible",
+            "settings/macos-access/service/0",
+            "settings/macos-access/service/6",
+        ] {
+            assert!(tall.semantic(&UiKey::new(key)).is_some(), "{key}");
+        }
+        let copy = macos_access_copy(&access);
+        assert!(
+            copy.identity.contains("installed in Applications"),
+            "{}",
+            copy.identity
+        );
+        assert!(
+            copy.responsible.contains("1 of 2 sessions"),
+            "{}",
+            copy.responsible
+        );
+        assert_eq!(copy.services.len(), 7);
+        assert!(
+            copy.services
+                .iter()
+                .any(|s| s.starts_with("Other applications' data \u{2014} not measured")),
+            "{:?}",
+            copy.services
+        );
+        assert!(
+            copy.services
+                .iter()
+                .any(|s| s.contains("Cloud-storage") && s.contains("does not apply")),
+            "{:?}",
+            copy.services
+        );
+    }
+
     /// The coverage sentence is selected by a NAMED FIELD, not by prose. Today
     /// it says aterm has not measured what a grant covers; flipping
     /// `fda_coverage_measured` is the only way a stronger sentence appears, and
@@ -20567,9 +20895,17 @@ mod tests {
             today.coverage
         );
         assert!(
-            today.prompt.contains("can still be interrupted"),
-            "a held grant whose breadth is unmeasured leaves a prompt possible: {}",
+            today.prompt.contains("cannot be ruled out"),
+            "a held grant whose breadth is unmeasured still leaves a prompt possible — and \
+             says so as a GRANTED state, not as the missing-grant sentence: {}",
             today.prompt
+        );
+        let denied = access_fixture(FdaState::Denied, DrClass::Identity, FdaScope::Unknown);
+        assert!(
+            macos_access_copy(&denied)
+                .prompt
+                .contains("can still be interrupted"),
+            "the missing-grant sentence is the denied state's"
         );
 
         let mut measured = unmeasured.clone();
@@ -21117,6 +21453,37 @@ mod tests {
             FdaScope::Unknown,
         ));
         assert_eq!(stale.observation, copy.observation);
+    }
+
+    #[test]
+    fn an_async_access_check_preserves_the_security_pages_observed_facts() {
+        use aterm_containment::FdaScope;
+        let mut access = access_fixture(FdaState::Unknown, DrClass::Identity, FdaScope::Unknown);
+        access.probe = ProbeLabel::Pending;
+        let pending = macos_access_copy(&access);
+        assert!(pending.headline.contains("checking"));
+        assert!(pending.probe_detail.contains("background"));
+        assert!(
+            pending
+                .identity
+                .contains("/Applications/fixture.app/Contents/MacOS/fixture")
+        );
+        assert!(pending.responsible.contains("1 of 2 sessions"));
+        assert!(
+            pending
+                .services
+                .iter()
+                .any(|line| line.contains("not measured"))
+        );
+
+        access.fda = FdaState::Denied;
+        access.probe = ProbeLabel::OpenEperm;
+        let denied = macos_access_copy(&access);
+        assert!(denied.headline.contains("may already be enabled"));
+        assert!(!denied.headline.contains("not granted"));
+        assert_eq!(denied.services, pending.services);
+        assert_eq!(denied.identity, pending.identity);
+        assert_eq!(denied.responsible, pending.responsible);
     }
 
     /// The switched-off case is spelled as a refusal to check, never as a
@@ -33859,10 +34226,12 @@ enabled = true
             "the sing-along riff event constructor moved; re-locate its gate"
         );
         assert_eq!(
-            render.matches("sing_riff_event(").count(),
-            // The constructor's own definition, plus the two pushes (the
-            // single-pane present and the split-pane compose).
-            3,
+            render
+                .matches("self.trail_audio.push(sing_riff_event(")
+                .count(),
+            // Count emission sites, not the definition or the outro's reuse
+            // of the pure event constructor. Both render paths read the gate.
+            2,
             "the riff is pushed from exactly the two known render paths"
         );
         // W13: the macOS site was `objc2_app_kit::NSBeep()` and is now
@@ -33949,12 +34318,19 @@ enabled = true
                     .starts_with("ws.focused")
             })
             .count();
-        // One audible push per path — the BAR riff — single-pane + compose
-        // = two. Every push resolves gain through the one policy function,
-        // identified by the raw focus bit.
+        // Each render path gates both its bar riff and its new outro through
+        // the same focus/master/riff/volume policy. Check all four decisions
+        // and both outro emissions, in addition to the two bar pushes above.
         assert_eq!(
-            production_calls, 2,
-            "both riff pushes must resolve gain through the one policy function"
+            production_calls, 4,
+            "both bar and outro pushes must resolve gain through the one policy function"
+        );
+        assert_eq!(
+            render
+                .matches("self.trail_audio.push(sing_outro_event(")
+                .count(),
+            2,
+            "both render paths emit their gated outro"
         );
 
         // BOTH BONK SEAMS MUST FEED THE MASTER IN. This is a LAYOUT pin and it
