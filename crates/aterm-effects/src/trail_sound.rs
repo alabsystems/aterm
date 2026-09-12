@@ -88,7 +88,7 @@ mod rainbow_kitty_v2;
 pub use rainbow_kitty_v2::{MelodyV2, RainbowKittyV2Palette, TimbreStops};
 
 use rainbow_kitty_v2::{
-    LANE_AGE_GUARD_S, LANE_FADE_STEAL_S, LANE_NONE, lane_cap, lane_drops_the_newcomer,
+    LANE_AGE_GUARD_S, LANE_CASCADE, LANE_FADE_STEAL_S, LANE_NONE, lane_cap, lane_drops_the_newcomer,
 };
 
 use crate::cursor_glow::GlowStyle;
@@ -3150,6 +3150,15 @@ pub struct TrailSynth {
     /// is audible as a clipped tail, so a bench that reports a nonzero count
     /// is reporting a real mix defect rather than a statistic.
     steals: u32,
+    /// AUDIT CENSUS (streaming cascade, 2026-09-12): per-lane voice births,
+    /// lane-cap refusals at claim, and onset-census drops, indexed by lane.
+    lane_births: [u32; 16],
+    lane_refused: [u32; 16],
+    lane_onset_dropped: [u32; 16],
+    /// `(at_ms, f0_hz, head, admitted)` of every cascade voice the music box
+    /// asked for — a ring the bench drains every block.
+    cascade_log: [(u32, f32, bool, bool); 32],
+    cascade_log_n: u8,
     /// RAINBOW KITTY's MELODY STATE (§10.1) — the time-gated verse, the
     /// pure-fifth chord loop, the re-strike ladder, the undo stack. Inert
     /// (and never read) until the first music-box event
@@ -3198,6 +3207,10 @@ pub struct TrailSynth {
     lim_g_l: f32,
     lim_env_r: f32,
     lim_g_r: f32,
+    /// THE BUS LIMITER IS IN CIRCUIT — `true` in every synth the host builds.
+    /// Only a bench that has to read what the INSTRUMENT minted, rather than
+    /// what the bus did to the sum, takes it out ([`Self::set_bus_limiter`]).
+    bus_limiter: bool,
     /// DC blockers (one-pole highpass ~20 Hz) per channel.
     dc_x_l: f32,
     dc_y_l: f32,
@@ -3416,6 +3429,11 @@ impl TrailSynth {
             sing_hold: 0.0,
             last_riff_sig: None,
             steals: 0,
+            lane_births: [0; 16],
+            lane_refused: [0; 16],
+            lane_onset_dropped: [0; 16],
+            cascade_log: [(0, 0.0, false, false); 32],
+            cascade_log_n: 0,
             v2: MelodyV2::new(),
             born_seq: 0,
             clock_s: 0.0,
@@ -3425,6 +3443,7 @@ impl TrailSynth {
             lim_g_l: 1.0,
             lim_env_r: 0.0,
             lim_g_r: 1.0,
+            bus_limiter: true,
             dc_x_l: 0.0,
             dc_y_l: 0.0,
             dc_x_r: 0.0,
@@ -3481,6 +3500,65 @@ impl TrailSynth {
     #[must_use]
     pub fn steals(&self) -> u32 {
         self.steals
+    }
+
+    /// TAKE §9.7's BUS LIMITER OUT OF CIRCUIT (bench / census hook; the host
+    /// never calls it). The limiter is the one stage on the bus with MEMORY —
+    /// a 0.5 ms gain attack released by an 80 ms peak follower — and over its
+    /// −14 dBFS threshold that gain moves a strike's envelope by about a
+    /// decibel inside the strike's first 15 ms. A census that counts EVENTS
+    /// as rises of an RMS envelope (`keyboard_song_ab`'s fine census: rise
+    /// 1.12, one decibel) reads that dip-and-recovery as a second strike that
+    /// no key minted, and reads it only where the sum clears the threshold —
+    /// so the count came out LEVEL-DEPENDENT (measured 2026-09-12: the
+    /// `Capital` row, a Shift's pickup then the shifted letter, read 2 onsets
+    /// at host volume 0.4 and 3 at 1.0, where its peak — −12.6 dBFS before
+    /// the limiter, −13.0 after — clears the ceiling and `Typed`'s −14.3 sits
+    /// under it; the limiter's gain read 0.921 on the letter's 69 ms window
+    /// and 0.946 on the next, and that recovery was the "third strike"). An
+    /// event count belongs BEFORE the ceiling: with the limiter out the same
+    /// census reads 2 at both volumes, and the shipping render is untouched
+    /// because the bench keeps the limiter in for the reel and the level
+    /// columns.
+    ///
+    /// `soft_clip` stays in circuit: it is memoryless and compressive, so it
+    /// can only lower a rise ratio, never mint one.
+    pub fn set_bus_limiter(&mut self, on: bool) {
+        self.bus_limiter = on;
+    }
+
+    /// AUDIT CENSUS: `[births, refused_at_claim, onset_dropped]` for one lane.
+    #[must_use]
+    pub fn lane_census(&self, lane: u8) -> [u32; 3] {
+        let l = usize::from(lane).min(15);
+        [
+            self.lane_births[l],
+            self.lane_refused[l],
+            self.lane_onset_dropped[l],
+        ]
+    }
+
+    /// AUDIT CENSUS: the cascade lane's number, so a bench need not know it.
+    #[must_use]
+    pub fn cascade_lane() -> u8 {
+        LANE_CASCADE
+    }
+
+    /// AUDIT CENSUS: drain `(at_ms, f0_hz, head, admitted)` of every cascade
+    /// voice asked for since the last drain (ring of 32 — drain every block).
+    pub fn drain_cascade_log(&mut self, out: &mut Vec<(u32, f32, bool, bool)>) {
+        for i in 0..usize::from(self.cascade_log_n) {
+            out.push(self.cascade_log[i]);
+        }
+        self.cascade_log_n = 0;
+    }
+
+    pub(crate) fn log_cascade(&mut self, at: u32, f: f32, head: bool, admitted: bool) {
+        let n = usize::from(self.cascade_log_n);
+        if n < self.cascade_log.len() {
+            self.cascade_log[n] = (at, f, head, admitted);
+            self.cascade_log_n += 1;
+        }
     }
 
     /// RAINBOW KITTY's MELODY STATE, read-only (test / bench introspection).
@@ -4111,6 +4189,15 @@ impl TrailSynth {
     /// live)". Running the census here would make the meteor's thump evict
     /// the word's downbeat `T` before the thump itself spoke.
     fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
+        let got = self.claim_lane_inner(lane, deferred);
+        if got.is_none() {
+            let l = usize::from(lane).min(15);
+            self.lane_refused[l] = self.lane_refused[l].saturating_add(1);
+        }
+        got
+    }
+
+    fn claim_lane_inner(&mut self, lane: u8, deferred: bool) -> Option<usize> {
         if lane == LANE_NONE {
             return Some(self.claim());
         }
@@ -4235,6 +4322,10 @@ impl TrailSynth {
         // thump itself spoke). The census runs in `render` on its first
         // sounding sample instead — see `lane_onset_steal`.
         let idx = self.claim_lane(proto.lane, proto.delay > 0.0)?;
+        {
+            let l = usize::from(proto.lane).min(15);
+            self.lane_births[l] = self.lane_births[l].saturating_add(1);
+        }
         let mut v = proto;
         // Tone TEMPO-FEEL: one narrow multiplier on length, decay and
         // flourish spacing (arpeggio/droplet delays ARE the phrase's tempo).
@@ -5685,6 +5776,9 @@ impl TrailSynth {
         // constants, resolved once per block. Read only while `v2_latched`.
         let lim_att = 1.0 - (-dt / LIMIT_ATTACK_S).exp();
         let lim_rel = (-dt / LIMIT_RELEASE_S).exp();
+        // In circuit while latched, unless a bench took it out (see
+        // [`Self::set_bus_limiter`]); neither bit changes inside a block.
+        let lim_on = self.v2_latched && self.bus_limiter;
         for f in 0..frames {
             let (mut l, mut r) = (0.0f32, 0.0f32);
             // Duck-exempt sum — the bonk itself, riding above the dip.
@@ -5741,6 +5835,8 @@ impl TrailSynth {
                 // for anything that has already sounded once.
                 if !v.env_run && v.lane != LANE_NONE && v.delay > 0.0 && self.lane_onset_steal(vi) {
                     self.voices[vi].on = false;
+                    let l = usize::from(self.voices[vi].lane).min(15);
+                    self.lane_onset_dropped[l] = self.lane_onset_dropped[l].saturating_add(1);
                     continue;
                 }
                 let v = &mut self.voices[vi];
@@ -5945,10 +6041,11 @@ impl TrailSynth {
             self.dc_y_r = yr;
             // THE BUS LIMITER (§9.7, §16 row 10) — after MASTER, before the
             // soft clip. Latched by the first v2 trail event and untaken
-            // otherwise, so every pinned path renders through the exact
-            // pre-limiter arithmetic; below its threshold the gain is exactly
-            // 1.0 and the multiply is an identity (A24).
-            let (yl, yr) = if self.v2_latched {
+            // otherwise (or while a bench holds it out), so every pinned path
+            // renders through the exact pre-limiter arithmetic; below its
+            // threshold the gain is exactly 1.0 and the multiply is an
+            // identity (A24).
+            let (yl, yr) = if lim_on {
                 (
                     limit(yl, &mut self.lim_env_l, &mut self.lim_g_l, lim_att, lim_rel),
                     limit(yr, &mut self.lim_env_r, &mut self.lim_g_r, lim_att, lim_rel),
@@ -16310,7 +16407,36 @@ mod tests {
         /// unchanged at 6: D18's cap is what this pin is about, and a
         /// band-pass cutoff cannot change how many notes speak.
         /// Previous: `0xcbd2_c6b8_d155_65bb`.
-        pub const BRRRRING_FOLD: u64 = 0xe93f_d713_843e_3442;
+        ///
+        /// **RE-BAKED 2026-09-12, from a run, for THE RUN'S WALK** (the
+        /// streaming-cascade audit; `MelodyV2::run_theme_step`). The owner
+        /// heard "a looping sound, doo doo doo doo, up and down" while a
+        /// program streamed on v0.82.0. Rendered against v0.76.0 on one 6 s
+        /// stream at 5 / 12 / 25 lines/s, D18's rate law was identical to
+        /// the unit — 30 heads, or 1 head + 71 re-strikes, 0 refused — and
+        /// the whole difference was the contour: v0.76.0's `on_jump` walked
+        /// the authored theme one phrase edge per line feed, and
+        /// `709b4c91d` (the 2026-09-08 re-bake above) had frozen the walk
+        /// where the typed line stood, so every re-strike of a run was one
+        /// pitch and every cascade one figure. The run's walk is restored;
+        /// the lone line feed keeps the resolve law. This script is SIX
+        /// Jumps 60 ms apart: the head is unchanged (a lone line feed
+        /// resolves exactly as before), and the two floored re-strikes now
+        /// sit at `walk+5` over the theme's first two edges rather than
+        /// twice over the frozen walk. `BRRRRING_ONSETS` is unchanged at 6:
+        /// D18's cap is what this pin is about, and only the base moved.
+        /// Previous: `0xe93f_d713_843e_3442`.
+        ///
+        /// RE-BAKED AGAIN THE SAME DAY (2026-09-12, the skeptic's finding):
+        /// the run's head now STANDS IN for the theme's first edge, as
+        /// v0.76.0's first Jump did, so the run resumes at the second edge.
+        /// Under this script's 60 ms floor the two floored re-strikes now sit
+        /// at `walk+5` over edges two and three (7, 5) rather than one and
+        /// two (0, 7) — measured on the stream bench, the unshifted walk gave
+        /// 1046/3140 Hz at 60 lines/s where v0.76.0 gave 1308/1046, and this
+        /// phase is what makes them agree. Head unchanged, six onsets
+        /// unchanged. Previous: `0xda46_2185_c044_f41c`.
+        pub const BRRRRING_FOLD: u64 = 0x7e1a_a7f6_eebb_982e;
         /// Pitched onsets the six-jump burst spawns under the music box (D18:
         /// one four-note cascade, then at most one quiet top-note re-strike per
         /// 60 ms).

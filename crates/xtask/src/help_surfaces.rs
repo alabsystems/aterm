@@ -69,9 +69,9 @@ const SURFACES: &[SurfaceRow<'static>] = &[
     // HELP_SURFACES_ROSTER_BEGIN
     (
         "crates/aterm-agent/src/supervise/run.rs",
-        "9c99932fd8fd0c48",
-        "2026-09-11",
-        "read against render_phase/render_prompt/render_result and the supervise loop as the handler of DRIVE_HELP's phase/await-turn/supervise sections by the 2026-09-10 round-3 reader; no findings; merged with origin/main's own 2026-09-11 re-read of this file, conflicts resolved by the orchestrator (upstream wording kept where both sides fixed the same claim)",
+        "77448ca5af19a7e5",
+        "2026-09-12",
+        "read crates/aterm-agent/src/supervise/run.rs (the module doc, the await_turn/await_turn_from, supervise, watch, drive and auto_read docs, EXIT_TIMEOUT/KEY_ROWS, and the render_phase, event_line, review_key and exit_reason text) against await_turn_from's settle/writing rule, drive's deadline check and its handed/moved dedup, review_key, exit_reason's `ERR exited`/`no such session` match and render_phase's no-signal reason, by aterm-supervise-round-4 on 2026-09-12 after the round-4 review; four slips (EXIT_TIMEOUT not naming watch, the frameless rule not excepting a box, the dedup not naming the reset on an approval, render_phase's fallback reason) fixed before this row; the test docs this round changed or added (the mock's server model, the watch, frameless, budget and survey tests) read against the assertions under them; the CtlReply/Caps/press docs are unchanged since the 2026-09-11 read",
     ),
     (
         "crates/aterm-forge/src/budget.rs",
@@ -93,9 +93,9 @@ const SURFACES: &[SurfaceRow<'static>] = &[
     ),
     (
         "crates/aterm-agent/src/lib.rs",
-        "c2e08bb9343652eb",
-        "2026-09-11",
-        "re-read against drive_cli.rs, supervise/run.rs and supervise/classify.rs by the 2026-09-10 round-3 reader after the round-2 merge changed DRIVE_HELP; seven findings (box shape, `OK skipped`, python globs, word count, the governor's refusal, two doc slips) fixed in the commit that updated this row; merged with origin/main's own 2026-09-11 re-read of this file, conflicts resolved by the orchestrator (upstream wording kept where both sides fixed the same claim)",
+        "47c4233b8996b10c",
+        "2026-09-12",
+        "read crates/aterm-agent/src/lib.rs (DRIVE_HELP's phase, await-turn, supervise and watch sections and EXAMPLES) against supervise/phase.rs worker_phase/busy_signal/status_block/status_busy/footer_busy/limit_notice/is_limit_notice/footer_limit, supervise/run.rs await_turn_from/drive/review_key/watch/exit_reason and drive_cli.rs main_entry/watch_exit_line, by aterm-supervise-round-4 on 2026-09-12 after the round-4 review; three slips (the dedup not naming the reset on an approval, `nothing busy` without the monitor exception, `nothing is pressed or printed` after the deadline) fixed before this row; the rest of DRIVE_HELP unchanged since the earlier 2026-09-12 read of this file",
     ),
     (
         "crates/aterm-cli/src/lib.rs",
@@ -105,9 +105,9 @@ const SURFACES: &[SurfaceRow<'static>] = &[
     ),
     (
         "crates/aterm-cli/src/manual.rs",
-        "d252491ae70315dd",
-        "2026-09-11",
-        "whole page set read against its handlers by aterm-help-surfaces-read on 2026-09-10; the fabric page rewrite (aterm link broker/mint, provisioning, eight grants, fabric attach argv form) read against aterm-link cli.rs and control.rs dispatch_fabric_verb by verify:F1/verify:F3 of aterm-fabric-attach-round-3 on 2026-09-10; merged page re-read by the orchestrator against those handlers and the pin tests on 2026-09-11; merged with origin/main's own 2026-09-11 re-read of this file, conflicts resolved by the orchestrator (upstream wording kept where both sides fixed the same claim)",
+        "5a1f8b71666134e3",
+        "2026-09-12",
+        "read crates/aterm-cli/src/manual.rs (DRIVE_PAGE's phase, await-turn, supervise and watch entries) against aterm-agent supervise/phase.rs worker_phase/busy_signal/limit_notice, supervise/run.rs await_turn_from/drive/review_key/watch and drive_cli.rs main_entry/watch_exit_line, by aterm-supervise-round-4 on 2026-09-12 after the round-4 review; one slip (the dedup not naming the reset on an approval) fixed before this row; every other page unchanged since the 2026-09-11 read",
     ),
     (
         "crates/aterm-cli/src/windowing.rs",
@@ -129,9 +129,9 @@ const SURFACES: &[SurfaceRow<'static>] = &[
     ),
     (
         "crates/aterm-ctl/src/lib.rs",
-        "d9e3b037e5cf0993",
-        "2026-09-11",
-        "re-read against control_query.rs cmd_cell, control_verbs.rs framing_of, exchange, discovery_targets, control_session.rs turn, control_input.rs take_leading_options and aterm-update-core http.rs by the 2026-09-10 round-3 reader after a8a895f0b; the `cell` reply shape, the response-framing paragraph, the synopsis' `--timeout`, the `$ATERM_CONTROL_SOCK` isolation claim, the dangling [`run`] link, `leading_options`' superset rule and the EXCHANGE_DEADLINE rationale fixed in the commit that updated this row; merged with origin/main's own 2026-09-11 re-read of this file, conflicts resolved by the orchestrator (upstream wording kept where both sides fixed the same claim)",
+        "ec55d7491126a3eb",
+        "2026-09-12",
+        "2026-09-12: the only text that moved since the 2026-09-11 read is a test fixture's argv in 4bc16ed87 (`if=esc.to.interrupt` became `if=quit.now`, a gitleaks false positive on the source guard) — no help or doc sentence changed, so the 2026-09-11 reading stands: re-read against control_query.rs cmd_cell, control_verbs.rs framing_of, exchange, discovery_targets, control_session.rs turn, control_input.rs take_leading_options and aterm-update-core http.rs by the 2026-09-10 round-3 reader after a8a895f0b; the `cell` reply shape, the response-framing paragraph, the synopsis' `--timeout`, the `$ATERM_CONTROL_SOCK` isolation claim, the dangling [`run`] link, `leading_options`' superset rule and the EXCHANGE_DEADLINE rationale fixed in the commit that updated this row; merged with origin/main's own 2026-09-11 re-read of this file, conflicts resolved by the orchestrator (upstream wording kept where both sides fixed the same claim)",
     ),
     (
         "crates/aterm-dev/src/main.rs",

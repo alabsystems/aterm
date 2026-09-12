@@ -68,7 +68,8 @@ use super::glyph_class::{
 };
 use super::{
     ERASE_MIN_GAP, EventMeta, HELD_ERASE_RUN_WINDOW, OutputGesture, PAN_LAW_SCALE, Palette,
-    Partial, SoundEvent, SoundGesture, SoundKind, TrailSynth, Voice, pan_gains, penta,
+    Partial, SONG_FORM, SONG_THEME, SoundEvent, SoundGesture, SoundKind, TrailSynth, Voice,
+    pan_gains, penta,
 };
 use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::timing;
@@ -377,6 +378,15 @@ const UNDO_N: usize = 8;
 pub(super) const CASCADE_EXCLUSIVE_MS: u32 = 180;
 /// Inside a live cascade, the top-note re-strike's own floor (D18).
 const CASCADE_RESTRIKE_MS: u32 = 60;
+/// THE LINE-FEED RUN (D18's "run", on its own clock). A Jump this soon after
+/// the previous Jump is the NEXT LINE of the same program's output; a Jump
+/// after a longer gap stands alone. It is [`PHRASE_PAUSE_MS`] — the melody's
+/// own rest — stated through that constant rather than as a fresh number: the
+/// pause that resolves the typed line is the pause that ends a line-feed run.
+/// [`CASCADE_EXCLUSIVE_MS`] cannot serve here: at 5 lines/s, the slow end of
+/// what a streaming program prints, every line feed is its own cascade head
+/// and the stream is still one run.
+const CASCADE_RUN_MS: u32 = PHRASE_PAUSE_MS;
 /// A `Jump` arriving this soon after a keyed `Enter` is that Return's OWN
 /// line-feed echo, not a PTY cascade, and is swallowed (§10.4, A26: "a keyed
 /// Enter → the cadence, no cascade"). §16 row 13 has the host suppress the
@@ -2161,6 +2171,25 @@ pub struct MelodyV2 {
     seen_jump: bool,
     /// The last top-note re-strike inside a live cascade.
     cascade_restrike_ms: u32,
+    /// THE RUN'S PLAYHEAD in [`SONG_THEME`] (§10.4 `on Jump`: "then an
+    /// accent step"). The second and every later line feed of a run takes
+    /// its cascade's base from the authored theme, one phrase EDGE per line
+    /// — a phrase's first note, then its last, then the next phrase's first
+    /// — exactly as v0.76.0's `on_jump` walked it, so a stream sings
+    /// `0 7 5 0 2 2 0 8` and round again rather than one figure looped.
+    /// `709b4c91d` (2026-09-08) took the theme out of the TYPED line, which
+    /// the owner ruled, and out of the line feed with it, which nobody did;
+    /// the typed line stays derived and the run's walk is restored here
+    /// (audit 2026-09-12). Re-headed by every lone line feed.
+    run_theme_pos: u8,
+    /// Which phrase of [`SONG_FORM`] `run_theme_pos` is inside.
+    run_phrase: u8,
+    /// AUDIT CENSUS (streaming cascade, 2026-09-12): `on_jump`'s three
+    /// answers — HEAD, top-note RE-STRIKE, SWALLOWED by the 60 ms floor —
+    /// counted where they are decided.
+    cascade_heads: u32,
+    cascade_restrikes: u32,
+    cascade_swallowed: u32,
     /// Keys since the last keyed Enter — [`ENTER_PICKUP_MIN_KEYS`] decides
     /// whether a Return is a cadence or a bare tonic dyad.
     keys_since_enter: u8,
@@ -2254,6 +2283,11 @@ impl MelodyV2 {
             cascade_at: 0,
             seen_jump: false,
             cascade_restrike_ms: 0,
+            run_theme_pos: 0,
+            run_phrase: 0,
+            cascade_heads: 0,
+            cascade_restrikes: 0,
+            cascade_swallowed: 0,
             keys_since_enter: 0,
             last_enter_ms: 0,
             seen_enter: false,
@@ -2288,6 +2322,17 @@ impl MelodyV2 {
     #[must_use]
     pub fn walk(&self) -> i8 {
         self.walk
+    }
+
+    /// AUDIT CENSUS: `[heads, restrikes, swallowed]` — what `on_jump` answered
+    /// to every line feed of this session.
+    #[must_use]
+    pub fn cascade_census(&self) -> [u32; 3] {
+        [
+            self.cascade_heads,
+            self.cascade_restrikes,
+            self.cascade_swallowed,
+        ]
     }
 
     /// HOW MANY KEYSTROKES HAVE MOVED THE MELODY (test / introspection hook).
@@ -3209,14 +3254,48 @@ impl MelodyV2 {
     /// re-strikes". D18's own words are "the first Jump of a **run**", so the
     /// run is what the window measures, and the assertion is what settles the
     /// contradiction.
+    ///
+    /// **THE WALK.** A lone line feed resolves the derived line where it
+    /// stands (`709b4c91d`); the second and later line feeds of a RUN — one
+    /// within [`CASCADE_RUN_MS`] of the last — walk [`SONG_THEME`]'s phrase
+    /// edges as v0.76.0 did (§10.4's "accent step"). Measured on the same
+    /// 6 s stream at 5 / 12 / 25 lines/s (`examples/stream_cascade.rs`): the
+    /// rate law is identical to the unit between v0.76.0 and the frozen walk
+    /// — 30 heads, or 1 head + 71 re-strikes, RMS within 0.3 dB — and the
+    /// frozen walk's whole difference was one figure at one pitch, looped:
+    /// the owner's "doo doo doo doo" of 2026-09-12.
     fn on_jump(&mut self, at: u32) -> Option<bool> {
-        // A LINE FEED IS NOT A KEYSTROKE: there is no glyph and no hand
-        // behind it, so there is nothing to derive from. It RESOLVES the line
-        // where it stands — the same act a rest performs — and the cascade is
-        // built on the resolved note. The contour bias goes with it: whatever
-        // the program printed is not a continuation of your typing.
-        let here = i32::from(self.walk);
-        self.walk = self.nearest_lit_within(here, here) as i8;
+        let in_run = self.seen_jump && at.saturating_sub(self.cascade_at) < CASCADE_RUN_MS;
+        if in_run {
+            // THE RUN WALKS THE THEME (§10.4: "then an accent step"). The
+            // second and later lines of one program's output take the
+            // authored theme's phrase edges in turn — v0.76.0's law — so a
+            // stream is a line that moves, not one figure at one pitch every
+            // 180 ms. The rate law below is untouched: only the base moves.
+            self.walk = self.run_theme_step();
+        } else {
+            // A LONE LINE FEED IS NOT A KEYSTROKE: there is no glyph and no
+            // hand behind it, so there is nothing to derive from. It RESOLVES
+            // the line where it stands — the same act a rest performs — and
+            // the cascade is built on the resolved note. The contour bias
+            // goes with it: whatever the program printed is not a
+            // continuation of your typing. It also re-heads the run's theme,
+            // so every stream starts its line the same way — and the head
+            // STANDS IN FOR THE THEME'S FIRST EDGE. v0.76.0's first Jump
+            // consumed `SONG_THEME[0]`, so its run resumed at the second
+            // edge; a head that resolved without consuming left the run one
+            // edge behind, and under the 60 ms re-strike floor — which
+            // swallows every other line of a fast stream — that parity
+            // decides WHICH edges are heard: measured 2026-09-12 at 25 and
+            // 60 lines/s, the unshifted walk gave 1046/3140 Hz where v0.76.0
+            // gave 1308/1046. The resolved note is the head's; the cursor
+            // moves past edge one without sounding it.
+            let here = i32::from(self.walk);
+            self.walk = self.nearest_lit_within(here, here) as i8;
+            self.run_theme_pos = 0;
+            self.run_phrase = 0;
+            let _first_edge_stood_in_for = self.run_theme_step();
+        }
         self.run_stride = 0;
         self.run_len = 0;
         self.restrike = 0;
@@ -3232,13 +3311,45 @@ impl MelodyV2 {
         self.cascade_at = at;
         if head {
             self.cascade_restrike_ms = at;
+            self.cascade_heads = self.cascade_heads.saturating_add(1);
             Some(true)
         } else if at.saturating_sub(self.cascade_restrike_ms) >= CASCADE_RESTRIKE_MS {
             self.cascade_restrike_ms = at;
+            self.cascade_restrikes = self.cascade_restrikes.saturating_add(1);
             Some(false)
         } else {
+            self.cascade_swallowed = self.cascade_swallowed.saturating_add(1);
             None
         }
+    }
+
+    /// One phrase EDGE of [`SONG_THEME`] — v0.76.0's `on_jump` walk, verbatim:
+    /// at a phrase's start take its first note and step in; anywhere else
+    /// take the phrase's last note and open the next phrase. Nothing but a
+    /// line feed moves this cursor now, so the edges alternate and a run
+    /// sings `0 7 5 0 2 2 0 8` and round again. Reflected into the TUNE
+    /// register by the file's own law, so an authored note can never park
+    /// the walk outside it.
+    fn run_theme_step(&mut self) -> i8 {
+        let form = |i: u8| usize::from(SONG_FORM[usize::from(i)]);
+        let (start, end) = (form(self.run_phrase), form(self.run_phrase + 1));
+        let pos = usize::from(self.run_theme_pos);
+        let deg = if pos == start {
+            self.run_theme_pos += 1;
+            if usize::from(self.run_theme_pos) == end {
+                self.open_next_run_phrase();
+            }
+            SONG_THEME[pos]
+        } else {
+            self.open_next_run_phrase();
+            SONG_THEME[end - 1]
+        };
+        reflect_deg(i32::from(deg)) as i8
+    }
+
+    fn open_next_run_phrase(&mut self) {
+        self.run_phrase = (self.run_phrase + 1) % (SONG_FORM.len() as u8 - 1);
+        self.run_theme_pos = SONG_FORM[usize::from(self.run_phrase)];
     }
 
     /// §10.4's `on Backspace`: rewind one keystroke of melody state. The sound
@@ -4772,7 +4883,8 @@ impl TrailSynth {
                 // field so four fast notes read as a run, not a chord.
                 let pan = if k % 2 == 0 { ev.pan } else { -ev.pan };
                 let gain = ev.gain * KEY_TINE_TRIM * CASCADE_LEVELS[k];
-                self.v2_spawn(voice, gain, pan);
+                let admitted = self.v2_spawn(voice, gain, pan).is_some();
+                self.log_cascade(at, f, true, admitted);
             }
         } else {
             let f = penta(TINE_BASE_HZ, base + CASCADE_RESTRIKE_DEG);
@@ -4786,7 +4898,8 @@ impl TrailSynth {
             );
             voice.lane = LANE_CASCADE;
             let gain = ev.gain * KEY_TINE_TRIM * CASCADE_RESTRIKE_LEVEL;
-            self.v2_spawn(voice, gain, ev.pan);
+            let admitted = self.v2_spawn(voice, gain, ev.pan).is_some();
+            self.log_cascade(at, f, false, admitted);
         }
     }
 
@@ -10590,6 +10703,141 @@ for it up front.\n\
             since(&s, mark).len(),
             4,
             "a line feed past the echo window is a PTY cascade again"
+        );
+    }
+
+    /// THE RUN WALKS THE THEME, THE LONE LINE FEED STANDS (audit 2026-09-12).
+    /// Owner report on v0.82.0: while a program streams, "a looping sound,
+    /// doo doo doo doo, up and down". Measured against v0.76.0 on one 6 s
+    /// stream (`examples/stream_cascade.rs`): D18's rate law was identical to
+    /// the unit — 30 heads at 5 lines/s, 1 head + 71 re-strikes at 12, RMS
+    /// within 0.3 dB — and only the CONTOUR differed: v0.76.0 walked the
+    /// authored theme one phrase edge per line feed (`523 1308 1046 523 654
+    /// 654 523 1570` Hz, a 1.6 s cycle, 20 turns in 30), the frozen walk
+    /// played `523 654 785 1046` every 200 ms, 0 turns. `709b4c91d` froze
+    /// the walk for the typed line's sake and took the line feed with it. A
+    /// lone line feed keeps that commit's law; a run gets v0.76.0's back.
+    #[test]
+    fn a_line_feed_run_walks_the_theme_and_a_lone_line_feed_stands() {
+        let base_hz = |v: &Voice| v.p[0].f0;
+        let expect = |deg: i32| penta(TINE_BASE_HZ, deg);
+        let mut s = synth();
+        for k in 0..5u32 {
+            push(&mut s, SoundKind::Typed, 1_000 + k * 150, 0.0, false);
+        }
+        // A lone line feed 1.3 s after the last key: the derived line
+        // resolves where it stands and the cascade is built on it.
+        let before = i32::from(s.v2.walk());
+        let resolved = s.v2.nearest_lit_within(before, before);
+        let mark = s.born_seq;
+        push(&mut s, SoundKind::Jump, 3_000, -0.9, false);
+        let head = since(&s, mark);
+        assert_eq!(head.len(), 4, "a lone line feed is one four-note cascade");
+        assert_eq!(
+            i32::from(s.v2.walk()),
+            resolved,
+            "a lone line feed resolves the line where it stands"
+        );
+        assert!((base_hz(&head[0]) - expect(resolved)).abs() < 0.01);
+
+        // Ten more at 200 ms — a stream at 5 lines/s: every one is a cascade
+        // head (200 ≥ 180), every one is in the run (200 < 900), and the
+        // bases walk the theme's phrase edges exactly as v0.76.0's did.
+        let mut buf = [0.0f32; 960];
+        let render_ms = |s: &mut TrailSynth, buf: &mut [f32; 960], ms: usize| {
+            for _ in 0..ms / 20 {
+                s.render(buf);
+            }
+        };
+        // The head stood in for the theme's first edge (0), as v0.76.0's
+        // first Jump did, so the run resumes at the second.
+        let theme_edges = [7, 5, 0, 2, 2, 0, 8, 0, 7, 5];
+        for (k, &deg) in theme_edges.iter().enumerate() {
+            render_ms(&mut s, &mut buf, 200);
+            let mark = s.born_seq;
+            push(&mut s, SoundKind::Jump, 3_200 + k as u32 * 200, -0.9, false);
+            let born = since(&s, mark);
+            assert_eq!(born.len(), 4, "line feed {} of the run: one cascade", k + 2);
+            assert_eq!(
+                i32::from(s.v2.walk()),
+                deg,
+                "line feed {} of the run walks the theme",
+                k + 2
+            );
+            let got = base_hz(&born[0]);
+            assert!(
+                (got - expect(deg)).abs() < 0.01,
+                "line feed {} of the run: base {got:.1} Hz, want {:.1}",
+                k + 2,
+                expect(deg)
+            );
+        }
+
+        // A line feed a second after the last stands alone again: the line
+        // resolves where the run left it and the theme is re-headed, so the
+        // NEXT run starts on the theme's first edge and not mid-cycle.
+        let here = i32::from(s.v2.walk());
+        let resolved = s.v2.nearest_lit_within(here, here);
+        render_ms(&mut s, &mut buf, 1_000);
+        push(
+            &mut s,
+            SoundKind::Jump,
+            3_200 + 9 * 200 + 1_000,
+            -0.9,
+            false,
+        );
+        assert_eq!(
+            i32::from(s.v2.walk()),
+            resolved,
+            "a lone line feed after a run resolves"
+        );
+        render_ms(&mut s, &mut buf, 200);
+        push(
+            &mut s,
+            SoundKind::Jump,
+            3_200 + 9 * 200 + 1_200,
+            -0.9,
+            false,
+        );
+        assert_eq!(
+            i32::from(s.v2.walk()),
+            7,
+            "a new run re-heads the theme: its head stood in for edge one, so its second line is edge two"
+        );
+
+        // Inside a live cascade the rate law is untouched — twelve line feeds
+        // at 60 ms are still one cascade and at most eleven re-strikes — and
+        // each re-strike is the top note over the run's MOVING walk.
+        let mut s = synth();
+        let mut cascades = 0;
+        let mut restrikes: Vec<f32> = Vec::new();
+        for k in 0..12u32 {
+            let mark = s.born_seq;
+            push(&mut s, SoundKind::Jump, 1_000 + k * 60, -0.9, false);
+            let born = since(&s, mark);
+            match born.len() {
+                4 => cascades += 1,
+                1 => restrikes.push(base_hz(&born[0])),
+                0 => {}
+                n => panic!("line feed {k}: {n} voices"),
+            }
+            render_ms(&mut s, &mut buf, 60);
+        }
+        assert_eq!(cascades, 1, "a 60 ms run is one cascade");
+        assert!(restrikes.len() <= 11, "{} re-strikes", restrikes.len());
+        let want: Vec<f32> = [7, 5, 0, 2, 2, 0, 8, 0, 7, 5, 0]
+            .iter()
+            .map(|d| expect(d + CASCADE_RESTRIKE_DEG))
+            .collect();
+        for (i, (g, w)) in restrikes.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 0.01,
+                "re-strike {i}: {g:.1} Hz, want {w:.1}"
+            );
+        }
+        assert!(
+            restrikes.windows(2).any(|w| w[0] != w[1]),
+            "the re-strikes of a run must not be one pitch"
         );
     }
 

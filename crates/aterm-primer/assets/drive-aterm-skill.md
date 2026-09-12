@@ -619,9 +619,10 @@ aterm drive --socket "$SOCK" --ready '' prompt 'echo hi'         # idle-only
 aterm drive --socket "$SOCK" await match BUILD.SUCCESSFUL     # ONE token: it shells out to `aterm ctl`, same wire rule
 aterm drive --socket "$SOCK" shot out.png
 aterm drive classify 'git status --short && git pull | tail'  # read-only (exit 0) | not-read-only <reason> (exit 1) — pure, no host needed
-aterm drive phase "@$SID"                                     # busy | prompt | idle | question, then the parsed prompt box
+aterm drive phase "@$SID"                                     # busy | prompt | limited | idle | question, then the parsed prompt box
 aterm drive await-turn "@$SID" --timeout 600000               # block until not busy, print the phase; exit 124 = still busy
 aterm drive supervise "@$SID" --auto-reads --max-s 1800 --notes notes.txt   # the manager loop; see the supervise-agent skill
+aterm drive watch "@$SID" --auto-reads --notes notes.txt      # the same loop under a background monitor: one line per decision
 ```
 
 `prompt` is `send` → `key enter` → `await idle <ms> timeout <ms>` → best-effort
@@ -634,11 +635,12 @@ program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` 
 idle-only. Also settable via `$ATERM_DRIVE_READY` (the flag wins). A non-matching pattern
 costs a bounded extra wait, never a failed turn.
 
-The last four are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
+The last five are the `supervise-agent` skill's loop (`aterm drive --help`, *SUPERVISING A
 WORKER*): `classify` is the read-only judgment, `phase` one read → one word, `await-turn`
 the wait that never sleeps, `supervise` the loop that approves only a read-only Bash prompt
-(guarded: `key if=Do.you.want.to.proceed 1`) and stops at everything else. `--timeout` is
-milliseconds; `--max-s` is seconds.
+(guarded: `key if=Do.you.want.to.proceed 1`) and stops at everything else, `watch` that loop
+printing one `EVENT` line per review point and keeping on. `--timeout` is milliseconds;
+`--max-s` is seconds.
 
 `drive` **shells out** to `aterm-ctl`, so through a bare symlink with no sibling client it
 fails with `could not run aterm-ctl`. Set `$ATERM_CTL`, or just use `aterm ctl` — that path

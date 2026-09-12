@@ -227,7 +227,7 @@ pub mod drive_cli;
 /// The `aterm fleet` CLI (binary-era `aterm-fleet`), callable in-process.
 pub mod fleet_cli;
 /// The supervisor: read-only classification, prompt parsing, the worker's phase,
-/// and the `await-turn` / `supervise` loop behind `aterm drive`.
+/// and the `await-turn` / `supervise` / `watch` loop behind `aterm drive`.
 pub mod supervise;
 
 /// Re-export so callers can match on a compile failure without depending on
@@ -585,6 +585,7 @@ USAGE
     aterm-drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
               | await-turn [@sid] [--timeout MS]
               | supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+              | watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -628,20 +629,62 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        words: `system(`, a redirect or a pipe in awk, a `w`/`e`
                        command or `s///w` flag in sed, a `-f` program file, all
                        refuse. A tie breaks toward not-read-only.
-    phase [@sid]       One read, one word: busy | prompt | idle | question. For a
-                       prompt the parsed box follows: `kind`, `command`,
-                       `description`, `classify` (a Bash box), one `option N …`
-                       per option, then `cancel esc` or `cancel none`.
-                       Busy is measured from the spinner row, the `esc to interrupt`
-                       footer, `Still working`, a waiting workflow, or a background
-                       shell still running — in auto mode the footer says nothing,
-                       so the spinner row is the signal.
+    phase [@sid]       One read, one word: busy | prompt | limited | idle |
+                       question. For a prompt the parsed box follows: `kind`,
+                       `command`, `description`, `classify` (a Bash box), one
+                       `option N …` per option, then `cancel esc` or `cancel
+                       none`. For busy, `reason <where>: <rule>` names the signal
+                       that fired. For limited, `message <text>` and `reset
+                       <text|->`. A prompt wins over busy, busy over limited,
+                       limited over question — except a busy that is only a
+                       background monitor, which a limit notice or a question
+                       outranks (a persistent monitor can outlive any budget).
+                       Busy is read from the LIVE ZONE around Claude Code's
+                       composer, which sits between two full-width rules. The
+                       STATUS ROW is, walking up from the top rule, the first row
+                       that starts in column 0 with a spinner glyph, found before
+                       any transcript row (the worker's `⏺` message or tool call,
+                       output under the `⎿` gutter); what sits between it and the
+                       rule never hides it (a tip, a todo list, a hint of any
+                       length, the session survey, a banner, a queued message).
+                       It is busy when it is a spinner running into an ellipsis,
+                       `Waiting for N …` (a dynamic workflow, a background agent)
+                       or a done row still counting `N shell(s) still running`;
+                       so is a `Still working` hint under it, and the FOOTER
+                       under the bottom rule: `esc to interrupt`, `Still
+                       working`, `ctrl+b to run in background`, `· N shell(s) ·`,
+                       a workflow's `◯ … agents done` line. A monitor still
+                       running (`N monitor(s) still running` on the status row,
+                       `· N monitor(s) ·` in the footer) is the soft busy above.
+                       A status row above a transcript row is history, not a
+                       signal. With no composer rules on the screen every row is
+                       scanned. The footer does not always say `esc to interrupt`
+                       while a turn runs, so the status row is the first signal.
+                       Limited is the usage-limit wall: nothing busy (a monitor
+                       aside), no box, and the last thing said above the
+                       composer (the done row, hints, tips, the survey and
+                       banners under it skipped) is a block under the `⎿`
+                       gutter that OPENS with a limit notice — `You've reached
+                       your … limit`, `You've hit your … limit`, a few words and
+                       `limit reached`, or `API Error` with a rate or usage
+                       limit — or the footer carries one. Anything
+                       said after a notice makes it history: a later turn (a
+                       background command's end or a monitor event starts one
+                       too), the `/model` output. The worker's own words about
+                       limits, the rows your message wrapped onto and a tool's
+                       output it went on to discuss never count, and neither does
+                       text that says `Approaching` a limit. The worker sits at an
+                       idle composer, and what you send it fails until the limit
+                       resets or its model is switched.
     await-turn [@sid] [--timeout MS]
                        Block until the phase is no longer busy, then print it like
                        `phase`. The loop is `await idle 2000` → read → `await seq`
                        (never a sleep); where the host knows `await gone`, the busy
-                       footer LEAVING is the first wait. Exit 124 on --timeout
-                       (default: the global --timeout) with the worker still busy.
+                       footer LEAVING is the first wait. A screen without the
+                       composer rules (a build, a script, a REPL) whose output
+                       never held still for the 2 s is busy too: its turn ends
+                       when the output pauses. Exit 124 on --timeout (default: the
+                       global --timeout) with the worker still busy.
     supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
                        The loop: await-turn; with --auto-reads, a Bash prompt whose
                        command classifies read-only is approved (option 1, pressed
@@ -659,11 +702,46 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        twice; one that does not move after the press is handed to
                        you), and the loop continues. The same read coming back
                        after two approvals is handed over too. ANYTHING ELSE — a
-                       write prompt, a workflow, a question, an idle composer —
-                       prints the compact result (the phase lines, then the prompt
-                       box or the last 28 non-blank rows) and exits 0: that is YOUR
-                       review point. Prints TIMEOUT and exits 124 after --max-s
-                       (default 1800).
+                       write prompt, a workflow, a question, a limit notice, an
+                       idle composer — prints the compact result (the phase lines,
+                       then the prompt box or the last 28 non-blank rows) and
+                       exits 0: that is YOUR review point. Once --max-s (default
+                       1800) is spent it prints TIMEOUT, then the last read's
+                       compact result, and exits 124 — a turn read at or after
+                       the deadline is not pressed.
+    watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
+                       supervise's loop for a harness that wakes its agent once per
+                       stdout line (a background monitor, a supervisor process).
+                       Approvals are supervise's, and each prints `APPROVED
+                       seq=<n> <command>`; --notes gets supervise's lines. A
+                       review point prints ONE line and the loop KEEPS WATCHING:
+                         EVENT <phase> seq=<n> <summary>
+                       the summary being, for a prompt, `kind=<k> classify=
+                       <read-only|not-read-only:<reason>|-> command=<command>` (`-`
+                       for a box that is not Bash; a workflow's description stands
+                       in for its command); for a question or idle, the last row
+                       the worker said; for limited, `message=<text> reset=
+                       <text|->` — each cut at 160 characters. Then it waits for
+                       the screen to move past that point (`await seq`) before it
+                       looks again, so your `turn` or `key` is picked up by
+                       itself. A point that looks like the one last reported —
+                       the same phase, summary and status row, the same last 8
+                       non-blank transcript rows up to it (their letters: a
+                       timer that ticks is no change), the same box — is neither
+                       pressed nor printed again unless, in between, a read saw
+                       the worker busy or it approved a read; a new box, a new
+                       reply, your own row or a retry's new notice changes those
+                       rows, however short the busy spell before it. The
+                       two-approvals count restarts at every review point, as a
+                       fresh supervise's would. A worker without the composer
+                       rules is looked at when its output pauses, as await-turn
+                       waits. Every line is flushed. The last line is TIMEOUT
+                       (exit 124) once --max-s (default 1800) is spent — no
+                       press and no EVENT comes after the deadline — or `EXIT
+                       <reason>` (exit 1): the session ended (`EXIT session gone
+                       (…)`, seen within one 20 s wait), a request or the notes
+                       file failed, or, before the loop ran, one of its flags or
+                       the host (also on stderr).
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to
@@ -717,6 +795,9 @@ EXAMPLES
     aterm-drive await-turn @s-1e918c46 --timeout 600000
     # keep it moving through its reads; stop at the first thing that needs you:
     aterm-drive supervise @s-1e918c46 --auto-reads --max-s 1800 --notes notes.txt
+    # the same loop, never exiting at a review point: one stdout line per
+    # decision — run it under your harness's background monitor:
+    aterm-drive watch @s-1e918c46 --auto-reads --notes notes.txt
 
 GOTCHA
     Submit with a real Enter keypress (this tool uses `key enter`), never a raw

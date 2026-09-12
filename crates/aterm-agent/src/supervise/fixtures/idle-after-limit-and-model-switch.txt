@@ -1,0 +1,63 @@
+
+⏺ Dynamic workflow "Review the cache-eviction fix and its tests (read-only)" completed · 7m 50s
+
+⏺ The reviewers earned their keep: one lens found that the eviction scan honours only the literal --max-entries N spelling, while the
+  parser also accepts a --max-entries=N form (which the repo's own scripts use), an environment override and a config-file key, and
+  that the new note claims the flag sized the memory budget without checking. Reading the other two lenses
+  before fixing.
+
+  Ran 1 shell command
+
+⏺ Confirmed: the cache ceiling equals the process budget rather than 10% under it, and in the default container posture the evictor
+  stays inert while the ceiling sits at 85% of the clamped memory (6,963 MiB of 8 GiB), with a small instance never evicting. Next I'll
+  check how the CLI expands its default command and rewrites the size spellings, plus the rebuild result, to align the evictor with
+  the parser. · summarized
+
+  Ran 3 shell commands
+
+⏺ Stopping the in-progress rebuild to rework it based on new findings: the evictor will replicate the CLI's default-command detection
+  exactly, accept all four size spellings, stop parsing at "--", skip the plugin host's pass-through argument, and cap the
+  cache ceiling at 90% of the process budget under an honoured flag, with a note verifying the two bounds actually agree. · summarized
+
+⏺ Stop Task
+  ⎿  cd ~/work/service; cargo test -p cache --lib -- eviction 2>&1 | tail -40; echo "== tests done =="; cargo build --release -p
+     cache-bench 2>&1 | tail -5… · stopped
+
+  Ran 1 shell command
+
+⏺ I'll register the CLI subcommand list at startup, compute the cache ceiling via a pure function at 90% of the honoured process
+  budget, add a check that warns on bound mismatches before starting, and fix the flagged documentation—then rebuild and rerun
+  the tests. · summarized
+
+  Ran 2 shell commands
+
+⏺ While the build runs, I'll do a second read-only review of the reworked change and extend the budget probe to also
+  cover the --max-entries=N spelling flagged by reviewers. · summarized
+
+  Ran 1 shell command
+
+⏺ Workflow(Second review pass on the reworked cache-eviction change (read-only))
+  ⎿  /workflows to view dynamic workflow runs
+  ⎿  Allowed by auto mode classifier
+
+⏺ Second-pass reviewers are out and the build is running. Nothing else can start until one of those returns.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "Second review pass on the reworked cache-eviction change (read-only)" completed · 5s
+  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.
+
+✻ Cooked for 23m 0s · done 11:24 PM
+
+⏺ Background command "Run the cache tests, then build the fixed release binary" completed (exit code 0)
+  ⎿  You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.
+
+✻ Churned for 0s · done 11:30 PM
+
+❯ /model
+  ⎿  Set model to Opus 5 (1M context) (default) and saved as your default for new sessions
+                                                                                                  ✔ Update installed · Restart to update
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active

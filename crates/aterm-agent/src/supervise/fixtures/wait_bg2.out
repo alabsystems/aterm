@@ -1,0 +1,30 @@
+== DONE iters=1 auto_approved=0 ==
+  so they cannot serve the counter gate; and set D runs about 6 hours, not 20 minutes, so wall replicates
+  should use sets C and E.
+  Amended lever the proposer found, which I checked in code and endorse: the shipped posture (--audit … --audit-format json)
+  runs a different and worse eviction than --fast because several gates key on audit_log.is_some() without an auditing
+  reason. Measured on set A today: misses 357,574 → 385,057 (+7.7%) and lookups +6% under the audit log. Verified sites: a
+  ghost-key entry is dropped under audit (evict.rs:1136), prefetch's warm entries are skipped under
+  audit (prefetch.rs:94), the compaction budget is a wall clock scaled 4x under audit (constants.rs:1055, also a load-dependent
+  nondeterminism hazard), and the sweeper never logs, so it never runs in the shipped configuration (capability.rs:135). Gate:
+  audit and plain arms must produce identical misses, evictions, lookups and ticks on sets A, B, C and E; the log checker
+  must verify the emitted log; the log must be byte-deterministic across two runs. This is not identical to today's shipped eviction
+  by design, so it needs your call. The three refuters of the original lever are still running and I will fold in anything material when
+  they land.
+  Waiting for your go on the amended lever, or a different direction.
+✻ Waiting for 1 dynamic workflow to finish
+❯ Go on the amended lever, with one correction: the ghost-key site comment says that entry is not safe to replay, so that gate has an
+  auditing reason; do not bypass it, either give it a sound replay the checker accepts or leave it and say so. Take the other
+  sites one at a time on a fresh branch named audit-parity, one small commit per site: prefetch warm entries logged as
+  entries under audit, the compaction wall-clock budget replaced by a deterministic work budget that admits the same work in both arms,
+  and the sweeper only if you can log it soundly. Gate per commit: identical misses, evictions, lookups and ticks between the
+  audit and plain arms on sets A, B, C and E; the log checker verifies every emitted log; two runs give byte-identical logs.
+  Report after each site with the numbers, and stop at the first gate that fails.
+✶ Deliberating…
+  ⎿  Tip: Share Claude Code and earn $10 in usage credits · /passes
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  paste again to expand                                                                                                       /rc active
+  ◯ cache-lever-pick  Adversarially check the proposed cache lever (lookups pe… 1/4 agents done · 21m 55s · ↓ 434.7k tokens
+exit=0

@@ -1,0 +1,30 @@
+== DONE iters=19 auto_approved=0 ==
+  └──────────┴─────────┴───────────┴──────────────┴──────────────┴──────────────────┴───────────────┘
+  The service is within ±8% of the reference cache per request on both, and misses per request match (1,683 vs 1,682 on set A). The
+  whole 1.4–1.6x gap is 1.45–1.48x more lookups per request, which is access shape and off-limits under identical request logs. Profile
+  shares match too: hashing is 66% of our lookup thread and 67% of the reference's on set B, so per-request work is at parity too.
+  The 15% latency target is unreachable, and the July report's own section 25.2 (2026-08-08), which I missed when proposing, had already
+  closed hash micro-optimisation after a 38-run study: fast path at 20 instructions vs the reference's 18, mostly memory-bound, "perfect
+  parity buys under 3%". No commits were made; the branch cache-per-request-cost is empty. The baseline build finished in 5m48s at
+  ~/work/targets/base/release/service in the unverified lane, since the verified lane refuses this repo's release config.
+  Two plan defects surfaced by the workflow's independent proposer, both confirmed: the two sample traces never go quiet in 5 minutes,
+  so they cannot serve the counter gate; and set D runs about 6 hours, not 20 minutes, so wall replicates
+  should use sets C and E.
+  Amended lever the proposer found, which I checked in code and endorse: the shipped posture (--audit … --audit-format json)
+  runs a different and worse eviction than --fast because several gates key on audit_log.is_some() without an auditing
+  reason. Measured on set A today: misses 357,574 → 385,057 (+7.7%) and lookups +6% under the audit log. Verified sites: a
+  ghost-key entry is dropped under audit (evict.rs:1136), prefetch's warm entries are skipped under
+  audit (prefetch.rs:94), the compaction budget is a wall clock scaled 4x under audit (constants.rs:1055, also a load-dependent
+  nondeterminism hazard), and the sweeper never logs, so it never runs in the shipped configuration (capability.rs:135). Gate:
+  audit and plain arms must produce identical misses, evictions, lookups and ticks on sets A, B, C and E; the log checker
+  must verify the emitted log; the log must be byte-deterministic across two runs. This is not identical to today's shipped eviction
+  by design, so it needs your call. The three refuters of the original lever are still running and I will fold in anything material when
+  they land.
+  Waiting for your go on the amended lever, or a different direction.
+✻ Waiting for 1 dynamic workflow to finish
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active
+  ◯ cache-lever-pick  Adversarially check the proposed cache lever (lookups pe… 1/4 agents done · 20m 59s · ↓ 428.2k tokens
+exit=0

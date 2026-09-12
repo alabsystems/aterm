@@ -1,0 +1,22 @@
+== TIMEOUT iters=91 auto_approved=0 ==
+  Ran 2 shell commands
+⏺ Handoff drafted (commit table, gates, open items with the two owner decisions marked as needing the big box, merge path); the
+  replicate table is the only part still open. The set C runs are in progress on the quiet box; I'll append the numbers and commit
+  when the script reports done.
+✻ Cogitated for 1m 30s · done 1:03 PM · 1 shell still running
+⏺ Background command "Wait for the benchmark runs to finish" completed (exit code 0)
+  Ran 1 shell command
+⏺ Site D confirms a slower shipped posture (sets C and E both up), and set E's identical throughput shows the slowdown is eviction
+  work, not per-request cost—likely parity shifting to the slower plain path. I still need set C's requests/second counters,
+  so I'm rerunning those three measurements now. · summarized
+  Ran 2 shell commands
+⏺ Set E is settled: 2.88 M requests per second in both binaries (spread under 0.5%), so the 27% longer wall is entirely more eviction
+  work. The set C counter runs (both binaries, both postures) are in progress; the handoff's replicate section and its commit follow
+  those.
+✻ Sautéed for 1m 7s · done 1:44 PM · 1 shell still running
+                                                                                                  ✔ Update installed · Restart to update
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯ Wait for the set C counters, then finish the handoff and commit it.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage                                                                      /rc active
+exit=124

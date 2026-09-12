@@ -1,0 +1,30 @@
+== DONE iters=3 auto_approved=0 ==
+  pass.
+  Gate numbers.
+  - Wall-clock gate: counters identical to the baseline in both arms on all four sets (parity FAIL, unchanged); logs byte-identical;
+    the log checker VERIFIED all four; the strict checker VERIFIED set A (38 s) and set E (127 s). The audit arm ran the sweeper (2
+    rounds) but its own 200 ms wall cap stopped it at 552 of 617 shards, before any merge, so nothing was audited there.
+  - Deterministic-compaction gate (--deterministic-compaction true, both arms): the audit arm records 171 merges and 2,449
+    rewrites on set A; the 128.1 MB log verifies with the strict checker in 43 s and the plain log (68.5 MB) with the log checker.
+    Set E's 431.8 MB log verifies in 140 s, though its audit arm found 0 merges. Parity FAIL: set A 357,574 vs 423,790, set E
+    1,279,520 vs 1,208,352.
+  First divergence, measured with an ordered trace (RUST_LOG=cache=debug … --verbose, both arms, diff): under deterministic
+  compaction the arms are identical through interning, merging and the backfill's outcome, but backfill is charged 277,606
+  ticks in the plain arm and 277,584 under audit. Audit-only bookkeeping (hint collection and replay probing) runs lookups that count
+  as eviction ticks. Immediately after, the first compaction round sees 605 keys without an audit and 904 with one, because compacting()
+  returns false whenever an audit surface is active (cache/compact.rs:146). Both precede the compaction wall budgets.
+  Not audited, recorded in the ledger: a shard that is empty outright, a rewrite yielding an empty entry, and a contradicting
+  key still fall back to eviction under audit (three early returns in compaction/sweep.rs).
+  Recommendation before site B. Flipping deterministic compaction on by default is the first half of site B and I am ready to do it,
+  but its own doc says the tick calibration has not been validated against the full regression floor, and no local set can measure
+  that. The two new sources sit ahead of it in time: tick bookkeeping in backfill under audit (small, cost-only, plain arm
+  bit-identical), and compaction under audit (larger, needs analysis of key remapping). Proposed order: backfill tick
+  bookkeeping, then site B, then compaction, then the post-merge reschedule. Waiting for your call.
+✻ Cogitated for 3m 49s · done 11:49 AM
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active
+exit=0

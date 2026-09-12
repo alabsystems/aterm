@@ -7,9 +7,12 @@
 //! Structural breakage (a broken bin shim, an active build whose store tree vanished, a
 //! fish-breaking stray `.sh`, a world-writable login-sourced dir) is a PROBLEM → nonzero
 //! exit. Everything advisory (bin not yet on PATH, a frozen-looking index, a foreign
-//! sysroot wiring) stays a WARNING → exit 0. It reads no unverified index/manifest
-//! (verify-before-parse): its freshness surface reads atpkg's OWN `status.toml` +
-//! the durable [`crate::sig::Floor`].
+//! sysroot wiring) stays a WARNING → exit 0. One kind of warning also withholds the
+//! word "healthy": a managed tool that cannot run (today, tippy refused by the Trust
+//! bundle's own `rustc` and `trustc`) is not a structural fault this machine can repair,
+//! and not health either, so the report ends "not healthy" and still exits 0. It reads no
+//! unverified index/manifest (verify-before-parse): its freshness surface reads atpkg's
+//! OWN `status.toml` + the durable [`crate::sig::Floor`].
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -663,6 +666,115 @@ pub fn run_with(
                  ({pinned_version}), not the managed {program} {managed_version} \
                  (build {managed_build}){override_hint}"
             );
+        }
+    }
+
+    // (5f) THE TRUST BUNDLE'S `rustc` MUST BE ITS `trustc`, OR tippy DOES NOT RUN.
+    //
+    // tippy starts by checking that the bundle's `bin/trustc` and its rustc-compatible
+    // alias `bin/rustc` are plain files and that the alias is the selected compiler, and
+    // lints nothing when either check fails. Measured 2026-09-12 on bundles 8571 and
+    // 8589: every `tippy -p <crate> --tests` exited 1 with "tippy: setup error:
+    // rustc-compatible sibling `…/bin/rustc` is not the selected Trust compiler
+    // `…/bin/trustc`; repair or reinstall the toolchain", while this report said
+    // "healthy". The two files ARE one program — same size, same code — and differ only
+    // inside their ad-hoc code signatures, because an ad-hoc signature embeds the file's
+    // own name (`rustc-<hash>` beside `trustc-<hash>`).
+    //
+    // The cure lives in the bundle, and not every plausible cure cures. Measured the same
+    // day on an APFS clone of 8589 (the store untouched): `rustc` as a hard link to
+    // `trustc`, or as a byte-for-byte copy of the signed `trustc`, lints; `rustc` as a
+    // symbolic link, relative or absolute, is refused ("compiler rustc-compatible alias
+    // `…/bin/rustc` is not a regular file or is a symlink/reparse point; selected Trust
+    // toolchain executables require a plain file"), and so is a symlinked `trustc` —
+    // which the tippy-driver route below refuses too; and re-signing the signed `rustc`
+    // under trustc's identifier matches the CDHash but leaves the files different inside
+    // the signature (byte 318 193), so tippy still refuses. What this machine can do is
+    // say which of these it is looking at, and what still lints.
+    //
+    // So: a `trustc` or `rustc` that is not a plain file, or the two one program under
+    // two signatures ([`crate::macho`], pure Rust, no `codesign` spawn), is a WARN that
+    // withholds "healthy" while tippy is in the bundle to be refused; two different
+    // programs are a FAIL; identical plain files say nothing; a file that is not a thin
+    // 64-bit Mach-O (an ELF on Linux) makes no claim about the program it holds — the
+    // plain-file check does not depend on the format, so a link is still reported.
+    let mut tools_cannot_run = 0usize;
+    if let Some(trust_build) = active.get("trust").copied() {
+        use crate::macho::Modulo;
+        let bin = layout.build_dir("trust", trust_build).join("bin");
+        let (rustc, trustc) = (bin.join("rustc"), bin.join("trustc"));
+        if let Some(found) = trust_siblings(&rustc, &trustc, TRUST_SIBLING_READ_LIMIT) {
+            match &found.verdict {
+                Ok(Modulo::Identical | Modulo::SameProgram | Modulo::Unparseable) => {}
+                Ok(Modulo::Different { offset }) => {
+                    fails += 1;
+                    let _ = writeln!(
+                        err,
+                        "{p}: FAIL — trust build {trust_build}: {} is not the same program as \
+                         the selected compiler {} (the first byte no code signature accounts \
+                         for differs at offset {offset}), so a tool that runs the bundle's \
+                         rustc runs something other than trustc; `aterm pkg verify trust` says \
+                         whether the store still matches what was published",
+                        rustc.display(),
+                        trustc.display()
+                    );
+                }
+                Err(why) => {
+                    let _ = writeln!(
+                        out,
+                        "{p}: warn — trust build {trust_build}: could not compare its rustc \
+                         with its trustc ({why}), so whether tippy can run is unchecked"
+                    );
+                }
+            }
+            // Why tippy stops, in the order it checks: trustc a plain file, rustc a plain
+            // file, then rustc the selected compiler.
+            let refusal = [(&trustc, found.trustc), (&rustc, found.rustc)]
+                .into_iter()
+                .find_map(|(path, file)| {
+                    Some(format!(
+                        "{} is {}, and tippy requires the selected compiler trustc and its \
+                         rustc-compatible alias rustc to be plain files",
+                        path.display(),
+                        file.refused_as()?
+                    ))
+                })
+                .or_else(|| {
+                    matches!(found.verdict, Ok(Modulo::SameProgram)).then(|| {
+                        format!(
+                            "{} is the same program as the selected compiler {}, but the two \
+                             differ inside their code signatures (an ad-hoc signature embeds \
+                             the file's own name) and tippy's sibling check reads that as a \
+                             different compiler",
+                            rustc.display(),
+                            trustc.display()
+                        )
+                    })
+                });
+            if let Some(refusal) = refusal
+                && bin.join("tippy").is_file()
+            {
+                tools_cannot_run += 1;
+                // The wrapper route skips tippy's sibling check, but tippy-driver still
+                // refuses a trustc that is not a plain file (measured), so it is offered
+                // only over a plain one.
+                let driver = bin.join("tippy-driver");
+                let today = if found.trustc == SiblingFile::Plain && driver.is_file() {
+                    format!(
+                        "; lint today with RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified \
+                         check …",
+                        driver.display()
+                    )
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    out,
+                    "{p}: warn — trust build {trust_build}: tippy cannot run — {refusal}, so \
+                     every tippy run stops at a setup error{today} (the bundle's fix: \
+                     {TRUST_SIBLING_FIX})"
+                );
+            }
         }
     }
 
@@ -1347,8 +1459,18 @@ pub fn run_with(
         }
     }
 
-    if fails == 0 && !toolset_problem {
+    if fails == 0 && !toolset_problem && tools_cannot_run == 0 {
         let _ = writeln!(out, "{p}: healthy");
+        true
+    } else if fails == 0 && !toolset_problem {
+        // Nothing structural — but a managed tool that cannot run is not health, and this
+        // line is the one a reader takes away. The warn above carries its own remedy, so no
+        // `next` line: the tail's rule for failures with an inline remedy.
+        let _ = writeln!(
+            out,
+            "{p}: not healthy — {tools_cannot_run} warning(s) above name a managed tool that \
+             cannot run; none is a structural problem, so the exit code stays 0"
+        );
         true
     } else {
         let total = fails + usize::from(toolset_problem);
@@ -1406,6 +1528,110 @@ fn probe_version(bin: &Path) -> String {
         return UNKNOWN.to_string();
     };
     token.split('+').next().unwrap_or(token).to_string()
+}
+
+/// What the bundle has to ship for tippy to run, as (5f) words it: every shape it names
+/// was measured on a clone of bundle 8589 — the hard link and the copy lint; a symbolic
+/// link is refused, and so is a second signing of an already-signed copy.
+const TRUST_SIBLING_FIX: &str = "ship trustc as one signed plain file and rustc as a hard \
+                                 link to it or a byte-for-byte copy of it, never a symbolic \
+                                 link";
+
+/// The most bytes (5f) reads of either Trust compiler file. Bundle 8589's `rustc` and
+/// `trustc` are 336 192 bytes each — the thin driver that loads the compiler's shared
+/// library — so this is some fifty times what was measured; a file over it is reported
+/// as not compared, never read whole.
+const TRUST_SIBLING_READ_LIMIT: u64 = 16 << 20;
+
+/// How one of the Trust bundle's compiler files sits in `bin/`, as tippy's plain-file
+/// check sees it: the directory entry itself, not what a link points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingFile {
+    Plain,
+    Symlink,
+    NotAFile,
+}
+
+impl SiblingFile {
+    /// What a report line calls a file tippy refuses; `None` for a plain file.
+    fn refused_as(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Symlink => Some("a symbolic link"),
+            Self::NotAFile => Some("not a regular file"),
+        }
+    }
+}
+
+/// What (5f) finds about the Trust bundle's `rustc` beside its `trustc`.
+#[derive(Debug)]
+struct TrustSiblings {
+    rustc: SiblingFile,
+    trustc: SiblingFile,
+    /// The two compared modulo their code signatures ([`crate::macho::compare`]),
+    /// through any link; `Err` when either could not be read within the bound.
+    verdict: Result<crate::macho::Modulo, String>,
+}
+
+/// The Trust bundle's `rustc` and `trustc` as tippy meets them, or `None` when either
+/// directory entry is absent or cannot be looked at.
+///
+/// Read-only and bounded. Each entry is looked at without following it — a link is what
+/// tippy's plain-file check refuses, so a link must not be judged by the file it
+/// reaches — and then each is read, following any link, only as a regular file of at
+/// most `limit` bytes ([`read_bounded`]). A file that cannot be read that way is an `Err`
+/// verdict, never a claim about the program it holds.
+fn trust_siblings(rustc: &Path, trustc: &Path, limit: u64) -> Option<TrustSiblings> {
+    let entry = |path: &Path| {
+        let file_type = std::fs::symlink_metadata(path).ok()?.file_type();
+        Some(if file_type.is_symlink() {
+            SiblingFile::Symlink
+        } else if file_type.is_file() {
+            SiblingFile::Plain
+        } else {
+            SiblingFile::NotAFile
+        })
+    };
+    let (rustc_file, trustc_file) = (entry(rustc)?, entry(trustc)?);
+    let read = |path: &Path| read_bounded(path, limit);
+    let verdict = read(rustc).and_then(|r| Ok(crate::macho::compare(&r, &read(trustc)?)));
+    Some(TrustSiblings {
+        rustc: rustc_file,
+        trustc: trustc_file,
+        verdict,
+    })
+}
+
+/// `path`'s bytes, following any link, when it is a regular file of at most `limit`
+/// bytes — the bound enforced, not assumed. The type is checked before the open, so
+/// nothing that could block an open (a FIFO) is opened; the length is checked on the
+/// open handle and again on what the read returns, so a file that grows in between is
+/// refused rather than read whole.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let named = |e: std::io::Error| format!("{}: {e}", path.display());
+    if !std::fs::metadata(path).map_err(named)?.is_file() {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    let file = std::fs::File::open(path).map_err(named)?;
+    let len = file.metadata().map_err(named)?.len();
+    if len > limit {
+        return Err(format!(
+            "{}: {len} bytes, over the {limit}-byte bound this check reads",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(named)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(format!(
+            "{}: grew past the {limit}-byte bound while being read",
+            path.display()
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Render a divergence's contested build numbers for the report line.
@@ -3686,6 +3912,354 @@ mod tests {
             None
         );
         assert_eq!(unknown_field_in(""), None);
+    }
+
+    /// A store with trust 8589 active, a synthetic home, and PATH on the store's bin —
+    /// what every (5f) test runs the whole report over. Returns the build's `bin/`.
+    fn tippy_sibling_store(label: &str) -> (Layout, PathBuf, std::ffi::OsString, PathBuf) {
+        let l = layout(label);
+        install(&l, "trust", 8589);
+        let home = synthetic_home(label);
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let bin = l.build_dir("trust", 8589).join("bin");
+        (l, home, path, bin)
+    }
+
+    /// The whole report: (exit ok, stdout, stderr).
+    fn whole_report(l: &Layout, home: &Path, path: &OsStr) -> (bool, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ok = run_with(
+            l,
+            Some(home),
+            Some(path),
+            0,
+            None,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut err,
+        );
+        (
+            ok,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    fn healthy(out: &str) -> bool {
+        out.lines().any(|line| line == "doctor: healthy")
+    }
+
+    /// The one "tippy cannot run" warn in `out`, which must exist.
+    fn tippy_warn(out: &str) -> &str {
+        let mut warns = out.lines().filter(|line| line.contains("tippy cannot run"));
+        let warn = warns
+            .next()
+            .unwrap_or_else(|| panic!("the warn is printed:\n{out}"));
+        assert_eq!(warns.next(), None, "one warn, not two:\n{out}");
+        assert!(
+            warn.starts_with("doctor: warn — trust build 8589: tippy cannot run — "),
+            "{warn}"
+        );
+        assert!(
+            warn.ends_with(&format!(" (the bundle's fix: {TRUST_SIBLING_FIX})")),
+            "every refusal carries the one fix that was measured to work: {warn}"
+        );
+        warn
+    }
+
+    /// The report withholds "healthy" for one tool that cannot run, and exits 0.
+    fn assert_not_healthy_exit_0(ok: bool, out: &str, err: &str) {
+        assert!(ok, "nothing structural: exit 0\n{out}{err}");
+        assert!(
+            !healthy(out),
+            "a tool that cannot run is not health:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "doctor: not healthy — 1 warning(s) above name a managed tool that cannot \
+                 run; none is a structural problem, so the exit code stays 0"
+            ),
+            "{out}"
+        );
+        assert!(!err.contains("FAIL"), "{err}");
+    }
+
+    /// What the fix line says, every shape of it measured on a clone of bundle 8589: a
+    /// hard link or a byte-for-byte copy lints; a symbolic link does not.
+    #[test]
+    fn the_bundle_fix_names_only_shapes_that_let_tippy_run() {
+        assert_eq!(
+            TRUST_SIBLING_FIX,
+            "ship trustc as one signed plain file and rustc as a hard link to it or a \
+             byte-for-byte copy of it, never a symbolic link"
+        );
+    }
+
+    /// (5f) THE MEASURED DEFECT, through the whole report. Bundle 8589's `rustc` and
+    /// `trustc` are one program under two ad-hoc signatures, tippy refuses to start over
+    /// that, and this report said "healthy". Now: a warn naming the bundle, both paths
+    /// and what still lints, and a verdict that withholds "healthy" without claiming a
+    /// structural problem (exit 0). The same pair byte-identical says nothing; a code
+    /// byte apart is a FAIL; with no tippy in the bundle nothing is refused; files that
+    /// are not Mach-O make no claim.
+    #[test]
+    fn a_trust_rustc_that_differs_from_trustc_only_in_its_signature_is_not_healthy() {
+        let (l, home, path, bin) = tippy_sibling_store("tippy-sibling");
+        let rustc_bytes = crate::macho::tests::signed("rustc-5555494429441d12e5e3340fa96ce4b");
+        let trustc_bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
+        std::fs::write(bin.join("rustc"), &rustc_bytes).unwrap();
+        std::fs::write(bin.join("trustc"), &trustc_bytes).unwrap();
+        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
+        std::fs::write(bin.join("tippy-driver"), b"tippy-driver").unwrap();
+        let run = || whole_report(&l, &home, &path);
+
+        let (ok, out, err) = run();
+        assert_not_healthy_exit_0(ok, &out, &err);
+        let warn = tippy_warn(&out);
+        assert!(
+            warn.contains(&format!(
+                "tippy cannot run — {} is the same program as the selected compiler {}, but \
+                 the two differ inside their code signatures (an ad-hoc signature embeds the \
+                 file's own name) and tippy's sibling check reads that as a different \
+                 compiler, so every tippy run stops at a setup error; lint today with \
+                 RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified check … (the bundle's fix: \
+                 ship trustc as one signed plain file and rustc as a hard link to it or a \
+                 byte-for-byte copy of it, never a symbolic link)",
+                bin.join("rustc").display(),
+                bin.join("trustc").display(),
+                bin.join("tippy-driver").display()
+            )),
+            "{warn}"
+        );
+
+        // No tippy in the bundle: nothing is refused, so nothing is withheld.
+        std::fs::remove_file(bin.join("tippy")).unwrap();
+        let (ok, out, _) = run();
+        assert!(
+            ok && healthy(&out) && !out.contains("tippy cannot run"),
+            "{out}"
+        );
+        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
+
+        // The pair byte-identical (what a byte-for-byte copy gives): nothing to say.
+        std::fs::write(bin.join("rustc"), &trustc_bytes).unwrap();
+        let (ok, out, _) = run();
+        assert!(
+            ok && healthy(&out) && !out.contains("tippy cannot run"),
+            "{out}"
+        );
+
+        // A code byte apart: two programs, a FAIL naming the offset.
+        let mut other = rustc_bytes.clone();
+        other[crate::macho::tests::CODE_AT + 7] ^= 0x01;
+        std::fs::write(bin.join("rustc"), &other).unwrap();
+        let (ok, out, err) = run();
+        assert!(
+            !ok,
+            "a different program is a structural problem:\n{out}{err}"
+        );
+        assert!(
+            err.contains(&format!(
+                "doctor: FAIL — trust build 8589: {} is not the same program as the selected \
+                 compiler {} (the first byte no code signature accounts for differs at \
+                 offset {})",
+                bin.join("rustc").display(),
+                bin.join("trustc").display(),
+                crate::macho::tests::CODE_AT + 7
+            )),
+            "{err}"
+        );
+        assert!(out.contains("doctor: found 1 problem(s)"), "{out}");
+        assert!(!out.contains("tippy cannot run"), "{out}");
+
+        // Not Mach-O (an ELF on Linux): no claim either way.
+        std::fs::write(bin.join("rustc"), b"\x7fELF rustc").unwrap();
+        std::fs::write(bin.join("trustc"), b"\x7fELF trustc").unwrap();
+        let (ok, out, err) = run();
+        assert!(ok && healthy(&out), "{out}{err}");
+        assert!(!out.contains("trust build 8589:") && !err.contains("trust build 8589:"));
+
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (5f) THE LINK THE FIRST FIX LINE RECOMMENDED. tippy refuses a symbolic link for
+    /// either compiler file before comparing a byte — measured on a clone of 8589:
+    /// `rustc -> trustc`, relative or absolute, stops at "compiler rustc-compatible alias
+    /// `…/bin/rustc` is not a regular file or is a symlink/reparse point", a symlinked
+    /// `trustc` at "compiler trustc `…` is not a regular file…", and a hard link lints.
+    /// Following the link, the bytes are trustc's own, so a check that reads through it
+    /// sees identical files and said "healthy". The entry is judged as it sits in `bin/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_trust_compiler_is_a_tippy_that_cannot_run_though_its_bytes_match() {
+        let (l, home, path, bin) = tippy_sibling_store("tippy-symlink");
+        let trustc_bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
+        let (rustc, trustc) = (bin.join("rustc"), bin.join("trustc"));
+        std::fs::write(&trustc, &trustc_bytes).unwrap();
+        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
+        std::fs::write(bin.join("tippy-driver"), b"tippy-driver").unwrap();
+        let run = || whole_report(&l, &home, &path);
+        let lint_today = format!(
+            "; lint today with RUSTC_WORKSPACE_WRAPPER='{}' targo --unverified check …",
+            bin.join("tippy-driver").display()
+        );
+        let link_refusal = |path: &Path| {
+            format!(
+                "tippy cannot run — {} is a symbolic link, and tippy requires the selected \
+                 compiler trustc and its rustc-compatible alias rustc to be plain files, so \
+                 every tippy run stops at a setup error",
+                path.display()
+            )
+        };
+
+        // rustc -> trustc, relative then absolute: the same bytes, still refused, and the
+        // tippy-driver route still lints (measured), so it is offered.
+        for target in [PathBuf::from("trustc"), trustc.clone()] {
+            let _ = std::fs::remove_file(&rustc);
+            std::os::unix::fs::symlink(&target, &rustc).unwrap();
+            assert_eq!(std::fs::read(&rustc).unwrap(), trustc_bytes, "same bytes");
+            let (ok, out, err) = run();
+            assert_not_healthy_exit_0(ok, &out, &err);
+            let warn = tippy_warn(&out);
+            assert!(
+                warn.contains(&format!("{}{lint_today}", link_refusal(&rustc))),
+                "{warn}"
+            );
+        }
+
+        // No tippy in the bundle: a link refuses nothing, and the bytes match.
+        std::fs::remove_file(bin.join("tippy")).unwrap();
+        let (ok, out, _) = run();
+        assert!(
+            ok && healthy(&out) && !out.contains("tippy cannot run"),
+            "{out}"
+        );
+        std::fs::write(bin.join("tippy"), b"tippy").unwrap();
+
+        // A hard link: one plain file under two names, which lints. Nothing to say.
+        std::fs::remove_file(&rustc).unwrap();
+        std::fs::hard_link(&trustc, &rustc).unwrap();
+        let (ok, out, err) = run();
+        assert!(
+            ok && healthy(&out) && !out.contains("tippy cannot run"),
+            "{out}{err}"
+        );
+
+        // trustc the link and rustc the plain file: tippy names trustc, and tippy-driver
+        // refuses the same link (measured), so no lint-today route is offered.
+        std::fs::remove_file(&rustc).unwrap();
+        std::fs::write(&rustc, &trustc_bytes).unwrap();
+        std::fs::remove_file(&trustc).unwrap();
+        std::os::unix::fs::symlink("rustc", &trustc).unwrap();
+        let (ok, out, err) = run();
+        assert_not_healthy_exit_0(ok, &out, &err);
+        let warn = tippy_warn(&out);
+        assert!(
+            warn.contains(&format!("{} (the bundle's fix", link_refusal(&trustc))),
+            "{warn}"
+        );
+        assert!(!warn.contains("lint today"), "{warn}");
+        std::fs::remove_file(&trustc).unwrap();
+        std::fs::write(&trustc, &trustc_bytes).unwrap();
+
+        // A link to a different program: the FAIL, and the link named beside it.
+        let other = bin.join("other-rustc");
+        let mut other_bytes = trustc_bytes.clone();
+        other_bytes[crate::macho::tests::CODE_AT] ^= 0x01;
+        std::fs::write(&other, &other_bytes).unwrap();
+        std::fs::remove_file(&rustc).unwrap();
+        std::os::unix::fs::symlink(&other, &rustc).unwrap();
+        let (ok, out, err) = run();
+        assert!(!ok, "{out}{err}");
+        assert!(
+            err.contains(&format!(
+                "doctor: FAIL — trust build 8589: {} is not the same program",
+                rustc.display()
+            )),
+            "{err}"
+        );
+        assert!(tippy_warn(&out).contains(&link_refusal(&rustc)), "{out}");
+        assert!(out.contains("doctor: found 1 problem(s)"), "{out}");
+
+        // A dangling link: nothing to compare, and still a link tippy refuses.
+        std::fs::remove_file(&other).unwrap();
+        let (ok, out, err) = run();
+        assert_not_healthy_exit_0(ok, &out, &err);
+        assert!(
+            out.contains(
+                "doctor: warn — trust build 8589: could not compare its rustc with its trustc ("
+            ),
+            "{out}"
+        );
+        assert!(tippy_warn(&out).contains(&link_refusal(&rustc)), "{out}");
+
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (5f) reads the two compiler files whole, so the bound on that read is enforced
+    /// rather than assumed: a file over it — or one that is not a regular file — is not
+    /// compared, and says so; a missing entry is no claim at all.
+    #[test]
+    fn the_trust_sibling_read_is_bounded_and_only_of_regular_files() {
+        let dir = synthetic_home("tippy-bound");
+        let (rustc, trustc) = (dir.join("rustc"), dir.join("trustc"));
+        let bytes = crate::macho::tests::signed("trustc-5555494429441d12e5e3340fa96ce4b");
+        let len = bytes.len() as u64;
+        std::fs::write(&rustc, &bytes).unwrap();
+        std::fs::write(&trustc, &bytes).unwrap();
+
+        assert_eq!(
+            read_bounded(&rustc, len).unwrap(),
+            bytes,
+            "at the bound: read"
+        );
+        let over = read_bounded(&rustc, len - 1).unwrap_err();
+        assert_eq!(
+            over,
+            format!(
+                "{}: {len} bytes, over the {}-byte bound this check reads",
+                rustc.display(),
+                len - 1
+            )
+        );
+        let found = trust_siblings(&rustc, &trustc, len).unwrap();
+        assert_eq!(
+            (found.rustc, found.trustc, found.verdict),
+            (
+                SiblingFile::Plain,
+                SiblingFile::Plain,
+                Ok(crate::macho::Modulo::Identical)
+            )
+        );
+        let found = trust_siblings(&rustc, &trustc, len - 1).unwrap();
+        assert_eq!(found.verdict, Err(over), "over the bound: not compared");
+        const {
+            assert!(
+                TRUST_SIBLING_READ_LIMIT >= 336_192 * 16,
+                "the bound sits well above the measured 336 192 bytes"
+            )
+        };
+
+        // A directory where rustc should be: not a regular file, never opened as one.
+        std::fs::remove_file(&rustc).unwrap();
+        std::fs::create_dir(&rustc).unwrap();
+        assert_eq!(
+            read_bounded(&rustc, len).unwrap_err(),
+            format!("{}: not a regular file", rustc.display())
+        );
+        let found = trust_siblings(&rustc, &trustc, len).unwrap();
+        assert_eq!(found.rustc, SiblingFile::NotAFile);
+        assert!(found.verdict.is_err(), "{found:?}");
+
+        // No rustc at all: nothing to say.
+        std::fs::remove_dir(&rustc).unwrap();
+        assert!(trust_siblings(&rustc, &trustc, len).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

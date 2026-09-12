@@ -828,22 +828,48 @@ pub fn build_in_progress(dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|lock| lock_is_held(lock))
 }
 
-/// Whether someone else holds `flock(2)` on `lock` right now.
+/// How long a lock may read as held before the probe believes it is a build's. A
+/// build holds `.cargo-lock` for seconds to hours; a hold this short is not one.
+///
+/// The short hold that exists: an `flock` lives on the OPEN FILE DESCRIPTION, and a
+/// process that spawns a child duplicates every descriptor into it for the window
+/// between the fork and the exec that closes the `CLOEXEC` copies — so a lock the
+/// holder has just closed stays held until the child of ANY thread in that process
+/// has exec'd. Measured 2026-09-12 on the unit test that holds a lock in-process
+/// beside 30 sibling tests that spawn `git`: under a full gate's load, 2 of 13 runs
+/// saw a lock still held one call after its owner dropped it. The window is
+/// milliseconds; the patience is a hundred, polled every ten, and the LAST reading
+/// is the verdict — a build that takes the lock mid-window is still caught, a copy
+/// that closes mid-window is not mistaken for one.
+const LOCK_PROBE_PATIENCE: std::time::Duration = std::time::Duration::from_millis(100);
+const LOCK_PROBE_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Whether someone else holds `flock(2)` on `lock` — for longer than
+/// [`LOCK_PROBE_PATIENCE`], which is what distinguishes a build from a spawn window.
 #[cfg(unix)]
 fn lock_is_held(lock: &Path) -> bool {
     use std::os::unix::io::AsRawFd as _;
     let Ok(file) = std::fs::OpenOptions::new().read(true).open(lock) else {
         return false;
     };
-    // SAFETY: flock on a valid open descriptor; LOCK_NB makes it return at once.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // SAFETY: releasing the lock this probe just took on the same descriptor.
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        return false;
+    let deadline = std::time::Instant::now() + LOCK_PROBE_PATIENCE;
+    loop {
+        // SAFETY: flock on a valid open descriptor; LOCK_NB makes it return at once.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // SAFETY: releasing the lock this probe just took on the same descriptor.
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return false;
+        }
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK)) {
+            return false;
+        }
+        if std::time::Instant::now() >= deadline {
+            return true;
+        }
+        std::thread::sleep(LOCK_PROBE_STEP);
     }
-    let err = std::io::Error::last_os_error();
-    matches!(err.raw_os_error(), Some(libc::EWOULDBLOCK))
 }
 
 #[cfg(not(unix))]

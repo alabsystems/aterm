@@ -9372,7 +9372,6 @@ mod split_capture_tests {
         let term = app.pool.get(focus).expect("focused pane").term.clone();
         term_lock(&term).process(b"\x1b[11;3Hkitty\x1b[4;31H");
         app.splice_word_decorations(wid, t0 + Duration::from_millis(16));
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(616));
         let ambient = |app: &App| {
             let resident = captured_resident_body_for_test(app, wid);
             app.windows[&wid]
@@ -9386,21 +9385,45 @@ mod split_capture_tests {
                 .map(|sprite| (sprite.x, sprite.y, sprite.w, sprite.h))
                 .collect::<Vec<_>>()
         };
-        let ambient_before = ambient(&app);
+        // The resident WALKS to the relocated caret. It used to be standing
+        // there one frame after the jump because the console layer teleported
+        // it (`pet_position_authority.rs` now pins that it may not), so the
+        // negative arm is read at the frame the walk has actually ended and
+        // the far word's kitty has settled — measured, not assumed from a
+        // timestamp. The bound makes a cat that never comes home a failure
+        // rather than a hang.
+        let (cw, _) = app.win_cell_size(wid);
+        let far = |app: &App, ambient: &[(i32, i32, u16, u16)]| {
+            app.windows[&wid].pet_hit_rect.is_some()
+                && ambient.len() == 1
+                && ambient[0].0 + i32::from(ambient[0].2) + 10 * (cw as i32)
+                    < captured_resident_body_for_test(app, wid).x
+        };
+        let mut at = Duration::from_millis(16);
+        let mut ambient_before = Vec::new();
+        while at < Duration::from_secs(8) {
+            at += Duration::from_millis(16);
+            app.splice_word_decorations(wid, t0 + at);
+            if app.windows[&wid].pet_hit_rect.is_some() {
+                ambient_before = ambient(&app);
+                if far(&app, &ambient_before) {
+                    break;
+                }
+            }
+        }
         assert_eq!(
             ambient_before.len(),
             1,
             "negative control: the isolated far word has one settled ambient kitty"
         );
-        let (cw, _) = app.win_cell_size(wid);
         assert!(
-            ambient_before[0].0 + i32::from(ambient_before[0].2) + 10 * (cw as i32)
-                < captured_resident_body_for_test(&app, wid).x,
-            "the ambient word is geographically distinct from the cursor resident"
+            far(&app, &ambient_before),
+            "the ambient word is geographically distinct from the cursor resident \
+             (the resident had {at:?} to walk home)"
         );
 
         term_lock(&term).process(b"\x1b[?25l\x1b[11;3H");
-        app.splice_word_decorations(wid, t0 + Duration::from_millis(632));
+        app.splice_word_decorations(wid, t0 + at + Duration::from_millis(16));
         {
             let term = term_lock(&term);
             assert!(!term.cursor_visible());

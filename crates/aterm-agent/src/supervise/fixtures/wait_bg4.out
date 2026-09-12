@@ -1,0 +1,30 @@
+== DONE iters=78 auto_approved=0 ==
+  Wall-clock replicates stay deferred, the machine is still not quiet.
+⏺ Committing site 1 first, then starting the site-A scouting: an isolation measurement of the arms with sweeping off and deterministic
+  compaction on (to see whether backward merging is then the only divergence on sets A and E), and reading the
+  backward-merge ordering path.
+  Ran 3 shell commands
+⏺ Site 1 is committed. With the sweeper off and deterministic compaction on, set A still diverges (378,277 vs 424,346), pointing to site
+  A as the next root cause—I'll dig into its ordering path to fix it. · summarized
+  Searched for 1 pattern, ran 11 shell commands
+⏺ I've confirmed the replace path writes the merged entry before the old delete, and that merge.dropped is only counted, not acted
+  on, in the loop I reviewed. Next I'll dig into the raw stats text, clarify dropped vs expired in backward.rs, check if the old
+  batched path still exists, and see if the log checker can validate the small set B and C logs. · summarized
+  Ran 3 shell commands
+⏺ Next I'll apply the site-A edit (drop the audit-output condition, keep the strict log gated, document the order) and build it, then
+  in parallel time the log checker on the 115 MB set A log and prepare the small-trace check list. · summarized
+  Ran 5 shell commands
+⏺ While the build runs, I'll kick off the baseline small-trace run (27 tiny traces, both audit postures, log checker) and
+  check the log checker's timing on the set A log. · summarized
+  Ran 3 shell commands
+⏺ I'll mark the five malformed traces with bad headers as not-applicable, and check which traces actually exercise backward
+  merging, while the site-A build remains pending. · summarized
+  Ran 3 shell commands
+⏺ Waiting for the site-A build (17 crates recompiled so far, now on the last dependents before the final link). I'll run the gates the
+  moment it lands; nothing else is independent of it right now.
+✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage                                                                      /rc active
+exit=0

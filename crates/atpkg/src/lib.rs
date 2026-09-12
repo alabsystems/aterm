@@ -100,6 +100,9 @@ pub mod installer_pkg;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
+/// Two thin 64-bit Mach-O files compared modulo their code signatures — how `doctor`
+/// tells one program under two ad-hoc signatures from two programs.
+mod macho;
 pub mod manifest;
 mod metadata_io;
 pub mod net;

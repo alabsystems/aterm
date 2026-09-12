@@ -1,0 +1,30 @@
+== DONE iters=95 auto_approved=0 ==
+  └──────────┴──────────────────────────────────────┴─────────────────────────────────────┴────────┴─────────────────┴────────────────┘
+  Every number equals the baseline binary's, arm for arm. Prefetch never runs on sets A, B and C, and on set E the audit arm's two
+  rounds find no warm entry, so the new path is exercised only by the two new unit tests (the log carries the warmed entry, the strict
+  log carries a non-empty hint chain); 13 prefetch tests pass. The diff sits uncommitted on audit-parity (114 insertions, 26
+  deletions).
+  Where the arms actually diverge first, measured from the counters:
+  - Sets B and C: key interning runs in the plain arm (4 groups, 1 merged key) and is skipped under any audit surface
+    (config_intern.rs:387). It has no audit route, so this is by design and stays unless audited.
+  - Sets A and E: backward merging inside compaction is gated on !has_audit_output (compact/body.rs:729) because of a log
+    ordering bug, not a logical limit (constants.rs:1091 says the technique is sound); 69 and 492 entries merged in the plain
+    arm versus 0 under audit, then 403 vs 361 evictions and 3 vs 2 compaction runs downstream.
+  - The sweeper: 1 and 3 runs in the plain arm, 0 under audit (capability None), which is site 3.
+  - The post-merge compaction reschedule refuses under audit with no stated reason (compaction_schedule.rs:853).
+  - Wall clocks: with the existing --deterministic-compaction switch the plain arm is unchanged on set A while the audit arm moves
+    from 385,057 to 424,346 misses, so the shipped route's eviction depends on host load. The determinism module already replaces the
+    compaction round, backfill and sweeper walls with tick budgets but is off by default and does not cover the seven compaction
+    wall consumers that site 2 targets. On these sets those walls are never reached (compaction takes milliseconds), so site 2 cannot
+    move this gate either.
+  Recommendation: take the backward-merge ordering fix first (write the merged entry before the delete, then un-gate), since it
+  is the first divergence on the two large sets and the audit-lens refuter of the earlier workflow independently arrived at the same
+  target; then site 2 plus flipping deterministic compaction on in both arms; then the sweeper. Key interning will keep sets B and C
+  from full parity regardless, so the gate needs either an interning audit or an exemption for that pass.
+  Waiting for your call.
+✻ Sautéed for 50m 35s · done 10:57 AM
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                                                                         /rc active
+exit=0

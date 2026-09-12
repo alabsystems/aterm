@@ -13,7 +13,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crate::supervise::{
-    self, EXIT_TIMEOUT, Session, SuperviseOpts, classify_command_with, render_phase, worker_phase,
+    self, EXIT_TIMEOUT, Session, SuperviseOpts, classify_command_with, exit_reason, render_phase,
+    worker_phase,
 };
 use crate::{ControlClient, CtlClient, DRIVE_HELP, RelayClient, SelfGovernor, Turn};
 
@@ -393,9 +394,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         }
         Err(e) => {
             eprintln!("aterm-drive: {e}");
+            if let Some(line) = watch_exit_line(&opts.cmd, &e) {
+                println!("{line}");
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `EXIT <reason>` line `watch` ends on when it fails before its loop
+/// runs — a flag of its own it cannot parse, no host to reach — so a harness
+/// that reads its stdout line by line learns why from the last line, as it
+/// does when the loop fails: the error's first line.
+fn watch_exit_line(cmd: &[String], err: &str) -> Option<String> {
+    (cmd.first().map(String::as_str) == Some("watch"))
+        .then(|| format!("EXIT {}", exit_reason(err.lines().next().unwrap_or(err))))
 }
 
 fn run(opts: &Opts) -> Result<Reply, String> {
@@ -509,15 +522,24 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         "supervise" => {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
             no_positionals(verb, &sub)?;
-            let sopts = SuperviseOpts {
-                auto_reads: sub.auto_reads,
-                max: Duration::from_secs(sub.max_s.unwrap_or(DEFAULT_MAX_S)),
-                python_allow: sub.allow_python.clone(),
-                notes: sub.notes.clone(),
-            };
+            let sopts = supervise_opts(&sub);
             let mut session = Session::new(&mut client, sub.sid);
             let (text, code) = session.supervise(&sopts)?;
             Ok(Reply { text, code })
+        }
+        // The same loop, one flushed stdout line per decision, for a harness
+        // monitor that wakes its agent per line; it prints as it goes, so the
+        // reply carries only the exit code.
+        "watch" => {
+            let sub = parse_sub(verb, &opts.cmd[1..])?;
+            no_positionals(verb, &sub)?;
+            let sopts = supervise_opts(&sub);
+            let mut session = Session::new(&mut client, sub.sid);
+            let code = session.watch(&sopts, &mut std::io::stdout().lock());
+            Ok(Reply {
+                text: String::new(),
+                code,
+            })
         }
         "await" => {
             if opts.cmd.len() < 2 {
@@ -541,15 +563,25 @@ fn run(opts: &Opts) -> Result<Reply, String> {
         }
         other => Err(format!(
             "unknown command '{other}'. Valid: prompt | read | await | shot | classify | phase | \
-             await-turn | supervise | help.\n  \
+             await-turn | supervise | watch | help.\n  \
              Run `aterm-drive --help` for the full guide."
         )),
     }
 }
 
-/// `supervise`'s default budget: the longest a worker is left unattended
-/// before the manager is told (30 min — the rate-limit wait the owner chose).
+/// `supervise`'s and `watch`'s default budget: the longest a worker is left
+/// unattended before the manager is told (30 min — the rate-limit wait the
+/// owner chose).
 const DEFAULT_MAX_S: u64 = 1800;
+
+fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
+    SuperviseOpts {
+        auto_reads: sub.auto_reads,
+        max: Duration::from_secs(sub.max_s.unwrap_or(DEFAULT_MAX_S)),
+        python_allow: sub.allow_python.clone(),
+        notes: sub.notes.clone(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -687,6 +719,54 @@ mod tests {
         assert!(err.contains("--max-s needs a seconds integer"), "{err}");
         let err = parse_sub("supervise", &args(&["--notes"])).expect_err("missing");
         assert!(err.contains("--notes needs a FILE"), "{err}");
+    }
+
+    /// `watch` takes supervise's flags, into the same options.
+    #[test]
+    fn watch_parses_supervises_flags_into_the_same_options() {
+        let sub = parse_sub(
+            "watch",
+            &args(&[
+                "@s-1e918c46",
+                "--auto-reads",
+                "--notes",
+                "notes.txt",
+                "--allow-python",
+                "tools/*.py",
+                "--max-s",
+                "7200",
+            ]),
+        )
+        .expect("parses");
+        assert!(no_positionals("watch", &sub).is_ok());
+        assert_eq!(sub.sid.as_deref(), Some("@s-1e918c46"));
+        assert_eq!(
+            supervise_opts(&sub),
+            SuperviseOpts {
+                auto_reads: true,
+                max: Duration::from_secs(7200),
+                python_allow: args(&["tools/*.py"]),
+                notes: Some(PathBuf::from("notes.txt")),
+            }
+        );
+        let sub = parse_sub("watch", &args(&[])).expect("parses");
+        assert_eq!(supervise_opts(&sub).max, Duration::from_secs(DEFAULT_MAX_S));
+        let err = parse_sub("watch", &args(&["--every", "5"])).expect_err("unknown flag");
+        assert!(err.contains("watch: unknown option '--every'"), "{err}");
+        // A failure before the loop is an `EXIT` line on stdout too.
+        assert_eq!(
+            watch_exit_line(&args(&["watch", "--every", "5"]), &err),
+            Some(format!("EXIT {}", err.lines().next().expect("a line")))
+        );
+        assert_eq!(
+            watch_exit_line(
+                &args(&["watch"]),
+                "cannot reach a target aterm over the control socket (refused).\n  • Is a host aterm running?"
+            )
+            .as_deref(),
+            Some("EXIT cannot reach a target aterm over the control socket (refused).")
+        );
+        assert_eq!(watch_exit_line(&args(&["supervise"]), &err), None);
     }
 
     fn prompt_opts(socket: String) -> Opts {

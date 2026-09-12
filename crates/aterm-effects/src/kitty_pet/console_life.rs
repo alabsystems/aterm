@@ -1417,6 +1417,25 @@ impl PetBrain {
         world.under_text_clearance_past_caret(rect, margin) == Some(true)
     }
 
+    /// MUST THIS BODY MOVE? THE SAME READING, ASKED THE OTHER WAY ROUND.
+    ///
+    /// [`Self::console_may_stand`] is the question CHOOSING a station asks,
+    /// and being fail-closed is right for it: an unknown place is not a
+    /// place to park a cat. This asks about a body that ALREADY EXISTS
+    /// somewhere, and fail-closed is the wrong default there. `None` from
+    /// the three-valued reading means the rectangle left the observed
+    /// coverage window — a window centred on the caret that SLIDES AS THE
+    /// USER TYPES — so a walking cat leaves it constantly, and a placement
+    /// pass that counted that as obstruction would recall the cat
+    /// constantly. That is a bound on this map returned as a fact about the
+    /// terminal, the same defect class the visibility hold was fixed for.
+    ///
+    /// Only a POSITIVE observation of a protected surface moves a body that
+    /// is already standing somewhere.
+    fn console_must_yield(world: &PetWorld, rect: PetRect) -> bool {
+        world.under_text_clearance_past_caret(rect, 0.0) == Some(false)
+    }
+
     /// THE ESCORT'S OWN STATION, CORRECTED ONLY WHERE THE LADDER IS BLIND.
     ///
     /// This layer used to REPLACE the baseline station: it took the caret's
@@ -1534,11 +1553,16 @@ impl PetBrain {
         )
     }
 
-    /// Cursor home and protected cells constrain every emitted body, including
-    /// a pose hold or flight. Resolve a moved caret with one bounded local
-    /// placement, preserving the full body and alpha. Translate the existing
-    /// motion coordinates together so the next tick cannot restore an old
-    /// output perch. Ordinary ink permits residency; protected surfaces yield.
+    /// PROTECTED CELLS constrain every emitted body, including a pose hold
+    /// or a flight: a body standing on a selection, an image or a row with
+    /// no certified projection steps aside with one bounded LOCAL
+    /// placement, preserving the full body and its alpha. Ordinary ink
+    /// permits residency; only a protected surface yields.
+    ///
+    /// The caret's home is deliberately NOT a constraint here — see the
+    /// guard below. When the step-aside does happen the existing motion
+    /// coordinates are translated with it, or the next tick's lerp would
+    /// restore the body to the protected spot it was just moved off.
     fn place_console_body_at_home(&mut self, frame: &mut PetFrame, sense: PetSense) {
         if self.console.clipped || frame.alpha == 0 {
             return;
@@ -1559,33 +1583,44 @@ impl PetBrain {
             return;
         };
         let Some(rect) = rect_of(*frame) else { return };
-        let home = self
-            .console_caret_home(sense, rect.cols)
-            .map(|home| PetRect {
-                row: (home.foot_row() + 1.0 - rect.rows).clamp(
-                    CLEARANCE,
-                    (f32::from(sense.rows) - rect.rows - CLEARANCE).max(CLEARANCE),
-                ),
-                rows: rect.rows,
-                ..home
-            });
-        // A BODY ALREADY WHERE IT MAY BE STAYS THERE, and the caret's own
-        // keep-off ring is not a reason to move it. [`STATION_LEAD`] seats
-        // the escort one cell past the caret — inside that 3x3 ring by
-        // construction — so the strict reading refused the escort's own
-        // station on every frame and relocated a WALKING cat to a perch
-        // clear of the ring, two cells further out. That relocation, not
-        // the search below it, is half of the standoff the owner reported.
-        // Everything the strict reading actually protects — a selection, an
-        // image, a row with no certified projection — still relocates here,
-        // and the DESTINATION search below stays strict, so the pet can
-        // still never be PARKED on the cursor.
-        if Self::near_console_home(rect, home) && Self::console_may_stand(world, rect, 0.0) {
+        // THE CONSOLE LAYER IS NOT A SECOND OPINION ABOUT POSITION.
+        //
+        // This guard used to read `near_console_home(rect, home) &&
+        // console_may_stand(world, rect, 0.0)`, and its `home` was the
+        // caret's own console home. So a body further than [`HOME_REACH`]
+        // from the caret was TELEPORTED to it: in one frame, over whatever
+        // the escort or a live flight was doing, on every emitted frame.
+        //
+        // Two writers then owned the same body with different targets and
+        // neither read the other. The escort closes distance at a walking
+        // pace — that pace IS the animal — and this closed the same
+        // distance instantly, so the escort walked the body back out and
+        // this yanked it home again, about eleven times a second for as
+        // long as a command printed into a screen that was not yet full.
+        // That is the owner's "it keeps jumping out and then looping back",
+        // and it is why every measured snap-back landed at exactly
+        // `caret + STATION_LEAD + HOME_BREATHING_ROOM`: the pull was this
+        // function's destination, not anywhere the escort ever chose.
+        //
+        // DISTANCE FROM THE CARET IS THE ESCORT'S BUSINESS and it is
+        // already covered twice over: the escort's chase follows the caret
+        // under the shipped speed law, and the resident's own handoff in
+        // [`Self::tick_console_resident`] resigns residency when the body
+        // is no longer near home rather than fighting for it. What is left
+        // here is the one correction the escort genuinely cannot make,
+        // because the ink ladder knows about GLYPHS and nothing else: a
+        // body standing on a selection, an image, or a row with no
+        // certified cell-to-pixel projection.
+        if !Self::console_must_yield(world, rect) {
             return;
         }
-        let Some(safe) =
-            world.nearest_under_text_perch(home.unwrap_or(rect), CLEARANCE, HOME_REACH)
-        else {
+        // AND IT STEPS ASIDE — it does not go home. The shortest move off
+        // the protected surface is the whole of what this layer owes.
+        // Searching from the caret's home instead would re-import the
+        // teleport under another name, and would carry
+        // [`HOME_BREATHING_ROOM`]'s two cells of standoff with it — the
+        // same two cells the escort restoration took off the station.
+        let Some(safe) = world.nearest_under_text_perch(rect, CLEARANCE, HOME_REACH) else {
             self.console.clipped = true;
             self.console.reason = "protected-home-unavailable";
             return;
@@ -2244,9 +2279,17 @@ mod tests {
             PetAttention::Exploring,
             "fixture: the surviving anchor is the content perch"
         );
-        // Let the perch trip finish, then hold the screen perfectly still.
-        for _ in 0..40 {
+        // Let the pet ARRIVE, then hold the screen perfectly still. It walks
+        // there on its own feet — the console layer no longer teleports a
+        // body to a perch, so the arrival costs real frames — and the dwell
+        // deliberately measures SETTLED time, so it cannot start until the
+        // walk and its trip are over. Waiting on the pet itself keeps this
+        // budget honest whatever the gait costs.
+        for _ in 0..240 {
             s.frame(0.016);
+            if !s.pet.console.moving && !s.pet.needs_frames() {
+                break;
+            }
         }
         assert!(
             s.pet.needs_frames() || s.pet.next_change_deadline(s.now).is_some(),
@@ -2254,7 +2297,13 @@ mod tests {
         );
         // …and that future is its own life: the perch is spent, so the pet
         // goes back to escorting the caret and running the idle ladder.
-        for _ in 0..(3 * 62) {
+        //
+        // The budget is DERIVED from the bound it is testing. Written out as
+        // `3 * 62` frames it was 2.976 s — SHORT of [`PERCH_DWELL`] — and
+        // passed only on slack donated by a console layer that teleported
+        // the body to its perch instead of letting the pet walk there. A
+        // test for a 3.0 s bound has to run past 3.0 s on its own.
+        for _ in 0..((PERCH_DWELL / 0.016).ceil() as usize + 2) {
             s.frame(0.016);
         }
         assert_eq!(

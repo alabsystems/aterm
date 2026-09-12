@@ -1212,8 +1212,8 @@ struct ProbeRow {
     tonality: f64,
     voices: usize,
     /// How many onsets the gesture's own body carries by the scene table's
-    /// detector ([`SCENE_ONSET`]), over the gesture's DIFFERENCE signal (see
-    /// [`probe`]).
+    /// detector ([`SCENE_ONSET`]), over the gesture's DIFFERENCE signal taken
+    /// before the bus limiter (see [`probe`]).
     onsets: usize,
     /// THE FINE CENSUS (§8 step 4's proof): the same body counted by
     /// [`FINE_ONSET`], on the rows it is valid for. A capital used to read
@@ -1247,6 +1247,19 @@ struct Probe {
 /// lift arriving 30-100 ms ahead of the capital it precedes.
 const CAPITAL_SHIFT_LEAD_MS: usize = 60;
 
+/// One gesture's takes: its row, and the four monos the row was scored on.
+struct Take {
+    row: ProbeRow,
+    /// The SHIPPING BUS, `with` the gesture and `without` it — the reel, and
+    /// the level and spectrum columns.
+    bus_with: Vec<f32>,
+    bus_alone: Vec<f32>,
+    /// The same two takes with §9.7's bus limiter out of circuit — the ONSET
+    /// census's domain (see [`probe`]).
+    pre_with: Vec<f32>,
+    pre_alone: Vec<f32>,
+}
+
 /// One gesture alone, from one settled melody state, measured as a
 /// DIFFERENCE: the settled synth is rendered twice, once with the gesture
 /// pushed and once left alone, and the row is scored on `with − without`.
@@ -1260,7 +1273,30 @@ const CAPITAL_SHIFT_LEAD_MS: usize = 60;
 /// is part of what the key did. The reel keeps the raw `with` render, which
 /// is what the ear hears.
 ///
-/// Returns the row and the raw render of the gesture's segment.
+/// THE ONSET CENSUS IS TAKEN BEFORE THE BUS LIMITER. `with − without` is
+/// "the gesture's own contribution" only through a LINEAR bus, and the bus
+/// has one stage with memory: §9.7's peak limiter (−14 dBFS ceiling, 0.5 ms
+/// attack, 80 ms release). Over the ceiling its gain moves a strike's
+/// envelope by about a decibel inside the strike's first 15 ms — a dip on
+/// the peak's window and a recovery on the next — and the fine census, whose
+/// rise ratio is a decibel ([`FINE_ONSET`]), counted that recovery as a
+/// strike no key minted. Measured 2026-09-12 (`--dump-probes`, the two
+/// domains censused side by side): at host volume 1.0 the `Capital` row's
+/// limiter gain — the bus take's RMS window over the unlimited take's — was
+/// 1.0000 through the letter's first window, 0.921 on its 69.3 ms window and
+/// 0.946 on the 72.0 ms one, so the bus difference rose ×1.135 there where
+/// the unlimited difference rose ×1.105, and the row read 3 onsets at 1.0
+/// (+0, +58.7, +72.0 ms) against 2 at 0.4 — a level-dependent count, which
+/// no count of events can be. The row's peak is −12.6 dBFS before the
+/// limiter (−13.0 after), over the ceiling; `Typed`'s −14.3 sits under it,
+/// which is why that row never showed it. So both takes are rendered
+/// TWICE: once on the shipping bus, for the reel and the level and spectrum
+/// columns (a −6 dB law and a centroid law are about what reaches the ear),
+/// and once with the limiter out ([`TrailSynth::set_bus_limiter`]) for the
+/// onset columns, which count what the instrument minted. `soft_clip` stays
+/// in on both: memoryless and compressive, it can only lower a rise ratio.
+///
+/// Returns the row and the four takes.
 fn probe(
     p: &Probe,
     voice: SoundVoice,
@@ -1268,7 +1304,7 @@ fn probe(
     volume: f32,
     seed: u32,
     timbre: Timbre,
-) -> (ProbeRow, Vec<f32>) {
+) -> Take {
     let ev = |kind, shifted| SoundEvent {
         style,
         voice,
@@ -1302,9 +1338,10 @@ fn probe(
     // settling keys are three unhurried notes — but only if the engine is
     // reading a real clock. Unstamped they collapse onto the block clock and
     // the probe is measured from a state the shipping engine never reaches.
-    let settled = || {
+    let settled = |limiter: bool| {
         let mut synth = TrailSynth::new(SR as f32, seed);
         synth.set_v2_timbre_stops(timbre.stops());
+        synth.set_bus_limiter(limiter);
         let mut warm = vec![0.0f32; 16_384 * CHANNELS];
         for i in 0..3 {
             synth.push_meta(ev(SoundKind::Typed, false), stamp(i * 16_384));
@@ -1319,30 +1356,38 @@ fn probe(
             .collect()
     };
 
-    // WITH the gesture. The lift, when the row carries one, is its own cue
-    // at the segment's first frame; the gesture lands CAPITAL_SHIFT_LEAD_MS
-    // of rendered audio later, stamped that much later, exactly as two host
-    // pushes would arrive.
-    let mut synth = settled();
-    let mut stereo = vec![0.0f32; frames * CHANNELS];
-    let t0 = 3 * 16_384;
-    let mut at = 0usize;
-    if p.lift {
-        synth.push_meta(ev(SoundKind::Shift, false), stamp(t0));
-        at = SR as usize * CAPITAL_SHIFT_LEAD_MS / 1000;
-        synth.render(&mut stereo[..at * CHANNELS]);
-    }
-    synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at));
-    let voices = synth.live_voices();
-    synth.render(&mut stereo[at * CHANNELS..]);
-    let raw = to_mono(&stereo);
+    // The pair of takes, on the bus as given.
+    let takes = |limiter: bool| -> (Vec<f32>, Vec<f32>, usize) {
+        // WITH the gesture. The lift, when the row carries one, is its own
+        // cue at the segment's first frame; the gesture lands
+        // CAPITAL_SHIFT_LEAD_MS of rendered audio later, stamped that much
+        // later, exactly as two host pushes would arrive.
+        let mut synth = settled(limiter);
+        let mut stereo = vec![0.0f32; frames * CHANNELS];
+        let t0 = 3 * 16_384;
+        let mut at = 0usize;
+        if p.lift {
+            synth.push_meta(ev(SoundKind::Shift, false), stamp(t0));
+            at = SR as usize * CAPITAL_SHIFT_LEAD_MS / 1000;
+            synth.render(&mut stereo[..at * CHANNELS]);
+        }
+        synth.push_meta(ev(p.kind, p.shifted), stamp(t0 + at));
+        let voices = synth.live_voices();
+        synth.render(&mut stereo[at * CHANNELS..]);
+        let raw = to_mono(&stereo);
 
-    // WITHOUT it: the same settled synth left to ring.
-    let mut quiet = settled();
-    let mut alone = vec![0.0f32; frames * CHANNELS];
-    quiet.render(&mut alone);
-    let alone = to_mono(&alone);
-    let mono: Vec<f32> = raw.iter().zip(&alone).map(|(a, b)| a - b).collect();
+        // WITHOUT it: the same settled synth left to ring.
+        let mut quiet = settled(limiter);
+        let mut alone = vec![0.0f32; frames * CHANNELS];
+        quiet.render(&mut alone);
+        (raw, to_mono(&alone), voices)
+    };
+    let difference =
+        |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(a, b)| a - b).collect() };
+    let (bus_with, bus_alone, voices) = takes(true);
+    let (pre_with, pre_alone, _) = takes(false);
+    let mono = difference(&bus_with, &bus_alone);
+    let body = difference(&pre_with, &pre_alone);
 
     let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     // Score the gesture's own body: onset to 250 ms past it.
@@ -1351,7 +1396,8 @@ fn probe(
     let (centroid, hi) = spectrum(&mono, start, end);
     // The onset census over the whole half second: a second sound anywhere
     // behind the key — an echo, a lift, a tap — counts against the gesture.
-    let count = |law| onsets(&mono, 0, mono.len(), law).len();
+    // Counted BEFORE the bus limiter (see above): events, not the ceiling.
+    let count = |law| onsets(&body, 0, body.len(), law).len();
     let row = ProbeRow {
         name: p.label.to_string(),
         peak_db: db(f64::from(peak)),
@@ -1363,7 +1409,13 @@ fn probe(
         onsets: count(SCENE_ONSET),
         fine: p.census.then(|| count(FINE_ONSET)),
     };
-    (row, raw)
+    Take {
+        row,
+        bus_with,
+        bus_alone,
+        pre_with,
+        pre_alone,
+    }
 }
 
 /// The gesture probes, back to back with 400 ms of air between them — the
@@ -1375,10 +1427,10 @@ fn probe_reel(
     volume: f32,
     seed: u32,
     timbre: Timbre,
-) -> (Vec<ProbeRow>, Vec<f32>, Vec<Cue>) {
+) -> (Vec<Take>, Vec<f32>, Vec<Cue>) {
     let gap = vec![0.0f32; SR as usize * 2 / 5];
     let mut reel = Vec::new();
-    let mut rows = Vec::new();
+    let mut takes = Vec::new();
     // Each probe's gesture fires on the FIRST frame of its own segment (a
     // row with a lift: the Shift there, the gesture CAPITAL_SHIFT_LEAD_MS
     // on), so the reel's click track is exact rather than detected.
@@ -1399,12 +1451,12 @@ fn probe_reel(
             at += CAPITAL_SHIFT_LEAD_MS as f32 / 1000.0;
         }
         marks.push(mark(at, SoundGesture::Trail(p.kind), p.shifted));
-        let (row, mono) = probe(p, voice, style, volume, seed, timbre);
-        reel.extend_from_slice(&mono);
+        let take = probe(p, voice, style, volume, seed, timbre);
+        reel.extend_from_slice(&take.bus_with);
         reel.extend_from_slice(&gap);
-        rows.push(row);
+        takes.push(take);
     }
-    (rows, reel, marks)
+    (takes, reel, marks)
 }
 
 /// The gestures the probe table and the reel cover, in reel order. `Capital`
@@ -1655,6 +1707,34 @@ fn wav_bytes(mono: &[f32], click: &[f32]) -> Vec<u8> {
         let r = click.get(i).copied().unwrap_or(0.0);
         w.extend_from_slice(&l.to_le_bytes());
         w.extend_from_slice(&r.to_le_bytes());
+    }
+    w
+}
+
+/// An ALIGNED float WAV: every channel on the same clock from frame 0 — no
+/// pre-roll, no click — so a reader can subtract one from another sample for
+/// sample. `--dump-probes` writes the gesture takes this way.
+fn wav_aligned(chans: &[&[f32]]) -> Vec<u8> {
+    let n = chans.len();
+    let frames = chans.iter().map(|c| c.len()).max().unwrap_or(0);
+    let data_len = (frames * n * 4) as u32;
+    let mut w = Vec::with_capacity(44 + data_len as usize);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data_len).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&3u16.to_le_bytes());
+    w.extend_from_slice(&(n as u16).to_le_bytes());
+    w.extend_from_slice(&SR.to_le_bytes());
+    w.extend_from_slice(&(SR * (n as u32) * 4).to_le_bytes());
+    w.extend_from_slice(&((n * 4) as u16).to_le_bytes());
+    w.extend_from_slice(&32u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    for i in 0..frames {
+        for c in chans {
+            w.extend_from_slice(&c.get(i).copied().unwrap_or(0.0).to_le_bytes());
+        }
     }
     w
 }
@@ -2182,7 +2262,7 @@ fn usage() -> ! {
         "keyboard_song_ab <out_dir> [--tag <name>] [--voice <name>] [--style <name>]\n\
         \x20   [--cps <rate>] [--jitter <pct>] [--seed <n>] [--bed on|off]\n\
         \x20   [--timbre plain|bloom|hue|room] [--jitterfix ship|j0|j1] [--metronome]\n\
-        \x20   [--census] [--probes]"
+        \x20   [--census] [--probes] [--dump-probes]"
     );
     std::process::exit(2)
 }
@@ -2200,6 +2280,7 @@ fn main() {
     let mut timbre = Timbre::Room;
     let mut timbre_named = false;
     let mut want_probes = false;
+    let mut dump_probes = false;
     // **J1 IS WHAT SHIPS, SO IT IS WHAT THE BENCH RENDERS** (the panel's Q3
     // ruling, 2026-09-09; §9). The host already sets
     // `EventMeta::block_lead_s` on every `push_meta`
@@ -2315,6 +2396,7 @@ fn main() {
             }
             "--census" => want_census = true,
             "--probes" => want_probes = true,
+            "--dump-probes" => dump_probes = true,
             "--metronome" => metronome = true,
             "-h" | "--help" => usage(),
             other if other.starts_with("--") => {
@@ -2353,7 +2435,7 @@ fn main() {
 
     std::fs::create_dir_all(&out).expect("out dir");
     if want_probes {
-        probe_tables(&out, &tag, voice, style, seed, timbre);
+        probe_tables(&out, &tag, voice, style, seed, timbre, dump_probes);
         return;
     }
 
@@ -2538,7 +2620,7 @@ fn main() {
         );
     }
 
-    probe_tables(&out, &tag, voice, style, seed, timbre);
+    probe_tables(&out, &tag, voice, style, seed, timbre, dump_probes);
 }
 
 /// THE GESTURE PROBE TABLE AND REEL, at both volumes — one gesture alone from
@@ -2551,6 +2633,7 @@ fn probe_tables(
     style: GlowStyle,
     seed: u32,
     timbre: Timbre,
+    dump: bool,
 ) {
     for volume in [0.4f32, 1.0] {
         println!("\n== gesture probes (isolated, vol {volume}) ==");
@@ -2566,7 +2649,8 @@ fn probe_tables(
             "onsets",
             "fine"
         );
-        let (probes, reel, marks) = probe_reel(voice, style, volume, seed, timbre);
+        let (takes, reel, marks) = probe_reel(voice, style, volume, seed, timbre);
+        let probes: Vec<&ProbeRow> = takes.iter().map(|t| &t.row).collect();
         for p in &probes {
             println!(
                 "{:<12} {:>8.2} {:>8.2} {:>9.0} {:>8.3} {:>9.1} {:>6} {:>6} {:>5}",
@@ -2650,6 +2734,34 @@ fn probe_tables(
                 } else {
                     "outside §3.3's 1250-1400 Hz window, under the 1600 Hz ceiling"
                 }
+            );
+        }
+        if dump {
+            // THE TAKES THEMSELVES, for an instrument other than this one:
+            // per gesture, the `with` take on the LEFT and the `without` take
+            // on the RIGHT, sample-aligned (no pre-roll, no click), once on
+            // the shipping bus and once with the limiter out — so a reader
+            // can subtract them and take any census it likes on either
+            // domain, and hear with/without as an A/B.
+            for t in &takes {
+                for (domain, with, alone) in [
+                    ("bus", &t.bus_with, &t.bus_alone),
+                    ("pre", &t.pre_with, &t.pre_alone),
+                ] {
+                    let path = out.join(format!(
+                        "{tag}-probe-{}-v{volume:.1}-{domain}.wav",
+                        t.row.name
+                    ));
+                    std::fs::File::create(&path)
+                        .and_then(|mut f| f.write_all(&wav_aligned(&[with, alone])))
+                        .expect("probe dump");
+                }
+            }
+            println!(
+                "wrote {}/{tag}-probe-<gesture>-v{volume:.1}-{{bus,pre}}.wav — each take, \
+                 L = with the gesture, R = without, aligned; `bus` is the shipping render, \
+                 `pre` the same with the bus limiter out (the onset census's domain)",
+                out.display()
             );
         }
         let path = out.join(format!("{tag}-gestures-v{volume:.1}.wav"));

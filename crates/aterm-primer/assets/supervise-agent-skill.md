@@ -71,8 +71,8 @@ are a discipline, not a sandbox.
 Keep a durable **notes file** with what a fresh copy of you needs to resume:
 objective, worker sid + socket, the ground-truth command, budget remaining, and
 one line per action taken. That file — not your context window — is your memory
-across restarts. Point `aterm drive supervise --notes` at the same file: it
-appends one UTC-stamped line per approval or hand-off.
+across restarts. Point `aterm drive supervise --notes` (or `watch --notes`) at the
+same file: it appends one UTC-stamped line per approval or hand-off.
 
 ## The loop
 
@@ -89,24 +89,38 @@ mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm
 
 2. **CLASSIFY** — one read, one word:
    ```sh
-   aterm drive phase "@$SID"       # busy | prompt | idle | question — for a prompt the parsed box follows
+   aterm drive phase "@$SID"       # busy | prompt | limited | idle | question — for a prompt the parsed box follows
    ```
    After `prompt` come `kind bash|edit|write|read|workflow|other`, `command <line>`,
    `description <text>`, `classify read-only` or `classify not-read-only <reason>` (Bash
-   only), one `option N <text>` per option, and `cancel esc|none`. `busy` is measured from
-   the spinner row, the `esc to interrupt` footer, `Still working`, a waiting workflow, or
-   a background shell still running — in auto mode the footer says nothing, so the spinner
-   row is the signal — and a prompt wins over busy (a worker blocked on a box cannot
-   proceed however many shells its footer counts). `question` = the last thing it said,
-   above the composer, ends in `?`. Manual form: `aterm ctl "@$SID" text tail=40` (an
-   older build answers `ERR usage` — read the full `text`) and this table:
+   only), one `option N <text>` per option, and `cancel esc|none`. `busy` is read only
+   from the LIVE ZONE around Claude Code's composer: the status row — the lowest row above
+   its top rule that starts with a spinner glyph, before any transcript row; a tip, a todo
+   list, a hint, the session survey or a banner under it never hides it — when it is a
+   spinner, `Waiting for N …` a workflow or a background agent, or a done row still
+   counting a shell; and the footer under its bottom rule (`esc to interrupt`, `· N
+   shell(s) ·`, a workflow's `◯ … agents done`). A monitor still running (`· N monitor(s)
+   ·`, `N monitor(s) still running`) is busy too, but soft: a question or a limit notice
+   outranks it, since a persistent monitor can run for as long as the worker lives. A
+   status row above the transcript is history, not a signal; `phase` prints `reason
+   <where>: <rule>` under `busy` so you can check which one fired. The footer does not
+   always say `esc to interrupt` while a turn runs, so the status row is the first signal
+   — and a prompt wins over busy (a worker blocked on a box cannot proceed however many
+   shells its footer counts). `limited` = its last turn ENDED on a usage or rate limit
+   notice: the last thing said above the composer is Claude Code's notice under the `⎿`
+   gutter (`message <text>` and `reset <text|->` follow) — never the worker's own words
+   about limits, and never a notice something was said after. `question` = the last
+   thing it said, above the composer, ends in `?`. Manual form:
+   `aterm ctl "@$SID" text tail=40` (an older build answers `ERR usage` — read the full
+   `text`) and this table:
 
    | you see | do |
    |---|---|
-   | `busy` — the spinner row, `esc to interrupt`, or a shell still running | WAIT — not a review point yet |
+   | `busy` — a live spinner or `Waiting for N …` row just above the composer, `esc to interrupt`, or a shell or monitor still running | WAIT — not a review point yet. A monitor alone is soft busy: a question or a limit notice under it reads `question` / `limited`, because a monitor can run for hours |
    | the busy indicator that *was* there is now gone | the turn finished → go REVIEW |
    | `prompt` — an approval box (`Do you want…`, `1. Yes / 2. No`, trust-folder prompt) | read WHAT it asks. Matches the task and is safe → approve GUARDED on a row the box shows: `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (the option's number, or `enter`); `OK skipped seq=<n>` = the box was already gone and nothing was pressed — re-CLASSIFY. Surprising, destructive, or off-task → deny (`key escape`) and redirect, or ESCALATE |
    | Claude Code's permission prompt: the command line, then `Do you want to proceed?` with numbered options — `1.` Yes (this once), `2.` Yes and don't ask again for a SCOPE (`git log *`, `allow reading from <dir>`), one option `switch to auto mode`, the last `No`; footer `Esc to cancel · Tab to amend` | classify the COMMAND LINE, not the box — the `classify` line `phase` printed, or `aterm drive classify '<command>'`. Read-only and the scope on option 2 is a read-only grant → option 2 (it removes a whole class of future prompts; see *Auto-approving reads*). A write or delete → judge that one command; option 1 at most, never the scope grant. **Never pick `switch to auto mode` unless the human said so.** Off-task or unsafe → `key escape` and redirect, or ESCALATE |
+   | `limited` — its last turn ended on a usage or rate limit notice (`You've hit your session limit · resets 7:30pm`) | the worker cannot act until the limit resets or its model is switched; anything you send it fails. Decide per the human's policy — wait for `reset`, switch with `/model`, or ESCALATE — and never keep driving into the wall |
    | `question` — a prose question, composer idle | answer it with a `turn`, from your notes |
    | `idle` — nothing running, no box, no question | the turn is over → go REVIEW |
    | a non-TUI worker (build/script/REPL) still streaming output (`phase` running) | WAIT — for these, completion is a returned shell prompt or `phase=exited`, at which point go REVIEW via the **exit code + expected artifacts**, not a busy indicator |
@@ -163,7 +177,7 @@ mechanical steps (`aterm drive --help`, *SUPERVISING A WORKER*); an older `aterm
    `--timeout` is milliseconds (default: the global `--timeout`, 180000). Inside it is
    `await gone esc.to.interrupt` as the first wait where the host has it, else `await idle
    2000` → read → `await seq <seq>` — never a sleep — in 20 s steps against the deadline,
-   returning the moment the screen is `prompt`, `idle` or `question`. Exit 124 is an
+   returning the moment the screen is `prompt`, `limited`, `idle` or `question`. Exit 124 is an
    answer — still busy — not an error. Manual form:
    ```sh
    aterm ctl "@$SID" await gone esc.to.interrupt timeout=600000   # OK gone <seq> = turn finished | OK timeout = still busy
@@ -197,15 +211,55 @@ WAIT and the read-only half of CLASSIFY in one process: it runs `await-turn`; wi
 press → re-read and backspace a digit that landed in the composer — one line `approved
 read-only: <command>` goes to `--notes`, and the loop continues. **Anything else stops it
 with exit 0 — your review point**: a write prompt, an Edit/Write/workflow box, a question,
-an idle composer, or a read-only command coming back after it was approved twice (`handed
+a limit notice, an idle composer, or a read-only command coming back after it was approved twice (`handed
 to the manager (<why>): <command>` in the notes). It prints the `phase` lines, a `--` line,
-then the prompt box verbatim or the last 28 non-blank rows. `TIMEOUT` / exit 124 after
-`--max-s` (seconds, default 1800) with the worker still busy. `--allow-python GLOB`
+then the prompt box verbatim or the last 28 non-blank rows. `TIMEOUT` / exit 124, then the
+last read's lines, once `--max-s` (seconds, default 1800) is spent — nothing is pressed
+after it. `--allow-python GLOB`
 (repeatable) widens the python rule; the default globs are `scripts/*standing*.py`,
 `scripts/*report*.py`, `scripts/*score*.py`. Without `--auto-reads` every prompt is yours.
 It presses option 1 only — never the scope grant, never auto mode — and never types text:
 REVIEW, drive the next `turn`, call it again. Its `--max-s` bounds ONE call's wall clock;
 the drive budget below is still yours to count.
+
+### Let the harness wake you: `aterm drive watch`
+
+```sh
+aterm drive watch "@$SID" --auto-reads --notes "$NOTES"   # under your harness's background monitor
+```
+
+When your harness can run a long-lived command in the background and wake you once per
+line it prints (Claude Code's Monitor tool, a supervisor process), run `watch` there
+instead of relaunching `supervise` after every review: you are woken only at decision
+points, and between them the worker is still being watched. It is `supervise`'s loop,
+except that a review point prints one line and the loop keeps going.
+
+- **Each `EVENT <phase> seq=<n> <summary>` line is a review point** — `prompt` with
+  `kind=… classify=… command=…`, `question`/`idle` with the last row the worker said,
+  `limited` with `message=… reset=…`. REVIEW it exactly as above, then act with
+  `aterm ctl "@$SID" turn …` or `aterm ctl "@$SID" key if=Do.you.want.to.proceed 1` (or
+  `key escape`). `watch` picks your action up by itself: it waits for the screen to move
+  past the point it reported before it looks again. A point that looks like the last one
+  it reported — the same summary and status row, the same last transcript rows up to it,
+  the same box — is not reported again unless, in between, it saw the worker busy or
+  approved a read; a new box, a new reply, your own `turn` or a retry's new notice
+  changes those rows, so a retried command or a second edit to one file is a new EVENT
+  however quick the worker was. An identical screen that the worker somehow reached
+  again is the one case it stays quiet about: if a line you expected does not come,
+  `aterm drive phase` it.
+- **`APPROVED seq=<n> <command>` lines are the audit trail** of what it waved through —
+  the same reads `supervise --auto-reads` approves, noted in `--notes` too.
+- **A `limited` EVENT means the worker cannot act** until its limit resets (`reset=` says
+  when, if the notice did) or its model is switched. Decide per the human's policy.
+- **A worker without Claude Code's composer** (a build, a REPL) gets an EVENT each time
+  its output pauses for 2 s and its last rows changed — for a build you are only waiting
+  on, `aterm drive await-turn` or `aterm ctl "@$SID" await block` is the better tool.
+- `TIMEOUT` (exit 124, once `--max-s` is spent, default 1800 — nothing is pressed or
+  reported after the deadline) or `EXIT <reason>` (exit 1) is its last line: `EXIT
+  session gone (…)` when the session ended, otherwise a request or the notes file failed,
+  or — before the loop ran — one of its flags or the host (the error is on stderr too).
+  Relaunch it or escalate. Like `supervise` it presses option 1 only and never types
+  text.
 
 ### Auto-approving reads
 

@@ -1122,19 +1122,53 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      handed to awk and sed), every danger token anywhere fails it,
                      every segment — a wrapper like xargs/env seen through, a `&`
                      splitting like `;` — must start a known read
-  phase [@sid]       one read, one word: busy | prompt | idle | question — for a
-                     prompt, the parsed box follows (kind, command, options)
+  phase [@sid]       one read, one word: busy | prompt | limited | idle | question
+                     — a prompt's parsed box follows (kind, command, options);
+                     busy adds `reason <where>: <rule>`; limited adds `message
+                     <text>` and `reset <text|->`. With the composer on the
+                     screen, busy is read around it only: the status row — the
+                     lowest row above its top rule that starts with a spinner
+                     glyph, before any transcript row (a tip, a hint, the survey
+                     between never hide it): a spinner, `Waiting for N …`, a
+                     shell still running — and the footer under its bottom rule
+                     (`esc to interrupt`, `· N shell(s) ·`, …). A monitor still
+                     running is busy too, but a question or a limit notice
+                     outranks it. A status row above the transcript is history;
+                     without the composer, every row counts. Limited: the last
+                     thing said above the composer is a usage or rate limit
+                     notice under the `⎿` gutter (or the footer shows one) — the
+                     worker's own words about limits never count — and what you
+                     send it fails until the limit resets or its model is
+                     switched
   await-turn [@sid] [--timeout MS]
-                     block until the phase is no longer busy (the spinner row,
-                     the busy footer and any background shell all gone), then
-                     print it like `phase`; exit 124 on the timeout
+                     block until the phase is no longer busy (the live status
+                     row and the busy footer both quiet; a screen without the
+                     composer, once its output pauses), then print it like
+                     `phase`; exit 124 on the timeout
   supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
                      the loop: await-turn; with --auto-reads a Bash prompt whose
                      command is read-only is approved (option 1, guarded: a
                      skipped guard is not an approval, and the box must leave
                      before the next look) and noted; anything else — a write, a
-                     workflow, a question, an idle composer — is printed and the
-                     tool exits 0 for YOUR review; TIMEOUT / exit 124 after --max-s
+                     workflow, a question, a limit notice, an idle composer — is
+                     printed and the tool exits 0 for YOUR review; TIMEOUT / exit
+                     124, with the last read, once --max-s is spent (nothing is
+                     pressed after it)
+  watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
+                     supervise's loop that never exits at a review point: it
+                     prints ONE line — `EVENT <phase> seq=<n> <summary>` — and
+                     keeps watching, looking again once the screen has moved past
+                     that point, so your turn or key is picked up by itself; a
+                     point that looks like the last one (the same summary, the
+                     same last transcript rows, the same box) is not repeated
+                     unless it saw the worker busy or approved a read in
+                     between; each approval prints `APPROVED seq=<n>
+                     <command>`; TIMEOUT / exit 124 once --max-s (default 1800)
+                     is spent, `EXIT <reason>` / exit 1 when the session ends,
+                     a request or the notes file fails, or a flag or the host
+                     fails before the loop. Run it under your harness's
+                     background monitor:
+                       aterm drive watch @s-… --auto-reads --notes notes.txt
 
   aterm drive --help       every flag
   aterm help introspection the control protocol underneath

@@ -1,0 +1,22 @@
+== TIMEOUT iters=90 auto_approved=0 ==
+  run the deferred wall-clock replicates: sets C and E, one at a time, 3 replicates each, site D versus baseline, in the shipped
+  audit posture, and report wall seconds and requests per second with the spread. Then write a handoff for the owner in
+  reports/audit-parity: what is on the branch commit by commit, the gate each passed, the open items with the deterministic
+  default flip and the interning audit marked as owner decisions needing the big box, and the recommended merge path. Commit the
+  handoff. Then stop and wait.
+⏺ Starting the deferred wall-clock replicates now (sets C and E, one at a time, three replicates each, site D against the baseline
+  binary, shipped audit posture, orders alternated), then the handoff.
+  Ran 2 shell commands
+⏺ While the replicates run, I'm drafting the handoff notes—commit history, gates, and open items flagging the two owner decisions—and
+  will append the replicate results table once the numbers come in. · summarized
+  Ran 2 shell commands
+⏺ Handoff drafted (commit table, gates, open items with the two owner decisions marked as needing the big box, merge path); the
+  replicate table is the only part still open. The set C runs are in progress on the quiet box; I'll append the numbers and commit
+  when the script reports done.
+✻ Cogitated for 1m 30s · done 1:03 PM · 1 shell still running
+                                                                  get pinged when Claude finishes · enable push notifications in /config
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── sandboxed ─
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage                                                                      /rc active
+exit=124
