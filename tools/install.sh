@@ -2944,8 +2944,11 @@ cli_path_hint() {
 # publishes nothing for, or a lapsed horizon, `seed-pending:` for
 # [packages].seed_install = false, and a plain note when a previous
 # `uninstall --all` declined the set). So a non-zero exit here is a REAL
-# failure and nothing else, and the config knobs keep their meaning instead of
-# being second-guessed in shell.
+# failure — with ONE exception, exit 75 (atpkg's contention code, 2026-09-10):
+# the app is already open and its own launch-time pass holds the store lock,
+# which is the app doing this function's job; the script stands down and says
+# so — and the config knobs keep their meaning instead of being second-guessed
+# in shell.
 install_toolchain() {
 	local aterm_bin
 	aterm_bin="$BIN_DIR/aterm"
@@ -2975,7 +2978,15 @@ install_toolchain() {
 		# was simply false.
 		echo "install.sh: checking the ALab toolset (aterm pkg seed — installs from the network index when builds exist for this machine)"
 	fi
-	if ! "$aterm_bin" pkg seed; then
+	local rc=0
+	"$aterm_bin" pkg seed || rc=$?
+	if [[ $rc -eq 75 ]]; then
+		# The app's own pass holds the store lock (the window opened during
+		# this script and started installing): not a failure, and nothing
+		# for this script to retry — that pass finishes the job.
+		echo "install.sh: the app is already installing the ALab toolset (another atpkg process holds the store lock) — nothing to do here; it finishes on its own" >&2
+		return 0
+	elif [[ $rc -ne 0 ]]; then
 		# NON-FATAL, and say why that is the right call: the terminal is
 		# installed and working, and `aterm pkg seed` is re-runnable at any
 		# time. Failing the whole install here would throw away a good app
@@ -2995,7 +3006,11 @@ install_toolchain() {
 	# is fetched, and an offline machine simply keeps the sealed builds.
 	echo "install.sh: bringing the toolset up to the latest published builds"
 	echo "  only out-of-date programs are downloaded; the rest are already current."
-	if ! "$aterm_bin" pkg update; then
+	rc=0
+	"$aterm_bin" pkg update || rc=$?
+	if [[ $rc -eq 75 ]]; then
+		echo "install.sh: the app's own update pass is running (another atpkg process holds the store lock) — it brings the toolset current" >&2
+	elif [[ $rc -ne 0 ]]; then
 		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
 		# "the sealed builds are installed and usable" was only true on the
 		# macOS DMG path — a lean/zip/Linux install has no seal, and a seed
