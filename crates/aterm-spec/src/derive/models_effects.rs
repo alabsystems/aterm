@@ -1593,6 +1593,16 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///   cells real presses banked, an admitted multi-cell coalesce PAYS for its
 ///   ribbon, a starved one pays nothing and stays dark, and retiring a stale
 ///   stamp never refunds cells to fund a second stray sweep (`credit_refunded`).
+/// * A press is IN FLIGHT until its row echoes or an observed edge forgets it
+///   (2026-09-12, the stall): with no stamp fresh, two or more unpaid presses
+///   license the row's late echo as one batch (`InFlightBatchEchoMintsLight`);
+///   a keyless move the echo shape refuses forgets them
+///   (`UnexplainedHopForgetsCredits`), so a swallowed press never licenses a
+///   later batch (`phantom_admitted`) and the pool a forget leaves is empty
+///   until the next press. The mutant is the patience that does not forget.
+///   The model is clockless: the patience's BOUND (`PatienceElapses`) is a
+///   forget like any other here, and its number is pinned by the engine's
+///   own tests, not by `ty`.
 /// * The slimmed diagnosis ring cannot lie to `ctl trail`: every spawn scores
 ///   exactly one of `licensed`/`declined`, and a `licensed` row means light was
 ///   actually minted.
@@ -1626,8 +1636,19 @@ pub fn cursor_hint_license_model() -> Model {
             // Moves that passed the licence seam (one per consumed arm).
             var admissions = 0;
             // The press CREDIT budget (`RainbowState::type_press_ring`).
+            // THE IN-FLIGHT LAW (2026-09-12, the stall): the unpaid pool is
+            // `credit_arms - spent - forfeited` — presses whose glyphs have
+            // not been laid AND that no observed edge has forgotten. A
+            // press is in flight until its row echoes (spent, by the cells
+            // it lays) or a move it cannot explain forgets it (forfeited);
+            // `just_forgot` says the last spawn was such an edge with no
+            // press since, and `phantom_admitted` witnesses a batch licensed
+            // out of a pool an edge had already forgotten.
             var credit_arms = 0;
             var spent = 0;
+            var forfeited = 0;
+            var just_forgot = 0;
+            var phantom_admitted = 0;
             var coalesce_births = 0;
             // Light: minted this run, and earned light already on glass.
             var births = 0;
@@ -1644,6 +1665,18 @@ pub fn cursor_hint_license_model() -> Model {
             var swallow_admitted = 0;
             var wiped = 0;
             var credit_refunded = 0;
+            // THE DELIVERED INSERT (2026-09-10, "the image insert breaks the
+            // rainbow"): a paste's write is QUEUED on the session FIFO and
+            // lands later on the writer thread. `write_pending` is that
+            // queued write; `insert_hint` is the insert's own licence slot
+            // (0 absent, 1 fresh, 2 stale — its own class, never `hint`);
+            // `insert_undelivered` marks a live insert arm minted at ENQUEUE,
+            // before the bytes landed — the shape the seam refuses.
+            var write_pending = 0;
+            var insert_hint = 0;
+            var insert_undelivered = 0;
+            // Witness: an insert echo admitted on an arm minted before delivery.
+            var undelivered_admitted = 0;
 
             // A press arms the licence and banks one cell credit. The stamp is
             // ONE SLOT: a press over a live stamp supersedes it (the older arm
@@ -1655,6 +1688,86 @@ pub fn cursor_hint_license_model() -> Model {
                 arms = arms + 1;
                 credit_arms = credit_arms + 1;
                 swallowed = 0;
+                just_forgot = 0;
+            }
+            // THE PASTE IS QUEUED: enqueue is not delivery, so the completed
+            // arm is nothing yet (the host's arrival-time gesture stamp is
+            // revoked in the same turn — `SwallowedKeyClearsLicense`'s shape).
+            // `Buggy=1` keeps an arm at enqueue: a licence for bytes that
+            // have not provably landed, spendable by concurrent program
+            // output.
+            action PasteEnqueues when (write_pending == 0 && arms <= ArmCap - 1) {
+                write_pending = 1;
+                superseded = if Buggy == 1 && insert_hint == 1 {
+                    superseded + 1
+                } else {
+                    superseded
+                };
+                insert_hint = if Buggy == 1 { 1 } else { insert_hint };
+                insert_undelivered = if Buggy == 1 { 1 } else { insert_undelivered };
+                arms = if Buggy == 1 { arms + 1 } else { arms };
+            }
+            // THE WRITER THREAD'S COMPLETED WRITE: the bytes are on the wire,
+            // and THAT arms the insert licence — one slot, the supersede
+            // shape. Its width is its OWN credit, carried on the stamp and
+            // spent with it, never a press credit in the typed ring
+            // (`credit_arms` is the typed budget the coalesce share reads).
+            action WriteCompletesArmsInsertLicence when (
+                write_pending == 1 && arms <= ArmCap - 1
+            ) {
+                write_pending = 0;
+                superseded = if insert_hint == 1 { superseded + 1 } else { superseded };
+                insert_hint = 1;
+                insert_undelivered = 0;
+                arms = arms + 1;
+            }
+            // The insert window elapses: set, no longer fresh.
+            action InsertLicenceExpires when (insert_hint == 1) {
+                insert_hint = 2;
+                expired = expired + 1;
+            }
+            action RetireStaleInsertLicence when (insert_hint == 2) {
+                insert_hint = 0;
+            }
+            // THE INSERT'S ECHO: one same-row forward hop, laid as one sweep,
+            // spending the stamp (its width goes with it). `Buggy=1` leaves
+            // the stamp live after consuming it, so one delivery funds every
+            // hop that follows — caught by the disposition conservation.
+            action LicensedInsertEchoMintsLight when (
+                insert_hint == 1 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                insert_hint = if Buggy == 1 { 1 } else { 0 };
+                consumed = consumed + 1;
+                admissions = admissions + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
+                undelivered_admitted = if insert_undelivered == 1 {
+                    1
+                } else {
+                    undelivered_admitted
+                };
+            }
+            // A stale insert stamp is not a licence either (the typed
+            // `StaleStampMoveDeclines`, restated for the delivered class).
+            action StaleInsertStampDeclines when (
+                insert_hint == 2 && hint == 0 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                stale_admitted = if Buggy == 1 { 1 } else { stale_admitted };
+                births = if Buggy == 1 { births + 1 } else { births };
+                resident = if Buggy == 1 { 1 } else { resident };
+                licensed_tally = if Buggy == 1 {
+                    licensed_tally + 1
+                } else {
+                    licensed_tally
+                };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
             }
             // A resize settle or a TUI repaint blink. Live, and never a licence.
             action MorphologyStampArrives when (morphology == 0) {
@@ -1707,7 +1820,7 @@ pub fn cursor_hint_license_model() -> Model {
             // for a second stray sweep. `Buggy=1` paints the ribbon for free.
             action AdmitCoalesceSpendsCredits when (
                 hint == 1 && coalesce_births == 0 && spawns <= MoveCap - 1
-                    && credit_arms - spent > CoalesceCells - 1
+                    && credit_arms - spent - forfeited > CoalesceCells - 1
             ) {
                 spawns = spawns + 1;
                 hint = 0;
@@ -1724,15 +1837,20 @@ pub fn cursor_hint_license_model() -> Model {
             // vim's `w` is one press echoing as a multi-cell hop. It stays dark
             // and pays nothing; the ring names `no-credits`. `Buggy=1` bills the
             // budget it could not afford AND tells `ctl trail` it painted.
+            // A `no-credits` refusal is an UNEXPLAINED HOP too (2026-09-12):
+            // whatever the pool held did not describe this move, and it is
+            // forgotten with the refusal.
             action StarvedCoalesceDeclines when (
                 hint == 1 && spawns <= MoveCap - 1
-                    && credit_arms - spent <= CoalesceCells - 1
+                    && credit_arms - spent - forfeited <= CoalesceCells - 1
             ) {
                 spawns = spawns + 1;
                 hint = 0;
                 consumed = consumed + 1;
                 admissions = admissions + 1;
                 spent = if Buggy == 1 { spent + CoalesceCells } else { spent };
+                forfeited = if Buggy == 1 { forfeited } else { credit_arms - spent };
+                just_forgot = 1;
                 licensed_tally = if Buggy == 1 {
                     licensed_tally + 1
                 } else {
@@ -1744,10 +1862,63 @@ pub fn cursor_hint_license_model() -> Model {
                     declined_tally + 1
                 };
             }
+            // THE IN-FLIGHT BATCH (2026-09-12, the stall — the owner's "I t"
+            // screenshot): no stamp is fresh (absent, or stale in place — the
+            // row stayed silent past the window), and the LEDGER licenses the
+            // echo: at least two unpaid presses whose glyphs have not been
+            // laid. The batch spends them. The stale stamps are NOT consumed
+            // (the real bank pops only fresh ones). `Buggy=1` is the mutant
+            // of `UnexplainedHopForgetsCredits` reaching here: a pool an
+            // unexplained hop should have forgotten licenses the batch, and
+            // `phantom_admitted` witnesses it.
+            action InFlightBatchEchoMintsLight when (
+                (hint == 0 || hint == 2) && coalesce_births == 0 && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited > CoalesceCells - 1
+            ) {
+                spawns = spawns + 1;
+                spent = spent + CoalesceCells;
+                coalesce_births = coalesce_births + 1;
+                admissions = admissions + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
+                phantom_admitted = if just_forgot == 1 { 1 } else { phantom_admitted };
+            }
+            // AN UNEXPLAINED HOP FORGETS THE CREDITS (2026-09-12): a keyless
+            // move the echo shape refuses — backward, cross-row, a row change
+            // no key licensed, a forward hop the share rule refused. The
+            // presses in flight did not describe it, so they are forgotten
+            // with the refusal: a swallowed press (a pager's `q`, a password,
+            // a modal) can never roll forward as a phantom credit. THE
+            // MUTANT (`Buggy=1`) is a patience that does not forget — the
+            // pool survives the hop, and the next batch shape licenses it.
+            action UnexplainedHopForgetsCredits when (
+                (hint == 0 || hint == 2) && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited > 0
+            ) {
+                spawns = spawns + 1;
+                declined_tally = declined_tally + 1;
+                forfeited = if Buggy == 1 { forfeited } else { credit_arms - spent };
+                just_forgot = 1;
+            }
+            // THE BOUND: the in-flight patience elapses with the row still
+            // silent — the presses are forgotten by the clock. A bounds
+            // action, not a design claim: the model has no clock, so it
+            // cannot say WHEN (the red unit tests pin the number); it says
+            // only that the bound is a forget like any other.
+            action PatienceElapses when (credit_arms - spent - forfeited > 0) {
+                forfeited = credit_arms - spent;
+            }
             // THE COLD MOVE: program output nobody's fingers asked for. No
             // stamp at all. `Buggy=1` is the pre-licence seam — v0.43.0's tick,
-            // which spawned on every presented cursor delta.
-            action ColdMoveDeclines when (hint == 0 && spawns <= MoveCap - 1) {
+            // which spawned on every presented cursor delta. With two or more
+            // presses in flight a keyless move is never merely cold: it is
+            // the batch's echo or an unexplained hop, and those two actions
+            // own it.
+            action ColdMoveDeclines when (
+                hint == 0 && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited <= CoalesceCells - 1
+            ) {
                 spawns = spawns + 1;
                 cold_admitted = if Buggy == 1 { 1 } else { cold_admitted };
                 births = if Buggy == 1 { births + 1 } else { births };
@@ -1768,6 +1939,7 @@ pub fn cursor_hint_license_model() -> Model {
             // wipes the ribbon, invisibly to the ring. That wipe is the darkness.
             action ColdMoveOverEarnedLight when (
                 hint == 0 && resident == 1 && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited <= CoalesceCells - 1
             ) {
                 spawns = spawns + 1;
                 resident = if Buggy == 1 { 0 } else { 1 };
@@ -1804,8 +1976,13 @@ pub fn cursor_hint_license_model() -> Model {
                 };
             }
             // A move whose stamp is SET but stale. The window, not the field.
+            // One press whose echo never came is indistinguishable from a
+            // stamp that went stale (`AStaleStampIsNotALicence`); two or
+            // more in flight are a batch, and `InFlightBatchEchoMintsLight`
+            // owns that shape.
             action StaleStampMoveDeclines when (
                 hint == 2 && spawns <= MoveCap - 1
+                    && credit_arms - spent - forfeited <= CoalesceCells - 1
             ) {
                 spawns = spawns + 1;
                 stale_admitted = if Buggy == 1 { 1 } else { stale_admitted };
@@ -1829,9 +2006,23 @@ pub fn cursor_hint_license_model() -> Model {
             invariant ASwallowedKeyNeverLicences: swallow_admitted == 0;
             invariant DeclinedMovesNeverDestroyEarnedLight: wiped == 0;
             invariant SpentCreditsNeverComeBack: credit_refunded == 0;
+            // THE IN-FLIGHT LAW'S TWO CLAIMS (2026-09-12): a press an
+            // unexplained hop forgot never licenses a later batch, and the
+            // pool such a hop leaves behind is empty until the next press.
+            // Each is falsified alone by the mutant that keeps the credits
+            // across the hop (`UnexplainedHopForgetsCredits` at `Buggy=1`).
+            invariant AForgottenPressNeverLicences: phantom_admitted == 0;
+            invariant ForgottenCreditsNeverReturn:
+                just_forgot == 0 || credit_arms - spent - forfeited == 0;
+            // An insert licence is minted by the COMPLETED WRITE and nothing
+            // else: enqueue arms nothing, so no insert echo is ever admitted
+            // on an arm from before the bytes landed.
+            invariant AnInsertLicenceIsMintedOnlyByACompletedWrite:
+                undelivered_admitted == 0;
             invariant EveryArmReachesExactlyOneDisposition:
                 arms == consumed + expired + cleared + superseded
-                    + (if hint == 1 { 1 } else { 0 });
+                    + (if hint == 1 { 1 } else { 0 })
+                    + (if insert_hint == 1 { 1 } else { 0 });
             invariant PairedAdmissionsNeverExceedArms: admissions <= arms;
             invariant SpentCreditsNeverExceedArmed: spent <= credit_arms;
             invariant ACoalesceRibbonIsPaidFor:
@@ -1845,10 +2036,13 @@ pub fn cursor_hint_license_model() -> Model {
                 licensed_tally + declined_tally == spawns;
             invariant StateBounded:
                 hint <= 2 && morphology <= 1 && swallowed <= 1 && arms <= ArmCap
+                    && write_pending <= 1 && insert_hint <= 2 && insert_undelivered <= 1
+                    && undelivered_admitted <= 1
                     && consumed <= ArmCap && expired <= ArmCap
                     && cleared <= ArmCap && superseded <= ArmCap
                     && admissions <= MoveCap && credit_arms <= ArmCap
                     && spent <= ArmCap + CoalesceCells && coalesce_births <= 1
+                    && forfeited <= ArmCap && just_forgot <= 1 && phantom_admitted <= 1
                     && births <= MoveCap && resident <= 1 && spawns <= MoveCap
                     && licensed_tally <= MoveCap && declined_tally <= MoveCap
                     && cold_admitted <= 1 && stale_admitted <= 1
@@ -1869,8 +2063,9 @@ pub fn cursor_hint_license_model() -> Model {
 /// KEY — the press whose clock the host's sweep for the move carries:
 /// `older` (presses banked before that key, whose glyphs lie in the hole),
 /// `younger` (the key and the presses still in flight behind it, whose glyphs
-/// lie at and past `from`), `stale` (presses past `ECHO_PATIENCE_S`, which the
-/// next move drops as swallowed). `hole` is the caret's unlicensed advance
+/// lie at and past `from`), `stale` (presses past `ECHO_PATIENCE_S` — the
+/// host's in-flight patience `IN_FLIGHT_PATIENCE_S` by alias since 2026-09-12
+/// — which the next move drops as swallowed). `hole` is the caret's unlicensed advance
 /// since the mirror — a late echo the seam refused, or program output; the
 /// engine cannot tell which, and that is the whole point: only the ledger can.
 ///
@@ -2094,7 +2289,8 @@ pub fn echo_ledger_bridge_model() -> Model {
             }
             // THE UNSWEPT ECHO: a licensed `Batch`-cell typed move the host
             // did not sweep — a non-coalesced re-anchor, or a batch its press
-            // credits (which age out at 2 s, `RAINBOW_COALESCE_CREDIT_LIFE`)
+            // credits (in flight for `IN_FLIGHT_PATIENCE_S`,
+            // `RAINBOW_COALESCE_CREDIT_LIFE` by alias)
             // could not pay for. With no key clock there is no partition:
             // only a move starting AT the mirror is attributed, to the oldest
             // presses, and every cell is laid.

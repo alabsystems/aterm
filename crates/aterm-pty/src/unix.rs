@@ -2745,6 +2745,46 @@ pub fn fd_is_tty(fd: i32) -> bool {
     rc == 0
 }
 
+/// The slave's ECHO / ICANON bits, read THROUGH THE MASTER — what the line
+/// discipline will do with the next byte a keypress writes into this PTY
+/// ([`crate::TtyEcho`]). `None` when `fd` is not a tty (a pipe sink, the `-1`
+/// sentinel, a closed fd): the caller then knows nothing and must keep its
+/// default behaviour.
+///
+/// WHY THE MASTER ANSWERS FOR THE SLAVE: a PTY pair has ONE termios — the
+/// slave's — and `tcgetattr` on either end reads it. On both the BSD and the
+/// Linux pty drivers the master's `TIOCGETA`/`TCGETS` is routed to the slave
+/// tty's struct, which is the fact `spawned_pty_carries_iutf8_and_b230400`
+/// (below, in the test module) proves end-to-end: it spawns `sleep`, reads the
+/// master, and sees the IUTF8 + B230400 the spawn seam set on the SLAVE. The
+/// same route carries a program's own `tcsetattr` on the slave — `read -s`
+/// clearing ECHO, a TUI clearing ICANON — back to this read, which the
+/// `tty_echo_*` tests below measure with real children.
+///
+/// One `ioctl`, no allocation, no blocking: cheap enough to run at every
+/// typed key. The read is a snapshot — a program can flip the mode between
+/// this call and the write that follows — so a consumer must treat it as
+/// evidence about the press, never as a lock on the tty.
+#[must_use]
+pub fn tty_echo(fd: i32) -> Option<crate::TtyEcho> {
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `libc::termios` is a plain struct of integer fields and a `c_cc`
+    // byte array; an all-zeros bit pattern is a valid, fully-initialized value.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` may be any integer; `tcgetattr` fails cleanly (rc != 0,
+    // EBADF/ENOTTY) on a bad or non-tty fd and fills `t` on success.
+    let rc = unsafe { libc::tcgetattr(fd, &mut t) };
+    if rc != 0 {
+        return None;
+    }
+    Some(crate::TtyEcho {
+        echo: t.c_lflag & libc::ECHO != 0,
+        canonical: t.c_lflag & libc::ICANON != 0,
+    })
+}
+
 /// Read up to `buf.len()` bytes from the PTY master into `buf`. Returns the number
 /// of bytes read (`0` = EOF, `< 0` = error, per `read(2)`).
 pub fn read(master: i32, buf: &mut [u8]) -> isize {
@@ -6025,6 +6065,149 @@ mod tests {
         unsafe {
             libc::close(master);
         }
+    }
+
+    /// Spawn `argv` on a fresh PTY (the real spawn seam, so the child's own
+    /// `tcsetattr` on the SLAVE is what the master read sees) and return
+    /// the master. Test-only helper for the `tty_echo_*` tests.
+    fn spawn_on_pty(argv: &[&str]) -> i32 {
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let exec: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+        let master = spawn_shell(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None, // shell_override
+            None, // shell_args
+            None, // argv_override
+            Some(&exec),
+            None,
+            None,
+        )
+        .expect("child must spawn");
+        assert!(master >= 0);
+        master
+    }
+
+    /// Poll [`tty_echo`] on `master` until `want` answers `true` or ~5 s pass
+    /// (a `/bin/sh -c 'stty …; sleep 5'` child needs a few ms to reach its
+    /// `stty`). Returns the last reading either way so a failure names it.
+    fn wait_tty_echo(master: i32, want: impl Fn(crate::TtyEcho) -> bool) -> Option<crate::TtyEcho> {
+        let mut last = None;
+        for _ in 0..500 {
+            last = tty_echo(master);
+            if last.is_some_and(&want) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        last
+    }
+
+    /// THE MASTER REPORTS THE SLAVE'S ECHO/ICANON — the fact the rainbow's
+    /// "a press the tty will not echo banks no credit" law rides on
+    /// (2026-09-12, the `read -s` half of the swallowed-press residual).
+    ///
+    /// Three real children, each setting its OWN termios on the slave the
+    /// way the programs they stand for do, read back through the master:
+    ///
+    /// * `sleep` (a cooked tty, the shell prompt's baseline): echo + canonical
+    ///   — the kernel echoes, the press banks.
+    /// * `stty -echo` (what `read -s`, `sudo`, `ssh`'s passphrase, `passwd`
+    ///   and `getpass` do — measured 2026-09-12: all four clear ECHO and keep
+    ///   ICANON): no echo, canonical — `swallows_input()`.
+    /// * `stty raw -echo` (a TUI: Claude Code's `setRawMode`, vim, less):
+    ///   no echo, NOT canonical — the program echoes for itself, so this is
+    ///   NOT a swallow; the stall fix's whole premise is that these presses
+    ///   keep banking.
+    ///
+    /// Non-vacuous in both directions: the cooked and raw children prove the
+    /// verdict is `false` on both sides of the `read -s` shape, so a reader
+    /// that ignored ICANON (any `!echo`) or ignored ECHO (any `canonical`)
+    /// fails here.
+    #[test]
+    fn tty_echo_reads_the_slaves_canonical_no_echo_through_the_master() {
+        // Cooked: the baseline every shell prompt starts from.
+        let cooked = spawn_on_pty(&["/bin/sleep", "5"]);
+        let t = wait_tty_echo(cooked, |t| t.echo && t.canonical).expect("tcgetattr(master)");
+        assert_eq!(
+            t,
+            crate::TtyEcho {
+                echo: true,
+                canonical: true
+            },
+            "sleep on a fresh pty is cooked: echo + canonical"
+        );
+        assert!(!t.swallows_input(), "a cooked tty echoes: the press banks");
+        // SAFETY: close the master (the child gets SIGHUP via slave close at exit).
+        unsafe {
+            libc::close(cooked);
+        }
+
+        // Password mode: `read -s` / sudo / ssh / passwd / getpass.
+        let secret = spawn_on_pty(&["/bin/sh", "-c", "stty -echo; sleep 5"]);
+        let t = wait_tty_echo(secret, |t| !t.echo).expect("tcgetattr(master)");
+        assert_eq!(
+            t,
+            crate::TtyEcho {
+                echo: false,
+                canonical: true
+            },
+            "`stty -echo` on the SLAVE must be visible through the MASTER"
+        );
+        assert!(
+            t.swallows_input(),
+            "canonical no-echo is iTerm2's password mode: the press will never echo"
+        );
+        // SAFETY: as above.
+        unsafe {
+            libc::close(secret);
+        }
+
+        // Raw: a TUI that echoes for itself — NOT a swallow.
+        let raw = spawn_on_pty(&["/bin/sh", "-c", "stty raw -echo; sleep 5"]);
+        let t = wait_tty_echo(raw, |t| !t.echo && !t.canonical).expect("tcgetattr(master)");
+        assert_eq!(
+            t,
+            crate::TtyEcho {
+                echo: false,
+                canonical: false
+            },
+            "`stty raw -echo` on the SLAVE must be visible through the MASTER"
+        );
+        assert!(
+            !t.swallows_input(),
+            "a raw-mode program draws its own echo: the press keeps banking (the stall fix)"
+        );
+        // SAFETY: as above.
+        unsafe {
+            libc::close(raw);
+        }
+    }
+
+    /// A NON-TTY ANSWERS `None`, never a verdict: a pipe sink (every
+    /// headless test), the `-1` sentinel, and a closed fd all leave the
+    /// caller on its default path. Fail-open by construction — the reader
+    /// can only ever WITHHOLD a bank on positive evidence.
+    #[test]
+    fn tty_echo_answers_none_off_a_tty() {
+        assert_eq!(tty_echo(-1), None, "the sentinel fd is not a tty");
+        let mut pipe = [0i32; 2];
+        // SAFETY: `pipe` is a valid two-element out-array.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        assert_eq!(tty_echo(pipe[0]), None, "a pipe read end is not a tty");
+        assert_eq!(tty_echo(pipe[1]), None, "a pipe write end is not a tty");
+        // SAFETY: both ends are ours and open.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        assert_eq!(tty_echo(pipe[1]), None, "a closed fd is not a tty");
     }
 
     /// A DUPLICATE OF THE MASTER IS CLOSE-ON-EXEC TOO.

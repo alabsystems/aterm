@@ -406,7 +406,13 @@ fn main() -> ExitCode {
     //     is covered by the same pass the window runs at first open. The attempt,
     //     not the success, on purpose: a pass that keeps failing is retried once per
     //     interval, not once per tab (atpkg's store lock only dedups CONCURRENT
-    //     passes). Gated on the same `[packages]` bits the window reads (`enabled`,
+    //     passes — a pass refused by it exits 75, atpkg's contention code, and is
+    //     silent here on purpose: this lane never passes `--wait-lock`, because a
+    //     detached, unobserved waiter per tab would pile up; the WINDOW's lanes are
+    //     the ones that queue behind a sibling, 2026-09-10). Note that this pass
+    //     writes no `progress.json`, so a window queued behind it shows its
+    //     waiting row and no meter. Gated on the same `[packages]` bits the window
+    //     reads (`enabled`,
     //     `auto_update`), on `ATPKG_DISABLE`, and on this being an INTERACTIVE
     //     launch: stdin a terminal and no `ATERM_SESSION_MODEL` — a harness driving
     //     the session over pipes (the integration tests, a driver's `--session`
@@ -455,18 +461,49 @@ fn spawn_detached_pkg_update() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["pkg", "update"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    if let Err(error) = spawn_detached(exe.as_os_str(), &["pkg", "update"]) {
+        eprintln!("aterm: could not start the background `aterm pkg update` pass: {error}");
+    }
+}
+
+/// Start `program args` DETACHED: stdio on `/dev/null`, its own process group, and
+/// NOT this process's child. The session lane goes on to run
+/// `aterm_cli::session_main` in this same process, and its unix driver reaps the
+/// shell with `waitpid(-1)`: a finished pass left as OUR zombie could be reaped in
+/// the shell's place, and `aterm` exited with the pass's status instead of the
+/// shell's (2026-09-12 audit K9; reliably on Linux, ~6% of exits on macOS). So on
+/// unix a `/bin/sh` middle process — the group leader — backgrounds the program and
+/// exits at once, and reaping it here re-parents the pass to launchd/init.
+fn spawn_detached(program: &std::ffi::OsStr, args: &[&str]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "\"$@\" &", "sh"])
+            .arg(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "the detaching shell {status}"
+            )))
+        }
     }
-    if let Err(error) = cmd.spawn() {
-        eprintln!("aterm: could not start the background `aterm pkg update` pass: {error}");
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(drop)
     }
 }
 
@@ -1094,6 +1131,61 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE DETACHED PASS IS NOT THIS PROCESS'S CHILD (2026-09-12). The session lane
+    /// runs `aterm_cli::session_main` in this same process, and its unix driver
+    /// reaps the shell with `waitpid(-1)`: a finished `aterm pkg update` left as
+    /// our zombie could be reaped in the shell's place, and `aterm` then exited
+    /// with the pkg pass's status instead of the shell's. So the pass must be
+    /// re-parented away from us — and still sit in its own process group, so the
+    /// session's SIGHUP cannot take it down mid-install.
+    #[test]
+    #[cfg(unix)]
+    fn a_detached_pass_is_neither_our_child_nor_in_our_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-detached-pass-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let pid_file = dir.join("pid");
+        let script = format!(
+            "echo $$ > '{0}.tmp' && mv '{0}.tmp' '{0}' && exec sleep 30",
+            pid_file.display()
+        );
+        spawn_detached(std::ffi::OsStr::new("/bin/sh"), &["-c", &script]).expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pid: libc::pid_t = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse().expect("a pid");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pass never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        let pgid = unsafe { libc::getpgid(pid) };
+        let ours = unsafe { libc::getpgid(0) };
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        if reaped == 0 {
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            (reaped, errno),
+            (-1, Some(libc::ECHILD)),
+            "the detached pass is still this process's child"
+        );
+        assert_ne!(
+            pgid, ours,
+            "the detached pass shares the session's process group"
+        );
+    }
 
     /// `ATERM_NO_REROUTE` is process-global and two tests here read or set it
     /// (`plain_launch_request` fails closed on it since the 2026-09-07 review);

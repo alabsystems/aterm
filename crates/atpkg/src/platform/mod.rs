@@ -113,6 +113,19 @@ pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
     install_shim_to_env(shim, target, &crate::shim_env::ShimEnv::NONE)
 }
 
+/// The shim [`install_shim_env`] would lay — the same target derivation, the same body
+/// — RENDERED but not written, for the callers that lay a whole pass of shims in ONE
+/// go through [`crate::lay::lay_executables`] (one untracked launchd job when this
+/// process is provenance-tracked, instead of one per file).
+pub fn shim_executable_env(
+    build_bin_dir: &Path,
+    tool: &crate::store::ToolName,
+    shim: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<crate::lay::Executable> {
+    shim_executable_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
+}
+
 // ---------------------------------------------------------------------------
 // Pure `.cmd` shim formatting/parsing.
 //

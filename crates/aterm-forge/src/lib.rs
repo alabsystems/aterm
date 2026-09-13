@@ -6,20 +6,24 @@
 //!
 //! # Why this exists
 //!
-//! The shipped `aterm` binary on aarch64-apple-darwin resolves 50 packages
-//! outside `crates/`, carrying ~451k lines of Rust; the Linux cell resolves
-//! 198 such packages and ~2.80M lines. This existing third-party metric includes
-//! the same-owner astream source bundle under `vendor/` (the pinned baselines
-//! are `measured::MAC_ARM` /
-//! `measured::LINUX`, as of 2026-09-10 — quote the constants, not this prose).
-//! `.cargo/config.toml` disables in-compilation verification
-//! (`-Ztrust-verify=off`) for exactly that reason, as an explicitly temporary
-//! opt-out.
+//! The shipped `aterm` binary on aarch64-apple-darwin resolves dozens of
+//! packages aterm did not write, carrying hundreds of thousands of lines of
+//! Rust; the Linux cell resolves hundreds of them and millions of lines. That
+//! metric EXCLUDES the same-owner astream source bundle under `vendor/`:
+//! `loc::measure` sets `is_third_party` by inverting
+//! `provenance::is_first_party`, which rosters `vendor/astream` as aterm's own.
+//! The exact counts are `measured::MAC_ARM` / `measured::LINUX`. It is that
+//! surface — code aterm did not write, compiled into the shipped binary — for
+//! which `.cargo/config.toml` disables in-compilation verification
+//! (`-Ztrust-verify=off`), as an explicitly temporary opt-out.
 //!
 //! Every pinned count is read from `measured` (`src/measured.rs`) — the single
 //! place the baseline lives, so an extraction that shrinks the surface costs
-//! ONE edit rather than fourteen red tests. The figures above are a copy of it
-//! and go stale the way copies do.
+//! ONE edit rather than fourteen red tests. This prose deliberately carries no
+//! digits: the copy it used to carry said 50 / ~451k and 198 / ~2.80M, and went
+//! stale within two days when the astream classifier landed and the real
+//! figures became 47 / 440,327 and 195 / 2,788,536. A copy goes stale the way
+//! copies do; name the constant instead.
 //!
 //! Forge is the instrument for shrinking that surface on a measured, ratcheted,
 //! provenance-carrying basis: it SURVEYS the graph, ATTRIBUTES each package's

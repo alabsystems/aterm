@@ -418,11 +418,16 @@ pub(crate) fn key_arms_own_license(rest: &str) -> bool {
             event_type: KeyEventType::Press,
             ..
         }) => {
-            !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+            (!mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
                 && matches!(
                     key,
                     Key::Named(NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace)
-                )
+                ))
+                // A bare ⌃V arms the delivered-insert class beside the
+                // gesture class (2026-09-10), bank-preserving like Tab.
+                || (mods.contains(Modifiers::CTRL)
+                    && !mods.intersects(Modifiers::ALT | Modifiers::SUPER)
+                    && matches!(key, Key::Character('v')))
         }
         _ => false,
     }

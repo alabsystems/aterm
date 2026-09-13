@@ -616,9 +616,10 @@ struct FabricLink {
     /// [`FABRIC_ABSENT`] covers both "the first bridge has not finished
     /// attaching" and "this build has no `[fabric] command`, so no bridge will
     /// EVER attach", and those two owe a caller opposite advice. Set once by
-    /// [`crate::fabric_launch::spawn_supervisor`]; never cleared, because the
-    /// supervisor relaunches forever and a supervisor that has run is a bridge
-    /// that can come back. See [`fabric_wait_refusal`].
+    /// [`crate::fabric_launch::arm`] — at startup, or later when `fabric attach`
+    /// arms a running instance; never cleared, because the supervisor relaunches
+    /// forever and a supervisor that has run is a bridge that can come back. See
+    /// [`fabric_wait_refusal`].
     supervised: AtomicBool,
 }
 
@@ -704,10 +705,13 @@ pub(crate) fn next_bridge_generation() -> BridgeGeneration {
 
 /// A bridge SUPERVISOR has started in this process — record it once.
 ///
-/// Called by [`crate::fabric_launch::spawn_supervisor`] when, and only when, a
-/// supervisor thread really started. It is not a claim that a bridge is up; it
-/// is the claim that one is coming, which is the half [`fabric_state`] cannot
-/// express (`absent` means both "not yet" and "never").
+/// Called by [`crate::fabric_launch::arm`] when, and only when, a supervisor
+/// thread really started — the ONE seam shared by the startup path
+/// ([`crate::fabric_launch::spawn_supervisor`]) and the `fabric attach` control
+/// verb, so the latch also flips at RUNTIME on an instance that started with no
+/// `[fabric] command`. It is not a claim that a bridge is up; it is the claim
+/// that one is coming, which is the half [`fabric_state`] cannot express
+/// (`absent` means both "not yet" and "never").
 pub(crate) fn note_bridge_supervised() {
     LINK.supervised.store(true, Ordering::Relaxed);
 }

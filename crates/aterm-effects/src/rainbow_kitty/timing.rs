@@ -214,21 +214,40 @@ pub const MINI_FAN_MAX_CELLS: u16 = JUMP_MIN_CELLS - 1;
 /// LATE: a TUI whose render loop stalled. Measured on the owner's machine
 /// (2026-09-10): a scripted typist on an idle Claude Code prompt saw echoes of
 /// 2-31 ms, but the instance's own echo ledger held a `1373 ms` worst case from
-/// real use, and `input_p99 = 268 ms`. Two seconds covers that worst case with
-/// margin and stays well inside the ribbon's own chain window
-/// (`ribbon::CHAIN_GAP_MAX`, 5 s), the rhythm the mark already treats as one
-/// burst; a press older than this has no echo coming that the eye would still
-/// pair with the key. It is the same two seconds the host gives an unpaid
-/// press credit (`CursorGlow::RAINBOW_COALESCE_CREDIT_LIFE`): one patience
-/// for one press, whichever layer is asked.
-pub const ECHO_PATIENCE_S: f32 = 2.0;
+/// real use, and `input_p99 = 268 ms`. Two seconds covered that.
+///
+/// **It is the host's IN-FLIGHT PATIENCE, by alias (2026-09-12).** Two
+/// seconds bounded the ECHO LATENCY; what a press really waits on is the
+/// ROW, and a row goes silent for longer than any debounce when the app's
+/// event loop stalls. Measured with real Claude Code 2.1.268 under three
+/// Rust compiles: the owner's screenshot came from a 2.7 s stall, and the
+/// matrix's worst real stall was 7.7 s — presses this ledger had expired as
+/// swallowed while the app was merely busy. One patience for one press,
+/// whichever layer is asked: `CursorGlow::IN_FLIGHT_PATIENCE_S` (10 s —
+/// see its doc for the number's reasons) is the one number, and this is an
+/// alias so the two cannot drift.
+pub const ECHO_PATIENCE_S: f32 = crate::cursor_glow::IN_FLIGHT_PATIENCE_S;
 
 /// The most cells one observed move may lay from the echo ledger — the host's
 /// own coalesced-sweep cap (`CursorGlow::RAINBOW_TYPED_SWEEP_MAX`, which is
-/// `TYPED_STAMP_DEPTH`, 32 since the host's own ledger fix of 2026-09-09):
-/// more presses than that cannot be paired with any one move, so the ledger
-/// never holds more either.
+/// `TYPED_STAMP_DEPTH`: 128 since 2026-09-12, 32 from the host's own ledger
+/// fix of 2026-09-09): more presses than that cannot be paired with any one
+/// move, so the ledger never holds more either.
 pub const ECHO_LEDGER_DEPTH: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
+
+/// **THE RIBBON'S BIRTH FLOOR** (seconds, 2026-09-12): a host sweep is dated
+/// at its licensing KEY's clock — for a stalled batch, the OLDEST unpaid
+/// press, seconds before the echo — because that clock is what the echo
+/// ledger partitions by. The RIBBON must not be born there: a cell born
+/// three seconds ago into a cohort whose last key was three seconds ago is
+/// retired on the very tick that laid it, and the batch the seam just
+/// licensed shows dark (the matrix's `held_lit_late`). So the engine floors
+/// the sweep's birth at one stamp window before the echo — the host's own
+/// `TYPE_HINT_FRESH`, the floor its insert lane already uses — so the
+/// echoing frame shows the run lit and the cohort it joins is refreshed. A
+/// per-key sweep's key is inside the window by definition: `max` is a no-op
+/// and that path is byte-identical.
+pub const SWEEP_BIRTH_FLOOR_S: f32 = crate::cursor_glow::CursorGlow::TYPE_HINT_FRESH;
 
 // ---------------------------------------------------------------------------
 // 2. THE SHARED COUNTS (§8.1, "plus two shared counts")

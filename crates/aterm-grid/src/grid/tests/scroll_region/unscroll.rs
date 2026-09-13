@@ -36,7 +36,7 @@ fn grid_unscroll_from_scrollback_basic() {
     let unscrolled = grid.unscroll_from_scrollback(2);
     assert_eq!(
         unscrolled, 2,
-        "requesting 2 lines should recover both tiered lines"
+        "requesting 2 lines should recover the 2 newest history lines"
     );
 
     // The top rows should now contain content from scrollback
@@ -44,11 +44,96 @@ fn grid_unscroll_from_scrollback_basic() {
     let row0_after = grid.row(0).map(|r| r.to_string()).unwrap_or_default();
     let row1_after = grid.row(1).map(|r| r.to_string()).unwrap_or_default();
 
-    // At least one of the top rows should have content
-    assert!(
-        !row0_after.is_empty() || !row1_after.is_empty(),
-        "Unscrolled rows should have content from scrollback"
+    // The NEWEST history (the ring's Lines 2-3), in order — not the tiered
+    // store's Lines 0-1, which are older.
+    assert_eq!(row0_after.trim_end(), "Line 2");
+    assert_eq!(row1_after.trim_end(), "Line 3");
+}
+
+fn write_numbered_lines(grid: &mut Grid, count: usize) {
+    for i in 0..count {
+        grid.carriage_return();
+        for c in format!("Line {i}").chars() {
+            grid.write_char(c);
+        }
+        if i + 1 < count {
+            grid.line_feed();
+        }
+    }
+}
+
+fn row_text(grid: &Grid, row: u16) -> String {
+    grid.row(row)
+        .map(|r| r.to_string())
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
+/// Kitty CSI + T restores the lines DIRECTLY above the viewport — the ring's
+/// newest — and removes them from the END of history. It used to read and remove
+/// the tiered store's newest lines, which are older than every ring line.
+#[test]
+fn grid_unscroll_restores_newest_ring_lines_in_order() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    write_numbered_lines(&mut grid, 8);
+    // History Lines 0-3: ring = Lines 2-3, tiered store = Lines 0-1.
+    assert_eq!(grid.scrollback_lines(), 4);
+
+    assert_eq!(grid.unscroll_from_scrollback(2), 2);
+
+    assert_eq!(row_text(&grid, 0), "Line 2");
+    assert_eq!(row_text(&grid, 1), "Line 3");
+    assert_eq!(row_text(&grid, 2), "Line 4");
+    assert_eq!(row_text(&grid, 3), "Line 5");
+    assert_eq!(grid.scrollback_lines(), 2);
+    let hist = |i: usize| {
+        grid.get_history_line(i)
+            .map(|l| l.to_string().trim_end().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(hist(0), "Line 0");
+    assert_eq!(hist(1), "Line 1");
+}
+
+/// Ring-only history (an empty tiered store) is still history: CSI + T must pull
+/// from it, not fall back to a blank scroll that discards the bottom rows.
+#[test]
+fn grid_unscroll_ring_only_history_is_not_a_blank_scroll() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(4, 10, 100, scrollback);
+    write_numbered_lines(&mut grid, 6);
+    assert_eq!(grid.tiered_scrollback_lines(), 0);
+    assert_eq!(grid.scrollback_lines(), 2);
+
+    assert_eq!(grid.unscroll_from_scrollback(1), 1);
+
+    assert_eq!(row_text(&grid, 0), "Line 1");
+    assert_eq!(row_text(&grid, 3), "Line 4");
+    assert_eq!(grid.scrollback_lines(), 1);
+    assert_eq!(
+        grid.get_history_line(0)
+            .map(|l| l.to_string().trim_end().to_string())
+            .unwrap_or_default(),
+        "Line 0"
     );
+}
+
+/// A pull spanning the ring AND the store keeps age order across the seam.
+#[test]
+fn grid_unscroll_spanning_ring_and_store_keeps_age_order() {
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(4, 10, 2, scrollback);
+    write_numbered_lines(&mut grid, 8);
+
+    assert_eq!(grid.unscroll_from_scrollback(3), 3);
+
+    assert_eq!(row_text(&grid, 0), "Line 1");
+    assert_eq!(row_text(&grid, 1), "Line 2");
+    assert_eq!(row_text(&grid, 2), "Line 3");
+    assert_eq!(row_text(&grid, 3), "Line 4");
+    assert_eq!(grid.scrollback_lines(), 1);
 }
 
 #[test]
@@ -117,14 +202,18 @@ fn grid_unscroll_limited_by_available_scrollback() {
         "6 total lines on a 4-row grid with ring scrollback 2 should leave 1 tiered line"
     );
 
+    // History is 2 ring lines over that 1 tiered line.
+    assert_eq!(grid.scrollback_lines(), 3);
+
     // Try to unscroll more than available
     let unscrolled = grid.unscroll_from_scrollback(100);
 
-    // Should be limited by available scrollback and region size
+    // Limited by ALL history (2 ring + 1 tiered) and the region size.
     assert_eq!(
-        unscrolled, 1,
-        "unscroll should clamp to the single available tiered line"
+        unscrolled, 3,
+        "unscroll should clamp to the 3 history lines, ring and tiered"
     );
+    assert_eq!(grid.scrollback_lines(), 0);
 }
 
 #[test]
@@ -222,7 +311,7 @@ fn grid_unscroll_preserves_attributes() {
     }
 
     // Scroll content into scrollback
-    for i in 0..6 {
+    for i in 0..4 {
         grid.set_cursor(3, 0);
         for c in format!("Line{i}").chars() {
             grid.write_char(c);
@@ -230,17 +319,17 @@ fn grid_unscroll_preserves_attributes() {
         grid.line_feed();
     }
 
-    let scrollback_available = grid.tiered_scrollback_lines();
+    let scrollback_available = grid.scrollback_lines();
     assert_eq!(
         scrollback_available, 4,
-        "6 bottom-row scrolls on a 4-row grid with ring scrollback 2 should offload 4 tiered lines"
+        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
     );
 
     // Unscroll to bring styled content back
     let unscrolled = grid.unscroll_from_scrollback(scrollback_available.min(4));
     assert_eq!(
         unscrolled, 4,
-        "unscroll should recover all 4 available tiered lines"
+        "unscroll should recover all 4 history lines, ring and tiered"
     );
 
     // Check if any restored row has non-default colors or flags
@@ -297,7 +386,7 @@ fn grid_unscroll_preserves_wrapped_flag() {
     }
 
     // Scroll the wrapped content into scrollback
-    for i in 0..6 {
+    for i in 0..4 {
         grid.set_cursor(3, 0);
         for c in format!("Scroll{i}").chars() {
             grid.write_char(c);
@@ -305,17 +394,17 @@ fn grid_unscroll_preserves_wrapped_flag() {
         grid.line_feed();
     }
 
-    let scrollback_available = grid.tiered_scrollback_lines();
+    let scrollback_available = grid.scrollback_lines();
     assert_eq!(
         scrollback_available, 4,
-        "6 bottom-row scrolls on a 4-row grid with ring scrollback 2 should offload 4 tiered lines"
+        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
     );
 
     // Unscroll to bring wrapped content back
     let unscrolled = grid.unscroll_from_scrollback(scrollback_available.min(4));
     assert_eq!(
         unscrolled, 4,
-        "unscroll should recover all 4 available tiered lines"
+        "unscroll should recover all 4 history lines, ring and tiered"
     );
 
     // Check if any restored row has the wrapped flag
@@ -432,7 +521,7 @@ fn grid_unscroll_wide_char_column_alignment() {
     }
 
     // Scroll content into scrollback (6 scrolls like other tests)
-    for i in 0..6 {
+    for i in 0..4 {
         grid.set_cursor(3, 0);
         for c in format!("Line{i}").chars() {
             grid.write_char(c);
@@ -440,7 +529,7 @@ fn grid_unscroll_wide_char_column_alignment() {
         grid.line_feed();
     }
 
-    let scrollback_count = grid.tiered_scrollback_lines();
+    let scrollback_count = grid.scrollback_lines();
     assert_eq!(scrollback_count, 4);
 
     // Unscroll to bring the wide char line back
@@ -583,7 +672,7 @@ fn grid_unscroll_preserves_extended_visual_flags() {
     grid.write_char_styled('B', fg, bg, CellFlags::SUBSCRIPT);
 
     // Scroll row 0 into scrollback
-    for i in 0..6 {
+    for i in 0..4 {
         grid.set_cursor(3, 0);
         for c in format!("Line{i}").chars() {
             grid.write_char(c);
@@ -591,17 +680,17 @@ fn grid_unscroll_preserves_extended_visual_flags() {
         grid.line_feed();
     }
 
-    let sb_count = grid.tiered_scrollback_lines();
+    let sb_count = grid.scrollback_lines();
     assert_eq!(
         sb_count, 4,
-        "6 bottom-row scrolls on a 4-row grid with ring scrollback 2 should offload 4 tiered lines"
+        "4 bottom-row scrolls on a 4-row grid should leave 4 history lines (2 ring, 2 tiered)"
     );
 
     // Unscroll to bring styled content back
     let unscrolled = grid.unscroll_from_scrollback(sb_count.min(4));
     assert_eq!(
         unscrolled, 4,
-        "unscroll should recover all 4 available tiered lines"
+        "unscroll should recover all 4 history lines, ring and tiered"
     );
 
     // Find the restored row starting with 'C'
@@ -814,14 +903,17 @@ fn grid_unscroll_removes_lines_from_scrollback() {
         }
     }
 
-    let sb_before = grid.tiered_scrollback_lines();
-    assert_eq!(sb_before, 2, "Should have 2 lines in tiered scrollback");
+    let sb_before = grid.scrollback_lines();
+    assert_eq!(
+        sb_before, 4,
+        "Should have 4 history lines (2 ring, 2 tiered)"
+    );
 
     // Unscroll 1 line: recover the most recent scrollback line
     let unscrolled = grid.unscroll_from_scrollback(1);
     assert_eq!(unscrolled, 1);
 
-    let sb_after = grid.tiered_scrollback_lines();
+    let sb_after = grid.scrollback_lines();
     assert_eq!(
         sb_after,
         sb_before - 1,
@@ -847,15 +939,18 @@ fn grid_unscroll_all_empties_scrollback() {
         }
     }
 
-    let sb_before = grid.tiered_scrollback_lines();
-    assert_eq!(sb_before, 2, "Should have 2 lines in tiered scrollback");
+    let sb_before = grid.scrollback_lines();
+    assert_eq!(
+        sb_before, 4,
+        "Should have 4 history lines (2 ring, 2 tiered)"
+    );
 
     // Unscroll all available
     let unscrolled = grid.unscroll_from_scrollback(sb_before);
     assert_eq!(unscrolled, sb_before);
 
     assert_eq!(
-        grid.tiered_scrollback_lines(),
+        grid.scrollback_lines(),
         0,
         "Scrollback should be empty after unscrolling all lines"
     );

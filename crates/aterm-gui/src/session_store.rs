@@ -99,9 +99,11 @@ pub struct SessionRecord {
     /// tolerated): a sanitized projection of the operator-set title/
     /// description/icon/role/attention (`meta set …`) for manifest
     /// inspection. HONEST SCOPE: adoption re-seeds user meta from the LAYOUT
-    /// sidecar's restore leaves (`seed_restored_user_meta`), not from these
-    /// fields — they are a write-side record, kept in lockstep with the leaf
-    /// carrier so external readers of the manifest see the same identity.
+    /// sidecar's restore leaves (`graft_restored_user_meta` for the session
+    /// already running in a window's first pane, `seed_restored_user_meta` for
+    /// every pane spawned or adopted after it), not from these fields — they
+    /// are a write-side record, kept in lockstep with the leaf carrier so
+    /// external readers of the manifest see the same identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

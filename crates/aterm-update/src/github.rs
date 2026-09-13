@@ -33,8 +33,8 @@
 //!
 //! **The token lane** — a repointed source for which the token chain
 //! ([`aterm_update_core::token`], dedicated rungs first, ambient rungs last) resolves a
-//! credential — keeps the API path: the paginated releases LIST (draft filter,
-//! unique-appcast proof, max canonical tag) and the asset API URLs with the token on
+//! credential — keeps the API path: the paginated releases LIST (draft and prerelease
+//! filter, unique-appcast proof, max canonical tag) and the asset API URLs with the token on
 //! stdin (never argv), and holds until the server's own `x-ratelimit-reset` when the
 //! LIST is rate-limited. A token GitHub rejects drops the check onto the web lane, once,
 //! with a throttled warning: the source then has no usable credential, which is the
@@ -475,7 +475,9 @@ struct Release {
     /// A prerelease is published but is not the channel head — GitHub's `latest`
     /// excludes it by construction, and the web lane's LIST fallback
     /// ([`web_head_fallback`]) must apply the same rule or the two lanes would
-    /// disagree about what "newest published release" means.
+    /// disagree about what "newest published release" means. The election
+    /// ([`select_authoritative_release`]) applies it too, so the token lane's raw
+    /// LIST obeys it as well.
     #[serde(default)]
     prerelease: bool,
     #[serde(default)]
@@ -702,7 +704,11 @@ fn select_authoritative_release(
     let mut selected: Option<ArbitratedRelease> = None;
 
     for release in releases {
-        if release.draft {
+        // Drafts and prereleases are never the channel head, on EITHER lane: the web
+        // lane's inputs are already filtered, and applying the rule HERE is what keeps
+        // the token lane's raw LIST from electing a prerelease — or, under an
+        // `-rc` tag, failing every check closed on one (2026-09-12).
+        if release.draft || release.prerelease {
             continue;
         }
         // A release with no exact-name appcast is not a candidate at all. A release whose
@@ -4069,6 +4075,40 @@ mod tests {
         )
         .expect_err("an unorderable historical exact-name tag must fail closed");
         assert!(err.contains("numeric dotted"), "{err}");
+    }
+
+    /// A PRERELEASE IS NOT A CANDIDATE ON EITHER LANE (2026-09-12). The web lane's
+    /// LIST fallback filtered prereleases before this election; the token lane
+    /// passed the raw LIST in, so a hand-published `v0.81.0-rc.1` prerelease with
+    /// an appcast failed every token-lane check closed ("not numeric dotted")
+    /// even though `v0.80.0` stood valid beneath it.
+    #[test]
+    fn token_lane_election_skips_prerelease_with_noncanonical_tag() {
+        let mut prerelease = release_with_appcast("v0.81.0-rc.1", "u1");
+        prerelease.prerelease = true;
+        let elected = select_authoritative_release(
+            vec![prerelease, release_with_appcast("v0.80.0", "u2")],
+            &[],
+        )
+        .expect("a prerelease must not fail the election")
+        .expect("stable elected");
+        assert_eq!(elected.release.tag_name, "v0.80.0");
+        assert_eq!(elected.version, "0.80.0");
+    }
+
+    /// …and a prerelease under a canonical tag never wins it: token-lane machines
+    /// must not stage a build the web lane and `tools/install.sh` never select.
+    #[test]
+    fn token_lane_election_never_elects_a_canonical_prerelease() {
+        let mut prerelease = release_with_appcast("v0.81.0", "u1");
+        prerelease.prerelease = true;
+        let elected = select_authoritative_release(
+            vec![prerelease, release_with_appcast("v0.80.0", "u2")],
+            &[],
+        )
+        .expect("canonical catalog")
+        .expect("stable elected");
+        assert_eq!(elected.release.tag_name, "v0.80.0");
     }
 
     #[test]

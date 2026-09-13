@@ -366,11 +366,32 @@ fn image_and_window_remain_disjoint_capture_apis() {
         "exact client destination from a successful",
         "application present",
         "does not observe compositor selection",
-        "Screen Recording permission",
+        "needs no Screen Recording permission",
     ] {
         assert!(
             ctl_docs.contains(documented_boundary),
             "aterm-ctl docs lost the image/window boundary: `{documented_boundary}`"
         );
     }
+
+    // THE CAPTURE NEVER ASKS FOR A PERMISSION IT DOES NOT USE (2026-09-12, TCC audit).
+    // `window` photographs aterm's OWN window, which CoreGraphics serves without a
+    // Screen Recording grant (measured with the grant not held: tccd preflight only,
+    // real pixels back). The NULL-image error used to send the owner to System
+    // Settings to grant Screen Recording — a grant aterm never uses and one that since
+    // macOS 15 re-prompts on a cooldown for as long as it is held, i.e. a recurring
+    // system alert aterm caused for nothing. The error names the real cause instead.
+    let capture = normalized("src/app_introspect.rs");
+    assert!(
+        !capture.contains("grant Screen Recording permission"),
+        "the own-window capture error must not send the owner to grant Screen Recording"
+    );
+    assert!(
+        capture.contains("this needs no Screen Recording grant"),
+        "the own-window capture error must say the grant is not needed"
+    );
+    assert!(
+        capture.contains("K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW"),
+        "the capture must stay single-own-window: any wider option would need the grant"
+    );
 }

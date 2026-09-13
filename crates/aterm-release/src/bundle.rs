@@ -401,6 +401,12 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
         "atpkg",
         "aterm-fleet",
         "aterm-drive",
+        // The fabric bridge. It is spawned BY NAME out of `[fabric] command`,
+        // which aterm whitespace-splits and exec's, so the name has to exist as
+        // an executable in a SHIPPED install — not only in `install.sh`. It was
+        // added to the three script lists and missed here, which made the alias
+        // work from a source checkout and silently not from a release.
+        "aterm-link",
         "aterm-gui",
     ] {
         let link = macos.join(alias);
@@ -587,4 +593,52 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>())
+}
+
+#[cfg(test)]
+mod alias_tests {
+    /// THE ARGV0 ALIAS SET IS HAND-TYPED IN FIVE PLACES, and on 2026-09-12 an
+    /// audit found `aterm-link` in four of them. This pins the bundle's copy
+    /// against the OTHER lists in the repository, so the next verb to grow an
+    /// alias cannot ship working from a source checkout and dead from a release.
+    ///
+    /// It reads the sibling files rather than importing a roster: `aterm-release`
+    /// deliberately does not depend on `aterm-cli`, and a test that asserted a
+    /// hard-coded list against a hard-coded list would prove only that one author
+    /// typed the same thing twice.
+    #[test]
+    fn the_bundle_ships_every_alias_the_installers_create() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crates/aterm-release sits two levels under the root");
+        let bundle = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bundle.rs"),
+        )
+        .expect("this file");
+        for script in [
+            "tools/install.sh",
+            "tools/atpkg-pack.sh",
+            "tools/dev-app.sh",
+        ] {
+            let text = std::fs::read_to_string(root.join(script))
+                .unwrap_or_else(|e| panic!("{script}: {e}"));
+            let Some(line) = text.lines().find(|l| l.contains("for alias in aterm-cli")) else {
+                panic!("{script} no longer spells its alias loop the way this test reads it");
+            };
+            for alias in line
+                .split_whitespace()
+                // `for alias in … aterm-gui; do` — the loop's own punctuation
+                // rides on the last word.
+                .map(|w| w.trim_end_matches(';'))
+                .filter(|w| w.starts_with("aterm-") || *w == "atpkg")
+            {
+                assert!(
+                    bundle.contains(&format!("\"{alias}\"")),
+                    "{script} installs the `{alias}` argv0 alias and the app bundle does not \
+                     ship it: the name works from a source checkout and is dead in a release"
+                );
+            }
+        }
+    }
 }

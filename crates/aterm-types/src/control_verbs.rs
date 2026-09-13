@@ -1218,8 +1218,19 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "trail [<n>]: the focused window's last <n> cursor-trail spawn-seam verdicts",
         "(default all, ring cap 32), newest last — one `admission seq= phase=licensed|declined \
-         reason= age_ms= origin= target= alt=` row per judged cursor move, from the engine's \
-         fixed-size DIAGNOSTIC ring. A move paints only if a keypress LICENSED it, so a \
+         reason= age_ms= origin= target= alt= licence=` row per judged cursor move, from the \
+         engine's fixed-size DIAGNOSTIC ring. `licence=` names the class that admitted a \
+         licensed row: `key` (a press hint — typed, Backspace, nav, Return, a composer \
+         newline, Tab or ⌃V as a gesture, the unpaid press), `inflight` (no hint was fresh and the \
+         presses still waiting on the row licensed the batch — a stalled prompt catching \
+         up), `insert` (a DELIVERED insert, \
+         Rainbow Kitty only — a file drop, ⌘V, and into the tab on screen the `paste` verb, \
+         `paste-bin`, `turn`'s paste phase, an unguarded `key tab` or `key ctrl+v` — laid as \
+         one sweep when its bytes provably landed; `send`/`feed`, a guarded `key if=` and \
+         any input routed to a background session stamp nothing and stay dark by \
+         contract), `rewrite` (the program pulled the caret back inside that insert's span \
+         and the ribbon retracted to it), or `none` on a decline. A move paints only if a \
+         keypress or a delivered insert LICENSED it, so a \
          decline carries one of four reasons: `no-fresh-hint` (no key hint was fresh — the \
          move was program output nobody's fingers asked for), `no-credits` (a multi-cell \
          coalesce outran the press CREDIT budget), `off-shape` (licensed and classified, but \
@@ -1235,11 +1246,33 @@ pub const VERBS: &[VerbSpec] = &[
          momentum_display= flow= combo= combo_best= glow_active= pet_active= cat_active= \
          block_fill= block_fill_rgb= block_fill_base= block_fill_base_from= \
          pet_action= pet_content= pet_pending= pet_body= pet_focus= pet_reason= \
-         pet_anchor= pet_event_seq= pet_pose=` (every gate \
+         pet_anchor= pet_event_seq= pet_pose= inserts_delivered= inserts_lit= \
+         inserts_retracted= last_insert_cells= inflight_licensed= inflight_forgotten= \
+         credits= swallowed_no_echo=` (every gate \
          from the config knob to the glass, in the order the frame path walks them, plus \
          the cumulative tally the ring has forgotten — `licensed=0 declined>0` blames the \
          licence and names why, `licensed>0` over a dark screen blames everything \
-         downstream of it). The `block_fill*` four are the BLOCK CURSOR's body, which no \
+         downstream of it). The `inserts_*` four are the DELIVERED INSERTS, and advance \
+         under Rainbow Kitty only: how many the host reported delivered (a paste's completed \
+         write, a bare Tab's or ⌃V's dispatch), how many the seam lit as one sweep, how many \
+         placeholder rewrites it retracted, and the last one's width in cells (priced from \
+         its text, else the 32-cell bound) — `inserts_delivered>0 inserts_lit=0` after a \
+         drop means the bytes landed and no echo was laid as the insert: refused, or not \
+         seen inside its 2 s window (read the ring's `licence=` and `reason=`). The \
+         `inflight_*` pair and `credits=` are the PRESSES IN FLIGHT: a typed key waits on \
+         its row until the row echoes or a move it cannot explain forgets it (bounded at \
+         ten seconds) — `inflight_licensed=` counts batches the waiting presses alone \
+         licensed after a stalled prompt caught up (the ring row reads `licence=inflight`), \
+         `inflight_forgotten=` counts the edges that dropped a non-empty pool (a backward \
+         or cross-row hop, a refused hop, a Return, an arrow, a kill), and `credits=` is \
+         the pool right now — `credits>0` over a silent row is a stall in progress. \
+         `swallowed_no_echo=` counts the presses that banked NOTHING because the pty was in \
+         canonical no-echo mode at the key (`read -s`, `sudo`, an `ssh` passphrase, `passwd` \
+         — iTerm2's password-mode rule, read off the master's termios): the tty will never \
+         echo them, so they are neither a licence nor a credit, and a dark password prompt \
+         with this count rising is the rule working. A raw-mode program (Claude Code, vim, \
+         a shell prompt under readline) echoes for itself and is never counted here. The \
+         `block_fill*` four are the BLOCK CURSOR's body, which no \
          other field covers: a style can take the caret away from the terminal entirely, \
          and `glow_active=false pet_active=false` over a tinted block is what that looks \
          like from every other gate. `block_fill=` names the owner the frame actually \

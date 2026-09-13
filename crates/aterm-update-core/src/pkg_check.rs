@@ -29,7 +29,10 @@ pub const NEVER_CHECKED_STDERR_LINE: &str = "atpkg: no update check has run yet 
 /// The cadence the window's update loop parks on between passes, and the age past
 /// which a SESSION launch spawns a one-shot pass of its own (R4): six hours, or
 /// `ATPKG_UPDATE_INTERVAL_SECS` when set (`0` = once per window launch, never from
-/// a session). One reader for both edges so they cannot drift.
+/// a session — a once-pass that timed out queued behind another aterm's install is
+/// retried on the window's short backoff until it actually runs, or given up on for
+/// that launch once the holder looks wedged: three waits with nothing moving in its
+/// progress file, 2026-09-10). One reader for both edges so they cannot drift.
 #[must_use]
 pub fn update_interval_secs() -> u64 {
     std::env::var("ATPKG_UPDATE_INTERVAL_SECS")

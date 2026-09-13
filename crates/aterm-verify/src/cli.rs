@@ -176,8 +176,12 @@ where
     Ok(out)
 }
 
-/// The `--help` text: the script's own header, kept as the contract it documents.
-pub const USAGE: &str = "\
+/// The `--help` text: the script's own header, kept as the contract it
+/// documents. `{CEILING}` is substituted by [`usage`] from
+/// [`crate::exec::DEFAULT_CHILD_CEILING`] — print [`usage`], never this. The
+/// ceiling was a hand-typed "45-minute" here through two raises of that
+/// constant (45 → 90 min, 90 min → 3 h) and was wrong for both.
+pub const USAGE_TEMPLATE: &str = "\
 verify — the single local gate entrypoint for aterm.
 
 aterm has NO CI by owner decision (docs/AUDIT.md, docs/PROCESS.md): the merge
@@ -223,7 +227,7 @@ NAMED, and any run that skipped a stage or narrowed its scope is refused the
 merge-contract verdict.
 
 A stage child that never exits is a FAILURE, not a hang: every child runs under
-a 45-minute wall-clock ceiling and is killed and reported past it, because a
+a {CEILING} wall-clock ceiling and is killed and reported past it, because a
 gate that hangs has decided nothing and says nothing. $ATERM_VERIFY_STAGE_TIMEOUT
 moves that ceiling (seconds); =off removes it and restores the unbounded wait.
 
@@ -233,9 +237,33 @@ exit 2  usage error
 exit 3  COULD NOT RUN — the environment is broken; nothing was decided
 ";
 
+/// The `--help` text as a reader sees it: [`USAGE_TEMPLATE`] with the child
+/// ceiling read from the constant that enforces it.
+#[must_use]
+pub fn usage() -> String {
+    USAGE_TEMPLATE.replace(
+        "{CEILING}",
+        &ceiling_text(crate::exec::DEFAULT_CHILD_CEILING),
+    )
+}
+
+/// A whole-unit English rendering of the child ceiling ("3-hour", "90-minute"),
+/// so the help text names whatever [`crate::exec::DEFAULT_CHILD_CEILING`] is.
+fn ceiling_text(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs % 3600 == 0 {
+        format!("{}-hour", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}-minute", secs / 60)
+    } else {
+        format!("{secs}-second")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn ok(args: &[&str]) -> Args {
         parse(args.iter().copied()).expect("parses")
@@ -393,11 +421,35 @@ mod tests {
 
     #[test]
     fn usage_documents_every_frozen_flag_and_every_exit_code() {
+        let text = usage();
         for flag in ["--fast", "--full", "--scope <crate>", "--changed", "--base"] {
-            assert!(USAGE.contains(flag), "usage must document {flag}");
+            assert!(text.contains(flag), "usage must document {flag}");
         }
         for code in ["exit 0", "exit 1", "exit 2", "exit 3"] {
-            assert!(USAGE.contains(code), "usage must document {code}");
+            assert!(text.contains(code), "usage must document {code}");
         }
+    }
+
+    /// The ceiling the help NAMES is the ceiling the code ENFORCES. It was a
+    /// hand-typed "45-minute" across two raises of the constant; deriving it is
+    /// the only thing that keeps them equal.
+    #[test]
+    fn usage_names_the_ceiling_the_constant_enforces() {
+        let text = usage();
+        assert!(
+            !text.contains("{CEILING}"),
+            "the template placeholder reached a reader: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{} wall-clock ceiling",
+                ceiling_text(crate::exec::DEFAULT_CHILD_CEILING)
+            )),
+            "usage must name DEFAULT_CHILD_CEILING: {text}"
+        );
+        assert_eq!(ceiling_text(Duration::from_secs(3 * 60 * 60)), "3-hour");
+        assert_eq!(ceiling_text(Duration::from_secs(90 * 60)), "90-minute");
+        assert_eq!(ceiling_text(Duration::from_secs(45 * 60)), "45-minute");
+        assert_eq!(ceiling_text(Duration::from_secs(90)), "90-second");
     }
 }

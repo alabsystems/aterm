@@ -76,12 +76,17 @@ fn grid_unscroll_clamps_region_scroll_delta_to_available_scrollback() {
     assert_eq!(
         grid.tiered_scrollback_lines(),
         1,
-        "fixture should leave exactly one recoverable tiered line"
+        "fixture should leave exactly one tiered line"
+    );
+    assert_eq!(
+        grid.scrollback_lines(),
+        3,
+        "fixture history is 2 ring lines over 1 tiered line"
     );
 
     grid.clear_damage();
     let unscrolled = grid.unscroll_from_scrollback(100);
 
-    assert_eq!(unscrolled, 1);
+    assert_eq!(unscrolled, 3);
     assert_eq!(dirty_rows(&grid), vec![0, 1, 2, 3]);
 }

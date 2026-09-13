@@ -777,9 +777,12 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
     {
         let _ = writeln!(
             s,
-            "      MEASURED FROM RESOLVED VENDORED SOURCE: {}. `loc::package_dir` reads the \
-             actual Cargo path for a patch or direct-path dependency before consulting the \
-             registry. These are the complete retained package sources, including tests and \
+            "      MEASURED FROM RESOLVED VENDORED SOURCE: {}. `loc::package_dir` reads a \
+             [patch.crates-io] target's actual Cargo path before consulting the registry; a \
+             direct-path dependency has no branch of its own and is reached LAST, through the \
+             cargo-tree hint, so it is measured from its real directory only because an \
+             unpublished crate has no registry copy to shadow it. These are the complete \
+             retained package sources, including tests and \
              examples, not only local edits or reachable code. `cargo forge attest` checks \
              fork obligations and the separately reviewed direct-bundle inventory.",
             d.vendored_measured.join(", ")

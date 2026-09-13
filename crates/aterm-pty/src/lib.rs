@@ -129,6 +129,43 @@ fn is_denied_env_key(key: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// What the line discipline will do with the NEXT byte typed into a PTY —
+/// the two `c_lflag` bits that decide whether a keypress is the kernel's to
+/// echo, read by [`tty_echo`] at the moment of the press.
+///
+/// The four corners, measured on this machine's ptys (2026-09-12):
+///
+/// | `echo` | `canonical` | who is at the slave                          | who echoes  |
+/// |--------|-------------|----------------------------------------------|-------------|
+/// | true   | true        | a cooked prompt, `sleep`, `cat`              | the kernel  |
+/// | false  | true        | `read -s`, `sudo`, `ssh`'s passphrase, `passwd`, `getpass` | NOBODY |
+/// | false  | false       | a raw TUI: Claude Code, vim, less — readline / ZLE at rest — bash's `read -s -n` | the program |
+/// | true   | false       | `read -n 3`, a cbreak program that leaves ECHO on | the kernel |
+///
+/// The second row is iTerm2's password-mode rule: canonical mode makes echo
+/// the kernel's job, and ECHO clear says the kernel will not do it, so the
+/// press will never land on the screen. The third row is deliberately NOT
+/// a swallow verdict: a program that took the tty raw draws its own echo,
+/// and the readline prompt itself sits in that mode between keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TtyEcho {
+    /// `ECHO` is set: the line discipline echoes input it processes.
+    pub echo: bool,
+    /// `ICANON` is set: line-at-a-time input, so echo is the kernel's job.
+    pub canonical: bool,
+}
+
+impl TtyEcho {
+    /// The press will reach the program but never the screen: canonical
+    /// no-echo — iTerm2's password mode. Exactly `!echo && canonical`; a
+    /// raw-mode program (`!echo && !canonical`) is `false` here because it
+    /// echoes for itself.
+    #[must_use]
+    pub const fn swallows_input(self) -> bool {
+        !self.echo && self.canonical
+    }
+}
+
 /// How a spawned child ended, as far as the platform can actually say.
 ///
 /// Deliberately platform-neutral and deliberately partial: the collector that

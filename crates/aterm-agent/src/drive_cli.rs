@@ -275,6 +275,9 @@ struct SubArgs {
     timeout_ms: Option<u64>,
     auto_reads: bool,
     max_s: Option<u64>,
+    /// How long an outage is ridden out (`--reconnect-s`; `None` =
+    /// the loop's default).
+    reconnect_s: Option<u64>,
     allow_python: Vec<String>,
     notes: Option<PathBuf>,
     /// Positional words (the command text for `classify`).
@@ -315,6 +318,9 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
             }
             "--auto-reads" => out.auto_reads = true,
             "--max-s" => out.max_s = Some(int("--max-s", "a seconds integer", it.next())?),
+            "--reconnect-s" => {
+                out.reconnect_s = Some(int("--reconnect-s", "a seconds integer", it.next())?)
+            }
             "--allow-python" => out.allow_python.push(need(
                 "--allow-python",
                 "a GLOB (e.g. 'scripts/*report*.py')",
@@ -512,7 +518,9 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             no_positionals(verb, &sub)?;
             let allow = python_allow(&sub);
             let timeout = Duration::from_millis(sub.timeout_ms.unwrap_or(opts.timeout_ms));
+            let reconnect = sub.reconnect_s;
             let mut session = Session::new(&mut client, sub.sid);
+            set_reconnect(&mut session, reconnect);
             let turn = session.await_turn(timeout)?;
             Ok(Reply {
                 text: render_phase(&turn, &allow),
@@ -523,7 +531,9 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
             no_positionals(verb, &sub)?;
             let sopts = supervise_opts(&sub);
+            let reconnect = sub.reconnect_s;
             let mut session = Session::new(&mut client, sub.sid);
+            set_reconnect(&mut session, reconnect);
             let (text, code) = session.supervise(&sopts)?;
             Ok(Reply { text, code })
         }
@@ -534,7 +544,9 @@ fn run(opts: &Opts) -> Result<Reply, String> {
             let sub = parse_sub(verb, &opts.cmd[1..])?;
             no_positionals(verb, &sub)?;
             let sopts = supervise_opts(&sub);
+            let reconnect = sub.reconnect_s;
             let mut session = Session::new(&mut client, sub.sid);
+            set_reconnect(&mut session, reconnect);
             let code = session.watch(&sopts, &mut std::io::stdout().lock());
             Ok(Reply {
                 text: String::new(),
@@ -573,6 +585,15 @@ fn run(opts: &Opts) -> Result<Reply, String> {
 /// unattended before the manager is told (30 min — the rate-limit wait the
 /// owner chose).
 const DEFAULT_MAX_S: u64 = 1800;
+
+/// `--reconnect-s`, when given: how long the loop rides out an outage (an
+/// aterm self-update's handoff, from its first unserved request) before it
+/// ends.
+fn set_reconnect(session: &mut Session<'_, CtlClient>, reconnect_s: Option<u64>) {
+    if let Some(s) = reconnect_s {
+        session.set_reconnect(Duration::from_secs(s));
+    }
+}
 
 fn supervise_opts(sub: &SubArgs) -> SuperviseOpts {
     SuperviseOpts {
@@ -699,6 +720,7 @@ mod tests {
                 timeout_ms: None,
                 auto_reads: true,
                 max_s: Some(600),
+                reconnect_s: None,
                 allow_python: args(&["tools/*.py", "scripts/*report*.py"]),
                 notes: Some(PathBuf::from("/tmp/notes.txt")),
                 rest: vec![],
@@ -751,6 +773,21 @@ mod tests {
         );
         let sub = parse_sub("watch", &args(&[])).expect("parses");
         assert_eq!(supervise_opts(&sub).max, Duration::from_secs(DEFAULT_MAX_S));
+        assert_eq!(sub.reconnect_s, None, "the loop's own default");
+        // How long an outage is ridden out: await-turn's, supervise's
+        // and watch's flag alike.
+        for verb in ["watch", "supervise", "await-turn"] {
+            let sub = parse_sub(verb, &args(&["@s-1", "--reconnect-s", "30"])).expect("parses");
+            assert_eq!(
+                (sub.sid.as_deref(), sub.reconnect_s),
+                (Some("@s-1"), Some(30))
+            );
+        }
+        let err = parse_sub("watch", &args(&["--reconnect-s", "soon"])).expect_err("not an int");
+        assert!(
+            err.contains("watch: --reconnect-s needs a seconds integer"),
+            "{err}"
+        );
         let err = parse_sub("watch", &args(&["--every", "5"])).expect_err("unknown flag");
         assert!(err.contains("watch: unknown option '--every'"), "{err}");
         // A failure before the loop is an `EXIT` line on stdout too.

@@ -51,7 +51,7 @@ use std::process::Command;
 use aterm_link::glance::{self, Glance};
 use harness::{until, Fleet, Node, FLEET};
 
-/// `aterm-ctl`, found the way [`harness::gui_binary`] finds `aterm-gui`: this
+/// `aterm-ctl`, found by [`harness::built_binary`], the finder `aterm-gui` uses: this
 /// crate is its own workspace, so there is no `CARGO_BIN_EXE_` for a binary of
 /// the aterm workspace and it has to be located rather than declared. A missing
 /// one is a hard failure naming the command that produces it — a rung that
@@ -61,34 +61,12 @@ use harness::{until, Fleet, Node, FLEET};
 /// for and did not do: the sentence above was here while nothing checked the
 /// binary's AGE, and when that was noticed `target/debug/aterm-ctl` was four and
 /// a half hours behind `crates/aterm-types/src/control_verbs.rs` — the file the
-/// round was auditing — with this suite driving it green. It is the same guard
-/// `gui_binary` uses, taking the crate and the `$…_BIN` exemption as arguments,
+/// round was auditing — with this suite driving it green. It is the same finder and
+/// guard `gui_binary` uses, taking the crate and the `$…_BIN` exemption as arguments,
 /// because "every binary this crate FINDS" is the property worth keeping and
 /// one wired call site is not it.
 fn ctl_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("ATERM_CTL_BIN") {
-        return PathBuf::from(p);
-    }
-    // TWO levels up: this crate moved from the repo root into `crates/` on
-    // 2026-09-10, and a one-level walk names `crates/target`, which has never
-    // existed. Same fix as `harness::workspace_root`.
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("crates/aterm-link sits two levels under the workspace root")
-        .to_path_buf();
-    for profile in ["debug", "release"] {
-        let p = root.join("target").join(profile).join("aterm-ctl");
-        if p.exists() {
-            harness::refuse_a_stale_binary(&p, "aterm-ctl", "ATERM_CTL_BIN");
-            return p;
-        }
-    }
-    panic!(
-        "aterm-ctl was not found under {}/target — build it first \
-         (`targo --unverified build -p aterm-ctl`) or set $ATERM_CTL_BIN",
-        root.display()
-    );
+    harness::built_binary("aterm-ctl", "aterm-ctl", "ATERM_CTL_BIN")
 }
 
 /// Run one `aterm-ctl` command against a node's control socket, as an operator

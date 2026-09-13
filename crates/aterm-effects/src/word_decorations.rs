@@ -4319,7 +4319,10 @@ impl WordDecorations {
                 scale_y: 1.0,
                 purr: 0.0,
                 contented: false,
-                under_ink: false,
+                // The ghost stands where the body stood; it wears the body's
+                // z-order, so a cat that was peering out from behind a word
+                // does not spend its last quarter second painted over it.
+                under_ink: pet.under_ink,
                 motes: [None; crate::kitty_pet::PET_MOTES_MAX],
                 departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
             };

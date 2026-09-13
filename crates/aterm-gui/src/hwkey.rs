@@ -16,11 +16,20 @@
 //! `WindowEvent::KeyboardInput` arm. A `Wake::Input` arrives on a `CFRunLoopSource`,
 //! not in the NSEvent queue, and it stamps its arrival at `note_input()`, i.e.
 //! AFTER the event loop already dequeued it. So a socket-injected key is
-//! structurally incapable of observing the single largest documented typing-stall
-//! mechanism on macOS: a blocking `nextDrawable` parks the main thread and queues
-//! keyDowns in the OS event queue behind it (`metrics.rs` prices that at up to
-//! ~84 ms). Every latency number this project has published was driven by `ctl
-//! key`, so every one of them is a measurement with that slice removed.
+//! structurally incapable of observing a typing stall that happens while the main
+//! thread is parked — historically the single largest documented one on macOS: a
+//! blocking `nextDrawable` parked the main thread and queued keyDowns in the OS
+//! event queue behind it (`metrics.rs` prices that at up to ~84 ms). Every latency
+//! number this project has published was driven by `ctl key`, so every one of them
+//! is a measurement with that slice removed.
+//!
+//! THAT PARTICULAR PARK IS GONE from the shipped macOS build, and the instrument
+//! outlives it on purpose. Since `ea581e158` an attached native Metal surface
+//! acquires its drawable on the `aterm-drawable-acquire` worker and every
+//! main-side call is non-blocking (`present.rs` `acquire` → `Pending`), and the
+//! `get_current_texture()` path named below is `cfg(wgpu_arm)`, emitted only for
+//! `!macos || wgpu-oracle`. What the queue-residence backdate measures is any
+//! main-thread park, whatever parks it; the drawable was the one worth naming.
 //!
 //! # What this does instead
 //!
@@ -50,8 +59,10 @@
 //! relationship the measurement is trying to sample fairly. `postEvent:atStart:` is
 //! one of the few `NSApplication` methods Apple documents as safe from any thread —
 //! it is the canonical secondary-thread wakeup — and it is how a key posted while
-//! the main thread is parked inside `get_current_texture()` can WAIT in the queue,
-//! which is the entire point.
+//! the main thread is parked can WAIT in the queue, which is the entire point.
+//! (The park that motivated this was `get_current_texture()`; that call is
+//! `cfg(wgpu_arm)` and no longer on the shipped macOS path — see the header. The
+//! measurement is of the queue, not of any one parker.)
 
 /// A parsed hardware-key injection request: everything needed to build the
 /// `NSEvent` pair, with no AppKit types, so the grammar is unit-testable.
@@ -446,7 +457,8 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
             // is AppKit's sanctioned way for a secondary thread to hand work to
             // the main run loop — and posting from this thread is the POINT: it
             // lets the event arrive, and wait, while the main thread is parked
-            // in `nextDrawable`.
+            // (in whatever parks it — `nextDrawable` was the motivating case and
+            // is off the shipped macOS path since `ea581e158`; see the header).
             let key_event = |kind: usize| unsafe {
                 let make: unsafe extern "C-unwind" fn(
                     Id,

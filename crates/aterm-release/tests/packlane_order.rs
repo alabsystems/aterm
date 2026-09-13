@@ -38,10 +38,13 @@ fn every_byte_mutation_precedes_relocate_gates_tar_and_sign() {
     // runs, so a first-occurrence scan must key on the section heads.
     let prune = at(&s, "# --- single-arch hygiene");
     let hygiene = at(&s, "# --- retired-entrypoint hygiene");
+    let one_compiler = at(&s, "# --- ONE COMPILER:");
     let strip = at(&s, "# --- PACK-TIME SYMBOL STRIP");
     let relocate = at(&s, "# --- relocate at PACK time");
+    let compiler_gate = at(&s, "# --- ONE-COMPILER GATE");
     let smoke = at(&s, "# --- PER-BIN SMOKE-EXEC");
     let hello = at(&s, "# --- TOOLCHAIN HELLO-WORLD");
+    let tippy = at(&s, "# --- TIPPY PROBE");
     let tar = at(&s, "# --- tar.zst with the SAME hygiene");
     let disk = at(&s, "DISK_INSTALLED=");
 
@@ -50,15 +53,22 @@ fn every_byte_mutation_precedes_relocate_gates_tar_and_sign() {
         prune < hygiene && hygiene < strip,
         "prune -> hygiene -> strip"
     );
+    // …with bin/rustc made ONE inode with bin/trustc before anything signs either:
+    // the strip pass signs once per inode and names each signature after its own
+    // file, which is how 8589/8590 shipped two compilers tippy refuses…
+    assert!(
+        hygiene < one_compiler && one_compiler < strip,
+        "the one-compiler step must precede the first signing pass (the strip)"
+    );
     // …then relocation (the last writer: vendoring + optional Dev-ID signing)…
     assert!(strip < relocate, "the strip must precede relocate/signing");
     // …then the gates that prove the FINAL bytes…
     assert!(
-        relocate < smoke && smoke < hello,
+        relocate < compiler_gate && compiler_gate < smoke && smoke < hello && hello < tippy,
         "gates run on relocated bytes"
     );
     // …and only then the tarball and the size that feed the signed manifest.
-    assert!(hello < tar && tar < disk, "tar + DISK_INSTALLED come last");
+    assert!(tippy < tar && tar < disk, "tar + DISK_INSTALLED come last");
 }
 
 #[test]
@@ -79,6 +89,11 @@ fn the_lane_keeps_its_fail_closed_guards_and_its_escape_hatches() {
         "REFUSING fat Mach-O", // thin guard fails closed
         "has NO members — refusing to sign an empty tarball", // member-listing refusal
         "AppleDouble",         // xattr leak refusal
+        // One compiler: rustc made a hard link to trustc before signing, the pair
+        // refused unless byte-identical after it, and the shipped tippy made to lint.
+        "atpkg_bundle_one_compiler",
+        "atpkg_bundle_compiler_gate",
+        "atpkg_bundle_tippy_gate",
     ] {
         assert!(s.contains(guard), "the lane lost its {guard:?} guard");
     }

@@ -583,9 +583,11 @@ USAGE
     aterm-drive [--socket PATH] [--idle MS] [--timeout MS] [--ready REGEX]
                 <command> [text...]
     aterm-drive classify [--allow-python GLOB]... <cmd...> | phase [@sid]
-              | await-turn [@sid] [--timeout MS]
+              | await-turn [@sid] [--timeout MS] [--reconnect-s S]
               | supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+                          [--reconnect-s S]
               | watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
+                      [--reconnect-s S]
 
 COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
@@ -676,7 +678,7 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        text that says `Approaching` a limit. The worker sits at an
                        idle composer, and what you send it fails until the limit
                        resets or its model is switched.
-    await-turn [@sid] [--timeout MS]
+    await-turn [@sid] [--timeout MS] [--reconnect-s S]
                        Block until the phase is no longer busy, then print it like
                        `phase`. The loop is `await idle 2000` → read → `await seq`
                        (never a sleep); where the host knows `await gone`, the busy
@@ -684,8 +686,12 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        composer rules (a build, a script, a REPL) whose output
                        never held still for the 2 s is busy too: its turn ends
                        when the output pauses. Exit 124 on --timeout (default: the
-                       global --timeout) with the worker still busy.
+                       global --timeout) with the worker still busy — or with the
+                       connection lost (see --reconnect-s): then the phase of the
+                       last screen read, or `busy` with `reason no screen: no
+                       read answered before the timeout` when none was.
     supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+              [--reconnect-s S]
                        The loop: await-turn; with --auto-reads, a Bash prompt whose
                        command classifies read-only is approved (option 1, pressed
                        GUARDED: `key if=Do.you.want.to.proceed 1` on a host that has
@@ -708,8 +714,10 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        exits 0: that is YOUR review point. Once --max-s (default
                        1800) is spent it prints TIMEOUT, then the last read's
                        compact result, and exits 124 — a turn read at or after
-                       the deadline is not pressed.
+                       the deadline is not pressed, and a budget spent while a
+                       lost connection is ridden out is the TIMEOUT too.
     watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
+          [--reconnect-s S]
                        supervise's loop for a harness that wakes its agent once per
                        stdout line (a background monitor, a supervisor process).
                        Approvals are supervise's, and each prints `APPROVED
@@ -729,19 +737,70 @@ SUPERVISING A WORKER (a Claude Code session in another tab; `@sid` from `aterm c
                        non-blank transcript rows up to it (their letters: a
                        timer that ticks is no change), the same box — is neither
                        pressed nor printed again unless, in between, a read saw
-                       the worker busy or it approved a read; a new box, a new
-                       reply, your own row or a retry's new notice changes those
-                       rows, however short the busy spell before it. The
-                       two-approvals count restarts at every review point, as a
-                       fresh supervise's would. A worker without the composer
-                       rules is looked at when its output pauses, as await-turn
-                       waits. Every line is flushed. The last line is TIMEOUT
-                       (exit 124) once --max-s (default 1800) is spent — no
-                       press and no EVENT comes after the deadline — or `EXIT
+                       the worker busy, it approved a read, or an outage came
+                       (see --reconnect-s: nothing could be read in it, so the
+                       point still showing after it is printed once more); a new
+                       box, a new reply, your own row or a retry's new notice
+                       changes those rows, however short the busy spell before
+                       it. The two-approvals count restarts at every review
+                       point, as a fresh supervise's would. A worker without the
+                       composer rules is looked at when its output pauses, as
+                       await-turn waits. Every line is flushed. The last line is
+                       TIMEOUT (exit 124) once --max-s (default 1800) is spent —
+                       no press and no EVENT comes after the deadline, and a
+                       budget spent in an outage is the TIMEOUT too — or `EXIT
                        <reason>` (exit 1): the session ended (`EXIT session gone
-                       (…)`, seen within one 20 s wait), a request or the notes
-                       file failed, or, before the loop ran, one of its flags or
-                       the host (also on stderr).
+                       (…)`, seen within one 20 s wait), an outage outlasted its
+                       window (`EXIT reconnect window lapsed: …`, see
+                       --reconnect-s), a request or the notes file failed, or,
+                       before the loop ran, one of its flags or the host (also
+                       on stderr).
+    --reconnect-s S    (await-turn, supervise, watch) An aterm self-update hands
+                       every session to the new instance under the same @sid, and
+                       a request in flight may get no answer (`server closed the
+                       connection without responding`; a socket refused, gone,
+                       reset or timed out) or be turned away unread (`ERR control
+                       server busy; retry`, `ERR auth`). That OUTAGE is ridden
+                       out, not the end: one line `RECONNECT <reason>` (cut at
+                       160 characters), then a screen read of the same @sid,
+                       retried 0.5 s apart doubling to 8 s, until one answers —
+                       `RECONNECTED after <ms> ms` — and the loop looks again
+                       from a fresh read. S (default 180; 0 = off, the failure
+                       ends the loop) bounds the whole outage, from its first
+                       unserved request until the loop gets past it (that kind
+                       of request served again, the screen seen to move, or a
+                       whole look done): a request dropped again after the
+                       RECONNECTED is the same outage — nothing more is printed,
+                       the retries keep backing off, the window keeps running.
+                       While an outage lasts, `ERR no such session` is not yet
+                       an answer (the new instance may not host the @sid yet);
+                       outside one it ends the loop at once, and `ERR exited`
+                       always does. After the outage no seq from before is
+                       waited on (the content seq starts over on the new
+                       instance), the point reported before it is reported once
+                       more if it is still showing, and a press whose answer
+                       never came is not repeated blind or counted as an
+                       approval — the box is read and classified again first (on
+                       a host without the guard, a `1` the server confirmed is
+                       the approval it was, and a digit left in the composer is
+                       backspaced after the reconnect). A wait that runs out is
+                       followed by a read, so a handoff no request saw fail is
+                       noticed too (the seq read is below the one waited on). An
+                       outage ends the loop when its window lapses, with
+                       `reconnect window lapsed: <the last failure>` (watch: an
+                       `EXIT` line; await-turn and supervise: the error, exit 1)
+                       — and when --max-s or --timeout runs out first, that is
+                       the TIMEOUT, exit 124. watch prints its lines on stdout
+                       (informational: nothing to do), await-turn and supervise
+                       on stderr. Every request, the probe included, resolves
+                       the socket afresh: with no --socket and no
+                       $ATERM_CONTROL_SOCK, the instance hosting this terminal,
+                       else the newest — after an update, the new instance, which
+                       hosts the @sid or forwards to the one that does. A
+                       per-instance socket named there (`aterm-<pid>.sock`, as
+                       `aterm ctl instances` prints) goes with its instance, so
+                       every ride-out through one lapses: leave both unset, or
+                       name the `aterm.sock` alias.
 
 OPTIONS
     --socket PATH   The target aterm's control socket. Defaults to

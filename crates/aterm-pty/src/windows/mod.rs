@@ -1251,6 +1251,15 @@ pub fn fd_is_tty(_fd: i32) -> bool {
     false
 }
 
+/// Windows twin of the Unix [`tty_echo`]: ConPTY exposes no termios, so the
+/// line-discipline question has no answer here and the caller keeps its
+/// default behaviour (bank the press) — the same fail-open a non-tty fd gets
+/// on Unix.
+#[must_use]
+pub fn tty_echo(_master: i32) -> Option<crate::TtyEcho> {
+    None
+}
+
 /// Write all of `bytes` to the child's input, retrying short writes. Stops
 /// silently on any error (matches the Unix Stop-on-error/peer-closed contract;
 /// there is no EINTR on Windows). After the child exits, writes still succeed

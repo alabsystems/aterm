@@ -24224,6 +24224,12 @@ impl App {
             // re-derived here: an agent that reads `flow=1.00` off this socket
             // and holds its turn is reading the same run the theme opened for.
             flow: ws.cursor_glow.flow_status(),
+            // THE DELIVERED INSERTS — did the drop reach the engine, did the
+            // seam lay it, did the placeholder rewrite retract it.
+            inserts: ws.cursor_glow.insert_tally(),
+            // THE IN-FLIGHT ROWS — did a stalled batch reach the seam, how
+            // was it judged, what is still waiting.
+            in_flight: ws.cursor_glow.in_flight_tally(),
         }
         // Rainbow Kitty v2's rows (`v2_quads=` … `v2_meteors=`) trail the
         // line ONLY while v2 owns the frame; every existing reader parses the
@@ -24295,6 +24301,34 @@ impl App {
         // real-window trail/kitty blackout).
         let raw_focused = self.windows.get(&id)?.focused;
         let win_focused = self.cursor_fx_focus(id, raw_focused, frame_started);
+        // THE DELIVERY EDGE (2026-09-10, "the image insert breaks the
+        // rainbow"): the receipts the session's writer thread published for
+        // completed QUEUED writes since this window last looked — a paste's
+        // priced insert width, a Tab / ⌃V queued behind it, a plain key
+        // whose arrival stamp was revoked at enqueue. Read HERE, on the
+        // frame that first observes the echo (the same `Wake::Output` redraw
+        // or headless `image` capture ticks the engine), and applied to the
+        // engines immediately before the print-anchor feed below, so the
+        // frame that judges the insert's hop already holds its licence. No
+        // new wake: with no echo there is nothing to light. Keyed by
+        // `(session, serial)`: a session switch baselines silently.
+        let delivery_seen = self.windows.get(&id)?.delivery_seen;
+        let deliveries = self
+            .front_terminal(id)
+            .map(|mirror| mirror.session)
+            .and_then(|session| {
+                let after = match delivery_seen {
+                    Some((seen_session, serial)) if seen_session == session => Some(serial),
+                    // A different session (or the first read): baseline at the
+                    // tracker's newest serial and apply nothing.
+                    _ => None,
+                };
+                let ctx = &self.pool.get(session)?.ctx;
+                let batch = ctx
+                    .output_echo
+                    .deliveries_after(&ctx.sink, after, frame_started);
+                Some((session, after.is_some(), batch))
+            });
         // Keep the legacy hard-shed policy for downstream non-cursor effects.
         // Cursor-family consumers use `cursor_motion` plus the soft envelope.
         let motion = self.motion_policy(win_focused);
@@ -24467,6 +24501,45 @@ impl App {
                 above_present.then_some(ws.poof_row_above_buf.as_slice()),
                 below_present.then_some(ws.poof_row_below_buf.as_slice()),
             );
+        }
+        // THE DELIVERY EDGE, applied: each receipt newer than the window's
+        // read head arms its licence at the delivery instant — the
+        // DELIVERED-INSERT class for Rainbow Kitty only (every other style
+        // is byte-identical by construction), the typed re-stamp for every
+        // style (the classic trail gets its lockstep twin). A receipt older
+        // than the insert window is marked seen and applied to nothing.
+        if let Some((session, same_session, batch)) = deliveries {
+            let rainbow = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
+            if batch.evicted > 0 {
+                // The register is sized to the engine's typed bank; past it
+                // the receipts are gone and the licences they carried with
+                // them. Loud, never silent: a dark insert with this line in
+                // the log is a diagnosis, without it a mystery.
+                aterm_log::warn!(
+                    "delivery register overran: {} receipt(s) evicted unread (session {session}, latest {})",
+                    batch.evicted,
+                    batch.latest
+                );
+            }
+            if same_session {
+                for (at, ticket) in batch.items.iter().flatten() {
+                    let fresh = frame_started.saturating_duration_since(*at).as_secs_f32()
+                        <= crate::cursor_glow::CursorGlow::INSERT_HINT_FRESH;
+                    if !fresh {
+                        continue;
+                    }
+                    if rainbow && let Some(width) = ticket.insert {
+                        ws.cursor_glow.note_insert_delivered(*at, width);
+                    }
+                    if ticket.typed {
+                        ws.cursor_glow.note_typed_stamp_delivered(*at);
+                        ws.cursor_trail.note_typed(*at);
+                    }
+                }
+                ws.delivery_seen = Some((session, batch.latest));
+            } else {
+                ws.delivery_seen = Some((session, batch.latest));
+            }
         }
         // ECHO-ANCHOR feed, immediately before the tick like the row probe:
         // where the terminal's last print run ended, so the hidden/parked-

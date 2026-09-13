@@ -286,8 +286,9 @@ impl Grid {
 
     /// Drop the `n` NEWEST ring-scrollback rows (the rows directly above the
     /// viewport) after their content has been re-seated into the viewport by
-    /// the deficit fill. Their `ring_extras` entries drop with them.
-    fn drop_newest_ring_scrollback(&mut self, n: usize) {
+    /// the deficit fill or a Kitty CSI + T unscroll. Their `ring_extras` entries
+    /// drop with them.
+    pub(super) fn drop_newest_ring_scrollback(&mut self, n: usize) {
         let hist = self.storage.ring_buffer_scrollback();
         let n = n.min(hist);
         if n == 0 {

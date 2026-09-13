@@ -458,9 +458,11 @@ usage: aterm link broker <socket> [log]
   <socket>  the Unix socket path the bridge's `--broker` names
   [log]     the durable record log (default: <socket>.log)
 
-The local bus: same-uid only, no capability enforcement on attach, no TLS. Put
-the socket inside a 0700 directory. Guarded and sealed transports are astream's
-`Broker::open_guarded` / the `sealed` feature; neither is reachable from here.
+The local bus: no capability enforcement on attach, no TLS, and the SOCKET ITSELF
+is created world-connectable — so the boundary is the DIRECTORY you put it in.
+Use a 0700 one (tools/fabric-enable.sh does). Guarded and sealed transports are
+astream's `Broker::open_guarded` / the `sealed` feature; neither is reachable
+from here.
 ";
     let Some(sock) = args.first() else {
         eprint!("{USAGE}");
@@ -559,6 +561,20 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
             return ExitCode::FAILURE;
         }
     };
+    // A SHORT SECRET IS REFUSED, not silently used. HMAC accepts a key of any
+    // length, so an empty or truncated file mints a capability that looks
+    // perfectly well-formed and seals nothing — the failure mode is a fleet that
+    // appears configured and is not. 32 bytes is what a mint secret is here (see
+    // tools/fabric-enable.sh, which writes exactly that from /dev/urandom).
+    const SECRET_MIN: usize = 32;
+    if key.len() < SECRET_MIN {
+        eprintln!(
+            "aterm link mint: {secret_path} holds {} bytes; a mint secret is at least \
+             {SECRET_MIN} (a short key mints a capability that seals nothing)",
+            key.len()
+        );
+        return ExitCode::FAILURE;
+    }
     match astream_cap::mint(&key, grant) {
         Ok(cap) => {
             // `<grant> <tag-hex>`, split at the LAST whitespace by every reader,
@@ -568,7 +584,7 @@ Prints one `<grant> <tag-hex>` line — append it to the file `serve --cap-file`
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("aterm link mint: {e:?}");
+            eprintln!("aterm link mint: {e}");
             ExitCode::FAILURE
         }
     }

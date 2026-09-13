@@ -661,8 +661,9 @@ fn image_file_reply(
 /// (front) or [`Wake::CaptureAuxWindow`] (Settings routes) with the confined target + a
 /// one-shot result channel and BLOCK. The main thread captures, the encode worker writes
 /// and transfers a guarded `Ok((w, h))`, and the socket server retains it through the
-/// client's explicit complete-response ACK; an `Err(msg)` is surfaced verbatim (missing
-/// Screen Recording grant / window not open / off-macOS).
+/// client's explicit complete-response ACK; an `Err(msg)` is surfaced verbatim (window
+/// not on screen / window not open / off-macOS — never a missing Screen Recording grant:
+/// aterm photographs its OWN window, which needs none; `capture_window_pixels`).
 pub(crate) fn cmd_window(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -2098,20 +2099,39 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
 ///
 /// * `trail [<n>]` — the last `n` SPAWN-SEAM VERDICTS (default: the whole
 ///   diagnostic ring, cap 32), one
-///   `admission seq= phase= reason= age_ms= origin= target= alt=` row each,
-///   newest last ([`crate::App::trail_admissions`]). `phase` is `licensed` or
-///   `declined`; `reason` on a decline is `no-fresh-hint` (no key hint was
-///   fresh, so the move was program output nobody's fingers asked for),
-///   `no-credits` (a multi-cell coalesce outran the press CREDIT budget) or
-///   `off-shape` (licensed and classified, but the style's shape gates laid
-///   nothing). What the last few keystrokes DECIDED.
+///   `admission seq= phase= reason= age_ms= origin= target= alt= licence=`
+///   row each, newest last ([`crate::App::trail_admissions`]). `phase` is
+///   `licensed` or `declined`; `reason` on a decline is `no-fresh-hint` (no
+///   key hint was fresh, so the move was program output nobody's fingers
+///   asked for), `no-credits` (a multi-cell coalesce outran the press CREDIT
+///   budget), `off-shape` (licensed and classified, but the style's shape
+///   gates laid nothing) or `program-row`; `licence=` (2026-09-10) names the
+///   class a licensed row was admitted under — `key` (a press hint),
+///   `insert` (a DELIVERED insert, Rainbow Kitty only: a file drop, ⌘V, and
+///   — into the tab on screen — the `paste` verb, `paste-bin`, `turn`'s
+///   paste phase, an unguarded `key tab` or `key ctrl+v`; its bytes provably
+///   on the wire, laid as one sweep) or `rewrite` (the program pulled the
+///   caret back inside that insert's span and the ribbon retracted to it);
+///   `none` on a decline. `send`, `feed`, a guarded `key if=` and any input
+///   routed to a background session stamp nothing and stay dark by
+///   contract. What the last few keystrokes DECIDED.
 /// * `trail status` — ONE `trail style= … ribbon_active= …` line of standing
 ///   engine state ([`crate::App::trail_status`]): the resolved style, every
 ///   gate from the `cursor_trail` knob to the glass, the cumulative
 ///   `licensed=`/`declined=`/`last_decline_reason=` scoreboard, the light
-///   alive right now, and — `block_fill=`/`block_fill_base=`/
-///   `block_fill_base_from=` — WHO OWNS THE BLOCK CURSOR and what colour their
-///   body is built from. What is TRUE.
+///   alive right now, WHO OWNS THE BLOCK CURSOR and what colour their body is
+///   built from (`block_fill=`/`block_fill_base=`/`block_fill_base_from=`),
+///   and the DELIVERED INSERTS (`inserts_delivered=`/`inserts_lit=`/
+///   `inserts_retracted=`/`last_insert_cells=`, which advance under Rainbow
+///   Kitty only): how many inserts the host reported delivered (a paste's
+///   completed write, a bare Tab's or ⌃V's dispatch), how many the seam lit,
+///   how many placeholder rewrites it retracted, and the last one's width in
+///   cells (priced from its text, else the 32-cell bound), and the PRESSES IN
+///   FLIGHT (`inflight_licensed=`/`inflight_forgotten=`/`credits=`/
+///   `swallowed_no_echo=`): batches the waiting presses alone licensed after a
+///   stalled prompt caught up, edges that forgot a pool, the pool right now, and
+///   presses a canonical no-echo tty (a password prompt) will never echo. What is
+///   TRUE.
 ///
 /// THE BLOCK-FILL FIELDS ARE NOT DECORATION. A cursor-body effect replaces the
 /// caret's colour outright (`RenderInput::cursor_fill_override` is applied

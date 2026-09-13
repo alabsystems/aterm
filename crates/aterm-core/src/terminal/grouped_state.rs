@@ -404,10 +404,6 @@ pub(super) struct NotificationState {
     pub(super) advanced_callback: Option<AdvancedNotificationCallback>,
     /// In-progress notifications being built from OSC 99 chunks.
     pub(super) pending: PendingNotificationsMap,
-    /// Counter for generating unique anonymous notification IDs.
-    /// Prevents collisions when multiple anonymous multi-part notifications
-    /// are interleaved.
-    pub(super) anon_counter: u32,
 }
 
 // NOTE: the OSC 9/99/777 notification rate-limiter (`check_rate_limit`,
@@ -425,14 +421,12 @@ impl NotificationState {
             callback: None,
             advanced_callback: None,
             pending: PendingNotificationsMap::default(),
-            anon_counter: 0,
         }
     }
 
     /// Reset pending notifications while preserving callbacks.
     pub(super) fn reset(&mut self) {
         self.pending.clear();
-        self.anon_counter = 0;
     }
 }
 

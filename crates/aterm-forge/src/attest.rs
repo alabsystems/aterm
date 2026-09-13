@@ -928,11 +928,14 @@ fn ob1_patch_vendor_agreement(
             let _ = writeln!(
                 log,
                 "    [OB-1] `{rel}` is a FIRST-PARTY VENDORED PATH DEPENDENCY (upstream {}), \
-                 reached by path from: {}. It is not a redistribution, so [OB-3]..[OB-10] — \
+                 reached by path from: {}. It is not a redistribution, so [OB-3]..[OB-9] — \
                  the [workspace] stub, .cargo_vcs_info.json/Cargo.toml.orig, a retained \
                  upstream LICENSE, a NOTICE row, the Apache §4(b) pristine diff, the \
-                 fork-marker census, the SPDX allowlist and the vendor/ ignore sweep — do NOT \
-                 apply to it, for the same reason they do not apply to crates/. {}",
+                 fork-marker census and the SPDX allowlist — do NOT apply to it, for the same \
+                 reason they do not apply to crates/. [OB-10] DOES: unlike a patch target \
+                 under crates/, this directory is under vendor/, and the ignore sweep walks \
+                 every path there — a rule that swallows first-party source loses it just as \
+                 silently. {}",
                 row.upstream,
                 dependants.join(", "),
                 row.why

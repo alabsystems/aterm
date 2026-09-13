@@ -1282,18 +1282,24 @@ fn install_channel(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 3.52) ATPKG PUBLISH TOOLING — the two deterministic shell suites over the
+// 3.52) ATPKG PUBLISH TOOLING — the deterministic shell suites over the
 //    producer scripts (tools/atpkg-author-vendor.sh, atpkg-index.sh,
 //    atpkg-publish.sh, atpkg-mirror-public.sh and the vendor lane
 //    tools/atpkg-auto-vendor.sh). Every vendor, key and gh call is stubbed
 //    (their headers say so): no network, no token, no repo mutation. Until
 //    2026-09-08 neither suite ran under any gate, so a change to the scripts
 //    that sign the toolchain index could land unmeasured (the audit finding).
-//    Same posture as install_channel: a missing suite is a cannot-run, never a
-//    skip.
+//    The third suite pins the sysroot-bundle pack's one-compiler contract
+//    (atpkg-pack-bundle.sh): keyless and offline, everything under one mktemp
+//    dir. Same posture as install_channel: a missing suite is a cannot-run,
+//    never a skip.
 // ---------------------------------------------------------------------------
 fn atpkg_tooling(ctx: &Ctx, r: &mut Report) {
-    for name in ["test-atpkg-vendor-tooling.sh", "test-atpkg-auto-vendor.sh"] {
+    for name in [
+        "test-atpkg-vendor-tooling.sh",
+        "test-atpkg-auto-vendor.sh",
+        "test-atpkg-pack-one-compiler.sh",
+    ] {
         let t = ctx.tools_dir().join(name);
         if is_executable_file(&t) {
             run_labeled(ctx, r, name, &Cmd::new(&t));

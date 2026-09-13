@@ -4806,41 +4806,8 @@ impl App {
                         .ok()
                         .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
                         .unwrap_or_default();
-                    let result = result.map(|out| out.status);
-                    let failed = match result {
-                        Ok(status) if status.success() => None,
-                        // EXIT 2 = "ran fine, installed nothing, and never will here"
-                        // (atpkg `cmd_install_default_set`: the signed index pins no
-                        // build for this machine's architecture). It is neither a
-                        // success nor a retryable failure, and reporting it as either
-                        // lies to the user — "install completed" over an empty store,
-                        // or a red error they will keep re-clicking. Give it its own
-                        // words. (A single-program door exits 2 only for a usage
-                        // error, which the admission gate above already refused.)
-                        Ok(status)
-                            if status.code() == Some(2)
-                                && verb.iter().any(|v| v == "--default-set") =>
-                        {
-                            Some(
-                                "Nothing was installed: the registry served no package \
-                                 this machine can run. This is not a temporary error — \
-                                 retrying will not change it."
-                                    .to_string(),
-                            )
-                        }
-                        Ok(status) => Some(if said.is_empty() {
-                            format!("atpkg {} exited with {status}", verb.join(" "))
-                        } else {
-                            // atpkg's own sentence, which names the cause and often
-                            // the remedy — better than the exit code every time.
-                            said.lines().last().unwrap_or(&said).to_string()
-                        }),
-                        Err(error) => Some(format!(
-                            "could not launch atpkg {}: {error}",
-                            verb.join(" ")
-                        )),
-                    };
-                    if let Some(message) = failed {
+                    let result = result.as_ref().map(|out| out.status);
+                    if let Some(message) = packages_child_failure(result, verb, &said) {
                         command = PackagesCommandOutcome::Failed {
                             operation: busy,
                             message,
@@ -7272,6 +7239,71 @@ impl App {
     }
 }
 
+/// The failure sentence for one finished `atpkg` child of the Packages worker, or
+/// `None` when it succeeded — pure over the exit status, the argv and the child's
+/// stderr, so the classification is testable without a child.
+///
+/// FAIL-FAST ON PURPOSE when another atpkg pass holds the store lock: a person
+/// clicked a button, and the worker never passes `--wait-lock` — a wait they cannot
+/// see is worse than a sentence they can act on. That refusal is classified by
+/// CODE now that atpkg reserves 75 (`EX_TEMPFAIL`) for contention (2026-09-10), and
+/// its sentence names the other installer rather than the lock file. The headline
+/// stays the operation's `failed_headline`: `PackagesCommandOutcome` is pinned to
+/// {none, success, failure} by the aterm-spec model
+/// (`models_native.rs` / `native_packages_conformance.rs`), so a distinct
+/// "deferred" outcome is a separate slice.
+fn packages_child_failure(
+    result: Result<std::process::ExitStatus, &std::io::Error>,
+    verb: &[String],
+    said: &str,
+) -> Option<String> {
+    match result {
+        Ok(status) if status.success() => None,
+        // EXIT 2 = "ran fine, installed nothing, and never will here"
+        // (atpkg `cmd_install_default_set`: the signed index pins no
+        // build for this machine's architecture). It is neither a
+        // success nor a retryable failure, and reporting it as either
+        // lies to the user — "install completed" over an empty store,
+        // or a red error they will keep re-clicking. Give it its own
+        // words. (A single-program door exits 2 only for a usage
+        // error, which the admission gate above already refused.)
+        Ok(status) if status.code() == Some(2) && verb.iter().any(|v| v == "--default-set") => {
+            Some(
+                "Nothing was installed: the registry served no package \
+                 this machine can run. This is not a temporary error — \
+                 retrying will not change it."
+                    .to_string(),
+            )
+        }
+        // EXIT 75 = another atpkg pass holds the store lock — the window's own
+        // launch/loop pass mid-install (it can hold the lock for the length of a
+        // multi-GB download), another window's, or a terminal `aterm pkg …`.
+        // Transient by definition; the page's status refresh shows the store
+        // that pass leaves behind.
+        Ok(status) if status.code() == Some(i32::from(atpkg::lock::CONTENDED_EXIT)) => {
+            Some(format!(
+                "Another aterm window or the background pass is installing right now \
+                 \u{2014} {}. Wait for it to finish, then try again.",
+                said.lines()
+                    .last()
+                    .filter(|l| !l.trim().is_empty())
+                    .unwrap_or("it holds the store lock")
+            ))
+        }
+        Ok(status) => Some(if said.is_empty() {
+            format!("atpkg {} exited with {status}", verb.join(" "))
+        } else {
+            // atpkg's own sentence, which names the cause and often
+            // the remedy — better than the exit code every time.
+            said.lines().last().unwrap_or(said).to_string()
+        }),
+        Err(error) => Some(format!(
+            "could not launch atpkg {}: {error}",
+            verb.join(" ")
+        )),
+    }
+}
+
 /// The exact argv of every `atpkg` process a [`PackagesRequest`] runs, one inner list
 /// per process, in order. THE table the Settings verbs and the first-launch admin card
 /// both go through; pinned verbatim by `packages_argv_is_pinned_per_request`, so a
@@ -7392,6 +7424,64 @@ mod packages_argv_tests {
                 s(&["install", "clt", "--elevate=osascript"]),
                 s(&["install", "brew", "--elevate=osascript"]),
             ]
+        );
+    }
+
+    /// The worker's exit classification (2026-09-10): success is no sentence;
+    /// `--default-set` exit 2 keeps its "nothing was installed" words; atpkg's
+    /// contention code (75) names the OTHER installer by code, not by matching the
+    /// sentence, and carries atpkg's own line; any other exit is the last stderr
+    /// line, or the status when there is none.
+    #[cfg(unix)]
+    #[test]
+    fn a_contended_verb_names_the_other_installer_by_exit_code() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = |code: i32| std::process::ExitStatus::from_raw(code << 8);
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<String>>();
+        let lock_line = "atpkg: another atpkg process holds the store lock at /p/store.lock \
+                         \u{2014} refusing to mutate the store concurrently (retry when it exits)";
+        assert_eq!(
+            packages_child_failure(Ok(status(0)), &s(&["update"]), ""),
+            None
+        );
+        assert!(
+            packages_child_failure(Ok(status(2)), &s(&["install", "--default-set"]), "")
+                .unwrap()
+                .starts_with("Nothing was installed"),
+        );
+        let contended = packages_child_failure(
+            Ok(status(i32::from(atpkg::lock::CONTENDED_EXIT))),
+            &s(&["install", "--default-set"]),
+            lock_line,
+        )
+        .unwrap();
+        assert!(
+            contended
+                .starts_with("Another aterm window or the background pass is installing right now"),
+            "{contended}"
+        );
+        assert!(contended.contains("retry when it exits"), "{contended}");
+        assert!(contended.ends_with("then try again."), "{contended}");
+        // With nothing on stderr the sentence still says what holds it up.
+        let quiet = packages_child_failure(
+            Ok(status(i32::from(atpkg::lock::CONTENDED_EXIT))),
+            &s(&["update"]),
+            "",
+        )
+        .unwrap();
+        assert!(quiet.contains("it holds the store lock"), "{quiet}");
+        assert_eq!(
+            packages_child_failure(Ok(status(1)), &s(&["update"]), "first\nlast line").as_deref(),
+            Some("last line")
+        );
+        assert_eq!(
+            packages_child_failure(Ok(status(1)), &s(&["update"]), "").as_deref(),
+            Some("atpkg update exited with exit status: 1")
+        );
+        let error = std::io::Error::other("no such file");
+        assert_eq!(
+            packages_child_failure(Err(&error), &s(&["update"]), "").as_deref(),
+            Some("could not launch atpkg update: no such file")
         );
     }
 

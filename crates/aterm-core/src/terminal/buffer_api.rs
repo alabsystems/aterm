@@ -17,6 +17,11 @@ const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
 /// admission probe. Formatting still consumes the full bounded paste off the
 /// event thread; admission is deliberately conservative beyond this prefix.
 const PASTE_GESTURE_PROBE_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 body the delivered-insert pricer ([`Terminal::paste_insert_cells`])
+/// walks synchronously. A single-line body longer than this is wider than
+/// any row and wraps — its echo is never the same-row hop the insert licence
+/// describes — so it is reported as an unknown width instead of scanned.
+const PASTE_INSERT_PRICE_BYTES: usize = PASTE_GESTURE_PROBE_BYTES;
 
 /// Return the prefix the paste formatter is permitted to inspect, ending on a
 /// UTF-8 boundary.  Keep the payload probe and formatter on this one boundary
@@ -69,6 +74,60 @@ impl Terminal {
             end -= 1;
         }
         text[..end].chars().any(paste_char_can_move)
+    }
+
+    /// THE DELIVERED INSERT'S WIDTH (2026-09-10): how many cells a paste of
+    /// `text` advances the caret on its own row, priced from the SAME
+    /// sanitized body [`Self::format_paste_framed`] puts on the wire (the
+    /// control-character sanitizer, then the grapheme display width under
+    /// the terminal's ambiguous-width mode — the pricing a committed IME run
+    /// already gets in the GUI).
+    ///
+    /// `Some(cells)` for a single-line body; `None` when the width is
+    /// UNKNOWABLE from the text alone — a TAB (the shell's tab stops), a
+    /// line break (the landing row), or a body longer than
+    /// [`PASTE_INSERT_PRICE_BYTES`] (it wraps, or an app collapses it into a
+    /// placeholder) — the host then licenses an unknown-width insert bounded
+    /// by the cursor engine's gesture cap. The scan is bounded by that byte
+    /// count BEFORE any character is looked at, so an adversarial 16 MiB
+    /// clipboard costs the UI thread one length compare.
+    #[must_use]
+    pub fn paste_insert_cells(text: &str, ambiguous_width_double: bool) -> Option<u16> {
+        use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+        let text = bounded_paste_text(text);
+        if text.len() > PASTE_INSERT_PRICE_BYTES {
+            return None;
+        }
+        let mut body = String::with_capacity(text.len());
+        for c in text.chars() {
+            if matches!(c, '\t' | '\n' | '\r') {
+                return None;
+            }
+            if paste_char_allowed(c) {
+                body.push(c);
+            }
+        }
+        // A base-less run of combining marks / selectors / joiners advances
+        // nothing, even where the grapheme classifier groups them into an
+        // emoji-shaped cluster (the GUI's committed-text rule).
+        if aterm_grapheme::str_width(&body) == 0 {
+            return Some(0);
+        }
+        let shaping = TextShapingConfig {
+            ambiguous_width: if ambiguous_width_double {
+                AmbiguousWidth::Double
+            } else {
+                AmbiguousWidth::Single
+            },
+            ..TextShapingConfig::default()
+        };
+        Some(
+            u16::try_from(
+                aterm_grapheme::grapheme_width_with_config(&body, &shaping).display_width,
+            )
+            .unwrap_or(u16::MAX),
+        )
     }
 
     /// Get a reference to the tiered scrollback storage, if attached.
@@ -518,7 +577,7 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PASTE_BYTES, PASTE_GESTURE_PROBE_BYTES, Terminal};
+    use super::{MAX_PASTE_BYTES, PASTE_GESTURE_PROBE_BYTES, PASTE_INSERT_PRICE_BYTES, Terminal};
 
     fn write_lines(t: &mut Terminal, start: usize, n: usize) {
         for i in start..start + n {
@@ -831,5 +890,63 @@ mod tests {
         assert_eq!(term.cell_grapheme(0, 0).as_deref(), Some("e\u{0301}"));
         // Out-of-range yields None.
         assert_eq!(term.cell_grapheme(999, 0), None);
+    }
+
+    /// THE DELIVERED INSERT'S WIDTH (2026-09-10): priced from the sanitized
+    /// single-line body exactly as the wire carries it; unknowable (`None`)
+    /// for a TAB, a line break or a body past the probe; zero for a
+    /// base-less run of marks; control characters stripped before pricing.
+    #[test]
+    fn paste_insert_cells_prices_the_sanitized_single_line_body() {
+        let path = "/Users//example/Desktop/Screenshot\\ 2026-09-10\\ at\\ 14.02.11.png ";
+        assert_eq!(
+            Terminal::paste_insert_cells(path, false),
+            Some(u16::try_from(path.chars().count()).unwrap()),
+            "an ASCII path is one cell per character"
+        );
+        assert_eq!(Terminal::paste_insert_cells("foo bar ", false), Some(8));
+        assert_eq!(
+            Terminal::paste_insert_cells("中🙂", false),
+            Some(4),
+            "CJK and emoji are two cells each"
+        );
+        assert_eq!(
+            Terminal::paste_insert_cells("\u{0301}\u{fe0f}\u{200d}", false),
+            Some(0),
+            "a base-less run of marks advances nothing"
+        );
+        assert_eq!(
+            Terminal::paste_insert_cells("a\x1b\x03b\u{009b}c\x7f", false),
+            Some(3),
+            "controls are stripped before pricing, as the formatter strips them"
+        );
+        assert_eq!(Terminal::paste_insert_cells("", false), Some(0));
+        assert_eq!(
+            Terminal::paste_insert_cells("a\nb", false),
+            None,
+            "a line break: the landing row is unknowable"
+        );
+        assert_eq!(Terminal::paste_insert_cells("a\r\nb", false), None);
+        assert_eq!(
+            Terminal::paste_insert_cells("a\tb", false),
+            None,
+            "a TAB: the shell's tab stops are unknowable"
+        );
+        let long = "x".repeat(PASTE_INSERT_PRICE_BYTES + 1);
+        assert_eq!(
+            Terminal::paste_insert_cells(&long, false),
+            None,
+            "a body past the probe wraps or is collapsed: unknown width"
+        );
+        let exact = "x".repeat(PASTE_INSERT_PRICE_BYTES);
+        assert_eq!(
+            Terminal::paste_insert_cells(&exact, false),
+            Some(u16::try_from(PASTE_INSERT_PRICE_BYTES).unwrap())
+        );
+        // The ambiguous-width mode is the terminal's, priced the same way the
+        // GUI prices a committed run.
+        assert!(
+            Terminal::paste_insert_cells("±", true) >= Terminal::paste_insert_cells("±", false)
+        );
     }
 }

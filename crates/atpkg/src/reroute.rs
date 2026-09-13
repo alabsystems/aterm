@@ -681,11 +681,19 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
     }
     let dir = dir(layout);
     layout.ensure_dir(&dir)?;
-    // The marker file first, so a walk racing this `lay` already recognizes
-    // the directory before the first stub lands in it.
+    // Every file of the pass rendered first and laid in ONE job
+    // ([`crate::lay::lay_executables`]: in-process, or through the untracked launchd
+    // job when this process is provenance-tracked — these stubs run every upstream
+    // `cargo`/`rustc` typed in a session, and a tagged one would track them all). The
+    // marker file first in the list, so a walk racing this `lay` already recognizes the
+    // directory before the first stub lands in it — the job writes in order.
+    let mut files = Vec::new();
     let marker = dir.join(DIR_MARKER_FILE);
     if !marker.is_file() {
-        crate::stub::write_executable_atomic(&marker, &format!("{STUB_MARKER}\n"))?;
+        files.push(crate::lay::Executable::new(
+            &marker,
+            format!("{STUB_MARKER}\n"),
+        ));
     }
     let atpkg = crate::stub::embedded_atpkg_path();
     for row in TABLE {
@@ -695,8 +703,12 @@ pub fn lay(layout: &Layout) -> io::Result<()> {
             Ok(_) if is_reroute_stub(&path) => {} // ours: rewrite refreshes the path
             Ok(_) => continue,                    // foreign: never touched
         }
-        crate::stub::write_executable_atomic(&path, &stub_body_sh(row.upstream, &atpkg, &dir))?;
+        files.push(crate::lay::Executable::new(
+            &path,
+            stub_body_sh(row.upstream, &atpkg, &dir),
+        ));
     }
+    crate::lay::lay_executables(&files)?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();

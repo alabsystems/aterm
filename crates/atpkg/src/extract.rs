@@ -280,7 +280,15 @@ pub fn vet_hardlink_stripped(
 /// the link's safe absolute path; `Ok(None)` when the entry strips away.
 ///
 /// Lexical on purpose: the resolution never consults the filesystem, so it cannot be
-/// raced, and a chain of links resolves link by link — each one vetted on its own.
+/// raced. That is only sound because `..` is admitted as a LEADING run and nowhere else
+/// ([`ExtractReject::RootEscape`] after any normal component): a `..` that follows a
+/// component pops from wherever that component points on disk, and when it is a link laid
+/// earlier in the same archive the lexical walk and the disk disagree — `a/b/c/up ->
+/// ../../..` and `bin -> a/b/c/up/../OUTSIDE` each vet in-root and chain out of it (audit
+/// K1, 2026-09-12). Leading pops start from the link's own directory, which is always a
+/// real directory (the ancestors and the landing path are guarded against links); after
+/// them the target only descends, through entries each vetted in-root, so no chain of
+/// links can climb out whatever order they are laid in.
 pub fn vet_symlink(
     root: &Path,
     raw: &Path,
@@ -299,12 +307,16 @@ pub fn vet_symlink(
     }
     // The link lives `depth` directories below the root; the target walks from there.
     let mut depth: usize = rel.components().count().saturating_sub(1);
+    let mut descended = false;
     for comp in target.components() {
         match comp {
-            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::Normal(_) => {
+                descended = true;
+                depth = depth.saturating_add(1);
+            }
             Component::CurDir => {}
             Component::ParentDir => {
-                if depth == 0 {
+                if depth == 0 || descended {
                     return Err(ExtractReject::RootEscape);
                 }
                 depth = depth.saturating_sub(1);
@@ -1748,9 +1760,9 @@ mod tests {
     }
 
     /// The symlink vet: in-root targets (relative from the link's own directory) pass;
-    /// anything that pops above the root, an absolute target, or an empty one is refused;
-    /// the resolution is lexical (a `..` after a `..` that reached the root escapes even
-    /// if a later component would come back in).
+    /// anything that pops above the root, a `..` after a normal component, an absolute
+    /// target, or an empty one is refused; the resolution is lexical (a `..` after a `..`
+    /// that reached the root escapes even if a later component would come back in).
     #[test]
     fn symlink_vet_resolves_targets_lexically_inside_the_root() {
         let r = root();
@@ -1779,6 +1791,15 @@ mod tests {
             ExtractReject::RootEscape,
             "lexical: no coming back"
         );
+        // `..` only as a leading run: after a normal component it would pop from inside
+        // whatever that component is on disk — possibly a link laid earlier (K1).
+        assert_eq!(
+            bad("bin", "a/b/c/up/../OUTSIDE"),
+            ExtractReject::RootEscape,
+            "a non-leading `..` can chain through an earlier link"
+        );
+        assert_eq!(bad("a/b/c", "../d/../e"), ExtractReject::RootEscape);
+        assert_eq!(bad("a/b/c", "./d/.."), ExtractReject::RootEscape);
         assert_eq!(bad("bin/x", "/etc/passwd"), ExtractReject::AbsolutePath);
         assert_eq!(bad("bin/x", ""), ExtractReject::EmptyPath);
         assert_eq!(bad("../x", "y"), ExtractReject::ParentTraversal);
@@ -2623,6 +2644,79 @@ mod tests {
             assert!(
                 matches!(&err, ExtractError::Rejected(r, _) if r == want),
                 "zip {label}: {err:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two symlinks that each vet in-root cannot ADD UP to one that leaves it: a `..` that
+    /// follows a component which is itself a link pops from wherever that link points on
+    /// disk, not from where the lexical walk thinks it is. `a/b/c/up -> ../../..` is the
+    /// root; `bin -> a/b/c/up/../OUTSIDE` then walks out of it. Refused in the tar and zip
+    /// lanes, and in either order (audit K1, 2026-09-12).
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_in_root_symlinks_cannot_escape_the_root() {
+        type Entry = (&'static str, u8, &'static str, &'static [u8], u32);
+        let d = dest("link-chain");
+        std::fs::create_dir_all(d.join("OUTSIDE")).unwrap();
+        let dir: Entry = ("a/b/c/", b'5', "", b"", 0o755);
+        let up: Entry = ("a/b/c/up", b'2', "../../..", b"", 0o777);
+        let bin: Entry = ("bin", b'2', "a/b/c/up/../OUTSIDE", b"", 0o777);
+        let file: Entry = ("gh-real", b'0', "", b"x", 0o755);
+        let orders: [(&str, [Entry; 4]); 2] = [
+            ("up-first", [dir, up, bin, file]),
+            ("bin-first", [bin, dir, up, file]),
+        ];
+        for (label, entries) in &orders {
+            let escaped = |root: &Path| {
+                std::fs::canonicalize(root.join("bin"))
+                    .is_ok_and(|p| p == std::fs::canonicalize(d.join("OUTSIDE")).unwrap())
+            };
+            let gz = d.join(format!("{label}.tar.gz"));
+            std::fs::write(&gz, gzip_bytes(&tar_bytes(entries))).unwrap();
+            let root = d.join(format!("{label}-gz"));
+            let got = extract_tar_gz_tree(&gz, &root, 10_000_000, 10_000, vendor(0));
+            assert!(
+                matches!(
+                    &got,
+                    Err(ExtractError::Rejected(
+                        ExtractReject::RootEscape | ExtractReject::ThroughSymlink,
+                        _
+                    ))
+                ),
+                "gz {label}: {:?} (bin escaped: {})",
+                got.map(|_| ()),
+                escaped(&root)
+            );
+            let members: Vec<ZipMember<'_>> = entries
+                .iter()
+                .map(|(n, tf, l, c, _)| ZipMember {
+                    name: n,
+                    mode: match tf {
+                        b'5' => 0o040_755,
+                        b'2' => 0o120_777,
+                        _ => 0o100_755,
+                    },
+                    data: if *tf == b'2' { l.as_bytes() } else { c },
+                    deflate: false,
+                })
+                .collect();
+            let zip = d.join(format!("{label}.zip"));
+            std::fs::write(&zip, zip_bytes(&members, false)).unwrap();
+            let root = d.join(format!("{label}-zip"));
+            let got = extract_zip_tree(&zip, &root, 10_000_000, 10_000, vendor(0));
+            assert!(
+                matches!(
+                    &got,
+                    Err(ExtractError::Rejected(
+                        ExtractReject::RootEscape | ExtractReject::ThroughSymlink,
+                        _
+                    ))
+                ),
+                "zip {label}: {:?} (bin escaped: {})",
+                got.map(|_| ()),
+                escaped(&root)
             );
         }
         let _ = std::fs::remove_dir_all(&d);

@@ -447,7 +447,10 @@ GOTCHAS (in the order they bite)
     and re-asserts on every install and update pass — a store update moves the
     compiler without touching rustup.
   * AUTOMATIC updates ride the windowed app: `aterm --window` runs the update pass at
-    launch and on a 6h loop (ATPKG_UPDATE_INTERVAL_SECS); the app's OWN self-update check
+    launch and on a 6h loop (ATPKG_UPDATE_INTERVAL_SECS); a launch pass that finds another
+    aterm's install in flight (a second window, the reopened app after the macOS Full
+    Disk Access grant) waits for it, then runs — it never reports that install as a
+    failure; the app's OWN self-update check
     runs from the window and from every terminal session. Headless or CLI-only usage
     updates the PACKAGES only when you run `aterm pkg update` (or a scheduler does), and
     until the first pass has completed on a machine, `aterm pkg list`/`which`/`status`/
@@ -1140,12 +1143,15 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      worker's own words about limits never count — and what you
                      send it fails until the limit resets or its model is
                      switched
-  await-turn [@sid] [--timeout MS]
+  await-turn [@sid] [--timeout MS] [--reconnect-s S]
                      block until the phase is no longer busy (the live status
                      row and the busy footer both quiet; a screen without the
                      composer, once its output pauses), then print it like
-                     `phase`; exit 124 on the timeout
+                     `phase`; exit 124 on the timeout (also when it runs out
+                     while a lost connection is ridden out: the last screen
+                     read, if any)
   supervise [@sid] [--auto-reads] [--max-s S] [--allow-python GLOB]... [--notes FILE]
+            [--reconnect-s S]
                      the loop: await-turn; with --auto-reads a Bash prompt whose
                      command is read-only is approved (option 1, guarded: a
                      skipped guard is not an approval, and the box must leave
@@ -1153,22 +1159,55 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      workflow, a question, a limit notice, an idle composer — is
                      printed and the tool exits 0 for YOUR review; TIMEOUT / exit
                      124, with the last read, once --max-s is spent (nothing is
-                     pressed after it)
+                     pressed after it; spent in an outage, it is the TIMEOUT too)
   watch [@sid] [--auto-reads] [--allow-python GLOB]... [--notes FILE] [--max-s S]
+        [--reconnect-s S]
                      supervise's loop that never exits at a review point: it
                      prints ONE line — `EVENT <phase> seq=<n> <summary>` — and
                      keeps watching, looking again once the screen has moved past
                      that point, so your turn or key is picked up by itself; a
                      point that looks like the last one (the same summary, the
                      same last transcript rows, the same box) is not repeated
-                     unless it saw the worker busy or approved a read in
-                     between; each approval prints `APPROVED seq=<n>
-                     <command>`; TIMEOUT / exit 124 once --max-s (default 1800)
-                     is spent, `EXIT <reason>` / exit 1 when the session ends,
-                     a request or the notes file fails, or a flag or the host
-                     fails before the loop. Run it under your harness's
+                     unless it saw the worker busy, approved a read, or lost
+                     the connection in between (the point still showing after
+                     an outage is printed once more); each approval prints
+                     `APPROVED seq=<n> <command>`; TIMEOUT / exit 124 once
+                     --max-s (default 1800) is spent, an outage included, `EXIT
+                     <reason>` / exit 1 when the session ends, an outage
+                     outlasts its window (see --reconnect-s), a request or the
+                     notes file fails, or a flag or the host fails before the
+                     loop. Run it under your harness's
                      background monitor:
                        aterm drive watch @s-… --auto-reads --notes notes.txt
+  --reconnect-s S    await-turn, supervise and watch ride through an aterm
+                     self-update: the session keeps its @sid on the new
+                     instance, and a request that got no answer (`server closed
+                     the connection without responding`, a refused or vanished
+                     socket) or was turned away unread (`ERR control server
+                     busy; retry`, `ERR auth`) prints `RECONNECT <reason>`, then
+                     re-reads the same @sid 0.5 s apart, doubling to 8 s. When
+                     one answers it prints `RECONNECTED after <ms> ms` and looks
+                     again from a fresh read — no seq from before the handoff
+                     is waited on, the point last reported is reported once
+                     more if still showing, and a press whose answer never came
+                     is not repeated blind: the box is read and classified
+                     first. S (default 180; 0 = off) bounds the whole outage,
+                     not one ride-out: a request dropped again before the loop
+                     gets past the first is the same outage, printed once. In
+                     one, `ERR no such session` is not yet an answer (the new
+                     instance may not host the @sid yet); outside one it ends
+                     the loop at once, as `ERR exited` always does. A wait that
+                     runs out is followed by a read, so a handoff no request saw
+                     fail is caught too. The window lapsing ends it, exit 1,
+                     with `reconnect window lapsed: <the last failure>` (watch:
+                     an `EXIT` line); --max-s or --timeout running out first is
+                     the TIMEOUT, exit 124. watch prints both lines on stdout
+                     (informational), await-turn and supervise on stderr. A
+                     per-instance socket named with --socket or
+                     $ATERM_CONTROL_SOCK (`aterm-<pid>.sock`) goes with its
+                     instance, so a ride-out through it lapses: leave both
+                     unset (the instance hosting this terminal, else the
+                     newest) or name the `aterm.sock` alias
 
   aterm drive --help       every flag
   aterm help introspection the control protocol underneath

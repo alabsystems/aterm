@@ -246,10 +246,12 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
 /// exercises is a key field a refactor deletes.
 #[test]
 fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
-    // A TIERED store, unlike the other fixtures: `unscroll_from_scrollback`
-    // measures its budget against the TIERED line count and routes a ring-only
-    // grid to a plain region scroll that removes nothing. A tiny ring pushes
-    // the corpus down into the tiers where the unscroll can reach it.
+    // A TIERED store with a tiny ring, unlike the other fixtures. Since
+    // 2026-09-12 `unscroll_from_scrollback` pulls history's newest lines from
+    // the ring above the viewport and then the store, so a ring-only grid
+    // unscrolls too; this fixture dates from when only the store was read
+    // (a ring-only grid then blank-scrolled and removed nothing), and it keeps
+    // most of the corpus in the tiers.
     let mut term = filled_tiered_terminal();
     let mut scratch = RenderInput::empty();
     term.scroll_display(DEPTH);
@@ -270,8 +272,8 @@ fn a_kitty_unscroll_renumbers_history_and_reopens_the_bill() {
         term.grid().scrollback_lines() < lines_before,
         "the CSI +T unscroll removed no scrollback line ({lines_before} -> {}) \
          — nothing was renumbered, so this fixture is not exercising the \
-         renumber epoch at all. A RING-ONLY grid routes here to a plain region \
-         scroll; the tiered store above is what makes the unscroll real.",
+         renumber epoch at all. The unscroll pulls from the ring and the \
+         store alike, so the fixture above must have left history to pull.",
         term.grid().scrollback_lines()
     );
     assert!(

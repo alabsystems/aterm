@@ -210,14 +210,33 @@ pub(crate) fn install_tools_env(
 ) -> io::Result<()> {
     let bin = layout.bin_dir();
     layout.ensure_dir(&bin)?;
+    // Rendered first, laid in ONE pass: every primary and — under [`Aliases::Alab`] —
+    // its `alab-<tool>` alias forwarding to the SAME executable, handed together to
+    // [`crate::lay::lay_executables`], which writes them in-process or, when this process
+    // is provenance-tracked, through one untracked launchd job (law m21: a tagged shim
+    // tracks the tool it execs). The alias is the primary's target under the alias's
+    // file name — the pair [`platform::shim_executable_env`] keeps apart by taking the
+    // target's [`ToolName`] and the shim path separately.
+    let mut files = Vec::new();
     for tool in tools {
-        platform::install_shim_env(&build_dir.join("bin"), tool, &layout.shim(tool), env)?;
+        files.push(platform::shim_executable_env(
+            &build_dir.join("bin"),
+            tool,
+            &layout.shim(tool),
+            env,
+        )?);
         if aliases == Aliases::Alab
             && let Some(alias) = tool.alias()
         {
-            install_alias(layout, build_dir, tool, &alias, env)?;
+            files.push(platform::shim_executable_env(
+                &build_dir.join("bin"),
+                tool,
+                &layout.shim(&alias),
+                env,
+            )?);
         }
     }
+    crate::lay::lay_executables(&files)?;
     prune_stale_shims(layout, build_dir, tools, aliases);
     // The front-of-PATH twin of an agent program's shim (owner decision 2026-09-10),
     // laid from the `bin/` shim just written so the two can never disagree.
@@ -308,21 +327,6 @@ pub fn sweep_agents_dir(layout: &Layout) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-}
-
-/// Lay `bin/<alias>` forwarding to the SAME executable `tool`'s own shim forwards to:
-/// `<build_dir>/bin/<tool><EXE_SUFFIX>`. The shim file is the alias's
-/// (`alab-ay`, `alab-ay.cmd`), the target is the primary's (`ay`, `ay.exe`) — which is
-/// exactly the pair [`platform::install_shim`] keeps apart by taking the target's
-/// [`ToolName`] and the shim path separately.
-fn install_alias(
-    layout: &Layout,
-    build_dir: &Path,
-    tool: &ToolName,
-    alias: &ToolName,
-    env: &crate::shim_env::ShimEnv,
-) -> io::Result<()> {
-    platform::install_shim_env(&build_dir.join("bin"), tool, &layout.shim(alias), env)
 }
 
 /// Bring the ALIASES of an already-installed program in line with `aliases` without

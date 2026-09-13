@@ -107,6 +107,14 @@ const TAILED_STALE: Duration = Duration::from_secs(30);
 /// progress file to tail — no store layout): a terminal marker normally answers
 /// it; if none ever comes, it folds after the same hold the old pill had.
 const ANNOUNCE_STALE: Duration = Duration::from_secs(20 * 60);
+/// The cap on the "waiting for another install" row ([`StatusBars::toolchain_waiting`],
+/// 2026-09-10): it is normally retired by the sibling's first tailed snapshot, by
+/// this child's own markers, or by the child's exit — this is the backstop for a
+/// launch thread that died, and it must OUTLAST the child's own `--wait-lock` bound
+/// (`crate::ATPKG_WAIT_LOCK_SECS`; a test pins the order).
+const WAIT_STALE: Duration = Duration::from_secs(35 * 60);
+/// The title of that row — also how [`Bar::is_waiting`] recognises it.
+const WAITING_TITLE: &str = "Waiting for another aterm's toolchain install";
 /// The cap on a LIVE update bar. The updater's download poller reports only on
 /// size CHANGE and its verify phase (codesign / Gatekeeper) can sit silent for
 /// tens of seconds, so this is long — but a check is bounded by curl's own
@@ -469,6 +477,11 @@ impl Bar {
 
     fn terminal(&self) -> bool {
         self.fold_at.is_some()
+    }
+
+    /// The "queued behind another install" row ([`StatusBars::toolchain_waiting`]).
+    fn is_waiting(&self) -> bool {
+        self.text.title == WAITING_TITLE
     }
 
     /// The instant this bar leaves on its own: its hold, or its staleness cap.
@@ -859,6 +872,65 @@ impl StatusBars {
         });
     }
 
+    /// The launch-time child is QUEUED behind another atpkg process at the store
+    /// lock (`lock-waiting:`, the `--wait-lock` lanes — 2026-09-10): a LIVE Info
+    /// row with no meter, so the sibling's own tailed snapshot replaces it with the
+    /// real install, a terminal marker outranks it, and `toolchain_snapshot(None)`
+    /// clears it at the child's exit. It fills only an EMPTY lane or refreshes
+    /// itself: a live meter already up (the sibling's pass, tailed before the
+    /// marker line was read) says more, and a held terminal row is a sentence the
+    /// user was meant to read — the wait reaches the log either way. Capped at
+    /// [`WAIT_STALE`]. Never the failure bar: the incident of 2026-09-10 rendered
+    /// this exact event as "⚠ ALab toolchain install failed".
+    pub(crate) fn toolchain_waiting(&mut self, now: Instant) {
+        if self.toolchain.as_ref().is_some_and(|b| !b.is_waiting()) {
+            return;
+        }
+        self.toolchain = Some(Bar {
+            text: BarText {
+                glyph: '\u{2139}',
+                title: WAITING_TITLE.to_string(),
+                detail: "it holds the store lock \u{2014} this window continues when it finishes"
+                    .to_string(),
+                stats: String::new(),
+                tone: Tone::Info,
+            },
+            fill: None,
+            fold_at: None,
+            stale_at: Some(now + WAIT_STALE),
+            pass_id: None,
+            staged_build: None,
+            health: false,
+        });
+    }
+
+    /// The wait ran out (atpkg exit 75): the pass is DEFERRED — the loop retries on
+    /// its short backoff, or parks an hour when the holder looks wedged (never the
+    /// interval) — and `detail` says which. A terminal Info notice held
+    /// [`HOLD_NOTICE`] (queued behind a held row like any other), the same ⏸ the
+    /// dead-writer row uses, never the word "failed".
+    pub(crate) fn toolchain_deferred(&mut self, detail: &str, now: Instant) {
+        self.post_toolchain_terminal(
+            Bar {
+                text: BarText {
+                    glyph: '\u{23f8}',
+                    title: "ALab toolchain".to_string(),
+                    detail: sanitize_for_tty(detail, 160),
+                    stats: String::new(),
+                    tone: Tone::Info,
+                },
+                fill: None,
+                fold_at: None,
+                stale_at: None,
+                pass_id: None,
+                staged_build: None,
+                health: false,
+            },
+            HOLD_NOTICE,
+            now,
+        );
+    }
+
     /// One classified `progress.json` read from the child-scoped tailer
     /// (`Wake::PkgProgress`). `None` = the file vanished at child exit.
     ///
@@ -1102,7 +1174,9 @@ impl StatusBars {
 
     /// A bad terminal outcome for the toolchain lane (`seed-partial:` /
     /// `seed-failed:` / `net-failed:` / `seed-unusable:` / the synthetic
-    /// "child died after announcing"). `what` is the whole sentence.
+    /// "child died after announcing"). `what` is the whole sentence. Never for a
+    /// store-lock wait or its timeout — those are [`Self::toolchain_waiting`] and
+    /// [`Self::toolchain_deferred`] (2026-09-10).
     pub(crate) fn toolchain_failed(&mut self, what: &str, now: Instant) {
         // A FAILURE ROW NEVER INHERITS A FINISHED METER. Carrying the fill over is
         // honest while the bar being replaced is this pass's LIVE meter — the reader
@@ -2522,6 +2596,164 @@ mod tests {
             bars.deadline(),
             Some(now + Duration::from_secs(20) + TAILED_STALE)
         );
+    }
+
+    /// The store-lock wait row (2026-09-10): live, no meter, Info — the sibling's
+    /// running snapshot replaces it with the real install, `None` clears it, an
+    /// announcement replaces it, and a real refusal after the wait still wins.
+    #[test]
+    fn a_lock_wait_opens_a_live_waiting_row_that_progress_replaces_and_none_clears() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_waiting(now);
+        assert_eq!(bars.rows(), 1);
+        let (lane, bar) = bars.bars().next().unwrap();
+        assert_eq!(lane, Lane::Toolchain);
+        assert_eq!(
+            bar.text.title,
+            "Waiting for another aterm's toolchain install"
+        );
+        assert_eq!(
+            bar.text.detail,
+            "it holds the store lock \u{2014} this window continues when it finishes"
+        );
+        assert_eq!(bar.text.tone, Tone::Info);
+        assert_eq!(bar.text.glyph, '\u{2139}');
+        assert_eq!(bar.fill, None, "no meter of its own");
+        assert_eq!(bar.fold_at, None, "live");
+        assert_eq!(bar.stale_at, Some(now + WAIT_STALE), "…with a cap");
+        assert!(!bar.terminal());
+        assert!(!bar.text.detail.contains("failed"));
+        // A second marker line (the update child, queued behind the same holder)
+        // refreshes the row in place.
+        bars.toolchain_waiting(now + Duration::from_secs(5));
+        assert_eq!(bars.rows(), 1);
+        assert_eq!(
+            bars.bars().next().unwrap().1.stale_at,
+            Some(now + Duration::from_secs(5) + WAIT_STALE)
+        );
+        // The sibling's real progress replaces it…
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "Installing the ALab toolchain"
+        );
+        // …`None` (the child's exit after a quiet run) clears it…
+        let mut fresh = StatusBars::default();
+        fresh.toolchain_waiting(now);
+        fresh.toolchain_snapshot(None, now);
+        assert_eq!(fresh.rows(), 0, "the clear retires a waiting row");
+        // …an announcement (this child's own pass starting) replaces it…
+        let mut fresh = StatusBars::default();
+        fresh.toolchain_waiting(now);
+        fresh.toolchain_announced("installing 10 ALab program(s) (about 3 GB)", now);
+        assert_eq!(
+            fresh.bars().next().unwrap().1.text.title,
+            "Installing the ALab toolchain"
+        );
+        // …and a real refusal after the wait still wins.
+        let mut fresh = StatusBars::default();
+        fresh.toolchain_waiting(now);
+        fresh.toolchain_failed(
+            "install failed \u{2014} see Settings \u{25b8} Packages",
+            now,
+        );
+        assert_eq!(fresh.bars().next().unwrap().1.text.tone, Tone::Warn);
+    }
+
+    /// The waiting row never covers what says more: a live meter already up (the
+    /// sibling's pass, tailed before the marker line was read) stays, and a held
+    /// terminal outcome the user was meant to read stays — the wait is logged, not
+    /// shown, in those two orderings.
+    #[test]
+    fn the_waiting_row_never_covers_a_meter_or_a_held_outcome() {
+        let now = t0();
+        let mut bars = StatusBars::default();
+        bars.toolchain_snapshot(Some(&snap(true)), now);
+        bars.toolchain_waiting(now);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "Installing the ALab toolchain");
+        assert!(bar.fill.is_some(), "the meter survived");
+        let mut bars = StatusBars::default();
+        bars.toolchain_installed("\u{2713} ALab toolchain installed: ay, trust", now);
+        bars.toolchain_waiting(now);
+        assert_eq!(
+            bars.bars().next().unwrap().1.text.title,
+            "ALab toolchain installed"
+        );
+        assert_eq!(bars.rows(), 1);
+        let mut bars = StatusBars::default();
+        bars.toolchain_failed("install failed", now);
+        bars.toolchain_waiting(now);
+        assert_eq!(bars.bars().next().unwrap().1.text.tone, Tone::Warn);
+    }
+
+    /// Its backstop: with nothing retiring it, the waiting row folds at its cap
+    /// into an Ok ledger row (nothing was wrong), and the `appstatus` grammar for
+    /// the live row is the ordinary live one.
+    #[test]
+    fn the_waiting_row_folds_at_its_cap_into_an_ok_ledger_row() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_waiting(now);
+        assert_eq!(bars.deadline(), Some(now + WAIT_STALE));
+        let live = bars.activity_rows(now);
+        assert_eq!(live.len(), 1);
+        assert!(
+            live[0].starts_with("activity kind=toolchain phase=live "),
+            "{}",
+            live[0]
+        );
+        assert!(live[0].ends_with(" outcome=-"), "{}", live[0]);
+        assert!(!bars.settle(now + WAIT_STALE / 2));
+        assert!(bars.settle(now + WAIT_STALE), "the cap retires it");
+        assert_eq!(bars.rows(), 0);
+        let row = bars.ledger().next().expect("recorded");
+        assert_eq!(row.outcome, Outcome::Ok);
+        assert_eq!(row.title, "Waiting for another aterm's toolchain install");
+    }
+
+    /// The cap must outlast the child's own wait, or a still-queued child would
+    /// lose its row before it could either proceed or time out.
+    #[test]
+    fn the_waiting_cap_outlasts_the_childs_own_wait() {
+        assert!(WAIT_STALE > Duration::from_secs(crate::ATPKG_WAIT_LOCK_SECS));
+        assert!(
+            WAIT_STALE
+                < Duration::from_secs(crate::ATPKG_WAIT_LOCK_SECS) + Duration::from_secs(10 * 60),
+            "…but not by much: a dead launch thread should not keep the row for long"
+        );
+    }
+
+    /// A wait that ran out is a DEFERRED notice — Info, ⏸, held like a notice,
+    /// never the word "failed" — and behind a held Warn row it queues like any
+    /// terminal row so both are read.
+    #[test]
+    fn a_lock_wait_timeout_is_a_deferred_notice_not_a_failure() {
+        let mut bars = StatusBars::default();
+        let now = t0();
+        bars.toolchain_waiting(now);
+        bars.toolchain_deferred(
+            "another install is still running \u{2014} trying again in 30 s (each try waits up to 30 min)",
+            now,
+        );
+        assert_eq!(bars.rows(), 1);
+        let bar = bars.bars().next().unwrap().1;
+        assert_eq!(bar.text.title, "ALab toolchain");
+        assert_eq!(bar.text.tone, Tone::Info);
+        assert_eq!(bar.text.glyph, '\u{23f8}');
+        assert_eq!(bar.fold_at, Some(now + HOLD_NOTICE));
+        assert!(bar.terminal(), "it replaced the live waiting row");
+        assert!(!bar.text.detail.contains("failed"), "{}", bar.text.detail);
+        assert!(bar.text.detail.contains("trying again in 30 s"));
+        // Behind a held Warn row it queues, and is promoted when that folds.
+        let mut bars = StatusBars::default();
+        bars.toolchain_failed("partly installed", now);
+        bars.toolchain_deferred("another install is still running", now);
+        assert_eq!(bars.bars().next().unwrap().1.text.tone, Tone::Warn);
+        assert!(bars.settle(now + HOLD_WARN));
+        assert_eq!(bars.bars().next().unwrap().1.text.glyph, '\u{23f8}');
+        assert_eq!(bars.ledger().count(), 1);
     }
 
     #[test]

@@ -221,11 +221,16 @@ fn ed3_discards_history_and_block_metadata_without_relocating_live_cells_or_pet(
 fn erases_and_selection_release_cannot_replay_old_ink_as_contact() {
     for (erase, removes_live_ink) in [(b"\x1b[2J".as_slice(), true), (b"\x1b[3J", false)] {
         let mut s = Scene::new(true);
-        // A reading perch is independent of the caret's protected halo. Move
-        // the selection after seating: the body holds its already-clear spot,
-        // leaving enough room to test ink contact rather than cursor proximity.
+        // The reading perch is the escort's own stand, inside the caret's
+        // keep-off ring by construction (`pet_escort_primacy`), so beside a
+        // VISIBLE caret the halo is always within the contact margin of the
+        // body. Hide the caret after seating — as `work()` does for the other
+        // scenes here — and move the selection: the body holds its spot at its
+        // last real home with clear ground on every side, so what follows
+        // measures ink contact rather than cursor proximity.
         s.select(9, 12);
         s.warm();
+        s.term.process(b"\x1b[?25l");
         s.select(3, 70);
         let held = body(s.tick(0));
         // The natural sprite top has a fractional gap above it. This row is

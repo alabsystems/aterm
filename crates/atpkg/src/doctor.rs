@@ -158,6 +158,84 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The doctor line for a bundle whose executables carry `com.apple.provenance` — the
+/// count, one example, the CAUSE when the store recorded one (`recorded`: the
+/// `<build>.tracked-install` record a tracked installer left under
+/// `ATPKG_ALLOW_TRACKED_INSTALL=1`, [`crate::store::tracked_install_record`]), what it
+/// breaks, and the cure. Pure, so the words are pinned by a test that mints a synthetic
+/// attribute rather than the one it cannot.
+pub(crate) fn provenance_bundle_line(
+    program: &str,
+    build: u64,
+    bin: &Path,
+    scan: &crate::provenance::Scan,
+    recorded: Option<&str>,
+) -> String {
+    let example = scan
+        .carriers
+        .first()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let cause = match recorded {
+        Some(why) => format!(
+            " — recorded cause: staged in-process by a provenance-tracked installer under \
+             {}=1 because {why}",
+            crate::lay::ALLOW_TRACKED_ENV
+        ),
+        None => String::new(),
+    };
+    format!(
+        "warn — {program} build {build} carries com.apple.provenance on {} of {} file(s) in {} \
+         (e.g. {example}){cause} — {}. fix: {}",
+        scan.carriers.len(),
+        scan.total,
+        bin.display(),
+        crate::provenance::WHAT_IT_BREAKS,
+        crate::provenance::REMEDY.replace("<program>", program),
+    )
+}
+
+/// The doctor line for a build that carries a tracked-install record but whose `bin/`
+/// scan finds no tagged file: the record is stale (a re-stage cleared the tag but not,
+/// somehow, the record) and says so rather than accusing a clean bundle.
+pub(crate) fn provenance_stale_record_line(
+    program: &str,
+    build: u64,
+    bin: &Path,
+    recorded: &str,
+) -> String {
+    format!(
+        "warn — {program} build {build} carries a tracked-install record ({recorded}) but no \
+         file in {} carries com.apple.provenance — a stale record; `aterm pkg uninstall \
+         {program} && aterm pkg install {program}` re-stages and clears it",
+        bin.display()
+    )
+}
+
+/// The doctor line for tagged shims in the managed `bin/`: a shim is exec'd as a script,
+/// so the tag on it tracks the tool it forwards to whatever the bundle carries.
+pub(crate) fn provenance_shim_line(bin_dir: &Path, scan: &crate::provenance::Scan) -> String {
+    let example = scan
+        .carriers
+        .first()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(
+        "warn — {} of {} shim(s) in {} carry com.apple.provenance (e.g. {example}) — a shim is \
+         a `#!/bin/sh` script the kernel execs, so a tagged shim makes the tool it forwards to \
+         provenance-tracked even when the bundle behind it is clean (its output is tagged, and \
+         a release cut built through it is refused after the claim). fix: `aterm pkg repair` \
+         re-lays them — this atpkg lays shims through an untracked launchd job when it \
+         measures itself as tracked, so any shell will do; the cutter itself resolves the \
+         bundle's bin/ directly and never goes through a shim",
+        scan.carriers.len(),
+        scan.total,
+        bin_dir.display(),
+    )
+}
+
 /// What the WORKSPACE the operator is standing in demands of the installed Trust
 /// toolchain, as decided by the installed `targo` itself (`targo locate-project
 /// --workspace` parses the manifest, compiles nothing, and refuses a `[trust]` policy
@@ -201,10 +279,25 @@ pub struct LocalSealProbe {
 
 /// The environment-dependent probes `run` takes and `run_with` only reports, so the
 /// reporting surface stays testable without spawning targo or reading rustup state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probes {
     pub workspace: Option<WorkspacePolicyProbe>,
     pub local_seal: Option<LocalSealProbe>,
+    /// The extended attribute the bundle/shim scan looks for —
+    /// [`crate::provenance::PROVENANCE_XATTR`] in production. Injected because that name
+    /// cannot be minted by a test (`xattr -w com.apple.provenance` is refused), so the
+    /// scan is exercised with a `user.*` attribute through the very `listxattr` path.
+    pub provenance_attr: &'static str,
+}
+
+impl Default for Probes {
+    fn default() -> Self {
+        Self {
+            workspace: None,
+            local_seal: None,
+            provenance_attr: crate::provenance::PROVENANCE_XATTR,
+        }
+    }
 }
 
 /// The publisher-side act that cures an `UnknownField` verdict: publish the newer
@@ -333,6 +426,7 @@ pub fn run(layout: &Layout, prefix: &str) -> bool {
             .ok()
             .and_then(|cwd| probe_workspace_policy(layout, &cwd)),
         local_seal: probe_local_seal(layout, home.as_deref()),
+        provenance_attr: crate::provenance::PROVENANCE_XATTR,
     };
     run_with(
         layout,
@@ -601,6 +695,57 @@ pub fn run_with(
         }
     }
     let _ = writeln!(out, "{p}: ok — {} program(s) active", active.len());
+
+    // (5b) PROVENANCE-TAGGED EXECUTABLES AND SHIMS (macOS).
+    //
+    // macOS stamps `com.apple.provenance` on every file a provenance-tracked process
+    // writes, and a process is tracked when its executable carries the tag or its parent
+    // does (measured 2026-09-12 — `crate::provenance`). So a bundle seeded from a tracked
+    // shell — an agent started from a tagged `claude`, a shell inside a tracked aterm.app —
+    // carries the tag on `bin/trustc`, every object file and proof snapshot a release cut
+    // builds with it inherits the tag, and tools/proof_snapshot.py refuses them AFTER the
+    // ledger claim: v0.83.0 burned a build number on `trust/8590`. The shims in the managed
+    // `bin/` are checked too: a shim is a `#!/bin/sh` script the kernel execs, and a tagged
+    // one tracks the tool it forwards to even when the bundle behind it is clean.
+    //
+    // A WARNING, never a PROBLEM: every tool still runs — only a release cut cannot use it
+    // — and doctor does not measure whether THIS process is tracked (that takes a probe
+    // write, and doctor never mutates); it reports what is on disk and names the cure.
+    if cfg!(target_os = "macos") {
+        for (program, build) in &active {
+            let build_dir = layout.build_dir(program, *build);
+            let bin = build_dir.join("bin");
+            let scan = crate::provenance::tagged_files_in(&bin, probes.provenance_attr);
+            // The CAUSE, when the store recorded one: a tracked installer that staged
+            // this build in-process under the escape hatch wrote `<build>.tracked-install`
+            // beside it, and the line names it rather than leaving the operator to guess
+            // which shell seeded what.
+            let recorded = crate::store::tracked_install_record(&build_dir);
+            if scan.carriers.is_empty() {
+                if let Some(why) = &recorded {
+                    let _ = writeln!(
+                        out,
+                        "{p}: {}",
+                        provenance_stale_record_line(program, *build, &bin, why)
+                    );
+                }
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "{p}: {}",
+                provenance_bundle_line(program, *build, &bin, &scan, recorded.as_deref())
+            );
+        }
+        let shims = crate::provenance::tagged_files_in(&layout.bin_dir(), probes.provenance_attr);
+        if !shims.carriers.is_empty() {
+            let _ = writeln!(
+                out,
+                "{p}: {}",
+                provenance_shim_line(&layout.bin_dir(), &shims)
+            );
+        }
+    }
 
     // (5c) SOLVERS THE `trust` BUNDLE PINS PRIVATELY.
     //
@@ -3817,6 +3962,7 @@ mod tests {
         let home = synthetic_home("wspolicy");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let probes = Probes {
+            provenance_attr: crate::provenance::PROVENANCE_XATTR,
             workspace: Some(WorkspacePolicyProbe {
                 workspace: PathBuf::from("/work/ty"),
                 policy: WorkspacePolicy::UnknownField {
@@ -3863,6 +4009,7 @@ mod tests {
         let home = synthetic_home("wsok");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         let probes = Probes {
+            provenance_attr: crate::provenance::PROVENANCE_XATTR,
             workspace: Some(WorkspacePolicyProbe {
                 workspace: PathBuf::from("/work/aterm"),
                 policy: WorkspacePolicy::Accepted,
@@ -4277,5 +4424,171 @@ mod tests {
         let plain = synthetic_home("wsplain");
         std::fs::write(plain.join("Cargo.toml"), "[workspace]\n").unwrap();
         assert_eq!(workspace_with_trust_table(&plain), None);
+    }
+
+    /// A bundle whose `bin/` executables carry the tag, and a tagged shim, are each ONE
+    /// warning line — exit stays 0 — naming the count, an example, what breaks (a release
+    /// cut, after the claim) and the cure. Minted with a synthetic `user.*` attribute:
+    /// `com.apple.provenance` cannot be set by hand, and a test process may itself be
+    /// tracked, so the negative half uses an attribute nothing set rather than the real one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn provenance_tagged_executables_and_shims_warn_but_exit_zero() {
+        let l = layout("provenance");
+        install(&l, "trust", 8590);
+        install(&l, "ay", 8256);
+        let trust_exe = l.build_dir("trust", 8590).join("bin/trust");
+        let shim = l.bin_dir().join("trust");
+        assert!(
+            trust_exe.is_file() && shim.is_file(),
+            "fixture laid the tool and its shim"
+        );
+        crate::provenance::set_xattr_for_test(&trust_exe, "user.aterm.probe", b"1").unwrap();
+        crate::provenance::set_xattr_for_test(&shim, "user.aterm.probe", b"1").unwrap();
+        let home = synthetic_home("provenance");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
+        let run = |attr: &'static str| {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let probes = Probes {
+                provenance_attr: attr,
+                ..Probes::default()
+            };
+            let ok = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                None,
+                "doctor",
+                &probes,
+                &mut out,
+                &mut err,
+            );
+            (
+                ok,
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        };
+
+        let (ok, out, err) = run("user.aterm.probe");
+        assert!(
+            ok,
+            "a tagged bundle is advisory, never structural:\n{out}\n{err}"
+        );
+        let bundle_line = out
+            .lines()
+            .find(|l| l.contains("trust build 8590 carries com.apple.provenance"))
+            .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
+        assert!(bundle_line.starts_with("doctor: warn — "), "{bundle_line}");
+        assert!(bundle_line.contains("1 of 1 file(s)"), "{bundle_line}");
+        assert!(bundle_line.contains("(e.g. trust)"), "{bundle_line}");
+        assert!(
+            bundle_line.contains("proof_snapshot.py"),
+            "what it breaks: {bundle_line}"
+        );
+        assert!(
+            bundle_line.contains("aterm pkg uninstall trust && aterm pkg install trust"),
+            "the cure names the program: {bundle_line}"
+        );
+        assert!(bundle_line.contains("TRUST_STAGE2_BIN"), "{bundle_line}");
+        // `ay` carries nothing and is not mentioned.
+        assert!(!out.contains("ay build 8256 carries"), "{out}");
+        let shim_line = out
+            .lines()
+            .find(|l| l.contains("shim(s) in"))
+            .unwrap_or_else(|| panic!("the shim line is missing:\n{out}"));
+        assert!(
+            shim_line.starts_with("doctor: warn — 1 of 2 shim(s) in"),
+            "{shim_line}"
+        );
+        assert!(shim_line.contains("(e.g. trust)"), "{shim_line}");
+        assert!(shim_line.contains("aterm pkg repair"), "{shim_line}");
+        assert!(err.is_empty(), "warnings go to out, never err:\n{err}");
+
+        // An attribute nothing set: neither line.
+        let (ok, out, _) = run("user.aterm.absent");
+        assert!(ok);
+        assert!(!out.contains("com.apple.provenance"), "{out}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The RECORD a tracked installer left under the escape hatch is reported as the
+    /// cause on the tagged bundle's line; a record with no tagged file behind it is
+    /// named as stale rather than presented as a tagged bundle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tracked_install_record_is_reported_as_the_cause() {
+        let l = layout("tracked-record");
+        install(&l, "trust", 8590);
+        install(&l, "ay", 8256);
+        let trust_exe = l.build_dir("trust", 8590).join("bin/trust");
+        crate::provenance::set_xattr_for_test(&trust_exe, "user.aterm.probe", b"1").unwrap();
+        crate::store::record_tracked_install(
+            &l.build_dir("trust", 8590),
+            "the untracked lane could not run (launchctl submit failed)",
+        )
+        .unwrap();
+        // `ay` carries a record but nothing tagged: stale.
+        crate::store::record_tracked_install(&l.build_dir("ay", 8256), "an old record").unwrap();
+        let home = synthetic_home("tracked-record");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let now = crate::flow::rfc3339_to_unix("2026-09-12T00:00:00Z").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let probes = Probes {
+            provenance_attr: "user.aterm.probe",
+            ..Probes::default()
+        };
+        let ok = run_with(
+            &l,
+            Some(&home),
+            Some(&path),
+            now,
+            None,
+            None,
+            "doctor",
+            &probes,
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8_lossy(&out).into_owned();
+        assert!(ok, "advisory, never structural:\n{out}");
+        let bundle_line = out
+            .lines()
+            .find(|l| l.contains("trust build 8590 carries com.apple.provenance"))
+            .unwrap_or_else(|| panic!("the bundle line is missing:\n{out}"));
+        assert!(
+            bundle_line.contains(
+                "recorded cause: staged in-process by a provenance-tracked installer under \
+                 ATPKG_ALLOW_TRACKED_INSTALL=1 because the untracked lane could not run \
+                 (launchctl submit failed)"
+            ),
+            "{bundle_line}"
+        );
+        assert!(
+            bundle_line.contains("fix: re-seed the bundle untagged"),
+            "the cure still follows the cause: {bundle_line}"
+        );
+        let stale = out
+            .lines()
+            .find(|l| l.contains("ay build 8256 carries a tracked-install record"))
+            .unwrap_or_else(|| panic!("the stale-record line is missing:\n{out}"));
+        assert!(stale.contains("(an old record)"), "{stale}");
+        assert!(stale.contains("stale record"), "{stale}");
+        assert!(
+            stale.contains("aterm pkg uninstall ay && aterm pkg install ay"),
+            "{stale}"
+        );
+        assert!(
+            !out.contains("ay build 8256 carries com.apple.provenance"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

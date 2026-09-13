@@ -97,6 +97,10 @@ pub mod install;
 /// The `pkg` protocol's lane: a Developer-ID-signed macOS installer package, its
 /// signer team checked with `pkgutil`, applied by `installer` with elevation.
 pub mod installer_pkg;
+/// Laying executables (shims, stubs, tombstones) through the untracked launchd lane when
+/// this process is provenance-tracked — law m21: a tagged `#!/bin/sh` shim tracks the
+/// tool it execs — and the one refuse-by-default policy both untracked lanes share.
+pub mod lay;
 pub mod linkmode;
 pub mod lock;
 pub mod machine;
@@ -113,6 +117,12 @@ pub mod ops;
 pub mod pin;
 pub mod platform;
 pub mod progress;
+/// The folders macOS guards with a consent dialog, named once, so no UNATTENDED lane
+/// (the update pass, the seed, the doctor's walk) ever opens one in aterm's name.
+pub mod protected;
+/// `com.apple.provenance`: the predicate (`listxattr`), the per-process tracking
+/// measurement, and the two sentences every refusal that names the tag shares.
+pub mod provenance;
 pub mod provisional;
 pub mod relocate;
 /// The `requires` relation's one gate (`unmet_requirement`, §17.10), shared by the
@@ -128,6 +138,9 @@ pub mod sig;
 /// The `softwareupdate` protocol's lane: Apple's Command Line Tools, installed
 /// headlessly by `softwareupdate` with elevation (never `xcode-select --install`).
 pub mod softwareupdate;
+/// The untracked staging lane: extraction handed to a launchd job when the installer
+/// measures itself as provenance-tracked, so the bundle it lays down is clean.
+pub mod stage_helper;
 /// The CANONICAL per-program state spellings (`managed <build> — pinned by index <N>`,
 /// `system: <path> — not managed by aterm`, …) shared by status.toml, the pass log,
 /// `doctor` and `which`.

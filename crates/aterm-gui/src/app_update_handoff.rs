@@ -7,6 +7,15 @@
 //! rollback (`HandoffRollbackWarrant`), the Commit-time admission facts, and
 //! `finish_update_handoff`'s drain gate, Commit, and rollback.
 //! A verbatim inherent-impl split of `App`.
+//!
+//! The successor this module spawns races the parent's in-flight `atpkg` pass
+//! exactly as a second window does: the parent's child dies at its next line of
+//! output once the parent has exited, and the successor's own launch lanes
+//! `--wait-lock` behind it and pick the work up (`crate::spawn_pkg_update_check`,
+//! `atpkg::lock`, 2026-09-10). A REJECTED candidate is the one shape that is not
+//! covered: its sweep SIGKILLs the candidate's process group, atpkg child included
+//! (the store is crash-consistent), and the parked parent's loop picks the
+//! remainder up at its next tick or bump.
 
 use winit::event_loop::ActiveEventLoop;
 
@@ -340,7 +349,22 @@ fn commit_layout_topology(
             // IS structural. The terminal leaf's USER metadata
             // (`user_title`/`description`/`icon`/`role`/`attention`) is read
             // under a BLOCKING lock in `view_restore_descriptor`, so it cannot
-            // degrade and is deliberately left in the comparison too.
+            // degrade and is deliberately left in the comparison too. It has to
+            // stay there: the successor puts those five fields back on the
+            // sessions it adopts FROM THE PENDING LAYOUT
+            // (`App::graft_restored_user_meta` for the session already running
+            // in each window's first pane, `App::seed_restored_user_meta` for
+            // the rest), so a `meta set` THIS process answers between the
+            // capture and the Commit-time re-capture must reject this Commit:
+            // admitting it would commit a successor that shows the value from
+            // before the edit. That is all the comparison covers. A `meta set`
+            // this process answers AFTER the re-capture — its control workers
+            // serve until `commit_and_exit` — is lost with it: nothing compares
+            // again, and the successor restores the pending value. A `meta set`
+            // the SUCCESSOR answers (it serves each adopted bootstrap's sid from
+            // its own bind, before its deferred restore) never reaches this
+            // process at all; the successor's graft keeps it instead
+            // (`session_timeline::restore_carried_meta`).
             crate::restore::RestoredSplitTree::Leaf { .. } => {}
             crate::restore::RestoredSplitTree::Split { first, second, .. } => {
                 strip_tree(first);
@@ -5522,6 +5546,77 @@ mod commit_layout_topology_tests {
             commit_layout_topology(&committed),
             commit_layout_topology(&extra_tab),
             "a tab that appeared during async preparation is what this gate exists to catch"
+        );
+    }
+
+    /// `captured`'s single terminal leaf, edited in place.
+    fn with_leaf(
+        mut layout: RestoreManifest,
+        edit: impl FnOnce(&mut TerminalLeafRestore),
+    ) -> RestoreManifest {
+        let RestoredSplitTree::Leaf {
+            view: RestoredView::Terminal(terminal),
+        } = &mut layout.windows[0].restored_tabs[0].root
+        else {
+            unreachable!("the fixture builds a single terminal leaf");
+        };
+        edit(terminal);
+        layout
+    }
+
+    fn stamp_all_five(terminal: &mut TerminalLeafRestore) {
+        terminal.user_title = Some("fable driver".to_string());
+        terminal.description = Some("drives the satcomp worker".to_string());
+        terminal.icon = Some("🦊".to_string());
+        terminal.role = Some("agent:claude-driver-fable".to_string());
+        terminal.attention = Some("waiting on a human review".to_string());
+    }
+
+    /// The invariant the comment in `commit_layout_topology` states, for ALL
+    /// FIVE user fields rather than the title alone: each stays in the Commit
+    /// comparison (so a `meta set` the parent answers before its Commit-time
+    /// re-capture is a change that Commit sees), the cwd/title/position
+    /// normalization never touches them, and the sidecar the child parses
+    /// carries exactly what was compared — which is what lets the successor
+    /// put them back on the adopted sessions.
+    #[test]
+    fn every_user_metadata_field_is_compared_and_rides_the_sidecar() {
+        type Clear = fn(&mut TerminalLeafRestore);
+        let stamped = with_leaf(
+            captured(Some((120, 80)), Some("/work"), "zsh"),
+            stamp_all_five,
+        );
+
+        let clears: [(&str, Clear); 5] = [
+            ("user_title", |terminal| terminal.user_title = None),
+            ("description", |terminal| terminal.description = None),
+            ("icon", |terminal| terminal.icon = None),
+            ("role", |terminal| terminal.role = None),
+            ("attention", |terminal| terminal.attention = None),
+        ];
+        for (field, clear) in clears {
+            assert_ne!(
+                commit_layout_topology(&stamped),
+                commit_layout_topology(&with_leaf(stamped.clone(), clear)),
+                "{field} is read under a blocking lock and must stay in the comparison"
+            );
+        }
+
+        let dragged_and_degraded = with_leaf(captured(Some((640, 310)), None, ""), stamp_all_five);
+        assert_eq!(
+            commit_layout_topology(&stamped),
+            commit_layout_topology(&dragged_and_degraded),
+            "the degradable-field normalization must not reach the user fields"
+        );
+
+        let wire = stamped.to_toml().expect("the parent serializes its layout");
+        let parsed = RestoreManifest::from_toml(&wire)
+            .filter(|layout| layout.covers_exact_seamless_ids(&[7]))
+            .expect("the child accepts the sidecar");
+        assert_eq!(
+            commit_layout_topology(&parsed),
+            commit_layout_topology(&stamped),
+            "the child's layout carries every compared user field"
         );
     }
 }

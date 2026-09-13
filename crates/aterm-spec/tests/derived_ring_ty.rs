@@ -8082,6 +8082,60 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
         !model.fire("LicensedTypedMoveMintsLight", &mut expiry),
         "a stale stamp licenses nothing"
     );
+
+    // THE DELIVERED INSERT (2026-09-10): enqueue arms nothing; the writer
+    // thread's completed write arms the insert's own slot; its echo spends
+    // it exactly once and the ring scores the sweep.
+    let mut insert = model.init_state();
+    assert!(model.fire("PasteEnqueues", &mut insert));
+    assert_eq!(insert["write_pending"], 1);
+    assert_eq!(insert["insert_hint"], 0, "enqueue is not delivery");
+    assert_eq!(insert["arms"], 0);
+    assert!(
+        !model.fire("LicensedInsertEchoMintsLight", &mut insert),
+        "an echo before the bytes landed is program output"
+    );
+    assert!(model.fire("WriteCompletesArmsInsertLicence", &mut insert));
+    assert_eq!(insert["write_pending"], 0);
+    assert_eq!(
+        insert["insert_hint"], 1,
+        "the completed write is the licence"
+    );
+    assert_eq!(insert["arms"], 1);
+    assert_eq!(
+        insert["credit_arms"], 0,
+        "the insert's width is its own, not a press credit"
+    );
+    assert!(model.fire("LicensedInsertEchoMintsLight", &mut insert));
+    assert_eq!(insert["insert_hint"], 0, "one delivery, one echo");
+    assert_eq!(insert["consumed"], 1);
+    assert_eq!(insert["births"], 1);
+    assert_eq!(insert["licensed_tally"], 1);
+    assert!(
+        !model.fire("LicensedInsertEchoMintsLight", &mut insert),
+        "a spent insert licence cannot fund a second hop"
+    );
+    let mut stale_insert = model.init_state();
+    assert!(model.fire("PasteEnqueues", &mut stale_insert));
+    assert!(model.fire("WriteCompletesArmsInsertLicence", &mut stale_insert));
+    assert!(model.fire("InsertLicenceExpires", &mut stale_insert));
+    assert!(
+        !model.fire("LicensedInsertEchoMintsLight", &mut stale_insert),
+        "a stale insert stamp licenses nothing"
+    );
+    assert!(model.fire("StaleInsertStampDeclines", &mut stale_insert));
+    assert_eq!(stale_insert["declined_tally"], 1);
+    // The mutant arms at enqueue, and the echo it then admits is the witness
+    // `AnInsertLicenceIsMintedOnlyByACompletedWrite` refuses.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut undelivered = buggy.init_state();
+    assert!(buggy.fire("PasteEnqueues", &mut undelivered));
+    assert_eq!(undelivered["insert_hint"], 1, "the mutant arms at enqueue");
+    assert!(buggy.fire("LicensedInsertEchoMintsLight", &mut undelivered));
+    assert!(
+        !buggy.check_invariant("AnInsertLicenceIsMintedOnlyByACompletedWrite", &undelivered),
+        "an echo lit on an undelivered arm must be caught"
+    );
     assert!(model.fire("StaleStampMoveDeclines", &mut expiry));
     assert_eq!(expiry["births"], 0);
     assert!(model.fire("RetireStaleLicense", &mut expiry));
@@ -8111,6 +8165,110 @@ fn derived_cursor_hint_license_proves_and_catches_cold_light() {
     assert_eq!(starved["births"], 0);
     assert_eq!(starved["spent"], 0, "a refused coalesce is billed nothing");
     assert_eq!(starved["declined_tally"], 1);
+    assert_eq!(
+        starved["forfeited"], 1,
+        "a `no-credits` refusal is an unexplained hop: the pool is forgotten with it"
+    );
+
+    // THE STALL (2026-09-12, the owner's "I t" screenshot): two presses, the
+    // stamp window elapses while the row stays silent, and the row echoes
+    // both as one batch — no stamp is fresh, and the LEDGER licenses it:
+    // the presses are in flight, and the batch spends them.
+    let pool = |st: &aterm_spec::interp::State| st["credit_arms"] - st["spent"] - st["forfeited"];
+    let mut stall = model.init_state();
+    assert!(model.fire("PressArmsLicense", &mut stall));
+    assert!(model.fire("PressArmsLicense", &mut stall));
+    assert!(model.fire("LicenseExpires", &mut stall));
+    assert_eq!(stall["hint"], 2, "the stamps went stale in place");
+    assert_eq!(pool(&stall), 2, "…and both presses are still in flight");
+    assert!(
+        !model.fire("LicensedTypedMoveMintsLight", &mut stall),
+        "no stamp is fresh"
+    );
+    assert!(
+        !model.fire("StaleStampMoveDeclines", &mut stall),
+        "two presses in flight are a batch, not a stale stamp"
+    );
+    assert!(model.fire("InFlightBatchEchoMintsLight", &mut stall));
+    assert_eq!(stall["licensed_tally"], 1, "the batch is licensed");
+    assert_eq!(stall["births"], 1, "…and lit");
+    assert_eq!(stall["coalesce_births"], 1);
+    assert_eq!(
+        pool(&stall),
+        0,
+        "the batch spent every press it was licensed by"
+    );
+    assert_eq!(stall["phantom_admitted"], 0);
+    assert!(
+        !model.fire("InFlightBatchEchoMintsLight", &mut stall),
+        "spent presses license nothing more"
+    );
+
+    // THE FORGET: the same two presses, then a keyless hop the echo shape
+    // refuses (backward, cross-row, a refused share). The presses did not
+    // describe it and are forgotten with it; the batch shape then finds an
+    // empty pool.
+    let mut forgot = model.init_state();
+    assert!(model.fire("PressArmsLicense", &mut forgot));
+    assert!(model.fire("PressArmsLicense", &mut forgot));
+    assert!(model.fire("LicenseExpires", &mut forgot));
+    assert!(model.fire("UnexplainedHopForgetsCredits", &mut forgot));
+    assert_eq!(forgot["declined_tally"], 1);
+    assert_eq!(forgot["forfeited"], 2, "both presses forgotten");
+    assert_eq!(pool(&forgot), 0);
+    assert_eq!(forgot["just_forgot"], 1);
+    assert!(
+        !model.fire("InFlightBatchEchoMintsLight", &mut forgot),
+        "a forgotten press licenses nothing"
+    );
+    assert!(model.check_invariant("ForgottenCreditsNeverReturn", &forgot));
+    // A new press reopens the pool — the forget was the edge's, not a ban.
+    let mut reopened = model.init_state();
+    assert!(model.fire("PressArmsLicense", &mut reopened));
+    assert!(model.fire("LicenseExpires", &mut reopened));
+    assert!(model.fire("UnexplainedHopForgetsCredits", &mut reopened));
+    assert_eq!((reopened["just_forgot"], pool(&reopened)), (1, 0));
+    assert!(model.fire("PressArmsLicense", &mut reopened));
+    assert_eq!((reopened["just_forgot"], pool(&reopened)), (0, 1));
+
+    // THE BOUND: the patience elapses with the row still silent — a forget
+    // by the clock, and the batch shape finds nothing.
+    let mut elapsed = model.init_state();
+    assert!(model.fire("PressArmsLicense", &mut elapsed));
+    assert!(model.fire("PressArmsLicense", &mut elapsed));
+    assert!(model.fire("LicenseExpires", &mut elapsed));
+    assert!(model.fire("PatienceElapses", &mut elapsed));
+    assert_eq!(pool(&elapsed), 0);
+    assert!(!model.fire("InFlightBatchEchoMintsLight", &mut elapsed));
+    assert!(
+        !model.fire("PatienceElapses", &mut elapsed),
+        "nothing left to forget"
+    );
+
+    // THE MUTANT — a patience that does not forget: the pool survives the
+    // unexplained hop, the batch shape licenses it, and both in-flight
+    // invariants name the defect.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut phantom = buggy.init_state();
+    assert!(buggy.fire("PressArmsLicense", &mut phantom));
+    assert!(buggy.fire("PressArmsLicense", &mut phantom));
+    assert!(buggy.fire("LicenseExpires", &mut phantom));
+    assert!(buggy.fire("UnexplainedHopForgetsCredits", &mut phantom));
+    assert_eq!(
+        pool(&phantom),
+        2,
+        "the mutant keeps the pool across the hop"
+    );
+    assert!(
+        !buggy.check_invariant("ForgottenCreditsNeverReturn", &phantom),
+        "the kept pool is the defect, and the law names it"
+    );
+    assert!(buggy.fire("InFlightBatchEchoMintsLight", &mut phantom));
+    assert_eq!(phantom["phantom_admitted"], 1);
+    assert!(
+        !buggy.check_invariant("AForgottenPressNeverLicences", &phantom),
+        "a batch licensed out of a forgotten pool must be caught"
+    );
 
     // A KEY THIS WINDOW SWALLOWED is not an answer to the licence question.
     let mut swallowed = model.init_state();

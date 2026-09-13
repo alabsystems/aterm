@@ -1680,8 +1680,9 @@ pub fn session_main(quiet: bool) -> ! {
     // PTY master + child pid. The seam itself fails closed if a demanded sandbox
     // wrapper is missing (it refuses to spawn an unsandboxed shell). The explicit
     // `shell_default` limits are byte-identical to what the historical
-    // `spawn_shell` wrapper passed; the pid is what the Windows driver's exit-code
-    // epilogue needs (the unix driver keeps its verbatim `waitpid(-1)`).
+    // `spawn_shell` wrapper passed; the pid is what both drivers reap for the exit
+    // code (the unix driver waits on exactly this pid, never `waitpid(-1)`: the
+    // session process can have other children).
     let shell = aterm_pty::spawn_shell_with_pid(
         rows,
         cols,

@@ -99,7 +99,7 @@ const fn poll_must_read(revents: libc::c_short) -> bool {
 }
 
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
-/// returns the shell's exit status (non-exit → 1). The body is the parent-side
+/// returns the shell's exit status (non-exit or a failed wait → 1). The body is the parent-side
 /// session loop moved verbatim from `main()`.
 ///
 /// `engine` is `None` for an ordinary session — the VT model is demand-driven
@@ -113,6 +113,7 @@ pub(crate) fn run(
     verbose: bool,
 ) -> i32 {
     let master = shell.master;
+    let shell_pid = shell.pid;
 
     // PARENT.
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
@@ -211,14 +212,23 @@ pub(crate) fn run(
         restore(libc::STDIN_FILENO, &t);
     }
     let mut status = 0;
-    unsafe {
+    // Reap the SHELL by its pid, never `waitpid(-1)`: this process is not the
+    // shell's only parent-of-record. `aterm` can start a detached `aterm pkg
+    // update` before the session, and the update checker runs codesign/curl; any
+    // of those that has already exited would otherwise be reaped in place of the
+    // shell and hand the session ITS exit status. The pid is the forked session
+    // leader, which may exec the sandbox-exec wrapper (it exits with the shell's
+    // status) and then the shell — the same pid either way.
+    let reaped = unsafe {
         libc::close(master);
-        // The protected spawn returns only the master fd; the shell (or the
-        // sandbox-exec wrapper, which exits with the shell's status) is this
-        // process's sole direct child, so reap it with `-1` to recover the exit
-        // code and avoid a zombie.
-        libc::waitpid(-1, &mut status, 0);
-    }
+        loop {
+            let r = libc::waitpid(shell_pid, &mut status, 0);
+            if r < 0 && eintr() {
+                continue;
+            }
+            break r == shell_pid;
+        }
+    };
     if verbose {
         // Say which session this was. The old wording claimed the VT core had
         // processed every byte, which is now true only when the model is armed —
@@ -230,7 +240,8 @@ pub(crate) fn run(
         };
         eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through {modelled}.");
     }
-    if libc::WIFEXITED(status) {
+    // A failed wait has no status to report: treat it like a non-exit.
+    if reaped && libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else {
         1
@@ -242,6 +253,80 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
+
+    /// THE SESSION'S EXIT STATUS IS THE SHELL'S (2026-09-12). The session
+    /// process is not the shell's only parent-of-record: `aterm` can start a
+    /// detached `aterm pkg update` before the session, and the update checker
+    /// runs codesign/curl. The closing reap was `waitpid(-1)`, so a child that
+    /// had already exited could be reaped in place of the shell and hand the
+    /// session its status.
+    ///
+    /// The body runs in a re-exec of this test binary with stdin at /dev/null,
+    /// so raw mode never touches a real terminal and no parallel test's children
+    /// are in reach of the reap.
+    #[test]
+    fn run_returns_the_shells_status_not_an_older_zombie_childs() {
+        const CHILD: &str = "ATERM_TEST_DRIVER_REAPS_THE_SHELL";
+        if std::env::var_os(CHILD).is_none() {
+            let name = format!(
+                "{}::run_returns_the_shells_status_not_an_older_zombie_childs",
+                module_path!().split_once("::").map_or("", |(_, rest)| rest)
+            );
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("re-exec the test binary");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "the re-exec failed:\n{text}");
+            assert!(
+                text.contains("1 passed"),
+                "the re-exec ran no test:\n{text}"
+            );
+            return;
+        }
+        // A decoy child that exits non-zero and is surely a zombie before the
+        // shell is.
+        let decoy = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .expect("decoy");
+        let decoy_pid = libc::pid_t::try_from(decoy.id()).expect("pid");
+        std::mem::forget(decoy);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let mut master: libc::c_int = -1;
+        // SAFETY: the child calls only close/usleep/_exit (async-signal-safe).
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(pid >= 0, "forkpty: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // The stand-in shell: close the slave so the master sees EOF, and be
+            // still ALIVE when the driver reaps, then exit 3.
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+                libc::close(2);
+                libc::usleep(300_000);
+                libc::_exit(3);
+            }
+        }
+        let code = run(aterm_pty::SpawnedShell { master, pid }, None, false);
+        let mut status = 0;
+        unsafe { libc::waitpid(decoy_pid, &mut status, libc::WNOHANG) };
+        assert_eq!(code, 3, "the session took another child's exit status");
+    }
 
     #[test]
     fn every_terminal_poll_flag_reaches_the_read_path() {

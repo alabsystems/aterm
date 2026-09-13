@@ -469,6 +469,30 @@ impl SinkWriter {
         self.master
     }
 
+    /// What the line discipline will do with the next byte typed into this
+    /// sink — the slave's ECHO / ICANON bits, read through the master
+    /// ([`aterm_pty::tty_echo`]; one `tcgetattr`, no allocation, no
+    /// blocking). `None` when the master is not a tty (a pipe fixture, the
+    /// `-1` sentinel, a ConPTY key): the caller learns nothing and keeps its
+    /// default.
+    ///
+    /// The master answers for the slave because a PTY pair has ONE termios,
+    /// the slave's, and both the BSD and Linux drivers route the master's
+    /// `tcgetattr` to it — the fact aterm-pty's
+    /// `spawned_pty_carries_iutf8_and_b230400` proves end-to-end and its
+    /// `tty_echo_reads_the_slaves_canonical_no_echo_through_the_master`
+    /// measures with a real `stty -echo` child.
+    ///
+    /// Consumed by the rainbow's licence law (aterm-gui's typed-glyph
+    /// dispatch): a press typed into canonical no-echo mode — `read -s`,
+    /// `sudo`, an `ssh` passphrase, `passwd` — will never be echoed, so it
+    /// banks no press credit and no typed stamp. The read is a snapshot at
+    /// the key, evidence about THIS press only.
+    #[must_use]
+    pub fn tty_echo(&self) -> Option<aterm_pty::TtyEcho> {
+        aterm_pty::tty_echo(self.master)
+    }
+
     /// Declare whether this sink's master file DESCRIPTION carries `O_NONBLOCK`.
     ///
     /// The direct-read gather flips the master non-blocking once per session, and
@@ -1542,6 +1566,18 @@ mod tests {
         assert_eq!(refused.accepted(), 0);
         assert_eq!(refused.order(), None);
         assert_eq!(refused.into_error().raw_os_error(), Some(libc::EBADF));
+    }
+
+    /// A NON-TTY SINK KNOWS NOTHING ABOUT ECHO: the socketpair fixture every
+    /// sink test drives, and the `-1` sentinel every plain headless test
+    /// shares, both answer `None` — so a consumer's default (bank the press)
+    /// is what every existing fixture exercises, byte-identical. The real-pty
+    /// verdicts are aterm-pty's `tty_echo_*` tests.
+    #[test]
+    fn tty_echo_is_none_off_a_tty() {
+        let (_reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        assert_eq!(SinkWriter::new(writer.as_raw_fd()).tty_echo(), None);
+        assert_eq!(SinkWriter::new(-1).tty_echo(), None);
     }
 
     // Whole-frame atomicity: N threads each write a distinct frame LARGER than the

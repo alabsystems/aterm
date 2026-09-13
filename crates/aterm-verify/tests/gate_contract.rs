@@ -51,6 +51,7 @@ impl FakeRepo {
         me.script("tools/test-install-channel.sh", "exit 0");
         me.script("tools/test-atpkg-vendor-tooling.sh", "exit 0");
         me.script("tools/test-atpkg-auto-vendor.sh", "exit 0");
+        me.script("tools/test-atpkg-pack-one-compiler.sh", "exit 0");
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
@@ -1168,6 +1169,10 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
                 "test-atpkg-vendor-tooling.sh (selftest: not executed)"
             ),
             ("skip", "test-atpkg-auto-vendor.sh (selftest: not executed)"),
+            (
+                "skip",
+                "test-atpkg-pack-one-compiler.sh (selftest: not executed)"
+            ),
             (
                 "skip",
                 "test-trust-gate-verdict.sh (selftest: not executed)"

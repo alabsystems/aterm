@@ -1254,7 +1254,15 @@ fn a_successful_publish_prints_no_absolute_home_path() {
     // the upload path, since the counter line only prints after a successful release.
     let bin = prefix.home.join("gh-stub");
     std::fs::create_dir_all(&bin).expect("stub dir");
-    std::fs::write(bin.join("gh"), "#!/usr/bin/env bash\nexit 0\n").expect("stub gh");
+    // `release view` answers "no such release", as the real gh does for a fresh tag: the
+    // indexer probes the tag before creating it and never clobbers an existing one
+    // (2026-09-12), so a stub that says yes to everything reads as a half-created
+    // release and the upload is refused before the counter line this test needs.
+    std::fs::write(
+        bin.join("gh"),
+        "#!/usr/bin/env bash\ncase \"$1 $2\" in 'release view') exit 1 ;; esac\nexit 0\n",
+    )
+    .expect("stub gh");
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
 

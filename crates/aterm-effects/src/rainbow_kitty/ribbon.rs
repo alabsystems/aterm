@@ -1877,8 +1877,9 @@ impl Ribbon {
             } => {
                 self.caret = Some(to);
                 // A typed echo's own motion is inert here: the key laid its
-                // cell, and the caret mirror is all that moves.
-                if licence != Licence::Typed {
+                // cell, and the caret mirror is all that moves. A delivered
+                // insert's is inert the same way: its sweep laid the span.
+                if !matches!(licence, Licence::Typed | Licence::Insert) {
                     let same_row = to.0 == from.0;
                     let jump = !same_row || to.1.abs_diff(from.1) >= JUMP_MIN_CELLS;
                     if jump {
@@ -1919,6 +1920,14 @@ impl Ribbon {
                 }
             }
             Event::Sweep { row, col0, col1 } => self.sweep(row, col0, col1, at, ctx),
+            // THE INSERT'S REWRITE: the kill's drain from the GIVEN column
+            // (the caret mirror has not moved yet on this frame's `ctx`),
+            // and the ribbon's caret follows it.
+            Event::Rewrite { row, col, cells } => {
+                let span_s = 0.012 * f32::from(cells) + 0.240;
+                self.retract_suffix(row, col, cells.max(1), at, span_s);
+                self.caret = Some((row, col));
+            }
             Event::Return | Event::ReducedMotion(_) => {}
         }
     }
@@ -5314,6 +5323,63 @@ mod tests {
         assert!(
             (b_left - 40.0 * cw).abs() < 0.5 && (b_right - 46.0 * cw).abs() < 0.5,
             "the cohort under the hand was squashed with its row-mate: [{b_left}, {b_right}]"
+        );
+    }
+
+    /// **THE INSERT'S REWRITE** ([`Event::Rewrite`], 2026-09-10) retracts the
+    /// row's suffix from the GIVEN column — not from `ctx.caret`, the mirror
+    /// the host has not moved yet — farthest-first inside `12·n + 240` ms,
+    /// the kill's law verbatim, and moves the ribbon's caret there. Cells
+    /// left of the column are untouched.
+    ///
+    /// RED-PROOF (2026-09-10, the variant stubbed inert): fails at the first
+    /// assert — no cell carries a `retract_at`.
+    #[test]
+    fn a_rewrite_retracts_the_suffix_from_the_given_column_not_the_mirror() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        type_run(&mut rib, t0, 10, 20, &c, 0.8);
+        let now = at(t0, 1300);
+        // The mirror still stands at the old end (2, 30).
+        let cx = ctx(now, &c, (2, 30), 0.8);
+        rib.on_event(
+            &Event::Rewrite {
+                row: 2,
+                col: 18,
+                cells: 12,
+            },
+            now,
+            &cx,
+        );
+        let retract_at = |col: u16| {
+            rib.cells()
+                .iter()
+                .find(|cell| cell.row == 2 && cell.col == col)
+                .unwrap_or_else(|| panic!("no cell at (2, {col})"))
+                .retract_at
+        };
+        assert!(
+            (18..30u16).all(|col| retract_at(col).is_some()),
+            "every cell at or right of the rewrite's caret retracts"
+        );
+        assert!(
+            (10..18u16).all(|col| retract_at(col).is_none()),
+            "the cells left of it are untouched"
+        );
+        let span = 0.012 * 12.0 + 0.240;
+        let far = retract_at(29).unwrap();
+        let near = retract_at(18).unwrap();
+        assert!(far < near, "farthest from the caret goes first");
+        let near_s = near.saturating_duration_since(now).as_secs_f32();
+        assert!(
+            (near_s - span * 11.0 / 12.0).abs() < 1e-3,
+            "the near cell goes last, at the kill's 12·n + 240 stagger: {near_s}"
+        );
+        assert_eq!(
+            rib.caret(),
+            Some((2, 18)),
+            "the ribbon's caret moves to the rewrite"
         );
     }
 

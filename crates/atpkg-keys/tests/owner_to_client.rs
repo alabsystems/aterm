@@ -354,7 +354,11 @@ fn an_unpinned_client_installs_nothing_although_every_byte_is_genuine() {
     // And the SHIPPED anchor is ARMED (2026-08-15): the unpinned behaviour this test
     // proves is exercised against the synthetic empty anchor above, not the tree's.
     assert!(!atpkg::PKG_TRUST_ANCHORS.is_empty());
-    assert!(atpkg::manager_enabled());
+    // The pure core, not `manager_enabled()`: that one also reads `ATPKG_DISABLE`, so a
+    // suite run with the manager disabled (the house rule for test runs that must not
+    // touch the real prefix) failed this assertion about the COMPILED anchor
+    // (2026-09-12).
+    assert!(atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS, false));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

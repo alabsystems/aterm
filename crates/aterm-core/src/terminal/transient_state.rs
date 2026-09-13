@@ -128,9 +128,12 @@ pub(super) struct TransientState {
     /// Cached flag: true when `current_hyperlink.is_some() || current_underline_color.is_some()`.
     /// Avoids 2 per-character Option checks in `write_char_core`.
     pub(super) has_transient_extras: bool,
-    /// Set by the RIS handler to signal that the parser should be reset after
-    /// the current `advance_fast` call completes (#7153). The parser cannot be
-    /// reset from inside its own dispatch loop.
+    /// Set by the RIS handler to carry the RIS side effects it cannot reach
+    /// from inside the parser's dispatch loop — clearing secure keyboard entry
+    /// and the parked selection — which the processing loop applies once the
+    /// current `advance_fast` call returns (#7153). The name is historical: the
+    /// parser is NOT reset (ESC c already leaves it in Ground, and a reset after
+    /// the whole chunk dropped a sequence left unfinished at its end, audit K6).
     pub(super) pending_parser_reset: bool,
     /// SELECTION CUSTODY Phase 3 — the MAIN grid's `absolute_row_counter` at the
     /// instant this batch parked it (smcup). The SCR-1 epilogue re-pins that grid

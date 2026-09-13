@@ -276,8 +276,13 @@ fn pre_tool_use(opts: &Opts) -> ExitCode {
             || "reason=unknown origin=unknown".to_string(),
             |r| r.header().trim_start_matches("ERR halted ").to_string(),
         );
+    // `origin=` in the tail says WHO, and this line must not guess: `hold`
+    // became `OwnerOnly` in `ac36660fe`, so a hold is `origin=fleet` OR
+    // `origin=local` — a supervising agent, or this session's own
+    // `aterm-ctl @self hold`. The gate above reads `hold=1`, which
+    // `session_status` builds origin-blind from `fabric.hold().is_some()`.
     eprintln!(
-        "[aterm fabric] this session is HALTED by the fleet: {}",
+        "[aterm fabric] this session is HELD: {}",
         safe_reason(&reason)
     );
     eprintln!(
@@ -290,10 +295,15 @@ fn pre_tool_use(opts: &Opts) -> ExitCode {
 /// The `ERR halted` tail, made safe to put in front of a model.
 ///
 /// THE THIRD PLACE ENDPOINT TEXT REACHES A MODEL FROM THIS FILE, and it is here
-/// for the same reason [`safe_header`] and [`safe_row`] are: `reason=` carries a
-/// halting human's own words (`b27dc3a3` put them here on purpose, and they must
-/// keep arriving), so this module must bound them itself rather than inherit a
-/// bound from the other side of the socket. The endpoint pct-encodes the token
+/// for the same reason [`safe_header`] and [`safe_row`] are: `reason=` carries
+/// the HOLDER's own words (`b27dc3a3` put them here on purpose, and they must
+/// keep arriving) — a human at the keyboard, and since `ac36660fe` made `hold`
+/// `OwnerOnly`, equally a supervising agent or this session's own
+/// `aterm-ctl @self hold`. So this module must bound them itself rather than
+/// inherit a bound from the other side of the socket; that the words may now be
+/// another model's is a reason for the bound, not against it.
+///
+/// The endpoint pct-encodes the token
 /// and caps it, so what is kept is ASCII graphic characters and single spaces,
 /// up to [`REASON_MAX`] bytes, with a `…` marking a cut.
 fn safe_reason(raw: &str) -> String {
@@ -1353,8 +1363,9 @@ mod tests {
         );
     }
 
-    /// A halting human's own words still reach the held agent (`b27dc3a3`), and
-    /// they arrive bounded and printable whatever the endpoint sends.
+    /// The holder's own words still reach the held agent (`b27dc3a3`) — a human
+    /// at the keyboard, or, since `hold` became `OwnerOnly`, a supervising agent
+    /// — and they arrive bounded and printable whatever the endpoint sends.
     #[test]
     fn a_halt_reason_is_bounded_by_this_module() {
         assert_eq!(

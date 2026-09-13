@@ -51,16 +51,67 @@ Both browser graphs and the default sealed-transport exclusion are unchanged.
 
 ```sh
 for c in astream-wire astream-cap astream-aead astream-broker; do
-  rsync -a --exclude target ../astream/crates/$c/ vendor/astream/crates/$c/
+  rsync -a --delete --exclude target ../astream/crates/$c/ vendor/astream/crates/$c/
 done
+rm -rf vendor/astream/crates/astream-broker/src/bin          # `asb` is not vendored
+rm -rf vendor/astream/crates/*/tests vendor/astream/crates/*/benches
 ```
 
-Then re-apply the three manifest edits this tree carries, none of which touch
-the crates' source: workspace-inherited `[package]` fields become explicit,
-`{ workspace = true }` dependencies become paths (and `sha2` a version), and
-`[dev-dependencies]`/`[[example]]`/`[[bench]]` are dropped — aterm does not run
-astream's suites, and the broker's dev-dependency on `astream-agent` is not
-vendored. `src/bin/asb.rs` and its `[[bin]]` section are dropped too: `aterm link broker`
+**`--delete` is load-bearing.** Without it rsync only ADDS, so a re-sync silently
+restores every file this tree deliberately drops — `src/bin/asb.rs` among them,
+which brings back the three lint failures that are the reason it is not here. The
+two `rm -rf` lines then remove what upstream has and this tree does not; they are
+listed rather than folded into an `--exclude` so a reader can see exactly what is
+missing and why.
+
+Then re-apply the manifest edits this tree carries. None touches the crates'
+SOURCE, and the list is exhaustive on purpose — an omitted one is how a re-sync
+produces a tree that neither builds nor matches its pins.
+
+1. Workspace-inherited `[package]` fields become explicit, at these EXACT values:
+
+   ```toml
+   version = "0.1.0"        # NOT upstream's 0.0.0 — see below
+   edition = "2021"
+   license = "Apache-2.0"
+   authors = ["Andrew Yates"]
+   rust-version = "1.89"
+   ```
+
+   **`version` deliberately diverges from upstream, and must.**
+   `crates/aterm-forge/src/direct_vendor.rs` hard-requires `0.1.0` in two places
+   — the manifest check (`"{name} manifest has unreviewed version"`) and the
+   cargo-metadata cross-check that the package resolves to this tree and not to a
+   registry. A syncer who faithfully copied upstream's `0.0.0` would fail
+   `aterm forge attest`, which is why the value is written out here rather than
+   described as "whatever upstream says".
+
+   `rust-version` must be upstream's real floor: the broker calls
+   `File::try_lock` (stable 1.89), and a lower number fails
+   `clippy::incompatible_msrv` under this repo's `-D warnings`.
+2. `{ workspace = true }` dependencies become paths, and `sha2` a version.
+3. `[dev-dependencies]` is dropped — aterm does not run astream's suites, and the
+   broker's dev-dependency on `astream-agent` is not vendored.
+4. The broker's feature table keeps every upstream feature NAME (the source
+   references them in `cfg(feature = …)`, and a missing one is an
+   `unexpected_cfg` warning, which is an error under this repo's `-D warnings`),
+   with only the comments rewritten to say what aterm does and does not enable.
+
+## Re-syncing to a NEW upstream commit
+
+Everything above keeps the SAME revision. Moving to a new one additionally
+requires editing Rust, in three places the recipe cannot reach:
+
+| file | what | why |
+|---|---|---|
+| `crates/aterm-forge/src/direct_vendor.rs` | `REVISION` | attest refuses an "unreviewed upstream revision" |
+| `crates/aterm-forge/src/direct_vendor.rs` | `RECORD_SHA256` | the digest OF `UPSTREAM.toml`: "the source inventory changed without a renewed review" |
+| `crates/aterm-forge/src/provenance.rs` | the `upstream:` string | attest prints it verbatim in its OB-1 line |
+
+`RECORD_SHA256` fires FIRST and swallows the per-file diagnostics, so refresh it
+last, after `UPSTREAM.toml` is final. Regenerate the per-file SHA-256 pins in
+`UPSTREAM.toml` in the same pass — they are what makes a silent drift detectable,
+and they are what the review those constants stand for actually reviewed. `src/bin/asb.rs` and its `[[bin]]` section are dropped too: `aterm link broker`
 and `aterm link mint` are the two things aterm needs from that CLI, they are
 first-party code in `crates/aterm-link/src/cli.rs`, and carrying upstream's bin
 meant carrying its lint surface — this repository builds with `-D warnings` and

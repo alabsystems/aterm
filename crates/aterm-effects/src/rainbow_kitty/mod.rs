@@ -190,6 +190,16 @@ pub enum Licence {
     Return,
     /// A scripted preview / example / benchmark (`note_synthetic_move`).
     Synthetic,
+    /// **A DELIVERED INSERT** (2026-09-10): a file drop, a paste, a Tab
+    /// completion, a ⌃V — the user's own gesture, licensed at DELIVERY (the
+    /// host's completed write) and handed over behind its own `Sweep` of the
+    /// whole span. Inert everywhere `Typed` is inert (no wake, no abandon,
+    /// no meteor, no mini-fan, no tick, no star deal); it differs from
+    /// `Typed` only at the echo ledger, which pays a hole BEFORE the insert
+    /// from the older presses (a key whose late echo the seam refused) and
+    /// charges the insert's own span to nothing — the span is the insert's,
+    /// not the presses'.
+    Insert,
     /// **NO CREDIT** — program-driven motion under an arm that admits it, such
     /// as a PTY line-feed cascade (§8.2's "PTY line feed (no credit)", D18).
     /// Draws its meteor under the 2-cap and the retire law; its AUDIO rides
@@ -326,6 +336,26 @@ pub enum Event {
         col0: u16,
         /// The landing (exclusive): the caret the echo left the row at.
         col1: u16,
+    },
+    /// **THE INSERT'S REWRITE** (seam point 1, 2026-09-10): the program
+    /// pulled the caret BACK inside a span a delivered insert laid — Claude
+    /// Code swapping a dropped image path for `[Image #1] `, which the seam
+    /// reads as the insert's own rewrite (`CursorGlow::insert_span`). The
+    /// ribbon retracts the row's suffix from `col` farthest-first at
+    /// `12·n + 240` ms, exactly the kill's law, and moves its caret; the sky
+    /// finishes the field stars of the retracted cells on the same span; the
+    /// engine's caret mirror moves so the next typed echo has no unexplained
+    /// gap. Nothing is born, nothing winces, nothing sounds, the spine and
+    /// the echo ledger are untouched (T1: nothing born; T5: toward the
+    /// caret). Minted only by the seam's insert-scoped rewrite arm, never
+    /// from a key — a Backspace or a kill keeps its own event.
+    Rewrite {
+        /// The rewritten row.
+        row: u16,
+        /// The caret after the rewrite — the retract's near end.
+        col: u16,
+        /// Cells the caret retreated by — the retract's span pricing.
+        cells: u16,
     },
 }
 
@@ -760,7 +790,7 @@ pub(crate) fn level_step_spend(peak: f32, u: f32, span_s: f32) -> Option<f32> {
 /// `Copy`, like the host's own `TypedStamps`: the steady frame path allocates
 /// nothing (§18), and [`ECHO_LEDGER_DEPTH`] is the most presses one move could
 /// ever pair with, so a fuller ledger would be presses no move can spend.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct EchoLedger {
     /// Packed oldest-first: every `Some` precedes every `None`.
     slots: [Option<(Instant, u16)>; ECHO_LEDGER_DEPTH],
@@ -768,6 +798,18 @@ pub struct EchoLedger {
     /// the shipping frame path carries nothing for it.
     #[cfg(test)]
     tally: LedgerTally,
+}
+
+impl Default for EchoLedger {
+    // Written out because `[T; N]: Default` stops at N = 32 and the ledger
+    // is 128 deep (`ECHO_LEDGER_DEPTH`, 2026-09-12).
+    fn default() -> Self {
+        Self {
+            slots: [None; ECHO_LEDGER_DEPTH],
+            #[cfg(test)]
+            tally: LedgerTally::default(),
+        }
+    }
 }
 
 /// Cells the ledger has banked, spent, forfeited and expired since it was
@@ -1162,7 +1204,24 @@ impl Engine {
                 {
                     self.last_host_sweep_at = host_sweep;
                 }
-                if let Some(col0) = self.echo_bridge(from, to, licence, host_sweep, now)
+                let bridge = self.echo_bridge(from, to, licence, host_sweep, now);
+                // THE RIBBON'S BIRTH FLOOR (2026-09-12): the ledger has read
+                // the host sweep's clock as the licensing KEY above; the
+                // ribbon is born no earlier than one stamp window before
+                // the echo (`timing::SWEEP_BIRTH_FLOOR_S`), so a stalled
+                // batch dated at its oldest press is not born seconds ago
+                // into a cohort that has already faded. A per-key sweep's
+                // clock is inside the window: byte-identical.
+                let floor = now
+                    .checked_sub(Duration::from_secs_f32(timing::SWEEP_BIRTH_FLOOR_S))
+                    .unwrap_or(now);
+                let birth = host_sweep.map(|at| at.max(floor));
+                if let (Some(birth), Some((Event::Sweep { .. }, at))) =
+                    (birth, self.events.last_mut())
+                {
+                    *at = birth;
+                }
+                if let Some(col0) = bridge
                     && (col0 < from.1 || host_sweep.is_none())
                 {
                     let host_end = if host_sweep.is_some() { from.1 } else { to.1 };
@@ -1175,7 +1234,7 @@ impl Engine {
                                 col0,
                                 col1: to.1,
                             },
-                            host_sweep.unwrap_or(now),
+                            birth.unwrap_or(now),
                         ),
                     );
                 }
@@ -1190,6 +1249,13 @@ impl Engine {
             // Focus is the ribbon's and the sky's to act on (they ember and
             // die in their own `on_event`); a Return is the KEY, and inert;
             // a Sweep is the ribbon's alone.
+            // The insert's rewrite moves the mirror (the next typed echo
+            // from the new caret then has no unexplained gap) and nothing
+            // else: no drain, no wince, the ledger kept — nothing is born.
+            Event::Rewrite { row, col, .. } => {
+                self.caret = (row, col);
+                self.caret_known = true;
+            }
             Event::Focus(true) | Event::Return | Event::Sweep { .. } => {}
         }
         self.events.push((ev, now));
@@ -1221,10 +1287,9 @@ impl Engine {
     /// licensed move's own clock (T2), joining the cohort they belong to so
     /// the walk continues with no seam and no feather. The same sweep covers
     /// a licensed multi-cell echo the host did not sweep itself — a
-    /// non-coalesced re-anchor, or a batch its press credits (which age out
-    /// at `2 s`, `CursorGlow::RAINBOW_COALESCE_CREDIT_LIFE`, the same two
-    /// seconds as [`timing::ECHO_PATIENCE_S`]) could not pay for; the
-    /// refusal is logged `licensed`.
+    /// non-coalesced re-anchor, or a batch its press credits (in flight for
+    /// `CursorGlow::IN_FLIGHT_PATIENCE_S`, which [`timing::ECHO_PATIENCE_S`]
+    /// is by alias) could not pay for; the refusal is logged `licensed`.
     ///
     /// **What it may never do.** T1 holds: geometry is born only on this
     /// observed, licensed move. The anti-stray law holds: a cell is laid only
@@ -1246,10 +1311,18 @@ impl Engine {
     /// mirror (a hop before it cannot be partitioned without a key clock, and
     /// is refused). The bound is the host's own coalesce cap
     /// ([`timing::ECHO_LEDGER_DEPTH`]). A press older than
-    /// [`timing::ECHO_PATIENCE_S`] was swallowed, not delayed, and buys
-    /// nothing. A non-typed licence, an erase or kill, a focus loss, a row
-    /// change, a scroll and a reset all clear the ledger: the presses it held
-    /// no longer describe the row under the hand.
+    /// [`timing::ECHO_PATIENCE_S`] — the host's in-flight patience — was
+    /// swallowed, not delayed, and buys nothing. A non-typed licence, an
+    /// erase or kill, a focus loss, a row change, a scroll and a reset all
+    /// clear the ledger: the presses it held no longer describe the row
+    /// under the hand.
+    ///
+    /// A STALLED BATCH (2026-09-12) is swept by the host on the clock of its
+    /// OLDEST press: nothing on the ledger is older than that key, the hop
+    /// starts at the mirror, and the whole batch is SPENT — a batch the app
+    /// drains across two frames keeps its tail here for the next key to
+    /// bridge, instead of forfeiting it. The RIBBON is not born at that
+    /// clock: see [`timing::SWEEP_BIRTH_FLOOR_S`] in the move handler.
     ///
     /// `key_at` is the host sweep's clock — the licensing press — when the
     /// host swept this move. Returns the first cell of a sweep that runs from
@@ -1268,7 +1341,12 @@ impl Engine {
         self.echo.expire(now);
         let (mrow, mcol) = self.caret;
         let known = self.caret_known;
-        if licence != Licence::Typed || !known || from.0 != mrow || to.0 != mrow {
+        let insert = licence == Licence::Insert;
+        if !matches!(licence, Licence::Typed | Licence::Insert)
+            || !known
+            || from.0 != mrow
+            || to.0 != mrow
+        {
             self.echo.clear();
             return None;
         }
@@ -1290,6 +1368,11 @@ impl Engine {
             return None;
         }
         let paid = match key_at {
+            // A DELIVERED INSERT swept `from..to` on the delivery clock: the
+            // span is the insert's own and charges the ledger nothing; the
+            // hole before it — a key whose late echo the seam refused just
+            // before the drop — is the older presses', exactly.
+            Some(key) if insert => self.echo.older_than(key) == gap && gap <= self.echo.total(),
             // The host swept `from..to` for the key at `key_at`: the hole
             // before it is the older presses', exactly, and the sweep's own
             // cells are the key's and the ones after it.
@@ -1302,7 +1385,7 @@ impl Engine {
             self.echo.clear();
             return None;
         }
-        self.echo.spend(gap + advance);
+        self.echo.spend(if insert { gap } else { gap + advance });
         Some(mcol)
     }
 
@@ -1674,9 +1757,9 @@ impl Engine {
             Licence::Return => (SoundKind::Enter { cells }, 0),
             Licence::Pty => (SoundKind::Jump, 0),
             // A typed echo never flies (§6.1) and the meteor never spawns on
-            // one; if it ever did, nothing here may fire — the keystroke's
-            // own cue is the host's.
-            Licence::Typed => return,
+            // one — nor on a delivered insert; if it ever did, nothing here
+            // may fire — the keystroke's own cue is the host's.
+            Licence::Typed | Licence::Insert => return,
         };
         let credited = licence != Licence::Pty;
         let reduced = ctx.cfg.reduced_motion;
@@ -2990,6 +3073,218 @@ mod tests {
             "the swallowed press was dropped at the ordinary echo; the nudge's cell stays dark"
         );
         assert!(eng.field_at(3, 7).is_some());
+    }
+
+    /// **THE INSERT'S REWRITE** ([`Event::Rewrite`], 2026-09-10): the
+    /// program pulled the caret back inside a delivered insert's span. It
+    /// offers the kitty no impulse (no Wince), drains no spine, throws no
+    /// star (the retracted cells' field stars finish with them), mints no
+    /// cue, keeps the echo ledger, and moves the caret
+    /// mirror — so the next typed echo from the new caret has no unexplained
+    /// gap and bridges nothing — while the ribbon retracts the suffix.
+    ///
+    /// RED-PROOF (2026-09-10, the variant stubbed inert): fails at the
+    /// caret-mirror assert (`(3, 5)` where `(3, 3)` is expected) — and the
+    /// cells right of the new caret keep their light.
+    #[test]
+    fn a_rewrite_offers_no_impulse_drains_no_spine_throws_no_star_and_keeps_the_ledger() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let t = three_typed_cells(&mut eng, t0);
+        // One press banked and not yet echoed: the ledger holds it.
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        assert_eq!(eng.echo.total(), 1, "PRECONDITION: one press on the ledger");
+        let stars_before = eng.status().stars;
+        let disp_before = eng.spine().disp();
+        let t = t + ms(300);
+        eng.on_event(
+            Event::Rewrite {
+                row: 3,
+                col: 3,
+                cells: 2,
+            },
+            t,
+        );
+        assert_eq!(
+            eng.spine().disp(),
+            disp_before,
+            "a rewrite drains no spine at its edge"
+        );
+        assert_eq!(eng.caret, (3, 3), "the caret mirror moves to the rewrite");
+        assert_eq!(eng.echo.total(), 1, "the ledger is kept");
+        let mut fr = sc.frame();
+        eng.tick(t, geom(), &cfg, &mut fr);
+        assert!(fr.companion.is_none(), "no impulse on the rewrite's frame");
+        assert!(eng.take_companion_impulse().is_none(), "no Wince");
+        assert!(sc.cues.is_empty(), "a rewrite sounds nothing");
+        assert!(
+            eng.status().stars <= stars_before,
+            "a rewrite throws no star (the retracted cells' field stars may finish): {} > {stars_before}",
+            eng.status().stars
+        );
+        // The retract: cells 3 and 4 leave, cells 2 keeps its light.
+        let done = t + ms((12 * 2 + 240) + 240 + 20);
+        tick_at(&mut eng, done);
+        assert!(
+            eng.field_at(3, 3).is_none() && eng.field_at(3, 4).is_none(),
+            "the cells right of the rewrite's caret are retracted"
+        );
+        // The next typed echo from the new caret: mirror (3,3), from (3,3) —
+        // gap 0, nothing to bridge, the press pays for its own cell.
+        let bridged = eng.status().bridged;
+        let t = type_key_at(&mut eng, done + ms(50), 3);
+        tick_at(&mut eng, t);
+        assert_eq!(
+            eng.status().bridged,
+            bridged,
+            "no gap opened, nothing bridged"
+        );
+        assert!(
+            eng.field_at(3, 3).is_some(),
+            "the key after the rewrite lays at the new caret"
+        );
+    }
+
+    /// A rewrite's retract completes and the engine idles free — the §18
+    /// idle → zero law with a [`Event::Rewrite`] in the stream.
+    #[test]
+    fn a_rewrite_retract_completes_and_the_engine_idles_free() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let cfg = config();
+        let mut eng = engaged();
+        let mut sc = Scratch::default();
+        let t = three_typed_cells(&mut eng, t0);
+        let t = t + ms(300);
+        eng.on_event(
+            Event::Rewrite {
+                row: 3,
+                col: 2,
+                cells: 3,
+            },
+            t,
+        );
+        tick_at(&mut eng, t);
+        let mut last = t;
+        for i in 1..=400u64 {
+            last = t + ms(10 * i);
+            tick_at(&mut eng, last);
+        }
+        let mut fr = sc.frame();
+        eng.tick(last + ms(10), geom(), &cfg, &mut fr);
+        assert_eq!(fr.fp, 0, "nothing on glass");
+        assert!(!eng.needs_frame_cadence(), "no cadence asked");
+        assert!(
+            eng.next_change_deadline(last + ms(10)).is_none(),
+            "no deadline"
+        );
+    }
+
+    /// A HOST SWEEP UNDER A TYPED MOVE beside banked presses the hop does
+    /// not explain: the whole span (`5..67`) laid as one sweep behind an
+    /// inert typed move; the presses banked before it are forfeited by the
+    /// ledger's mismatch rule and nothing is bridged — the anti-stray law
+    /// the typed composition keeps. (The seam hands a delivered insert over
+    /// as `Licence::Insert` instead, whose ledger rule pays such a hole from
+    /// the older presses — `an_inserts_sweep_pays_the_hole_a_late_key_left_before_it`.)
+    #[test]
+    fn a_delivered_insert_sweep_beside_banked_presses_forfeits_them_and_bridges_nothing() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        eng.on_event(typed(1), t + ms(50));
+        tick_at(&mut eng, t + ms(50));
+        assert_eq!(eng.echo.total(), 2);
+        let delivered = t + ms(400);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 5,
+                col1: 67,
+            },
+            delivered,
+        );
+        eng.on_event(mv((3, 5), (3, 67), Licence::Typed), delivered + ms(20));
+        tick_at(&mut eng, delivered + ms(20));
+        assert_eq!(eng.status().bridged, 0, "nothing bridged");
+        assert_eq!(eng.echo.total(), 0, "the unexplained presses are forfeited");
+        assert!(
+            (5..67u16).all(|col| eng.field_at(3, col).is_some()),
+            "the whole span is lit"
+        );
+        assert_eq!(eng.caret, (3, 67));
+    }
+
+    /// A DELIVERED INSERT'S SWEEP PAYS THE HOLE A LATE KEY LEFT BEFORE IT:
+    /// a key pressed just before the drop, whose echo the seam refused (one
+    /// press, its stamp stale — the shape `AStaleStampIsNotALicence` is
+    /// right about), leaves the mirror one cell behind the insert's origin.
+    /// Under `Licence::Insert` the ledger pays that one cell from the key's
+    /// own press and charges the insert's span to nothing; under `Typed` the
+    /// span would have to be covered by presses too, the mismatch would
+    /// FORGET the ledger, and the key's cell would stay dark for good.
+    #[test]
+    fn an_inserts_sweep_pays_the_hole_a_late_key_left_before_it() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // The late key: pressed, its echo refused at the seam (no move).
+        let key = t + ms(100);
+        eng.on_event(typed(1), key);
+        tick_at(&mut eng, key);
+        // The drop: delivered 400 ms later; the caret is observed at 6 (the
+        // key's echo landed unlicensed) and the insert echoes 6 → 17.
+        let delivered = key + ms(400);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 6,
+                col1: 17,
+            },
+            delivered,
+        );
+        eng.on_event(mv((3, 6), (3, 17), Licence::Insert), delivered + ms(20));
+        tick_at(&mut eng, delivered + ms(20));
+        assert!(
+            eng.field_at(3, 5).is_some(),
+            "the late key's cell is paid by its own press through the insert's sweep"
+        );
+        assert!(
+            (6..17u16).all(|col| eng.field_at(3, col).is_some()),
+            "the insert's span is lit"
+        );
+        assert_eq!(eng.status().bridged, 1, "one bridged cell — the key's");
+        assert_eq!(eng.echo.total(), 0, "the press is spent");
+        assert_eq!(eng.caret, (3, 17));
+        // Control: the same shape under `Typed` forgets the ledger and
+        // leaves the hole (the seam's typed sweep charges its span to presses).
+        let mut typed_eng = engaged();
+        let t = three_typed_cells(&mut typed_eng, t0);
+        let key = t + ms(100);
+        typed_eng.on_event(typed(1), key);
+        tick_at(&mut typed_eng, key);
+        let delivered = key + ms(400);
+        typed_eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 6,
+                col1: 17,
+            },
+            delivered,
+        );
+        typed_eng.on_event(mv((3, 6), (3, 17), Licence::Typed), delivered + ms(20));
+        tick_at(&mut typed_eng, delivered + ms(20));
+        assert!(typed_eng.field_at(3, 5).is_none());
+        assert_eq!(typed_eng.echo.total(), 0, "…and the press is forfeited");
     }
 
     /// TIER 1 for the echo ledger: the REAL `Engine`, driven through the
@@ -6233,5 +6528,133 @@ mod tests {
             "the control: moves no press explains lay nothing — \
              the frame this law is about"
         );
+    }
+
+    /// **A PRESS WAITS ON THE LEDGER FOR THE WHOLE PATIENCE** (2026-09-12,
+    /// the stall). A key refused at the seam, the next key nine seconds
+    /// later — inside `ECHO_PATIENCE_S`, which is the host's in-flight
+    /// patience by alias — with the host's sweep on its clock: the stalled
+    /// press pays for its cell, and it is relit.
+    ///
+    /// RED on 81dea89c8: the ledger expired the press at 2 s.
+    #[test]
+    fn a_press_waits_on_the_ledger_for_the_whole_patience() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        // The refused press at col 5: pressed, its echo refused by the seam.
+        let t = t + ms(100);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        // Nine seconds of silence, then a key at col 6 echoed on time.
+        let t = t + ms(9000);
+        eng.on_event(typed(1), t);
+        tick_at(&mut eng, t);
+        let echo = t + ms(8);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 6,
+                col1: 7,
+            },
+            t,
+        );
+        eng.on_event(mv((3, 6), (3, 7), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        assert!(
+            eng.field_at(3, 5).is_some(),
+            "the stalled press's cell is relit nine seconds later"
+        );
+        assert_eq!(eng.status().bridged, 1);
+    }
+
+    /// **FORTY PRESSES TYPED INTO A STALL FIT THE LEDGER.** Forty `Typed`
+    /// banked; the host's sweep 5..45 on the OLDEST press's clock and the
+    /// move from the mirror: the ledger SPENDS forty (its tally says spent,
+    /// not forfeited) and nothing is cleared.
+    ///
+    /// RED on 81dea89c8: `gap + advance > ECHO_LEDGER_DEPTH` (32) clears.
+    #[test]
+    fn forty_presses_typed_into_a_stall_fit_the_ledger() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let first = t + ms(100);
+        let mut last = first;
+        for k in 0..40u64 {
+            last = first + ms(85 * k);
+            eng.on_event(typed(1), last);
+            tick_at(&mut eng, last);
+        }
+        let echo = last + ms(400);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 5,
+                col1: 45,
+            },
+            first,
+        );
+        eng.on_event(mv((3, 5), (3, 45), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        let tally = eng.echo.tally;
+        assert_eq!(
+            (tally.spent, tally.forfeited, tally.expired),
+            (43, 0, 0),
+            "the three pre-roll presses and the forty of the batch are spent, none forfeited"
+        );
+        for col in 5..45u16 {
+            assert!(eng.field_at(3, col).is_some(), "col {col} is dark");
+        }
+    }
+
+    /// **A BATCH SWEEP ON THE OLDEST PRESS'S CLOCK IS BORN NO EARLIER THAN
+    /// THE BIRTH FLOOR.** The host dates a stalled batch's sweep at its
+    /// oldest press so the ledger can partition it; the RIBBON must not be
+    /// born there — three seconds into a cohort that has already faded — but
+    /// one stamp window before the echo, so the echoing frame shows the run
+    /// lit and the next frame still does.
+    ///
+    /// RED on 81dea89c8: the cells are born at the sweep's clock and retired
+    /// on the tick that laid them.
+    #[test]
+    fn a_batch_sweep_on_the_oldest_press_clock_is_born_no_earlier_than_the_birth_floor() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut eng = engaged();
+        let t = three_typed_cells(&mut eng, t0);
+        let first = t + ms(100);
+        let mut last = first;
+        for k in 0..12u64 {
+            last = first + ms(85 * k);
+            eng.on_event(typed(1), last);
+            tick_at(&mut eng, last);
+        }
+        let echo = last + ms(3000);
+        eng.on_event(
+            Event::Sweep {
+                row: 3,
+                col0: 5,
+                col1: 17,
+            },
+            first,
+        );
+        eng.on_event(mv((3, 5), (3, 17), Licence::Typed), echo);
+        tick_at(&mut eng, echo);
+        for col in 5..17u16 {
+            assert!(
+                eng.field_at(3, col).is_some(),
+                "col {col} is dark in the echoing frame"
+            );
+        }
+        tick_at(&mut eng, echo + ms(100));
+        for col in 5..17u16 {
+            assert!(
+                eng.field_at(3, col).is_some(),
+                "col {col} is dark 100 ms after the echo"
+            );
+        }
     }
 }

@@ -10,7 +10,7 @@ license = "Apache-2.0"
 
 [files]
 "LICENSE" = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
-"README.md" = "82d4dbb0d661544e0dafbb1187791f2916f24e65c8f9ecb06ac98a48343d4fdb"
+"README.md" = "94357e193d45c29f8ad98e117b018b6d2734172f989e169d6d3364b12502b7cd"
 "crates/astream-aead/Cargo.toml" = "007e22ff3813a37faf8cd740df8426e57bfa1a131a0ccb8ae73a136c040a0d80"
 "crates/astream-aead/src/handshake.rs" = "28bb99e056c81c28fdda8f2e6f21e0e7d1e41f8223d18e4202cd236d5cfbaca1"
 "crates/astream-aead/src/identity.rs" = "bd006429092b42711131d4cb96a8ede4e58939399e0760298268fd52a1d110eb"

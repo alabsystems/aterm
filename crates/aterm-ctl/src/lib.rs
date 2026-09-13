@@ -63,7 +63,8 @@
 //!   cell's pct-encoded GRAPHEME (empty for a blank cell or a wide glyph's
 //!   right-half spacer), `rrggbb` foreground and background, then `none` or a
 //!   comma list of attributes (`bold`, `dim`, `italic`, `underline`, `blink`,
-//!   `inverse`, `strike`, plus the `wide` / `wide_cont` width markers), and a
+//!   `inverse`, `strike`, `hidden`, plus the `wide` / `wide_cont` width
+//!   markers — ten tokens, the vocabulary `cmd_cell` documents), and a
 //!   trailing ` link=<url>` only when the cell carries an OSC 8 hyperlink.
 //! * `search <pat>`    — print one `"<row> <col> <len>"` line per match. A hit
 //!   that straddles a SOFT WRAP is one match, reported at the row and column it
@@ -91,9 +92,11 @@
 //!   colour management, scanout, occlusion, or photons. A first token that is a known
 //!   target keyword always selects that window — to write to a file literally named
 //!   `prefs`/`front`, give a target first (e.g. `window front prefs`). It requires
-//!   an attached OS window; macOS also needs Screen Recording permission (a clear
-//!   `ERR` explains how to grant it if missing). A missing target, headless
-//!   instance, or unsupported platform gets a clear `ERR`.
+//!   an attached OS window that is on screen. It photographs aterm's OWN window and
+//!   so needs no Screen Recording permission on macOS — do not grant one for it (a
+//!   held grant re-prompts on a cooldown since macOS 15, for nothing). A window that
+//!   is not on screen, a missing target, a headless instance, or an unsupported
+//!   platform gets a clear `ERR` naming that cause.
 //! * `controls <target>` — dump a GUI surface's controls as text. For
 //!   `prefs`/`settings`, compatibility `field key=… label=… value=… effective=…`
 //!   rows describe only setting controls on the current native route; the following

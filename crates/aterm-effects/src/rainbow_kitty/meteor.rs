@@ -2740,8 +2740,9 @@ impl Meteors {
         ctx: &Ctx<'_>,
     ) -> Option<Spawn> {
         // §6.1: typed wraps never fly, and reflow licenses nothing. A typed
-        // echo lays ribbon; it does not streak.
-        if matches!(licence, Licence::Typed) {
+        // echo lays ribbon; it does not streak — and neither does a delivered
+        // insert, whose span its own sweep laid.
+        if matches!(licence, Licence::Typed | Licence::Insert) {
             return None;
         }
         let drow = i32::from(to.0) - i32::from(from.0);

@@ -147,10 +147,12 @@ impl Terminal {
                 let (parser, mut handler) = self.split_for_process();
                 parser.advance_fast(input, &mut handler);
             }
-            // RIS sets pending_parser_reset because the parser can't be reset
-            // from inside its own dispatch loop (#7153).
+            // RIS side effects the handler cannot reach (#7153). The parser is NOT
+            // reset here: ESC c is an EscDispatch that already left it in Ground, so
+            // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
+            // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
+            // the next chunk printed that sequence's tail as text.
             if self.transient.pending_parser_reset {
-                self.parser.reset();
                 // Clear session-only state not accessible from the handler (#7336).
                 self.secure_keyboard_entry = false;
                 // Kill the parked selection HERE, not by leaning on the park/restore
@@ -190,10 +192,12 @@ impl Terminal {
                 let (parser, mut handler) = self.split_for_process();
                 parser.advance_fast(input, &mut handler);
             }
-            // RIS sets pending_parser_reset because the parser can't be reset
-            // from inside its own dispatch loop (#7153).
+            // RIS side effects the handler cannot reach (#7153). The parser is NOT
+            // reset here: ESC c is an EscDispatch that already left it in Ground, so
+            // a reset after the WHOLE slice (to 2026-09-12) only wiped the half-parsed
+            // CSI / UTF-8 / DCS that bytes after the RIS left at the chunk's end, and
+            // the next chunk printed that sequence's tail as text.
             if self.transient.pending_parser_reset {
-                self.parser.reset();
                 // Clear session-only state not accessible from the handler (#7336).
                 self.secure_keyboard_entry = false;
                 // Kill the parked selection HERE, not by leaning on the park/restore
@@ -957,6 +961,76 @@ mod tests {
             "the reset must retire the parked selection in its own batch; leaving it \
              for a later restore hands a pre-RIS highlight back over an erased grid"
         );
+    }
+
+    /// RIS followed by bytes the PTY read cut mid-sequence: the tail of the chunk
+    /// must survive into the next `process` call. The RIS parser reset used to run
+    /// after the WHOLE slice, so it wiped the half-parsed CSI / UTF-8 / DCS that the
+    /// bytes AFTER `ESC c` had built, and the next chunk printed its tail as text.
+    /// Both `advance_fast` branches are exercised (profiling off and on).
+    fn ris_then_split_tail(profiling: bool, first: &[u8], second: &[u8]) -> Terminal {
+        let mut t = Terminal::new(24, 80);
+        t.transient.pipeline_timestamps.profiling_enabled = profiling;
+        t.process(first);
+        t.process(second);
+        t
+    }
+
+    fn row_text(t: &Terminal, row: u16) -> String {
+        t.grid().row(row).map(|r| r.to_string()).unwrap_or_default()
+    }
+
+    #[test]
+    fn ris_does_not_drop_csi_split_across_process_calls() {
+        use crate::grid::PackedColor;
+        for profiling in [false, true] {
+            let t = ris_then_split_tail(profiling, b"\x1bc\x1b[3", b"1mX");
+            let cell = t.grid().cell(0, 0).expect("cell 0,0");
+            assert_eq!(
+                cell.char(),
+                'X',
+                "profiling={profiling}: {:?}",
+                row_text(&t, 0)
+            );
+            assert_eq!(
+                cell.fg_color(),
+                Some(PackedColor::indexed(1)),
+                "profiling={profiling}: the split SGR 31 must apply to the X"
+            );
+            assert_ne!(t.grid().cell(0, 1).expect("cell 0,1").char(), 'm');
+        }
+    }
+
+    #[test]
+    fn ris_does_not_drop_utf8_split_across_process_calls() {
+        for profiling in [false, true] {
+            let t = ris_then_split_tail(profiling, b"\x1bc\xe4\xb8", b"\xadA");
+            let cell = t.grid().cell(0, 0).expect("cell 0,0");
+            assert_eq!(
+                cell.char(),
+                '\u{4E2D}',
+                "profiling={profiling}: {:?}",
+                row_text(&t, 0)
+            );
+            assert!(cell.is_wide());
+            assert_eq!(t.grid().cell(0, 2).expect("cell 0,2").char(), 'A');
+        }
+    }
+
+    #[test]
+    fn ris_does_not_print_a_dcs_payload_split_across_process_calls() {
+        for profiling in [false, true] {
+            let t = ris_then_split_tail(
+                profiling,
+                b"\x1bc\x1bP0;0;0q\"1;1;1;1#0;2;0;0;0",
+                b"~\x1b\\",
+            );
+            let text = row_text(&t, 0);
+            assert!(
+                !text.contains('~') && !text.contains("#0"),
+                "profiling={profiling}: sixel payload printed as text: {text:?}"
+            );
+        }
     }
 
     /// Negative control for the cross-field contract behind piecewise selection

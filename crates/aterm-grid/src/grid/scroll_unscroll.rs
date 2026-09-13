@@ -34,38 +34,57 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.scroll_region.top <= self.storage.scroll_region.bottom
     /// ENSURES: result <= n
-    /// ENSURES: result <= old(scrollback.line_count())
+    /// ENSURES: result <= old(scrollback_lines())
     pub fn unscroll_from_scrollback(&mut self, n: usize) -> usize {
         if n == 0 {
             return 0;
         }
         self.storage.clear_pending_wrap();
 
-        // Drain lazy buffer first so all lines are in tiered scrollback.
-        // Unscroll reads the N newest lines and then removes them — this
-        // is simpler and correct when all lines are in one storage.
+        // Drain the lazy buffer so history is the ring (newest) over the store.
         self.drain_lazy_buffer();
 
-        let scrollback_available = self
-            .storage
-            .scrollback
-            .as_ref()
-            .map_or(0, ScrollbackStorage::line_count);
-        if scrollback_available == 0 {
+        // History's NEWEST lines are the ring rows directly above the viewport,
+        // then the lazy buffer, then the tiered store. Budgeting, reading and
+        // removing only the store (to 2026-09-12) pasted lines a whole ring older
+        // than the ones above the screen and cut them out of the middle of
+        // history, and a ring-only history (every GUI session under its ring cap)
+        // took the blank-scroll arm below and lost the bottom rows. Pull
+        // newest-first from the ring, then the store, but the store only when no
+        // lazy-staged lines sit between them (a store detached for reflow keeps
+        // them staged): the `fill_viewport_deficit_from_history` rule.
+        let ring = self.storage.ring_buffer_scrollback();
+        let available = if self.storage.lazy_buffer_lines() > 0 {
+            ring
+        } else {
+            ring + self
+                .storage
+                .scrollback
+                .as_ref()
+                .map_or(0, ScrollbackStorage::line_count)
+        };
+        if available == 0 {
             self.scroll_region_down(n);
             return 0;
         }
 
         let top = usize::from(self.storage.scroll_region.top);
         let bottom = usize::from(self.storage.scroll_region.bottom);
-        let n = n.min(scrollback_available).min(bottom - top + 1);
+        let n = n.min(available).min(bottom - top + 1);
 
         // Read all lines BEFORE any destructive operations. If any line
         // fails to decompress, abort to prevent permanent data loss (#4521).
-        let lines = match self.try_read_scrollback_lines(n) {
-            Some(lines) => lines,
-            None => return 0,
-        };
+        let mut lines = Vec::with_capacity(n);
+        for rev_idx in (0..n).rev() {
+            match self.try_history_line_rev(rev_idx) {
+                Ok(Some(line)) => lines.push(line.into_owned()),
+                Ok(None) => return 0,
+                Err(e) => {
+                    aterm_log::warn!("unscroll: decompression failed at line {rev_idx}: {e}");
+                    return 0;
+                }
+            }
+        }
 
         // Row access during the unscroll writes must target the live viewport,
         // not a scrolled-back projection.
@@ -78,28 +97,29 @@ impl Grid {
         self.storage.extras.shift_region_down_by(t, b, row_u16(n));
 
         let cols = self.storage.cols;
-        for (i, line_opt) in lines.into_iter().enumerate() {
-            let row_idx = top + i;
-            if let Some(line) = line_opt {
-                self.fill_row_from_line(row_u16(row_idx), &line, cols);
-            } else if let Some(r) = self.row_mut(row_u16(row_idx)) {
-                r.clear();
-            }
+        for (i, line) in lines.iter().enumerate() {
+            self.fill_row_from_line(row_u16(top + i), line, cols);
         }
 
-        // Remove recovered lines from scrollback (Kitty spec, #4248).
-        // If removal fails (decompression error), lines remain in scrollback
-        // (duplicated with grid) — preferable to silent data loss (#4638).
-        //
-        // Defensive: with tier-aware remove_newest (#4638) and try-read-first
-        // (#4521), this error branch is unreachable — if try_read succeeds,
-        // remove_newest will too (both traverse the same tiers from newest).
-        // Retained as safety net against future architectural changes.
-        if let Some(scrollback) = self.storage.scrollback.as_mut()
-            && let Err(e) = scrollback.remove_newest(n)
+        // Remove recovered lines from history (Kitty spec, #4248): ring first
+        // (they are the newest), then the store for any remainder. Ring rows go
+        // only AFTER the fill: dropping them rotates `ring_head` and shrinks
+        // `rows`, and the viewport indices above were computed before that.
+        // If store removal fails (decompression error), lines remain in
+        // scrollback (duplicated with grid) — preferable to silent data loss
+        // (#4638). Defensive: with try-read-first (#4521) this branch is
+        // unreachable, since both traverse the same tiers from newest.
+        let from_ring = n.min(ring);
+        if from_ring > 0 {
+            self.drop_newest_ring_scrollback(from_ring);
+        }
+        let from_tiered = n - from_ring;
+        if from_tiered > 0
+            && let Some(scrollback) = self.storage.scrollback.as_mut()
+            && let Err(e) = scrollback.remove_newest(from_tiered)
         {
             aterm_log::warn!(
-                "unscroll_from_scrollback: failed to remove {n} lines from scrollback: {e}"
+                "unscroll_from_scrollback: failed to remove {from_tiered} lines from scrollback: {e}"
             );
         }
         // Every history row OLDER than the removed suffix keeps its line, but
@@ -126,33 +146,5 @@ impl Grid {
             .damage
             .mark_rows(top_u16, bottom_u16.saturating_add(1));
         n
-    }
-
-    /// Try to read `n` lines from scrollback in reverse order.
-    ///
-    /// Returns `None` if any line fails to decompress (caller should abort).
-    /// Returns `Some(vec![None; n])` if no scrollback is attached.
-    fn try_read_scrollback_lines(
-        &mut self,
-        n: usize,
-    ) -> Option<Vec<Option<aterm_scrollback::Line>>> {
-        let Some(scrollback) = self.storage.scrollback.as_mut() else {
-            return Some(vec![None; n]);
-        };
-        let mut all_ok = true;
-        let lines: Vec<_> = (0..n)
-            .map(|i| {
-                let rev_idx = n - 1 - i;
-                match scrollback.get_line_rev(rev_idx) {
-                    Ok(cow_opt) => cow_opt.map(std::borrow::Cow::into_owned),
-                    Err(e) => {
-                        aterm_log::warn!("unscroll: decompression failed at line {rev_idx}: {e}");
-                        all_ok = false;
-                        None
-                    }
-                }
-            })
-            .collect();
-        all_ok.then_some(lines)
     }
 }

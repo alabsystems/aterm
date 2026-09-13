@@ -433,8 +433,9 @@ fn refuse2(head: &str, detail: &str) -> FlowError {
 
 /// Admit an artifact row BEFORE any byte moves, by its `protocol`:
 ///
-/// * `github-release` — unchanged: nothing to check here (the release lane's gates are
-///   the signed `sha256`/`tree_root` at stage time, exactly as before the split);
+/// * `github-release` — [`check_release_row`]: only a bare `asset` name (the release
+///   lane's other gates are the signed `sha256`/`tree_root` at stage time, exactly as
+///   before the split);
 /// * `https` — every refusal the vendor lane has always had: https on an allow-listed
 ///   bare host, a known `payload` that matches the `kind` (`dmg` ⇔ `app-bundle`), a
 ///   shimmable exposed `entry` for `raw-binary`, `strip_components` on archives only,
@@ -465,7 +466,7 @@ fn refuse2(head: &str, detail: &str) -> FlowError {
 /// The first field that fails admission, in the order listed on the struct.
 pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowError> {
     match artifact.protocol.as_str() {
-        "github-release" => Ok(()),
+        "github-release" => check_release_row(artifact),
         "https" => check_https_row(artifact, exposes),
         "pkg" => check_pkg_row(artifact),
         "system-pm" => check_system_pm_row(artifact),
@@ -475,6 +476,22 @@ pub fn check_row(artifact: &Artifact, exposes: &[String]) -> Result<(), FlowErro
             other,
         )),
     }
+}
+
+/// The `github-release` half of [`check_row`]: the `asset` is joined onto the program's
+/// staging directory as the download's local name, so it must be one bare file name —
+/// the rule the `https` and `pkg` lanes carry. Until 2026-09-12 release rows skipped
+/// admission, and an absolute or `..` asset named a file outside staging that install
+/// unlinked, sweeping that directory's `*.part` files, before any download (audit K3).
+/// The flow refuses an escaping staged path a second time.
+fn check_release_row(artifact: &Artifact) -> Result<(), FlowError> {
+    if !artifact.asset.is_empty() && !bare_file_name(&artifact.asset) {
+        return Err(refuse2(
+            "asset must be a bare local file name (no separators, not `.`/`..`): ",
+            &artifact.asset,
+        ));
+    }
+    Ok(())
 }
 
 /// The `https` half of [`check_row`] — every refusal the vendor lane has always carried.
@@ -1228,8 +1245,9 @@ mod tests {
         check_row(&row(), &exposes()).expect("the reference row admits");
     }
 
-    /// A `github-release` row is admitted UNCHANGED — no vendor checks apply to the
-    /// release lane, whatever its other keys hold (they are ignored there, as before).
+    /// A `github-release` row with a bare `asset` is admitted UNCHANGED — no vendor
+    /// checks beyond the asset name apply to the release lane, whatever its other keys
+    /// hold (they are ignored there, as before).
     #[test]
     fn a_github_release_row_is_unchanged_by_admission() {
         let mut a = row();
@@ -1244,6 +1262,36 @@ mod tests {
         // …even with the retired-shape keys hanging off it.
         a.url = "http://evil.example/x".into();
         check_row(&a, &[]).expect("release rows ignore url");
+    }
+
+    /// A `github-release` row's `asset` is joined onto the program's staging directory as
+    /// the download's local name, so admission holds it to the same bare-name rule the
+    /// `https` and `pkg` lanes carry. Until 2026-09-12 release rows skipped admission
+    /// entirely, and an absolute or `..` asset named a file OUTSIDE staging that install
+    /// unlinked (and whose directory's `*.part` files it swept) before any download
+    /// (audit K3; flow.rs refuses the escaping path a second time at stage).
+    #[test]
+    fn a_github_release_row_with_a_path_asset_is_refused() {
+        let mut a = row();
+        a.protocol = "github-release".into();
+        a.sha256 = "d".into();
+        for bad in [
+            "/Users//victim/.ssh/authorized_keys",
+            "../../../x",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            "x\ny",
+        ] {
+            a.asset = bad.into();
+            assert!(
+                refused(&a, &[]).contains("asset must be a bare local file name"),
+                "{bad:?}"
+            );
+        }
+        a.asset = "ty-2973.tar.zst".into();
+        check_row(&a, &[]).expect("a bare release asset name is admitted");
     }
 
     #[test]

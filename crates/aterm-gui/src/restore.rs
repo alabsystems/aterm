@@ -83,9 +83,14 @@ pub(crate) struct TerminalLeafRestore {
     pub local_id: Option<u64>,
     /// USER session metadata (session-metadata stage 1; additive, absent
     /// tolerated by older manifests): the operator's `meta set` title/
-    /// description/icon/role/attention, captured at quit and RE-SEEDED onto
-    /// the respawned session so restore keeps the operator-chosen identity
-    /// (the `title` above is the engine/OSC one — a different datum).
+    /// description/icon/role/attention, captured at quit (and at a seamless
+    /// update's park) and RE-SEEDED onto whichever session fills the leaf on
+    /// the way back — a respawned one, a re-adopted one, or the window's
+    /// already-running bootstrap when this leaf names it
+    /// (`App::graft_restored_user_meta`, which also leaves alone any field a
+    /// driver wrote on that live session first) — so restore keeps the
+    /// operator-chosen identity (the `title` above is the engine/OSC one — a
+    /// different datum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +104,20 @@ pub(crate) struct TerminalLeafRestore {
 }
 
 impl TerminalLeafRestore {
+    /// The five USER fields this leaf carries, as the values of the
+    /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured
+    /// from.
+    pub(crate) fn carried_user_meta(&self) -> crate::session_timeline::SessionMeta {
+        crate::session_timeline::SessionMeta {
+            user_title: self.user_title.clone(),
+            description: self.description.clone(),
+            icon: self.icon.clone(),
+            role: self.role.clone(),
+            attention: self.attention.clone(),
+            ..Default::default()
+        }
+    }
+
     /// Restore files survive across versions and are operator-writable. Normalize
     /// USER chrome fields before they can be re-seeded onto a live session; the
     /// control path's visible rejection cannot protect this persistence path.
@@ -409,6 +428,20 @@ impl RestoredSplitTree {
             }
     }
 
+    /// The first TERMINAL leaf in the order a rebuild walks this tree (first
+    /// branch before second) — see [`WindowLayout::bootstrap_local_id`].
+    pub(crate) fn first_terminal_leaf(&self) -> Option<&TerminalLeafRestore> {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Terminal(terminal),
+            } => Some(terminal),
+            Self::Leaf { .. } => None,
+            Self::Split { first, second, .. } => first
+                .first_terminal_leaf()
+                .or_else(|| second.first_terminal_leaf()),
+        }
+    }
+
     fn first_terminal_cwd(&self) -> Option<&str> {
         match self {
             Self::Leaf {
@@ -648,6 +681,24 @@ pub(crate) struct WindowLayout {
 }
 
 impl WindowLayout {
+    /// The handed-off shell id of the pane this window's BOOTSTRAP session
+    /// fills. The deferred restore grafts the session already running in the
+    /// window onto the first terminal leaf of the canonical tree, walked the
+    /// way it rebuilds it (tabs in order, each tree first branch before
+    /// second), so the shell adopted as that session must be the one that
+    /// leaf names — `main_entry` picks window 0's by this, and `apply_restore_manifest`
+    /// every further window's. The legacy `tabs` mirror is only a fallback for
+    /// a layout with no canonical terminal leaf: it lists all-terminal tabs
+    /// only, so it names a different shell whenever a tab split between a
+    /// native view and a terminal comes first.
+    pub(crate) fn bootstrap_local_id(&self) -> Option<u64> {
+        self.restored_tabs
+            .iter()
+            .find_map(|tab| tab.root.first_terminal_leaf())
+            .and_then(|leaf| leaf.local_id)
+            .or_else(|| self.tabs.first()?.leaves().first()?.local_id())
+    }
+
     /// Validated canonical order. Legacy terminal-only manifests synthesize the identity
     /// order. Duplicate/out-of-range indices fail closed rather than aliasing descriptors.
     pub(crate) fn canonical_order(&self) -> Option<Vec<TabOrderEntry>> {

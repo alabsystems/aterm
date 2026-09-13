@@ -145,6 +145,8 @@ pub fn backend_for_host() -> Result<Box<dyn Backend>, String> {
 /// Relocate a staged payload in place. Vendors every machine-local dependency
 /// (transitively) into `lib/atpkg-vendored/`, rewrites objects to reference them
 /// through a relative-origin rpath, deletes machine-local rpaths, and re-signs.
+/// A hard-link group (one inode under several names) is rewritten and signed once
+/// and its names are re-linked onto the result, so it leaves as one file.
 ///
 /// # Errors
 /// I/O, a missing relocation tool, or a rewrite failure. Unresolved machine-local
@@ -189,9 +191,33 @@ pub fn relocate_with(
     // pre-scan had just read. A staged sysroot holds hundreds to thousands of native
     // objects, so that was hundreds-to-thousands of redundant fork+exec cycles.
     let mut prescanned: BTreeMap<PathBuf, ObjectRefs> = BTreeMap::new();
+    // HARD-LINK GROUPS are relocated ONCE, never name by name. A sysroot carries one
+    // program under several names by inode — `bin/rustc` beside `bin/trustc` (tippy
+    // refuses any `rustc` that is not the selected `trustc`), `cargo` beside `targo`,
+    // librustc_driver in both `lib/` and `lib/rustlib/<triple>/lib/` — and the pack's
+    // strip pass keeps each group one signed file. But `install_name_tool` and
+    // `codesign` REPLACE the file they rewrite (a new inode; measured 2026-09-12), so
+    // rewriting each name in turn severed the group and signed every copy under its
+    // own file name: `rustc-<uuid>` beside `trustc-<uuid>`, one program as two files
+    // that differ inside their signatures — the pair tippy refuses. So the first name
+    // of a group (sorted order) is its one object here; the other names are left out of
+    // the queue and re-linked onto it once it has been rewritten and re-signed.
+    let mut group_first: BTreeMap<(u64, u64), PathBuf> = BTreeMap::new();
+    let mut aliases: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for rel in &files {
         let p = stage.join(rel);
         if backend.is_native_object(&p) {
+            if let Some(key) = hard_link_key(&p) {
+                match group_first.entry(key) {
+                    std::collections::btree_map::Entry::Occupied(first) => {
+                        aliases.entry(first.get().clone()).or_default().push(p);
+                        continue;
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(p.clone());
+                    }
+                }
+            }
             let refs = backend.read_refs(&p)?;
             for r in &refs.rpaths {
                 if is_machine_local(r) {
@@ -219,6 +245,8 @@ pub fn relocate_with(
             Some(refs) => refs,
             None => backend.read_refs(&obj)?,
         };
+        // The other names of this object's hard-link group (empty for most objects).
+        let group: &[PathBuf] = aliases.get(&obj).map_or(&[], Vec::as_slice);
         let mut changed = false;
 
         // 1. A machine-local install-id → the portable form.
@@ -272,7 +300,7 @@ pub fn relocate_with(
             .filter(|r| is_machine_local(r))
             .cloned()
             .collect();
-        let keep: Vec<String> = refs
+        let mut keep: Vec<String> = refs
             .rpaths
             .iter()
             .filter(|r| !is_machine_local(r))
@@ -285,21 +313,45 @@ pub fn relocate_with(
                     || is_shared_lib_basename(&basename(n))
             });
         if needs_vendor || !ml_rpaths.is_empty() {
-            let dir = obj.parent().unwrap_or(stage);
-            let rel = origin_relative(backend.origin_token(), dir, &vendored);
-            if let Err(e) = backend.fix_rpaths(&obj, &rel, &keep, &ml_rpaths) {
-                report.unresolved.push(format!(
-                    "{}: rpath rewrite failed: {e}",
-                    rel_display(stage, &obj)
-                ));
-            } else {
+            // One origin-relative rpath per DIRECTORY the object is reachable from. A
+            // group spanning directories (librustc_driver in `lib/` and in
+            // `lib/rustlib/<triple>/lib/`) is one set of bytes, so it carries the
+            // vendored dir as seen from each of them; a plain object has one directory
+            // and gets exactly the single rewrite it always got.
+            let mut dirs: Vec<&Path> = vec![obj.parent().unwrap_or(stage)];
+            for alias in group {
+                let d = alias.parent().unwrap_or(stage);
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+            let mut drop = ml_rpaths;
+            for (i, dir) in dirs.iter().enumerate() {
+                let rel = origin_relative(backend.origin_token(), dir, &vendored);
+                if i > 0 && keep.contains(&rel) {
+                    continue;
+                }
+                if let Err(e) = backend.fix_rpaths(&obj, &rel, &keep, &drop) {
+                    report.unresolved.push(format!(
+                        "{}: rpath rewrite failed: {e}",
+                        rel_display(stage, &obj)
+                    ));
+                    break;
+                }
                 changed = true;
+                // What this rewrite left behind is the next one's baseline: the rpath
+                // it added is now kept, and the machine-local ones are already gone.
+                if !keep.contains(&rel) {
+                    keep.push(rel);
+                }
+                drop.clear();
             }
         }
 
         if changed {
             backend.resign(&obj, sign_id)?;
             report.rewritten += 1;
+            relink_aliases(stage, &obj, group)?;
         }
     }
 
@@ -336,6 +388,50 @@ fn vendor_file(
     have.insert(base.to_string());
     report.vendored.push(base.to_string());
     Ok(true)
+}
+
+/// `(device, inode)` of a regular file that has more than one name, else `None`. Only
+/// such files can belong to a hard-link group; everything else is its own object.
+#[cfg(unix)]
+fn hard_link_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    (meta.is_file() && meta.nlink() > 1).then(|| (meta.dev(), meta.ino()))
+}
+
+/// No relocation backend exists off Unix, so there is no group to keep.
+#[cfg(not(unix))]
+fn hard_link_key(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Point every other name of `obj`'s hard-link group back at `obj`'s inode — the one
+/// the rewrite and the re-sign just produced. Each alias is linked to a hidden sibling
+/// and RENAMED over, so it is never absent: a failure leaves it on its old bytes, and
+/// the error names it (the pack's one-compiler gate would refuse that tree anyway).
+fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), String> {
+    for alias in aliases {
+        if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
+            continue; // the rewrite went through the inode: still one file
+        }
+        let name = alias
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = alias.with_file_name(format!(".{name}.atpkg-relink"));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::hard_link(obj, &tmp)
+            .and_then(|()| std::fs::rename(&tmp, alias))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!(
+                    "re-link {} onto the rewritten {}: {e}",
+                    rel_display(stage, alias),
+                    rel_display(stage, obj)
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn find_in_donors(base: &str, donors: &BTreeSet<PathBuf>) -> Option<PathBuf> {
@@ -851,5 +947,148 @@ mod tests {
         r.unresolved
             .push("bin/x: @rpath/libfoo.so not found".into());
         assert!(r.require_self_contained().is_err());
+    }
+
+    /// A backend that behaves like `install_name_tool` and `codesign` where it matters
+    /// here: every rewrite REPLACES the file (a sibling written, then renamed over — a
+    /// new inode), and the "signature" names the file it was written under, the way an
+    /// ad-hoc identifier is `<file name>-<uuid>`. Objects are the files starting `OBJ`;
+    /// each carries one machine-local rpath and no deps, so every object needs exactly
+    /// the rpath rewrite plus a re-sign, and nothing is vendored.
+    struct ReplacingBackend {
+        log: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl ReplacingBackend {
+        fn rewrite(&self, path: &Path, what: &str) -> Result<(), String> {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            self.log
+                .borrow_mut()
+                .push(format!("{what} {}", name.unwrap_or_default()));
+            let mut bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            bytes.extend_from_slice(format!("|{what}").as_bytes());
+            let tmp = path.with_extension("fake-rewrite");
+            std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        }
+    }
+
+    impl Backend for ReplacingBackend {
+        fn is_native_object(&self, path: &Path) -> bool {
+            std::fs::read(path).is_ok_and(|b| b.starts_with(b"OBJ"))
+        }
+        fn read_refs(&self, _path: &Path) -> Result<ObjectRefs, String> {
+            Ok(ObjectRefs {
+                id: None,
+                needed: Vec::new(),
+                rpaths: vec!["/Users//builder/.rustup/lib".to_string()],
+            })
+        }
+        fn set_id_portable(&self, _path: &Path, _basename: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn repoint_dep(&self, _path: &Path, _from: &str, _basename: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn fix_rpaths(
+            &self,
+            path: &Path,
+            rel_origin: &str,
+            _keep: &[String],
+            _drop: &[String],
+        ) -> Result<(), String> {
+            self.rewrite(path, &format!("rpath={rel_origin}"))
+        }
+        fn resign(&self, path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            self.rewrite(path, &format!("sig={}", name.unwrap_or_default()))
+        }
+        fn portable_dep_ref(&self, basename: &str) -> String {
+            format!("@rpath/{basename}")
+        }
+        fn origin_token(&self) -> &'static str {
+            "@loader_path"
+        }
+    }
+
+    /// A hard-link group leaves relocation as ONE file: rewritten and signed once, under
+    /// its first name, with the other names re-linked onto the result. Relocating name
+    /// by name — what this pass did — severed the group, because the real tools replace
+    /// the file they rewrite, and signed each copy under its own name: `bin/rustc` and
+    /// `bin/trustc` came out as one program in two files that differ inside their
+    /// signatures, the pair tippy refuses ("rustc-compatible sibling … is not the
+    /// selected Trust compiler"). A group spanning directories gets the vendored-dir
+    /// rpath as seen from each directory, because it is one set of bytes in both.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_group_is_relocated_once_and_stays_one_file() {
+        use std::os::unix::fs::MetadataExt;
+        let stage =
+            std::env::temp_dir().join(format!("atpkg-reloc-hardlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        std::fs::create_dir_all(stage.join("bin")).unwrap();
+        std::fs::create_dir_all(stage.join("lib/rustlib/t/lib")).unwrap();
+        std::fs::write(stage.join("bin/rustc"), b"OBJ compiler").unwrap();
+        std::fs::hard_link(stage.join("bin/rustc"), stage.join("bin/trustc")).unwrap();
+        std::fs::write(stage.join("lib/libdriver.dylib"), b"OBJ driver").unwrap();
+        std::fs::hard_link(
+            stage.join("lib/libdriver.dylib"),
+            stage.join("lib/rustlib/t/lib/libdriver.dylib"),
+        )
+        .unwrap();
+        std::fs::write(stage.join("bin/solo"), b"OBJ solo").unwrap();
+
+        let backend = ReplacingBackend {
+            log: std::cell::RefCell::default(),
+        };
+        let report = relocate_with(&stage, &backend, None).unwrap();
+        assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+        assert_eq!(report.rewritten, 3, "one rewrite per object, not per name");
+
+        let ino = |rel: &str| std::fs::metadata(stage.join(rel)).unwrap().ino();
+        let text = |rel: &str| std::fs::read_to_string(stage.join(rel)).unwrap();
+        assert_eq!(
+            ino("bin/rustc"),
+            ino("bin/trustc"),
+            "bin/rustc must still be bin/trustc"
+        );
+        assert_eq!(
+            text("bin/trustc"),
+            "OBJ compiler|rpath=@loader_path/../lib/atpkg-vendored|sig=rustc"
+        );
+        assert_eq!(
+            ino("lib/libdriver.dylib"),
+            ino("lib/rustlib/t/lib/libdriver.dylib"),
+            "the dylib must not ship twice"
+        );
+        assert_eq!(
+            text("lib/rustlib/t/lib/libdriver.dylib"),
+            "OBJ driver|rpath=@loader_path/atpkg-vendored\
+             |rpath=@loader_path/../../../atpkg-vendored|sig=libdriver.dylib"
+        );
+        assert_eq!(
+            text("bin/solo"),
+            "OBJ solo|rpath=@loader_path/../lib/atpkg-vendored|sig=solo"
+        );
+        let log = backend.log.borrow();
+        assert_eq!(
+            log.iter().filter(|l| l.starts_with("sig=")).count(),
+            3,
+            "{log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("sig=trustc")),
+            "trustc must not be signed under its own name: {log:?}"
+        );
+        let leftovers: Vec<PathBuf> = walk_files(&stage)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.to_string_lossy().contains("atpkg-relink"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "re-link scratch left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&stage);
     }
 }

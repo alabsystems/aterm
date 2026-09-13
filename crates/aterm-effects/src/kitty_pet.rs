@@ -3386,7 +3386,17 @@ impl PetBrain {
     /// either side, it parks flush left and the clamp does the rest.
     #[must_use]
     pub fn station(caret_col: u16, cols: u16, width: f32) -> f32 {
-        let right = f32::from(caret_col) + STATION_LEAD;
+        Self::station_with(caret_col, cols, width, 0.0)
+    }
+
+    /// [`Self::station`] with `extra` cells folded into the lead — the far
+    /// stand of a controller lease ([`Self::standoff`]) — so the wall
+    /// crossing is decided about the stand the cat will actually take. The
+    /// console resident's caret home reads this: a hand that has PARKED
+    /// earns no keep-ahead lead, and the wall hysteresis is the chase's own
+    /// state, so the lead-free law is the one both arms can agree on.
+    fn station_with(caret_col: u16, cols: u16, width: f32, extra: f32) -> f32 {
+        let right = f32::from(caret_col) + STATION_LEAD + extra;
         let limit = f32::from(cols) - width;
         if limit <= 0.0 {
             return 0.0;
@@ -3395,7 +3405,7 @@ impl PetBrain {
             return right;
         }
         // The wall: stand on the other side of the caret, one clear cell back.
-        (f32::from(caret_col) - width - STATION_LEAD).max(0.0)
+        (f32::from(caret_col) - width - STATION_LEAD - extra).max(0.0)
     }
 
     /// The rhythm gate is open: a real same-direction typing run is under way,
@@ -4430,6 +4440,17 @@ impl PetBrain {
         // other moving body, while `clock` above keeps taking the full
         // elapsed for the quiet and animation clocks (the doctrine above).
         self.lane_clock += f64::from(dt);
+        // THE ARRIVAL RAMP IS A CLOCK, NOT A BRANCH. It used to be decayed
+        // further down, past the console arms' early return — so a tick the
+        // console resident owned (a selection, a command's output anchor, a
+        // protected displacement) emitted `alpha × arrival` with `arrive_t`
+        // frozen wherever the handoff left it. Measured on glass (0.83.0,
+        // a look swap landing while a command's output held the resident):
+        // the incoming cat sat at 27 % opacity for 660 ms and 15 presented
+        // frames, then ramped only once the prompt came back — the owner's
+        // "flashing". A ramp that is running must run on every tick, whoever
+        // owns the body this frame.
+        self.arrive_t = (self.arrive_t - dt).max(0.0);
 
         let width = art_cols(sense.cell_w, sense.cell_h);
         self.begin_console_tick(sense, width);
@@ -4660,13 +4681,27 @@ impl PetBrain {
             // steal the arc that custody needs.
             // …and the pose a re-anchor hop owed back: no audience, no debt.
             self.resume = None;
-            // A hidden caret retires the handoff outright: the park landed
-            // (or will land) at zero alpha above, and departing bodies are
-            // dropped, not parked — no audience, no theater (the wave-1
-            // rule), and nothing left to pin `needs_frames` on a hidden cat.
-            self.departures = [None; PET_DEPARTURES_MAX];
+            // A hidden caret retires the handoff's PARK outright: it landed
+            // (or will land) at zero alpha above, no audience, no theater
+            // (the wave-1 rule). A crossfade ALREADY ON GLASS is another
+            // matter: this used to drop every departing body and snap the
+            // arrival to full on the first hidden tick — the ghost gone and
+            // the arriver at 100 % in one frame — while the body itself was
+            // still there, fading over FADE_OUT. That is a one-frame
+            // recolour mid-fade, the cut the arrival exists to remove, and
+            // the third of three places (with the console resident's two)
+            // that hid one half of a crossfade without the other. Both
+            // halves now ride the lane byte down together — the ghost as
+            // `d.alpha × lane_alpha`, the arriver as its ramp × the same
+            // fade — and the lane is emptied only once the body is at zero,
+            // which is also what keeps a hidden cat from owing frames: a
+            // departure is finite by construction, but nothing invisible
+            // may pin `needs_frames` at all.
+            if self.alpha == 0.0 {
+                self.departures = [None; PET_DEPARTURES_MAX];
+                self.arrive_t = 0.0;
+            }
             self.handoff_parked_clock = None;
-            self.arrive_t = 0.0;
             // Micro-life sleeps with the audience gone.
             self.twitch_t = 0.0;
             self.last_burst = false;
@@ -5141,7 +5176,6 @@ impl PetBrain {
         // the prologue): "one vignette per [`BORED_COOL`]" counts seconds
         // the user sat there, not ticks the lane happened to run.
         self.bored_cool = (self.bored_cool - elapsed).max(0.0);
-        self.arrive_t = (self.arrive_t - dt).max(0.0);
         if burst_edge
             && self.twitch_t <= 0.0
             && self.watch_heat < WATCH_GATE
@@ -16814,6 +16848,81 @@ mod tests {
         assert!(
             ghost_frames >= want - 2 && ghost_frames <= want + 2,
             "the still ghost held for the whole 0.25 s ({ghost_frames} frames)"
+        );
+    }
+
+    /// THE CROSSFADE FADES WITH THE BODY WHEN THE CARET GOES AWAY. The
+    /// no-caret arm used to drop every departing body and snap the arrival
+    /// to full on its first tick — the ghost gone and the arriver at 100 %
+    /// in one frame — while the body itself was still on glass, fading over
+    /// FADE_OUT: a one-frame recolour mid-fade, the cut the arrival exists
+    /// to remove. Both halves now ride the lane byte down together, and the
+    /// lane is emptied only once the body is at zero.
+    #[test]
+    fn a_hidden_caret_fades_the_crossfade_with_the_body_instead_of_cutting_it() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 48);
+        assert_eq!(
+            pet.sync_look((3, 1), PetArrival::Ceremony).worn,
+            (3, 1),
+            "the first dress applies"
+        );
+        let (mut t, _) = idle(&mut pet, t, (4, 50), 0.2);
+        assert_eq!(
+            pet.sync_look((9, 4), PetArrival::Quiet).worn,
+            (3, 1),
+            "fixture: the homecoming parks"
+        );
+        let mut born_life = None;
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 50))));
+            if pet.sync_look((9, 4), PetArrival::Quiet).worn == (9, 4) {
+                assert_eq!(f.alpha, (ARRIVE_FLOOR * 255.0) as u8);
+                born_life = pet.departures[0].map(|d| (d.born, d.life()));
+                break;
+            }
+        }
+        let (born, life) = born_life.expect("the debounced park landed with its ghost");
+        // The caret goes away on the very next tick: the body fades over
+        // FADE_OUT (0.45 s), longer than the ghost's whole EDGE_FADE life.
+        let mut prev_lane = 255u8;
+        let mut ticks = 0u32;
+        loop {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, None));
+            ticks += 1;
+            if f.lane_alpha == 0 {
+                break;
+            }
+            assert!(f.lane_alpha <= prev_lane, "the lane only fades down");
+            prev_lane = f.lane_alpha;
+            let age = (pet.lane_clock - born) as f32;
+            if age < life - 0.02 {
+                let g = f.departures[0].unwrap_or_else(|| {
+                    panic!(
+                        "tick {ticks}: the ghost (age {age:.3} of {life:.3} s) was dropped while \
+                         the body is still on glass at lane {}",
+                        f.lane_alpha
+                    )
+                });
+                assert!(g.alpha > 0, "a live ghost has a byte");
+            }
+            if ticks <= 12 {
+                assert!(
+                    pet.arrive_t > 0.0 && f.alpha < f.lane_alpha,
+                    "tick {ticks}: the arrival ramp was snapped to full ({} of lane {}) under a \
+                     fading body",
+                    f.alpha,
+                    f.lane_alpha
+                );
+            }
+            assert!(ticks < 60, "FADE_OUT is 0.45 s");
+        }
+        assert!(
+            pet.departures.iter().all(Option::is_none) && pet.arrive_t == 0.0,
+            "the lane is emptied and the ramp retired once the body is at zero"
         );
     }
 

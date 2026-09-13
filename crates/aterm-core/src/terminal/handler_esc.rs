@@ -479,7 +479,12 @@ impl TerminalHandler<'_> {
         // may hold stale resolutions from pre-reset content (#7488).
         self.invalidate_bidi_all();
 
-        // Signal the parser to reset after advance_fast completes (#7153).
+        // Hand the processing loop the RIS side effects this handler cannot
+        // reach — clearing secure keyboard entry and the parked selection —
+        // which it applies once advance_fast returns (#7153). The flag's name
+        // is historical: the parser itself is NOT reset (ESC c already left it
+        // in Ground; a reset after the whole chunk dropped any sequence left
+        // unfinished at its end, audit K6).
         // Must be set AFTER reset_common_fields (which calls transient.reset()
         // and would clear the flag if set beforehand).
         self.transient.pending_parser_reset = true;

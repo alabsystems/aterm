@@ -3516,6 +3516,10 @@ pub(crate) fn atpkg_child_path() -> String {
 /// rc file that blocks (a `read`, an `ssh-add` prompt) must not stall provisioning.
 const LOGIN_PATH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long [`login_shell_path`] keeps collecting after the shell has answered: the
+/// PATH line is already in the pipe then, so this only covers the reader's hop.
+const LOGIN_PATH_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// The user's login-shell `PATH`, or `None` when the shell did not answer in time /
 /// printed nothing that looks like one.
 fn login_shell_path() -> Option<String> {
@@ -3528,23 +3532,76 @@ fn login_shell_path() -> Option<String> {
             )
         })
         .unwrap_or_else(|| "/bin/zsh".to_string());
-    let mut child = std::process::Command::new(&shell)
-        .args(["-l", "-i", "-c", "printf '%s\\n' \"$PATH\""])
+    login_shell_path_with(
+        &shell,
+        &["-l", "-i", "-c", "printf '%s\\n' \"$PATH\""],
+        LOGIN_PATH_BUDGET,
+    )
+}
+
+/// [`login_shell_path`]'s body over an explicit program, argv and budget, so the
+/// budget is testable against a plain `/bin/sh`.
+fn login_shell_path_with(
+    program: &str,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // Its own SESSION, so a timeout kills what the rc file is blocked in (a
+    // `sleep`, a password helper) along with the shell: those grandchildren hold
+    // the stdout pipe too, and a session leader's pid is also its group's id, so
+    // `killpg(child.id())` below reaches them. A session and not just a group
+    // (2026-09-12): when this GUI has a controlling terminal and sits in its
+    // foreground (`aterm --window` typed at a shell, `targo run`), `zsh -i` in a
+    // mere background group opens `/dev/tty`, tries to take the foreground, takes
+    // SIGTTOU and sits STOPPED until the budget runs out. A new session has no
+    // controlling tty at all, so there is nothing for the shell to take.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: the pre-exec hook calls only `setsid`, which is
+        // async-signal-safe, and allocates nothing.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     // Drain on a helper so a chatty rc file cannot fill the pipe and wedge the
-    // child against the poll below (the two-pipe rule, one pipe over).
-    let reader = std::thread::spawn(move || {
+    // child against the poll below (the two-pipe rule, one pipe over). The helper
+    // STREAMS what it reads and is never joined (2026-09-12): its read reaches EOF
+    // only when every holder of the pipe's write end has closed it, and an rc
+    // file's background job can hold it for as long as it lives — joining a
+    // read-to-EOF reader held `atpkg seed` and every update pass that long.
+    let (chunks_tx, chunks) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         use std::io::Read as _;
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if chunks_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
     });
-    let deadline = std::time::Instant::now() + LOGIN_PATH_BUDGET;
+    let deadline = std::time::Instant::now() + budget;
     let answered = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -3552,17 +3609,41 @@ fn login_shell_path() -> Option<String> {
                 std::thread::sleep(std::time::Duration::from_millis(25));
             }
             _ => {
+                // The whole group (the session leader's pid is its group id),
+                // BEFORE the leader is reaped (its pid names the group until then).
+                #[cfg(unix)]
+                if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                    unsafe { libc::killpg(group, libc::SIGKILL) };
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break false;
             }
         }
     };
-    let text = reader.join().ok()?;
     if !answered {
         return None;
     }
-    pick_login_path(&text)
+    // The shell exited 0, so its PATH line is already in the pipe. Collect to EOF,
+    // but no further than the budget plus a short grace — and once a PATH line is
+    // in hand, only until the pipe goes quiet for that grace: a background job the
+    // rc file started with stdout inherited keeps the pipe open, and it is the
+    // user's own daemon, so it is left running rather than killed.
+    let hard_stop = deadline.max(std::time::Instant::now()) + LOGIN_PATH_GRACE;
+    let mut output = Vec::new();
+    loop {
+        let remaining = hard_stop.saturating_duration_since(std::time::Instant::now());
+        let wait = if pick_login_path(&String::from_utf8_lossy(&output)).is_some() {
+            LOGIN_PATH_GRACE.min(remaining)
+        } else {
+            remaining
+        };
+        match chunks.recv_timeout(wait) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    pick_login_path(&String::from_utf8(output).ok()?)
 }
 
 /// The PATH line out of a login shell's output: the LAST non-empty line that starts
@@ -3694,6 +3775,180 @@ mod reroute_path_env_tests {
         assert_eq!(
             fallback_child_path(None, Some(home)),
             path(&["/Users//u/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"])
+        );
+    }
+
+    /// THE BUDGET BOUNDS THE WAIT, NOT JUST THE SHELL (2026-09-12). An rc file
+    /// blocked in an EXTERNAL command (`sleep`, a password helper) leaves that
+    /// grandchild holding the stdout pipe after the shell is killed; joining a
+    /// read-to-EOF reader then waited for the grandchild, holding back `atpkg
+    /// seed` and every update pass for as long as it lived.
+    #[test]
+    #[cfg(unix)]
+    fn login_path_budget_bounds_a_grandchild_holding_stdout() {
+        let started = std::time::Instant::now();
+        let path = super::login_shell_path_with(
+            "/bin/sh",
+            &["-c", "sleep 8; printf '/a:/b\\n'"],
+            std::time::Duration::from_millis(300),
+        );
+        assert_eq!(path, None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "blocked {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// …and an rc file that backgrounds a job without redirecting its stdout
+    /// (`somedaemon &`) must not hold the answer hostage once the shell has
+    /// printed its PATH and exited.
+    #[test]
+    #[cfg(unix)]
+    fn login_path_returns_despite_a_backgrounded_rc_job() {
+        let started = std::time::Instant::now();
+        let path = super::login_shell_path_with(
+            "/bin/sh",
+            &["-c", "sleep 8 & printf '/a:/b\\n'"],
+            std::time::Duration::from_secs(2),
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "blocked {:?}",
+            started.elapsed()
+        );
+        assert_eq!(path.as_deref(), Some("/a:/b"));
+    }
+
+    /// A GUI WITH A FOREGROUND CONTROLLING TERMINAL (`aterm --window` typed at a
+    /// shell, `targo run`) must still get its answer (2026-09-12). The lookup's
+    /// shell once ran in its own process GROUP on that tty: `zsh -i` opens
+    /// `/dev/tty`, tries to take the foreground, takes SIGTTOU, sits STOPPED, and
+    /// every launch burned the whole budget and fell back to the wrong PATH.
+    ///
+    /// The lookup runs in a re-exec of this test binary under `forkpty`, so it has
+    /// a controlling tty in the foreground, and the tty stays out of the
+    /// parallel test process.
+    #[test]
+    #[cfg(unix)]
+    fn login_path_answers_under_a_foreground_controlling_tty() {
+        use std::os::unix::ffi::OsStrExt as _;
+        const CHILD: &str = "ATERM_TEST_LOGIN_PATH_UNDER_A_PTY";
+        const ZSH: &str = "/bin/zsh";
+        if std::env::var_os(CHILD).is_some() {
+            let started = std::time::Instant::now();
+            let path = super::login_shell_path_with(
+                ZSH,
+                &["-f", "-i", "-c", "printf '/a:/b\\n'"],
+                std::time::Duration::from_secs(2),
+            );
+            let elapsed = started.elapsed();
+            assert_eq!(path.as_deref(), Some("/a:/b"), "after {elapsed:?}");
+            assert!(
+                elapsed < std::time::Duration::from_secs(1),
+                "took {elapsed:?}"
+            );
+            return;
+        }
+        if !std::path::Path::new(ZSH).exists() {
+            eprintln!("skipped: no {ZSH} on this host");
+            return;
+        }
+        let name = format!(
+            "{}::login_path_answers_under_a_foreground_controlling_tty",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let cstring = |bytes: &[u8]| std::ffi::CString::new(bytes).expect("no NUL");
+        let exe = cstring(
+            std::env::current_exe()
+                .expect("test binary")
+                .as_os_str()
+                .as_bytes(),
+        );
+        let argv_owned = [
+            exe.clone(),
+            cstring(b"--exact"),
+            cstring(name.as_bytes()),
+            cstring(b"--nocapture"),
+            cstring(b"--test-threads=1"),
+        ];
+        let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let mut env_owned: Vec<std::ffi::CString> = std::env::vars_os()
+            .filter(|(key, _)| key != CHILD)
+            .map(|(key, value)| {
+                let mut entry = key.as_bytes().to_vec();
+                entry.push(b'=');
+                entry.extend_from_slice(value.as_bytes());
+                cstring(&entry)
+            })
+            .collect();
+        env_owned.push(cstring(format!("{CHILD}=1").as_bytes()));
+        let mut envp: Vec<*const libc::c_char> = env_owned.iter().map(|e| e.as_ptr()).collect();
+        envp.push(std::ptr::null());
+
+        let mut master: libc::c_int = -1;
+        // SAFETY: the child calls only execve and _exit (async-signal-safe) on
+        // argv/envp built before the fork.
+        let pid = unsafe {
+            libc::forkpty(
+                &mut master,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(pid >= 0, "forkpty: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::execve(exe.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                libc::_exit(127);
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut output = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                break;
+            }
+            let mut fd = libc::pollfd {
+                fd: master,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+            let ready = unsafe { libc::poll(&mut fd, 1, ms) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if ready == 0 {
+                continue;
+            }
+            let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break; // EOF / EIO: every holder of the slave is gone
+            }
+            output.extend_from_slice(&buf[..n as usize]);
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+            libc::close(master);
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "the lookup under a controlling tty failed (status {status:#x}):\n{output}"
+        );
+        assert!(
+            output.contains("1 passed"),
+            "the re-exec ran no test:\n{output}"
         );
     }
 

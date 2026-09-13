@@ -28,6 +28,9 @@ use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};
 /// without bound; once the cap is hit, new ids are dropped.
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
 
+/// Pending-map key shared by every OSC 99 chunk without an `i=` id.
+const ANON_NOTIFICATION_KEY: &str = "\u{0}anon";
+
 /// Maximum byte length accepted for any single notification field (title or
 /// body). Longer payloads are truncated at a UTF-8 boundary. Desktop
 /// notification surfaces are small; an unbounded title is a memory/DoS vector.
@@ -88,9 +91,10 @@ impl TerminalHandler<'_> {
     /// - `u=<n>`    urgency: 0=low, 1=normal (default), 2=critical
     /// - `d=<0|1>`  done flag: `d=0` = more chunks follow, `d=1`/absent = final
     ///
-    /// Multi-part notifications sharing an `i=<id>` are accumulated until the
-    /// final chunk (`d=1` or no `d`), then dispatched to the advanced
-    /// notification callback registered via
+    /// Multi-part notifications sharing an `i=<id>` (chunks without one share a
+    /// single default id) are accumulated — same-kind text concatenated, capped at
+    /// [`MAX_NOTIFICATION_FIELD_BYTES`] — until the final chunk (`d=1` or no `d`),
+    /// then dispatched to the advanced notification callback registered via
     /// [`Terminal::set_advanced_notification_callback`][cb].
     ///
     /// Gated by host notification authorization (see module docs).
@@ -139,40 +143,26 @@ impl TerminalHandler<'_> {
 
         let text = sanitize_notification(&payload);
 
-        // Build/update the accumulator entry for this notification.
-        let key = id.clone().unwrap_or_else(|| {
-            // Anonymous notifications get a unique synthetic key so concurrent
-            // anonymous notifications don't clobber each other.
-            let n = self.notifications.anon_counter;
-            self.notifications.anon_counter = n.wrapping_add(1);
-            format!("\u{0}anon-{n}")
-        });
+        // Build/update the accumulator entry for this notification. Every id-less
+        // chunk shares ONE key, as kitty treats a missing `i` as one default id.
+        // A fresh `\0anon-N` key per chunk (to 2026-09-12) meant an id-less `d=0`
+        // chunk could never be completed, so 64 of them filled the map for good.
+        let key = id
+            .clone()
+            .unwrap_or_else(|| ANON_NOTIFICATION_KEY.to_string());
 
-        let entry = if let Some(existing) = self.notifications.pending.remove(&key) {
-            existing
-        } else if self.notifications.pending.len() >= MAX_PENDING_NOTIFICATIONS {
-            // Pending map is full — drop rather than grow unbounded.
-            return;
-        } else {
-            Notification {
+        let mut entry = self
+            .notifications
+            .pending
+            .remove(&key)
+            .unwrap_or_else(|| Notification {
                 id: id.clone(),
                 ..Notification::default()
-            }
-        };
-
-        let mut entry = entry;
+            });
         entry.urgency = urgency;
         match payload_kind {
-            Osc99Payload::Title => {
-                if !text.is_empty() {
-                    entry.title = Some(text);
-                }
-            }
-            Osc99Payload::Body => {
-                if !text.is_empty() {
-                    entry.body = Some(text);
-                }
-            }
+            Osc99Payload::Title => append_notification_field(&mut entry.title, &text),
+            Osc99Payload::Body => append_notification_field(&mut entry.body, &text),
         }
 
         if done {
@@ -181,10 +171,14 @@ impl TerminalHandler<'_> {
                     callback(entry);
                 }
             }
-        } else {
-            // More chunks expected — re-insert for accumulation.
+        } else if self.notifications.pending.len() < MAX_PENDING_NOTIFICATIONS {
+            // More chunks expected — re-insert for accumulation. The cap is checked
+            // HERE, after this key's own entry was removed: a continuing id always
+            // has room, and a final chunk is never refused by it.
             self.notifications.pending.insert(key, entry);
         }
+        // Otherwise the map is full of other in-flight ids — drop this non-final
+        // chunk rather than grow unbounded.
     }
 
     /// Handle OSC 777 — rxvt-unicode `notify` notification.
@@ -269,6 +263,18 @@ fn parse_conemu_taskbar_progress(message: &str) -> Option<TaskbarProgress> {
         "4" => TaskbarProgress::Paused(value.unwrap_or(0)),
         _ => return None,
     })
+}
+
+/// Append one OSC 99 chunk's sanitized text to a title/body field, keeping the
+/// field within [`MAX_NOTIFICATION_FIELD_BYTES`] (cut at a UTF-8 boundary). Empty
+/// text leaves the field untouched.
+fn append_notification_field(field: &mut Option<String>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let value = field.get_or_insert_with(String::new);
+    let room = MAX_NOTIFICATION_FIELD_BYTES.saturating_sub(value.len());
+    value.push_str(&text[..text.floor_char_boundary(room)]);
 }
 
 fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
@@ -478,6 +484,96 @@ mod tests {
         assert_eq!(got.id.as_deref(), Some("42"));
         assert_eq!(got.title.as_deref(), Some("My Title"));
         assert_eq!(got.body.as_deref(), Some("My Body"));
+    }
+
+    fn capture_all(term: &mut Terminal) -> Arc<Mutex<Vec<Notification>>> {
+        let captured = Arc::new(Mutex::new(Vec::<Notification>::new()));
+        let captured_clone = Arc::clone(&captured);
+        term.set_advanced_notification_callback(move |n| {
+            captured_clone.lock().expect("poisoned").push(n);
+        });
+        term.authorize_notifications();
+        captured
+    }
+
+    /// Id-less `d=0` chunks used to take a fresh key each, so none could ever be
+    /// completed, and once 64 sat in the pending map the capacity check (which ran
+    /// before the `done` check) rejected every later OSC 99 until a full reset.
+    /// They now share one default id: the flood stays one pending entry, the next
+    /// id-less final chunk completes it, and a fresh id is never refused.
+    #[test]
+    fn osc_99_anonymous_nonfinal_chunks_do_not_starve_final_notifications() {
+        let mut term = Terminal::new(24, 80);
+        let captured = capture_all(&mut term);
+        let last_title = |c: &Arc<Mutex<Vec<Notification>>>| {
+            c.lock()
+                .expect("poisoned")
+                .last()
+                .and_then(|n| n.title.clone())
+        };
+
+        for _ in 0..200 {
+            term.process(b"\x1b]99;d=0;x\x07");
+        }
+        assert!(term.notifications.pending.len() <= 1);
+        term.process(b"\x1b]99;i=build;Build finished\x07");
+        assert_eq!(
+            last_title(&captured).as_deref(),
+            Some("Build finished"),
+            "id-less non-final chunks must not fill the pending map"
+        );
+        term.process(b"\x1b]99;;tail\x07");
+        assert!(
+            last_title(&captured).is_some_and(|t| t.ends_with("tail")),
+            "an id-less final chunk completes the id-less notification"
+        );
+        assert!(term.notifications.pending.is_empty());
+
+        // A full map of distinct in-flight ids must not reject a FINAL chunk.
+        for i in 0..MAX_PENDING_NOTIFICATIONS {
+            term.process(format!("\x1b]99;i={i}:d=0;t\x07").as_bytes());
+        }
+        term.process(b"\x1b]99;i=other;Done\x07");
+        assert_eq!(
+            last_title(&captured).as_deref(),
+            Some("Done"),
+            "a final chunk must never be rejected by the pending-map cap"
+        );
+    }
+
+    /// Same-kind chunks are CONCATENATED (the doc's "accumulated"), not replaced.
+    #[test]
+    fn osc_99_same_kind_chunks_concatenate() {
+        let mut term = Terminal::new(24, 80);
+        let captured = capture_all(&mut term);
+
+        term.process(b"\x1b]99;i=1:d=0;Hello \x07");
+        term.process(b"\x1b]99;i=1;world\x07");
+        term.process(b"\x1b]99;i=2:p=body:d=0;a\x07");
+        term.process(b"\x1b]99;i=2:p=body;b\x07");
+
+        let got = captured.lock().expect("poisoned").clone();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].title.as_deref(), Some("Hello world"));
+        assert_eq!(got[1].body.as_deref(), Some("ab"));
+    }
+
+    /// Concatenation stays bounded by the per-field cap, cut at a char boundary.
+    #[test]
+    fn osc_99_concatenated_field_is_capped() {
+        let mut term = Terminal::new(24, 80);
+        let captured = capture_all(&mut term);
+
+        let chunk = "\u{00e9}".repeat(1500); // 3000 bytes
+        for _ in 0..3 {
+            term.process(format!("\x1b]99;i=big:d=0;{chunk}\x07").as_bytes());
+        }
+        term.process(b"\x1b]99;i=big;end\x07");
+
+        let got = captured.lock().expect("poisoned").clone();
+        let title = got[0].title.as_deref().expect("title");
+        assert!(title.len() <= MAX_NOTIFICATION_FIELD_BYTES);
+        assert_eq!(title.len(), MAX_NOTIFICATION_FIELD_BYTES);
     }
 
     #[test]

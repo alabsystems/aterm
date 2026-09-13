@@ -572,24 +572,28 @@ pub fn install_shim_to_env(
     target: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
-    // An EXEC STUB, not a symlink. See `platform::sh_shim_content` for why: Trust's
-    // `targo` refuses to authenticate when its own `current_exe` is a symlink or a
-    // non-canonical path, so a symlinked shim made the product's headline tool fail
-    // on 100% of successful installs. `exec` hands the process image to the real
-    // binary at its real path, which also keeps its sysroot siblings resolvable.
-    //
-    // Written temp+rename so the swap stays atomic exactly as `atomic_symlink` was:
-    // a shim on the user's PATH is never briefly absent or half-written.
-    let body = super::sh_shim_content_env(target, env);
-    let tmp = shim.with_extension("atpkg-new");
-    let _ = std::fs::remove_file(&tmp);
-    {
-        let mut f = open_create_write(&tmp, 0o755)?;
-        use std::io::Write as _;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, shim)
+    let file = shim_executable_to_env(shim, target, env)?;
+    crate::lay::lay_executables(&[file])
+}
+
+/// The shim [`install_shim_to_env`] lays, RENDERED but not written: an EXEC STUB, not a
+/// symlink — see `platform::sh_shim_content` for why (Trust's `targo` refuses to
+/// authenticate when its own `current_exe` is a symlink or a non-canonical path, so a
+/// symlinked shim made the product's headline tool fail on 100% of successful installs;
+/// `exec` hands the process image to the real binary at its real path, which also keeps
+/// its sysroot siblings resolvable). Written by [`crate::lay`] — temp+rename, `0755`,
+/// in-process or through the untracked launchd job when this process is
+/// provenance-tracked — so a shim on the user's PATH is never briefly absent, never
+/// half-written, and never a tagged script that tracks the tool it execs.
+pub fn shim_executable_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<crate::lay::Executable> {
+    Ok(crate::lay::Executable::new(
+        shim,
+        super::sh_shim_content_env(target, env),
+    ))
 }
 
 /// Wrap `s` in single quotes for safe embedding in a `/bin/sh` script, escaping any embedded
@@ -621,27 +625,12 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
     script.push_str(&sh_single_quote(message));
     script.push_str(" 1>&2\nexit 70\n");
 
-    // Atomic install: write a sibling temp, make it executable, then `rename(2)` over `shim`.
-    // `rename` is atomic on POSIX and replaces the destination regardless of its prior type
-    // (symlink or regular file), so the live shim flips to the tombstone with no torn window.
-    let file_name = match crate::call1(std::path::Path::file_name, shim) {
-        Some(name) => crate::call1(std::ffi::OsStr::to_str, name),
-        None => None,
-    }
-    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "shim has no file name"))?;
-    let mut tmp_name = String::from(".");
-    tmp_name.push_str(file_name);
-    tmp_name.push_str(".tomb-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = shim.with_file_name(tmp_name);
-    let _ = fs::remove_file(&tmp);
-    crate::call2(std::fs::write, tmp.as_path(), script.as_bytes())?;
-    fs::set_permissions(&tmp, Permissions::from_mode(0o755))?;
-    if let Err(e) = fs::rename(&tmp, shim) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    // Atomic install through the one executable writer (`crate::lay`): a sibling temp,
+    // `0755`, then `rename(2)` over `shim` — atomic on POSIX and replacing the
+    // destination regardless of its prior type (symlink or regular file), so the live
+    // shim flips to the tombstone with no torn window; and through the untracked launchd
+    // job when this process is provenance-tracked, like every other shim.
+    crate::lay::lay_executable(shim, script.as_bytes())
 }
 
 /// Resolve the store/checkout target a `bin/<tool>` shim points at, or `None` if there is

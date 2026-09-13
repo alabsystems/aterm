@@ -17,7 +17,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use aterm_verify::cli::{self, USAGE};
+use aterm_verify::cli;
 use aterm_verify::ladder::Report;
 use aterm_verify::{Ctx, EnvSnapshot, Scope, Toolchain, changed, exit};
 
@@ -27,12 +27,12 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{}", e.message());
-            print!("{USAGE}");
+            print!("{}", cli::usage());
             std::process::exit(exit::USAGE);
         }
     };
     if parsed.help {
-        print!("{USAGE}");
+        print!("{}", cli::usage());
         std::process::exit(0);
     }
 

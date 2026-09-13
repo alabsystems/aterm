@@ -5017,16 +5017,7 @@ fn serve_request_line(
         return None;
     }
     if binary_frame_verb(&line) == Some("operator-propose-bin") {
-        if !run_operator_proposal_bin(
-            &line,
-            reader,
-            scope,
-            active,
-            operator,
-            store,
-            subscribers,
-            writer,
-        ) {
+        if !run_operator_proposal_bin(&line, reader, scope, operator, store, subscribers, writer) {
             return Some(ServeDisposition::Close);
         }
         return None;
@@ -5798,6 +5789,22 @@ fn run_operator_proposal(
         Ok(proposal) => proposal,
         Err(error) => return format!("ERR {error}\n"),
     };
+    // `operator-propose-bin` is on the §5.3 halted list: it pastes and presses
+    // Enter into the session its body NAMES, so that session's hold is the one to
+    // obey. Until 2026-09-12 the frame asked the front tab instead, and a held
+    // session was driven whenever an unheld (or native) tab was in front. Asked
+    // before any durable step — a claim never makes a held session drivable.
+    let halted = {
+        let guard = store
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .by_sid(&SessionId::new(&proposal.sid))
+            .and_then(|target| crate::fabric::halt_refusal(&target.ctx, "operator-propose-bin"))
+    };
+    if let Some(refusal) = halted {
+        return refusal;
+    }
     // Keep process replacement from crossing the proposal's durable-intent /
     // PTY-egress / durable-result transaction. The reversible update fence
     // refuses while this token exists; every return path drops it.
@@ -6118,18 +6125,10 @@ fn operator_input_error_summary(status: &str) -> Option<String> {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the operator frame's independent collaborators: the header line, the \
-              stream it must consume, the connection scope, the active handle (the \
-              halted session it is self-scoped to), the operator handle, the registry \
-              and the subscribers it notifies, and the writer"
-)]
 fn run_operator_proposal_bin<W: Write>(
     line: &str,
     reader: &mut impl BufRead,
     scope: Scope,
-    active: &ActiveHandle,
     operator: Option<&crate::operator_host::ControlHandle>,
     store: &Store,
     subscribers: &Subscribers,
@@ -6153,18 +6152,10 @@ fn run_operator_proposal_bin<W: Write>(
     // touching its body: reading attacker-chosen bytes after an authority,
     // routing, availability, or operator-specific size failure needlessly parks
     // a scarce control lane and contradicts the fail-closed framing contract.
-    // `operator-propose-bin` is on the §5.3 halted list: it hands the embedded
-    // operator an actuation proposal, which is driving. It is self-scoped (a
-    // selector is refused just below), so the held session to ask about is the
-    // active one — the same session every other bare verb on this connection
-    // resolves to. Checked here, at its own interception, for the same reason
-    // `feed-bin` repeats the check: this frame never reaches the dispatch gate.
-    let halted = resolve_active(active)
-        .and_then(|(_, _, _, ctx)| crate::fabric::halt_refusal(&ctx, "operator-propose-bin"));
+    // The §5.3 halt is NOT asked here: the session this frame drives is the one
+    // its body names, so `run_operator_proposal` asks it once that sid is known.
     let pre_body_error = if !scope.is_owner_class() || selector.is_some() {
         Some("ERR denied\n".to_string())
-    } else if let Some(refusal) = halted {
-        Some(refusal)
     } else if operator.is_none() {
         Some("ERR operator unavailable\n".to_string())
     } else if n > MAX_OPERATOR_PROPOSAL {
@@ -7394,6 +7385,12 @@ fn operator_input_if_epoch(
         || fingerprint != expected_generation.fingerprint
         || crate::operator_host::looks_like_approval(&evidence)
     {
+        return Delivery::ConflictZero;
+    }
+    // A §5.3 hold can land after the proposal's halt gate, mid-turn: every
+    // operator paste and Enter re-asks it here, at the last seam before egress,
+    // and a held session gets zero bytes (2026-09-12).
+    if ctx.fabric.hold().is_some() {
         return Delivery::ConflictZero;
     }
     let bytes = match ev {
@@ -10710,9 +10707,6 @@ mod tests {
         );
         let store = crate::session_store::new_store();
         let subscribers = crate::subscribe::new_registry();
-        // No active session: the halt lookup has nothing to ask about, which is
-        // the state every pre-body refusal below is judged in.
-        let active: ActiveHandle = Arc::new(Mutex::new(None));
 
         let assert_rejected = |line: &str,
                                scope: Scope,
@@ -10725,7 +10719,6 @@ mod tests {
                     line,
                     &mut reader,
                     scope,
-                    &active,
                     operator,
                     &store,
                     &subscribers,
@@ -10769,6 +10762,140 @@ mod tests {
         assert!(
             !response.contains("invalid proposal JSON"),
             "fleet fault must reject before proposal parsing or any action"
+        );
+    }
+
+    /// `operator-propose-bin` types into the session its BODY names, so that is
+    /// the session whose halt it must obey — not the front tab. Until 2026-09-12
+    /// the frame asked `resolve_active` (the frontmost window's front tab), so a
+    /// held session received operator paste + Enter whenever an unheld tab (or a
+    /// native tab, `active == None`) was in front, and a valid proposal for an
+    /// unheld session was refused while the front tab happened to be held. The
+    /// frame no longer takes the front tab at all; which tab is in front cannot
+    /// change the answer.
+    #[test]
+    #[cfg(unix)]
+    fn operator_proposal_is_halted_on_its_target_sid_not_the_front_tab() {
+        let hold = || {
+            Some(crate::fabric::Hold {
+                reason: "incident".to_string(),
+                origin: "fleet".to_string(),
+            })
+        };
+        let (session_a, rx_a) = pipe_session(81);
+        let (session_b, rx_b) = pipe_session(82);
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(session_a.clone());
+        store.write().unwrap().register(session_b.clone());
+        let subscribers = crate::subscribe::new_registry();
+        let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(1);
+        // An INVALID fleet id: past the halt gate the proposal's first durable
+        // step (`queue()`) is refused by fleet-id validation before any state
+        // root is resolved on disk, so neither arm of this test can touch the
+        // owner's operator state.
+        let operator =
+            crate::operator_host::ControlHandle::new("not a valid fleet id".to_string(), notify_tx);
+        let propose = |sid: &str| -> String {
+            let body = format!(
+                r#"{{"schema":1,"event_id":7,"claim_token":"{zeros}","sid":"{sid}","generation":{{"lifecycle_epoch":3,"alternate_screen":false,"content_seq":9,"fingerprint":"{zeros}"}},"action":{{"kind":"turn","text":"echo pwned"}},"expectation":{{"kind":"busy_then_attention","deadline_ms":1000}}}}"#,
+                zeros = "0".repeat(64),
+            );
+            let line = format!("operator-propose-bin {}", body.len());
+            let mut reader = std::io::Cursor::new(body.into_bytes());
+            let mut output = Vec::new();
+            let _ = run_operator_proposal_bin(
+                &line,
+                &mut reader,
+                Scope::Owner,
+                Some(&operator),
+                &store,
+                &subscribers,
+                &mut output,
+            );
+            String::from_utf8(output).unwrap()
+        };
+        let sid_b = session_b.sid.as_str().to_string();
+
+        // B held, A (any front tab) unheld: the proposal for B is halted, zero bytes.
+        assert!(crate::fabric::apply_hold_for_test(&session_b.ctx, hold()));
+        assert!(crate::fabric::halt_refusal(&session_a.ctx, "operator-propose-bin").is_none());
+        let epoch_b = session_b.ctx.sink.input_epoch();
+        assert_eq!(
+            propose(&sid_b),
+            "ERR halted reason=incident origin=fleet\n",
+            "a held target must refuse whatever tab is in front"
+        );
+        assert_eq!(session_b.ctx.sink.input_epoch(), epoch_b);
+        assert!(
+            drain_pipe(&rx_b).is_empty(),
+            "no operator byte reached held B"
+        );
+
+        // Mirror: A held, B unheld — the proposal for B is not halted.
+        assert!(crate::fabric::apply_hold_for_test(&session_b.ctx, None));
+        assert!(crate::fabric::apply_hold_for_test(&session_a.ctx, hold()));
+        let reply = propose(&sid_b);
+        assert!(
+            !reply.starts_with("ERR halted"),
+            "another session's hold must not refuse a proposal for an unheld target: {reply}"
+        );
+        assert!(drain_pipe(&rx_a).is_empty());
+    }
+
+    /// A hold that lands MID-TURN — after the proposal's gate, between validation
+    /// and the paste or the Enter — still stops the operator's egress: the final
+    /// fence refuses with zero bytes, as it does for a changed screen.
+    #[test]
+    #[cfg(unix)]
+    fn operator_egress_refuses_a_session_held_mid_turn() {
+        use aterm_agent::operator::EventGeneration;
+
+        let (target, rx) = pipe_session(83);
+        aterm_pty::set_nonblocking(target.master, true).expect("nonblocking test master");
+        target.ctx.sink.note_master_nonblocking(true);
+        let generation = {
+            let terminal = term_lock(&target.term);
+            let evidence = crate::operator_host::terminal_evidence(&terminal);
+            EventGeneration::new(
+                0,
+                terminal.is_alternate_screen(),
+                terminal.content_seq(),
+                Sha256::digest(evidence.as_bytes()),
+            )
+        };
+        let paste = || {
+            operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                Some(operator_paste_event("echo pwned")),
+                target.ctx.sink.input_epoch(),
+                OperatorTerminalFence::Exact(generation),
+            )
+        };
+        assert!(crate::fabric::apply_hold_for_test(
+            &target.ctx,
+            Some(crate::fabric::Hold {
+                reason: "incident".to_string(),
+                origin: "fleet".to_string(),
+            })
+        ));
+        let held = paste();
+        assert!(matches!(held, Delivery::ConflictZero), "{held:?}");
+        assert!(
+            drain_pipe(&rx).is_empty(),
+            "a held session got operator bytes"
+        );
+
+        // Control: the same egress, unheld, delivers — the refusal was the hold.
+        assert!(crate::fabric::apply_hold_for_test(&target.ctx, None));
+        let delivered = paste();
+        assert!(
+            matches!(delivered, Delivery::FullAt { .. }),
+            "{delivered:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&drain_pipe(&rx)).contains("echo pwned"),
+            "the unheld control delivered"
         );
     }
 
@@ -21021,6 +21148,13 @@ mod tests {
             "the SESSION halt gate has exactly three production call sites: the verb \
              dispatch, the feed-bin/paste-bin frame, and the operator proposal frame"
         );
+        // The operator proposal asks the session its body NAMES — the one it would
+        // paste into — never the front tab (2026-09-12: asking `resolve_active`
+        // let a held session be driven while an unheld tab was in front).
+        assert!(
+            control.contains("crate::fabric::halt_refusal(&target.ctx, \"operator-propose-bin\")"),
+            "the operator proposal's halt gate reads the proposal's target session"
+        );
         // And the APP lane, which is a different gate because an App-target verb
         // never resolves a session: `invoke Paste` was answered in
         // `dispatch_before_session`, so `halt_refusal` was structurally
@@ -22321,6 +22455,18 @@ mod tests {
                 heat: 1.0,
                 combo: 24,
                 best: 24,
+            },
+            inserts: aterm_effects::cursor_glow::InsertTally {
+                delivered: 2,
+                lit: 1,
+                retracted: 1,
+                last_cells: 63,
+            },
+            in_flight: aterm_effects::cursor_glow::InFlightTally {
+                licensed: 1,
+                forgotten: 2,
+                credits: 3,
+                swallowed_no_echo: 4,
             },
         }
         .line();

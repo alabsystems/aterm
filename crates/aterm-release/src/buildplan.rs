@@ -300,9 +300,38 @@ fn create_private_release_directory(
     open_release_directory(path, expected_uid, true, what).map(drop)
 }
 
-fn prepare_release_target_parent(repo_root: &Path) -> Result<(PathBuf, u32), String> {
-    let expected_uid = current_release_uid()?;
+/// The one name a `target` symlink may point at: the Spotlight-excluded twin that
+/// `aterm pkg noindex apply` (crates/atpkg/src/noindex.rs) leaves beside it.
+const NOINDEX_TARGET_TWIN: &str = "target.noindex";
+
+/// The directory every release path under `<repo>/target` is derived from — the
+/// REAL one, never a link.
+///
+/// The anti-redirection rule: `<repo>/target` is git-ignored, so a clean checkout can
+/// carry a symlink there, and residue GC (`cleanup_release_target_residue`), the
+/// sealed take's `CARGO_TARGET_DIR`, the per-arch slice paths, the dSYM stage and the
+/// verified-product hard link all live beneath it. A link pointing outside this
+/// checkout would aim `remove_dir_all` and the artifact paths wherever the link says.
+/// So the root must be a real directory owned by this uid and not group/other-writable
+/// (`open_release_directory`) — with ONE accepted link shape, measured 2026-09-12 to stop
+/// every cut on a machine running the doctor's Spotlight remedy:
+///
+/// `<repo>/target -> target.noindex`, where the referent is EXACTLY the twin name
+/// (relative, as `noindex apply` writes it, or the same path spelled absolute), the twin
+/// is a real directory in the SAME parent (`symlink_metadata`: not itself a link — no
+/// chain), on the same filesystem as the checkout, passes the same ownership and mode
+/// checks as a plain root, and following the link lands on that opened inode. Anything
+/// else — a link to another checkout, a hop through a second link, a twin that is a link,
+/// a missing twin — keeps the refusal, with the reason appended so the operator can see
+/// which clause failed. The RESOLVED path (the twin) is returned, so every consumer
+/// above operates on the real directory and no later step follows the link again.
+#[cfg(unix)]
+fn resolve_release_target_root(repo_root: &Path, expected_uid: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let target_root = repo_root.join("target");
+    // mkdir(2) answers EEXIST for a symlink at the path (dangling or not), so a link is
+    // never followed to create its referent here.
     match std::fs::create_dir(&target_root) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -313,14 +342,97 @@ fn prepare_release_target_parent(repo_root: &Path) -> Result<(PathBuf, u32), Str
             ));
         }
     }
-    // Reject an ignored `target` symlink before constructing or collecting any
-    // child beneath it. Otherwise a clean checkout could redirect residue GC.
-    drop(open_release_directory(
-        &target_root,
-        expected_uid,
-        false,
-        "release target root",
-    )?);
+    let link = std::fs::symlink_metadata(&target_root).map_err(|error| {
+        format!(
+            "inspect release target root {}: {error}",
+            target_root.display()
+        )
+    })?;
+    if !link.file_type().is_symlink() {
+        // Reject anything that is not a directory before constructing or collecting
+        // any child beneath it. Otherwise a clean checkout could redirect residue GC.
+        drop(open_release_directory(
+            &target_root,
+            expected_uid,
+            false,
+            "release target root",
+        )?);
+        return Ok(target_root);
+    }
+
+    // The message keeps its first clause verbatim: it is what the operator greps for
+    // and what the tests below assert; the parenthetical says which clause refused.
+    let refuse = |why: String| {
+        format!(
+            "release target root is not a real directory: {} ({why}; the one link accepted is \
+             `target -> {NOINDEX_TARGET_TWIN}` beside a real `{NOINDEX_TARGET_TWIN}` directory \
+             in the same checkout)",
+            target_root.display()
+        )
+    };
+    if link.uid() != expected_uid {
+        return Err(refuse(format!(
+            "the link is owned by uid {}, expected {expected_uid}",
+            link.uid()
+        )));
+    }
+    let referent = std::fs::read_link(&target_root)
+        .map_err(|error| refuse(format!("the link cannot be read: {error}")))?;
+    let twin = repo_root.join(NOINDEX_TARGET_TWIN);
+    if referent != Path::new(NOINDEX_TARGET_TWIN) && referent != twin {
+        return Err(refuse(format!("it is a symlink to {}", referent.display())));
+    }
+    let twin_metadata = std::fs::symlink_metadata(&twin).map_err(|error| {
+        refuse(format!(
+            "its twin {} cannot be inspected: {error}",
+            twin.display()
+        ))
+    })?;
+    if twin_metadata.file_type().is_symlink() {
+        return Err(refuse(format!(
+            "its twin {} is itself a symlink",
+            twin.display()
+        )));
+    }
+    if !twin_metadata.file_type().is_dir() {
+        return Err(refuse(format!(
+            "its twin {} is not a directory",
+            twin.display()
+        )));
+    }
+    let checkout = std::fs::symlink_metadata(repo_root)
+        .map_err(|error| format!("inspect release checkout {}: {error}", repo_root.display()))?;
+    if twin_metadata.dev() != checkout.dev() {
+        return Err(refuse(format!(
+            "its twin {} is on a different filesystem from the checkout",
+            twin.display()
+        )));
+    }
+    // The twin takes exactly the checks a plain root takes: owned, not
+    // group/other-writable, and unchanged between inspection and open.
+    let opened = open_release_directory(&twin, expected_uid, false, "release target root twin")?
+        .metadata()
+        .map_err(|error| format!("inspect opened release target root twin: {error}"))?;
+    // Following the link must land on the inode just opened — the read_link answer and
+    // the twin inspection above are two syscalls apart, and this closes that gap.
+    let followed = std::fs::metadata(&target_root)
+        .map_err(|error| refuse(format!("following the link failed: {error}")))?;
+    if (followed.dev(), followed.ino()) != (opened.dev(), opened.ino()) {
+        return Err(refuse(
+            "following the link does not land on the inspected twin".to_owned(),
+        ));
+    }
+    Ok(twin)
+}
+
+#[cfg(not(unix))]
+fn resolve_release_target_root(_repo_root: &Path, _expected_uid: u32) -> Result<PathBuf, String> {
+    Err("release target privacy requires Unix ownership and mode semantics".into())
+}
+
+fn prepare_release_target_parent(repo_root: &Path) -> Result<(PathBuf, u32), String> {
+    let expected_uid = current_release_uid()?;
+    let target_root = resolve_release_target_root(repo_root, expected_uid)?;
 
     let parent = target_root.join("release-takes");
     match std::fs::create_dir(&parent) {
@@ -622,13 +734,7 @@ fn cleanup_release_target_residue_with_uid(
 }
 
 fn prepare_release_product_parent(repo_root: &Path, expected_uid: u32) -> Result<PathBuf, String> {
-    let target_root = repo_root.join("target");
-    drop(open_release_directory(
-        &target_root,
-        expected_uid,
-        false,
-        "release target root",
-    )?);
+    let target_root = resolve_release_target_root(repo_root, expected_uid)?;
     let parent = target_root.join("release-products");
     match std::fs::create_dir(&parent) {
         Ok(()) => {}
@@ -2673,7 +2779,192 @@ mod tests {
 
         let error = prepare_release_target_parent(&repo).unwrap_err();
         assert!(error.contains("not a real directory"), "{error}");
+        assert!(error.contains("is a symlink to"), "{error}");
         assert!(!outside.join("release-takes").exists());
+    }
+
+    /// A checkout after `aterm pkg noindex apply`: the twin directory exists, and the
+    /// test lays the link itself so each case can vary its shape.
+    fn twin_checkout(scratch: &PrivateSliceDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let repo = scratch.0.join("repo");
+        let twin = repo.join("target.noindex");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&twin).unwrap();
+        (repo, twin)
+    }
+
+    #[test]
+    fn release_target_root_accepts_the_noindex_twin_and_resolves_every_child_to_it() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let (repo, twin) = twin_checkout(&scratch);
+        // Exactly what `aterm pkg noindex apply` lays: a RELATIVE link to the twin name.
+        symlink("target.noindex", repo.join("target")).unwrap();
+        let uid = current_release_uid().unwrap();
+
+        let (parent, parent_uid) = prepare_release_target_parent(&repo).unwrap();
+        assert_eq!(parent_uid, uid);
+        assert_eq!(parent, twin.join("release-takes"));
+        let parent_metadata = std::fs::symlink_metadata(&parent).unwrap();
+        assert!(parent_metadata.file_type().is_dir());
+        assert_eq!(parent_metadata.uid(), uid);
+        assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o700);
+        // The link is untouched and the twin is still the plain directory it was.
+        assert!(
+            std::fs::symlink_metadata(repo.join("target"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&twin)
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+
+        // Residue GC runs on the resolved parent: an abandoned take under the twin is
+        // collected, the live one kept.
+        let take = "a".repeat(64);
+        let token = "b".repeat(64);
+        let abandoned = parent.join(format!("{take}-7-{token}"));
+        let live = parent.join(format!("{take}-8-{token}"));
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::create_dir(&live).unwrap();
+        cleanup_release_target_residue_with(&parent, |pid| {
+            Ok((pid == 8).then(|| "live process".to_owned()))
+        })
+        .unwrap();
+        assert!(!abandoned.exists());
+        assert!(live.is_dir());
+
+        // The product parent resolves the same way: the verified binary is hard-linked
+        // under the twin, not through the link.
+        let staged = twin.join("staged-aterm");
+        std::fs::write(&staged, "verified").unwrap();
+        let published =
+            publish_verified_binary(&repo, &staged, &take, std::process::id(), &token, uid)
+                .unwrap();
+        assert!(
+            published.starts_with(twin.join("release-products")),
+            "{}",
+            published.display()
+        );
+        assert_eq!(std::fs::read_to_string(&published).unwrap(), "verified");
+    }
+
+    #[test]
+    fn release_target_root_accepts_the_twin_spelled_absolute() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let (repo, twin) = twin_checkout(&scratch);
+        symlink(&twin, repo.join("target")).unwrap();
+
+        let (parent, _) = prepare_release_target_parent(&repo).unwrap();
+        assert_eq!(parent, twin.join("release-takes"));
+    }
+
+    #[test]
+    fn release_target_root_refuses_a_link_chain_to_the_twin() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let (repo, twin) = twin_checkout(&scratch);
+        // target -> target.hop -> target.noindex: the referent is not the twin name, even
+        // though the chain ends on the twin.
+        symlink("target.noindex", repo.join("target.hop")).unwrap();
+        symlink("target.hop", repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(error.contains("is a symlink to target.hop"), "{error}");
+        assert!(!twin.join("release-takes").exists());
+    }
+
+    #[test]
+    fn release_target_root_refuses_a_twin_that_is_itself_a_symlink() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        let outside = scratch.0.join("outside-twin");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, repo.join("target.noindex")).unwrap();
+        symlink("target.noindex", repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(error.contains("is itself a symlink"), "{error}");
+        assert!(!outside.join("release-takes").exists());
+    }
+
+    #[test]
+    fn release_target_root_refuses_a_missing_twin() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        symlink("target.noindex", repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(error.contains("cannot be inspected"), "{error}");
+        // Nothing was created THROUGH the dangling link: the twin is still absent and
+        // the link still stands.
+        assert!(std::fs::symlink_metadata(repo.join("target.noindex")).is_err());
+        assert!(
+            std::fs::symlink_metadata(repo.join("target"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn release_target_root_refuses_a_twin_that_is_not_a_directory() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("target.noindex"), "a file").unwrap();
+        symlink("target.noindex", repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(error.contains("is not a directory"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("target.noindex")).unwrap(),
+            "a file"
+        );
+    }
+
+    #[test]
+    fn release_target_root_refuses_a_twin_the_world_can_write() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let (repo, twin) = twin_checkout(&scratch);
+        std::fs::set_permissions(&twin, std::fs::Permissions::from_mode(0o777)).unwrap();
+        symlink("target.noindex", repo.join("target")).unwrap();
+
+        let error = prepare_release_target_parent(&repo).unwrap_err();
+        assert!(error.contains("group/other-writable"), "{error}");
+        assert!(!twin.join("release-takes").exists());
+    }
+
+    #[test]
+    fn verified_binary_publication_refuses_a_symlinked_target_root_to_elsewhere() {
+        let scratch = PrivateSliceDir::create().unwrap();
+        let repo = scratch.0.join("repo");
+        let outside = scratch.0.join("outside-target");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, repo.join("target")).unwrap();
+        let staged = scratch.0.join("staged-aterm");
+        std::fs::write(&staged, "verified").unwrap();
+
+        let error = publish_verified_binary(
+            &repo,
+            &staged,
+            &"a".repeat(64),
+            std::process::id(),
+            &"b".repeat(64),
+            current_release_uid().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(!outside.join("release-products").exists());
     }
 
     #[test]

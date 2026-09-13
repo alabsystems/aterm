@@ -7095,9 +7095,10 @@ impl App {
             );
         }
 
-        // Off to CoreGraphics: photograph the composited on-screen pixels. Any
-        // failure (most commonly a missing Screen Recording grant) returns a clear
-        // `Err`. The PNG encode + confined write (identical to `render_image`'s:
+        // Off to CoreGraphics: photograph the composited on-screen pixels of OUR OWN
+        // window — no Screen Recording grant is involved (see `capture_window_pixels`).
+        // Any failure (the window is not on screen) returns a clear `Err`. The PNG
+        // encode + confined write (identical to `render_image`'s:
         // `openat` the final component under the canonical `images/` dir fd,
         // `O_NOFOLLOW`) happen on the encode worker.
         capture_window_pixels(window_number as u32)
@@ -8115,9 +8116,12 @@ fn decode_native_chrome_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String>
 /// tightly-packed buffer (`width * 4` stride, premultiplied-alpha-last). So the
 /// bytes are always plain RGBA8 no matter what the window server hands us.
 ///
-/// Returns `Err` (never panics / leaks) when CoreGraphics cannot capture — almost
-/// always a missing Screen Recording grant, which the caller turns into the clear,
-/// actionable permission error.
+/// Returns `Err` (never panics / leaks) when CoreGraphics cannot capture. That is NOT
+/// a permission failure: this is aterm's own window, which CoreGraphics photographs
+/// without a Screen Recording grant (measured 2026-09-12 with the grant not held —
+/// tccd preflight only, real pixels back). NULL means the window is not on screen,
+/// and the error says so rather than sending the owner to grant a permission aterm
+/// never uses — one that since macOS 15 re-prompts on a cooldown while held.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32), String> {
     use crate::cg_capture::*;
@@ -8135,11 +8139,22 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         )
     };
     if image.is_null() {
-        // The single most common cause is a missing Screen Recording grant; give the
-        // exact, actionable remediation rather than a bare failure.
+        // NOT a permission failure, and the remediation must not say it is. This
+        // photographs aterm's OWN window (`kCGWindowListOptionIncludingWindow` on our
+        // `NSWindow`'s `windowNumber`), which CoreGraphics serves WITHOUT a Screen
+        // Recording grant: measured 2026-09-12 on macOS 26 with the grant not held
+        // (tccd `kTCCServiceScreenCapture` preflight only, `authValue=1`), a 2104×1676
+        // RGBA capture came back. The earlier text sent owners to System Settings to
+        // grant Screen Recording — a grant aterm never uses, and one that since
+        // macOS 15 re-prompts on a cooldown for as long as it is held (design §1.3) —
+        // which is a system alert aterm caused for nothing. NULL here means the window
+        // is not on screen: minimized, on another Space, not yet painted, or
+        // zero-sized.
         return Err(
-            "window capture failed (grant Screen Recording permission to aterm-gui in \
-             System Settings > Privacy & Security > Screen Recording, then retry)"
+            "window capture failed (CoreGraphics returned no image for aterm's own \
+             window — it is not on screen: minimized, on another Space, not yet \
+             painted, or zero-sized; this needs no Screen Recording grant, so do not \
+             grant one — bring the window on screen and retry)"
                 .to_string(),
         );
     }

@@ -410,6 +410,36 @@ pub fn install_shim_to_env(
     atomic_write(shim, super::cmd_shim_content_env(target, env).as_bytes())
 }
 
+/// The shim [`install_shim_to_env`] lays, RENDERED but not written — the same two
+/// injection refusals, the `.cmd` body — for the callers that lay a whole pass of shims
+/// in one go ([`crate::lay::lay_executables`]; no provenance lane exists here, so it
+/// writes in-process).
+pub fn shim_executable_to_env(
+    shim: &Path,
+    target: &Path,
+    env: &crate::shim_env::ShimEnv,
+) -> io::Result<crate::lay::Executable> {
+    if !super::cmd_target_is_injection_safe(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to shim an unsafe target path (quote/%/newline): {}",
+                target.display()
+            ),
+        ));
+    }
+    if !super::cmd_env_is_injection_safe(env) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to shim an unsafe shim_env entry (quote/%/newline)",
+        ));
+    }
+    Ok(crate::lay::Executable::new(
+        shim,
+        super::cmd_shim_content_env(target, env),
+    ))
+}
+
 /// Install a **failing tombstone shim** at `shim` (a `.cmd`) that prints `message` to
 /// stderr and exits 70 — the Windows analogue of the Unix `sh` tombstone.
 pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {

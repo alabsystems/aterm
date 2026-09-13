@@ -819,6 +819,70 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// The record a provenance-tracked installer leaves when it staged `build_dir` IN-PROCESS
+/// under `ATPKG_ALLOW_TRACKED_INSTALL=1` (or kept an untracked lane's tree that came back
+/// tagged): a SIBLING file `store/<program>/<build>.tracked-install`, outside the hashed
+/// tree like `.ready`. It is the CAUSE `aterm pkg doctor` reports beside its "carries
+/// com.apple.provenance" line, and what `aterm pkg repair` names as needing a re-seed —
+/// the archive is reclaimed after every stage, so no local re-stage exists.
+fn tracked_install_marker_path(build_dir: &Path) -> Option<PathBuf> {
+    let name = crate::call1(std::path::Path::file_name, build_dir)?;
+    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let mut marker = String::from(name);
+    marker.push_str(TRACKED_INSTALL_SUFFIX);
+    Some(build_dir.with_file_name(marker))
+}
+
+/// The suffix of the tracked-install record beside a build dir.
+pub const TRACKED_INSTALL_SUFFIX: &str = ".tracked-install";
+
+/// Write the tracked-install record beside `build_dir` (temp + rename): `why` is the one
+/// line the installer had — which lane failure, or the measured-tagged witness — and the
+/// time. Called by the stage BEFORE the build is marked complete, so a record that could
+/// not be written leaves an unmarked (re-stageable) build rather than a marked, tagged,
+/// unexplained one.
+pub fn record_tracked_install(build_dir: &Path, why: &str) -> std::io::Result<()> {
+    let dest = tracked_install_marker_path(build_dir).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    let parent = dest.parent().unwrap_or(build_dir);
+    let mut tmp_name = String::from(".tracked-install.tmp-");
+    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    let tmp = parent.join(tmp_name);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut body = String::from("tracked-install v1\nwhy=");
+    // One line: the reader takes the `why=` line whole.
+    body.push_str(&why.replace(['\n', '\r'], " "));
+    body.push_str("\nat=");
+    body.push_str(&crate::dec_u64(secs));
+    body.push('\n');
+    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
+    std::fs::rename(&tmp, &dest)
+}
+
+/// The recorded reason `build_dir` was staged tagged, if a record is there and readable.
+/// `None` is "no record" — never a claim about the tree's attributes, which `doctor`
+/// scans directly.
+#[must_use]
+pub fn tracked_install_record(build_dir: &Path) -> Option<String> {
+    let marker = tracked_install_marker_path(build_dir)?;
+    let text = std::fs::read_to_string(marker).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("why="))
+        .map(str::to_string)
+}
+
+/// Remove the tracked-install record beside `build_dir`, if any — a clean stage of the
+/// same build number, and every discard, so the record never outlives its cause.
+pub fn clear_tracked_install(build_dir: &Path) {
+    if let Some(marker) = tracked_install_marker_path(build_dir) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 /// The sibling scratch directory a stage extracts INTO before it swaps: `<build>.incoming-<pid>`.
 ///
 /// Staging never writes into the live `<build>/` tree. The old flow deleted the live tree
@@ -1027,6 +1091,9 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // reinstall under this build number writes its own from its own signed manifest,
     // and must never re-lay shims with an environment a discarded build declared.
     crate::shim_env::remove_sidecar(build_dir);
+    // And the tracked-install record (`<build>.tracked-install`): the cause it named is
+    // gone with the tree, and a clean reinstall must not be reported under it.
+    clear_tracked_install(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
@@ -1537,6 +1604,42 @@ mod tests {
         #[cfg(unix)]
         std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o700)).unwrap();
         h
+    }
+
+    /// The tracked-install record: written beside the build, read back as its `why=`
+    /// line (newlines folded), absent reads as `None`, cleared explicitly and by
+    /// `discard_build`.
+    #[test]
+    fn the_tracked_install_record_round_trips_and_goes_with_the_build() {
+        let h = temp_home("tracked-install");
+        let l = Layout { prefix: h.clone() };
+        let build = l.build_dir("trust", 8590);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        assert_eq!(tracked_install_record(&build), None);
+        record_tracked_install(
+            &build,
+            "the untracked lane could not run (launchctl\nfailed)",
+        )
+        .unwrap();
+        let marker = build.with_file_name("8590.tracked-install");
+        assert!(marker.is_file(), "a sibling, outside the tree");
+        assert_eq!(
+            tracked_install_record(&build).as_deref(),
+            Some("the untracked lane could not run (launchctl failed)")
+        );
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(text.starts_with("tracked-install v1\nwhy="), "{text}");
+        assert!(text.lines().any(|l| l.starts_with("at=")), "{text}");
+        clear_tracked_install(&build);
+        assert_eq!(tracked_install_record(&build), None);
+        clear_tracked_install(&build); // idempotent
+        record_tracked_install(&build, "again").unwrap();
+        discard_build(&build);
+        assert!(
+            !build.exists() && !marker.exists(),
+            "the discard takes the record"
+        );
+        let _ = std::fs::remove_dir_all(&h);
     }
 
     /// The EXTRAS opt-in markers: recorded by name (idempotent, `0600`, regular file),

@@ -3009,3 +3009,104 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
     assert!(publish::RECOVERY_STOPPED_PROCESS_BANNER.contains("OPERATOR ASSERTION"));
     assert!(publish::RECOVERY_STOPPED_PROCESS_BANNER.contains("cannot cancel"));
 }
+
+// ---------------------------------------------------------------------------
+// resume's provenance gate (the fresh cut's pre-claim gate, re-run before a rebuild)
+// ---------------------------------------------------------------------------
+
+/// A resume that still has `build` to do runs the provenance gate BEFORE the pipeline,
+/// and its refusal carries the gate's own words plus the step that would rebuild.
+///
+/// MUTATION TARGET: delete the call in `resume_cut`, or make the early return
+/// unconditional — a tracked shell's `--resume` then bakes tagged artifacts and dies at
+/// the proof snapshot with the build number already burned.
+#[test]
+fn a_resume_that_will_rebuild_runs_the_provenance_gate_first() {
+    let mut j = journal();
+    j.done = vec!["lock".into()];
+    let called = std::cell::Cell::new(false);
+    let err = publish::resume_provenance_gate(&j, || {
+        called.set(true);
+        Err(ledger::Error::new(
+            "trustc: /s/bin/trustc carries com.apple.provenance",
+        ))
+    })
+    .expect_err("a tagged toolchain must not be rebuilt with");
+    assert!(called.get(), "the gate was consulted");
+    let msg = err.to_string();
+    assert!(msg.contains("would rebuild"), "{msg}");
+    assert!(msg.contains("\"build\""), "the step named: {msg}");
+    assert!(
+        msg.contains("trustc: /s/bin/trustc carries com.apple.provenance"),
+        "the gate's own words: {msg}"
+    );
+    // A gate that passes lets the rebuild through.
+    assert!(publish::resume_provenance_gate(&j, || Ok(())).is_ok());
+    // And a journal that has not even locked yet is still "will rebuild".
+    let fresh = journal();
+    assert!(publish::resume_provenance_gate(&fresh, || Err(ledger::Error::new("x"))).is_err());
+}
+
+/// A resume past `build` never consults the gate: nothing remaining compiles, so a
+/// tagged compiler cannot reach a file, and a cut one upload from finished must stay
+/// finishable — even from a tracked shell, even with a tagged toolchain installed.
+///
+/// MUTATION TARGET: drop the `is_done("build")` early return — the closure below then
+/// runs, returns its refusal, and this test goes red.
+#[test]
+fn a_resume_past_the_build_never_consults_the_provenance_gate() {
+    for done in [
+        vec!["lock", "build"],
+        vec!["lock", "build", "selfcheck", "draft"],
+        vec![
+            "lock",
+            "build",
+            "selfcheck",
+            "draft",
+            "upload",
+            "preflip",
+            "tag",
+            "flip",
+            "archive",
+            "verify",
+            "mirror",
+            "unlock",
+        ],
+    ] {
+        let mut j = journal();
+        j.done = done.iter().map(|s| (*s).to_string()).collect();
+        let called = std::cell::Cell::new(false);
+        publish::resume_provenance_gate(&j, || {
+            called.set(true);
+            Err(ledger::Error::new(
+                "this cutter PROCESS is provenance-tracked",
+            ))
+        })
+        .unwrap_or_else(|e| panic!("a resume past build must not be blocked ({done:?}): {e}"));
+        assert!(
+            !called.get(),
+            "the gate must not even be consulted ({done:?})"
+        );
+    }
+}
+
+/// The production gate a rebuilding resume runs IS the fresh cut's gate over the same
+/// toolchain: on this machine the two answer identically, pass or refusal, word for word.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_resume_gate_is_the_fresh_cuts_gate_on_this_machine() {
+    let fresh = gates::trust_stage2_bin()
+        .and_then(|bin| gates::provenance_gate(&bin.join("trustc")))
+        .map_err(|e| e.to_string());
+    let resumed = publish::toolchain_provenance_gate().map_err(|e| e.to_string());
+    assert_eq!(resumed, fresh);
+    let mut j = journal();
+    j.done = vec!["lock".into()];
+    let through_the_rule = publish::resume_provenance_gate(&j, publish::toolchain_provenance_gate)
+        .map_err(|e| e.to_string());
+    match (&fresh, &through_the_rule) {
+        (Ok(()), Ok(())) => {}
+        (Err(f), Err(r)) => assert!(r.contains(f.as_str()), "{r}\n--- vs ---\n{f}"),
+        other => panic!("the rule must agree with the gate: {other:?}"),
+    }
+}

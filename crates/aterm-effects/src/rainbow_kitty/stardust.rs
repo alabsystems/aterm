@@ -2897,6 +2897,13 @@ impl Stardust {
             }
             // A move mints no star here: §6.12's mini-fan and §6.5's fan and
             // shed are the meteor's, and T1 keeps geometry born in one place.
+            // The insert's rewrite: the field stars of the retracted cells
+            // finish on the ribbon's own retract span (the kill arm minus
+            // its thrown stars — nothing is born for a program rewrite).
+            Event::Rewrite { row, col, cells } => {
+                let span = FIELD_RETRACT_BASE_MS + FIELD_RETRACT_PER_CELL_MS * f32::from(cells);
+                self.finish_field((row, col), span, at, ctx.geom);
+            }
             Event::Move { .. } | Event::Return | Event::Sweep { .. } => {}
             Event::Focus(false) => self.ember(at),
             Event::Focus(true) | Event::ReducedMotion(_) => {}

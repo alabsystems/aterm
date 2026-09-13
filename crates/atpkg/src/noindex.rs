@@ -83,6 +83,17 @@
 //! was. A repo that did not ignore the directory at all gets the same link and one line
 //! saying the link shows as untracked, exactly as the directory did.
 //!
+//! THE CUTTER ACCEPTS EXACTLY THIS LINK AND NO OTHER (2026-09-12). The release build runs
+//! under `<repo>/target` and guards that root against redirection (a git-ignored link
+//! there would aim residue GC and the artifact paths anywhere); v0.83.0's cut stopped on
+//! the link this pass leaves, and the operator had to undo the migration by hand.
+//! `crates/aterm-release/src/buildplan.rs::resolve_release_target_root` now accepts
+//! `target -> target.noindex` when the referent is that exact name, the twin is a real
+//! directory in the same parent on the same filesystem, and it passes the plain root's
+//! ownership and mode checks — then derives every path from the twin. Change the SHAPE
+//! this function lays (an absolute link, a different suffix, a hop) and the cutter
+//! refuses again.
+//!
 //! Measured on macOS 26.6.2 (25G83) on 2026-09-10 with a scratch tree under `$HOME`
 //! (`repo/target/debug/<token>.txt`, `mdimport`ed, then polled with `mdfind -onlyin`):
 //!
@@ -939,7 +950,7 @@ pub fn point_cargo_config(text: &str, old_name: &str, value: &str) -> ConfigEdit
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_build = trimmed == "[build]";
+            in_build = is_build_header(trimmed);
             if in_build {
                 seen_build = true;
             }
@@ -978,7 +989,7 @@ pub fn point_cargo_config(text: &str, old_name: &str, value: &str) -> ConfigEdit
         let mut with_key: Vec<String> = Vec::with_capacity(out.len() + 1);
         let mut inserted = false;
         for line in out {
-            let is_header = line.trim() == "[build]";
+            let is_header = is_build_header(&line);
             with_key.push(line);
             if is_header && !inserted {
                 with_key.push(key_line.clone());
@@ -1011,6 +1022,38 @@ pub fn point_cargo_config(text: &str, old_name: &str, value: &str) -> ConfigEdit
     }
 }
 
+/// Whether a line is the `[build]` table header, read by what it names: a trailing
+/// `# comment` and whitespace inside the brackets are TOML, not another table. Byte
+/// equality with `[build]` missed `[build] # faster links`, appended a second `[build]`,
+/// and the edit was refused as unparseable (2026-09-12, audit K11).
+fn is_build_header(line: &str) -> bool {
+    let line = line.trim();
+    let mut quote: Option<char> = None;
+    let mut end = line.len();
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => {
+                end = i;
+                break;
+            }
+            None => {}
+        }
+    }
+    line[..end]
+        .trim()
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .is_some_and(|inner| {
+            inner
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .eq("build".chars())
+        })
+}
+
 /// Whether a `target-dir` value names the directory called `old_name` in this repo:
 /// the bare name, `./name`, or any path whose last component is it.
 fn names_dir(value: &str, old_name: &str) -> bool {
@@ -1020,54 +1063,173 @@ fn names_dir(value: &str, old_name: &str) -> bool {
         || Path::new(v).file_name().is_some_and(|n| n == old_name)
 }
 
-/// Write `[build] target-dir` for the migration `from -> to` into `repo`'s
-/// `.cargo/config.toml` (creating `.cargo/` and the file when absent).
-fn point_repo(repo: &Path, from: &Path, to: &Path) -> ConfigNote {
+/// What [`plan_repo_config`] decided, before anything is renamed.
+enum RepoConfig {
+    /// Write this text to this `.cargo/config.toml`.
+    Write {
+        config: PathBuf,
+        text: String,
+        rewritten: bool,
+    },
+    /// Nothing to write, and the rename is still safe: an existing `target-dir` names
+    /// some other directory, so cargo never used this one.
+    Leave(String),
+}
+
+/// Decide the `[build] target-dir` edit for the migration `from -> to` in `repo`'s
+/// `.cargo/config.toml`, touching nothing. `Err` is a config that cannot be pointed —
+/// the caller must not rename: until 2026-09-12 this ran AFTER the rename, and a
+/// refusal left cargo aimed at a `target/` that was gone, orphaned the renamed tree,
+/// and wedged every later pass on "already exists" (audit K11).
+fn plan_repo_config(repo: &Path, from: &Path, to: &Path) -> Result<RepoConfig, String> {
     let config = repo.join(".cargo").join("config.toml");
+    // Cargo reads a legacy `.cargo/config` in preference to `config.toml`, so an edit to
+    // the latter would not move the build — unless the one is a link to the other.
+    let legacy = repo.join(".cargo").join("config");
+    if std::fs::symlink_metadata(&legacy).is_ok()
+        && !std::fs::canonicalize(&legacy)
+            .is_ok_and(|l| std::fs::canonicalize(&config).is_ok_and(|c| c == l))
+    {
+        return Err(format!(
+            "{} exists and cargo reads it before config.toml — point cargo at {} yourself",
+            legacy.display(),
+            to.display()
+        ));
+    }
+    // A linked config is edited through the link (`write_repo_config`); a dangling one
+    // would read as absent and be REPLACED by a file of our own, so it is refused.
+    if std::fs::symlink_metadata(&config).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::canonicalize(&config).is_err()
+    {
+        return Err(format!(
+            "{} is a symlink to a file that does not exist — point cargo at {} yourself",
+            config.display(),
+            to.display()
+        ));
+    }
     let text = match std::fs::read_to_string(&config) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return ConfigNote::Untouched(format!("{} unreadable ({e})", config.display())),
+        Err(e) => {
+            return Err(format!("{} unreadable ({e})", config.display()));
+        }
     };
     let old_name = from
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let value = target_dir_value(repo, to);
-    let (new_text, rewritten) = match point_cargo_config(&text, &old_name, &value) {
-        ConfigEdit::Written(t) => (t, false),
-        ConfigEdit::Rewritten(t) => (t, true),
-        ConfigEdit::PointsElsewhere(v) => {
-            return ConfigNote::Untouched(format!(
-                "{} already sets target-dir = {v:?}, which is not the migrated directory — \
-                 left as is",
-                config.display()
-            ));
-        }
-        ConfigEdit::Unparseable(_) => {
-            return ConfigNote::Untouched(format!(
-                "{} could not be edited into valid TOML — point cargo at {} yourself",
-                config.display(),
-                to.display()
-            ));
-        }
+    match point_cargo_config(&text, &old_name, &value) {
+        ConfigEdit::Written(text) => Ok(RepoConfig::Write {
+            config,
+            text,
+            rewritten: false,
+        }),
+        ConfigEdit::Rewritten(text) => Ok(RepoConfig::Write {
+            config,
+            text,
+            rewritten: true,
+        }),
+        ConfigEdit::PointsElsewhere(v) => Ok(RepoConfig::Leave(format!(
+            "{} already sets target-dir = {v:?}, which is not the migrated directory — left as is",
+            config.display()
+        ))),
+        ConfigEdit::Unparseable(_) => Err(format!(
+            "{} could not be edited into valid TOML — point cargo at {} yourself",
+            config.display(),
+            to.display()
+        )),
+    }
+}
+
+/// Write a planned config edit into `repo`'s `.cargo/config.toml` (creating `.cargo/`
+/// and the file when absent). `Err` is a failed write; the caller rolls the rename back.
+fn write_repo_config(repo: &Path, plan: RepoConfig) -> Result<ConfigNote, String> {
+    let (config, text, rewritten) = match plan {
+        RepoConfig::Write {
+            config,
+            text,
+            rewritten,
+        } => (config, text, rewritten),
+        RepoConfig::Leave(why) => return Ok(ConfigNote::Untouched(why)),
     };
     if let Err(e) = std::fs::create_dir_all(repo.join(".cargo")) {
-        return ConfigNote::Untouched(format!("{}: {e}", repo.join(".cargo").display()));
+        return Err(format!("{}: {e}", repo.join(".cargo").display()));
     }
-    // Atomic: temp + rename, so a crash mid-write cannot leave cargo a half config.
-    let tmp = repo.join(".cargo").join(".config.toml.atpkg-tmp");
-    if let Err(e) = std::fs::write(&tmp, new_text.as_bytes()) {
-        return ConfigNote::Untouched(format!("{}: {e}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, &config) {
+    // Write to the FILE the config names, never over a link: a symlinked config.toml
+    // (shared across checkouts, dotfiles-managed) renamed over became a detached regular
+    // copy, and later edits to the shared file stopped reaching this repo (2026-09-12,
+    // the audit K12 class). A link that no longer resolves is refused, not replaced.
+    let real = match std::fs::symlink_metadata(&config) {
+        Ok(m) if m.file_type().is_symlink() => match std::fs::canonicalize(&config) {
+            Ok(real) => real,
+            Err(e) => return Err(format!("{}: unresolvable symlink ({e})", config.display())),
+        },
+        _ => config.clone(),
+    };
+    let Some(real_dir) = real.parent() else {
+        return Err(format!("{}: no parent directory", real.display()));
+    };
+    // Atomic: temp + rename, so a crash mid-write cannot leave cargo a half config. The
+    // temp sits beside the REAL file (same filesystem, so the rename replaces it and not
+    // the link), and an existing file's mode carries over.
+    let tmp = real_dir.join(format!(".config.toml.atpkg-{}.tmp", std::process::id()));
+    let mode = std::fs::metadata(&real).ok().map(|m| m.permissions());
+    let _ = std::fs::remove_file(&tmp);
+    let written = create_config_temp(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .and_then(|()| match mode {
+            Some(perms) => std::fs::set_permissions(&tmp, perms),
+            None => new_config_permissions(&tmp),
+        });
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
-        return ConfigNote::Untouched(format!("{}: {e}", config.display()));
+        return Err(format!("{}: {e}", tmp.display()));
     }
-    if rewritten {
+    if let Err(e) = std::fs::rename(&tmp, &real) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", config.display()));
+    }
+    Ok(if rewritten {
         ConfigNote::Rewritten(config)
     } else {
         ConfigNote::Written(config)
-    }
+    })
+}
+
+/// Create the cargo config rewrite's temp: exclusively, and born `0600`. It holds the
+/// WHOLE config before the real file's mode is applied, so a umask-default temp left a
+/// `0600` `config.toml` readable by other users until that chmod (2026-09-12, review of
+/// the audit follow-ups; `hooks::create_rc_temp` closed the same window for rc files).
+/// The name carries the pid, so two checkouts sharing one linked config cannot collide.
+#[cfg(unix)]
+fn create_config_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
+#[cfg(not(unix))]
+fn create_config_temp(tmp: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+}
+
+/// A config.toml this pass CREATES gets the ordinary `0644` a plain write used to leave
+/// under the usual umask, not the temp's private `0600`.
+#[cfg(unix)]
+fn new_config_permissions(tmp: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(not(unix))]
+fn new_config_permissions(_tmp: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// One bounded `git -C <repo> <args>` (the doctor's 5 s probe clock; stderr dropped).
@@ -1332,6 +1494,23 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
         (Some(repo), Pointer::Symlink) if !dry_run => git_ignores(repo, dir),
         _ => None,
     };
+    // The config edit is decided BEFORE the rename, so a tree whose cargo cannot be
+    // re-pointed is never moved (`plan_repo_config`). Only when the rename would
+    // happen: a directory `migrate` refuses or calls excluded keeps that answer.
+    let mut config_plan = None;
+    if let (Some(repo), Pointer::Config(_)) = (&repo, &pointer)
+        && let Ok(Migration::Planned { from, to }) = migrate(dir, true)
+    {
+        match plan_repo_config(repo, &from, &to) {
+            Ok(plan) => config_plan = Some(plan),
+            Err(why) => {
+                return Applied::Skipped {
+                    path: dir.to_path_buf(),
+                    reason: format!("{why} — nothing was renamed"),
+                };
+            }
+        }
+    }
     match migrate(dir, dry_run) {
         Ok(Migration::Migrated { from, to }) => {
             let config = match (&repo, &pointer) {
@@ -1356,7 +1535,34 @@ pub fn apply_one(dir: &Path, require_repo: bool, dry_run: bool) -> Applied {
                         }
                     }
                 }
-                (Some(repo), _) => point_repo(repo, &from, &to),
+                (Some(repo), _) => {
+                    let written = match config_plan {
+                        Some(plan) => Ok(plan),
+                        None => plan_repo_config(repo, &from, &to),
+                    }
+                    .and_then(|plan| write_repo_config(repo, plan));
+                    match written {
+                        Ok(note) => note,
+                        Err(why) => {
+                            // A renamed tree cargo is not pointed at breaks the next build
+                            // silently: roll back, as the symlink arm does.
+                            return match std::fs::rename(&to, &from) {
+                                Ok(()) => Applied::Skipped {
+                                    path: dir.to_path_buf(),
+                                    reason: format!("{why} — the rename was rolled back"),
+                                },
+                                Err(e) => Applied::Migrated {
+                                    from,
+                                    to,
+                                    config: ConfigNote::Untouched(format!(
+                                        "{why}, and rolling the rename back failed ({e}) — point \
+                                         cargo at the new name yourself"
+                                    )),
+                                },
+                            };
+                        }
+                    }
+                }
                 (None, _) => ConfigNote::Untouched(
                     "no Cargo.toml beside it — point cargo at the new name yourself".to_string(),
                 ),
@@ -1875,6 +2081,37 @@ mod tests {
             panic!("written");
         };
         assert!(t.contains("[other]\ntarget-dir = \"z\"\n"), "{t}");
+        // The [build] header is recognized by what it names, not by its exact bytes: a
+        // trailing comment or inner spaces used to miss the table, append a second
+        // `[build]`, and refuse as unparseable AFTER the rename (2026-09-12, audit K11).
+        let ConfigEdit::Written(t) = point_cargo_config(
+            "[build] # faster links\njobs = 1\n",
+            "target",
+            "target.noindex",
+        ) else {
+            panic!("inserted under a commented header");
+        };
+        assert!(
+            t.contains("[build] # faster links\ntarget-dir = \"target.noindex\"\n"),
+            "{t}"
+        );
+        assert_eq!(t.matches("[build]").count(), 1, "{t}");
+        assert_eq!(
+            point_cargo_config("[ build ]\njobs = 1\n", "target", "target.noindex"),
+            ConfigEdit::Written(
+                "[ build ]\ntarget-dir = \"target.noindex\"\njobs = 1\n".to_string()
+            )
+        );
+        // A sub-table is not the build table.
+        let ConfigEdit::Written(t) =
+            point_cargo_config("[build.x]\ny = 1\n", "target", "target.noindex")
+        else {
+            panic!("appended beside a sub-table");
+        };
+        assert!(
+            t.ends_with("\n[build]\ntarget-dir = \"target.noindex\"\n"),
+            "{t}"
+        );
         // Something that cannot be made to parse is refused, never written.
         assert!(matches!(
             point_cargo_config("[build\nbroken = ", "target", "t"),
@@ -1974,12 +2211,180 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // A `.cargo/config.toml` that is a symlink (a config shared across checkouts, a
+    // dotfiles-managed one) is edited THROUGH the link: the temp is renamed over the file
+    // the link names, never over the link, which would leave a detached regular copy and
+    // stop later edits to the shared file reaching this repo (2026-09-12, the K12 class).
+    // A dangling link is refused before anything is renamed, never replaced by a file.
+    #[cfg(unix)]
+    #[test]
+    fn repo_config_is_written_through_a_symlinked_config_toml() {
+        let root = scratch("config-symlink");
+        let repo = root.join("repo");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let real = shared.join("config.toml");
+        std::fs::write(&real, "[alias]\nb = \"build\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = repo.join(".cargo").join("config.toml");
+        std::os::unix::fs::symlink("../../shared/config.toml", &link).unwrap();
+        let (from, to) = (repo.join("target"), repo.join("target.noindex"));
+
+        let plan = plan_repo_config(&repo, &from, &to).expect("a linked config plans");
+        let note = write_repo_config(&repo, plan).expect("and writes");
+        assert!(matches!(note, ConfigNote::Written(_)), "{note:?}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config.toml must stay a symlink"
+        );
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(
+            text.starts_with("[alias]") && text.contains("target-dir = \"target.noindex\""),
+            "the edit lands in the link's target: {text}"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the real file keeps its mode"
+        );
+        let strays: Vec<_> = [repo.join(".cargo"), shared.clone()]
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d).unwrap().filter_map(Result::ok))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("atpkg"))
+            .collect();
+        assert!(strays.is_empty(), "temp files left: {strays:?}");
+
+        // Dangling: refused at plan time, the link left exactly as it was.
+        let dangling = root.join("dangling");
+        std::fs::create_dir_all(dangling.join(".cargo")).unwrap();
+        let dlink = dangling.join(".cargo").join("config.toml");
+        std::os::unix::fs::symlink(root.join("not-checked-out.toml"), &dlink).unwrap();
+        let refused = plan_repo_config(
+            &dangling,
+            &dangling.join("target"),
+            &dangling.join("target.noindex"),
+        );
+        assert!(refused.is_err(), "a dangling config link is refused");
+        assert!(
+            std::fs::symlink_metadata(&dlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                && !root.join("not-checked-out.toml").exists()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A config that cannot be pointed must refuse BEFORE the rename. Until 2026-09-12 the
+    // non-git branch renamed first and then reported `cargo: NOT re-pointed`, leaving
+    // cargo aimed at a `target/` that no longer existed: the next build rebuilt an
+    // indexed `target/`, the renamed tree was orphaned, and every later pass skipped
+    // silently on "already exists" (audit K11). Three ways in: a config the editor
+    // cannot make parse, a legacy `.cargo/config` cargo would prefer over what gets
+    // written, and a write that fails after the rename (which rolls the rename back).
+    #[test]
+    fn apply_one_rolls_the_rename_back_when_the_cargo_config_cannot_be_pointed() {
+        if !SUPPORTED {
+            return;
+        }
+        let root = scratch("apply-unpointable");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".cargo")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let target = repo.join("target");
+        tagged_target(&target);
+        let noindex = repo.join("target.noindex");
+
+        // (1) Unparseable once edited: a top-level dotted `build.` key already defines
+        // the table, so an appended `[build]` header is a duplicate.
+        let cfg = "build.jobs = 8\n";
+        std::fs::write(repo.join(".cargo/config.toml"), cfg).unwrap();
+        for dry_run in [false, false, true] {
+            let out = apply_one(&target, true, dry_run);
+            assert!(
+                matches!(out, Applied::Skipped { ref reason, .. }
+                    if reason.contains("valid TOML") && !reason.contains("already exists")),
+                "dry_run={dry_run}: {out:?}"
+            );
+            assert!(target.is_dir(), "dry_run={dry_run}: target/ must stay put");
+            assert!(!noindex.exists(), "dry_run={dry_run}: nothing renamed");
+            assert_eq!(
+                std::fs::read_to_string(repo.join(".cargo/config.toml")).unwrap(),
+                cfg
+            );
+        }
+
+        // (2) A legacy `.cargo/config`: cargo reads it first, so a written config.toml
+        // would not move the build.
+        std::fs::remove_file(repo.join(".cargo/config.toml")).unwrap();
+        std::fs::write(repo.join(".cargo/config"), "[build]\njobs = 1\n").unwrap();
+        let out = apply_one(&target, true, false);
+        assert!(
+            matches!(out, Applied::Skipped { ref reason, .. } if reason.contains(".cargo/config")),
+            "{out:?}"
+        );
+        assert!(target.is_dir() && !noindex.exists());
+        assert!(!repo.join(".cargo/config.toml").exists());
+        std::fs::remove_file(repo.join(".cargo/config")).unwrap();
+
+        // (3) The write fails after the rename: `.cargo/` read-only. Rolled back.
+        #[cfg(unix)]
+        {
+            let cargo_dir = repo.join(".cargo");
+            std::fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            // Root writes through 0500; the case only means something when it cannot.
+            if std::fs::write(cargo_dir.join("probe"), "").is_err() {
+                let out = apply_one(&target, true, false);
+                assert!(
+                    matches!(out, Applied::Skipped { ref reason, .. } if reason.contains("rolled back")),
+                    "{out:?}"
+                );
+                assert!(target.is_dir() && !noindex.exists());
+                assert!(!repo.join(".cargo/config.toml").exists());
+            }
+            std::fs::set_permissions(&cargo_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn out_is(a: &Path, b: &Path) -> bool {
         a == b
     }
 
     // A build holding cargo's lock refuses the migration — probed with a real
     // `flock(2)` on `<target>/debug/.cargo-lock`, released, then the migration goes.
+    #[cfg(unix)]
+    #[test]
+    fn config_temp_is_never_created_wider_than_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("config-temp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".config.toml.atpkg-1.tmp");
+        let f = create_config_temp(&path).unwrap();
+        assert_eq!(
+            f.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the temp must be private from the instant it exists"
+        );
+        drop(f);
+        assert!(
+            create_config_temp(&path).is_err(),
+            "exclusive: an existing temp is never opened and truncated"
+        );
+        new_config_permissions(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a config this pass creates gets the ordinary mode"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_live_cargo_lock_refuses_the_migration_until_released() {

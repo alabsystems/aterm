@@ -9,7 +9,12 @@
 //! — the `aterm-ctl` launcher the other drive subcommands use in production, a
 //! scripted mock in the tests — and the server features newer builds add
 //! (`text … tail=`, `await gone`, `key if=`) are probed ONCE and remembered, so
-//! the loop runs against an older host too.
+//! the loop runs against an older host too. A request the server did not serve
+//! — the instance hosting the session went away under it, as it does when an
+//! aterm self-update hands every session to the new instance under the same
+//! `@sid`, or the server turned the connection away — does not end the loop:
+//! the outage is ridden out ([`Session::ride_out`]) and the loop looks again
+//! from a fresh read.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -77,7 +82,70 @@ impl CtlReply {
     pub fn skipped(&self) -> bool {
         self.ok() && self.stdout.trim_start().starts_with("OK skipped")
     }
+    /// The request was not served: the client could not reach the instance
+    /// hosting the session, or lost it mid-exchange — the connection closed
+    /// before a reply (`server closed the connection without responding`,
+    /// measured when aterm 0.82.0 handed its sessions to 0.83.0 under a running
+    /// `watch`), a reply cut short, a socket nothing listens on or that is gone,
+    /// a reset, a broken pipe, a socket timeout — or the server turned the
+    /// connection away before it read the request (`TURNED_AWAY`: its
+    /// admission queue full, or the token sent another instance's). Any other
+    /// `ERR …` line is the server's answer and never this: `ERR no such
+    /// session` and `ERR exited` say the session is gone (though while an
+    /// outage is being ridden out the loop takes `no such session` for one
+    /// more request not served — `Session::unserved`).
+    pub fn lost(&self) -> bool {
+        if self.ok() {
+            return false;
+        }
+        let lines: Vec<&str> = self
+            .stderr
+            .lines()
+            .map(|l| {
+                let l = l.trim();
+                l.strip_prefix("aterm-ctl:").map_or(l, str::trim)
+            })
+            .filter(|l| !l.is_empty())
+            .collect();
+        match lines.iter().find(|l| l.starts_with("ERR")) {
+            Some(err) => TURNED_AWAY.iter().any(|m| {
+                err.strip_prefix(m)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', ';']))
+            }),
+            None => lines.iter().any(|l| {
+                LOST.iter().any(|m| l.contains(m))
+                    || (l.starts_with("connect ") && LOST_SOCKET.iter().any(|m| l.contains(m)))
+            }),
+        }
+    }
 }
+
+/// What the client prints when a request never got the server's answer
+/// ([`CtlReply::lost`]): `aterm-ctl`'s own words for a connection that closed
+/// before the reply or during it, and the OS's for a refused, reset or broken
+/// connection and a socket timeout (the Unix and the Windows spellings).
+const LOST: &[&str] = &[
+    "server closed the connection without responding",
+    "server hung up before the complete response",
+    "Connection refused",
+    "actively refused",
+    "Connection reset",
+    "forcibly closed",
+    "Broken pipe",
+    "Resource temporarily unavailable",
+    "timed out",
+];
+/// A socket path that is gone, as the client's `connect <path>: …` line says
+/// it: the instance that bound it has exited.
+const LOST_SOCKET: &[&str] = &["No such file or directory", "cannot find the file"];
+/// The server's `ERR` lines that turn a connection away BEFORE its request is
+/// read, so nothing was served ([`CtlReply::lost`]), each a whole leading
+/// phrase: `ERR control server busy; retry` (the listener's admission queue is
+/// full — an explicit retry signal) and `ERR auth` (the token sent is not the
+/// one this instance holds: the `latest` alias moved between the client's
+/// connect and its token read, or the instance restarted — the client re-reads
+/// the token on its next run).
+const TURNED_AWAY: &[&str] = &["ERR control server busy", "ERR auth"];
 
 /// The transport seam: run one control request against the target session.
 pub trait Ctl {
@@ -168,10 +236,83 @@ const KEY_ROWS: usize = 8;
 /// budget.
 pub const EXIT_TIMEOUT: u8 = 124;
 
+/// How long an outage is ridden out before it ends the loop, unless
+/// `--reconnect-s` says otherwise.
+const DEFAULT_RECONNECT: Duration = Duration::from_secs(180);
+/// The pause before the first try to reach the session again; each pause
+/// doubles, up to [`RECONNECT_PAUSE_MAX`], across all of an outage's
+/// ride-outs.
+const RECONNECT_PAUSE: Duration = Duration::from_millis(500);
+const RECONNECT_PAUSE_MAX: Duration = Duration::from_secs(8);
+
+/// Why a request failed, as the loop needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fail {
+    /// The request was not served ([`Session::unserved`]): ridden out
+    /// ([`Session::ride_out`]).
+    Lost(String),
+    /// Anything else — a server answer (`ERR exited`, `ERR no such session`
+    /// outside an outage, …), a reply that does not parse, the notes file,
+    /// stdout: final.
+    Hard(String),
+}
+
+impl From<String> for Fail {
+    fn from(e: String) -> Self {
+        Fail::Hard(e)
+    }
+}
+
+impl From<Fail> for String {
+    fn from(f: Fail) -> Self {
+        match f {
+            Fail::Lost(e) | Fail::Hard(e) => e,
+        }
+    }
+}
+
 enum Wait {
     Latched,
     TimedOut,
     Unsupported,
+}
+
+/// Whether one wait saw the content move past a seq ([`Session::moved_past`]).
+enum Past {
+    Moved,
+    /// The step ran out with the content unchanged: the screen the check read
+    /// (none once the budget is spent — nothing is read after it).
+    Still(Option<Screen>),
+}
+
+/// How a ride-out ([`Session::ride_out`]) ended, when it did not end the loop.
+enum Rode {
+    /// A read of the session answered; `fresh` when it is the outage's first,
+    /// `RECONNECTED` said with it.
+    Back { fresh: bool },
+    /// The budget (`--max-s`, `--timeout`) ran out first: the loop's TIMEOUT.
+    Spent,
+}
+
+/// An outage: from the first request the server did not serve until the loop
+/// gets past it ([`Session::call`], [`Session::drive`]). However many
+/// ride-outs it takes, it is said once and bounded by one reconnect window.
+#[derive(Debug)]
+struct Outage {
+    /// When that first request came back unserved: the window runs from here.
+    since: Instant,
+    /// Its kind, the verb and the verb's first word (`await seq`, `key
+    /// if=Do.you.want.to.proceed`, `text --json`): a request of the same kind
+    /// served again — the probe read aside — ends the outage.
+    kind: String,
+    /// `RECONNECT` was said.
+    told: bool,
+    /// `RECONNECTED` was said.
+    back: bool,
+    /// The pause before the next try to reach the session: it keeps doubling
+    /// across the outage's ride-outs, so one that keeps coming back is tried
+    /// less and less often, not every half second.
+    pause: Duration,
 }
 
 /// How the shared loop ended.
@@ -180,6 +321,22 @@ enum End {
     Stopped(Turn),
     /// The budget ran out; the last screen read.
     Timeout(Turn),
+}
+
+/// What the shared loop ([`Session::drive`]) carries from one look to the
+/// next.
+struct Looking {
+    /// The read-only commands approved since the last review point.
+    approved: Vec<String>,
+    /// The first wait of the next turn: the busy footer leaving, except right
+    /// after a press, a review point or a reconnect, when it is no signal.
+    gone_first: bool,
+    /// The review point last handed over, until the worker moves.
+    handed: Option<String>,
+    /// A read since the last turn's end saw the worker busy. Kept here, not
+    /// in one wait's locals, so a busy spell read before a lost connection
+    /// still counts after it.
+    moved: bool,
 }
 
 /// What [`Session::auto_read`] made of a turn.
@@ -199,17 +356,27 @@ trait Review {
     /// A new review point. `false` stops the loop with it (`supervise`);
     /// `true` means it was reported and the loop keeps watching (`watch`).
     fn review(&mut self, turn: &Turn) -> Result<bool, String>;
+    /// An informational line (`RECONNECT …`, `RECONNECTED …`), said as it
+    /// happens.
+    fn say(&mut self, line: &str) -> Result<(), String>;
 }
 
-/// `supervise`: the first review point ends the loop, and is its result.
-struct StopAtReview;
+/// `supervise`: the first review point ends the loop, and is its result; an
+/// informational line goes to `log` (stderr), never into the result.
+struct StopAtReview<'l> {
+    log: &'l mut dyn Write,
+}
 
-impl Review for StopAtReview {
+impl Review for StopAtReview<'_> {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
         Ok(())
     }
     fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(false)
+    }
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        log_line(self.log, line);
+        Ok(())
     }
 }
 
@@ -227,6 +394,9 @@ impl Review for Lines<'_> {
         emit(self.out, &event_line(turn, self.allow))?;
         Ok(true)
     }
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        emit(self.out, line)
+    }
 }
 
 /// What one guarded press did. `seq` is the content baseline the server
@@ -242,11 +412,44 @@ enum Press {
     Skipped { seq: u64 },
 }
 
-/// One driven session: the transport, the target selector, the probed caps.
+/// A guarded press, and whether the connection held until it was seen
+/// through.
+enum Pressing {
+    /// The press was decided and seen through.
+    Done(Press),
+    /// The connection was lost first. `known` is what the loop knows the press
+    /// did — `None` when the press itself got no answer, so the `1` may or may
+    /// not have been written — and `why` the failure.
+    Lost { known: Option<Press>, why: String },
+}
+
+/// One driven session: the transport, the target selector, the probed caps,
+/// how long an outage is ridden out, and what the loop carries across one.
 pub struct Session<'a, C: Ctl> {
     ctl: &'a mut C,
     sid: Option<String>,
     caps: Caps,
+    /// How long an outage is ridden out before the loop ends
+    /// ([`Self::ride_out`]); zero ends the loop at its first unserved request.
+    reconnect: Duration,
+    /// The first pause between tries to reach the session again, and the
+    /// longest (each doubles).
+    pause: Duration,
+    pause_max: Duration,
+    /// The outage in progress: from a request the server did not serve until
+    /// the loop gets past it.
+    outage: Option<Outage>,
+    /// A ride-out's probe read is in flight: its answer does not end the
+    /// outage (it says the session answers a read, not that the request that
+    /// failed would now be served).
+    probing: bool,
+    /// The last screen a read returned: the TIMEOUT's when the budget runs
+    /// out while an outage is ridden out.
+    last: Option<Screen>,
+    /// A `1` the fallback press may have left in the composer, unchecked
+    /// because the connection was lost first: the command it answered. The
+    /// next turn's screen is checked for it ([`Self::look`]).
+    stray: Option<String>,
 }
 
 impl<'a, C: Ctl> Session<'a, C> {
@@ -255,7 +458,20 @@ impl<'a, C: Ctl> Session<'a, C> {
             ctl,
             sid,
             caps: Caps::default(),
+            reconnect: DEFAULT_RECONNECT,
+            pause: RECONNECT_PAUSE,
+            pause_max: RECONNECT_PAUSE_MAX,
+            outage: None,
+            probing: false,
+            last: None,
+            stray: None,
         }
+    }
+
+    /// How long an outage is ridden out before the loop ends
+    /// (`--reconnect-s`; 180 s unless set; zero: not at all).
+    pub fn set_reconnect(&mut self, window: Duration) {
+        self.reconnect = window;
     }
 
     /// The features the server turned out to have (for diagnostics).
@@ -263,18 +479,82 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.caps
     }
 
-    fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+    /// One request to the target session; a client that could not be
+    /// launched at all is final. Keeps the outage's books: a request the
+    /// server did not serve ([`Self::unserved`]) starts one, unless one is in
+    /// progress; a request of the outage's kind served again ends it, and so
+    /// does an `await seq` that latched — the content moved on the instance
+    /// that answers now. The probe read's answer ends nothing.
+    fn call(&mut self, args: &[&str]) -> Result<CtlReply, Fail> {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         if let Some(sid) = &self.sid {
             full.push(sid.as_str());
         }
         full.extend_from_slice(args);
-        self.ctl.call(&full)
+        let r = self.ctl.call(&full).map_err(Fail::Hard)?;
+        let kind = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+        if self.unserved(&r) {
+            if self.outage.is_none() {
+                self.outage = Some(Outage {
+                    since: Instant::now(),
+                    kind,
+                    told: false,
+                    back: false,
+                    pause: self.pause,
+                });
+            }
+        } else if !self.probing
+            && self
+                .outage
+                .as_ref()
+                .is_some_and(|o| o.kind == kind || (kind == "await seq" && r.ok()))
+        {
+            self.outage = None;
+        }
+        Ok(r)
+    }
+
+    /// The request was not served: the reply never came or the server turned
+    /// the connection away ([`CtlReply::lost`]) — or, while an outage is being
+    /// ridden out, the server does not host the session: the instance that
+    /// adopts the sessions in a handoff may not host this one YET, and a
+    /// request it forwards to the instance it replaces falls through to `ERR
+    /// no such session` once that one is gone. Outside an outage `no such
+    /// session` is the session gone, and final.
+    fn unserved(&self, r: &CtlReply) -> bool {
+        r.lost() || (self.outage.is_some() && r.is_err("no such session"))
+    }
+
+    /// A failed request's error, typed: [`Fail::Lost`] when it was not served
+    /// ([`Self::unserved`]), else final.
+    fn fault(&self, r: &CtlReply, what: String) -> Fail {
+        if self.unserved(r) {
+            Fail::Lost(what)
+        } else {
+            Fail::Hard(what)
+        }
     }
 
     /// Read the screen: `text --json tail=40` where the server accepts it (probed
     /// once), else the full `text --json`.
     pub fn read_screen(&mut self) -> Result<Screen, String> {
+        self.screen().map_err(String::from)
+    }
+
+    /// [`Self::read_screen`], a request not served told apart; the screen is
+    /// kept as the last one read.
+    /// One read of the worker's screen over the control socket. Named `screen`, not
+    /// `read`: the lock-order census (OB-7) identifies a lock by its NAME —
+    /// `read`/`write`/`lock`/`try_*` on a receiver — and excludes nothing, by
+    /// design; a method called `read` that is held across another `read` reads as a
+    /// re-entrant lock and fails the gate (2026-09-12, `press_one_guarded`).
+    fn screen(&mut self) -> Result<Screen, Fail> {
+        let screen = self.read_once()?;
+        self.last = Some(screen.clone());
+        Ok(screen)
+    }
+
+    fn read_once(&mut self) -> Result<Screen, Fail> {
         if self.caps.tail != Some(false) {
             let tail = format!("tail={TAIL_ROWS}");
             let r = self.call(&["text", "--json", &tail])?;
@@ -282,19 +562,25 @@ impl<'a, C: Ctl> Session<'a, C> {
                 self.caps.tail = Some(false);
             } else if r.ok() {
                 self.caps.tail = Some(true);
-                return parse_text_json(&r.stdout);
+                return parse_text_json(&r.stdout).map_err(Fail::Hard);
             } else {
-                return Err(format!("text --json {tail} failed: {}", r.stderr.trim()));
+                return Err(self.fault(
+                    &r,
+                    format!("text --json {tail} failed: {}", r.stderr.trim()),
+                ));
             }
         }
         let r = self.call(&["text", "--json"])?;
         if !r.ok() {
-            return Err(format!("text --json failed: {}", r.stderr.trim()));
+            return Err(self.fault(&r, format!("text --json failed: {}", r.stderr.trim())));
         }
-        parse_text_json(&r.stdout)
+        parse_text_json(&r.stdout).map_err(Fail::Hard)
     }
 
-    fn wait(&mut self, cond: &[&str], step: Duration) -> Result<Wait, String> {
+    /// One `await <cond> timeout <step>`. A request not served is told apart
+    /// before the exit code is read: the client's own deadline also exits 124,
+    /// and only the server's `OK timeout` is a step that ran out.
+    fn wait(&mut self, cond: &[&str], step: Duration) -> Result<Wait, Fail> {
         let ms = step.as_millis().to_string();
         let mut args = vec!["await"];
         args.extend_from_slice(cond);
@@ -303,16 +589,40 @@ impl<'a, C: Ctl> Session<'a, C> {
         let r = self.call(&args)?;
         if r.ok() {
             Ok(Wait::Latched)
+        } else if self.unserved(&r) {
+            Err(Fail::Lost(format!(
+                "await {} failed: {}",
+                cond.join(" "),
+                r.stderr.trim()
+            )))
         } else if r.timed_out() {
             Ok(Wait::TimedOut)
         } else if r.usage_error() {
             Ok(Wait::Unsupported)
         } else {
-            Err(format!(
+            Err(Fail::Hard(format!(
                 "await {} failed: {}",
                 cond.join(" "),
                 r.stderr.trim()
-            ))
+            )))
+        }
+    }
+
+    /// The turn the TIMEOUT carries when the budget runs out while an outage
+    /// is ridden out: the last screen read, as it read (a busy phase and no
+    /// rows when no read ever answered).
+    fn spent_turn(&self) -> Turn {
+        match &self.last {
+            Some(screen) => Turn {
+                phase: worker_phase(&screen.rows),
+                screen: screen.clone(),
+                timed_out: true,
+            },
+            None => Turn {
+                phase: Phase::Busy,
+                screen: Screen::default(),
+                timed_out: true,
+            },
         }
     }
 
@@ -326,23 +636,54 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// an older build. A screen without Claude Code's composer frame (a build,
     /// a script, a REPL) that never held still for the 2 s and shows no
     /// approval box is output still arriving, and counts as busy: its turn
-    /// ends when the output pauses.
+    /// ends when the output pauses. An outage is ridden out
+    /// ([`Self::ride_out`], its lines on stderr) and the wait starts again
+    /// from a fresh read; a timeout spent in one is the timed-out turn all the
+    /// same, on the last screen read (`spent_turn`).
     pub fn await_turn(&mut self, timeout: Duration) -> Result<Turn, String> {
-        self.await_turn_from(timeout, true).map(|(turn, _)| turn)
+        self.await_turn_to(timeout, &mut std::io::stderr())
+    }
+
+    /// [`Self::await_turn`], its `RECONNECT …` lines said to `log`.
+    fn await_turn_to(&mut self, timeout: Duration, log: &mut dyn Write) -> Result<Turn, String> {
+        let deadline = Instant::now() + timeout;
+        let mut gone_first = true;
+        let mut moved = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.await_turn_from(remaining, gone_first, &mut moved) {
+                Ok(turn) => return Ok(turn),
+                Err(Fail::Lost(why)) => {
+                    let rode = self.ride_out(why, deadline, &mut |line| {
+                        log_line(&mut *log, line);
+                        Ok(())
+                    })?;
+                    if let Rode::Spent = rode {
+                        return Ok(self.spent_turn());
+                    }
+                    // What the instance that answers now serves may still be
+                    // arriving: settle first.
+                    gone_first = false;
+                }
+                Err(Fail::Hard(e)) => return Err(e),
+            }
+        }
     }
 
     /// [`Self::await_turn`], with the `await gone` first wait optional: right
     /// after an approval the busy footer is not up YET, so its leaving is no
-    /// signal — the settle wait is the first one. Also says whether a read on
-    /// the way was busy: the worker moved since the last look.
+    /// signal — the settle wait is the first one. Sets `saw_busy` when a read
+    /// on the way was busy (the worker moved since the last look); the caller
+    /// owns the flag, so what was read before a lost connection is not lost
+    /// with it.
     fn await_turn_from(
         &mut self,
         timeout: Duration,
         gone_first: bool,
-    ) -> Result<(Turn, bool), String> {
+        saw_busy: &mut bool,
+    ) -> Result<Turn, Fail> {
         let deadline = Instant::now() + timeout;
         let mut first = gone_first;
-        let mut saw_busy = false;
         loop {
             let step = deadline
                 .saturating_duration_since(Instant::now())
@@ -365,7 +706,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 settled = matches!(self.wait(&["idle", IDLE_MS], step)?, Wait::Latched);
             }
             first = false;
-            let screen = self.read_screen()?;
+            let screen = self.screen()?;
             let mut phase = worker_phase(&screen.rows);
             // No composer frame and the screen never held still: a build's or a
             // REPL's output still arriving, not the end of anything.
@@ -373,26 +714,24 @@ impl<'a, C: Ctl> Session<'a, C> {
                 && !matches!(phase, Phase::Busy | Phase::Prompt)
                 && !has_composer_frame(&screen.rows);
             if phase != Phase::Busy && !writing {
-                let turn = Turn {
+                return Ok(Turn {
                     phase,
                     screen,
                     timed_out: false,
-                };
-                return Ok((turn, saw_busy));
+                });
             }
             if writing {
                 phase = Phase::Busy;
             }
             if !(writing && gone) {
-                saw_busy = true;
+                *saw_busy = true;
             }
             if Instant::now() >= deadline {
-                let turn = Turn {
+                return Ok(Turn {
                     phase,
                     screen,
                     timed_out: true,
-                };
-                return Ok((turn, saw_busy));
+                });
             }
             if writing && gone {
                 // Settle first: the next wait is the idle one.
@@ -407,10 +746,21 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// compact result when the worker needs the manager (a non-read prompt, a
     /// question, a limit notice, an idle composer); [`EXIT_TIMEOUT`] with
     /// `TIMEOUT` and the last read's compact result when the budget is spent —
-    /// a turn read at or after the deadline is the TIMEOUT, never pressed.
+    /// a turn read at or after the deadline is the TIMEOUT, never pressed, and
+    /// so is a budget spent while an outage is ridden out. An outage is ridden
+    /// out ([`Self::ride_out`]), its lines on stderr, never in the result.
     pub fn supervise(&mut self, opts: &SuperviseOpts) -> Result<(String, u8), String> {
+        self.supervise_to(opts, &mut std::io::stderr())
+    }
+
+    /// [`Self::supervise`], its `RECONNECT …` lines said to `log`.
+    fn supervise_to(
+        &mut self,
+        opts: &SuperviseOpts,
+        log: &mut dyn Write,
+    ) -> Result<(String, u8), String> {
         let allow = opts.allow();
-        Ok(match self.drive(opts, &mut StopAtReview)? {
+        Ok(match self.drive(opts, &mut StopAtReview { log })? {
             End::Stopped(turn) => (render_result(&turn, &allow), 0),
             End::Timeout(turn) => (
                 format!("TIMEOUT\n{}", render_result(&turn, &allow)),
@@ -427,14 +777,22 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// looks the same as the one last reported ([`review_key`]: the same phase,
     /// summary and status row, the same last rows of the transcript up to it,
     /// the same box) is neither pressed nor printed again unless a read in
-    /// between saw the worker busy or the loop approved a read — so a footer
-    /// that ticks does not repeat an EVENT, while a new box, a new reply, a
-    /// manager's row or a retry's new notice does, however short the busy
-    /// spell before it. An approval prints `APPROVED seq=<n> <command>`. The
-    /// last line is `TIMEOUT` (returns [`EXIT_TIMEOUT`]) when the budget is
-    /// spent — no press and no EVENT comes after the deadline — or `EXIT
-    /// <reason>` (returns 1) when the session goes or the loop fails (a
-    /// request, the notes file). Every line is flushed as it is written.
+    /// between saw the worker busy, the loop approved a read, or an outage
+    /// came in between — so a footer that ticks does not repeat an EVENT,
+    /// while a new box, a new reply, a manager's row or a retry's new notice
+    /// does, however short the busy spell before it; and since nothing could
+    /// be read in an outage, the point still showing after one is reported
+    /// once more. An approval prints `APPROVED seq=<n> <command>`. An outage
+    /// prints `RECONNECT <reason>`, is ridden out ([`Self::ride_out`]) and
+    /// prints `RECONNECTED after <ms> ms` once a read answers again — each
+    /// once an outage, however often it comes back before the loop gets past
+    /// it. The last line is `TIMEOUT` (returns [`EXIT_TIMEOUT`]) when the
+    /// budget is spent — no press and no EVENT comes after the deadline, and a
+    /// budget spent in an outage is the TIMEOUT too — or `EXIT <reason>`
+    /// (returns 1) when the session goes, the outage outlasts its reconnect
+    /// window (`EXIT reconnect window lapsed: <the last failure>`) or the loop
+    /// fails (a request, the notes file). Every line is flushed as it is
+    /// written.
     pub fn watch(&mut self, opts: &SuperviseOpts, out: &mut dyn Write) -> u8 {
         let allow = opts.allow();
         let end = self.drive(
@@ -459,54 +817,222 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// `--auto-reads`, approve a read-only Bash prompt ([`Self::auto_read`]);
     /// anything else is a review point for `review`, which stops the loop or
     /// reports the point and keeps watching — and then the loop waits for the
-    /// screen to move past it before the next look.
+    /// screen to move past it before the next look. A request not served is
+    /// ridden out ([`Self::ride_out`], its lines said through `review`) and
+    /// the loop looks again from a fresh read; the budget spent in it is the
+    /// loop's TIMEOUT. A look that gets through ends the outage.
     fn drive(&mut self, opts: &SuperviseOpts, review: &mut dyn Review) -> Result<End, String> {
         let deadline = Instant::now() + opts.max;
         let allow = opts.allow();
-        let mut approved: Vec<String> = Vec::new();
-        // The first wait of the next turn: the busy footer leaving, except
-        // right after a press or a review point, when it is not up yet.
-        let mut gone_first = true;
-        // The review point last handed over, until the worker moves.
-        let mut handed: Option<String> = None;
+        let mut state = Looking {
+            approved: Vec::new(),
+            gone_first: true,
+            handed: None,
+            moved: false,
+        };
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let (turn, moved) = self.await_turn_from(remaining, gone_first)?;
-            if moved {
-                handed = None;
-            }
-            // The budget bounds every action: a turn read at or after the
-            // deadline is neither pressed nor reported — it is the TIMEOUT.
-            if turn.timed_out || Instant::now() >= deadline {
-                return Ok(End::Timeout(turn));
-            }
-            let seen = if handed.as_deref() == Some(review_key(&turn, &allow).as_str()) {
-                // The point already handed over, still showing: the screen
-                // moved (a footer tick, a banner) and nothing the point is made
-                // of did. Nothing is pressed or reported.
-                turn
-            } else {
-                let point =
-                    match self.auto_read(turn, opts, &allow, &mut approved, deadline, review)? {
-                        Step::Again { settle } => {
-                            handed = None;
-                            gone_first = !settle;
-                            continue;
-                        }
-                        Step::Review(point) => point,
-                    };
-                if !review.review(&point)? {
-                    return Ok(End::Stopped(point));
+            match self.look(opts, &allow, &mut state, deadline, review) {
+                Ok(Some(end)) => return Ok(end),
+                Ok(None) => self.outage = None,
+                Err(Fail::Lost(why)) => {
+                    match self.ride_out(why, deadline, &mut |line| review.say(line))? {
+                        Rode::Spent => return Ok(End::Timeout(self.spent_turn())),
+                        // Nothing could be read while the session was out of
+                        // reach, so nothing says the worker did not move: the
+                        // point handed before is handed again if it is still
+                        // showing — once an outage, not on every relapse of
+                        // it, so an outage that keeps coming back does not
+                        // repeat an EVENT each time.
+                        Rode::Back { fresh: true } => state.handed = None,
+                        Rode::Back { fresh: false } => {}
+                    }
+                    // The screen may have changed and its seq may have started
+                    // over: settle, then read, as after a press. No seq from
+                    // before is waited on, and a press that was in flight is
+                    // not repeated — the box is read and classified again.
+                    state.gone_first = false;
                 }
-                // The manager has the worker now, as after a fresh `supervise`.
-                approved.clear();
-                handed = Some(review_key(&point, &allow));
-                point
-            };
-            if !self.wait_past(seen.screen.seq, deadline)? {
-                return Ok(End::Timeout(seen));
+                Err(Fail::Hard(e)) => return Err(e),
             }
-            gone_first = false;
+        }
+    }
+
+    /// One look of [`Self::drive`]: await the turn, then approve a read, hand
+    /// a review point over, or pass over the point already handed; `Some`
+    /// ends the loop. First, if the fallback press may have left a `1` in the
+    /// composer unchecked ([`Self::stray`]), the turn is checked for it: one
+    /// found is backspaced and noted, and the loop looks again.
+    fn look(
+        &mut self,
+        opts: &SuperviseOpts,
+        allow: &[String],
+        state: &mut Looking,
+        deadline: Instant,
+        review: &mut dyn Review,
+    ) -> Result<Option<End>, Fail> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let turn = self.await_turn_from(remaining, state.gone_first, &mut state.moved)?;
+        if std::mem::take(&mut state.moved) {
+            state.handed = None;
+        }
+        // The budget bounds every action: a turn read at or after the
+        // deadline is neither pressed nor reported — it is the TIMEOUT.
+        if turn.timed_out || Instant::now() >= deadline {
+            return Ok(Some(End::Timeout(turn)));
+        }
+        if let Some(command) = self.stray.take()
+            && stray_digit(&turn.screen)
+        {
+            let r = self.call(&["key", "backspace"])?;
+            if self.unserved(&r) {
+                self.stray = Some(command);
+                return Err(Fail::Lost(format!(
+                    "key backspace failed: {}",
+                    r.stderr.trim()
+                )));
+            }
+            append_note(
+                opts.notes.as_deref(),
+                &format!(
+                    "backspaced a 1 left in the composer by the press for: {command} (the \
+                     connection was lost before the press was checked)"
+                ),
+            )?;
+            state.gone_first = false;
+            return Ok(None);
+        }
+        let seen = if state.handed.as_deref() == Some(review_key(&turn, allow).as_str()) {
+            // The point already handed over, still showing: the screen
+            // moved (a footer tick, a banner) and nothing the point is made
+            // of did. Nothing is pressed or reported.
+            turn
+        } else {
+            let point =
+                match self.auto_read(turn, opts, allow, &mut state.approved, deadline, review)? {
+                    Step::Again { settle } => {
+                        state.handed = None;
+                        state.gone_first = !settle;
+                        return Ok(None);
+                    }
+                    Step::Review(point) => point,
+                };
+            // A point decided at or after the deadline — the press's wait for
+            // the box to leave ran out with the budget — is the TIMEOUT too.
+            if Instant::now() >= deadline {
+                return Ok(Some(End::Timeout(point)));
+            }
+            if !review.review(&point)? {
+                return Ok(Some(End::Stopped(point)));
+            }
+            // The manager has the worker now, as after a fresh `supervise`.
+            state.approved.clear();
+            state.handed = Some(review_key(&point, allow));
+            point
+        };
+        if !self.wait_past(seen.screen.seq, deadline)? {
+            return Ok(Some(End::Timeout(seen)));
+        }
+        state.gone_first = false;
+        Ok(None)
+    }
+
+    /// Ride out an outage — a request the server did not serve
+    /// ([`Self::unserved`]), as when an aterm self-update hands every session
+    /// to the new instance under the same `@sid`. Reads the screen of the same
+    /// selector after a pause that starts at 0.5 s and doubles up to 8 s
+    /// across the outage, until a read answers
+    /// (`Rode::Back`) or the window runs out. The client resolves its socket
+    /// afresh for every request: with none named (no `--socket`, no
+    /// `$ATERM_CONTROL_SOCK`) that is the instance hosting the caller's own
+    /// terminal, else the newest instance (the `aterm.sock` alias) — after a
+    /// handoff, the new instance, which hosts the sid or forwards the request
+    /// to the instance that does. A socket named is dialed as named, and a
+    /// per-instance one (`aterm-<pid>.sock`) goes with its instance, so an
+    /// outage through one lapses.
+    ///
+    /// The window is the OUTAGE's, not one ride-out's: it runs from the first
+    /// request not served, and an outage lasts until the loop gets past it — a
+    /// request of the kind that failed is served again ([`Self::call`]), an
+    /// `await seq` latches, or a look gets through ([`Self::drive`]). A read
+    /// answering here says only that the session answers a read, so a request
+    /// not served after it, before any of those, is the same outage: its
+    /// window runs on, and nothing more is said. `RECONNECT <why>` (cut at 160
+    /// characters) is said at an outage's first ride-out, and `RECONNECTED
+    /// after <ms> ms` (since the outage began) at its first answer.
+    ///
+    /// Ends the loop (`Err`) when the window runs out (`reconnect window
+    /// lapsed: <the last failure>`), with `why` as it came when the window is
+    /// zero (`--reconnect-s 0`), and at once when the server answers a probe
+    /// with an `ERR` that [`Self::unserved`] does not name (`ERR exited`, …).
+    /// The budget spent first — before the ride-out, or during it — is
+    /// `Rode::Spent`, the loop's TIMEOUT. The read is the probe, never the
+    /// request that failed: an `await seq <n>` from before a handoff names a
+    /// count the new instance has not reached (its content seq starts over —
+    /// measured, from about 652 to 12), and a press is decided again from a
+    /// fresh read. The probed caps are forgotten first: the instance that
+    /// answers may be another build.
+    fn ride_out(
+        &mut self,
+        why: String,
+        deadline: Instant,
+        say: &mut dyn FnMut(&str) -> Result<(), String>,
+    ) -> Result<Rode, String> {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(Rode::Spent);
+        }
+        if self.reconnect.is_zero() {
+            return Err(why);
+        }
+        let first_pause = self.pause;
+        let outage = self.outage.get_or_insert_with(|| Outage {
+            since: now,
+            kind: String::new(),
+            told: false,
+            back: false,
+            pause: first_pause,
+        });
+        let since = outage.since;
+        if !std::mem::replace(&mut outage.told, true) {
+            say(&format!("RECONNECT {}", clip(&one_line(&why))))?;
+        }
+        let end = since
+            .checked_add(self.reconnect)
+            .map_or(deadline, |end| end.min(deadline));
+        self.caps = Caps::default();
+        let mut last = why;
+        loop {
+            let now = Instant::now();
+            if now >= end {
+                return if now >= deadline {
+                    Ok(Rode::Spent)
+                } else {
+                    Err(format!("reconnect window lapsed: {last}"))
+                };
+            }
+            let pause = self.outage.as_ref().map_or(first_pause, |o| o.pause);
+            std::thread::sleep(pause.min(end - now));
+            if let Some(o) = self.outage.as_mut() {
+                o.pause = pause.saturating_mul(2).min(self.pause_max);
+            }
+            self.probing = true;
+            let probe = self.screen();
+            self.probing = false;
+            match probe {
+                Ok(_) => {
+                    let fresh = self
+                        .outage
+                        .as_mut()
+                        .is_some_and(|o| !std::mem::replace(&mut o.back, true));
+                    if fresh {
+                        let ms = since.elapsed().as_millis();
+                        say(&format!("RECONNECTED after {ms} ms"))?;
+                    }
+                    return Ok(Rode::Back { fresh });
+                }
+                Err(Fail::Lost(e)) => last = e,
+                Err(Fail::Hard(e)) => return Err(e),
+            }
         }
     }
 
@@ -515,7 +1041,10 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// `review`), and the loop looks again once the box has LEFT; anything
     /// else — not a prompt, not Bash, not read-only, the same read back after
     /// two approvals, a guard that matched no row of this very box, a box that
-    /// did not move after the press — is a review point.
+    /// did not move after the press — is a review point. When the connection
+    /// is lost before the press is seen through, what the loop knows it did is
+    /// noted — a `1` the server confirmed is an approval, a press whose answer
+    /// never came is noted as such and is not — and the loss is ridden out.
     fn auto_read(
         &mut self,
         turn: Turn,
@@ -524,7 +1053,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         approved: &mut Vec<String>,
         deadline: Instant,
         review: &mut dyn Review,
-    ) -> Result<Step, String> {
+    ) -> Result<Step, Fail> {
         let bash = (opts.auto_reads && turn.phase == Phase::Prompt)
             .then(|| parse_prompt(&turn.screen.rows))
             .flatten()
@@ -548,30 +1077,62 @@ impl<'a, C: Ctl> Session<'a, C> {
             )?;
             return Ok(Step::Review(turn));
         }
-        match self.press_one_guarded(&p, &turn.screen)? {
+        let mut approve = |seq: u64| -> Result<(), String> {
+            approved.push(p.command.clone());
+            append_note(
+                opts.notes.as_deref(),
+                &format!("approved read-only: {}", p.command),
+            )?;
+            review.approved(seq, &p.command)
+        };
+        let press = match self.press_one_guarded(&p, &turn.screen)? {
+            Pressing::Done(press) => press,
+            Pressing::Lost { known, why } => {
+                match known {
+                    Some(Press::Pressed { seq }) => approve(seq)?,
+                    Some(Press::Skipped { .. }) => append_note(
+                        opts.notes.as_deref(),
+                        &format!(
+                            "nothing pressed, the box had left the screen: {}",
+                            p.command
+                        ),
+                    )?,
+                    None => append_note(
+                        opts.notes.as_deref(),
+                        &format!(
+                            "pressed, no answer came; the box is read again after the \
+                             reconnect: {}",
+                            p.command
+                        ),
+                    )?,
+                }
+                return Err(Fail::Lost(why));
+            }
+        };
+        match press {
             Press::Pressed { seq } => {
-                approved.push(p.command.clone());
-                append_note(
-                    opts.notes.as_deref(),
-                    &format!("approved read-only: {}", p.command),
-                )?;
-                review.approved(seq, &p.command)?;
+                approve(seq)?;
                 // The box must LEAVE before the next look: `await gone` is
                 // level-triggered and a box shows no busy footer, so an
                 // immediate re-read of an unchanged screen would match the same
                 // box and press it again — the stray digit the guard exists to
                 // prevent.
-                if !self.moved_past(seq, deadline)? {
-                    append_note(
-                        opts.notes.as_deref(),
-                        &format!(
-                            "handed to the manager (the box did not change after the press): {}",
-                            p.command
-                        ),
-                    )?;
-                    return Ok(Step::Review(self.current_turn()?));
-                }
-                Ok(Step::Again { settle: true })
+                let screen = match self.moved_past(seq, deadline)? {
+                    Past::Moved => return Ok(Step::Again { settle: true }),
+                    Past::Still(Some(screen)) => screen,
+                    // The budget ran out waiting: nothing is read or handed
+                    // over after it — the box as last read is the TIMEOUT's
+                    // ([`Self::look`]).
+                    Past::Still(None) => return Ok(Step::Review(turn)),
+                };
+                append_note(
+                    opts.notes.as_deref(),
+                    &format!(
+                        "handed to the manager (the box did not change after the press): {}",
+                        p.command
+                    ),
+                )?;
+                Ok(Step::Review(turn_of(screen)))
             }
             Press::Skipped { seq } => {
                 if seq == turn.screen.seq {
@@ -598,21 +1159,11 @@ impl<'a, C: Ctl> Session<'a, C> {
         }
     }
 
-    /// One read, classified.
-    fn current_turn(&mut self) -> Result<Turn, String> {
-        let screen = self.read_screen()?;
-        Ok(Turn {
-            phase: worker_phase(&screen.rows),
-            screen,
-            timed_out: false,
-        })
-    }
-
     /// Wait for the content to move past `seq`, step after step, until
     /// `deadline`: `false` when the budget ran out with the screen unchanged.
-    fn wait_past(&mut self, seq: u64, deadline: Instant) -> Result<bool, String> {
+    fn wait_past(&mut self, seq: u64, deadline: Instant) -> Result<bool, Fail> {
         while Instant::now() < deadline {
-            if self.moved_past(seq, deadline)? {
+            if let Past::Moved = self.moved_past(seq, deadline)? {
                 return Ok(true);
             }
         }
@@ -620,15 +1171,32 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     /// Wait (one step, capped by `deadline`) for the content to move past
-    /// `seq`: `true` when it did, `false` when the screen sat unchanged.
-    fn moved_past(&mut self, seq: u64, deadline: Instant) -> Result<bool, String> {
+    /// `seq`. A step that runs out is checked with a read: `await seq <n>`
+    /// latches only once THIS instance's count passes `n`, so after a handoff
+    /// no request saw fail — the instance handing over answered the step (its
+    /// readers parked, its count frozen), or the step ended as the successor
+    /// took the socket — the loop would wait on a count the successor, whose
+    /// count started over, may not reach for hours. A read BELOW `seq` is
+    /// that other count: the screen moved. Nothing is read once the budget is
+    /// spent.
+    fn moved_past(&mut self, seq: u64, deadline: Instant) -> Result<Past, Fail> {
         let step = deadline
             .saturating_duration_since(Instant::now())
             .min(WAIT_STEP);
         match self.wait(&["seq", &seq.to_string()], step)? {
-            Wait::Latched => Ok(true),
-            Wait::TimedOut => Ok(false),
-            Wait::Unsupported => Err("await seq is not known to this host".to_string()),
+            Wait::Latched => Ok(Past::Moved),
+            Wait::TimedOut if Instant::now() >= deadline => Ok(Past::Still(None)),
+            Wait::TimedOut => {
+                let now = self.screen()?;
+                Ok(if now.seq < seq {
+                    Past::Moved
+                } else {
+                    Past::Still(Some(now))
+                })
+            }
+            Wait::Unsupported => Err(Fail::Hard(
+                "await seq is not known to this host".to_string(),
+            )),
         }
     }
 
@@ -644,7 +1212,16 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// answers, reading `if=…` as a key name — falls back for good; `ERR busy
     /// sink` is retried; every other `ERR` (`halted`, `no such session`,
     /// `badregex`) is an error, never an approval.
-    fn press_one_guarded(&mut self, prompt: &Prompt, seen: &Screen) -> Result<Press, String> {
+    ///
+    /// A lost connection is [`Pressing::Lost`]: a press whose answer never
+    /// came is not an approval, and is not sent again as it was — the loop
+    /// rides the connection out, then reads and classifies again
+    /// ([`Self::drive`]), the box may have moved or gone. On the fallback path
+    /// a `1` the server confirmed is written, lost connection or not: it is
+    /// the approval it was, and what could not be checked after it — a digit
+    /// in the composer — is checked on the next turn ([`Self::stray`]), as it
+    /// is after a fallback press whose answer never came.
+    fn press_one_guarded(&mut self, prompt: &Prompt, seen: &Screen) -> Result<Pressing, Fail> {
         if self.caps.key_if != Some(false) {
             let cond = format!("if={PROCEED}");
             let mut busy = 0;
@@ -653,11 +1230,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                 if r.ok() {
                     self.caps.key_if = Some(true);
                     let seq = r.seq().unwrap_or(seen.seq);
-                    return Ok(if r.skipped() {
+                    return Ok(Pressing::Done(if r.skipped() {
                         Press::Skipped { seq }
                     } else {
                         Press::Pressed { seq }
-                    });
+                    }));
+                }
+                let why = format!("key {cond} 1 failed: {}", r.stderr.trim());
+                if self.unserved(&r) {
+                    // The guard ran under the server's lock or not at all: a
+                    // `1` it wrote went to the box, never the composer.
+                    return Ok(Pressing::Lost { known: None, why });
                 }
                 if r.unknown_form() {
                     self.caps.key_if = Some(false);
@@ -668,40 +1251,82 @@ impl<'a, C: Ctl> Session<'a, C> {
                     std::thread::sleep(BUSY_SINK_BACKOFF);
                     continue;
                 }
-                return Err(format!("key {cond} 1 failed: {}", r.err_text()));
+                return Err(Fail::Hard(why));
             }
         }
-        let now = self.read_screen()?;
+        let now = self.screen()?;
         match parse_prompt(&now.rows) {
             Some(q) if q.command == prompt.command => {}
-            _ => return Ok(Press::Skipped { seq: now.seq }),
+            _ => return Ok(Pressing::Done(Press::Skipped { seq: now.seq })),
         }
         let r = self.call(&["key", "1"])?;
         if !r.ok() {
-            return Err(format!("key 1 failed: {}", r.err_text()));
+            let why = format!("key 1 failed: {}", r.stderr.trim());
+            if self.unserved(&r) {
+                self.stray = Some(prompt.command.clone());
+                return Ok(Pressing::Lost { known: None, why });
+            }
+            return Err(Fail::Hard(why));
         }
         let seq = r.seq().unwrap_or(now.seq);
+        let pressed = Press::Pressed { seq };
         // Let the worker take the press before looking for a stray digit: the
         // first content change after it, bounded.
-        self.wait(&["seq", &seq.to_string()], STRAY_SETTLE)?;
-        let after = self.read_screen()?;
-        if parse_prompt(&after.rows).is_none()
-            && composer_text(&after.rows).as_deref() == Some("1")
-            && !is_placeholder(&after.rows, after.cursor_col)
+        let after = match self
+            .wait(&["seq", &seq.to_string()], STRAY_SETTLE)
+            .and_then(|_| self.screen())
         {
-            self.call(&["key", "backspace"])?;
-            return Ok(Press::Skipped { seq: after.seq });
+            Ok(after) => after,
+            Err(Fail::Lost(why)) => {
+                self.stray = Some(prompt.command.clone());
+                return Ok(Pressing::Lost {
+                    known: Some(pressed),
+                    why,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        if stray_digit(&after) {
+            let r = self.call(&["key", "backspace"])?;
+            let skipped = Press::Skipped { seq: after.seq };
+            if self.unserved(&r) {
+                self.stray = Some(prompt.command.clone());
+                return Ok(Pressing::Lost {
+                    known: Some(skipped),
+                    why: format!("key backspace failed: {}", r.stderr.trim()),
+                });
+            }
+            return Ok(Pressing::Done(skipped));
         }
-        Ok(Press::Pressed { seq })
+        Ok(Pressing::Done(pressed))
     }
+}
+
+/// One screen, classified as a turn that ended.
+fn turn_of(screen: Screen) -> Turn {
+    Turn {
+        phase: worker_phase(&screen.rows),
+        screen,
+        timed_out: false,
+    }
+}
+
+/// A `1` sitting alone in the composer with no box on the screen: the digit
+/// the fallback press wrote after the prompt had resolved on its own (typed
+/// text, not the placeholder the composer shows when empty).
+fn stray_digit(screen: &Screen) -> bool {
+    parse_prompt(&screen.rows).is_none()
+        && composer_text(&screen.rows).as_deref() == Some("1")
+        && !is_placeholder(&screen.rows, screen.cursor_col)
 }
 
 /// The lines `phase` / `await-turn` print: the phase word, then for a prompt
 /// its parsed kind, command, description, classification and options; for
 /// busy, `reason <zone>: <rule>` (which signal fired, and where — `whole
 /// screen, no composer frame: output still changing` when a wait ran out on a
-/// screen without the composer frame that kept changing); for a limit notice,
-/// `message <text>` and `reset <text|->`.
+/// screen without the composer frame that kept changing, `no screen: no read
+/// answered before the timeout` when the budget ran out in an outage before
+/// any read did); for a limit notice, `message <text>` and `reset <text|->`.
 pub fn render_phase(turn: &Turn, python_allow: &[String]) -> String {
     let mut out = format!("{}\n", turn.phase.name());
     match &turn.phase {
@@ -712,6 +1337,11 @@ pub fn render_phase(turn: &Turn, python_allow: &[String]) -> String {
         }
         Phase::Busy => match busy_signal(&turn.screen.rows) {
             Some(b) => out.push_str(&format!("reason {b}\n")),
+            // A real read always has rows: none is the timeout an outage
+            // spent before any read answered (see `spent_turn`).
+            None if turn.screen.rows.is_empty() => {
+                out.push_str("reason no screen: no read answered before the timeout\n")
+            }
             // Only a timed-out wait says this: output still arriving on a
             // screen without the composer frame (see `await_turn_from`).
             None => out.push_str("reason whole screen, no composer frame: output still changing\n"),
@@ -840,16 +1470,27 @@ fn or_dash(s: &str) -> String {
 /// session going when that is what the host said — `ERR exited` to a wait in
 /// progress when the session ends, `ERR no such session` to a request after.
 pub fn exit_reason(err: &str) -> String {
-    let err: String = err
-        .trim()
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let err = one_line(err);
     if err.contains("ERR exited") || err.contains("no such session") {
         format!("session gone ({err})")
     } else {
         err
     }
+}
+
+/// `s` on one line: a control character (a newline in a client's error)
+/// becomes a space.
+fn one_line(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// An informational line on a diagnostic stream (`supervise`'s and
+/// `await-turn`'s stderr): flushed, and a failed write is not the loop's end.
+fn log_line(log: &mut dyn Write, line: &str) {
+    let _ = emit(log, line);
 }
 
 /// Write one line and flush it: the harness reading `watch` wakes per line.
@@ -955,7 +1596,7 @@ pub fn utc_stamp(secs: u64) -> String {
 mod tests {
     use super::super::prompt::fixtures::{bash_one_row, composer, rows, workflow_box};
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
 
     /// A scripted server: each `call` pops the next reply and records the
     /// request; screens are served in order from `screens`.
@@ -974,6 +1615,20 @@ mod tests {
     /// `idle_skips_busy`, an `await idle` passes over the busy screens next in
     /// the script (the content moves, nothing reads them) when another screen
     /// follows them — a busy spell the loop never sees.
+    ///
+    /// A handoff: `by_index` answers chosen requests (by arrival order) ahead
+    /// of every other rule — [`closed`], the connection the old instance
+    /// dropped, or a server's `ERR` — and from `down`'s index on every request
+    /// gets `down`'s reply (the session never came back, or never serves
+    /// again). From `drop_awaits_from` on every `await` is [`closed`] while
+    /// reads are served: an outage that keeps coming back. The first lost
+    /// reply served starts the content seq over at `handoff_seq`, as the
+    /// instance that adopts the session counts from its own start; `restart`
+    /// starts it over at a request with none failing — a handoff no request
+    /// saw fail. `await seq <n>` for an `n` the content has not reached — a
+    /// number from before the handoff — never latches, as on the real server
+    /// (it passes the stalls the way the last screen does). `delay` holds a
+    /// request's answer back.
     struct Mock {
         requests: Vec<String>,
         /// Replies to non-`text`, non-`key` requests, in order (missing = the
@@ -995,6 +1650,19 @@ mod tests {
         stalls: u32,
         /// `await idle` passes over busy screens (see the struct doc).
         idle_skips_busy: bool,
+        /// Replies by request index, ahead of everything (see the struct doc).
+        by_index: BTreeMap<usize, CtlReply>,
+        /// From this request index on, every request gets this reply.
+        down: Option<(usize, CtlReply)>,
+        /// From this request index on, every `await` answers [`closed`].
+        drop_awaits_from: Option<usize>,
+        /// Where the content seq starts over at the first lost reply served.
+        handoff_seq: Option<u64>,
+        /// At this request index the content seq starts over at this value,
+        /// before the request is served.
+        restart: Option<(usize, u64)>,
+        /// How long the answer to the request at an index is held back.
+        delay: BTreeMap<usize, Duration>,
     }
 
     fn ok(stdout: &str) -> CtlReply {
@@ -1030,6 +1698,20 @@ mod tests {
             stderr: "aterm-ctl: ERR\n".to_string(),
         }
     }
+    /// What the client printed when aterm 0.82.0 handed its sessions to
+    /// 0.83.0 under a running `watch` (measured 2026-09-12): the connection
+    /// closed before any answer came.
+    fn closed() -> CtlReply {
+        failed(1, "server closed the connection without responding")
+    }
+    /// A client-side failure: `aterm-ctl: <text>` on stderr, nothing on stdout.
+    fn failed(code: i32, text: &str) -> CtlReply {
+        CtlReply {
+            code,
+            stdout: String::new(),
+            stderr: format!("aterm-ctl: {text}\n"),
+        }
+    }
 
     impl Mock {
         fn new(modern: bool, screens: Vec<Vec<String>>) -> Self {
@@ -1044,6 +1726,12 @@ mod tests {
                 vanish_after: None,
                 stalls: 0,
                 idle_skips_busy: false,
+                by_index: BTreeMap::new(),
+                down: None,
+                drop_awaits_from: None,
+                handoff_seq: None,
+                restart: None,
+                delay: BTreeMap::new(),
             }
         }
         fn last_served(&self) -> &[String] {
@@ -1076,8 +1764,9 @@ mod tests {
         }
     }
 
-    impl Ctl for Mock {
-        fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+    impl Mock {
+        /// The built-in answers and the scripted queues (see the struct doc).
+        fn serve(&mut self, args: &[&str]) -> Result<CtlReply, String> {
             let line = args.join(" ");
             self.requests.push(line.clone());
             let verb_at = usize::from(args.first().is_some_and(|a| a.starts_with('@')));
@@ -1098,7 +1787,11 @@ mod tests {
                     if let Some(r) = self.replies.pop_front() {
                         return Ok(r);
                     }
-                    if self.served < self.screens.len() {
+                    let stale = tail
+                        .get(1)
+                        .and_then(|n| n.parse::<u64>().ok())
+                        .is_some_and(|n| n > self.seq);
+                    if self.served < self.screens.len() && !stale {
                         return Ok(ok("OK seq\n"));
                     }
                     if let Some(n) = self.vanish_after {
@@ -1142,6 +1835,51 @@ mod tests {
                 }
                 _ => Ok(self.replies.pop_front().unwrap_or_else(|| ok("OK\n"))),
             }
+        }
+    }
+
+    impl Ctl for Mock {
+        fn call(&mut self, args: &[&str]) -> Result<CtlReply, String> {
+            let at = self.requests.len();
+            if let Some(pause) = self.delay.remove(&at) {
+                std::thread::sleep(pause);
+            }
+            if let Some((i, seq)) = self.restart
+                && i == at
+            {
+                self.seq = seq;
+                self.restart = None;
+            }
+            let verb = args
+                .iter()
+                .find(|a| !a.starts_with('@'))
+                .copied()
+                .unwrap_or("");
+            let scripted = self
+                .by_index
+                .remove(&at)
+                .or_else(|| {
+                    self.down
+                        .as_ref()
+                        .filter(|(from, _)| at >= *from)
+                        .map(|(_, r)| r.clone())
+                })
+                .or_else(|| {
+                    (verb == "await" && self.drop_awaits_from.is_some_and(|d| at >= d)).then(closed)
+                });
+            let reply = match scripted {
+                Some(r) => {
+                    self.requests.push(args.join(" "));
+                    r
+                }
+                None => self.serve(args)?,
+            };
+            if reply.lost()
+                && let Some(seq) = self.handoff_seq.take()
+            {
+                self.seq = seq;
+            }
+            Ok(reply)
         }
     }
 
@@ -1812,7 +2550,8 @@ mod tests {
     /// The watch loop, scripted: busy → a read-only prompt (approved, one
     /// `APPROVED` line) → busy → a question (one `EVENT`) → the manager's turn
     /// (busy) → idle (one `EVENT`) → the idle screen sits unchanged (no second
-    /// `EVENT`, however long) → the session ends under the wait (`ERR exited`,
+    /// `EVENT`, however long; each wait step that runs out is checked with a
+    /// read) → the session ends under the wait (`ERR exited`,
     /// `EXIT session gone`, 1). After each EVENT the loop waits for the screen
     /// to move past it, then settles before the next look.
     #[test]
@@ -1863,10 +2602,15 @@ mod tests {
                 "await seq 105 timeout 20000",
                 "await idle 2000 timeout 20000",
                 "text --json tail=40",
-                // EVENT idle: the screen never moves again; it is not re-read.
+                // EVENT idle: the screen never moves again. Each step that
+                // runs out is checked with a read — its seq is not below 106,
+                // so the count did not start over — and nothing is reported.
                 "await seq 106 timeout 20000",
+                "text --json tail=40",
                 "await seq 106 timeout 20000",
+                "text --json tail=40",
                 "await seq 106 timeout 20000",
+                "text --json tail=40",
                 "await seq 106 timeout 20000",
             ],
             "{:?}",
@@ -2161,7 +2905,8 @@ mod tests {
 
     /// The budget bounds every action: a turn read at or after the deadline
     /// is the TIMEOUT — `watch` prints no EVENT before it, and `supervise`
-    /// presses nothing, whatever the phase — with the last read's lines.
+    /// presses nothing, whatever the phase — with the last read's lines; and
+    /// so is a point decided after it, a pressed box that never left.
     #[test]
     fn nothing_happens_after_the_budget() {
         let spent = SuperviseOpts {
@@ -2188,6 +2933,28 @@ mod tests {
         let (out, code) = s.supervise(&spent).expect("supervise");
         assert_eq!(code, EXIT_TIMEOUT);
         assert!(out.starts_with("TIMEOUT\nidle\n--\n"), "{out}");
+
+        // A press in the budget, then the wait for its box to leave runs out
+        // with it: the approval stands, and the box that did not move is the
+        // TIMEOUT, not an EVENT printed after the deadline.
+        let mut m = Mock::new(true, vec![bash_one_row()]);
+        m.delay.insert(3, Duration::from_millis(200));
+        let opts = SuperviseOpts {
+            max: Duration::from_millis(100),
+            ..auto(0, None)
+        };
+        let (lines, code) = watch_lines(&mut m, &opts);
+        assert_eq!(
+            (lines, code),
+            (
+                vec![
+                    "APPROVED seq=101 git log --oneline -5".to_string(),
+                    "TIMEOUT".to_string()
+                ],
+                EXIT_TIMEOUT
+            )
+        );
+        assert_eq!(m.requests.len(), 4, "nothing read after: {:?}", m.requests);
     }
 
     #[test]
@@ -2203,6 +2970,931 @@ mod tests {
         assert_eq!(
             exit_reason("await seq 633 failed: aterm-ctl: ERR exited"),
             "session gone (await seq 633 failed: aterm-ctl: ERR exited)"
+        );
+    }
+
+    // ---- an outage: an aterm self-update's handoff ------------------------
+
+    /// A session whose reconnect pauses are milliseconds, not seconds: 5 ms
+    /// doubling to 20 ms, within `window`.
+    fn quick(m: &mut Mock, window: Duration) -> Session<'_, Mock> {
+        let mut s = Session::new(m, None);
+        s.set_reconnect(window);
+        s.pause = Duration::from_millis(5);
+        s.pause_max = Duration::from_millis(20);
+        s
+    }
+    fn watch_quick(m: &mut Mock, window: Duration) -> (Vec<String>, u8) {
+        watch_quick_with(m, window, &auto(30, None))
+    }
+    fn watch_quick_with(m: &mut Mock, window: Duration, opts: &SuperviseOpts) -> (Vec<String>, u8) {
+        let mut out: Vec<u8> = Vec::new();
+        let code = quick(m, window).watch(opts, &mut out);
+        let text = String::from_utf8(out).expect("utf-8");
+        (text.lines().map(str::to_string).collect(), code)
+    }
+    /// `--auto-reads` with a budget of `ms` milliseconds.
+    fn auto_ms(ms: u64, notes: Option<PathBuf>) -> SuperviseOpts {
+        SuperviseOpts {
+            max: Duration::from_millis(ms),
+            ..auto(0, notes)
+        }
+    }
+    /// The milliseconds a `RECONNECTED after <ms> ms` line names.
+    fn reconnected_ms(line: &str) -> u128 {
+        line.strip_prefix("RECONNECTED after ")
+            .and_then(|r| r.strip_suffix(" ms"))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("not a RECONNECTED line: {line}"))
+    }
+    fn said_idle(said: &str) -> Vec<String> {
+        let mut r = rows(&[said, "", "✻ Cogitated for 2s · done 2:44 PM", ""]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    }
+    /// The idle composer with a `1` typed into it: the fallback press's digit
+    /// after the prompt had resolved on its own.
+    fn stray_screen() -> Vec<String> {
+        let mut stray = idle_screen();
+        let c = stray.iter().position(|r| r == "❯").expect("composer");
+        stray[c] = "❯ 1".to_string();
+        stray
+    }
+    const CLOSED: &str = "server closed the connection without responding";
+
+    /// A request not served — the reply never came, or the server turned the
+    /// connection away before reading it — is told from a server's answer:
+    /// the client's own words for a closed or cut-short exchange, a socket
+    /// nothing serves or that is gone, a reset or broken connection, a socket
+    /// timeout, and the two `ERR`s that turn a connection away (a full
+    /// admission queue, a token that is another instance's, each a whole
+    /// phrase); never another `ERR` the server sent, a usage line, a timeout
+    /// the server answered, or a socket the sandbox refuses. `ERR no such
+    /// session` is one more request not served only while an outage is being
+    /// ridden out: the instance adopting the sessions may not host this one
+    /// yet.
+    #[test]
+    fn a_request_not_served_is_told_from_a_server_answer() {
+        let refused = "connect /d/aterm-7.sock: Connection refused (os error 61) — aterm \
+                       isn't running (nothing is serving this control socket); launch \
+                       aterm.app (`open -a aterm`) and retry";
+        let gone = "connect /d/latest: No such file or directory (os error 2) — aterm isn't \
+                    running (nothing is serving this control socket); launch aterm.app \
+                    (`open -a aterm`) and retry";
+        for r in [
+            closed(),
+            failed(1, "server hung up before the complete response"),
+            failed(1, refused),
+            failed(1, gone),
+            failed(1, "Connection reset by peer (os error 54)"),
+            failed(1, "Broken pipe (os error 32)"),
+            failed(124, "Resource temporarily unavailable (os error 35)"),
+            err("control server busy; retry"),
+            err("auth"),
+        ] {
+            assert!(r.lost(), "{r:?}");
+        }
+        for r in [
+            ok("OK\n"),
+            timeout(),
+            err("no such session"),
+            err("exited"),
+            err("halted"),
+            err("authority revoked"),
+            bare_err(),
+            usage("text [--json] [trim]"),
+            failed(
+                1,
+                "cannot resolve control socket: set --sock, $ATERM_CONTROL_SOCK, or \
+                 $XDG_RUNTIME_DIR/$HOME",
+            ),
+            failed(
+                1,
+                "connect /d/aterm-7.sock: Operation not permitted (os error 1)",
+            ),
+            failed(1, "stream did not contain valid UTF-8"),
+        ] {
+            assert!(!r.lost(), "{r:?}");
+        }
+        // A note ahead of a server's answer does not make it a lost one.
+        let answered = CtlReply {
+            code: 1,
+            stdout: String::new(),
+            stderr: "note: Connection refused once, retried\naterm-ctl: ERR exited\n".to_string(),
+        };
+        assert!(!answered.lost());
+
+        let mut m = Mock::new(true, vec![idle_screen()]);
+        let mut s = Session::new(&mut m, None);
+        assert!(
+            !s.unserved(&err("no such session")),
+            "outside an outage the session is gone"
+        );
+        s.outage = Some(Outage {
+            since: Instant::now(),
+            kind: "await seq".to_string(),
+            told: true,
+            back: false,
+            pause: RECONNECT_PAUSE,
+        });
+        assert!(
+            s.unserved(&err("no such session")),
+            "in one it is not hosted yet"
+        );
+        assert!(!s.unserved(&err("exited")));
+        assert!(!s.unserved(&err("halted")));
+    }
+
+    /// The measured failure: the connection drops under `await seq` while the
+    /// worker is busy. One `RECONNECT` line however many reads fail (two here;
+    /// the third, after pauses of 5 + 10 + 20 ms, answers), then `RECONNECTED
+    /// after <ms> ms`, and the loop goes on — settling first, then reading —
+    /// to the next review point, on the seq the new instance counts.
+    #[test]
+    fn watch_rides_out_a_lost_connection_to_the_next_event() {
+        let mut m = Mock::new(true, vec![busy_screen(), busy_screen(), question_screen()]);
+        for i in 2..=4 {
+            m.by_index.insert(i, closed());
+        }
+        m.handoff_seq = Some(20);
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        assert!(
+            reconnected_ms(&lines[1]) >= 35,
+            "three pauses, 5 + 10 + 20 ms: {lines:?}"
+        );
+        assert_eq!(
+            lines[2..],
+            [
+                "EVENT question seq=22 ⏺ Keep the harness or rewrite it?",
+                "EXIT session gone (await seq 22 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            m.requests,
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "text --json tail=40",
+                // The instance goes under the wait.
+                "await seq 101 timeout 20000",
+                // Three reads of the same session: two fail, one answers.
+                "text --json tail=40",
+                "text --json tail=40",
+                "text --json tail=40",
+                // The loop again: settle, read, report, wait past the point.
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "await seq 22 timeout 20000",
+            ],
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// The content seq starts over on the instance that adopts the session
+    /// (measured: from about 652 to 12), so after the outage the wait past the
+    /// point is on the NEW seq — an `await seq 101` there would never latch
+    /// (the mock's server never latches it either). Nothing could be read in
+    /// the outage, so the point reported before it, still showing, is
+    /// reported once more: a duplicate costs the manager a look, a point
+    /// missed leaves the worker waiting. The manager's turn then moves the
+    /// worker, and its reply is the next EVENT.
+    #[test]
+    fn after_an_outage_the_point_is_reported_again_and_waited_past_on_the_new_seq() {
+        let pushed = said_idle("⏺ Pushed.");
+        let mut m = Mock::new(
+            true,
+            vec![
+                idle_screen(),
+                idle_screen(),
+                idle_screen(),
+                busy_screen(),
+                pushed,
+            ],
+        );
+        m.by_index.insert(2, closed());
+        m.handoff_seq = Some(10);
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines[0], "EVENT idle seq=101 ⏺ Done.");
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3..],
+            [
+                "EVENT idle seq=12 ⏺ Done.",
+                "EVENT idle seq=14 ⏺ Pushed.",
+                "EXIT session gone (await seq 14 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            m.requests,
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "text --json tail=40",
+                "await seq 101 timeout 20000",
+                "text --json tail=40",
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                // The same point, reported again, waited past at the new
+                // instance's seq 12.
+                "await seq 12 timeout 20000",
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "await seq 13 timeout 20000",
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "await seq 14 timeout 20000",
+            ],
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// A handoff no request saw fail: the instance handing over answers the
+    /// wait step (`OK timeout` — its readers parked, its count frozen) and
+    /// the next request reaches the one that took over, whose count started
+    /// over below the point's seq. `await seq 101` would never latch there;
+    /// the read that checks the step that ran out sees seq 5 < 101 — the
+    /// count started over, the screen moved — and the loop looks again, so
+    /// the worker's new reply is the next EVENT. (The live repro sent `await
+    /// seq 1046` until the budget ran out against a session at seq 356, its
+    /// new reply never reported.)
+    #[test]
+    fn a_count_that_started_over_with_no_request_failing_is_seen_moved() {
+        let mut m = Mock::new(true, vec![idle_screen(), said_idle("⏺ New reply on B.")]);
+        m.restart = Some((2, 4));
+        m.vanish_after = Some(1);
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(
+            lines,
+            [
+                "EVENT idle seq=101 ⏺ Done.",
+                "EVENT idle seq=6 ⏺ New reply on B.",
+                "EXIT session gone (await seq 6 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            m.requests,
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "text --json tail=40",
+                // Served, and ran out: the count is another instance's now.
+                "await seq 101 timeout 20000",
+                // The check: seq 5, below 101.
+                "text --json tail=40",
+                "await idle 2000 timeout 20000",
+                "text --json tail=40",
+                "await seq 6 timeout 20000",
+            ],
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// A session that never comes back: every read fails until the window
+    /// lapses, and the last line names the last failure.
+    #[test]
+    fn a_connection_that_never_comes_back_ends_when_the_window_lapses() {
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.down = Some((2, closed()));
+        let window = Duration::from_millis(60);
+        let started = Instant::now();
+        let (lines, code) = watch_quick(&mut m, window);
+        assert!(started.elapsed() >= window, "{:?}", started.elapsed());
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?".to_string(),
+                format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}"),
+                format!(
+                    "EXIT reconnect window lapsed: text --json tail=40 failed: aterm-ctl: {CLOSED}"
+                ),
+            ]
+        );
+        assert_eq!(code, 1);
+        let probes = &m.requests[3..];
+        assert!(!probes.is_empty(), "{:?}", m.requests);
+        assert!(
+            probes.iter().all(|r| r == "text --json tail=40"),
+            "only reads, never the failed wait again: {:?}",
+            m.requests
+        );
+    }
+
+    /// An outage that keeps coming back — every read answers, every wait is
+    /// dropped (the live repro dropped each `await` after 3 s) — is ONE
+    /// outage: a read answering says the session answers a read, not that the
+    /// wait that failed would be served now. One `RECONNECT`, one
+    /// `RECONNECTED`, the relapses ridden out in silence within the one
+    /// window, and the loop ends when it lapses — not a RECONNECT/RECONNECTED
+    /// pair each round until the budget runs out.
+    #[test]
+    fn an_outage_that_keeps_coming_back_is_one_window() {
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.drop_awaits_from = Some(2);
+        let window = Duration::from_millis(200);
+        let started = Instant::now();
+        let (lines, code) = watch_quick(&mut m, window);
+        assert!(started.elapsed() >= window, "{:?}", started.elapsed());
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "EVENT question seq=101 ⏺ Keep the harness or rewrite it?"
+        );
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3],
+            format!("EXIT reconnect window lapsed: await idle 2000 failed: aterm-ctl: {CLOSED}")
+        );
+        assert_eq!(code, 1);
+        let relapses = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("await idle"))
+            .count();
+        assert!(
+            relapses >= 2,
+            "it relapsed, and said nothing more: {:?}",
+            m.requests
+        );
+    }
+
+    /// An outage is over once the loop gets past what failed — here the
+    /// `await seq` that was lost is served again (a step that ran out) — so a
+    /// later one, longer after the first than the window, is a NEW outage:
+    /// said again, with a window of its own, not the first one's long run out.
+    #[test]
+    fn a_later_outage_is_a_new_one_with_its_own_window() {
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, closed());
+        m.by_index.insert(6, timeout());
+        m.delay.insert(6, Duration::from_millis(400));
+        m.by_index.insert(8, closed());
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick(&mut m, Duration::from_millis(300));
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "EVENT question seq=101 ⏺ Keep the harness or rewrite it?"
+        );
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3],
+            "EVENT question seq=103 ⏺ Keep the harness or rewrite it?"
+        );
+        assert_eq!(
+            lines[4],
+            format!("RECONNECT await seq 103 failed: aterm-ctl: {CLOSED}")
+        );
+        assert!(reconnected_ms(&lines[5]) < 300, "its own window: {lines:?}");
+        assert_eq!(
+            lines[6..],
+            [
+                "EVENT question seq=106 ⏺ Keep the harness or rewrite it?",
+                "EXIT session gone (await seq 106 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+    }
+
+    /// Outside an outage the server's answer is final: `ERR no such session`
+    /// under the wait ends the loop at once, with no further request. Inside
+    /// one it is not yet an answer — the instance adopting the sessions may
+    /// not host this one yet — so the reads go on: one that answers after it
+    /// carries on, and a session that stays unknown ends the loop when the
+    /// window lapses, named as gone. `--reconnect-s 0` makes a lost
+    /// connection final too, as it was before.
+    #[test]
+    fn no_such_session_is_final_outside_an_outage_and_not_yet_inside_one() {
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, err("no such session"));
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?",
+                "EXIT session gone (await seq 101 failed: aterm-ctl: ERR no such session)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(m.requests.len(), 3, "no retry: {:?}", m.requests);
+
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, closed());
+        m.by_index.insert(3, err("no such session"));
+        m.by_index.insert(4, err("no such session"));
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3..],
+            [
+                "EVENT question seq=103 ⏺ Keep the harness or rewrite it?",
+                "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, closed());
+        m.down = Some((3, err("no such session")));
+        let (lines, code) = watch_quick(&mut m, Duration::from_millis(60));
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?".to_string(),
+                format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}"),
+                "EXIT session gone (reconnect window lapsed: text --json tail=40 failed: \
+                 aterm-ctl: ERR no such session)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(code, 1);
+
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, closed());
+        let (lines, code) = watch_quick(&mut m, Duration::ZERO);
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?".to_string(),
+                format!("EXIT await seq 101 failed: aterm-ctl: {CLOSED}"),
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(m.requests.len(), 3, "{:?}", m.requests);
+    }
+
+    /// The server turning a connection away before reading it — its
+    /// admission queue full (`ERR control server busy; retry`), or the token
+    /// another instance's (`ERR auth`, the `latest` alias moving under the
+    /// client) — served nothing: it is ridden out like a dropped connection,
+    /// a probe it turns away included.
+    #[test]
+    fn a_connection_turned_away_is_ridden_out() {
+        for text in ["control server busy; retry", "auth"] {
+            let mut m = Mock::new(true, vec![question_screen()]);
+            m.by_index.insert(2, err(text));
+            m.by_index.insert(3, err(text));
+            m.vanish_after = Some(0);
+            let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+            assert_eq!(lines.len(), 5, "{text}: {lines:?}");
+            assert_eq!(
+                lines[1],
+                format!("RECONNECT await seq 101 failed: aterm-ctl: ERR {text}")
+            );
+            reconnected_ms(&lines[2]);
+            assert_eq!(
+                lines[3..],
+                [
+                    "EVENT question seq=103 ⏺ Keep the harness or rewrite it?",
+                    "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)",
+                ],
+                "{text}"
+            );
+            assert_eq!(code, 1);
+        }
+    }
+
+    /// The budget bounds an outage too: once `--max-s` (or `--timeout`) is
+    /// spent while a lost connection is ridden out — or as the request is
+    /// lost — the loop ends as it does on any spent budget. `watch` says
+    /// `TIMEOUT` and exits 124; `supervise` returns `TIMEOUT` with the last
+    /// screen read; `await-turn` the timed-out turn, and when no read ever
+    /// answered, a busy phase that says so.
+    #[test]
+    fn a_budget_spent_in_an_outage_is_the_timeout() {
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.down = Some((2, closed()));
+        let started = Instant::now();
+        let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(150, None));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?".to_string(),
+                format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}"),
+                "TIMEOUT".to_string(),
+            ]
+        );
+        assert_eq!(code, EXIT_TIMEOUT);
+
+        // The budget ran out while the request that was lost was in flight.
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, closed());
+        m.delay.insert(2, Duration::from_millis(200));
+        let (lines, code) = watch_quick_with(&mut m, Duration::from_secs(5), &auto_ms(100, None));
+        assert_eq!(
+            lines,
+            [
+                "EVENT question seq=101 ⏺ Keep the harness or rewrite it?",
+                "TIMEOUT",
+            ]
+        );
+        assert_eq!(code, EXIT_TIMEOUT);
+        assert_eq!(m.requests.len(), 3, "nothing after: {:?}", m.requests);
+
+        let mut m = Mock::new(true, vec![busy_screen()]);
+        m.down = Some((2, closed()));
+        let mut log: Vec<u8> = Vec::new();
+        let (out, code) = quick(&mut m, Duration::from_secs(5))
+            .supervise_to(&auto_ms(150, None), &mut log)
+            .expect("supervise");
+        assert_eq!(code, EXIT_TIMEOUT);
+        assert!(
+            out.starts_with("TIMEOUT\nbusy\nreason status row: spinner\n--\n"),
+            "{out}"
+        );
+        assert!(
+            String::from_utf8(log)
+                .expect("utf-8")
+                .starts_with("RECONNECT await seq 101 failed: "),
+        );
+
+        let mut m = Mock::new(true, vec![busy_screen()]);
+        m.down = Some((0, closed()));
+        let mut log: Vec<u8> = Vec::new();
+        let turn = quick(&mut m, Duration::from_secs(5))
+            .await_turn_to(Duration::from_millis(100), &mut log)
+            .expect("turn");
+        assert!(turn.timed_out);
+        assert_eq!(
+            render_phase(&turn, &[]),
+            "busy\nreason no screen: no read answered before the timeout\n"
+        );
+    }
+
+    /// A guarded press whose answer never came is not sent again as it was:
+    /// the loop reads and classifies first. Here the box moved — a write now,
+    /// not the read it was about to approve — so it is handed over, with the
+    /// one press the log shows; nothing is APPROVED, since the press was never
+    /// confirmed, and the notes say a press went unanswered. When the same
+    /// read box is still up after the reconnect, it is pressed again only
+    /// after the fresh read.
+    #[test]
+    fn a_press_in_flight_is_decided_again_from_a_fresh_read() {
+        let (dir, notes) = notes_file("inflight");
+        let mut m = Mock::new(true, vec![bash_one_row(), write_prompt()]);
+        m.by_index.insert(2, closed());
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick_with(
+            &mut m,
+            Duration::from_secs(5),
+            &auto(30, Some(notes.clone())),
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!("RECONNECT key if=Do.you.want.to.proceed 1 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[1]);
+        assert!(
+            lines[2].starts_with("EVENT prompt seq=103 kind=bash classify=not-read-only:")
+                && lines[2].ends_with(" command=rm -rf target"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[3],
+            "EXIT session gone (await seq 103 failed: aterm-ctl: ERR exited)"
+        );
+        assert_eq!(code, 1);
+        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1"]);
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 2, "{noted:?}");
+        assert!(
+            noted[0].ends_with(
+                "pressed, no answer came; the box is read again after the reconnect: git log \
+                 --oneline -5"
+            ),
+            "{noted:?}"
+        );
+        assert!(
+            noted[1].ends_with("handed to the manager (rm): rm -rf target"),
+            "{noted:?}"
+        );
+
+        let mut m = Mock::new(
+            true,
+            vec![
+                bash_one_row(),
+                bash_one_row(),
+                bash_one_row(),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.by_index.insert(2, closed());
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(
+            decisions(&lines[2..]),
+            [
+                "APPROVED git log --oneline -5",
+                "EVENT idle ⏺ Done.",
+                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(
+            m.requests[..7],
+            [
+                "await gone esc.to.interrupt timeout 20000",
+                "text --json tail=40",
+                "key if=Do.you.want.to.proceed 1",
+                "text --json tail=40",
+                "await idle 2000 timeout 20000",
+                // The box read and classified again, then pressed.
+                "text --json tail=40",
+                "key if=Do.you.want.to.proceed 1",
+            ],
+            "{:?}",
+            m.requests
+        );
+    }
+
+    /// The fallback press (a host without `key if=`) and a connection lost
+    /// part way through it: what the loop knows the press did is noted as far
+    /// as it is known. A `1` the server confirmed is written, lost connection
+    /// or not — the settle wait lost after it, or the re-read — so it is the
+    /// approval it was: `APPROVED`, noted, counted. What could not be checked
+    /// after it, a digit in the composer, is checked on the first turn after
+    /// the reconnect: a stray `1` there is backspaced and noted. A `key 1`
+    /// whose answer never came is not an approval, and the digit it may have
+    /// left is checked for the same way.
+    #[test]
+    fn a_fallback_press_under_a_lost_connection_is_noted_as_far_as_it_is_known() {
+        // The settle wait after a confirmed `key 1` is lost; after the
+        // reconnect the `1` sits in the composer.
+        let (dir, notes) = notes_file("landed");
+        let mut m = Mock::new(
+            false,
+            vec![
+                bash_one_row(),
+                bash_one_row(),
+                stray_screen(),
+                stray_screen(),
+                idle_screen(),
+            ],
+        );
+        m.by_index.insert(7, closed());
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick_with(
+            &mut m,
+            Duration::from_secs(5),
+            &auto(30, Some(notes.clone())),
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[0], "APPROVED seq=102 git log --oneline -5");
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 102 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3..],
+            [
+                "EVENT idle seq=105 ⏺ Done.",
+                "EXIT session gone (await seq 105 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            m.presses(),
+            ["key if=Do.you.want.to.proceed 1", "key 1", "key backspace"],
+            "{:?}",
+            m.requests
+        );
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 2, "{noted:?}");
+        assert!(
+            noted[0].ends_with("approved read-only: git log --oneline -5"),
+            "{noted:?}"
+        );
+        assert!(
+            noted[1].ends_with(
+                "backspaced a 1 left in the composer by the press for: git log --oneline -5 \
+                 (the connection was lost before the press was checked)"
+            ),
+            "{noted:?}"
+        );
+
+        // The re-read after the settle wait is lost; after the reconnect the
+        // box has taken the `1` (the worker ran, and is idle): nothing to
+        // backspace.
+        let (dir, notes) = notes_file("landed-clean");
+        let mut m = Mock::new(
+            false,
+            vec![bash_one_row(), bash_one_row(), busy_screen(), idle_screen()],
+        );
+        m.by_index.insert(8, closed());
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_quick_with(
+            &mut m,
+            Duration::from_secs(5),
+            &auto(30, Some(notes.clone())),
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert_eq!(lines[0], "APPROVED seq=102 git log --oneline -5");
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT text --json failed: aterm-ctl: {CLOSED}")
+        );
+        assert_eq!(lines[3], "EVENT idle seq=104 ⏺ Done.");
+        assert_eq!(m.presses(), ["key if=Do.you.want.to.proceed 1", "key 1"]);
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        assert!(
+            noted[0].ends_with("approved read-only: git log --oneline -5"),
+            "{noted:?}"
+        );
+
+        // The `key 1` itself gets no answer: no approval; the digit it left
+        // is found and backspaced after the reconnect.
+        let (dir, notes) = notes_file("unanswered");
+        let mut m = Mock::new(
+            false,
+            vec![
+                bash_one_row(),
+                bash_one_row(),
+                stray_screen(),
+                stray_screen(),
+                idle_screen(),
+            ],
+        );
+        m.by_index.insert(6, closed());
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_quick_with(
+            &mut m,
+            Duration::from_secs(5),
+            &auto(30, Some(notes.clone())),
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            format!("RECONNECT key 1 failed: aterm-ctl: {CLOSED}")
+        );
+        assert_eq!(lines[2], "EVENT idle seq=105 ⏺ Done.");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("APPROVED")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            m.presses(),
+            ["key if=Do.you.want.to.proceed 1", "key 1", "key backspace"]
+        );
+        let noted = read_notes(&dir, &notes);
+        assert_eq!(noted.len(), 2, "{noted:?}");
+        assert!(
+            noted[0].contains("pressed, no answer came") && !noted[0].contains("approved"),
+            "{noted:?}"
+        );
+        assert!(noted[1].contains("backspaced a 1"), "{noted:?}");
+    }
+
+    /// The dedup across an outage: a busy read before a lost connection still
+    /// counts after it — the flag lives in the loop's state, not in the wait
+    /// the connection dropped — so a point that looks like the one last
+    /// reported is reported, not taken for it. Here the outage relapses (a
+    /// relapse's probe that answers is not the outage's first — no second
+    /// RECONNECTED — and clears nothing): only the busy read before the last
+    /// relapse says the worker moved.
+    #[test]
+    fn a_busy_read_before_a_lost_connection_still_counts() {
+        let mut m = Mock::new(
+            true,
+            vec![
+                idle_screen(),
+                idle_screen(),
+                idle_screen(),
+                idle_screen(),
+                busy_screen(),
+                idle_screen(),
+                idle_screen(),
+            ],
+        );
+        // Under the wait past the point; the probe answers.
+        m.by_index.insert(2, closed());
+        // A relapse under the next wait past it; the probe answers.
+        m.by_index.insert(6, closed());
+        // A relapse under the wait after the busy read (request 9).
+        m.by_index.insert(10, closed());
+        m.vanish_after = Some(0);
+        let (lines, code) = watch_quick(&mut m, Duration::from_secs(5));
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert_eq!(lines[0], "EVENT idle seq=101 ⏺ Done.");
+        assert_eq!(
+            lines[1],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(&lines[2]);
+        assert_eq!(
+            lines[3..],
+            [
+                // Once more after the outage began: nothing was read in it.
+                "EVENT idle seq=103 ⏺ Done.",
+                // After the busy read, which the relapse did not wipe.
+                "EVENT idle seq=107 ⏺ Done.",
+                "EXIT session gone (await seq 107 failed: aterm-ctl: ERR exited)",
+            ]
+        );
+        assert_eq!(code, 1);
+        assert_eq!(m.requests[9], "text --json tail=40");
+        assert_eq!(m.requests[10], "await seq 105 timeout 20000");
+    }
+
+    /// `await-turn` and `supervise` ride it out the same way; their lines go
+    /// to the log (stderr), and their result is untouched.
+    #[test]
+    fn await_turn_and_supervise_ride_it_out_with_the_lines_on_stderr() {
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        m.by_index.insert(2, closed());
+        m.handoff_seq = Some(7);
+        let mut log: Vec<u8> = Vec::new();
+        let turn = quick(&mut m, Duration::from_secs(5))
+            .await_turn_to(Duration::from_secs(30), &mut log)
+            .expect("turn");
+        assert_eq!((turn.phase, turn.screen.seq), (Phase::Idle, 9));
+        let log = String::from_utf8(log).expect("utf-8");
+        let log: Vec<&str> = log.lines().collect();
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(
+            log[0],
+            format!("RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}")
+        );
+        reconnected_ms(log[1]);
+
+        let mut m = Mock::new(true, vec![busy_screen(), write_prompt()]);
+        m.by_index.insert(2, closed());
+        let mut log: Vec<u8> = Vec::new();
+        let (out, code) = quick(&mut m, Duration::from_secs(5))
+            .supervise_to(&auto(30, None), &mut log)
+            .expect("supervise");
+        assert_eq!(code, 0);
+        assert!(
+            out.starts_with("prompt\nkind bash\ncommand rm -rf target\n"),
+            "{out}"
+        );
+        assert!(!out.contains("RECONNECT"), "{out}");
+        let log = String::from_utf8(log).expect("utf-8");
+        assert!(
+            log.starts_with(&format!(
+                "RECONNECT await seq 101 failed: aterm-ctl: {CLOSED}\nRECONNECTED after "
+            )),
+            "{log}"
+        );
+    }
+
+    /// A `RECONNECT` line is cut at 160 characters like an EVENT's fields:
+    /// the client's own connect error runs to about 330.
+    #[test]
+    fn a_reconnect_line_is_cut_at_160_characters() {
+        let long = format!(
+            "connect /{}/aterm.sock: No such file or directory (os error 2) — aterm isn't \
+             running (nothing is serving this control socket); launch aterm.app (`open -a \
+             aterm`) and retry",
+            "d".repeat(120)
+        );
+        let mut m = Mock::new(true, vec![question_screen()]);
+        m.by_index.insert(2, failed(1, &long));
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_quick(&mut m, Duration::from_secs(5));
+        assert!(
+            lines[1].starts_with("RECONNECT await seq 101 failed: aterm-ctl: connect /ddd"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines[1].chars().count(),
+            "RECONNECT ".len() + LINE_CHARS,
+            "{lines:?}"
         );
     }
 

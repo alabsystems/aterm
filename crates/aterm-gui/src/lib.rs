@@ -3679,18 +3679,25 @@ enum Wake {
     /// — and the success row asserts a toolchain that is demonstrably not on the disk.
     /// The only honest sentence names the promise and the outcome and nothing else.
     PkgSeedNothing { detail: String },
-    /// `seed-busy:` — ANOTHER `atpkg` HOLDS THE STORE LOCK, so this pass stood aside
-    /// (2026-09-11). Raised so the refusal branch below does NOT fire: that branch is
-    /// right for an unwritable prefix and right for a bundle whose atpkg cannot exec,
-    /// and it was wrong for the one refusal where the work is being done by somebody
-    /// else — two aterm launches sixteen seconds apart put "install failed" on screen
-    /// while the install was running in the other process. Log only; no card.
-    PkgSeedBusy { detail: String },
     /// Some members installed and some did not — raised from `seed-partial:`. Its own
     /// variant because the two obvious renderings are both lies: the success pill
     /// claims a toolchain the machine does not have, and the failure pill hides the
     /// programs that did arrive.
     PkgSeedPartial { detail: String },
+    /// `lock-waiting:` — the launch-time child found another atpkg process holding
+    /// the store lock (a sibling window's pass, the first instance's pass after the
+    /// macOS Full Disk Access grant quit and re-opened the app, a self-update
+    /// predecessor, the session lane's detached pass, a terminal `aterm pkg
+    /// install`) and is QUEUED behind it (`--wait-lock`, 2026-09-10). Neither a pass
+    /// start nor a terminal answer: it opens the non-terminal waiting row
+    /// (`StatusBars::toolchain_waiting`), which the sibling's tailed progress, this
+    /// child's own markers, or this child's exit retires — except a `Busy` exit (75),
+    /// which leaves the row for the child that queues next behind the same holder.
+    PkgLockWaiting { detail: String },
+    /// The waited-on sibling did not finish inside the child's bound (atpkg exit 75):
+    /// the pass is DEFERRED, not failed — the loop retries on a short backoff.
+    /// `detail` says what happens next (`StatusBars::toolchain_deferred`).
+    PkgLockTimedOut { detail: String },
     /// `managed-current:` — every AGENT program (claude, codex) that is installed AND
     /// at the index pin, as atpkg lists it at the end of a pass (`claude 2.1.267
     /// (build 2026091001); codex 0.154.0 (build 2026091001)`). Raises the "Claude
@@ -5904,10 +5911,11 @@ pub struct SessionCtx {
     /// and writable by the control thread. A LEAF lock: taken briefly, never
     /// across a `Terminal` or `Store` lock, and contended only by an actual
     /// `meta set` (rare, human/agent rate). ONE sanctioned nesting exists:
-    /// `control_session::set_meta_field` records its `meta-change` timeline
-    /// event WHILE holding this guard (order meta → [`Self::timeline`],
-    /// nowhere reversed) so racing `meta set`s can never invert the event
-    /// stream against the stored value.
+    /// `session_timeline::apply_meta_value` (every driver write) and
+    /// `session_timeline::restore_carried_meta` (a restore onto a live
+    /// session) record their `meta-change` timeline events WHILE holding this
+    /// guard (order meta → [`Self::timeline`], nowhere reversed) so racing
+    /// writes can never invert the event stream against the stored value.
     pub meta: std::sync::Mutex<crate::session_timeline::SessionMeta>,
     /// THE PROGRAM-CAT slot (per-app cursor breeds with tenure, owner spec
     /// 2026-08-07 / ruling 2026-08-17): the pane's RAW program claim —
@@ -5931,9 +5939,9 @@ pub struct SessionCtx {
     /// `turns`); recorded from the store's lifecycle mutators (which hold the
     /// handle's ctx Arc) and the GUI's title/cwd observers — never on the PTY
     /// reader's hot path. Empty + cheap for an unobserved session. A STRICT
-    /// leaf: nothing may lock anything else while holding it (the meta →
-    /// timeline nesting in `set_meta_field` is the only site that holds
-    /// another lock WHEN TAKING it, and that order is never reversed).
+    /// leaf: nothing may lock anything else while holding it (a caller may
+    /// hold [`Self::meta`] — `session_timeline`'s two meta recorders — or
+    /// `fabric` WHEN TAKING it, and neither order is ever reversed).
     pub timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
     /// This session's FABRIC endpoint: the bounded inbox ring the bridge
     /// `deliver`s into, this session's outbound posts, the two watermarks and the
@@ -8417,6 +8425,14 @@ struct WindowState {
     /// read at the swap, while an ordering test would go BLIND on the alt
     /// screen until its serial caught up.
     pet_wrap_serial: Option<(u64, u64)>,
+    /// THE DELIVERY REGISTER'S READ HEAD (2026-09-10): `(session, serial)`
+    /// of the newest delivery receipt this window's cursor engines have
+    /// applied (`App::tick_cursor_fx`). Per `(session, serial)` like the
+    /// pet's wrap latch above — a serial is meaningful only within one
+    /// session's tracker, so a session switch (or the first read) stores the
+    /// baseline silently and applies nothing; every co-viewing window applies
+    /// each receipt once.
+    delivery_seen: Option<(u64, u64)>,
     /// Last observed `(session, OSC-shell-executing)` state for the native
     /// rain's payload-free Execute pulse. A new session is baselined silently;
     /// only a same-session false→true edge emits, so a long-running agent can
@@ -10621,6 +10637,7 @@ impl WindowState {
             kitty_rung: crate::launch_kitty::CompanionRung::Launch,
             pet_content_seq: None,
             pet_wrap_serial: None,
+            delivery_seen: None,
             rain_shell_executing: None,
             cursor_trail: crate::cursor_trail::CursorTrail::default(),
             typing_cadence: crate::cursor_trail::TypingCadence::default(),
@@ -21346,13 +21363,6 @@ impl ApplicationHandler<Wake> for App {
             // Exit 0, announced, and nothing on the disk. Neither "failed" (no failure
             // was observed) nor a tick (no toolchain is there) — so it says exactly
             // that, and points at the page that holds each program's reason.
-            // Another atpkg is doing this work. The log gets it; the screen does not.
-            // A warning a user cannot act on, about a condition that resolves itself
-            // seconds later, is worse than silence — and this one appeared on a
-            // machine whose toolchain was being installed correctly at that moment.
-            Wake::PkgSeedBusy { detail } => {
-                aterm_log::info!("atpkg stood aside: {detail}");
-            }
             Wake::PkgSeedNothing { detail } => {
                 aterm_log::warn!("atpkg pass installed nothing: {detail}");
                 self.status_bars.toolchain_failed(
@@ -21367,6 +21377,22 @@ impl ApplicationHandler<Wake> for App {
                     "no build for this machine's architecture — see Settings ▸ Packages",
                     Instant::now(),
                 );
+                self.sync_status_bars();
+            }
+            // QUEUED BEHIND ANOTHER ATPKG PASS at the store lock (2026-09-10): a
+            // live Info row, never the failure bar — the incident rendered this
+            // exact event as "⚠ ALab toolchain install failed". The row is retired
+            // by the sibling's tailed progress, this child's own markers, or its
+            // exit — not a `Busy` exit (75), which leaves the row to the child that
+            // queues next; a wait that runs out is the deferred notice below.
+            Wake::PkgLockWaiting { detail } => {
+                aterm_log::info!("atpkg is queued behind another atpkg pass: {detail}");
+                self.status_bars.toolchain_waiting(Instant::now());
+                self.sync_status_bars();
+            }
+            Wake::PkgLockTimedOut { detail } => {
+                aterm_log::info!("the ALab toolchain pass is deferred: {detail}");
+                self.status_bars.toolchain_deferred(&detail, Instant::now());
                 self.sync_status_bars();
             }
             // The R6 rows (2026-09-10): the managed agents in use, and the machine
@@ -22374,9 +22400,11 @@ mod cg_capture {
     // backing buffer outlives the read.
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
-        /// Photograph one or more on-screen windows into a CGImage. Returns NULL when
-        /// it cannot capture — notably when Screen Recording permission is not
-        /// granted, which we surface as a clear, actionable error.
+        /// Photograph one or more on-screen windows into a CGImage. aterm only ever
+        /// asks for its OWN window, which needs no Screen Recording grant (measured
+        /// 2026-09-12: preflight only, real pixels back with the grant not held).
+        /// Returns NULL when the window is not on screen, which we surface as a
+        /// clear error that names that cause — never a permission to grant.
         pub fn CGWindowListCreateImage(
             screen_bounds: CGRect,
             list_option: u32,
@@ -22567,9 +22595,18 @@ fn read_pkg_progress_snapshot(
 /// `progress.json` at 10Hz and posts through `post` ONLY when the classified content
 /// changed. No child ⇒ no tailer ⇒ no wakes — the FL-1 invariant is structural, not
 /// scheduled. `post` abstracts the `EventLoopProxy` so the posting discipline is
-/// unit-testable without an OS event loop.
+/// unit-testable without an OS event loop. While our child is QUEUED on the store
+/// lock behind a sibling window's pass (`--wait-lock`, 2026-09-10) the tailer is
+/// alive and follows the SIBLING's `progress.json` through the foreign-pid path, so
+/// this window shows the real install — when the holder writes one (a window's pass
+/// does; a terminal `aterm pkg install` or the session lane's detached pass writes
+/// none, and the waiting row is all there is to show).
 struct PkgProgressTailer {
     stop: Arc<AtomicBool>,
+    /// Whether a RUNNING sibling's file — the holder our child is queued behind —
+    /// moved its WORK on between two reads ([`holder_work_advanced`]): the loop's
+    /// backoff reads it at `finish` to tell a slow install from a wedged holder.
+    holder_advanced: Arc<AtomicBool>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -22581,11 +22618,14 @@ impl PkgProgressTailer {
     ) -> Option<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let holder_advanced = Arc::new(AtomicBool::new(false));
+        let advanced = Arc::clone(&holder_advanced);
         let handle = std::thread::Builder::new()
             .name("atpkg-progress-tail".into())
             .spawn(move || {
                 let mut probe = ForeignProbe::default();
                 let mut last_posted: Option<PkgProgressSnapshot> = None;
+                let mut last_holder: Option<atpkg::progress::ProgressFile> = None;
                 // The clock this tailer's freshness test is against, read BEFORE the
                 // first poll: anything the file says ended before now belongs to a
                 // pass that finished before this child was even spawned.
@@ -22596,9 +22636,26 @@ impl PkgProgressTailer {
                     // classified with `child_alive = false`, which is what retires
                     // a still-warm heartbeat from our own dead child truthfully.
                     let stopping = flag.load(Ordering::Acquire);
-                    match read_pkg_progress_snapshot(
+                    let snapshot = read_pkg_progress_snapshot(
                         &layout, child_pid, !stopping, since_unix, &mut probe,
-                    ) {
+                    );
+                    if let Some(snap) = &snapshot
+                        && holder_work_advanced(snap, child_pid, &mut last_holder)
+                    {
+                        advanced.store(true, Ordering::Release);
+                    }
+                    match snapshot {
+                        // A sibling's installer died mid-pass while our child was
+                        // queued behind it: not our story ([`foreign_writer_died_mid_pass`]).
+                        // Mid-run the last good state is held (the sibling's live
+                        // meter, which folds at its own cap); at exit, whatever was
+                        // shown is cleared — a dead writer's file must never become
+                        // this window's ⏸ outcome.
+                        Some(snap) if foreign_writer_died_mid_pass(&snap, child_pid) => {
+                            if stopping && last_posted.take().is_some() {
+                                post(None);
+                            }
+                        }
                         Some(snap) => {
                             if last_posted.as_ref() != Some(&snap) {
                                 post(Some(Box::new(snap.clone())));
@@ -22623,14 +22680,20 @@ impl PkgProgressTailer {
                 }
             })
             .ok()?;
-        Some(Self { stop, handle })
+        Some(Self {
+            stop,
+            holder_advanced,
+            handle,
+        })
     }
 
     /// Stop and JOIN — called right after `child.wait()` returns, so the tailer's
-    /// lifetime is provably a subset of the child's plus one final read.
-    fn finish(self) {
+    /// lifetime is provably a subset of the child's plus one final read. Returns
+    /// whether a sibling holder's work was seen to advance during that lifetime.
+    fn finish(self) -> bool {
         self.stop.store(true, Ordering::Release);
         let _ = self.handle.join();
+        self.holder_advanced.load(Ordering::Acquire)
     }
 }
 
@@ -22725,6 +22788,184 @@ fn sleep_interval_watching_bump(
         watch.last_trigger = Some(Instant::now());
         return;
     }
+}
+
+/// The launch children's `--wait-lock` bound: 30 min. Bounded by the RETRY, not by
+/// the download — curl's own per-file ceiling can exceed this on a slow link — so a
+/// wait that runs out is retried ([`ContentionBackoff`]), never reported as a failed
+/// install. The child is idle while it waits, and the child-scoped tailer follows the
+/// SIBLING's `progress.json` through the foreign-pid path meanwhile. The waiting row's
+/// cap (`status_bars::WAIT_STALE`) must outlast this; a test there pins it.
+pub(crate) const ATPKG_WAIT_LOCK_SECS: u64 = 30 * 60;
+
+/// The update loop's first park after a pass that timed out waiting on the store
+/// lock — seconds, not the six-hour interval the incident of 2026-09-10 sat through.
+const CONTENTION_BACKOFF_FIRST: Duration = Duration::from_secs(30);
+/// …doubling to this cap.
+const CONTENTION_BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
+/// How many CONSECUTIVE timed-out waits (each [`ATPKG_WAIT_LOCK_SECS`] long) with NO
+/// visible progress from the holder before it is treated as WEDGED — a Settings ▸
+/// Packages door parked on an unanswered admin-password dialog, a terminal `aterm
+/// pkg install` sitting on a sudo prompt, a SIGSTOPped sibling — and the loop parks
+/// for [`CONTENTION_WEDGE_PARK`] between tries (bump watch kept) instead of another
+/// half-hour wait every few minutes. A wait during which the holder's
+/// `progress.json` WORK advanced (the child-scoped tailer follows a sibling
+/// window's file, [`holder_work_advanced`]) does not count: a 3 GB default set on a
+/// slow link legitimately outlasts three of these waits, and that is a slow install
+/// being followed, not a wedge being counted.
+const CONTENTION_WEDGE_CYCLES: u32 = 3;
+/// The park once the holder looks wedged: an hour, never the six-hour interval. A
+/// wedge is a human-attended state — the dialog gets answered, the sudo prompt its
+/// password, the typed install finishes or dies — and a window parked for the
+/// interval on it sat out the rest of the six hours with an incomplete store after
+/// the holder let go (the incident's shape, one step removed). An hour keeps the
+/// waiting row off the glass most of the time and still picks the work up within
+/// the hour; a test pins it above the backoff cap.
+const CONTENTION_WEDGE_PARK: Duration = Duration::from_secs(60 * 60);
+
+/// The park after a store-lock timeout (atpkg exit 75): 30 s, doubling to 10 min,
+/// reset by any pass that actually ran — and by a wait during which the holder's
+/// work visibly advanced; `wedged` after [`CONTENTION_WEDGE_CYCLES`] in a row. Pure
+/// for the test.
+#[derive(Default, Debug)]
+struct ContentionBackoff {
+    consecutive: u32,
+}
+
+impl ContentionBackoff {
+    /// The next park, and one more consecutive timeout on the tally — unless
+    /// `holder_advanced`: the holder's progress file moved its work on during the
+    /// wait that just timed out, so this is a slow install being followed, not a
+    /// cycle towards a wedge; the tally starts over at zero and the park is the
+    /// first one again.
+    fn park(&mut self, holder_advanced: bool) -> Duration {
+        if holder_advanced {
+            self.consecutive = 0;
+            return CONTENTION_BACKOFF_FIRST;
+        }
+        let n = self.consecutive;
+        self.consecutive = n.saturating_add(1);
+        let secs = CONTENTION_BACKOFF_FIRST
+            .as_secs()
+            .saturating_mul(1u64 << n.min(16));
+        Duration::from_secs(secs).min(CONTENTION_BACKOFF_CAP)
+    }
+
+    fn wedged(&self) -> bool {
+        self.consecutive >= CONTENTION_WEDGE_CYCLES
+    }
+
+    fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+}
+
+/// A wait or a park as a person reads it: "30 s", "2 min", "10 min", "6 h".
+fn human_park(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 && secs.is_multiple_of(3600) {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// The clause a lane's `Busy` log line carries for what the child SAID: 0.82.0's
+/// `seed-busy:` — "another atpkg holds the store lock, this pass stood aside" — is
+/// folded into that one WARN, so a timed-out wait is logged once, not at INFO from
+/// a wake and again at WARN from the lane (see [`read_seed_markers`]).
+fn stood_aside_said(seen: SeedMarkers) -> &'static str {
+    if seen.saw_busy {
+        " (atpkg exit 75, `seed-busy:`)"
+    } else {
+        " (atpkg exit 75, no `seed-busy:` line)"
+    }
+}
+
+/// How an `atpkg` seed/update child ENDED, from its exit code and the two marker
+/// facts the stdout loop kept — classified in ONE place, purely, because the lanes
+/// used to do this with overlapping `if`s that read a store-lock contention refusal
+/// (atpkg's own sentence says "retry when it exits") as a terminal install failure
+/// (incident 2026-09-10).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PassVerdict {
+    /// Exit 0, no marker: the healthy launch of a provisioned Mac (the round-10
+    /// property — NOTHING is raised for it).
+    Quiet,
+    /// A terminal marker spoke; stderr goes to the log, the markers already answered.
+    Answered,
+    /// An announcement was opened and never answered, whatever the exit: the held
+    /// card must be retired with the truth.
+    AnnouncedThenDied,
+    /// atpkg's contention code (75): the child queued behind another atpkg pass at
+    /// the store lock and its bound ran out. Deferred, never failed.
+    Busy,
+    /// A markerless non-zero exit that is NOT contention: the CLI-edge `Io` refusal
+    /// (an unwritable prefix), a spawn that died, a signal. A real failure.
+    Refused,
+}
+
+/// See [`PassVerdict`]. `code` is `None` for a child killed by a signal.
+///
+/// The contention code is read BEFORE the marker flag: the dispatch edge's refusal
+/// is the only thing that exits 75, it runs before any verb could announce, and
+/// since 0.82.0 it prints a terminal of its own (`seed-busy:`, "this pass stood
+/// aside") — so a terminal beside 75 is that line, not proof the verb ran. Every
+/// other terminal still outranks its exit code: a verb that printed one held the
+/// lock, and nothing it exits with afterwards can be a lock refusal.
+fn classify_pass_exit(code: Option<i32>, saw_start: bool, saw_marker: bool) -> PassVerdict {
+    if saw_start && !saw_marker {
+        PassVerdict::AnnouncedThenDied
+    } else if code == Some(i32::from(atpkg::lock::CONTENDED_EXIT)) {
+        PassVerdict::Busy
+    } else if saw_marker {
+        PassVerdict::Answered
+    } else if code == Some(0) {
+        PassVerdict::Quiet
+    } else {
+        PassVerdict::Refused
+    }
+}
+
+/// Whether a snapshot is a FOREIGN writer's file that died MID-PASS — dead pid or
+/// stale heartbeat, no `ended_unix` — the shape a sibling window's orphaned
+/// installer leaves behind when it dies at its next line of output after that
+/// window quit (2026-09-10) while OUR child is queued on the store lock behind it.
+/// That file is not our child's story: our child is about to take the freed lock
+/// and write its own, or to answer with its own markers. Rendering it would put the
+/// ⏸ "stopped — run: aterm pkg update" Warn row up for 45 s — a TERMINAL row that
+/// then suppresses our own live meter and lands as `outcome=warn` in the ledger —
+/// for a pass that is, in this window, continuing. Pure for the test.
+fn foreign_writer_died_mid_pass(snap: &PkgProgressSnapshot, child_pid: u32) -> bool {
+    !snap.running
+        && snap.file.ended_unix.is_none()
+        && snap.file.pid.is_some_and(|pid| pid != child_pid)
+}
+
+/// Whether `snap` is a RUNNING sibling's file (a foreign pid — the holder our child
+/// is queued behind) whose WORK moved on since the last such read in `last_holder`:
+/// the per-program rows, the queue or the rollup — never the heartbeat, which the
+/// holder's own tick thread keeps fresh whether or not anything is happening (a
+/// pass parked on a sudo prompt heartbeats too), and never `pid`/timestamps. This
+/// is what tells a slow install from a wedged one for the update loop's backoff
+/// ([`ContentionBackoff::park`]). Updates `last_holder`; pure for the test.
+fn holder_work_advanced(
+    snap: &PkgProgressSnapshot,
+    child_pid: u32,
+    last_holder: &mut Option<atpkg::progress::ProgressFile>,
+) -> bool {
+    if !snap.running || !snap.file.pid.is_some_and(|pid| pid != child_pid) {
+        return false;
+    }
+    let advanced = last_holder.as_ref().is_some_and(|prev| {
+        prev.overall != snap.file.overall
+            || prev.programs != snap.file.programs
+            || prev.queue != snap.file.queue
+    });
+    *last_holder = Some(snap.file.clone());
+    advanced
 }
 
 #[cfg(test)]
@@ -22960,6 +23201,280 @@ mod pkg_progress_tests {
             "no admitted names ⇒ nothing to do"
         );
     }
+
+    /// The park after a store-lock timeout: 30 s, doubling to the 10 min cap, reset
+    /// by a pass that ran; three in a row with nothing moving and the holder
+    /// counts as wedged — a wait during which the holder's work advanced is not a
+    /// cycle at all, and the wedged park is an hour, never the interval.
+    #[test]
+    fn contention_backoff_doubles_to_its_cap_and_resets() {
+        let mut b = ContentionBackoff::default();
+        let secs: Vec<u64> = (0..7).map(|_| b.park(false).as_secs()).collect();
+        assert_eq!(secs, [30, 60, 120, 240, 480, 600, 600]);
+        assert!(b.wedged());
+        b.reset();
+        assert!(!b.wedged());
+        assert_eq!(b.park(false).as_secs(), 30, "reset starts over");
+        let mut c = ContentionBackoff::default();
+        c.park(false);
+        c.park(false);
+        assert!(!c.wedged(), "two timeouts are not yet a wedge");
+        c.park(false);
+        assert!(c.wedged(), "the third consecutive timeout is");
+        // A wait during which the HOLDER's work advanced is a slow install being
+        // followed, not a wedge being counted: not a cycle, and a fresh tally.
+        let mut d = ContentionBackoff::default();
+        d.park(false);
+        d.park(false);
+        assert_eq!(
+            d.park(true).as_secs(),
+            30,
+            "advanced: not a cycle, the first park again"
+        );
+        assert!(
+            !d.wedged(),
+            "…and no wedge on what would have been the third"
+        );
+        d.park(false);
+        d.park(false);
+        assert!(!d.wedged(), "two with nothing moving since the advance");
+        d.park(false);
+        assert!(d.wedged(), "the third is the wedge");
+        assert_eq!(d.park(true).as_secs(), 30, "movement un-wedges");
+        assert!(!d.wedged());
+        // The wedged park: above the backoff cap, an hour, well under the interval.
+        assert!(CONTENTION_WEDGE_PARK > CONTENTION_BACKOFF_CAP);
+        assert_eq!(CONTENTION_WEDGE_PARK, Duration::from_secs(3600));
+        assert!(CONTENTION_WEDGE_PARK < Duration::from_secs(6 * 3600));
+        assert_eq!(human_park(Duration::from_secs(30)), "30 s");
+        assert_eq!(human_park(Duration::from_secs(120)), "2 min");
+        assert_eq!(human_park(Duration::from_secs(600)), "10 min");
+        assert_eq!(human_park(Duration::from_secs(1800)), "30 min");
+        assert_eq!(human_park(Duration::from_secs(6 * 3600)), "6 h");
+        assert_eq!(human_park(Duration::from_secs(90)), "90 s");
+    }
+
+    /// A SIBLING's file whose writer died mid-pass (dead pid, no `ended_unix`) is
+    /// not this window's story while our own child lives: the tailer holds it back
+    /// instead of rendering the ⏸ Warn "stopped" row over a pass that is continuing
+    /// here. Our own child's file, a running foreign one, and an ENDED foreign one
+    /// are all still posted.
+    #[test]
+    fn a_dead_sibling_writer_is_not_posted_over_our_own_waiting_child() {
+        let dead_sibling = PkgProgressSnapshot {
+            file: file_with(Some(15359), 0),
+            running: false,
+        };
+        assert!(foreign_writer_died_mid_pass(&dead_sibling, 15441));
+        assert!(
+            !foreign_writer_died_mid_pass(&dead_sibling, 15359),
+            "our own dead child's file is our outcome"
+        );
+        let live_sibling = PkgProgressSnapshot {
+            file: file_with(Some(15359), pkg_unix_now()),
+            running: true,
+        };
+        assert!(!foreign_writer_died_mid_pass(&live_sibling, 15441));
+        let mut ended = file_with(Some(15359), 0);
+        ended.ended_unix = Some(1);
+        let ended_sibling = PkgProgressSnapshot {
+            file: ended,
+            running: false,
+        };
+        assert!(
+            !foreign_writer_died_mid_pass(&ended_sibling, 15441),
+            "a sibling's finished pass is a real outcome"
+        );
+        let no_pid = PkgProgressSnapshot {
+            file: file_with(None, 0),
+            running: false,
+        };
+        assert!(!foreign_writer_died_mid_pass(&no_pid, 15441));
+    }
+
+    /// The wedge tally's input: a RUNNING sibling's file whose WORK moved on between
+    /// two reads is the holder advancing; a heartbeat-only refresh (the holder's
+    /// tick thread runs whether or not anything happens — a pass parked on a sudo
+    /// prompt heartbeats too), our own child's file, and a sibling's not-running
+    /// file are not.
+    #[test]
+    fn a_running_siblings_work_moving_on_is_an_advance_and_a_heartbeat_alone_is_not() {
+        let ours = 15441;
+        let sibling = 15359;
+        let running = |file: &ProgressFile| PkgProgressSnapshot {
+            file: file.clone(),
+            running: true,
+        };
+        let mut last = None;
+        let mut file = file_with(Some(sibling), pkg_unix_now());
+        assert!(
+            !holder_work_advanced(&running(&file), ours, &mut last),
+            "the first read is the baseline, not an advance"
+        );
+        file.heartbeat_unix += 5;
+        assert!(
+            !holder_work_advanced(&running(&file), ours, &mut last),
+            "a heartbeat alone is liveness, not progress"
+        );
+        file.programs.get_mut("trust").unwrap().bytes_done = 50;
+        assert!(
+            holder_work_advanced(&running(&file), ours, &mut last),
+            "bytes landing is progress"
+        );
+        assert!(
+            !holder_work_advanced(&running(&file), ours, &mut last),
+            "…counted once"
+        );
+        file.overall.programs_done += 1;
+        assert!(
+            holder_work_advanced(&running(&file), ours, &mut last),
+            "a program finishing is progress"
+        );
+        file.queue.push("ay".to_string());
+        assert!(
+            holder_work_advanced(&running(&file), ours, &mut last),
+            "the queue moving is progress"
+        );
+        // Our OWN child's file is never "the holder advancing", however it moves —
+        // it is not even a baseline.
+        let mut own_last = None;
+        let mut own = file_with(Some(ours), pkg_unix_now());
+        assert!(!holder_work_advanced(&running(&own), ours, &mut own_last));
+        own.programs.get_mut("trust").unwrap().bytes_done = 99;
+        assert!(!holder_work_advanced(&running(&own), ours, &mut own_last));
+        assert!(own_last.is_none());
+        // A sibling's file that is NOT running (dead pid / stale heartbeat) neither.
+        let mut dead_last = None;
+        let dead = PkgProgressSnapshot {
+            file: file_with(Some(sibling), 0),
+            running: false,
+        };
+        assert!(!holder_work_advanced(&dead, ours, &mut dead_last));
+        assert!(dead_last.is_none());
+    }
+
+    /// At the thread level: a tailer that watched a running sibling's file move its
+    /// work on says so at `finish`; one that saw only heartbeat refreshes does not.
+    /// The "sibling" is this test process — alive, and foreign to child pid 1.
+    #[test]
+    fn the_tailer_reports_a_siblings_advance_at_finish() {
+        let prefix =
+            std::env::temp_dir().join(format!("aterm-pkg-progress-advance-{}", std::process::id()));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        let write = |file: &ProgressFile| {
+            std::fs::write(layout.progress_file(), aterm_json::to_vec(file).unwrap()).unwrap();
+        };
+        let mut file = file_with(Some(std::process::id()), pkg_unix_now());
+        write(&file);
+        let (tx, _rx) = std::sync::mpsc::channel::<Option<Box<PkgProgressSnapshot>>>();
+        let sender = tx.clone();
+        let idle = PkgProgressTailer::spawn(layout.clone(), 1, move |s| {
+            let _ = sender.send(s);
+        })
+        .expect("tailer spawns");
+        std::thread::sleep(Duration::from_millis(300));
+        file.heartbeat_unix = pkg_unix_now();
+        write(&file);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !idle.finish(),
+            "heartbeat refreshes alone are not an advance"
+        );
+        let sender = tx;
+        let busy = PkgProgressTailer::spawn(layout.clone(), 1, move |s| {
+            let _ = sender.send(s);
+        })
+        .expect("tailer spawns");
+        std::thread::sleep(Duration::from_millis(300));
+        file.programs.get_mut("trust").unwrap().bytes_done = 60;
+        file.heartbeat_unix = pkg_unix_now();
+        write(&file);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            busy.finish(),
+            "the sibling's bytes landing during the tailer's life is"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+}
+
+/// How the launch lanes classify a child's exit (2026-09-10): the incident's shape
+/// — atpkg's contention code with no marker — is `Busy`, never `Refused`; the
+/// healthy quiet launch raises nothing; an opened card is answered whatever the
+/// exit; a marker outranks the code; the `Io` refusal and a signal stay refused.
+#[cfg(test)]
+mod pass_verdict_tests {
+    use super::{PassVerdict, classify_pass_exit};
+
+    /// REGRESSION (2026-09-10): the second instance's seed and update children
+    /// exited with the contention refusal and no marker, and both lanes called that
+    /// a terminal failure — "⚠ ALab toolchain install failed", six hours of nothing.
+    #[test]
+    fn contention_is_busy_never_refused_regression_2026_09_10() {
+        let code = Some(i32::from(atpkg::lock::CONTENDED_EXIT));
+        assert_eq!(classify_pass_exit(code, false, false), PassVerdict::Busy);
+        assert_eq!(code, Some(75));
+    }
+
+    #[test]
+    fn a_healthy_quiet_launch_raises_nothing() {
+        assert_eq!(
+            classify_pass_exit(Some(0), false, false),
+            PassVerdict::Quiet
+        );
+    }
+
+    #[test]
+    fn an_io_refusal_is_still_refused() {
+        assert_eq!(
+            classify_pass_exit(Some(1), false, false),
+            PassVerdict::Refused
+        );
+        assert_eq!(
+            classify_pass_exit(Some(2), false, false),
+            PassVerdict::Refused
+        );
+    }
+
+    #[test]
+    fn an_opened_card_is_answered_whatever_the_exit() {
+        for code in [Some(0), Some(1), Some(75), None] {
+            assert_eq!(
+                classify_pass_exit(code, true, false),
+                PassVerdict::AnnouncedThenDied,
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_outranks_the_code() {
+        assert_eq!(
+            classify_pass_exit(Some(1), false, true),
+            PassVerdict::Answered
+        );
+        assert_eq!(
+            classify_pass_exit(Some(0), true, true),
+            PassVerdict::Answered
+        );
+        // …except beside the contention code: exit 75 comes only from the dispatch
+        // edge, before any verb, and since 0.82.0 that refusal prints a terminal of
+        // its own (`seed-busy:`) — so a marker beside 75 is the refusal saying it
+        // stood aside, and the pass is still deferred, never "answered".
+        assert_eq!(
+            classify_pass_exit(Some(75), false, true),
+            PassVerdict::Busy,
+            "the contention refusal's own terminal does not make it a pass that ran"
+        );
+    }
+
+    #[test]
+    fn a_signalled_child_is_refused() {
+        assert_eq!(classify_pass_exit(None, false, false), PassVerdict::Refused);
+    }
 }
 
 /// Spawn the silent toolchain-update loop: a detached thread that periodically runs the
@@ -22980,7 +23495,14 @@ mod pkg_progress_tests {
 /// reads launch-time config only: flipping the switch takes effect at the next launch
 /// (documented; the loop itself is stateless between passes) — and it gates the seed
 /// pass too: `[packages].auto_update = false` also forgoes the launch-time seed, since
-/// the seed rides this one thread.
+/// the seed rides this one thread. A pass that finds another aterm's install in
+/// flight WAITS for it (`--wait-lock`, [`ATPKG_WAIT_LOCK_SECS`]) and then runs; a
+/// wait that runs out is retried on a 30 s → 10 min backoff ([`ContentionBackoff`]),
+/// never parked for the interval — the SEED included: a seed whose wait ran out is
+/// run again by the loop, ahead of its first update, since on a store the seed has
+/// not adopted `atpkg update` is a no-op; interval 0 still means one pass, but a
+/// contended one is retried until it actually runs, or stood down on for this launch
+/// once the holder looks wedged (2026-09-10).
 fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool {
     // The MASTER switch (`[packages].enabled`) gates everything this thread
     // does. `auto_update` gates only the recurring pass — NOT the one-shot
@@ -23059,18 +23581,54 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // `atpkg seed` exactly like this spawn, and deleted the five
             // rounds of begin/note/end patches this block used to carry.
             // What the child's stdout said about the marker contract: whether it
-            // announced, and whether anything answered.
+            // announced, whether anything answered — and whether it queued behind a
+            // sibling at the store lock, which is neither (`read_seed_markers`).
             let mut seen = SeedMarkers::default();
+            // Whether a `lock-waiting:` line has opened the waiting row on the
+            // toolchain lane and nothing has retired it yet — carried across the
+            // seed child and every update child, since the row belongs to the
+            // LANE, not to the child that opened it.
+            let mut wait_row_open = false;
+            // Whether the seed pass is still OWED for this launch: it timed out queued
+            // behind a sibling (`Busy`), so the update loop runs `seed` again ahead
+            // of its first `update` — an update on a store the seed has not yet
+            // adopted is `cmd_update_all`'s empty no-op (adoption is the seed's to
+            // record), so "the update pass queues behind it next" alone would have
+            // been six-hourly no-ops and a toolchain that never arrived until the
+            // next launch (2026-09-10; reachable only behind a holder that outlasts
+            // the seed's whole half-hour wait at first open).
+            let mut seed_pending = false;
             // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
-            // dispatch edge — store-lock contention, an unwritable or symlinked
-            // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
-            // stderr and emit no marker. With stderr going to /dev/null the GUI
-            // raised no event, wrote no status and logged nothing, so a launch that
-            // silently did nothing was indistinguishable from one that had nothing
-            // to do (2026-08-20 round-8 audit).
+            // dispatch edge — an unwritable or symlinked prefix — BEFORE `cmd_seed`
+            // runs, so those refusals print only to stderr and emit no marker. With
+            // stderr going to /dev/null the GUI raised no event, wrote no status and
+            // logged nothing, so a launch that silently did nothing was
+            // indistinguishable from one that had nothing to do (2026-08-20 round-8
+            // audit). Store-lock CONTENTION is not one of those refusals any more:
+            // the child WAITS on it (`--wait-lock`, below) and a wait that runs out
+            // is a `Busy` verdict, never a failure.
             let mut seed_cmd = std::process::Command::new(&atpkg);
             seed_cmd
                 .arg("seed")
+                // QUEUE BEHIND A SIBLING'S PASS instead of refusing (2026-09-10):
+                // the macOS Full Disk Access grant quits the app and opens it
+                // again while the first window's pass still holds the store lock
+                // (13 s apart, measured: pids 15359 and 15441), and so does a
+                // self-update re-exec or a window opened by hand. The first
+                // window's child is NOT detached on purpose — it dies at its next
+                // line of output once its window is gone (its stdout is a pipe
+                // nobody reads; the store is crash-consistent under that, see
+                // `atpkg::lock`) — and this child's wait is what picks the work
+                // up: atpkg polls the lock for up to `ATPKG_WAIT_LOCK_SECS`,
+                // announces the wait once on stdout (`lock-waiting:`), and exits
+                // 75 if the bound runs out.
+                .arg("--wait-lock")
+                .arg(ATPKG_WAIT_LOCK_SECS.to_string())
+                // WHO spawned it, said outright: a waiter whose window quits
+                // stands down when its parent is no longer this pid (the edge's
+                // own `getppid` capture races a parent that dies inside the
+                // child's startup; the pid from the spawner does not).
+                .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
                 .env("PATH", &child_path)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -23118,18 +23676,22 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         })
                     });
                     if let Some(out) = child.stdout.take() {
-                        // ONLY A TERMINAL MARKER COUNTS (2026-08-20 round-9 audit), and
-                        // the rule now lives in ONE place both passes read:
+                        // ONLY A TERMINAL MARKER COUNTS as an answer (2026-08-20 round-9
+                        // audit), and the rule lives in ONE place both passes read:
                         // `read_seed_markers`. The seed and update lanes carried two
                         // byte-identical copies of this loop and one of them was fixed
-                        // twice without the other.
+                        // twice without the other. The start opens the held card, and
+                        // a store-lock wait (`lock-waiting:`, 2026-09-10) opens only the
+                        // lane's waiting row — it is neither a start nor an answer.
                         seen = read_seed_markers(std::io::BufReader::new(out), |event| {
                             let _ = proxy.send_event(event);
                         });
                     }
                     drain.and_then(|h| h.join().ok()).unwrap_or_default()
                 });
-                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                let status = child.wait().ok();
+                let code = status.and_then(|s| s.code());
+                let ok = status.is_some_and(|s| s.success());
                 // Child exited: the tailer's lifetime ends here — one final read
                 // (classified not-running) and a join. No child, no tailer, no wakes.
                 if let Some(t) = tailer {
@@ -23156,60 +23718,132 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         said.trim().to_string()
                     }
                 };
-                // ANSWER THE ANNOUNCEMENT WITH THE CHILD'S OWN VERDICT, not with the
-                // fact that we failed to read one. `ok` was computed above and this
-                // branch ignored it: the comment said "answer it however the child
-                // ended" while the code sent `PkgSeedFailed` however it ended, and
-                // since the contract's markers were ALL failure markers, a pass that
-                // announced itself, did the work, succeeded and exited 0 was reported
-                // as "⚠ ALab toolchain install failed" (owner report, 2026-09-11).
-                // Both earlier audits are guards inside `seed_retire`, not here.
-                let verdict = seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
-                let announced = verdict != SeedRetire::Nothing;
-                if let Some(event) = seed_retire_event(verdict, &said) {
-                    let _ = proxy.send_event(event);
+                if seen.saw_lock_wait {
+                    // The wait line opened the lane's waiting row; the row belongs to
+                    // the LANE (see `wait_row_open`), so it is carried past this child.
+                    wait_row_open = true;
                 }
-                // The LOG is a different question from the pill: a non-zero exit with
-                // no marker is the CLI-edge refusal (store-lock contention, an
-                // unwritable prefix) that round 8 made visible, and it happens
-                // without any announcement having been opened. Gating this on
-                // `saw_start` would have re-silenced it.
-                // The seed pass's stderr reaches the log whatever the exit
-                // (2026-09-10), like the update pass's below; the refusal
-                // branch keeps its own sentence.
-                if !(!ok && !seen.saw_terminal) && !said.trim().is_empty() {
-                    let why: String = said.trim().chars().take(2000).collect();
-                    if ok {
-                        aterm_log::info!("atpkg seed said: {why}");
-                    } else {
-                        aterm_log::warn!("atpkg seed said: {why}");
-                    }
+                let why: String = said.trim().chars().take(2000).collect();
+                // HOW THE PASS ENDED, classified once and purely
+                // ([`classify_pass_exit`]). This used to be two overlapping `if`s
+                // whose refusal branch — "a non-zero exit that never reached the
+                // marker, which is a real failure every time" — read a store-lock
+                // contention refusal as a terminal install failure (2026-09-10).
+                let verdict = classify_pass_exit(code, seen.saw_start, seen.saw_terminal);
+                // A WAITED PASS THAT THEN RAN (or died) RETIRES ITS OWN WAITING ROW.
+                // `toolchain_snapshot(None)` clears only a non-terminal bar, so a
+                // terminal outcome — this child's marker, the sibling's tailed pass
+                // — is left standing. A `Busy` exit leaves the row for the update
+                // child that queues next behind the same holder (see below).
+                if wait_row_open && verdict != PassVerdict::Busy {
+                    let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
+                    wait_row_open = false;
                 }
-                if !ok && !seen.saw_terminal {
-                    let why = said.trim();
-                    aterm_log::warn!(
-                        "the ALab toolchain install did not run: {}",
-                        if why.is_empty() {
+                match verdict {
+                    // The announcement is held for 20 minutes and nothing else would
+                    // take it down, so answer it — WITH THE CHILD'S OWN VERDICT, not
+                    // with the fact that we failed to read one. This arm used to send
+                    // `PkgSeedFailed` however the child ended while its comment said
+                    // "however the child ended", and since the contract's markers were
+                    // ALL failure markers, a pass that announced itself, did the work,
+                    // succeeded and exited 0 was reported as "⚠ ALab toolchain install
+                    // failed" (owner report, 2026-09-11). `seed_retire` reads the exit
+                    // and the store — the one POSITIVE authority in reach; the marker
+                    // stream's silence is not. Both earlier audits are guards inside it.
+                    PassVerdict::AnnouncedThenDied => {
+                        let unanswered: &str = if why.is_empty() {
                             "atpkg exited without saying why"
                         } else {
-                            why
+                            why.as_str()
+                        };
+                        if ok {
+                            aterm_log::info!(
+                                "atpkg seed announced an install and ended without \
+                                 answering it (exit 0): {unanswered}"
+                            );
+                        } else {
+                            aterm_log::warn!(
+                                "atpkg seed announced an install and ended without \
+                                 answering it: {unanswered}"
+                            );
                         }
-                    );
-                    // ...AND SAY IT ON SCREEN, not only in the log. This branch is
-                    // the CLI-edge refusal — an unwritable prefix, store-lock
-                    // contention — and it was the ONE failing path with no card,
-                    // because the announcement above is gated on `saw_start` and a
-                    // refusal never gets that far. A machine sat with no toolchain
-                    // for three weeks in exactly this state: two WARN lines in a
-                    // file nobody opens, and a normal prompt on screen
-                    // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
-                    //
-                    // This does NOT reintroduce the round-10 false positive. That
-                    // one fired on a HEALTHY machine, where `atpkg seed` exits
-                    // quietly, markerlessly and ZERO — so `!ok` is false here and
-                    // no card is raised. This fires only on a non-zero exit that
-                    // never reached the marker, which is a real failure every time.
-                    if !announced {
+                        let retire =
+                            seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
+                        if let Some(event) = seed_retire_event(retire, &said) {
+                            let _ = proxy.send_event(event);
+                        }
+                    }
+                    // The markers spoke, or the child ran QUIETLY — `atpkg seed`
+                    // exits quietly, markerlessly and ZERO on every ordinary launch
+                    // of a provisioned Mac (the seal is reclaimed after the first
+                    // success), on a declined toolset, a disabled manager, and
+                    // `seed_install = false`, and raising the failure event there put
+                    // "⚠ ALab toolchain install failed" on screen at every launch of a
+                    // healthy machine (2026-08-20 round-10 audit). NOTHING is raised.
+                    // The log is a different question from the pill: the pass's
+                    // stderr reaches it whatever the exit (2026-09-10).
+                    PassVerdict::Answered | PassVerdict::Quiet => {
+                        if !why.is_empty() {
+                            if ok {
+                                aterm_log::info!("atpkg seed said: {why}");
+                            } else {
+                                aterm_log::warn!("atpkg seed said: {why}");
+                            }
+                        }
+                    }
+                    // QUEUED BEHIND A SIBLING AND THE BOUND RAN OUT (atpkg exit 75).
+                    // Not a failure and no failure bar: with the update loop armed
+                    // the loop runs the SEED again behind the same holder, on its
+                    // own backoff, and the update follows once it has run; without
+                    // the loop, say honestly that nothing in this window will. A
+                    // half-hour wait IS an anomaly, so the log line is a WARN (the
+                    // round-8 rule: a pass that did not run leaves one), but a Warn
+                    // ROW would be the incident's mistake.
+                    PassVerdict::Busy => {
+                        seed_pending = true;
+                        let bound = human_park(Duration::from_secs(ATPKG_WAIT_LOCK_SECS));
+                        aterm_log::warn!(
+                            "the ALab toolchain seed pass waited {bound} for another atpkg pass \
+                             to release the store lock and stood aside{}{}",
+                            stood_aside_said(seen),
+                            if run_update_loop {
+                                " — the update loop tries the seed again behind it"
+                            } else {
+                                " — automatic updates are off, so this window will not retry"
+                            }
+                        );
+                        if !why.is_empty() {
+                            aterm_log::info!("atpkg seed said: {why}");
+                        }
+                        if !run_update_loop {
+                            let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                detail: format!(
+                                    "another install held the store lock for {bound} \u{2014} \
+                                     automatic updates are off; run: aterm pkg update"
+                                ),
+                            });
+                            wait_row_open = false;
+                        }
+                    }
+                    // A markerless non-zero exit that is NOT contention: the CLI-edge
+                    // `Io` refusal (an unwritable prefix), a spawn that died, a signal.
+                    // Say it on screen, not only in the log: this was the ONE failing
+                    // path with no card, because the announcement is gated on
+                    // `saw_start` and a refusal never gets that far. A machine sat
+                    // with no toolchain for three weeks in exactly this state: two
+                    // WARN lines in a file nobody opens, and a normal prompt on
+                    // screen (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md).
+                    // This does NOT reintroduce the round-10 false positive: a
+                    // healthy machine exits ZERO, which is `Quiet` above.
+                    PassVerdict::Refused => {
+                        aterm_log::warn!(
+                            "the ALab toolchain install did not run: {}",
+                            if why.is_empty() {
+                                "atpkg exited without saying why"
+                            } else {
+                                &why
+                            }
+                        );
                         let _ = proxy.send_event(Wake::PkgSeedFailed {
                             detail: detail_of(&said),
                         });
@@ -23245,7 +23879,20 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // Cost of being wrong in this direction is one index fetch (~1 KB)
             // on a machine that just downloaded a gigabyte.
             let mut bump_watch = BumpWatch::default();
+            // The park after a timed-out wait on the store lock (2026-09-10): a
+            // short backoff, never the interval — see `ContentionBackoff`.
+            let mut backoff = ContentionBackoff::default();
             loop {
+                // Whether THIS pass timed out queued behind a sibling (atpkg exit
+                // 75), and the short park that follows when it did.
+                let mut busy = false;
+                let mut busy_park: Option<Duration> = None;
+                // THE VERB THIS TICK RUNS: `update`, or `seed` again while the seed
+                // is still owed (`seed_pending`, above) — the retried seed rides
+                // this lane's wait, tailer, backoff and wedge rule, and once it has
+                // RUN (any verdict but `Busy`) the update follows at once, as it
+                // does after a first seed that ran.
+                let verb = if seed_pending { "seed" } else { "update" };
                 // STREAM this child too. It was spawned with stdout discarded, which
                 // meant the NETWORK provisioning lane reached the user through no
                 // channel whatsoever: a multi-GB install could run with nothing on
@@ -23258,13 +23905,20 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 let mut update_cmd = std::process::Command::new(&atpkg);
                 // STDERR IS CAPTURED HERE TOO — the seed pass learned this in
                 // round 8 and this lane never did: atpkg's CLI-edge refusals
-                // (store-lock contention, an unwritable prefix) print only to
-                // stderr and emit no marker, so with stderr on /dev/null and
-                // the exit status discarded, six-hourly provisioning could
-                // fail forever with zero evidence anywhere. On the lean
-                // install this lane IS how the toolchain arrives.
+                // (an unwritable prefix) print only to stderr and emit no marker,
+                // so with stderr on /dev/null and the exit status discarded,
+                // six-hourly provisioning could fail forever with zero evidence
+                // anywhere. On the lean install this lane IS how the toolchain
+                // arrives — and on a lean install it is THIS pass that installs
+                // the default set, which is why a contention refusal here (the
+                // incident of 2026-09-10) left an adopted, empty store for six
+                // hours: the child now WAITS on the lock instead (same bound and
+                // reasoning as the seed child above).
                 update_cmd
-                    .arg("update")
+                    .arg(verb)
+                    .arg("--wait-lock")
+                    .arg(ATPKG_WAIT_LOCK_SECS.to_string())
+                    .env(atpkg::cli::SPAWNER_PID_ENV, std::process::id().to_string())
                     .env("PATH", &child_path)
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
@@ -23302,94 +23956,246 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                 })
                             });
                             if let Some(out) = child.stdout.take() {
+                                // The one marker loop both lanes read
+                                // (`read_seed_markers`): a start opens the card, a
+                                // store-lock wait opens the lane's row, and only a
+                                // terminal answers.
                                 seen = read_seed_markers(std::io::BufReader::new(out), |event| {
                                     let _ = proxy.send_event(event);
                                 });
                             }
                             drain.and_then(|h| h.join().ok()).unwrap_or_default()
                         });
-                        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-                        if let Some(t) = tailer {
-                            t.finish();
-                        }
+                        let status = child.wait().ok();
+                        let code = status.and_then(|s| s.code());
+                        let ok = status.is_some_and(|s| s.success());
+                        // Joined at the child's exit, as on the seed pass — and it
+                        // says whether the HOLDER our child was queued behind moved
+                        // its work on meanwhile, which the backoff below reads.
+                        let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
                         // The same admin step after a NETWORK pass — on the lean
                         // install this lane is where the `needs admin` rows first
                         // appear. Same rule, same marker: a set already declined
                         // raises nothing, and the six-hourly tick stays silent.
                         post_admin_step(layout.as_ref(), &proxy);
-                        // THE SAME DEFECT LIVED HERE TOO, verbatim: `atpkg update`'s
-                        // network set-completion announces `net-starting:` before it
-                        // moves gigabytes on an adopted machine, and `ok` was computed
-                        // two lines above and never consulted — an announced network
-                        // install that succeeded and exited 0 reported itself as a
-                        // failed install. This lane is the more exposed of the two:
-                        // `atpkg seed` runs once at launch, while this one runs every
-                        // six hours for the life of the process. Same seam, same guards
-                        // (2026-09-11).
-                        let verdict =
-                            seed_retire(seen, ok, pkg_store_holds_programs(layout.as_ref()));
-                        if let Some(event) = seed_retire_event(verdict, &said) {
-                            let _ = proxy.send_event(event);
+                        if seen.saw_lock_wait {
+                            // The wait line opened the lane's waiting row (see
+                            // `wait_row_open`): carried past this child, like the seed's.
+                            wait_row_open = true;
                         }
-                        // A markerless non-zero exit is the CLI-edge refusal —
-                        // the quiet steady state ("everything up to date",
-                        // exit 0, no marker) stays quiet ON SCREEN. In the LOG
-                        // every pass leaves a trace (2026-09-10): its stderr,
-                        // whatever the exit and whether or not a marker was
-                        // printed — a pass that exits non-zero AFTER a marker,
-                        // or exits 0 with per-program failure lines, used to
-                        // drop its stderr entirely — and one INFO line naming
-                        // the outcome atpkg recorded, so "did the check run,
-                        // and when?" has an answer beside status.toml.
-                        let why = said.trim();
-                        if !ok && !seen.saw_terminal {
-                            aterm_log::warn!(
-                                "the ALab toolchain update pass did not run: {}",
-                                if why.is_empty() {
+                        let why: String = said.trim().chars().take(2000).collect();
+                        // The seed lane's classifier, for the seed lane's reason.
+                        let verdict = classify_pass_exit(code, seen.saw_start, seen.saw_terminal);
+                        if wait_row_open && verdict != PassVerdict::Busy {
+                            let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
+                            wait_row_open = false;
+                        }
+                        match verdict {
+                            // `net-starting:` OPENS the bar (it rides the PkgSeedStarted
+                            // arm), and a child that dies after opening it must still
+                            // answer it — or the bar sits for its full hold with the
+                            // failure recorded nowhere.
+                            PassVerdict::AnnouncedThenDied => {
+                                // A pass that announced RAN (it held the lock): the
+                                // contention tally starts over like any pass that ran.
+                                backoff.reset();
+                                // THE SAME DEFECT LIVED HERE TOO, verbatim: `atpkg update`'s
+                                // network set-completion announces `net-starting:` before
+                                // it moves gigabytes on an adopted machine, and `ok` was
+                                // computed two lines above and never consulted — an
+                                // announced network install that succeeded and exited 0
+                                // reported itself as a failed install. This lane is the
+                                // more exposed of the two: `atpkg seed` runs once at
+                                // launch, while this one runs every six hours for the
+                                // life of the process. Same seam, same guards (2026-09-11).
+                                let unanswered: &str = if why.is_empty() {
                                     "atpkg exited without saying why"
                                 } else {
-                                    why
+                                    why.as_str()
+                                };
+                                if ok {
+                                    aterm_log::info!(
+                                        "atpkg {verb} announced an install and ended without \
+                                         answering it (exit 0): {unanswered}"
+                                    );
+                                } else {
+                                    aterm_log::warn!(
+                                        "atpkg {verb} announced an install and ended without \
+                                         answering it: {unanswered}"
+                                    );
                                 }
-                            );
-                        } else if !why.is_empty() {
-                            let why: String = why.chars().take(2000).collect();
-                            if ok {
-                                aterm_log::info!("atpkg update said: {why}");
-                            } else {
-                                aterm_log::warn!("atpkg update said: {why}");
+                                let retire = seed_retire(
+                                    seen,
+                                    ok,
+                                    pkg_store_holds_programs(layout.as_ref()),
+                                );
+                                if let Some(event) = seed_retire_event(retire, &said) {
+                                    let _ = proxy.send_event(event);
+                                }
+                            }
+                            // A markerless non-zero exit that is NOT contention is the
+                            // CLI-edge `Io` refusal (or a signal): the quiet steady
+                            // state ("everything up to date", exit 0, no marker) stays
+                            // quiet ON SCREEN, but in the LOG every pass leaves a trace.
+                            PassVerdict::Refused => {
+                                backoff.reset();
+                                aterm_log::warn!(
+                                    "the ALab toolchain {verb} pass did not run: {}",
+                                    if why.is_empty() {
+                                        "atpkg exited without saying why"
+                                    } else {
+                                        &why
+                                    }
+                                );
+                                // A retried SEED keeps the seed lane's rule: its
+                                // refusal is the one failing path with no card
+                                // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md),
+                                // so it is said on screen, not only in the log.
+                                if seed_pending {
+                                    let _ = proxy.send_event(Wake::PkgSeedFailed {
+                                        detail: if why.is_empty() {
+                                            "atpkg ended without saying what happened".to_string()
+                                        } else {
+                                            why.clone()
+                                        },
+                                    });
+                                }
+                            }
+                            // QUEUED BEHIND A SIBLING AND THE BOUND RAN OUT (exit 75):
+                            // deferred, never failed. The park that follows is the
+                            // backoff, not the interval, and the row says so — until
+                            // the holder looks WEDGED (three waits with nothing
+                            // moving in its file), when the park stretches to an
+                            // hour — still never the interval — and says that
+                            // instead; a holder whose work the tailer saw advance
+                            // is a slow install and never counts. The refusal
+                            // happened at atpkg's edge, before anything wrote
+                            // `status.toml`, so the outcome line below is skipped:
+                            // "(no status.toml)" would be a non-answer.
+                            PassVerdict::Busy => {
+                                busy = true;
+                                let bound = human_park(Duration::from_secs(ATPKG_WAIT_LOCK_SECS));
+                                let park = backoff.park(holder_advanced);
+                                if backoff.wedged() {
+                                    // WEDGED: three half-hour waits in a row with
+                                    // nothing moving in the holder's file. The park
+                                    // is an hour (`CONTENTION_WEDGE_PARK`), never
+                                    // the six-hour interval, and never longer than
+                                    // the interval either.
+                                    let park = CONTENTION_WEDGE_PARK
+                                        .min(Duration::from_secs(interval.max(1)));
+                                    busy_park = Some(park);
+                                    aterm_log::warn!(
+                                        "another atpkg pass has held the store lock through {} \
+                                         consecutive {bound} waits of this window's {verb} pass \
+                                         with no visible progress \u{2014} trying again in {} (a \
+                                         stub run still triggers an early pass)",
+                                        backoff.consecutive,
+                                        human_park(park)
+                                    );
+                                    let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                        detail: format!(
+                                            "another install has held the store lock for over an \
+                                             hour with no visible progress \u{2014} this window \
+                                             tries again in {}",
+                                            human_park(park)
+                                        ),
+                                    });
+                                } else {
+                                    busy_park = Some(park);
+                                    aterm_log::warn!(
+                                        "the ALab toolchain {verb} pass waited {bound} for another \
+                                         atpkg pass to release the store lock and stood aside{} \
+                                         \u{2014} trying again in {}",
+                                        stood_aside_said(seen),
+                                        human_park(park)
+                                    );
+                                    let _ = proxy.send_event(Wake::PkgLockTimedOut {
+                                        detail: format!(
+                                            "another install is still running \u{2014} trying \
+                                             again in {} (each try waits up to {bound})",
+                                            human_park(park)
+                                        ),
+                                    });
+                                }
+                                if !why.is_empty() {
+                                    aterm_log::info!("atpkg {verb} said: {why}");
+                                }
+                                wait_row_open = false;
+                            }
+                            // The markers spoke, or the pass ran quietly: stderr,
+                            // whatever the exit and whether or not a marker was
+                            // printed — a pass that exits non-zero AFTER a marker,
+                            // or exits 0 with per-program failure lines, used to
+                            // drop its stderr entirely (2026-09-10).
+                            PassVerdict::Answered | PassVerdict::Quiet => {
+                                backoff.reset();
+                                if !why.is_empty() {
+                                    if ok {
+                                        aterm_log::info!("atpkg {verb} said: {why}");
+                                    } else {
+                                        aterm_log::warn!("atpkg {verb} said: {why}");
+                                    }
+                                }
                             }
                         }
-                        let outcome = layout
-                            .as_ref()
-                            .and_then(atpkg::status::read)
-                            .map(|status| status.outcome)
-                            .filter(|outcome| !outcome.is_empty())
-                            .unwrap_or_else(|| "(no status.toml)".to_string());
-                        aterm_log::info!(
-                            "atpkg update pass finished: exit={} outcome={outcome}",
-                            if ok { "ok" } else { "failed" }
-                        );
+                        if verdict != PassVerdict::Busy {
+                            // One INFO line naming the outcome atpkg recorded, so "did
+                            // the check run, and when?" has an answer beside status.toml.
+                            let outcome = layout
+                                .as_ref()
+                                .and_then(atpkg::status::read)
+                                .map(|status| status.outcome)
+                                .filter(|outcome| !outcome.is_empty())
+                                .unwrap_or_else(|| "(no status.toml)".to_string());
+                            aterm_log::info!(
+                                "atpkg {verb} pass finished: exit={} outcome={outcome}",
+                                if ok { "ok" } else { "failed" }
+                            );
+                        }
+                        if seed_pending && verdict != PassVerdict::Busy {
+                            // The retried seed RAN (or died, its card raised above):
+                            // the seed is no longer owed, and the update follows AT
+                            // ONCE — no park — exactly as it does after a first seed
+                            // that ran (the "run the first update immediately" rule).
+                            seed_pending = false;
+                            continue;
+                        }
                     }
                     Err(error) => {
                         // A bundle whose co-located atpkg cannot exec is a
                         // provisioning outage, not a quiet tick.
-                        aterm_log::warn!("could not launch atpkg update: {error}");
+                        aterm_log::warn!("could not launch atpkg {verb}: {error}");
+                        // A waiting row the seed child left open for THIS child to
+                        // carry (its `Busy` exit with the loop armed) has no child
+                        // to retire it now: clear it here, or it sits for its cap.
+                        if wait_row_open {
+                            let _ = proxy.send_event(Wake::PkgProgress { snapshot: None });
+                            wait_row_open = false;
+                        }
                     }
                 }
-                if interval == 0 {
+                // A once-pass (`ATPKG_UPDATE_INTERVAL_SECS=0`, the test knob) ends
+                // after a pass that RAN — a contended one is retried until it does,
+                // unless the holder looks wedged, when a once-pass stands down for
+                // good rather than looping on half-hour waits (the three doc sites
+                // — `prefs.rs`, `pkg_check.rs`, the streaming design §4 — say the
+                // same). A retried seed that ran `continue`d above, so the update
+                // it owes still runs before this can end the once-pass.
+                if interval == 0 && (!busy || backoff.wedged()) {
                     break;
                 }
-                // Park for the interval in 5s slices watching `<prefix>/bump`
+                // Park — for the interval in 5s slices watching `<prefix>/bump`
                 // (design §4): a stub run while NO installer holds the flock can
                 // only wish — this watch is what grants it, turning a fresh bump
                 // into an immediate pass. Rate-floored (one early pass per 5min),
                 // failure-aware (a program the current pass already recorded as
                 // failed does not re-trigger), and the 6h cadence itself stands.
-                sleep_interval_watching_bump(
-                    layout.as_ref(),
-                    Duration::from_secs(interval),
-                    &mut bump_watch,
-                );
+                // After a timed-out wait on the store lock the park is the SHORT
+                // backoff instead (the incident sat through a whole interval);
+                // the bump watch is kept either way.
+                let park = busy_park.unwrap_or_else(|| Duration::from_secs(interval));
+                sleep_interval_watching_bump(layout.as_ref(), park, &mut bump_watch);
             }
         })
         .is_ok()
@@ -23513,7 +24319,8 @@ fn r6_marker_body<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
 /// 2026-09-10): atpkg prints them at the end of every pass, announced or not, so a
 /// catch-all counted one as the answer to a card the pass had not finished with —
 /// round 9's rule read backwards. A marker variant added later is not an answer
-/// until it is named here.
+/// until it is named here. (`seed-busy:` is the one terminal with no variant: it
+/// never reaches the app loop — [`read_seed_markers`] keeps it for the lane.)
 fn seed_event_is_terminal(event: &Wake) -> bool {
     matches!(
         event,
@@ -23522,19 +24329,23 @@ fn seed_event_is_terminal(event: &Wake) -> bool {
             | Wake::PkgSeedPartial { .. }
             | Wake::PkgSeedFailed { .. }
             | Wake::PkgSeedUnusable { .. }
-            // `seed-busy:` ends this pass as surely as any other terminal — it just
-            // ends it with "somebody else is doing it". It is printed at the dispatch
-            // edge, BEFORE any verb can announce, so it never leaves a card standing.
-            | Wake::PkgSeedBusy { .. }
     )
 }
 
 /// What an `atpkg` child's stdout said about the marker contract: whether it OPENED
-/// an announcement, and whether anything ANSWERED it.
+/// an announcement, whether anything ANSWERED it — whether it QUEUED behind a
+/// sibling at the store lock (`lock-waiting:`, 2026-09-10), which is neither: the
+/// wait opens only the lane's waiting row, so a child that waited and then ran
+/// quietly is still the quiet, nothing-raised launch ([`classify_pass_exit`]) — and
+/// whether it then STOOD ASIDE for that sibling (`seed-busy:`, 0.82.0): a terminal
+/// whose exit code (75) is what defers the pass, and whose words go to the lane's
+/// one log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SeedMarkers {
     saw_start: bool,
     saw_terminal: bool,
+    saw_lock_wait: bool,
+    saw_busy: bool,
 }
 
 /// Read an `atpkg` child's stdout for the marker contract, posting each marker event
@@ -23546,11 +24357,34 @@ struct SeedMarkers {
 fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) -> SeedMarkers {
     let mut seen = SeedMarkers::default();
     for line in out.lines().map_while(Result::ok) {
+        // `seed-busy:` — ANOTHER `atpkg` HOLDS THE STORE LOCK and this pass stood
+        // aside (0.82.0). A terminal: it ends the pass, at the dispatch edge, before
+        // any verb could announce, so it never leaves a card standing. And the one
+        // marker that is NOT an event: the exit code it rides (75, `Busy` in
+        // `classify_pass_exit`) is what defers the pass, and the lane's `Busy` arm —
+        // which knows the wait bound and the retry policy — writes the log line.
+        // Posting it too logged the same fact twice, at INFO from the wake and at
+        // WARN from the lane. The screen never gets it: a warning a user cannot act
+        // on, about a condition that resolves itself, is worse than silence — and
+        // this one appeared on a machine whose toolchain was being installed
+        // correctly at that moment (2026-09-11).
+        if line
+            .strip_prefix("atpkg: ")
+            .is_some_and(|rest| rest.starts_with(atpkg::cli::SEED_BUSY_MARKER))
+        {
+            seen.saw_terminal = true;
+            seen.saw_busy = true;
+            continue;
+        }
         if let Some(event) = parse_seed_line(&line) {
             if matches!(event, Wake::PkgSeedStarted { .. }) {
                 // The announcement was OPENED. Only then is there a held card that
                 // needs retiring.
                 seen.saw_start = true;
+            } else if matches!(event, Wake::PkgLockWaiting { .. }) {
+                // Queued behind a sibling: the lane's waiting row opens, and nothing
+                // about the card — not a start, not an answer.
+                seen.saw_lock_wait = true;
             } else if seed_event_is_terminal(&event) {
                 seen.saw_terminal = true;
             }
@@ -23677,9 +24511,8 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     if let Some(detail) = marked(atpkg::cli::SEED_DONE_MARKER) {
         return Some(Wake::PkgSeedDone { detail });
     }
-    if let Some(detail) = marked(atpkg::cli::SEED_BUSY_MARKER) {
-        return Some(Wake::PkgSeedBusy { detail });
-    }
+    // (`seed-busy:` is read by `read_seed_markers` ahead of this parser and never
+    // becomes an event: its exit code is the verdict, and the lane writes the line.)
     // The network lane's ANNOUNCEMENT and failure TERMINAL ride the seed
     // lane's card semantics — to the user they are the same events (an install
     // is starting; an install came to nothing), and the held "Installing…"
@@ -23689,6 +24522,12 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     }
     if let Some(detail) = marked(atpkg::cli::NET_FAILED_MARKER) {
         return Some(Wake::PkgSeedFailed { detail });
+    }
+    // The dispatch edge's "queued behind a sibling" line (2026-09-10): neither a
+    // start nor an answer — the lanes keep it out of their announcement
+    // bookkeeping and it opens only the non-terminal waiting row.
+    if let Some(detail) = marked(atpkg::cli::LOCK_WAITING_MARKER) {
+        return Some(Wake::PkgLockWaiting { detail });
     }
     // The NETWORK completion lane's arrival — same pill as a local install, because
     // to the user it is the same event: the toolchain is now here.
@@ -23837,11 +24676,21 @@ fn seed_pill_text(
 /// pass was reported as a failed install.
 #[cfg(test)]
 mod seed_announcement_verdict_tests {
-    use super::{SeedMarkers, SeedRetire, Wake, read_seed_markers, seed_retire, seed_retire_event};
+    use super::{
+        PassVerdict, SeedMarkers, SeedRetire, Wake, classify_pass_exit, read_seed_markers,
+        seed_retire, seed_retire_event,
+    };
 
     /// Run a real child under the marker loop and report what the stream said plus how
     /// the child ended — the two inputs the verdict is built from.
     fn drive(script: &str) -> (SeedMarkers, bool, Vec<Wake>) {
+        let (seen, code, posted) = drive_code(script);
+        (seen, code == Some(0), posted)
+    }
+
+    /// [`drive`], reporting the child's exit CODE rather than pass/fail: the input
+    /// [`classify_pass_exit`] keys the contention verdict on.
+    fn drive_code(script: &str) -> (SeedMarkers, Option<i32>, Vec<Wake>) {
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(script)
@@ -23854,8 +24703,8 @@ mod seed_announcement_verdict_tests {
             std::io::BufReader::new(child.stdout.take().expect("piped stdout")),
             |event| posted.push(event),
         );
-        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-        (seen, ok, posted)
+        let code = child.wait().ok().and_then(|s| s.code());
+        (seen, code, posted)
     }
 
     /// THE PIN. Announced, worked, exited 0, printed no terminal marker — and the user
@@ -23986,33 +24835,50 @@ mod seed_announcement_verdict_tests {
     /// seconds apart; the second one's children lost the store lock to the first
     /// one's, exited non-zero and printed nothing, and the refusal branch put
     /// "⚠ ALab toolchain install failed" on screen while the install was RUNNING in
-    /// the other process. `seed-busy:` is that pass saying it stood aside.
+    /// the other process. `seed-busy:` is that pass saying it stood aside — and what
+    /// keeps the card down is the exit code it rides: atpkg exits 75 on contention,
+    /// and [`classify_pass_exit`] reads that BEFORE the marker, so the verdict both
+    /// lanes match on is `Busy`. The line itself is kept for the lane's log.
     #[test]
     fn a_contended_pass_is_not_a_failed_install() {
-        let (seen, ok, posted) = drive(
+        let (seen, code, posted) = drive_code(&format!(
             "echo 'atpkg: seed-busy: another atpkg process holds the store lock \
-             — that pass is doing this work and this one stood aside'; exit 1",
+             — that pass is doing this work and this one stood aside'; exit {}",
+            atpkg::lock::CONTENDED_EXIT
+        ));
+        assert_eq!(
+            code,
+            Some(75),
+            "the contended child exits atpkg's contention code"
         );
-        assert!(!ok, "the contended child still exits non-zero");
         assert!(
-            seen.saw_terminal,
-            "`seed-busy:` ENDS the pass — and it is the flag the refusal branch reads"
+            seen.saw_terminal && seen.saw_busy && !seen.saw_start,
+            "`seed-busy:` ENDS the pass, says so, and opens nothing: {seen:?}"
         );
         assert!(
-            matches!(posted.as_slice(), [Wake::PkgSeedBusy { .. }]),
-            "{posted:?}"
+            posted.is_empty(),
+            "the line is the lane's to log, not an event: {posted:?}"
         );
-        // The refusal branch's own condition, verbatim from both lanes: with a
-        // terminal seen it does not fire, so no card is raised.
-        assert!(
-            !(!ok && !seen.saw_terminal),
-            "a contended pass must not reach the refusal card"
+        // THE LANES' OWN CONDITION — the one classifier both match on, fed exactly
+        // what they feed it. `Busy` is the arm with no card.
+        assert_eq!(
+            classify_pass_exit(code, seen.saw_start, seen.saw_terminal),
+            PassVerdict::Busy,
+            "a contended pass is deferred, never a failed install"
         );
-        // …while a refusal with NO marker — an unwritable prefix, a bundle whose
-        // atpkg cannot exec — still does. That branch is not being weakened.
-        let (bare, bare_ok, _) = drive("echo 'atpkg: the prefix is not writable' >&2; exit 1");
+        // …while a refusal with NO marker and NOT the contention code — an
+        // unwritable prefix, a bundle whose atpkg cannot exec — still reaches the
+        // card. That branch is not being weakened.
+        let (bare, bare_code, bare_posted) =
+            drive_code("echo 'atpkg: the prefix is not writable' >&2; exit 1");
+        assert_eq!(bare_code, Some(1));
         assert!(
-            !bare_ok && !bare.saw_terminal,
+            bare_posted.is_empty() && bare == SeedMarkers::default(),
+            "{bare:?}"
+        );
+        assert_eq!(
+            classify_pass_exit(bare_code, bare.saw_start, bare.saw_terminal),
+            PassVerdict::Refused,
             "a real refusal still reaches the card"
         );
     }
@@ -24214,10 +25080,15 @@ mod seed_marker_tests {
     #[test]
     fn every_atpkg_marker_constant_has_a_wake_arm() {
         use super::parse_seed_line;
-        let cases: [(&str, &str); 8] = [
+        let cases: [(&str, &str); 9] = [
             (
                 atpkg::cli::SEED_STARTING_MARKER,
                 "installing 8 ALab program(s)",
+            ),
+            (
+                atpkg::cli::LOCK_WAITING_MARKER,
+                "another atpkg process holds the store lock at /x/store.lock \u{2014} \
+                 waiting up to 1800 s for it to finish",
             ),
             (atpkg::cli::SEED_PARTIAL_MARKER, "3 installed, 5 failed"),
             (atpkg::cli::SEED_FAILED_MARKER, "nothing could be installed"),
@@ -24255,6 +25126,93 @@ mod seed_marker_tests {
         }
         // An empty tail is not an event.
         assert!(parse_seed_line(&format!("atpkg: {}", atpkg::cli::SEED_FAILED_MARKER)).is_none());
+    }
+
+    /// The store-lock wait line (2026-09-10) raises its own wake, with the prefix
+    /// stripped and an empty tail raising nothing — and it is NEITHER a start nor
+    /// an answer: the lanes' exit classifier never sees it, so a child that waited
+    /// and then ran quietly is still the quiet, nothing-raised launch.
+    #[test]
+    fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
+        use super::{PassVerdict, classify_pass_exit};
+        let line = format!(
+            "atpkg: {}another atpkg process holds the store lock at /x/store.lock \u{2014} \
+             waiting up to 1800 s for it to finish",
+            atpkg::cli::LOCK_WAITING_MARKER
+        );
+        match parse_seed_line(&line) {
+            Some(Wake::PkgLockWaiting { detail }) => {
+                assert!(
+                    detail.starts_with("another atpkg process holds"),
+                    "{detail}"
+                );
+                assert!(
+                    !detail.contains("lock-waiting"),
+                    "prefix stripped: {detail}"
+                );
+            }
+            other => panic!("expected PkgLockWaiting, got {other:?}"),
+        }
+        assert!(parse_seed_line(&format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER)).is_none());
+        assert_eq!(atpkg::cli::LOCK_WAITING_MARKER, "lock-waiting: ");
+        // THE LANES' OWN BOOKKEEPING, driven through the one loop both stdout
+        // readers call (`read_seed_markers`): the wait opens only the lane's
+        // waiting row — neither `saw_start` nor `saw_terminal` — so "waited, then
+        // ran quietly" is the healthy launch's verdict and "waited, then timed out"
+        // is deferred; a start and an answer are still each their own fact
+        // afterwards.
+        use super::read_seed_markers;
+        let read = |stdout: &str| read_seed_markers(stdout.as_bytes(), |_| {});
+        let seen = read(&format!("{line}\n"));
+        assert!(seen.saw_lock_wait, "the wait opens the lane's row");
+        assert!(
+            !seen.saw_start && !seen.saw_terminal,
+            "…and is neither a start nor an answer"
+        );
+        assert_eq!(
+            classify_pass_exit(Some(0), seen.saw_start, seen.saw_terminal),
+            PassVerdict::Quiet,
+            "waited, then ran quietly: nothing raised"
+        );
+        assert_eq!(
+            classify_pass_exit(Some(75), seen.saw_start, seen.saw_terminal),
+            PassVerdict::Busy,
+            "waited, then timed out: deferred, never failed"
+        );
+        // …and a timed-out wait that says so (0.82.0's `seed-busy:` terminal rides
+        // the same exit 75) is STILL deferred, never a pass that ran.
+        let busy = read(&format!(
+            "{line}\natpkg: {}another atpkg process holds the store lock\n",
+            atpkg::cli::SEED_BUSY_MARKER
+        ));
+        assert!(busy.saw_lock_wait && busy.saw_terminal && busy.saw_busy && !busy.saw_start);
+        assert_eq!(
+            classify_pass_exit(Some(75), busy.saw_start, busy.saw_terminal),
+            PassVerdict::Busy,
+            "waited, timed out and said so: deferred"
+        );
+        let started = read(&format!(
+            "{line}\natpkg: {}installing 8 ALab program(s)\n",
+            atpkg::cli::SEED_STARTING_MARKER
+        ));
+        assert!(
+            started.saw_start && !started.saw_terminal,
+            "a start opens the card, answers nothing"
+        );
+        assert_eq!(
+            classify_pass_exit(Some(1), started.saw_start, started.saw_terminal),
+            PassVerdict::AnnouncedThenDied
+        );
+        let answered = read(&format!(
+            "{line}\natpkg: {}installing 8 ALab program(s)\natpkg: {}ay, trust\n",
+            atpkg::cli::SEED_STARTING_MARKER,
+            atpkg::cli::SEED_INSTALLED_MARKER
+        ));
+        assert!(answered.saw_terminal, "a terminal marker is the answer");
+        assert_eq!(
+            classify_pass_exit(Some(1), answered.saw_start, answered.saw_terminal),
+            PassVerdict::Answered
+        );
     }
 
     #[test]
@@ -25681,19 +26639,34 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // launch, and the seeded bars fold at their staleness caps like any other.
     // `=managed` / `=machine` (2026-09-10) seed the two R6 rows — the managed
     // agents in use, and the machine settings a pass changed — through their real
-    // wakes, and nothing else, so each can be captured on its own.
+    // wakes, and nothing else, so each can be captured on its own. `=waiting` /
+    // `=deferred` seed the store-lock rows the same way: the live "queued behind
+    // another install" row, and the deferred notice a timed-out wait posts.
     if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS")
-        && (mode == "managed" || mode == "machine")
+        && (mode == "managed" || mode == "machine" || mode == "waiting" || mode == "deferred")
     {
         let proxy = event_loop.create_proxy();
         let _ = proxy.send_event(if mode == "managed" {
             Wake::PkgManagedCurrent(
                 "claude 2.1.267 (build 2026091001); codex 0.154.0 (build 2026091001)".to_string(),
             )
-        } else {
+        } else if mode == "machine" {
             Wake::PkgMachineSettings(
                 "spotlight-noindex 73 dir(s) migrated; universal-control disabled".to_string(),
             )
+        } else if mode == "waiting" {
+            Wake::PkgLockWaiting {
+                detail: "another atpkg process holds the store lock at ~/Library/Application \
+                         Support/aterm/pkg/store.lock \u{2014} waiting up to 1800 s for it to \
+                         finish"
+                    .to_string(),
+            }
+        } else {
+            Wake::PkgLockTimedOut {
+                detail: "another install is still running \u{2014} trying again in 30 s (each \
+                         try waits up to 30 min)"
+                    .to_string(),
+            }
         });
     } else if let Some(mode) = std::env::var_os("ATERM_DEBUG_STATUS_BARS") {
         let proxy = event_loop.create_proxy();
@@ -25905,13 +26878,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // Session 0: on the adopt path, the shell whose id matches the manifest's first leaf
     // (so session 0 lands in its original first pane); fall back to any handed-off shell
     // if the manifest is absent/unmatched. The chosen shell is REMOVED from the pool the
-    // rest of the layout adopts from, so it is never adopted twice.
+    // rest of the layout adopts from, so it is never adopted twice. "First leaf" is the
+    // one the deferred restore grafts session 0 onto — `bootstrap_local_id`, the canonical
+    // tree's first terminal leaf. The legacy `tabs` mirror this used to read lists only
+    // all-terminal tabs, so a native/terminal split tab ahead of them put this shell in
+    // another shell's pane.
     let adopt0 = if adopting {
         let first_leaf_id = restore_manifest
             .as_ref()
             .and_then(|m| m.windows.first())
-            .and_then(|w| w.tabs.first())
-            .and_then(|t| t.leaves().first().and_then(|l| l.local_id()));
+            .and_then(restore::WindowLayout::bootstrap_local_id);
         let idx = first_leaf_id
             .and_then(|id| seamless_adopt.iter().position(|a| a.local_id == id))
             .unwrap_or(0);
@@ -26781,6 +27757,34 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // close) stays non-blocking via `Session::drop`'s hang-up-then-off-thread-close.
     // `forget` `app` for good measure so even a future early `return` can't trip
     // the blocking Drop; `exit(0)` already skips it.
+    //
+    // THE ATPKG CHILDREN ARE NEITHER KILLED NOR WAITED FOR HERE, ON PURPOSE
+    // (2026-09-10). They are spawned coupled to this window — no process group of
+    // their own, stdout and stderr piped to it — so an installing child outlives
+    // this exit only until its next line of output: a Finder-launched app has no
+    // controlling tty (the SIGHUP above is for the PTY shells), Rust leaves SIGPIPE
+    // ignored, and atpkg's next print gets EPIPE and panics (exit 101, the flock
+    // released by the kernel). That is the incident's first half: the first
+    // window's pass died like this while the second window's pass was refused.
+    // The fix is not to make the orphan survive — every print site would need an
+    // EPIPE-proof funnel, or stdio on a file that blinds the marker contract, and
+    // an unobserved orphan cannot be shown or answered — and not to SIGTERM it
+    // either: atpkg blocks on a curl child that appends to `<asset>.part`, and a
+    // signal mid-download would orphan THAT writer against the successor's
+    // `--continue-at` on the same file. The store is crash-consistent for any
+    // death (`atpkg::lock`), so the orphan's death costs at most one program's
+    // redo, and the successor's own children `--wait-lock` behind it and pick the
+    // work up. A merely WAITING child (queued at the lock, its one marker line
+    // printed at most) is told this window's pid when spawned (`SPAWNER_PID_ENV`),
+    // notices its parent is no longer that pid (init here, a subreaper on Linux;
+    // a parent it cannot read, as on Windows, is never "gone") and stands down on
+    // its own, before it would print anything (`atpkg::cli::parent_is_gone`; the check
+    // precedes the announcement on every poll). The one relaunch shape this does
+    // not cover
+    // is the self-update handoff REJECTING a candidate: that sweep SIGKILLs the
+    // candidate's process group, atpkg child included (still crash-consistent),
+    // and the parked parent's loop picks the remainder up at its next tick or
+    // bump.
     std::mem::forget(app);
     std::process::exit(0);
 }
@@ -38834,6 +39838,10 @@ mod spec_xref_gate {
         );
         // ConsoleLifeEpisode and ConsoleResidentHandoff add two distinct
         // machines; the uniqueness assertion above must remain before this pin.
+        // 2026-09-10: `EchoLedgerBridge` (`echo_ledger_bridge_model`, the
+        // echo ledger's ty-checked law, 88c9d82ff) adds one — 151 → 152. The
+        // delivered-insert arm of the same day EXTENDS `CursorHintLicense`
+        // (new actions and invariants on a registered machine) and adds none.
         assert_eq!(
             total, 152,
             "update the live TrustIr report-shape regression when the registry changes"

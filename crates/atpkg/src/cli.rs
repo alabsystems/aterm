@@ -341,6 +341,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("seed" | "update" | "install")
     ) {
         strip_progress_file_flag(&mut args);
+        // `--wait-lock <secs>` — the machine lanes' opt-in to QUEUE behind a sibling's
+        // pass at the store lock instead of refusing (2026-09-10), stripped here for
+        // the same reason and BEFORE everything that would otherwise refuse it:
+        // `cmd_seed`'s operand refusal, the flag gate below, and the lock itself,
+        // which is what reads it ([`mutator_store_lock`]).
+        if let Some(bound) = take_wait_lock_flag(&mut args) {
+            // The spawner's pid is captured HERE, at the edge, because "my parent
+            // is gone" is a CHANGE of parent (see `parent_is_gone`), and this is
+            // the last moment the parent is known to be the spawner.
+            let _ = WAIT_LOCK.set(WaitLock {
+                bound,
+                spawner: spawner_pid(),
+            });
+        }
     }
     let verb = args.first().map(String::as_str);
     // The HIDDEN pending-program verb (R6): what a laid stub execs. Deliberately
@@ -360,13 +374,30 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     if verb == Some(crate::reroute::HIDDEN_VERB) {
         return cmd_reroute(&args[1..]);
     }
+    // The HIDDEN untracked-stage verb (`crate::stage_helper`): what the launchd job the
+    // store's staging lane submits execs, from a clean byte copy of this binary, when the
+    // installer measured itself as provenance-tracked. Same discipline as `__pending`:
+    // unlisted, dispatched before the store lock — its PARENT holds that lock — and it
+    // touches only the staging scratch its spec names.
+    if verb == Some(crate::stage_helper::HIDDEN_VERB) {
+        return crate::stage_helper::run_helper(&args[1..]);
+    }
+    // The HIDDEN executable-laying verb (`crate::lay`): the same launchd job, laying the
+    // shims, stubs and tombstones a tracked parent must not write itself (law m21: a
+    // tagged shim tracks the tool it execs). Same discipline as the stage verb.
+    if verb == Some(crate::lay::HIDDEN_VERB) {
+        return crate::lay::run_helper(&args[1..]);
+    }
     // THE single-writer-per-store gate ([`crate::lock`]): every store-MUTATING verb
     // TRY-acquires the store-wide `store.lock` here — at the ONE dispatch edge, so
     // internal verb re-routing (`update <p>` → install) can
     // never double-acquire — and holds it for the whole verb. Contention is a loud
-    // exit-1 refusal naming the lock path (the GUI Packages page surfaces the child
-    // stderr; the 6-hour loop just retries next pass). Read-only verbs skip this
-    // entirely and never need the lock.
+    // exit-75 refusal naming the lock path for a typed verb (the GUI Packages page
+    // surfaces the child stderr); the window's launch lanes pass `--wait-lock` and
+    // QUEUE behind the holder instead (see `mutator_store_lock`), and their loop
+    // retries a timed-out wait on a short backoff — never "simply next pass"
+    // (incident 2026-09-10). Read-only verbs skip this entirely and never need the
+    // lock.
     // The conventional help spellings land on the help surface with exit 0, not the
     // unknown-verb error path — `atpkg` rides PATH as an argv0 alias, so `--help` is
     // the first thing a shell (or an AI) tries. Handled BEFORE the verb match so the
@@ -532,7 +563,7 @@ fn not_installed_fix(name: &str) -> String {
 /// must never know about it.
 static PROGRESS_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Remove every `--progress-file <path>` pair from `args`, recording the LAST path
+/// Remove every `--progress-file <path>` pair from `args`, recording the FIRST path
 /// given. Value-missing is tolerated as "no opt-in" rather than an error: the flag
 /// is machinery for the GUI spawn, not user vocabulary, and a broken spawn must
 /// degrade to a progress-less install, never a refused one.
@@ -549,6 +580,129 @@ fn strip_progress_file_flag(args: &mut Vec<String>) {
 /// Where this invocation's live progress should land, if the GUI opted in.
 fn progress_path() -> Option<&'static std::path::Path> {
     PROGRESS_FILE.get().map(std::path::PathBuf::as_path)
+}
+
+/// What the dispatch edge recorded from `--wait-lock <secs>`: the bound, and the pid
+/// of the parent that spawned this process at that moment — the window — so a
+/// waiter can tell "my parent is gone" as a CHANGE of parent rather than as
+/// "re-parented to pid 1", which is true on macOS (orphans go to launchd) and false
+/// on a Linux box with a subreaper (`systemd --user`, most container and sandbox
+/// runtimes), where an orphan re-parents to the subreaper's pid instead.
+#[derive(Clone, Copy, Debug)]
+struct WaitLock {
+    bound: std::time::Duration,
+    spawner: Option<u32>,
+}
+
+/// The [`WaitLock`] this invocation carries, if any — set once at the dispatch edge
+/// by [`main_entry`] from the pure [`take_wait_lock_flag`]'s return value, read
+/// through [`wait_lock`] by [`mutator_store_lock`] and by [`parent_is_gone`].
+/// Process-global for the same reason as [`PROGRESS_FILE`]: the lock edge has no
+/// argv of its own.
+static WAIT_LOCK: std::sync::OnceLock<WaitLock> = std::sync::OnceLock::new();
+
+/// The environment variable a spawner sets beside `--wait-lock` to say WHO it is —
+/// its own pid — so the waiter's "my window is gone" is a comparison against a
+/// fact, not against a guess. The guess (`getppid` at the dispatch edge) races a
+/// parent that dies inside the child's few milliseconds of startup: by the time
+/// the edge looks, the child is already re-parented, and the "spawner" it records
+/// is init or the subreaper — the very pid it would later be compared against
+/// (measured 2026-09-10: a `sh -c '… &'` parent exiting at once left the waiter
+/// polling out its whole bound under ppid 1). Hidden machinery like
+/// `--wait-lock` itself; `aterm-gui` imports the name so a rename is a compile
+/// error on both sides.
+///
+/// Unnamed, the edge records the parent it sees, and the waiter stands down when
+/// its parent CHANGES from that ([`is_orphaned`]) — whoever that parent was. A
+/// `nohup … &` job is no exception: its parent at the edge is the shell that
+/// launched it, so when that shell exits the job is re-parented and its next
+/// contended poll stands down, silently, with 75 (measured 2026-09-12: gone 4.1 s
+/// into a 60 s bound, the lock still held, once the launching `sh` exited).
+/// `nohup` guards against SIGHUP, not against this rule: a caller that wants its
+/// waiter to outlive it must keep the job's parent alive, or the waiter stands
+/// down. Only a parent that is ALREADY init or launchd at the edge — a launchd
+/// agent's job — never changes, and that waiter waits out its bound like a typed
+/// one. A cron job run in the foreground waits too, though not for that reason:
+/// its parent is cron's own child or the `sh` it runs, not init, and that parent
+/// outlives the job. The same `ppid 1` that means "gone" for a window's child
+/// means "spawned by launchd" for an agent's job, which is why the rule is a
+/// change and never the pid alone. A caller that wants its waiter to stand down
+/// when IT exits names itself here — which also covers the one shape the fallback
+/// misses: an unnamed parent that dies inside the waiter's startup, before the
+/// edge looks, so the edge records init or the subreaper and the waiter polls out
+/// its bound (the documented degradation; no window is unnamed).
+pub const SPAWNER_PID_ENV: &str = "ATPKG_SPAWNER_PID";
+
+/// This process's parent pid right now; `None` where the platform has no notion
+/// of one that std exposes.
+fn current_parent_id() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(std::os::unix::process::parent_id())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The pid of the process that spawned this one, as recorded at the dispatch edge:
+/// what the spawner SAID ([`SPAWNER_PID_ENV`]) when it said anything, else the
+/// parent pid as seen right now (a typed `--wait-lock` from a shell).
+fn spawner_pid() -> Option<u32> {
+    std::env::var(SPAWNER_PID_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .or_else(current_parent_id)
+}
+
+/// Whether a waiter spawned by `spawner` has been orphaned, given its parent pid
+/// `now`: its parent is no longer the spawner — init on macOS and a subreaper-less
+/// Linux, the subreaper's pid where there is one — and both count because the rule
+/// is a CHANGE, never "pid 1" on its own. A parent nobody can read (`now == None`:
+/// std has no notion of one on Windows) is never judged gone, and neither is a
+/// spawner nobody could name; both poll out the bound instead — still a TRY at
+/// the end, still store-safe. Init as the parent is NOT gone by itself: an
+/// unnamed waiter whose parent was already init at the edge (a launchd agent's
+/// job) recorded init as its spawner, and that spawner never changes. Any other
+/// recorded parent can: a `nohup … &` job recorded the shell that launched it, and
+/// is orphaned once that shell exits (see [`SPAWNER_PID_ENV`]). The rule used to
+/// be `now == Some(1) || …`, which made an unnamed `--wait-lock` a silent, instant
+/// exit 75 from every pid-1-parented caller, and
+/// `spawner.is_some() && now != spawner` alone made the window's own waiter —
+/// named, on a platform with no readable parent — an orphan at its first contended
+/// poll (both 2026-09-10). Pure for the test.
+fn is_orphaned(spawner: Option<u32>, now: Option<u32>) -> bool {
+    matches!((spawner, now), (Some(spawner), Some(now)) if now != spawner)
+}
+
+/// Remove every `--wait-lock <secs>` pair from `args`, returning the LAST parsable
+/// value. Pure (no static) so the edge grammar is unit-testable. An unparsable VALUE
+/// degrades to "no wait" — the `--progress-file` doctrine: the flag is machinery for
+/// the window's spawn, never user vocabulary, and a broken spawn must degrade to the
+/// fail-fast try, never to a refused verb. The token after the flag is consumed
+/// either way, so it can never be read as a program name — which means a VALUELESS
+/// flag eats whatever follows it: `atpkg install --wait-lock --default-set` loses
+/// `--default-set` and is refused as a bare `install` (the usage, exit 2). Only a
+/// valueless flag at the END of argv degrades to "no wait"; no spawner produces the
+/// valueless shape (the window always passes a number).
+fn take_wait_lock_flag(args: &mut Vec<String>) -> Option<std::time::Duration> {
+    let mut wait = None;
+    while let Some(i) = args.iter().position(|a| a == "--wait-lock") {
+        args.remove(i);
+        if i < args.len() {
+            let value = args.remove(i);
+            if let Ok(secs) = value.parse::<u64>() {
+                wait = Some(std::time::Duration::from_secs(secs));
+            }
+        }
+    }
+    wait
+}
+
+/// The wait the edge recorded, if the caller opted in.
+fn wait_lock() -> Option<WaitLock> {
+    WAIT_LOCK.get().copied()
 }
 
 /// Mark `program` terminal on the live progress pass, if one is running. The ONE
@@ -1195,32 +1349,106 @@ fn verb_mutates_store(verb: &str) -> bool {
     )
 }
 
-/// TRY-acquire the store-wide writer lock for a mutating verb at the dispatch edge.
-/// `Ok(None)` when no prefix resolves (HOME unset) — nothing to lock, and the verb
-/// itself refuses with its own message moments later. Contention or an unusable
-/// lock file is fail-closed: the loud one-line refusal and exit 1.
+/// Acquire the store-wide writer lock for a mutating verb at the dispatch edge: a
+/// TRY by default, or — when the edge recorded `--wait-lock <secs>` — a BOUNDED WAIT
+/// ([`crate::lock::lock_store_waiting`]) that queues behind a sibling's pass and
+/// announces itself ONCE on stdout as the [`LOCK_WAITING_MARKER`] line (this is that
+/// marker's one production emission site). `Ok(None)` when no prefix resolves (HOME
+/// unset) — nothing to lock, and the verb itself refuses with its own message
+/// moments later. Every refusal stays fail-closed and prints the loud one-line
+/// sentence: contention — fail-fast or timed out — exits
+/// [`crate::lock::CONTENDED_EXIT`] (75) so a caller classifies it by code; an
+/// unusable lock file (`Io`) exits 1. A waiter whose parent has died (the window
+/// quit — its pipes are gone) stands down silently with the same code at its next
+/// CONTENDED poll: the wait consults [`parent_is_gone`] only when a try finds the
+/// lock still held (before the announcement, before the deadline), so an orphan
+/// whose holder lets go within that poll interval (≤ 500 ms) takes the lock and runs
+/// its verb — the race with the successor's own waiter is narrowed, not closed. And
+/// every line a waiter prints — the `lock-waiting:` announcement, the refusal
+/// sentence on stderr and the `seed-busy:` terminal ([`emit_marker_line_lossy`]) —
+/// is a write whose failure is ignored, so a window that quits between the check and
+/// the print costs an `EPIPE` nobody sees rather than a panic (Rust leaves `SIGPIPE`
+/// ignored and `println!` would panic on the dead pipe).
 fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
     let Some(layout) = crate::store::resolve(configured_prefix().as_deref()) else {
         return Ok(None);
     };
-    match crate::lock::try_lock_store(&layout) {
+    let acquired = match wait_lock() {
+        Some(WaitLock { bound, .. }) => crate::lock::lock_store_waiting(
+            &layout,
+            bound,
+            |path| {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "atpkg: {LOCK_WAITING_MARKER}another atpkg process holds the store lock \
+                     at {} \u{2014} waiting up to {} s for it to finish",
+                    path.display(),
+                    bound.as_secs()
+                );
+            },
+            || !parent_is_gone(),
+        ),
+        None => crate::lock::try_lock_store(&layout),
+    };
+    match acquired {
         Ok(guard) => Ok(Some(guard)),
         Err(e) => {
-            eprintln!("atpkg: {e}");
-            // CONTENTION GETS A MARKER; every other refusal does not. An unwritable
-            // prefix or a broken lock file is a real outage and must keep reaching the
-            // GUI's refusal card. A lock held by another `atpkg` is the opposite: that
-            // process is doing this work right now, and the only honest thing to say
-            // about THIS pass is that it stood aside (see [`SEED_BUSY_MARKER`]).
-            if matches!(e, crate::lock::StoreLockError::Contended(_)) {
-                emit_marker_line(&format!(
-                    "atpkg: {SEED_BUSY_MARKER}another atpkg process holds the store lock \
-                     — that pass is doing this work and this one stood aside"
-                ));
+            // An orphaned waiter has nobody to tell — its stderr and stdout are the
+            // dead window's pipes — and the exit code says it all. That guard is a
+            // snapshot, and a window can quit between it and the prints below, so a
+            // WAITER's two lines are writes whose failure is ignored — an `EPIPE`
+            // nobody sees — never the `eprintln!`/`println!` pair, which panics on a
+            // dead pipe and would trade the promised silent 75 for a 101. A typed
+            // verb keeps the macros: its stderr is a person's terminal.
+            if !parent_is_gone() {
+                let waiter = wait_lock().is_some();
+                if waiter {
+                    use std::io::Write as _;
+                    let _ = writeln!(std::io::stderr(), "atpkg: {e}");
+                } else {
+                    eprintln!("atpkg: {e}");
+                }
+                // CONTENTION GETS A MARKER; every other refusal does not. An unwritable
+                // prefix or a broken lock file is a real outage and must keep reaching
+                // the GUI's refusal card. A lock held by another `atpkg` is the
+                // opposite: that process is doing this work right now, and the only
+                // honest thing to say about THIS pass is that it stood aside (see
+                // [`SEED_BUSY_MARKER`]). Said to the MACHINE lane only — a caller that
+                // opted into `--wait-lock`, like the `lock-waiting:` line above: a typed
+                // verb is told on stderr and keeps its stdout silent (the two-process
+                // proof pins both), and the exit code below says the same thing to
+                // every caller.
+                if matches!(e, crate::lock::StoreLockError::Contended(_)) && waiter {
+                    emit_marker_line_lossy(&format!(
+                        "atpkg: {SEED_BUSY_MARKER}another atpkg process holds the store lock \
+                         — that pass is doing this work and this one stood aside"
+                    ));
+                }
             }
-            Err(ExitCode::from(1))
+            Err(ExitCode::from(match e {
+                crate::lock::StoreLockError::Contended(_) => crate::lock::CONTENDED_EXIT,
+                crate::lock::StoreLockError::Io(..) => 1,
+            }))
         }
     }
+}
+
+/// Whether this process has been orphaned: its parent — the aterm window that
+/// spawned it, which named itself in [`SPAWNER_PID_ENV`] or was read at the edge
+/// with the `--wait-lock` flag — is gone, which shows as a different parent pid
+/// now: init on macOS, a subreaper on Linux ([`is_orphaned`]). Only a `--wait-lock`
+/// waiter asks (no recorded wait ⇒ always false). A waiter holds nothing and prints
+/// at most one line while it polls — the `lock-waiting:` announcement, once the
+/// grace has passed — so it is the one atpkg child that would otherwise outlive its
+/// window for the whole bound and then race the successor's own waiter for the freed
+/// lock. It is asked only on a CONTENDED poll, so that race is narrowed to one poll
+/// interval (≤ 500 ms: an orphan whose holder lets go inside it still takes the
+/// lock), not closed. An INSTALLING child is a different case — it dies at its next
+/// line of output (aterm-gui's final-exit path in its `main_entry`, 2026-09-10), and
+/// the store is crash-consistent under that (`crate::lock`).
+fn parent_is_gone() -> bool {
+    wait_lock().is_some_and(|w| is_orphaned(w.spawner, current_parent_id()))
 }
 
 /// `atpkg` (no verb) — the inert/enabled posture, observable from the shell, answering
@@ -2469,7 +2697,9 @@ fn cmd_list(args: &[String]) -> ExitCode {
 /// shims and one for shell integration:
 ///
 /// 1. rewrite the shell hooks and wire them into the user's rc (PATH in every shell);
-/// 2. re-lay each installed program's shims from its newest complete build;
+/// 2. re-lay each installed program's shims from its live `current` build (the newest
+///    complete build only where no `current` link selects one) — never over a revoked
+///    build's tombstone, which only an update pass may lift;
 /// 3. name — and do not silently paper over — programs whose build is GONE, which no
 ///    local operation can fix and only a reinstall can.
 ///
@@ -2495,32 +2725,122 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    // Newest complete build per program: the one a repair should make live.
-    let mut newest: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for (program, build) in &installed {
-        let e = newest.entry(program.clone()).or_insert(*build);
-        if *build > *e {
-            *e = *build;
-        }
+    let (relaid, missing, revoked, tracked, failed) = relay_shims(&layout);
+    println!("repair: re-laid shims for {relaid} program(s)");
+    for r in &revoked {
+        println!(
+            "repair: {r} was revoked (yanked/below floor) — left disabled; run `aterm pkg update`"
+        );
     }
-    let (mut relaid, mut missing) = (0usize, Vec::new());
-    for (program, build) in &newest {
-        let build_dir = layout.build_dir(program, *build);
+    if missing.is_empty() && revoked.is_empty() && tracked.is_empty() && failed.is_empty() {
+        println!("repair: done — `aterm pkg doctor` confirms");
+        return ExitCode::SUCCESS;
+    }
+    if !missing.is_empty() {
+        println!(
+            "repair: {} program(s) have no build on disk and need a reinstall: {}",
+            missing.len(),
+            missing.join(", ")
+        );
+        println!("repair: `aterm pkg install --default-set` refetches them");
+    }
+    if !tracked.is_empty() {
+        println!(
+            "repair: {} build(s) were staged in-process by a provenance-tracked installer \
+             under {}=1 and carry com.apple.provenance on every executable (recorded \
+             beside each as <build>.tracked-install): {}",
+            tracked.len(),
+            crate::lay::ALLOW_TRACKED_ENV,
+            tracked.join("; ")
+        );
+        println!(
+            "repair: nothing local removes the tag (`xattr -d` exits 0 and removes nothing) \
+             and the archive is reclaimed after every stage, so each needs a re-seed from \
+             an untracked process — Terminal.app, or `launchctl submit -l aterm-pkg -- <path \
+             to atpkg> install <program>`: `aterm pkg uninstall <program> && aterm pkg \
+             install <program>`"
+        );
+    }
+    if !failed.is_empty() {
+        println!(
+            "repair: {} program(s) still have shims that could not be re-laid: {}",
+            failed.len(),
+            failed.join("; ")
+        );
+    }
+    ExitCode::from(1)
+}
+
+/// Step 2 of [`run_repair`], split out so it can be tested without the rc wiring step 1
+/// writes: re-lay every installed program's shims. Returns how many programs were re-laid,
+/// the `program@build` of each whose build is gone, of each left tombstoned, of each staged
+/// in-process by a provenance-tracked installer (`<build>.tracked-install`), and of each
+/// whose shims could not be re-laid — the last is what a REFUSED lay from a tracked process
+/// looks like, and it must reach the exit code (audit 2026-09-12: repair said "done" over it).
+fn relay_shims(
+    layout: &crate::store::Layout,
+) -> (usize, Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let mut builds: std::collections::BTreeMap<String, std::collections::BTreeSet<u64>> =
+        std::collections::BTreeMap::new();
+    for (program, build) in crate::list_installed(layout) {
+        builds.entry(program).or_default().insert(build);
+    }
+    let recorded = crate::status::read(layout)
+        .map(|s| s.programs)
+        .unwrap_or_default();
+    let (mut relaid, mut missing, mut revoked, mut tracked, mut failed) =
+        (0usize, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for (program, complete) in &builds {
+        let Some(&newest) = complete.last() else {
+            continue;
+        };
+        // The build ACTIVATION selects (`store/<program>/current`), not the highest on disk:
+        // `rollback` keeps the build it rolled off until gc, and re-laying that one silently
+        // undid the rollback and minted a ChannelShimMismatch (audit K2, 2026-09-12). With no
+        // usable link — a prefix older than it, or one naming a build that is gone — the
+        // newest complete build, as before.
+        let build = std::fs::read_link(layout.program_current(program))
+            .ok()
+            .and_then(|t| crate::ops::store_build_of(&layout.prefix, &t))
+            .filter(|(owner, b)| owner == program && complete.contains(b))
+            .map_or(newest, |(_, b)| b);
+        let build_dir = layout.build_dir(program, build);
         if !build_dir.exists() {
             missing.push(format!("{program}@{build}"));
             continue;
+        }
+        // A build a provenance-tracked installer staged in-process under the escape
+        // hatch (`<build>.tracked-install`, `crate::store::record_tracked_install`)
+        // carries com.apple.provenance on every executable, and no local operation
+        // can take the tag off: the archive is reclaimed after every stage, so the only
+        // cure is a re-seed — named below, exit 1, like a build that is gone.
+        if let Some(why) = crate::store::tracked_install_record(&build_dir) {
+            tracked.push(format!("{program}@{build} — {why}"));
         }
         // What this program exposes, recovered from its own shims where they survive
         // (they resolve even when their TARGET is gone, which is the audited shape) and
         // falling back to the program's own name, which is the overwhelmingly common
         // single-tool case.
         let exposes =
-            crate::installed_exposes(&layout, program).unwrap_or_else(|| vec![program.clone()]);
+            crate::installed_exposes(layout, program).unwrap_or_else(|| vec![program.clone()]);
+        // Never over a tombstone (audit K2, 2026-09-12). A revoked build keeps its tree,
+        // marker and `current` links; only its shims turn into failing notices, which
+        // resolve to nothing — so the fallback above read "nothing recorded" and laid a
+        // live shim that made the yanked/below-floor build runnable again. Only an update
+        // pass, which holds the index that revoked it, may lift that.
+        let tombstoned = recorded
+            .get(program)
+            .is_some_and(|r| r.state.starts_with("tombstoned:"))
+            || exposes.iter().any(|tool| is_tombstone_shim(layout, tool));
+        if tombstoned {
+            revoked.push(format!("{program}@{build}"));
+            continue;
+        }
         match crate::activate::install_shims(
-            &layout,
+            layout,
             &build_dir,
             &exposes,
-            crate::activate::Aliases::laid_for(&layout, program),
+            crate::activate::Aliases::laid_for(layout, program),
         ) {
             Ok(refused) => {
                 relaid = relaid.saturating_add(1);
@@ -2528,21 +2848,25 @@ fn run_repair(layout: Option<crate::store::Layout>) -> ExitCode {
                     println!("repair: {program}: refused shim {name:?} (not an allowed tool name)");
                 }
             }
-            Err(e) => println!("repair: {program}: could not re-lay shims: {e}"),
+            Err(e) => {
+                println!("repair: {program}: could not re-lay shims: {e}");
+                failed.push(format!("{program}@{build} — {e}"));
+            }
         }
     }
-    println!("repair: re-laid shims for {relaid} program(s)");
-    if missing.is_empty() {
-        println!("repair: done — `aterm pkg doctor` confirms");
-        return ExitCode::SUCCESS;
-    }
-    println!(
-        "repair: {} program(s) have no build on disk and need a reinstall: {}",
-        missing.len(),
-        missing.join(", ")
-    );
-    println!("repair: `aterm pkg install --default-set` refetches them");
-    ExitCode::from(1)
+    (relaid, missing, revoked, tracked, failed)
+}
+
+/// Whether `bin/<tool>` is a tombstone: a shim that forwards nowhere and carries the
+/// notice `activate::install_tombstone_shim` writes.
+fn is_tombstone_shim(layout: &crate::store::Layout, tool: &str) -> bool {
+    let Some(tool) = crate::store::ToolName::new(tool) else {
+        return false;
+    };
+    let shim = layout.shim(&tool);
+    crate::platform::resolve_shim(&shim).is_none()
+        && crate::metadata_io::read_bounded_regular_utf8(&shim, crate::platform::MAX_SHIM_BYTES)
+            .is_ok_and(|body| body.contains(" was yanked/revoked"))
 }
 
 /// [`cmd_list`] under an already-resolved layout — split so the exit codes and both
@@ -4516,12 +4840,16 @@ fn write_removed(layout: &crate::store::Layout, all: &std::collections::BTreeSet
 /// undetected once. `aterm-gui` imports these, so a rename is a compile error on both
 /// sides instead of a string that quietly stops matching.
 ///
-/// Every marker is a TERMINAL answer to an announcement except the TWO that OPEN one:
-/// `SEED_STARTING` (the local lane) and `NET_STARTING` (its twin for the wire, added
-/// after this paragraph first named only the local one). [`announcement::MARKERS`] is
-/// where that split is recorded and [`emit_marker_line`] is what keeps the ledger, so
-/// the classification lives in one table rather than in this sentence. An
-/// announcement with no answer leaves "Installing…" on screen forever.
+/// Every marker is a TERMINAL answer to an announcement except the TWO that OPEN one
+/// — `SEED_STARTING` (the local lane) and `NET_STARTING` (its twin for the wire, added
+/// after this paragraph first named only the local one) — and the ones that are
+/// neither, which the ledger deliberately leaves unclassified: `LOCK_WAITING` (a
+/// non-terminal "queued behind a sibling" row; [`LOCK_WAITING_MARKER`] says what
+/// retires it) and the informational `SHADOWED`, `MANAGED_CURRENT` and
+/// `MACHINE_SETTINGS` rows. [`announcement::MARKERS`] is where that split is recorded
+/// and [`emit_marker_line`] is what keeps the ledger, so the classification lives in
+/// one table rather than in this sentence. An announcement with no answer leaves
+/// "Installing…" on screen forever.
 pub const SEED_STARTING_MARKER: &str = "seed-starting: ";
 pub const SEED_INSTALLED_MARKER: &str = "seed-installed: ";
 pub const SEED_PENDING_MARKER: &str = "seed-pending: ";
@@ -4550,6 +4878,16 @@ pub const NET_STARTING_MARKER: &str = "net-starting: ";
 /// lane shipped exactly this bug once (a held card that sat for its full 20
 /// minutes), and the marker contract is what prevents the rerun.
 pub const NET_FAILED_MARKER: &str = "net-failed: ";
+/// The dispatch edge's "queued behind a sibling" ANNOUNCEMENT (2026-09-10): printed
+/// ONCE, before any verb output, only when the caller opted into `--wait-lock`, the
+/// store lock is held, and the wait has outlasted [`crate::lock::WAIT_ANNOUNCE_GRACE`].
+/// It is neither a pass start nor a terminal answer — the GUI opens a non-terminal
+/// "waiting" row on it, which the sibling's progress file, this child's own markers,
+/// or this child's exit retires — any exit but 75: a wait that ran out leaves the row
+/// to the lane (its next child, queued behind the same holder, or the deferred
+/// notice), because the row belongs to the lane, not the child. Emitted by exactly
+/// one site ([`mutator_store_lock`]).
+pub const LOCK_WAITING_MARKER: &str = "lock-waiting: ";
 /// The SHADOW reconcile's answer ([`reconcile_shadowed`]): the managed programs a
 /// foreign copy out-ranks on this pass's `PATH`, comma-separated — the pass printed
 /// one `<program>: managed <build> — SHADOWED by <path>` line per member and no
@@ -4603,12 +4941,7 @@ fn apply_machine_settings() {
             false,
         );
         for line in render_applied(&outcomes) {
-            // Only the rows that DID something narrate here; the pass log is not the
-            // place for 73 "skipped" lines every six hours.
-            if line.starts_with("migrated ")
-                || line.starts_with("  cargo")
-                || line.starts_with("  git")
-            {
+            if noindex_pass_prints(&line) {
                 println!("atpkg noindex: {line}");
             }
         }
@@ -4631,6 +4964,29 @@ fn apply_machine_settings() {
     if !entries.is_empty() {
         println!("atpkg: {}", machine_settings_line(&entries));
     }
+}
+
+/// Whether the automatic pass narrates one [`render_applied`] line: the rows that DID
+/// something, plus every skip the user has to act on. The pass log is not the place for
+/// 73 routine "skipped" lines every six hours — not beside a Cargo.toml, a live build
+/// (retried next pass), not applicable — nor for already-excluded rows. Any OTHER skip
+/// recurs on every pass until someone acts: a crate whose cargo config cannot be pointed
+/// (nothing renamed), a destination that already exists. Until 2026-09-12 those were
+/// silent here forever (review of audit K11). One outcome renders one `skipped` line,
+/// so each prints once per pass.
+fn noindex_pass_prints(line: &str) -> bool {
+    if line.starts_with("migrated ") || line.starts_with("  cargo") || line.starts_with("  git") {
+        return true;
+    }
+    let Some(skip) = line.strip_prefix("skipped ") else {
+        return false;
+    };
+    let Some((_, reason)) = skip.split_once(" — ") else {
+        return true;
+    };
+    !(reason.starts_with("not beside a Cargo.toml")
+        || reason.starts_with("not applicable")
+        || (reason.starts_with("a build holds ") && reason.ends_with("retried next pass")))
 }
 
 /// The `managed-current:` payload ([`MANAGED_CURRENT_MARKER`]) for `entries` —
@@ -4726,7 +5082,13 @@ fn print_managed_current(
 pub const SEED_DONE_MARKER: &str = "seed-done: ";
 
 /// ANOTHER `atpkg` IS ALREADY DOING THIS WORK. Printed when the store lock is
-/// CONTENDED at the dispatch edge — never for any other refusal.
+/// CONTENDED at the dispatch edge — never for any other refusal — and only to a
+/// caller that opted into `--wait-lock` and whose parent is still there (the GUI's
+/// machine lanes, exactly like the `lock-waiting:` line): a typed verb is told on
+/// stderr and keeps its stdout silent, and the contention exit code
+/// ([`crate::lock::CONTENDED_EXIT`], 75) says the same thing to every caller. That
+/// code, not this line, is what the lanes key their "deferred, never failed" verdict
+/// on; the line is the pass's own words for their log.
 ///
 /// This is the line the owner's 2026-09-11 banner needed and did not have. Two aterm
 /// processes launched sixteen seconds apart; the second one's `seed` and `update`
@@ -4749,9 +5111,10 @@ pub const SEED_BUSY_MARKER: &str = "seed-busy: ";
 /// and then ends through four separate `return`s, none of which prints a marker, so
 /// the card's only possible answer was the reader's guess (2026-09-11).
 ///
-/// The bookkeeping lives at the ONE place a marker reaches stdout
-/// ([`emit_marker_line`]) rather than at each print site, so a lane that grows a new
-/// early return cannot forget to answer — answering is not its job.
+/// The bookkeeping lives where a marker reaches stdout ([`emit_marker_line`], and
+/// its one lossy twin [`emit_marker_line_lossy`] for the waiter's `seed-busy:` line)
+/// rather than at each print site, so a lane that grows a new early return cannot
+/// forget to answer — answering is not its job.
 pub(crate) mod announcement {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -4764,6 +5127,12 @@ pub(crate) mod announcement {
     ///
     /// `seed-pending:` is an OFFER, printed only on the lane that announces nothing,
     /// so classifying it as an answer costs nothing and keeps the table total.
+    ///
+    /// `lock-waiting:` ([`super::LOCK_WAITING_MARKER`]) is deliberately ABSENT: it is
+    /// printed at the dispatch edge, before any verb, and is neither half of the
+    /// contract — not an announcement (nothing to retire) and not an answer (were it
+    /// one, a child that waited and then announced would look answered before it
+    /// began). [`note`] ignores an unlisted prefix, which is the right reading of it.
     pub(crate) const MARKERS: &[(&str, bool)] = &[
         (super::SEED_STARTING_MARKER, true),
         (super::NET_STARTING_MARKER, true),
@@ -4810,12 +5179,29 @@ pub(crate) mod announcement {
     }
 }
 
-/// THE one way a marker reaches stdout: print it, and record it against the
+/// THE way a marker reaches stdout: print it, and record it against the
 /// announcement ledger. The bytes are unchanged — `line` is already the whole
 /// `atpkg: <marker><body>` line the GUI parses — so this adds bookkeeping and
-/// nothing else.
+/// nothing else. `println!` on purpose: an INSTALLING child whose window has quit
+/// is meant to die at its next line of output (aterm-gui's final-exit path in its
+/// `main_entry`, 2026-09-10), and a marker is one of those lines. A WAITER's
+/// `seed-busy:` goes through [`emit_marker_line_lossy`] — the same printer with the
+/// panic taken out — and its `lock-waiting:` announcement is a bare write with the
+/// error ignored, in [`mutator_store_lock`]'s wait (a marker the ledger does not list).
 fn emit_marker_line(line: &str) {
     println!("{line}");
+    announcement::note(line);
+}
+
+/// [`emit_marker_line`] for the `--wait-lock` waiter's `seed-busy:` line: the same
+/// bytes and the same ledger entry, but a write whose failure is ignored. A waiter's
+/// contract is a SILENT stand-down with exit 75 once its window has gone, and the
+/// [`parent_is_gone`] guard at the lock edge is a snapshot — a window that quits
+/// between it and this print leaves a dead pipe for a stdout, where `println!`
+/// would panic (exit 101) and an `EPIPE` nobody sees is the promised outcome.
+fn emit_marker_line_lossy(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{line}");
     announcement::note(line);
 }
 
@@ -8977,7 +9363,7 @@ mod tests {
     /// malformed rather than their system broken.
     #[test]
     fn install_refuses_a_flag_as_a_program_name() {
-        for flag in ["--progress-file", "-v", "--default-sett"] {
+        for flag in ["--progress-file", "--wait-lock", "-v", "--default-sett"] {
             let code = super::cmd_install_elevated(Some(&flag.to_string()), None, "install");
             assert_eq!(
                 code,
@@ -9001,6 +9387,126 @@ mod tests {
             default_set_at < guard_at,
             "--default-set must be answered BEFORE the flag guard, or the \
              documented whole-toolset spelling would refuse itself"
+        );
+    }
+
+    /// The `--wait-lock <secs>` edge grammar (2026-09-10), mirror of the
+    /// `--progress-file` reasoning above: stripped for the three provisioning verbs
+    /// wherever it sits, the LAST parsable value wins, and an unparsable value — or a
+    /// bare flag at the END of argv — is consumed and means "no wait", never a program
+    /// name. (A valueless flag mid-argv eats the next token instead; no spawner
+    /// produces that shape — see `take_wait_lock_flag`.)
+    #[test]
+    fn wait_lock_flag_is_stripped_at_the_edge_and_degrades_to_no_wait() {
+        let argv = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let secs = |n: u64| Some(std::time::Duration::from_secs(n));
+
+        let mut args = argv(&["seed", "--wait-lock", "5"]);
+        assert_eq!(super::take_wait_lock_flag(&mut args), secs(5));
+        assert_eq!(args, argv(&["seed"]));
+
+        let mut args = argv(&["install", "--default-set", "--wait-lock", "9"]);
+        assert_eq!(super::take_wait_lock_flag(&mut args), secs(9));
+        assert_eq!(args, argv(&["install", "--default-set"]));
+
+        let mut args = argv(&["update", "--wait-lock"]);
+        assert_eq!(super::take_wait_lock_flag(&mut args), None, "bare: no wait");
+        assert_eq!(args, argv(&["update"]));
+
+        let mut args = argv(&["seed", "--wait-lock", "soon"]);
+        assert_eq!(
+            super::take_wait_lock_flag(&mut args),
+            None,
+            "unparsable: no wait"
+        );
+        assert_eq!(args, argv(&["seed"]), "…and the value is consumed");
+
+        let mut args = argv(&["seed", "--wait-lock", "1", "--wait-lock", "2"]);
+        assert_eq!(super::take_wait_lock_flag(&mut args), secs(2), "LAST wins");
+        assert_eq!(args, argv(&["seed"]));
+
+        let mut args = argv(&["update"]);
+        assert_eq!(super::take_wait_lock_flag(&mut args), None);
+        assert_eq!(args, argv(&["update"]), "absent: untouched");
+    }
+
+    /// "My window is gone" is a CHANGE of parent from the spawner the edge recorded
+    /// — never "pid 1" on its own: the macOS orphan (launchd) and the Linux
+    /// subreaper orphan (any other pid) both count; the spawner itself never does,
+    /// even when it IS init (a scheduler's job); a parent nobody can read (Windows)
+    /// and a spawner nobody named never count — those wait out the bound instead.
+    #[test]
+    fn an_orphaned_waiter_is_one_whose_parent_changed_from_its_spawner() {
+        assert!(
+            !super::is_orphaned(Some(15359), Some(15359)),
+            "still the window"
+        );
+        assert!(super::is_orphaned(Some(15359), Some(1)), "macOS: launchd");
+        assert!(
+            super::is_orphaned(Some(15359), Some(4242)),
+            "Linux: a subreaper, not pid 1"
+        );
+        assert!(
+            !super::is_orphaned(Some(15359), None),
+            "Windows: the window named itself but the parent cannot be read — \
+             never judged gone (this was an orphan at the first contended poll)"
+        );
+        assert!(
+            !super::is_orphaned(Some(1), Some(1)),
+            "a launchd agent's unnamed job: init IS its spawner, and it is not an \
+             orphan (this was a silent, instant exit 75)"
+        );
+        assert!(
+            !super::is_orphaned(None, Some(1)),
+            "no spawner named: nothing to compare against, init included"
+        );
+        assert!(
+            !super::is_orphaned(None, Some(4242)),
+            "no spawner named and not init: never on the change rule alone"
+        );
+        assert!(!super::is_orphaned(None, None));
+        assert_eq!(super::SPAWNER_PID_ENV, "ATPKG_SPAWNER_PID");
+    }
+
+    /// The `lock-waiting:` marker is printed by ONE production site — the lock edge
+    /// (`mutator_store_lock`) — with the `atpkg: ` prefix the GUI strips, and the
+    /// literal itself appears once (the constant). A second emission site would let
+    /// a verb body announce a wait it is not in.
+    #[test]
+    fn the_lock_waiting_marker_has_exactly_one_production_emission_site() {
+        let src = include_str!("cli.rs");
+        // `production_half`, not a split on `#[cfg(test)]`: that literal first
+        // appears INSIDE production now (the announcement ledger's reset seam), so
+        // the old split truncated this scan to the first few thousand lines.
+        let production = production_half(src);
+        assert!(production.len() < src.len());
+        assert_eq!(
+            production.matches("LOCK_WAITING_MARKER}").count(),
+            1,
+            "exactly one production emission site"
+        );
+        assert!(
+            production.contains("atpkg: {LOCK_WAITING_MARKER}"),
+            "the emission carries the `atpkg: ` prefix parse_seed_line strips"
+        );
+        assert_eq!(
+            production.matches("\"lock-waiting: \"").count(),
+            1,
+            "the literal lives in the constant and nowhere else"
+        );
+        let edge = production
+            .find("fn mutator_store_lock")
+            .expect("the lock edge");
+        let edge_end = production[edge + 1..]
+            .find("\nfn ")
+            .map(|i| edge + 1 + i)
+            .expect("a function after the lock edge");
+        let emission = production
+            .find("{LOCK_WAITING_MARKER}")
+            .expect("the emission");
+        assert!(
+            edge < emission && emission < edge_end,
+            "the emission is inside the lock edge, not in a verb body"
         );
     }
     use super::*;
@@ -9941,6 +10447,43 @@ mod tests {
             machine_settings_line(&[crate::machine::UNIVERSAL_CONTROL_ENTRY.to_string()]),
             "machine-settings: universal-control disabled"
         );
+        // The automatic pass's log filter: what it changed, plus every skip the user has
+        // to act on — never the routine not-a-repo / live-build / not-applicable skips
+        // or already-excluded rows. A crate whose cargo config cannot be pointed is
+        // skipped (nothing renamed) on EVERY pass; before 2026-09-12 that was silent
+        // there forever (review of audit K11).
+        {
+            use crate::noindex::Applied;
+            let skip = |reason: &str| Applied::Skipped {
+                path: PathBuf::from("/h/p/target"),
+                reason: reason.to_string(),
+            };
+            let printed: Vec<String> = render_applied(&[
+                skip(
+                    "/h/p/.cargo/config.toml could not be edited into valid TOML — point \
+                     cargo at /h/p/target.noindex yourself — nothing was renamed",
+                ),
+                skip(
+                    "/h/p/target.noindex already exists and is never merged into — remove or \
+                     rename it, then re-run",
+                ),
+                skip(
+                    "not beside a Cargo.toml — its pointer is an env var this cannot \
+                     re-point; `aterm pkg noindex apply <dir>` migrates it by name",
+                ),
+                skip("a build holds /h/p/target/debug/.cargo-lock — retried next pass"),
+                skip("not applicable"),
+                skip("not applicable — Spotlight is a macOS index"),
+                Applied::AlreadyExcluded(PathBuf::from("/h/q/target.noindex")),
+            ])
+            .into_iter()
+            .filter(|l| noindex_pass_prints(l))
+            .collect();
+            assert_eq!(printed.len(), 2, "{printed:#?}");
+            assert!(printed[0].starts_with("skipped /h/p/target — "));
+            assert!(printed[0].contains("could not be edited into valid TOML"));
+            assert!(printed[1].contains("already exists and is never merged into"));
+        }
         // The apply renderer's words, over one of each outcome — the git-checkout line
         // is the contract spelling from the 2026-09-10 design rule.
         use crate::noindex::{Applied, ConfigNote, ExcludeNote, Pointer};
@@ -10061,6 +10604,7 @@ mod tests {
     fn the_shadowed_and_managed_current_markers_are_byte_stable() {
         assert_eq!(SHADOWED_MARKER, "shadowed: ");
         assert_eq!(MANAGED_CURRENT_MARKER, "managed-current: ");
+        assert_eq!(LOCK_WAITING_MARKER, "lock-waiting: ");
         assert_eq!(
             managed_current_line(&[]),
             None,
@@ -11004,6 +11548,147 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// A COMPLETE build dir with an executable `bin/<program>` and its ready marker — the
+    /// shape `list_installed` reports — for the repair tests below.
+    fn seed_ready_build(layout: &crate::store::Layout, program: &str, build: u64) -> PathBuf {
+        let dir = layout.build_dir(program, build);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let exe = dir.join("bin").join(program);
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+        dir
+    }
+
+    /// Lay `program`'s shims at `dir` and point both `current` links at it.
+    fn activate_seeded(layout: &crate::store::Layout, program: &str, dir: &Path) {
+        crate::activate::install_shims(
+            layout,
+            dir,
+            &[program.to_string()],
+            crate::activate::Aliases::Off,
+        )
+        .unwrap();
+        crate::activate::activate_channel(layout, "stable", dir).unwrap();
+    }
+
+    /// REPAIR NEVER REVIVES A REVOKED BUILD (audit K2, 2026-09-12).
+    ///
+    /// A tombstone keeps the revoked build's tree, marker and `current` links; only its
+    /// shim turns into a failing notice, which resolves to nothing. Repair used to read
+    /// that silence as "no exposes recorded", fall back to the program's name and lay a
+    /// live shim over the tombstone — making a yanked/below-floor build runnable again.
+    /// Refused both on the recorded `tombstoned:` row and on the tombstone shim alone.
+    #[test]
+    fn repair_does_not_revive_a_tombstoned_build() {
+        for with_status_row in [true, false] {
+            let label = if with_status_row {
+                "repair-tomb-row"
+            } else {
+                "repair-tomb-shim"
+            };
+            let l = temp_layout(label);
+            let d17 = seed_ready_build(&l, "ay", 17);
+            activate_seeded(&l, "ay", &d17);
+            if with_status_row {
+                record_status(
+                    &l,
+                    "ay",
+                    crate::ProgramStatus {
+                        installed_build: Some(17),
+                        state: "tombstoned: pin yanked/below floor".into(),
+                        tree_root: String::new(),
+                    },
+                    "tombstoned".into(),
+                );
+            }
+            let ay = crate::store::ToolName::new("ay").unwrap();
+            crate::activate::install_tombstone_shim(&l, &ay).unwrap();
+            assert!(
+                crate::platform::resolve_shim(&l.shim(&ay)).is_none(),
+                "precondition: the tombstone forwards nowhere"
+            );
+
+            let (_, _, revoked, _, _) = relay_shims(&l);
+
+            assert_eq!(revoked, ["ay@17"], "{label}: named as still revoked");
+            assert_eq!(
+                crate::platform::resolve_shim(&l.shim(&ay)),
+                None,
+                "{label}: repair laid a live shim over the tombstone"
+            );
+            assert!(
+                std::fs::read_to_string(l.shim(&ay))
+                    .unwrap()
+                    .contains("was yanked/revoked"),
+                "{label}: the failing notice is still what `ay` runs"
+            );
+            let _ = std::fs::remove_dir_all(&l.prefix);
+        }
+    }
+
+    /// A LAY THAT FAILS REACHES THE EXIT CODE (audit 2026-09-12). A provenance-tracked
+    /// installer whose untracked lane cannot run REFUSES to lay shims; repair printed the
+    /// refusal and then said "done", exit 0, so a scripted `repair && …` could not tell
+    /// fixed from refused. Every program whose shims could not be re-laid now comes back in
+    /// the fifth slot and `run_repair` exits 1 on it. Forced here the way any lay fails: an
+    /// unwritable `bin/`.
+    #[cfg(unix)]
+    #[test]
+    fn a_shim_that_cannot_be_relaid_is_named_and_not_swallowed() {
+        let l = temp_layout("repair-failed-lay");
+        let d17 = seed_ready_build(&l, "ay", 17);
+        activate_seeded(&l, "ay", &d17);
+        let ay = crate::store::ToolName::new("ay").unwrap();
+        // The seeded activation already laid `ay`; a lay that finds its shim in place and
+        // identical writes nothing, so take it away — and a read-only `bin/` is no
+        // obstacle either (the lay re-asserts the directory's mode). A DIRECTORY where
+        // the shim goes is: no rename lands a file over it.
+        std::fs::remove_file(l.shim(&ay)).unwrap();
+        std::fs::create_dir(l.shim(&ay)).unwrap();
+
+        let report = relay_shims(&l);
+
+        let (_, _, _, _, failed) = &report;
+        assert_eq!(
+            failed.len(),
+            1,
+            "one program could not be re-laid: report={report:?}"
+        );
+        assert!(failed[0].starts_with("ay@17"), "{failed:?}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// REPAIR RESPECTS A ROLLBACK (audit K2, 2026-09-12). `rollback` keeps the build it
+    /// rolled off until gc; repair must re-lay the build `current` selects, not the highest
+    /// one on disk — or it silently undoes the rollback and mints the very
+    /// `ChannelShimMismatch` doctor then reports.
+    #[test]
+    fn repair_respects_rollback() {
+        let l = temp_layout("repair-rollback");
+        let d18 = seed_ready_build(&l, "ay", 18);
+        let d19 = seed_ready_build(&l, "ay", 19);
+        activate_seeded(&l, "ay", &d19);
+        // The rollback: shims and both links back on 18, 19 retained on disk.
+        activate_seeded(&l, "ay", &d18);
+        let ay = crate::store::ToolName::new("ay").unwrap();
+
+        let _ = relay_shims(&l);
+
+        let target = crate::platform::resolve_shim(&l.shim(&ay)).expect("a live shim");
+        assert!(
+            target.starts_with(&d18),
+            "repair re-pointed the shim off the rollback target: {}",
+            target.display()
+        );
+        assert!(
+            crate::gc::live_builds(&l).diverged().is_empty(),
+            "{:?}",
+            crate::gc::live_builds(&l).diverged()
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// A ROW MUST NOT OUTLIVE ITS PROGRAM.
     ///
     /// `active_builds` reads shims, so doctor went quiet after an uninstall — but Settings ▸
@@ -11250,9 +11935,10 @@ mod tests {
     }
 
     /// The visible option parsers outside the name-operand gate also name every
-    /// accepted flag in their per-verb help. `--progress-file` is omitted
-    /// deliberately: the GUI strips that hidden machine channel before verb
-    /// dispatch, and it is not a user-facing CLI option.
+    /// accepted flag in their per-verb help. `--progress-file` and `--wait-lock` are
+    /// omitted deliberately: they are hidden machine channels the GUI adds to its
+    /// spawns and atpkg's own `main_entry` strips before verb dispatch, and neither
+    /// is a user-facing CLI option.
     #[test]
     fn remaining_visible_option_usage_names_every_accepted_flag() {
         for (verb, flags) in [
@@ -11724,7 +12410,10 @@ mod tests {
         // check is now against the constant and against the call that records it in
         // the announcement ledger. A marker printed any other way is invisible to the
         // ledger, which is what decides whether an announcement was ever answered.
-        let emissions: Vec<String> = whole_calls(production, "emit_marker_line(");
+        let emissions: Vec<String> = whole_calls(production, "emit_marker_line(")
+            .into_iter()
+            .chain(whole_calls(production, "emit_marker_line_lossy("))
+            .collect();
         for (marker, konst) in [
             (SEED_STARTING_MARKER, "SEED_STARTING_MARKER"),
             (SEED_INSTALLED_MARKER, "SEED_INSTALLED_MARKER"),
@@ -11862,6 +12551,28 @@ mod tests {
                 "{marker:?} is published as part of the contract but classified nowhere"
             );
         }
+        // …and `lock-waiting:`, which is NEITHER half, stays out of the table: a
+        // `lock-waiting:` line answers nothing and opens nothing, so the ledger
+        // must read straight past it (a child that waited and then announced is
+        // an OPEN announcement, not an answered one).
+        assert!(
+            !MARKERS.iter().any(|(m, _)| *m == LOCK_WAITING_MARKER),
+            "`lock-waiting:` is neither an announcement nor an answer"
+        );
+        use super::announcement;
+        announcement::reset();
+        announcement::note(&format!(
+            "atpkg: {LOCK_WAITING_MARKER}another atpkg process holds the store lock"
+        ));
+        assert!(!announcement::is_open());
+        announcement::note(&format!(
+            "atpkg: {SEED_STARTING_MARKER}installing 2 program(s)"
+        ));
+        assert!(
+            announcement::is_open(),
+            "a wait before the announcement did not pre-answer it"
+        );
+        announcement::reset();
     }
 
     /// The ledger reads the same bytes the GUI parses, and an INFORMATIONAL row is not
@@ -11929,10 +12640,13 @@ mod tests {
         let src = include_str!("cli.rs");
         let production = production_half(src);
         // Whole macro invocations, not single lines: these calls wrap, and the marker
-        // is usually on the line after `println!(`.
+        // is usually on the line after `println!(`. `writeln!` too: the waiter's
+        // printer is a bare write with the error ignored, and a marker written that
+        // way OUTSIDE it would be just as invisible to the ledger.
         for call in whole_calls(production, "println!(")
             .into_iter()
             .chain(whole_calls(production, "print!("))
+            .chain(whole_calls(production, "writeln!("))
         {
             for (marker, _) in super::announcement::MARKERS {
                 let konst = format!("{}_MARKER", marker.trim_end_matches(": ").to_uppercase())
@@ -11949,10 +12663,35 @@ mod tests {
             whole_calls(production, "println!(").len() > 100,
             "the scanner found almost no println! calls — it is not reading this file"
         );
-        // …and the one printer really is used.
+        // …and the one printer really is used — and its lossy twin exactly once, by
+        // the lock edge, for the waiter's `seed-busy:` line.
         assert!(
             production.matches("emit_marker_line(").count() >= 9,
             "every marker site must go through the one printer"
+        );
+        let lossy = whole_calls(production, "emit_marker_line_lossy(");
+        assert_eq!(
+            lossy.len(),
+            2,
+            "the lossy printer has ONE call site (plus its definition): {lossy:?}"
+        );
+        assert!(
+            lossy.iter().any(|call| call.contains("SEED_BUSY_MARKER")),
+            "the lossy printer's one caller is the waiter's stood-aside terminal"
+        );
+        let edge = production
+            .find("fn mutator_store_lock")
+            .expect("the lock edge");
+        let edge_end = production[edge + 1..]
+            .find("\nfn ")
+            .map(|i| edge + 1 + i)
+            .expect("a function after the lock edge");
+        let call = production
+            .find("emit_marker_line_lossy(&format")
+            .expect("the call");
+        assert!(
+            edge < call && call < edge_end,
+            "the lossy call is inside the lock edge, not in a verb body"
         );
     }
 

@@ -73,6 +73,13 @@ pub enum StageError {
     /// refusing the image. Names the field or tool, so a mis-authored row fails fast on
     /// the authoring machine.
     Payload(String),
+    /// This installer is provenance-tracked and the untracked staging lane could not run
+    /// (the string is [`crate::lay::tracked_refusal`]: why, what the tag breaks, and the
+    /// two ways out). Refused rather than laid: a bundle every executable of which carries
+    /// `com.apple.provenance` is the v0.83.0 shape, and nothing on disk would have said
+    /// so. `ATPKG_ALLOW_TRACKED_INSTALL=1` turns this into an in-process stage RECORDED
+    /// beside the build ([`crate::store::record_tracked_install`]).
+    TrackedInstaller(String),
 }
 
 // Hand-rendered through `Formatter::write_str` + direct `Display::fmt` calls (no
@@ -107,6 +114,7 @@ impl std::fmt::Display for StageError {
                 f.write_str("payload: ")?;
                 f.write_str(m)
             }
+            StageError::TrackedInstaller(m) => f.write_str(m),
         }
     }
 }
@@ -162,6 +170,35 @@ pub fn verify_and_stage(
     archive: &Path,
     build_dir: &Path,
 ) -> Result<(), StageError> {
+    let scratch = archive
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    // MEASURED, once per process: a probe file written into the staging scratch and read
+    // back for the tag ([`crate::provenance::process_is_tracked`]).
+    let tracked = cfg!(target_os = "macos") && crate::provenance::process_is_tracked(&scratch);
+    verify_and_stage_with(
+        artifact,
+        archive,
+        build_dir,
+        tracked,
+        &crate::lay::lane_for_this_binary(),
+        crate::lay::tracked_policy(),
+    )
+}
+
+/// [`verify_and_stage`] with the untracked lane's three inputs explicit — whether this
+/// process is tracked, which binary would serve the lane, and the policy when it cannot
+/// — so the refusal, the escape hatch and the record beside the build are each provable
+/// from a test that is not itself in a position to be tracked.
+pub fn verify_and_stage_with(
+    artifact: &Artifact,
+    archive: &Path,
+    build_dir: &Path,
+    tracked: bool,
+    lane: &crate::lay::Lane,
+    policy: crate::lay::TrackedPolicy,
+) -> Result<(), StageError> {
     // 1. Download integrity — the compressed asset's sha256 must match the signed value,
     //    BEFORE we spend any work extracting it.
     let got = file_sha256(archive).map_err(StageError::Io)?;
@@ -188,8 +225,11 @@ pub fn verify_and_stage(
     //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
     //    by-product of the writing, not a second reading of it. (The `dmg` lane is
     //    the exception — `ditto` wrote its bytes, so it walks them once.)
-    let extracted_root = match stage_payload(artifact, archive, &incoming) {
-        Ok(root) => root,
+    let StagedTree {
+        root: extracted_root,
+        tracked_record,
+    } = match stage_for_store_with(artifact, archive, &incoming, tracked, lane, policy) {
+        Ok(staged) => staged,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&incoming);
             return Err(e);
@@ -243,6 +283,20 @@ pub fn verify_and_stage(
     //    old tree aside, then the verified tree into place, then the old tree reclaimed.
     if let Err(e) = swap_into_place(build_dir, &incoming) {
         let _ = std::fs::remove_dir_all(&incoming);
+        return Err(StageError::Io(e));
+    }
+
+    // 4b. THE RECORD. A tree a tracked installer laid in-process under the escape hatch
+    //     is written down beside the build (`<build>.tracked-install`, a sibling like
+    //     `.ready`, outside the hashed tree) BEFORE the build is marked complete: a
+    //     record that could not be written leaves the build unmarked — re-stageable, and
+    //     honestly not the clean install the marker would claim — rather than a tagged
+    //     bundle nothing on disk explains. A clean stage clears any record a previous
+    //     stage of this build number left, so `doctor` never names a cause that is gone.
+    crate::store::clear_tracked_install(build_dir);
+    if let Some(why) = &tracked_record
+        && let Err(e) = crate::store::record_tracked_install(build_dir, why)
+    {
         return Err(StageError::Io(e));
     }
 
@@ -315,12 +369,193 @@ pub fn stage_payload(
     archive: &Path,
     dest: &Path,
 ) -> Result<String, StageError> {
-    let cap = size_cap(artifact);
+    stage_payload_spec(&StageSpec::of(artifact), archive, dest)
+}
+
+/// The fields of a signed row that [`stage_payload`] reads — and nothing else — so the
+/// untracked lane ([`crate::stage_helper`]) can hand exactly them to another process
+/// without re-parsing a manifest there. Built by [`StageSpec::of`]; the size cap is
+/// already derived ([`size_cap`]), so both processes bound the extraction identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSpec {
+    /// The row's `payload` lane (`""` for a release bundle).
+    pub payload: String,
+    /// `raw-binary` only: the tool name the download becomes.
+    pub entry: String,
+    /// Archive lanes: leading components to drop.
+    pub strip_components: u32,
+    /// `bin/<name> -> ../<target>` symlinks to lay after staging.
+    pub links: BTreeMap<String, String>,
+    /// Uncompressed-size cap for the extraction ([`size_cap`]).
+    pub size_cap: u64,
+}
+
+impl StageSpec {
+    /// The staging inputs of `artifact`.
+    #[must_use]
+    pub fn of(artifact: &Artifact) -> Self {
+        Self {
+            payload: artifact.payload.clone(),
+            entry: artifact.entry.clone(),
+            strip_components: artifact.strip_components,
+            links: artifact.links.clone(),
+            size_cap: size_cap(artifact),
+        }
+    }
+}
+
+/// What [`stage_for_store_with`] laid: the folded `tree_root`, and — when a tracked
+/// installer laid it in-process under `ATPKG_ALLOW_TRACKED_INSTALL=1`, or kept a lane's
+/// tree that came back tagged — the reason, to be recorded beside the build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedTree {
+    /// The folded `tree_root`.
+    pub root: String,
+    /// `Some(why)` iff the tree carries the tag by the operator's choice.
+    pub tracked_record: Option<String>,
+}
+
+/// What a tracked installer does with its lane's outcome under a policy — the pure
+/// decision behind [`stage_for_store_with`], so every cell of the table is testable
+/// without a launchd job (or without being tracked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneDecision {
+    /// The lane laid a clean tree: keep it.
+    Keep(String),
+    /// The lane laid a tree that nevertheless came back tagged; `Allow` keeps it — it is
+    /// the verified tree, and re-extracting would only produce a tagged one — and records
+    /// why.
+    KeepRecorded { root: String, why: String },
+    /// The lane could not run; `Allow` stages in-process and records why.
+    InProcessRecorded(String),
+    /// `Refuse`: the reason, already rendered as the refusal.
+    Refuse(String),
+}
+
+/// See [`LaneDecision`].
+#[must_use]
+pub fn decide_tracked_stage(
+    outcome: Result<crate::stage_helper::StagedUntracked, String>,
+    policy: crate::lay::TrackedPolicy,
+) -> LaneDecision {
+    use crate::lay::TrackedPolicy;
+    match (outcome, policy) {
+        (Ok(staged), _) if !staged.witness_tagged => LaneDecision::Keep(staged.root),
+        (Ok(staged), TrackedPolicy::Allow) => LaneDecision::KeepRecorded {
+            root: staged.root,
+            why: String::from(
+                "the untracked lane ran, but the first file it laid still carried \
+                 com.apple.provenance",
+            ),
+        },
+        (Ok(_), TrackedPolicy::Refuse) => LaneDecision::Refuse(crate::lay::tracked_refusal(
+            "stage the bundle clean",
+            "the lane ran, but the first file it laid still carried com.apple.provenance",
+        )),
+        (Err(why), TrackedPolicy::Allow) => {
+            LaneDecision::InProcessRecorded(format!("the untracked lane could not run ({why})"))
+        }
+        (Err(why), TrackedPolicy::Refuse) => {
+            LaneDecision::Refuse(crate::lay::tracked_refusal("stage the bundle", &why))
+        }
+    }
+}
+
+/// Stage for the STORE: [`stage_payload`], except that a provenance-TRACKED installer
+/// hands the extraction to an untracked launchd job ([`crate::stage_helper`]) — and,
+/// when that lane cannot run, does what the policy says rather than quietly staging
+/// tagged files.
+///
+/// `tracked` is measured by the caller ([`verify_and_stage`]: a probe file written into
+/// the staging scratch and read back for `com.apple.provenance`) — a tracked atpkg would
+/// otherwise tag every executable it lays down, and a tagged `trustc` cannot cut a
+/// release (v0.83.0, 2026-09-12). An untracked installer takes exactly the path it always
+/// took, as does a binary with no lane ([`crate::lay::Lane::Unavailable`]: a test harness
+/// — a fact about the binary, not a failure). A tracked one whose lane fails is refused
+/// under [`crate::lay::TrackedPolicy::Refuse`] (the default) with
+/// [`StageError::TrackedInstaller`], or staged in-process and RECORDED under `Allow`
+/// (`ATPKG_ALLOW_TRACKED_INSTALL=1`). The decision table is [`decide_tracked_stage`].
+///
+/// On `Err`, `incoming` is left empty for the caller to remove.
+pub fn stage_for_store_with(
+    artifact: &Artifact,
+    archive: &Path,
+    incoming: &Path,
+    tracked: bool,
+    lane: &crate::lay::Lane,
+    policy: crate::lay::TrackedPolicy,
+) -> Result<StagedTree, StageError> {
+    let helper = match (tracked, lane) {
+        (true, crate::lay::Lane::Helper(exe)) => exe,
+        _ => {
+            return Ok(StagedTree {
+                root: stage_payload(artifact, archive, incoming)?,
+                tracked_record: None,
+            });
+        }
+    };
+    let scratch = archive
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir);
+    let outcome = crate::stage_helper::stage_untracked(
+        helper,
+        &StageSpec::of(artifact),
+        archive,
+        incoming,
+        &scratch,
+    );
+    match decide_tracked_stage(outcome, policy) {
+        LaneDecision::Keep(root) => Ok(StagedTree {
+            root,
+            tracked_record: None,
+        }),
+        LaneDecision::KeepRecorded { root, why } => Ok(StagedTree {
+            root,
+            tracked_record: Some(why),
+        }),
+        LaneDecision::InProcessRecorded(why) => {
+            eprintln!(
+                "atpkg: note — this installer is provenance-tracked and {why}; \
+                 {} is set, so the bundle is staged in-process and WILL carry \
+                 com.apple.provenance — recorded beside the build for `aterm pkg doctor`",
+                crate::lay::ALLOW_TRACKED_ENV
+            );
+            Ok(StagedTree {
+                root: stage_payload(artifact, archive, incoming)?,
+                tracked_record: Some(why),
+            })
+        }
+        LaneDecision::Refuse(msg) => {
+            // The lane may have left a (tagged) tree on the measured-tagged path; a
+            // refused stage leaves `incoming` empty for the caller.
+            if let Ok(entries) = std::fs::read_dir(incoming) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    let _ = if std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+                        std::fs::remove_dir_all(&p)
+                    } else {
+                        std::fs::remove_file(&p)
+                    };
+                }
+            }
+            Err(StageError::TrackedInstaller(msg))
+        }
+    }
+}
+
+/// [`stage_payload`] over an explicit [`StageSpec`] — the body; see there for the lanes.
+pub fn stage_payload_spec(
+    spec: &StageSpec,
+    archive: &Path,
+    dest: &Path,
+) -> Result<String, StageError> {
+    let cap = spec.size_cap;
     let vendor = ExtractOptions {
-        strip_components: artifact.strip_components,
+        strip_components: spec.strip_components,
         in_root_symlinks: true,
     };
-    let mut folded: Option<TreeAccumulator> = match artifact.payload.as_str() {
+    let mut folded: Option<TreeAccumulator> = match spec.payload.as_str() {
         "" => Some(
             extract_tar_zst_tree(archive, dest, cap, MAX_ENTRIES, ExtractOptions::default())
                 .map_err(StageError::Extract)?,
@@ -337,14 +572,14 @@ pub fn stage_payload(
             extract_zip_tree(archive, dest, cap, MAX_ENTRIES, vendor)
                 .map_err(StageError::Extract)?,
         ),
-        "raw-binary" => Some(stage_raw_binary(archive, dest, &artifact.entry, cap)?),
+        "raw-binary" => Some(stage_raw_binary(archive, dest, &spec.entry, cap)?),
         "dmg" => {
             stage_dmg(archive, dest)?;
             None
         }
         other => return Err(payload2("unknown payload lane: ", other)),
     };
-    apply_links(dest, &artifact.links, folded.as_mut())?;
+    apply_links(dest, &spec.links, folded.as_mut())?;
     match folded {
         Some(tree) => Ok(tree.root()),
         None => tree_root(dest).map_err(StageError::Io),
@@ -382,6 +617,7 @@ fn stage_raw_binary(
     std::fs::create_dir_all(dest).map_err(StageError::Io)?;
     crate::extract::require_empty_destination(dest).map_err(StageError::Extract)?;
     let bin = dest.join("bin");
+    refuse_symlinked_bin(&bin)?;
     std::fs::create_dir_all(&bin).map_err(StageError::Io)?;
     crate::platform::set_mode(&bin, 0o755).map_err(StageError::Io)?;
     let target = bin.join(tool.exe_file());
@@ -414,12 +650,45 @@ fn link_target_admissible(target: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
+/// Refuse a staged `bin` that exists as anything but a real directory. `create_dir_all`,
+/// `set_mode` and the link creation after them all FOLLOW a `bin` symlink, so a staged
+/// `bin -> <anywhere>` would chmod that directory and plant links in it, outside the stage
+/// (audit K1, 2026-09-12). The extractor's vet keeps every in-root link inside the root;
+/// this refuses the shape outright, whatever laid it.
+fn refuse_symlinked_bin(bin: &Path) -> Result<(), StageError> {
+    match std::fs::symlink_metadata(bin) {
+        Ok(m) if !m.is_dir() => Err(StageError::Payload(String::from(
+            "links: the staged `bin` is a symlink or a file, not a directory",
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether any proper ancestor of `dest/<target>` below `dest` is a symlink — the probe
+/// and the link would then be answered by a tree the digest does not describe.
+fn target_ancestor_is_symlink(dest: &Path, target: &str) -> bool {
+    let mut cur = dest.to_path_buf();
+    let mut comps = Path::new(target).components().peekable();
+    while let Some(c) = comps.next() {
+        if comps.peek().is_none() {
+            break;
+        }
+        cur.push(c);
+        if std::fs::symlink_metadata(&cur).is_ok_and(|m| m.is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Create the row's `links`: for every `(name, target)`, the RELATIVE symlink
 /// `bin/<name> -> ../<target>`, and record it in the open fold (when there is one) so
 /// the root closes over the finished tree. Fail-closed on a name that is not a tool
 /// name, a target that is not a clean relative path, a target absent from the staged
-/// tree (an authoring slip: the link would dangle), or a `bin/<name>` something already
-/// occupies (the link would either fail or shadow an extracted entry).
+/// tree (an authoring slip: the link would dangle), a target reached through a symlinked
+/// directory, a staged `bin` that is not a real directory ([`refuse_symlinked_bin`]), or a
+/// `bin/<name>` something already occupies (the link would either fail or shadow an
+/// extracted entry).
 fn apply_links(
     dest: &Path,
     links: &BTreeMap<String, String>,
@@ -429,6 +698,7 @@ fn apply_links(
         return Ok(());
     }
     let bin = dest.join("bin");
+    refuse_symlinked_bin(&bin)?;
     for (name, target) in links {
         if crate::store::ToolName::new(name).is_none() {
             return Err(payload2(
@@ -439,6 +709,12 @@ fn apply_links(
         if !link_target_admissible(target) {
             return Err(payload2(
                 "links target must be a relative, `..`-free path inside the staged tree: ",
+                target,
+            ));
+        }
+        if target_ancestor_is_symlink(dest, target) {
+            return Err(payload2(
+                "links target passes through a symlinked directory: ",
                 target,
             ));
         }
@@ -872,6 +1148,144 @@ mod tests {
             dir.join("ay-18.tar.zst"),
             tar_entry("bin/ay", b"#!/bin/true\nthe ay binary"),
         )
+    }
+
+    /// The decision table behind a tracked installer's stage, every cell: a clean lane
+    /// keeps; a lane that could not run refuses by default and stages in-process
+    /// (recorded) under `Allow`; a lane whose tree came back tagged refuses by default
+    /// and keeps that tree (recorded) under `Allow` — never a second extraction that
+    /// would only produce another tagged tree.
+    #[test]
+    fn the_tracked_stage_decision_table_is_complete() {
+        use crate::lay::TrackedPolicy::{Allow, Refuse};
+        use crate::stage_helper::StagedUntracked;
+        let clean = || {
+            Ok(StagedUntracked {
+                root: "r".into(),
+                witness_tagged: false,
+            })
+        };
+        let tagged = || {
+            Ok(StagedUntracked {
+                root: "r".into(),
+                witness_tagged: true,
+            })
+        };
+        let failed = || {
+            Err(String::from(
+                "the untracked helper job x exited without a result",
+            ))
+        };
+        assert_eq!(
+            decide_tracked_stage(clean(), Refuse),
+            LaneDecision::Keep("r".into())
+        );
+        assert_eq!(
+            decide_tracked_stage(clean(), Allow),
+            LaneDecision::Keep("r".into())
+        );
+        match decide_tracked_stage(failed(), Refuse) {
+            LaneDecision::Refuse(msg) => {
+                assert!(msg.contains("could not stage the bundle"), "{msg}");
+                assert!(msg.contains("exited without a result"), "{msg}");
+                assert!(msg.contains(crate::lay::ALLOW_TRACKED_ENV), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide_tracked_stage(failed(), Allow) {
+            LaneDecision::InProcessRecorded(why) => {
+                assert!(why.contains("could not run"), "{why}");
+                assert!(why.contains("exited without a result"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide_tracked_stage(tagged(), Refuse) {
+            LaneDecision::Refuse(msg) => {
+                assert!(msg.contains("still carried com.apple.provenance"), "{msg}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match decide_tracked_stage(tagged(), Allow) {
+            LaneDecision::KeepRecorded { root, why } => {
+                assert_eq!(root, "r");
+                assert!(why.contains("still carried"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The failure path, with a helper BROKEN ON PURPOSE (`/usr/bin/true` under the name
+    /// `atpkg`: spelled right, answers nothing) and the tracking measurement forced:
+    /// by default the stage is REFUSED — nothing installed, no marker, no record, the
+    /// refusal naming the cause and the escape hatch; under `Allow` it installs, marks
+    /// the build complete and RECORDS the cause beside it; and a later clean stage of the
+    /// same build number clears the record.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_tracked_installer_whose_lane_fails_refuses_by_default_and_records_under_allow() {
+        use crate::lay::{Lane, TrackedPolicy};
+        let d = tmp("tracked-refuse");
+        let archive = make_archive(&d);
+        let sha = file_sha256(&archive).unwrap();
+        let reference = d.join("reference");
+        std::fs::create_dir_all(&reference).unwrap();
+        let root = stage_payload(&artifact(&sha, ""), &archive, &reference).unwrap();
+        let a = artifact(&sha, &root);
+        let store = d.join("store").join("ay");
+        std::fs::create_dir_all(&store).unwrap();
+        let build = store.join("18");
+        let fake_dir = d.join("fake");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let fake = fake_dir.join("atpkg");
+        std::fs::copy("/usr/bin/true", &fake).unwrap();
+        let broken = Lane::Helper(fake);
+
+        // Default: refused.
+        let err = verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Refuse)
+            .expect_err("a tracked installer with a broken lane must refuse");
+        let msg = err.to_string();
+        assert!(matches!(err, StageError::TrackedInstaller(_)), "{err:?}");
+        assert!(msg.contains("provenance-tracked"), "{msg}");
+        assert!(msg.contains("could not stage the bundle"), "{msg}");
+        assert!(msg.contains("exited without a result"), "the cause: {msg}");
+        assert!(
+            msg.contains("ATPKG_ALLOW_TRACKED_INSTALL=1"),
+            "the hatch: {msg}"
+        );
+        assert!(msg.contains("launchctl submit"), "the other way out: {msg}");
+        assert!(!build.exists(), "nothing installed");
+        assert!(!crate::store::build_is_complete(&build));
+        assert_eq!(crate::store::tracked_install_record(&build), None);
+        let scratch_left: Vec<_> = std::fs::read_dir(&store)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            scratch_left.is_empty(),
+            "no incoming scratch left: {scratch_left:?}"
+        );
+
+        // Escape hatch: installed, complete, RECORDED.
+        verify_and_stage_with(&a, &archive, &build, true, &broken, TrackedPolicy::Allow)
+            .expect("the escape hatch stages in-process");
+        assert!(build.join("bin/ay").is_file());
+        assert!(crate::store::build_is_complete(&build));
+        let why = crate::store::tracked_install_record(&build).expect("the cause is recorded");
+        assert!(why.contains("the untracked lane could not run"), "{why}");
+        assert!(why.contains("exited without a result"), "{why}");
+
+        // A clean (untracked) re-stage of the same build number clears the record.
+        verify_and_stage_with(&a, &archive, &build, false, &broken, TrackedPolicy::Refuse).unwrap();
+        assert!(crate::store::build_is_complete(&build));
+        assert_eq!(crate::store::tracked_install_record(&build), None);
+
+        // A binary with no lane is a fact about the binary, not a lane failure: no
+        // refusal, no record, even when tracked.
+        let none = Lane::Unavailable(String::from("a test harness"));
+        verify_and_stage_with(&a, &archive, &build, true, &none, TrackedPolicy::Refuse).unwrap();
+        assert_eq!(crate::store::tracked_install_record(&build), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// An archive whose EXTRACTION fails part-way: a good first entry (so real bytes land in
@@ -1880,6 +2294,74 @@ mod tests {
             assert!(matches!(err, StageError::Payload(_)), "{bad:?}: {err:?}");
             assert!(!build.exists(), "{bad:?}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `apply_links` runs `create_dir_all(bin)` + `chmod 0755 bin` and then creates
+    /// `bin/<name>` — all of which FOLLOW a `bin` that is a symlink. A staged `bin` (or a
+    /// link target's ancestor) that is a symlink must be refused before any of it, so
+    /// nothing outside the stage is chmodded or gets a link planted in it (audit K1,
+    /// 2026-09-12). Both through the real vendor lane (a link chain in the archive) and
+    /// against `apply_links` directly (defence in depth: any `bin` symlink at all).
+    #[cfg(unix)]
+    #[test]
+    fn apply_links_never_writes_through_a_staged_bin_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp("links-bin-symlink");
+        let victim = d.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // 1. Through the vendor lane: two in-root links that chain out to `victim`.
+        let gz = d.join("chain.tar.gz");
+        std::fs::write(
+            &gz,
+            gzip_bytes(&tar_bytes(&[
+                ("a/b/c/", b'5', "", b"", 0o755),
+                ("a/b/c/up", b'2', "../../..", b"", 0o777),
+                ("bin", b'2', "a/b/c/up/../victim", b"", 0o777),
+                ("gh-real", b'0', "", b"#!/bin/sh\n", 0o755),
+            ])),
+        )
+        .unwrap();
+        let mut art = vendor_artifact(&gz, "tar-gz", "");
+        art.links.insert("gh".into(), "gh-real".into());
+        let stage = d.join("stage");
+        let got = stage_payload(&art, &gz, &stage);
+        assert!(got.is_err(), "the chained bin link must not stage: {got:?}");
+        assert!(
+            std::fs::symlink_metadata(victim.join("gh")).is_err(),
+            "no link planted outside the stage"
+        );
+        assert_eq!(
+            mode(&victim),
+            0o700,
+            "the outside directory was not chmodded"
+        );
+
+        // 2. apply_links itself: a `bin` symlink laid by any means is refused …
+        let dest = d.join("direct");
+        lay(&dest, "gh-real", b"#!/bin/sh\n", 0o755);
+        std::os::unix::fs::symlink(&victim, dest.join("bin")).unwrap();
+        let mut links = BTreeMap::new();
+        links.insert("gh".to_string(), "gh-real".to_string());
+        let err = apply_links(&dest, &links, None).unwrap_err();
+        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
+        assert!(std::fs::symlink_metadata(victim.join("gh")).is_err());
+        assert_eq!(mode(&victim), 0o700);
+
+        // … and so is a target reached through a symlinked ancestor, whose existence
+        // probe would otherwise be answered from outside the stage.
+        let dest = d.join("ancestor");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(victim.join("tool"), b"x").unwrap();
+        std::os::unix::fs::symlink(&victim, dest.join("lib")).unwrap();
+        let mut links = BTreeMap::new();
+        links.insert("tool".to_string(), "lib/tool".to_string());
+        let err = apply_links(&dest, &links, None).unwrap_err();
+        assert!(matches!(err, StageError::Payload(_)), "{err:?}");
+        assert!(std::fs::symlink_metadata(dest.join("bin/tool")).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

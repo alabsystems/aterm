@@ -3891,6 +3891,44 @@ pub fn resume_apple_tier(
     resolve_apple_tier(team_id, credentials)
 }
 
+/// The provenance gate a RESUME must pass — which is nothing at all unless `build`
+/// is still going to run.
+///
+/// The fresh cut runs [`gates::provenance_gate`] before the claim, so a tagged
+/// toolchain or a tracked cutter process costs nothing. A resume starts AFTER the
+/// claim: the build number is already burned, and a resume that still has to bake
+/// artifacts (`build` not journaled — a cut that died in the gate ladder's shadow, or
+/// during the build itself) would produce tagged object files and a tagged proof
+/// snapshot and die where v0.83.0 did. So it re-runs the same gate, over the toolchain
+/// it will resolve and its own executable, before the pipeline is entered. A resume
+/// past `build` compiles nothing — every later step uploads, flips and verifies bytes
+/// already on disk — and is NOT blocked by it: the tag on a compiler that will not run
+/// cannot reach a file, and refusing there would turn a cut one upload from finished
+/// into one that cannot be finished, the trade [`resume_apple_tier`] refuses for the
+/// same reason under the same predicate.
+///
+/// `gate` is the filesystem half, injected so the rule is testable without a
+/// toolchain: in production it is [`toolchain_provenance_gate`].
+pub fn resume_provenance_gate(journal: &Journal, gate: impl FnOnce() -> Result<()>) -> Result<()> {
+    if journal.is_done("build") {
+        return Ok(());
+    }
+    gate().map_err(|e| {
+        Error::new(format!(
+            "a resume at step {:?} would rebuild, and {e}",
+            journal.first_incomplete().unwrap_or("build")
+        ))
+    })
+}
+
+/// The fresh cut's provenance gate over the toolchain THIS cutter resolves
+/// ([`gates::trust_stage2_bin`] — the same resolution `buildplan` performs) and its own
+/// binary: the production `gate` of [`resume_provenance_gate`].
+pub fn toolchain_provenance_gate() -> Result<()> {
+    let trustc = gates::trust_stage2_bin()?.join("trustc");
+    gates::provenance_gate(&trustc)
+}
+
 const MAX_SMALL_RELEASE_ASSET_BYTES: u64 = 256 * 1024;
 
 /// Immutable GitHub release capability. Tag names are mutable and draft tags
@@ -8141,7 +8179,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "",
         &format!(
-            "Cargo.lock exact/offline · trustc ok ({}) · {} · disk ok ({} GiB free)",
+            "Cargo.lock exact/offline · trustc ok ({}) · no com.apple.provenance on \
+             trustc/targo/the cutter, probe write untagged · {} · disk ok ({} GiB free)",
             gr.trustc.display(),
             if gr.universal {
                 "x86_64 target ok"
@@ -8529,6 +8568,13 @@ fn resume_cut(
     // and reject every unexplained worktree change before acquiring a remote
     // lease/fence.
     ordinary_resume_claim_preflight(repo, &git, &journal)?;
+
+    // The provenance gate the fresh cut ran before its claim, re-run here — under the
+    // one rule every rebuild-only check below shares — BEFORE any artifact is baked: a
+    // resume from a tracked shell that still has `build` to do would tag every object
+    // file and die at the proof snapshot with the build number already burned, which
+    // is the fresh cut's incident with the claim's protection removed.
+    resume_provenance_gate(&journal, toolchain_provenance_gate)?;
 
     // Steps that (re)bake artifact bytes additionally require the recovered
     // signing key. The claim-commit/clean-tree proof above applies to every

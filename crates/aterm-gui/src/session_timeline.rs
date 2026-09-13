@@ -142,7 +142,7 @@ const MAX_PAYLOAD: usize = 256;
 /// The user-settable per-session metadata (`meta set`/`meta unset`). All
 /// fields are `None` until a driver sets them; `user_title` (when set +
 /// non-empty) outranks the live OSC title in tab labels and stays until unset.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug)]
 pub struct SessionMeta {
     /// Operator-chosen display title — the TOP rung of the tab-label chain.
     pub user_title: Option<String>,
@@ -158,7 +158,42 @@ pub struct SessionMeta {
     /// and the value is the one-line reason shown in the status-item menu.
     /// Replaces the legacy `⚠`-title convention (still honored as fallback).
     pub attention: Option<String>,
+    /// PROVENANCE, not value: one bit per [`MetaField`] a DRIVER has written on
+    /// this process — every write [`apply_meta_value`] accepted (`meta set`,
+    /// `meta unset`, the GUI rename, the operator row's stamp), including a
+    /// re-set to the same value and a clear of a field that was already unset,
+    /// since each of those answered `OK` too. A restore seed ([`Self::set`])
+    /// marks nothing. [`restore_carried_meta`] reads it so that an identity
+    /// carried in from the previous process never overwrites a write a driver
+    /// made here after that identity was captured. Not persisted and not part
+    /// of equality (see the `PartialEq` impl). Write it only through
+    /// [`apply_meta_value`]; read it through [`Self::driver_wrote`].
+    pub(crate) driver_writes: u8,
 }
+
+/// Equality is over the five VALUES — what a tab label, a `meta` reader and a
+/// restore capture see. `driver_writes` records how a value got there, and two
+/// metas that read the same are the same identity. Destructured, so a sixth
+/// field cannot be added without deciding which side of that line it is on.
+impl PartialEq for SessionMeta {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            user_title,
+            description,
+            icon,
+            role,
+            attention,
+            driver_writes: _,
+        } = self;
+        *user_title == other.user_title
+            && *description == other.description
+            && *icon == other.icon
+            && *role == other.role
+            && *attention == other.attention
+    }
+}
+
+impl Eq for SessionMeta {}
 
 impl SessionMeta {
     /// Whether ANY field is set — the `sessions` listing's `meta=<1|0>` bit.
@@ -169,6 +204,13 @@ impl SessionMeta {
             || self.icon.is_some()
             || self.role.is_some()
             || self.attention.is_some()
+    }
+
+    /// Whether a driver wrote `field` on this process (see
+    /// [`Self::driver_writes`]).
+    #[must_use]
+    pub(crate) const fn driver_wrote(&self, field: MetaField) -> bool {
+        self.driver_writes & field.bit() != 0
     }
 
     /// The named field's current value (`None` for an unknown field name —
@@ -239,7 +281,9 @@ impl SessionMeta {
         }
     }
 
-    /// A canonical bounded copy suitable for restore/handoff persistence.
+    /// A canonical bounded copy suitable for restore/handoff persistence. The
+    /// copy carries values only: which of them a driver wrote here is a fact
+    /// about this process, and it does not travel.
     #[must_use]
     pub(crate) fn sanitized(&self) -> Self {
         Self {
@@ -248,6 +292,7 @@ impl SessionMeta {
             icon: self.presentation_value("icon"),
             role: self.presentation_value("role"),
             attention: self.presentation_value("attention"),
+            driver_writes: 0,
         }
     }
 
@@ -307,6 +352,20 @@ pub(crate) enum MetaField {
 }
 
 impl MetaField {
+    /// Every field, in the order `meta` prints them.
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Title,
+        Self::Description,
+        Self::Icon,
+        Self::Role,
+        Self::Attention,
+    ];
+
+    /// This field's bit in [`SessionMeta::driver_writes`].
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+
     /// Parse a wire field token, or `None` for an unknown name — the ONE door
     /// from the string vocabulary into the typed one.
     #[must_use]
@@ -415,6 +474,10 @@ pub(crate) fn validated_meta_value(
 /// whether the stored value moved, which is the caller's gate for the wake +
 /// subscriber fan-out (see the `meta` dispatch arm and the GUI rename commit).
 ///
+/// Every call, a no-op one included, marks the field in
+/// [`SessionMeta::driver_writes`]: this is the one door a driver's write comes
+/// through, and each such write was answered `OK`.
+///
 /// ATOMICITY: the timeline record happens WHILE the meta guard is still held —
 /// the one sanctioned meta→timeline nesting (documented on `SessionCtx`). The
 /// control socket runs concurrent worker threads, so two authorized `meta set`s
@@ -424,8 +487,9 @@ pub(crate) fn validated_meta_value(
 /// LAST event that names the LOSING value while the stored meta, the bare
 /// `meta` readout, and the tab label all show the winner. Holding the guard
 /// across the record makes event-stream order match store order by
-/// construction. Deadlock-free: no other site takes these two nested, and
-/// timeline is a leaf everywhere (nothing locks meta under timeline).
+/// construction. Deadlock-free: the one other site that takes these two nested
+/// ([`restore_carried_meta`]) takes them in the same order, and timeline is a
+/// leaf everywhere (nothing locks meta under timeline).
 ///
 /// GUARDS ARE RELEASED ON RETURN, and that is load-bearing rather than tidy: a
 /// SAME-THREAD GUI caller refreshes the tab chrome immediately after this
@@ -437,22 +501,72 @@ pub(crate) fn apply_meta_value(
     field: MetaField,
     value: Option<String>,
 ) -> bool {
-    let payload_value = value
-        .as_deref()
-        .map_or_else(|| "-".to_string(), crate::control::pct_encode);
+    let payload = meta_change_payload(field, value.as_deref());
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    meta.driver_writes |= field.bit();
     let changed = meta.set(field.wire_name(), value).unwrap_or(false);
     if changed {
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record(
-                "meta-change",
-                format!("field={} value={payload_value}", field.wire_name()),
-            );
+            .record("meta-change", payload);
     }
     drop(meta);
     changed
+}
+
+/// The `meta-change` record's payload for `field` now storing `value`:
+/// `field=<f> value=<pct|->`. One spelling for both recorders, so a restored
+/// field reads on the `events` digest exactly like a `meta set` one.
+fn meta_change_payload(field: MetaField, value: Option<&str>) -> String {
+    let value = value.map_or_else(|| "-".to_string(), crate::control::pct_encode);
+    format!("field={} value={value}", field.wire_name())
+}
+
+/// Put a CARRIED identity — the five USER fields a restore leaf captured in
+/// the previous process — back onto a session that is ALREADY LIVE here:
+/// registered and served under its sid, so a reader may have seen it without
+/// them and a driver may have written it since. That is what separates this
+/// from a seed onto a session nobody can address yet, and it sets two rules.
+///
+/// * A DRIVER'S WRITE WINS. A field a driver wrote on this process
+///   ([`SessionMeta::driver_writes`]) keeps the driver's value, set or
+///   cleared. That write was answered `OK` here after `carried` was captured
+///   there, so it is the newer intent.
+/// * Every other field takes the carried value EXACTLY — absent means unset —
+///   and a field that moves records the ordinary `meta-change` event, under
+///   the meta guard exactly as [`apply_meta_value`] records it. A `timeline`
+///   reader or an `events` watcher that saw the session bare sees each field
+///   arrive the way a `meta set` would arrive, and the chrome cache's
+///   `high_id` key moves with it.
+///
+/// Returns whether any stored value moved: the caller's gate for waking the
+/// session's `events` watchers.
+pub(crate) fn restore_carried_meta(ctx: &crate::SessionCtx, carried: &SessionMeta) -> bool {
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let mut moved = false;
+    for field in MetaField::ALL {
+        if meta.driver_wrote(field) {
+            continue;
+        }
+        let name = field.wire_name();
+        if !meta
+            .set(name, carried.get(name).map(str::to_owned))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        moved = true;
+        // The STORED value, which `set`'s sanitizer may have narrowed from
+        // what the manifest spelled.
+        let payload = meta_change_payload(field, meta.get(name));
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record("meta-change", payload);
+    }
+    drop(meta);
+    moved
 }
 
 /// Validate THEN apply — the entry point a NON-wire caller uses so it cannot
@@ -951,6 +1065,119 @@ mod write_api_tests {
             vec!["field=title value=agent", "field=title value=-"],
             "exactly one record per REAL change, and a clear is `-`"
         );
+    }
+
+    /// Every write the door accepts marks its field as the DRIVER's — a no-op
+    /// re-set and a clear of an unset field included, since both answered `OK`
+    /// — while a restore seed through [`super::SessionMeta::set`] marks nothing,
+    /// and the marks never enter equality.
+    #[test]
+    fn every_accepted_write_marks_its_field_and_a_seed_marks_none() {
+        use super::SessionMeta;
+        let ctx = crate::stub_session(0).ctx.clone();
+        assert!(
+            !apply_meta_value(&ctx, MetaField::Attention, None),
+            "clearing an unset field moves nothing"
+        );
+        assert!(apply_meta_value(&ctx, MetaField::Role, Some("lead".into())));
+        assert!(!apply_meta_value(
+            &ctx,
+            MetaField::Role,
+            Some("lead".into())
+        ));
+        let meta = ctx.meta.lock().unwrap().clone();
+        let wrote = MetaField::ALL.map(|field| meta.driver_wrote(field));
+        assert_eq!(
+            wrote,
+            [false, false, false, true, true],
+            "title, description, icon, role, attention"
+        );
+
+        let mut seeded = SessionMeta::default();
+        assert_eq!(seeded.set("role", Some("lead".into())), Some(true));
+        assert!(
+            MetaField::ALL
+                .iter()
+                .all(|field| !seeded.driver_wrote(*field))
+        );
+        assert_eq!(seeded, meta, "equality is over the values alone");
+    }
+}
+
+/// Proofs for [`super::restore_carried_meta`]: the rules that put an identity
+/// carried in from the previous process back on a session that is already
+/// live here.
+#[cfg(test)]
+mod carried_meta_tests {
+    use super::{MetaField, SessionMeta, apply_meta_value, restore_carried_meta};
+
+    fn meta_events_after(ctx: &crate::SessionCtx, watermark: Option<u64>) -> Vec<String> {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .since(watermark)
+            .filter(|event| event.kind == "meta-change")
+            .map(|event| event.payload.clone())
+            .collect()
+    }
+
+    /// A field a driver wrote here keeps the driver's value, set or cleared;
+    /// every other field takes the carried value exactly; and each field that
+    /// moves is recorded as the ordinary `meta-change`, naming the value it
+    /// now stores, so a watcher that saw the session bare sees it arrive.
+    #[test]
+    fn a_driver_write_outranks_the_carried_value_and_every_move_is_announced() {
+        let ctx = crate::stub_session(0).ctx.clone();
+        // A value from an earlier restore — no driver wrote it here — that
+        // the carried identity does not name.
+        let _ = ctx.meta.lock().unwrap().set("icon", Some("🧟".into()));
+        // What a driver wrote here before the carried identity arrived.
+        assert!(apply_meta_value(
+            &ctx,
+            MetaField::Role,
+            Some("worker:new".into())
+        ));
+        assert!(apply_meta_value(
+            &ctx,
+            MetaField::Attention,
+            Some("fresh escalation".into())
+        ));
+        assert!(!apply_meta_value(&ctx, MetaField::Description, None));
+        let watermark = ctx.timeline.lock().unwrap().high_id();
+
+        let carried = SessionMeta {
+            user_title: Some("fable driver".into()),
+            description: Some("carried notes".into()),
+            role: Some("worker:old".into()),
+            ..SessionMeta::default()
+        };
+        assert!(restore_carried_meta(&ctx, &carried));
+
+        let meta = ctx.meta.lock().unwrap().clone();
+        assert_eq!(
+            meta,
+            SessionMeta {
+                user_title: Some("fable driver".into()),
+                role: Some("worker:new".into()),
+                attention: Some("fresh escalation".into()),
+                ..SessionMeta::default()
+            },
+            "the driver's role and attention and its clear of description \
+             stand; the title is carried; the stale icon is cleared"
+        );
+        assert_eq!(
+            meta_events_after(&ctx, watermark),
+            vec![
+                "field=title value=fable%20driver".to_string(),
+                "field=icon value=-".to_string(),
+            ],
+            "exactly the fields that moved, each naming what it now stores"
+        );
+
+        // Nothing left to move: silent, and says so.
+        let watermark = ctx.timeline.lock().unwrap().high_id();
+        assert!(!restore_carried_meta(&ctx, &carried));
+        assert!(meta_events_after(&ctx, watermark).is_empty());
     }
 }
 

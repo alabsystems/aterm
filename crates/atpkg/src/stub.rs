@@ -507,51 +507,43 @@ pub fn write_pending_stub_with(
     kind: StubKind,
     requires: &[String],
 ) -> io::Result<()> {
+    match pending_stub_executable(layout, tool, kind, requires)? {
+        Some(file) => crate::lay::lay_executables(&[file]),
+        None => Ok(()),
+    }
+}
+
+/// The pending stub [`write_pending_stub_with`] would lay, RENDERED but not written —
+/// `Ok(None)` when there is nothing to lay (an alias, a name Windows cannot embed
+/// inertly, a name something else occupies), so the two roster loops can lay a whole
+/// pass of stubs in one untracked job ([`crate::lay::lay_executables`]) instead of one
+/// per name. The precedence rule lives here, once: NEVER over anything that is not
+/// already a pending stub.
+pub(crate) fn pending_stub_executable(
+    layout: &Layout,
+    tool: &ToolName,
+    kind: StubKind,
+    requires: &[String],
+) -> io::Result<Option<crate::lay::Executable>> {
     if cfg!(windows) && !cmd_stub_name_safe(tool.as_str()) {
         // See `cmd_stub_name_safe`: no inert embedding exists, so no stub.
-        return Ok(());
+        return Ok(None);
     }
     if tool.is_alias() {
         // An alias is never a stub (module doc): it names the managed copy once
         // installed, and the plain name's stub already answers until then.
-        return Ok(());
+        return Ok(None);
     }
     let shim = layout.shim(tool);
     match std::fs::symlink_metadata(&shim) {
         Err(_) => {}                          // absent: ours to claim
         Ok(_) if is_pending_stub(&shim) => {} // ours: rewrite refreshes path + kind
-        Ok(_) => return Ok(()), // someone else's file (shim/tombstone/hand-made): never touch
+        Ok(_) => return Ok(None), // someone else's file (shim/tombstone/hand-made): never touch
     }
     let bin = layout.bin_dir();
     layout.ensure_dir(&bin)?;
     let body = stub_content_with(tool, &embedded_atpkg_path(), kind, requires);
-    write_executable_atomic(&shim, &body)
-}
-
-/// Temp+rename an executable script onto `dest` (the tombstone writer's discipline,
-/// restated here because that helper hard-codes its own body).
-pub(crate) fn write_executable_atomic(dest: &Path, body: &str) -> io::Result<()> {
-    let file_name = dest
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "stub has no file name"))?;
-    let mut tmp_name = String::from(".");
-    tmp_name.push_str(file_name);
-    tmp_name.push_str(".stub-");
-    tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
-    let tmp = dest.with_file_name(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
-    crate::call2(std::fs::write, tmp.as_path(), body.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    }
-    if let Err(e) = std::fs::rename(&tmp, dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
+    Ok(Some(crate::lay::Executable::new(shim, body)))
 }
 
 /// Remove `program`'s stub iff the name still resolves to a pending stub — the
@@ -595,13 +587,21 @@ pub fn lay_adoption_stubs(layout: &Layout) {
         .chain(AGENT_STUB_NAMES)
         .map(|(n, _)| (*n, StubKind::DefaultSet))
         .chain(EXTRAS_STUB_NAMES.iter().map(|(n, _)| (*n, StubKind::Extra)));
+    let mut files = Vec::new();
     for (name, kind) in rosters {
         if installed.contains_key(name) || removed.contains(name) {
             continue;
         }
-        if let Some(tool) = ToolName::new(name) {
-            let _ = write_pending_stub_kind(layout, &tool, kind);
+        if let Some(tool) = ToolName::new(name)
+            && let Ok(Some(file)) = pending_stub_executable(layout, &tool, kind, &[])
+        {
+            files.push(file);
         }
+    }
+    // One pass for the whole roster (one untracked job when this process is tracked).
+    // Best-effort like every stub, but never silent: the reason is printed once.
+    if let Err(e) = crate::lay::lay_executables(&files) {
+        eprintln!("atpkg: warn — pending stubs not laid: {e}");
     }
 }
 
@@ -635,6 +635,7 @@ pub fn reconcile_with_requires(
     requires_of: &BTreeMap<String, Vec<String>>,
 ) {
     let mut keep: BTreeSet<&str> = BTreeSet::new();
+    let mut files = Vec::new();
     for name in wanted.union(extras) {
         if installed.contains_key(name.as_str()) {
             continue;
@@ -652,9 +653,23 @@ pub fn reconcile_with_requires(
             StubKind::DefaultSet
         };
         let requires: &[String] = requires_of.get(name.as_str()).map_or(&[], Vec::as_slice);
-        if write_pending_stub_with(layout, &tool, kind, requires).is_ok() {
-            keep.insert(name.as_str());
+        match pending_stub_executable(layout, &tool, kind, requires) {
+            Ok(Some(file)) => {
+                files.push(file);
+                keep.insert(name.as_str());
+            }
+            Ok(None) => {
+                keep.insert(name.as_str());
+            }
+            Err(_) => {}
         }
+    }
+    // One pass for every stub this reconcile adds or refreshes (one untracked job when
+    // this process is tracked). A pass that could not be laid leaves the names it would
+    // have laid in `keep`, so the sweep below removes nothing over a lane failure — the
+    // stubs on disk stay what they were, and the reason is printed once.
+    if let Err(e) = crate::lay::lay_executables(&files) {
+        eprintln!("atpkg: warn — pending stubs not laid: {e}");
     }
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
         return;

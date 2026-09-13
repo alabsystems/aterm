@@ -663,7 +663,7 @@ impl App {
             let recursive_terminal = wl
                 .restored_tabs
                 .iter()
-                .find_map(|tab| Self::first_terminal_restore_leaf(&tab.root));
+                .find_map(|tab| tab.root.first_terminal_leaf());
             let native_only = if wl.restored_tabs.is_empty() {
                 wl.tabs.is_empty() && !wl.native_tabs.is_empty()
             } else {
@@ -712,11 +712,10 @@ impl App {
             // SEAMLESS: adopt this window's first-leaf shell as its bootstrap session
             // (matched by id), so the reopened window comes up with its LIVE shell rather
             // than a fresh one. Consumed (removed) so it is never adopted twice; a cold
-            // restore's `seamless_adopt` is empty, so this is always `None` there.
-            let local_id = recursive_terminal
-                .and_then(|leaf| leaf.local_id)
-                .or_else(|| first_leaf.and_then(|leaf| leaf.local_id()));
-            let adopt = local_id
+            // restore's `seamless_adopt` is empty, so this is always `None` there. The
+            // same pick `main_entry` makes for window 0, so the graft's leaf names this shell.
+            let adopt = wl
+                .bootstrap_local_id()
                 .and_then(|id| self.seamless_adopt.iter().position(|a| a.local_id == id))
                 .map(|pos| self.seamless_adopt.remove(pos));
             let outer = (wl.outer_x, wl.outer_y);
@@ -812,6 +811,12 @@ impl App {
     /// after the layout was rebuilt) as fresh single-pane tabs in the front window, so no
     /// live shell handed across a seamless update is ever lost. Empty ⇒ no-op (every cold
     /// restore, and the normal seamless case where the layout placed them all).
+    ///
+    /// An orphan comes back WITHOUT its USER metadata (`meta set` fields): the leaf
+    /// that carried them either did not rebuild or was filled by another shell (the
+    /// bootstrap a failed tab handed on, which `graft_restored_user_meta` refuses to
+    /// give that leaf's identity), and the manifest has been consumed by the time this
+    /// net runs. Every shell the layout placed in its own pane keeps it.
     fn adopt_orphan_shells_as_tabs(&mut self) {
         if self.seamless_adopt.is_empty() {
             return;
@@ -1078,7 +1083,7 @@ impl App {
         } = wl;
         let has_terminal = restored_tabs
             .iter()
-            .any(|tab| Self::first_terminal_restore_leaf(&tab.root).is_some());
+            .any(|tab| tab.root.first_terminal_leaf().is_some());
         let preserve_adopted_bootstrap =
             !has_terminal && self.bootstrap_session_adopted && self.window_has_terminal_tab(wid);
         let mut reusable_terminal = if preserve_adopted_bootstrap {
@@ -1269,21 +1274,6 @@ impl App {
             }
         }
         reusable
-    }
-
-    fn first_terminal_restore_leaf(
-        tree: &restore::RestoredSplitTree,
-    ) -> Option<&restore::TerminalLeafRestore> {
-        match tree {
-            restore::RestoredSplitTree::Leaf {
-                view: restore::RestoredView::Terminal(terminal),
-            } => Some(terminal),
-            restore::RestoredSplitTree::Leaf { .. } => None,
-            restore::RestoredSplitTree::Split { first, second, .. } => {
-                Self::first_terminal_restore_leaf(first)
-                    .or_else(|| Self::first_terminal_restore_leaf(second))
-            }
-        }
     }
 
     fn build_recursive_restore_tab(
@@ -1477,7 +1467,22 @@ impl App {
         reusable_terminal: &mut Option<(crate::tab_model::ViewId, u64)>,
         ids: LeafIds,
     ) -> Result<crate::tab_model::ViewId, String> {
-        if let Some((view, _)) = reusable_terminal.take() {
+        // THE GRAFT CARRIES THE LEAF'S USER IDENTITY, not just its position. The
+        // reusable terminal is the window's already-running BOOTSTRAP session —
+        // on a seamless update, the adopted shell itself (session 0 is adopted
+        // in `main_entry`, every further window's in `create_window_internal`, each
+        // picked by `WindowLayout::bootstrap_local_id`, i.e. by this leaf); on a
+        // cold restore, the shell those same two spawned for the window. Either
+        // way it started with a fresh ctx, so whatever the operator stamped with
+        // `meta set` in the previous process exists only in this leaf. Returning
+        // the view without it is how the 0.82.0 -> 0.83.0 handoff (measured
+        // 2026-09-12) came back with `user_title=- description=- icon=- role=-
+        // attention=-` on BOTH of its sessions: two windows, one terminal each,
+        // so every session was a graft, and only a leaf that spawned or
+        // re-adopted a session below was ever re-seeded. What the graft may and
+        // may not overwrite is `graft_restored_user_meta`'s business.
+        if let Some((view, session)) = reusable_terminal.take() {
+            self.graft_restored_user_meta(session, terminal);
             return Ok(view);
         }
         // RE-ATTACH ONLY TO AN ID THIS PROCESS MINTED. A closed-tab record names a
@@ -1587,6 +1592,69 @@ impl App {
         let _ = meta.set("icon", leaf.icon.clone());
         let _ = meta.set("role", leaf.role.clone());
         let _ = meta.set("attention", leaf.attention.clone());
+    }
+
+    /// Put the leaf's USER identity back on the GRAFTED session — the window's
+    /// bootstrap, which the reuse branch in [`Self::restore_terminal_leaf`]
+    /// hands this leaf. Unlike [`Self::seed_restored_user_meta`]'s session,
+    /// this one is LIVE before the deferred pass reaches it: registered and
+    /// served under its sid. On a handoff the child owns that sid from its
+    /// control-socket bind in `main_entry`, which repoints `aterm.sock` and the
+    /// sid's graph entry at itself before `first_present_done` lets this pass
+    /// run. So a reader may have seen it without its identity, and a driver may
+    /// have written it. Three rules follow.
+    ///
+    /// * THE LEAF MUST NAME THIS SHELL. An adopted bootstrap keeps the id the
+    ///   parent knew it by (`Session::handoff_local_id`); a leaf naming any
+    ///   other id describes a different shell, whose title, role and attention
+    ///   must never land on this one — a misplaced `role=operator` moves the
+    ///   status item's operator election and its Stop confirm-suppression to
+    ///   the wrong process. A bootstrap a handoff child spawned instead of
+    ///   adopting stands in for the handed-over shell the leaf names; it is not
+    ///   that shell either. Only a cold restore's bootstrap, which exists to
+    ///   become the shell of the pane it fills, takes the leaf's identity with
+    ///   no name to match. `main_entry` and `apply_restore_manifest` pick every
+    ///   window's bootstrap by [`restore::WindowLayout::bootstrap_local_id`] —
+    ///   this very leaf — so on a handoff the two part only when a tab failed
+    ///   to build and handed the bootstrap on to the next terminal leaf; the
+    ///   pane keeps its position, and the shell keeps no identity rather than
+    ///   the wrong one.
+    /// * A DRIVER'S WRITE WINS. A field `meta set`, `meta unset` or the GUI
+    ///   rename wrote on this process keeps that value
+    ///   ([`crate::session_timeline::restore_carried_meta`]). It was answered
+    ///   `OK` after the leaf was captured; the parent's Commit-time comparison
+    ///   cannot see it, so nothing else would keep it.
+    /// * Every other field takes the leaf's value exactly — a field the leaf
+    ///   does not carry is stored unset, which is what clears an identity an
+    ///   earlier graft stamped on a cold bootstrap before that tab failed to
+    ///   build — and each move is an ordinary `meta-change`: recorded on the
+    ///   timeline (which also moves `composed_session_chrome`'s `high_id` key,
+    ///   so the tooltip the first present cached is recomposed) and pushed to
+    ///   the session's `events` watchers.
+    fn graft_restored_user_meta(&mut self, session: u64, leaf: &restore::TerminalLeafRestore) {
+        let Some(live) = self.pool.get(session) else {
+            return;
+        };
+        let names_this_shell = match live.handoff_local_id {
+            Some(adopted_as) => leaf.local_id == Some(adopted_as),
+            None => !self.bootstrap_session_adopted,
+        };
+        if !names_this_shell {
+            crate::logging::stderr_line!(
+                "aterm-gui: session restore: a pane was filled by a shell its layout \
+                 did not name; that pane's identity was not carried onto it"
+            );
+            return;
+        }
+        let ctx = live.ctx.clone();
+        if crate::session_timeline::restore_carried_meta(&ctx, &leaf.carried_user_meta())
+            && self.subscribers.any()
+        {
+            self.subscribers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .notify(session);
+        }
     }
 
     fn restore_native_leaf(
@@ -3598,5 +3666,553 @@ mod tests {
         // Second pass: nothing pending, nothing changes.
         app.remint_carried_connections();
         assert_eq!(crate::connections::connection_count(&app.store), 1);
+    }
+
+    /// A one-window, one-terminal-leaf layout whose leaf carries `leaf`'s USER
+    /// fields — the shape `capture_restore_manifest` writes for a window that
+    /// holds a single session.
+    fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayout {
+        restore::WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(0),
+            restored_tabs: vec![restore::RestoredTab {
+                root: restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(leaf)),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        }
+    }
+
+    fn bare_leaf() -> restore::TerminalLeafRestore {
+        restore::TerminalLeafRestore {
+            cwd: None,
+            title: String::new(),
+            profile: None,
+            local_id: Some(0),
+            user_title: None,
+            description: None,
+            icon: None,
+            role: None,
+            attention: None,
+        }
+    }
+
+    /// Mark pool session `session` as the shell a seamless handoff ADOPTED
+    /// under the parent's id `parent_id` — what `spawn_session` records from
+    /// the `Adopted` handle.
+    fn adopt_as(app: &mut App, session: u64, parent_id: u64) {
+        app.pool
+            .sessions
+            .get_mut(&session)
+            .expect("live session")
+            .session
+            .handoff_local_id = Some(parent_id);
+    }
+
+    /// The live USER metadata of pool session `session`, read the way `@<sid>
+    /// meta` reads it: resolve the sid through the registry, then lock the
+    /// handle's ctx.
+    fn registry_meta(app: &App, session: u64) -> crate::session_timeline::SessionMeta {
+        let sid = app
+            .pool
+            .get(session)
+            .expect("the session survived the restore")
+            .ctx
+            .self_id
+            .clone();
+        let store = app.store.read().unwrap();
+        let handle = store.by_sid(&sid).expect("the sid still resolves");
+        handle.ctx.meta.lock().unwrap().clone()
+    }
+
+    /// THE SELF-UPDATE HANDOFF DROPPED EVERY SESSION'S USER METADATA. Measured
+    /// 2026-09-12 on the 0.82.0 -> 0.83.0 handoff, on a machine with two windows
+    /// and one terminal in each: before it `meta` read `role=agent:claude-driver-
+    /// fable` on one session and `role=worker:claude-satcomp` plus an
+    /// `attention=` on the other; after it both — the same sids, `attribution=
+    /// adopted` — read `user_title=- description=- icon=- role=- attention=-`.
+    ///
+    /// This drives every stage that shape crosses, in order: `meta set`'s own
+    /// write ladder, the post-park capture (`capture_restore_manifest`, the call
+    /// `start_unix_update_handoff` makes), the exact sidecar bytes the parent
+    /// writes (`to_toml`) and the child's acceptance of them (`from_toml` plus
+    /// `covers_exact_seamless_ids`), then the successor's per-window apply onto
+    /// the sessions it ADOPTED — each window's bootstrap, which is what fills a
+    /// window's first terminal leaf. Capture, wire and parse all carried the
+    /// fields; the graft in `restore_terminal_leaf` dropped them.
+    #[test]
+    fn a_handoff_keeps_user_metadata_on_every_adopted_window_bootstrap() {
+        use crate::session_timeline::{MetaEdit, MetaField, SessionMeta, write_session_meta};
+
+        let stamp = |app: &App, session: u64, field: MetaField, value: &str| {
+            let ctx = app.pool.get(session).expect("live session").ctx.clone();
+            assert_eq!(
+                write_session_meta(&ctx, field, MetaEdit::Set(value)),
+                Ok(true),
+                "`meta set {}` stores",
+                field.wire_name()
+            );
+        };
+
+        // PREDECESSOR: two windows, one terminal each — the measured layout.
+        let mut old = App::headless_for_test();
+        let second = crate::stub_session(1);
+        App::register_session(&old.store, &second, None);
+        let old_second_window = old.insert_logical_window(second, 24, 80);
+        // Session 0 carries all five fields; session 1 carries two, and its
+        // title, description and icon are never set.
+        stamp(&old, 0, MetaField::Title, "fable driver");
+        stamp(&old, 0, MetaField::Description, "drives the satcomp worker");
+        stamp(&old, 0, MetaField::Icon, "🦊");
+        stamp(&old, 0, MetaField::Role, "agent:claude-driver-fable");
+        stamp(&old, 0, MetaField::Attention, "waiting on a human review");
+        stamp(&old, 1, MetaField::Role, "worker:claude-satcomp");
+        stamp(
+            &old,
+            1,
+            MetaField::Attention,
+            "SAT-COMP campaign docs handoff",
+        );
+        let driver = SessionMeta {
+            user_title: Some("fable driver".to_string()),
+            description: Some("drives the satcomp worker".to_string()),
+            icon: Some("🦊".to_string()),
+            role: Some("agent:claude-driver-fable".to_string()),
+            attention: Some("waiting on a human review".to_string()),
+            ..SessionMeta::default()
+        };
+        let worker = SessionMeta {
+            role: Some("worker:claude-satcomp".to_string()),
+            attention: Some("SAT-COMP campaign docs handoff".to_string()),
+            ..SessionMeta::default()
+        };
+        assert_eq!(registry_meta(&old, 0), driver, "PRECONDITION: stamped");
+        assert_eq!(registry_meta(&old, 1), worker, "PRECONDITION: stamped");
+
+        // CAPTURE, then the WIRE: the parent writes exactly `to_toml()` to the
+        // layout sidecar (and hashes those bytes); the child parses the bytes it
+        // read and refuses a layout that does not name every handed-off id once.
+        let captured = old.capture_restore_manifest();
+        let wire = captured
+            .to_toml()
+            .expect("the parent serializes its layout");
+        for spelled in [
+            "user_title = \"fable driver\"",
+            "role = \"agent:claude-driver-fable\"",
+            "role = \"worker:claude-satcomp\"",
+            "attention = \"SAT-COMP campaign docs handoff\"",
+        ] {
+            assert!(
+                wire.contains(spelled),
+                "the sidecar spells {spelled}: {wire}"
+            );
+        }
+        let carried = restore::RestoreManifest::from_toml(&wire)
+            .filter(|layout| layout.covers_exact_seamless_ids(&[0, 1]))
+            .expect("the child accepts the sidecar");
+        assert_eq!(
+            carried, captured,
+            "neither the wire nor the parse drops a field"
+        );
+
+        // SUCCESSOR: window 0's bootstrap is the shell adopted in `main_entry`, window
+        // 1's the one adopted in `create_window_internal` — each picked by
+        // `bootstrap_local_id`, and each keeping the id the parent knew it by.
+        // Adoption mints a fresh ctx, so both start with no USER metadata.
+        let mut new = App::headless_for_test();
+        new.bootstrap_session_adopted = true;
+        let picked: Vec<Option<u64>> = carried
+            .windows
+            .iter()
+            .map(restore::WindowLayout::bootstrap_local_id)
+            .collect();
+        assert_eq!(picked, vec![Some(0), Some(1)]);
+        adopt_as(&mut new, 0, 0);
+        let adopted = crate::stub_session(1);
+        App::register_session(&new.store, &adopted, None);
+        let new_second_window = new.insert_logical_window(adopted, 24, 80);
+        adopt_as(&mut new, 1, 1);
+        assert_eq!(new_second_window, old_second_window);
+        assert!(
+            !registry_meta(&new, 0).any_set() && !registry_meta(&new, 1).any_set(),
+            "PRECONDITION: an adopted session arrives with a fresh ctx"
+        );
+
+        // APPLY: what `apply_restore_manifest` runs for each window once its
+        // host (and so its bootstrap session) exists.
+        let mut windows = carried.windows.into_iter();
+        new.restore_into_window(WindowId(0), windows.next().expect("window 0"));
+        new.restore_into_window(new_second_window, windows.next().expect("window 1"));
+
+        for (window, session) in [(WindowId(0), 0), (new_second_window, 1)] {
+            assert_eq!(
+                new.focused_session_id(window),
+                Some(session),
+                "the leaf was filled by the ADOPTED session, not a respawn"
+            );
+        }
+        assert_eq!(
+            registry_meta(&new, 0),
+            driver,
+            "all five fields survive onto the adopted session"
+        );
+        assert_eq!(
+            registry_meta(&new, 1),
+            worker,
+            "the two set fields survive and the three unset ones stay unset"
+        );
+        // And the successor now carries exactly the layout the parent's Commit
+        // compared — USER metadata included, which `commit_layout_topology`
+        // deliberately keeps in that comparison.
+        assert_eq!(new.capture_restore_manifest(), captured);
+        assert!(new.structural_invariants_ok());
+    }
+
+    /// The graft stores the leaf's USER fields EXACTLY over anything a driver
+    /// did not write: an unset leaf field is unset on the session afterwards
+    /// even when the session held a value — as it does on a cold restore when
+    /// an earlier graft's tab failed to build and handed the bootstrap on to
+    /// the next terminal leaf. (`stale` is assigned raw, the way that earlier
+    /// graft stored it: no driver wrote it.)
+    #[test]
+    fn a_graft_leaves_every_field_the_leaf_does_not_carry_unset() {
+        use crate::session_timeline::SessionMeta;
+
+        let stale = SessionMeta {
+            user_title: Some("someone else".to_string()),
+            description: Some("a leaf that failed to build".to_string()),
+            icon: Some("🧟".to_string()),
+            role: Some("operator".to_string()),
+            attention: Some("stale escalation".to_string()),
+            ..SessionMeta::default()
+        };
+        let mut app = App::headless_for_test();
+        *app.pool.get(0).unwrap().ctx.meta.lock().unwrap() = stale.clone();
+        let mut leaf = bare_leaf();
+        leaf.role = Some("worker:claude-satcomp".to_string());
+        app.restore_into_window(WindowId(0), single_leaf_window(leaf));
+        assert_eq!(app.focused_session_id(WindowId(0)), Some(0));
+        assert_eq!(
+            registry_meta(&app, 0),
+            SessionMeta {
+                role: Some("worker:claude-satcomp".to_string()),
+                ..SessionMeta::default()
+            },
+            "only the leaf's own field is set"
+        );
+
+        // A leaf carrying nothing leaves a grafted session with nothing.
+        let mut app = App::headless_for_test();
+        *app.pool.get(0).unwrap().ctx.meta.lock().unwrap() = stale;
+        app.restore_into_window(WindowId(0), single_leaf_window(bare_leaf()));
+        assert!(
+            !registry_meta(&app, 0).any_set(),
+            "{:?}",
+            registry_meta(&app, 0)
+        );
+    }
+
+    /// The bootstrap window presents BEFORE the deferred restore runs, so its
+    /// session's tooltip is already composed and cached by the time the graft
+    /// seeds it. An icon-only seed moves no label, activity or connection
+    /// revision the cache is keyed on; it recomposes only because the graft
+    /// records its `meta-change`, which moves the timeline high-water mark.
+    /// (Seeded without that record, the tooltip stayed
+    /// "zsh\nstate: spawning\n\nspawned · just now".)
+    #[test]
+    fn a_graft_recomposes_the_chrome_the_first_present_cached() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A live OSC title outranks the tab's fallback, so the label — one of
+        // the cache's keys — is the same before and after the rebuild.
+        feed_session0(&app, b"\x1b]2;zsh\x07");
+        app.refresh_window_tabs(wid);
+        let tooltip = |app: &App| {
+            app.windows[&wid]
+                .tab_set
+                .active()
+                .and_then(|tab| tab.presentation.tooltip.clone())
+        };
+        assert!(
+            !tooltip(&app).is_some_and(|text| text.contains('🚀')),
+            "PRECONDITION: {:?}",
+            tooltip(&app)
+        );
+
+        let mut leaf = bare_leaf();
+        leaf.title = "zsh".to_string();
+        leaf.icon = Some("🚀".to_string());
+        app.restore_into_window(wid, single_leaf_window(leaf));
+        app.refresh_window_tabs(wid);
+        assert_eq!(app.tab_titles(wid), vec!["zsh".to_string()]);
+        assert!(
+            tooltip(&app).is_some_and(|text| text.starts_with('🚀')),
+            "the seeded icon reaches the tooltip: {:?}",
+            tooltip(&app)
+        );
+    }
+
+    /// A driver's `aterm ctl @<sid> meta set|unset` on pool session `session`:
+    /// resolve the sid through the registry the way the control socket does,
+    /// then take the write door the verb's handler takes (`cmd_meta` calls
+    /// `write_session_meta` for a set and `apply_meta_value` for an unset,
+    /// which is what `write_session_meta` does with a `Clear`). `Ok` is the
+    /// `OK` the verb answers.
+    fn driver_meta(
+        app: &App,
+        session: u64,
+        field: crate::session_timeline::MetaField,
+        edit: crate::session_timeline::MetaEdit<'_>,
+    ) {
+        let sid = app
+            .pool
+            .get(session)
+            .expect("live session")
+            .ctx
+            .self_id
+            .clone();
+        let ctx = app
+            .store
+            .read()
+            .unwrap()
+            .by_sid(&sid)
+            .expect("the sid resolves")
+            .ctx
+            .clone();
+        assert!(
+            crate::session_timeline::write_session_meta(&ctx, field, edit).is_ok(),
+            "`meta` answers OK to {field:?} {edit:?}"
+        );
+    }
+
+    /// A WRITE THE SUCCESSOR ANSWERED `OK` IS NEVER UNDONE BY ITS OWN RESTORE.
+    /// A handoff child binds its control socket in `main_entry` — repointing
+    /// `aterm.sock` and the adopted session's graph entry at itself — but runs
+    /// the deferred restore only after its first present, so a `meta set` can
+    /// land on the adopted bootstrap before the graft reaches it. On a cold
+    /// restore the bootstrap shell's own startup can do the same. The graft
+    /// keeps every field such a write touched — set, or cleared even where the
+    /// clear moved nothing — and fills only the others from the leaf.
+    #[test]
+    fn a_graft_keeps_every_field_a_driver_wrote_before_the_restore_reached_it() {
+        use crate::session_timeline::{MetaEdit, MetaField, SessionMeta};
+
+        for adopted in [true, false] {
+            let mut app = App::headless_for_test();
+            if adopted {
+                app.bootstrap_session_adopted = true;
+                adopt_as(&mut app, 0, 0);
+            }
+            driver_meta(&app, 0, MetaField::Role, MetaEdit::Set("worker:new"));
+            driver_meta(
+                &app,
+                0,
+                MetaField::Attention,
+                MetaEdit::Set("fresh escalation"),
+            );
+            driver_meta(&app, 0, MetaField::Description, MetaEdit::Clear);
+            let mut leaf = bare_leaf();
+            leaf.user_title = Some("carried title".to_string());
+            leaf.description = Some("carried notes".to_string());
+            leaf.role = Some("worker:old".to_string());
+            leaf.attention = Some("old escalation".to_string());
+            app.restore_into_window(WindowId(0), single_leaf_window(leaf));
+            assert_eq!(app.focused_session_id(WindowId(0)), Some(0));
+
+            let meta = registry_meta(&app, 0);
+            assert_eq!(
+                (meta.role.as_deref(), meta.attention.as_deref()),
+                (Some("worker:new"), Some("fresh escalation")),
+                "adopted={adopted}: the two `meta set`s stand"
+            );
+            assert_eq!(
+                meta,
+                SessionMeta {
+                    user_title: Some("carried title".to_string()),
+                    role: Some("worker:new".to_string()),
+                    attention: Some("fresh escalation".to_string()),
+                    ..SessionMeta::default()
+                },
+                "adopted={adopted}: the `meta unset description` stands too, and \
+                 only the title nobody wrote is carried"
+            );
+        }
+    }
+
+    /// THE LEAF MUST NAME THE SHELL IT IS GRAFTED ONTO. A tab split between a
+    /// native view and a terminal has no entry in the legacy `tabs` mirror (the
+    /// capture writes only all-terminal tabs there), so when such a tab comes
+    /// first, the mirror's first leaf and the recursive tree's first terminal
+    /// leaf — the one the graft fills — name different shells. `main_entry` adopted
+    /// window 0's bootstrap by the mirror; with the graft carrying identity,
+    /// that stamped one shell's role on another shell's live sid.
+    #[test]
+    fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
+        use crate::session_timeline::{MetaEdit, MetaField, SessionMeta};
+
+        // PREDECESSOR: tab A splits a recovery placeholder with shell 0 (role
+        // `operator`); tab B holds shell 1 alone (role `worker`). Built by the
+        // real restore, stamped by the real verb, captured by the real capture.
+        let mut old = App::headless_for_test();
+        let mut layout = single_leaf_window(bare_leaf());
+        layout.restored_tabs = vec![
+            restore::RestoredTab {
+                root: restore::RestoredSplitTree::Split {
+                    axis: restore::SplitKind::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(restore::RestoredSplitTree::leaf(
+                        restore::RestoredView::Placeholder(restore::PlaceholderLeafRestore {
+                            restore_tag: "markdown".to_string(),
+                            reason: "Document could not be reopened".to_string(),
+                            metadata: String::new(),
+                        }),
+                    )),
+                    second: Box::new(restore::RestoredSplitTree::leaf(
+                        restore::RestoredView::Terminal(bare_leaf()),
+                    )),
+                },
+                focused_path: vec![restore::RestoreBranch::Second],
+                zoomed: false,
+            },
+            restore::RestoredTab {
+                root: restore::RestoredSplitTree::leaf(
+                    restore::RestoredView::Terminal(bare_leaf()),
+                ),
+                focused_path: Vec::new(),
+                zoomed: false,
+            },
+        ];
+        old.restore_into_window(WindowId(0), layout);
+        driver_meta(&old, 0, MetaField::Role, MetaEdit::Set("operator"));
+        driver_meta(&old, 1, MetaField::Role, MetaEdit::Set("worker"));
+        let wire = old
+            .capture_restore_manifest()
+            .to_toml()
+            .expect("the parent serializes its layout");
+        let carried = restore::RestoreManifest::from_toml(&wire)
+            .filter(|layout| layout.covers_exact_seamless_ids(&[0, 1]))
+            .expect("the child accepts the sidecar");
+        let window = carried.windows[0].clone();
+        let mirror_first = window
+            .tabs
+            .first()
+            .and_then(|tab| tab.leaves().first().and_then(|leaf| leaf.local_id()));
+        assert_eq!(
+            (mirror_first, window.bootstrap_local_id()),
+            (Some(1), Some(0)),
+            "PRECONDITION: the mirror's first leaf is tab B's shell; the graft fills \
+             tab A's"
+        );
+
+        let operator = SessionMeta {
+            role: Some("operator".to_string()),
+            ..SessionMeta::default()
+        };
+        let worker = SessionMeta {
+            role: Some("worker".to_string()),
+            ..SessionMeta::default()
+        };
+        // The session each of window 0's tabs shows, in tab order.
+        let tab_sessions = |app: &App| -> Vec<Vec<u64>> {
+            app.windows[&WindowId(0)]
+                .tab_set
+                .tabs()
+                .iter()
+                .map(|tab| {
+                    tab.root
+                        .leaves()
+                        .into_iter()
+                        .filter_map(|view| {
+                            app.view_store
+                                .get(view)
+                                .copied()
+                                .and_then(crate::tab_model::View::terminal_session)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        // `main_entry` picks by `bootstrap_local_id`: session 0 IS shell 0, fills tab
+        // A's terminal pane, and takes shell 0's identity.
+        let mut new = App::headless_for_test();
+        new.bootstrap_session_adopted = true;
+        adopt_as(&mut new, 0, 0);
+        new.restore_into_window(WindowId(0), window.clone());
+        let placed = tab_sessions(&new);
+        assert_eq!(placed[0], vec![0], "tab A's terminal pane is session 0");
+        assert_eq!(registry_meta(&new, 0), operator);
+        assert_eq!(registry_meta(&new, placed[1][0]), worker);
+
+        // The mirror's pick: session 0 is shell 1. The graft still fills tab
+        // A's pane with it, but tab A's leaf names shell 0, so none of that
+        // leaf's identity may land on this one.
+        let mut new = App::headless_for_test();
+        new.bootstrap_session_adopted = true;
+        adopt_as(&mut new, 0, 1);
+        new.restore_into_window(WindowId(0), window.clone());
+        assert_eq!(tab_sessions(&new)[0], vec![0]);
+        assert_eq!(
+            registry_meta(&new, 0),
+            SessionMeta::default(),
+            "a leaf naming shell 0 stamped its identity on shell 1"
+        );
+
+        // A handoff child's bootstrap it did NOT adopt stands in for a shell
+        // running elsewhere; it is not the one the leaf names either.
+        let mut new = App::headless_for_test();
+        new.bootstrap_session_adopted = true;
+        new.restore_into_window(WindowId(0), window);
+        assert_eq!(tab_sessions(&new)[0], vec![0]);
+        assert_eq!(registry_meta(&new, 0), SessionMeta::default());
+    }
+
+    /// THE GRAFT IS A CHANGE A WATCHER CAN SEE. The grafted session is already
+    /// registered and served under its sid when the deferred restore reaches
+    /// it, so a `meta` reader or a `subscribe … events` watcher may already have
+    /// seen it without its identity. Each field the graft moves lands on the
+    /// session's timeline as the ordinary `meta-change` — what the digest pushes
+    /// as `EVENT <sid> meta …` — and the watcher is woken for it.
+    #[test]
+    fn a_graft_announces_every_field_it_moves_to_an_events_watcher() {
+        let mut app = App::headless_for_test();
+        let ctx = app.pool.get(0).expect("the bootstrap").ctx.clone();
+        // Where a `subscribe … events` digest seeds its watermark.
+        let watermark = ctx.timeline.lock().unwrap().high_id();
+        let watch = crate::subscribe::SubscriberSet::register(&app.subscribers, &[0]);
+        while watch.wait(std::time::Duration::ZERO) {}
+
+        let mut leaf = bare_leaf();
+        leaf.user_title = Some("fable driver".to_string());
+        leaf.role = Some("agent:claude-driver-fable".to_string());
+        app.restore_into_window(WindowId(0), single_leaf_window(leaf));
+
+        let pushed: Vec<String> = ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .since(watermark)
+            .filter(|event| event.kind == "meta-change")
+            .map(|event| event.payload.clone())
+            .collect();
+        assert_eq!(
+            pushed,
+            vec![
+                "field=title value=fable%20driver".to_string(),
+                "field=role value=agent:claude-driver-fable".to_string(),
+            ]
+        );
+        assert!(
+            watch.wait(std::time::Duration::ZERO),
+            "the session's `events` watcher was woken for them"
+        );
     }
 }

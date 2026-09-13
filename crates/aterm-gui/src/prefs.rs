@@ -2983,7 +2983,7 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
         "update.auto_apply" => "$ATERM_NO_AUTO_APPLY forces this off for the launch",
         "packages.account" => "$ATPKG_ACCOUNT overrides this value for package operations",
         EDIT_PACKAGES_AUTO_UPDATE => {
-            "$ATPKG_UPDATE_INTERVAL_SECS controls cadence only (default 21600 seconds; 0 runs once); it never overrides packages.enabled or packages.auto_update"
+            "$ATPKG_UPDATE_INTERVAL_SECS controls cadence only (default 21600 seconds; 0 runs once — a pass queued behind another aterm's install is retried on a short backoff until it runs, or given up on for this launch once that install has sat through three waits with no visible progress); it never overrides packages.enabled or packages.auto_update"
         }
         EDIT_FALLBACK_FONTS => "when unset, deprecated $ATERM_FALLBACK_FONT supplies the fallback",
         EDIT_SYMBOL_FONT => "when unset, deprecated $ATERM_SYMBOL_FONT supplies the fallback",

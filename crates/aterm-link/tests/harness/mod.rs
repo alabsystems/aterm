@@ -659,21 +659,70 @@ fn workspace_root() -> PathBuf {
 }
 
 pub fn gui_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("ATERM_GUI_BIN") {
-        return PathBuf::from(p);
-    }
-    let root = workspace_root();
-    for profile in ["debug", "release"] {
-        let p = root.join("target").join(profile).join("aterm-gui");
-        if p.exists() {
-            refuse_a_stale_binary(&p, "aterm-gui", "ATERM_GUI_BIN");
-            return p;
+    built_binary("aterm-gui", "aterm-gui", "ATERM_GUI_BIN")
+}
+
+/// Every directory cargo may have put this workspace's binaries in, nearest first: the
+/// target dir THIS test binary was built into (`<target>/<profile>/deps/<test>`), then
+/// `$CARGO_TARGET_DIR` (relative to the workspace root when relative), then
+/// `<root>/target`.
+///
+/// Looking only under `<root>/target` failed every e2e suite of this crate whenever the
+/// workspace was built with `CARGO_TARGET_DIR` set — the house rule for agents and
+/// worktrees — with "aterm-gui was not found" beside a fresh binary in the real target
+/// dir (measured 2026-09-12: 10 suites, 54 tests red, none of them about the product).
+pub fn target_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    // Edition 2021 crate: nested `if let`, not a let-chain.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target) = exe
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+        {
+            dirs.push(target.to_path_buf());
         }
     }
+    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let dir = PathBuf::from(dir);
+        dirs.push(if dir.is_absolute() {
+            dir
+        } else {
+            workspace_root().join(dir)
+        });
+    }
+    dirs.push(workspace_root().join("target"));
+    let mut unique: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if !unique.contains(&dir) {
+            unique.push(dir);
+        }
+    }
+    unique
+}
+
+/// The workspace binary `name` (built by crate `krate`): `$env_var` when set, else the
+/// first build under [`target_dirs`] (debug before release in each), refused when STALE
+/// by [`refuse_a_stale_binary`].
+pub fn built_binary(name: &str, krate: &str, env_var: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
+        return PathBuf::from(p);
+    }
+    let dirs = target_dirs();
+    for dir in &dirs {
+        for profile in ["debug", "release"] {
+            let p = dir.join(profile).join(name);
+            if p.exists() {
+                refuse_a_stale_binary(&p, krate, env_var);
+                return p;
+            }
+        }
+    }
+    let searched: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
     panic!(
-        "aterm-gui was not found under {}/target — build it first \
-         (`targo --unverified build -p aterm-gui`) or set $ATERM_GUI_BIN",
-        root.display()
+        "{name} was not found under any of [{}] — build it first \
+         (`targo --unverified build -p {krate}`) or set ${env_var}",
+        searched.join(", ")
     );
 }
 
@@ -1783,6 +1832,34 @@ fn self_check_age_reader() {
 ///
 /// Deterministic: the mtimes are SET, not raced. No sleep, no clock comparison against
 /// wall time.
+/// The binary lookup searches the target dir THIS test was built into first, so a
+/// workspace built with `CARGO_TARGET_DIR` finds its own fresh binaries (2026-09-12:
+/// every e2e suite here was red under a custom target dir because only `<root>/target`
+/// was searched).
+#[test]
+fn the_binary_lookup_searches_the_target_dir_this_test_was_built_into_first() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let dirs = target_dirs();
+    let first = dirs.first().expect("at least one target dir");
+    assert!(
+        exe.starts_with(first),
+        "{} is not under the first searched dir {}",
+        exe.display(),
+        first.display()
+    );
+    assert!(
+        dirs.contains(&workspace_root().join("target")),
+        "<root>/target is still searched as the last resort"
+    );
+    let mut sorted = dirs.clone();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        dirs.len(),
+        "no dir is searched twice: {dirs:?}"
+    );
+}
+
 #[test]
 fn the_stale_guard_sees_every_crate_the_binary_was_built_from() {
     let dir = std::env::temp_dir().join(format!("atl-stale-{}", std::process::id()));
@@ -1861,18 +1938,21 @@ fn the_stale_guard_sees_every_crate_the_binary_was_built_from() {
 /// EVERY BINARY THIS CRATE FINDS IS AGE-CHECKED, not just the one somebody remembered.
 ///
 /// `aterm-link` is its own workspace, so a binary of the aterm workspace cannot be
-/// declared with `CARGO_BIN_EXE_` and has to be LOCATED — `target/<profile>/<name>`,
-/// whatever the last build left there. There are two such finders: [`gui_binary`] here
-/// and `ctl_binary` in `glance_and_tui.rs`. The staleness guard was wired into the first
-/// only; the second carried the doctrine in its doc comment and none of it in its code,
-/// and `aterm-ctl` was four and a half hours behind `control_verbs.rs` when that was
-/// found — the file the round was auditing, with the suite green over it.
+/// declared with `CARGO_BIN_EXE_` and has to be LOCATED — `<target>/<profile>/<name>`,
+/// whatever the last build left there. There used to be two such finders, [`gui_binary`]
+/// here and `ctl_binary` in `glance_and_tui.rs`; the staleness guard was wired into the
+/// first only, and `aterm-ctl` was four and a half hours behind `control_verbs.rs` when
+/// that was found — the file the round was auditing, with the suite green over it. Since
+/// 2026-09-12 there is ONE finder, [`built_binary`], and both callers delegate to it
+/// (the second copy had also kept the `<root>/target`-only search that failed every
+/// suite under `CARGO_TARGET_DIR`).
 ///
 /// The check is STRUCTURAL: every `for profile in ["debug", "release"]` search in these
-/// two files must call [`refuse_a_stale_binary`] on what it found. It covers the two
-/// files it reads and no others, which is stated here rather than implied: a third
-/// finder in a third file is not seen by this test, and adding one means adding it to
-/// the list below.
+/// two files must call [`refuse_a_stale_binary`] on what it found; `harness/mod.rs` must
+/// still contain a search; and `glance_and_tui.rs` must either own an age-checked search
+/// or delegate its `aterm-ctl` lookup to [`built_binary`]. It covers the two files it
+/// reads and no others, which is stated here rather than implied: a third finder in a
+/// third file is not seen by this test, and adding one means adding it to the list below.
 #[test]
 fn every_binary_this_crate_finds_is_age_checked() {
     for (name, src) in [
@@ -1891,8 +1971,11 @@ fn every_binary_this_crate_finds_is_age_checked() {
                  {window}"
             );
         }
+        let delegates = name == "glance_and_tui.rs"
+            && src.contains("harness::built_binary(")
+            && src.contains("\"ATERM_CTL_BIN\"");
         assert!(
-            searches > 0,
+            searches > 0 || delegates,
             "{name}: the search this test guards has moved or been renamed, so this test \
              now guards nothing — re-point it rather than deleting it"
         );

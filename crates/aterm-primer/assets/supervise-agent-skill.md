@@ -249,6 +249,14 @@ except that a review point prints one line and the loop keeps going.
   `aterm drive phase` it.
 - **`APPROVED seq=<n> <command>` lines are the audit trail** of what it waved through —
   the same reads `supervise --auto-reads` approves, noted in `--notes` too.
+- **`RECONNECT <reason>` and `RECONNECTED after <ms> ms` are informational:** `watch`
+  rides through an aterm self-update (the worker keeps its `@sid` on the new instance)
+  and carries on from a fresh read — the EVENT it last printed comes once more if it is
+  still the screen — so there is nothing to do unless it ends in `EXIT reconnect window
+  lapsed: …` (the outage outlasted `--reconnect-s`, default 180 s from its first dropped
+  request; a drop that keeps coming back is the same outage). Leave `--socket` unset, or
+  name the `aterm.sock` alias: a per-instance `aterm-<pid>.sock` goes with the old
+  instance, and every ride-out through it lapses.
 - **A `limited` EVENT means the worker cannot act** until its limit resets (`reset=` says
   when, if the notice did) or its model is switched. Decide per the human's policy.
 - **A worker without Claude Code's composer** (a build, a REPL) gets an EVENT each time

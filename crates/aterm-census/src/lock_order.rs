@@ -2781,7 +2781,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
              \x20        instance this deadlocks outright; if they are DIFFERENT instances of\n\
              \x20        the `{id}` class (e.g. two sessions' term mutexes), the nesting needs\n\
              \x20        an instance ORDER this census cannot verify — restructure so the\n\
-             \x20        first guard ends before the next `{id}` is taken."
+             \x20        first guard ends before the next `{id}` is taken. If `{id}` is not a lock at \
+             all — a method merely NAMED read/write/lock/try_* — RENAME the method: this \
+             census identifies a lock by its name and excludes nothing (no registry, no \
+             waiver: every exclusion tried under-reported a real deadlock), so a screen \
+             `read` held across another `read` is indistinguishable from a re-entrant \
+             lock."
         );
         for w in wit.iter().take(3) {
             let via = w

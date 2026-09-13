@@ -967,7 +967,7 @@ fn install_inner(
     }
 
     // 6. Download → verify-and-stage (sha256 → extract → tree_root re-verify).
-    let dl = layout.staging_dir(program).join(&artifact.asset);
+    let dl = staged_download_path(layout, program, &artifact.asset)?;
     // Disk preflight (§9): the compressed asset + its extracted tree must fit (they coexist
     // until the asset is reclaimed post-stage) while keeping the free floor. Fails OPEN when
     // free space can't be queried (available_bytes None) — preflight is a safety net.
@@ -2774,7 +2774,7 @@ fn stage_member(
             return None;
         }
     };
-    let dl = layout.staging_dir(program).join(&artifact.asset);
+    let dl = staged_download_path(layout, program, &artifact.asset).ok()?;
     std::fs::create_dir_all(dl.parent()?).ok()?;
     // Same reason as the singleton path: a stale staging entry can be a hardlink
     // into the sealed registry, and fetching over it corrupts the app bundle.
@@ -2889,6 +2889,29 @@ fn flip_member(layout: &Layout, channel: &str, program: &str, s: &Staged) -> boo
         return false;
     }
     true
+}
+
+/// `staging/<program>/<asset>` — where a byte-moving row downloads to — or
+/// [`FlowError::VendorRefused`] when `asset` is not one plain file name. Both callers
+/// unlink this path and sweep every `*.part` beside it BEFORE any download, and
+/// `vendor::check_row` holds `https` rows to a bare name but not `github-release` ones:
+/// an absolute asset (`Path::join` replaces the base) or a `..` climb would have a signed
+/// row delete files anywhere the user can write (audit K3, 2026-09-12). Checked on the
+/// path itself, so no protocol lane can reach those deletions with one that escapes.
+fn staged_download_path(layout: &Layout, program: &str, asset: &str) -> Result<PathBuf, FlowError> {
+    let mut comps = Path::new(asset).components();
+    let one_name = matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    );
+    if !one_name || asset.contains('/') || asset.contains('\\') {
+        let mut why = String::from(
+            "asset must be a bare file name inside staging (no separators, not `.`/`..`): ",
+        );
+        why.push_str(asset);
+        return Err(FlowError::VendorRefused(why));
+    }
+    Ok(layout.staging_dir(program).join(asset))
 }
 
 /// Roll a flipped (or partially-flipped) member back to the build it pointed at before this
@@ -3848,6 +3871,73 @@ mod tests {
             "the dir: registry keeps the fail-closed default"
         );
         assert!(!dest.exists(), "a refusal writes nothing");
+    }
+
+    /// A `github-release` row's `asset` is joined onto `staging/<program>/`, and the flow
+    /// unlinks that path and sweeps every `*.part` beside it BEFORE any download. An asset
+    /// that is a PATH — absolute (`Path::join` replaces the base) or climbing with `..` —
+    /// must be refused before either runs, so a signed row can never delete a file outside
+    /// staging (audit K3, 2026-09-12).
+    #[test]
+    fn install_never_unlinks_outside_staging_for_a_release_row() {
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        for label in ["absolute", "climbing"] {
+            let dir = scratch(&format!("release-asset-{label}"));
+            let victim = dir.join("victim");
+            std::fs::create_dir_all(&victim).unwrap();
+            std::fs::write(victim.join("keep.txt"), b"keep").unwrap();
+            std::fs::write(victim.join("other.part"), b"part").unwrap();
+            // `layout(dir)` stages under `dir/prefix/staging/ay/`.
+            let asset = if label == "absolute" {
+                victim.join("keep.txt").to_string_lossy().into_owned()
+            } else {
+                String::from("../../../victim/keep.txt")
+            };
+            let base = fixture(&dir);
+            let sha = "a".repeat(64);
+            let root = "b".repeat(64);
+            let pkg_body = format!(
+                "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
+                 exposes = [\"ay\"]\n\
+                 [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\n\
+                 protocol = \"github-release\"\nasset = \"{asset}\"\n\
+                 sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 1\n\
+                 [artifact.cost]\ndisk_installed = 1\n"
+            );
+            let mut pkg = HashMap::new();
+            pkg.insert(
+                ("ay".to_string(), 18u64),
+                (
+                    pkg_body.clone().into_bytes(),
+                    sign(&RELEASE_SEED, pkg_body.as_bytes()),
+                ),
+            );
+            let fake = Fake {
+                index: base.index,
+                index_sig: base.index_sig,
+                pkg,
+                archives: HashMap::new(),
+            };
+            let err = install(&fake, &layout(&dir), &anchor(), &req, fl(0), 0).unwrap_err();
+            assert!(
+                victim.join("keep.txt").exists(),
+                "{label}: the file named by the asset was unlinked ({err:?})"
+            );
+            assert!(
+                victim.join("other.part").exists(),
+                "{label}: a partial beside it was swept ({err:?})"
+            );
+            assert!(
+                matches!(err, FlowError::VendorRefused(_)),
+                "{label}: refused as a row, not a download: {err:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// THE VENDOR LANE, end to end through the real flow:

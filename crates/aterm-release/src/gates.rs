@@ -244,6 +244,8 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     let gh_account = gh_auth()?;
     locked_metadata_gate(repo)?;
     let trustc = trustc_probe(repo)?;
+    // The compiler runs; now prove it will not tag everything it writes.
+    provenance_gate(&trustc)?;
     let universal = if opts.arm64_only {
         false
     } else {
@@ -747,6 +749,106 @@ pub fn trustc_probe(repo: &Path) -> Result<PathBuf> {
     result
 }
 
+/// The provenance gate: refuse, BEFORE the claim, a cut whose files would all carry
+/// `com.apple.provenance`.
+///
+/// macOS stamps that attribute on every file a provenance-TRACKED process writes, and a
+/// process is tracked when its executable carries the tag or its parent is tracked
+/// (measured 2026-09-12; `atpkg::provenance` has the table). Three things can bring it
+/// into a cut, and this gate checks all three, the way the incident taught:
+///
+/// * the `trustc` the native slice will run — [`trustc_probe`] proved it compiles; its
+///   attribute decides whether every object file, the proof snapshot and the release
+///   artifacts inherit the tag (v0.83.0: the store's `trust/8590` had been seeded from a
+///   tracked shell, and the cut died at tools/proof_snapshot.py's "published proof
+///   snapshot has extended metadata" AFTER the ledger claim — a burned build number);
+/// * the `targo` beside it, which drives that trustc and writes on its own;
+/// * the cutter's own binary — AND, separately, whether this PROCESS is tracked, which
+///   the binary's attribute cannot tell (a clean cutter under a tracked parent — a shell
+///   inside aterm.app, an agent started from a tagged `claude` — is tracked too). That is
+///   MEASURED by writing a probe file and reading the attribute back; `xattr -d` cannot
+///   remove the tag, so nothing this gate could do would fix it, and it says what does.
+///
+/// A path this gate cannot inspect is a refusal, not a pass: the tag's whole failure mode
+/// is being invisible until after the claim.
+pub fn provenance_gate(trustc: &Path) -> Result<()> {
+    let targo = trust_stage2_bin()?.join("targo");
+    let cutter = env::current_exe().and_then(fs::canonicalize).map_err(|e| {
+        Error::new(format!(
+            "provenance gate: cannot resolve the cutter's own binary: {e}"
+        ))
+    })?;
+    let mut carriers: Vec<(&'static str, PathBuf)> = Vec::new();
+    for (label, path) in [
+        ("trustc", trustc.to_path_buf()),
+        ("targo", targo),
+        ("the cutter's own binary", cutter),
+    ] {
+        match atpkg::provenance::xattr_names(&path) {
+            Ok(names)
+                if names
+                    .iter()
+                    .any(|n| n == atpkg::provenance::PROVENANCE_XATTR) =>
+            {
+                carriers.push((label, path));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(Error::new(format!(
+                    "provenance gate: cannot inspect {label} at {} for com.apple.provenance: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    let scratch = env::temp_dir();
+    let tracked = atpkg::provenance::measure_tracked(&scratch).ok_or_else(|| {
+        Error::new(format!(
+            "provenance gate: could not write a probe file under {} to measure whether this \
+             cutter process is provenance-tracked",
+            scratch.display()
+        ))
+    })?;
+    provenance_verdict(&carriers, tracked)
+}
+
+/// The decision behind [`provenance_gate`], without the filesystem: `carriers` are the
+/// `(label, path)` pairs found tagged, `cutter_tracked` is the probe-write measurement.
+/// Clean on both counts passes silently; anything else is the one refusal, naming every
+/// carrier, what the tag does, and the two ways out.
+pub fn provenance_verdict(carriers: &[(&str, PathBuf)], cutter_tracked: bool) -> Result<()> {
+    if carriers.is_empty() && !cutter_tracked {
+        return Ok(());
+    }
+    let mut msg = String::from(
+        "com.apple.provenance would reach every file this cut writes — refusing BEFORE the \
+         claim (after it, a build number is burned):\n",
+    );
+    for (label, path) in carriers {
+        msg.push_str(&format!(
+            "  {label}: {} carries com.apple.provenance\n",
+            path.display()
+        ));
+    }
+    if cutter_tracked {
+        msg.push_str(
+            "  this cutter PROCESS is provenance-tracked: a probe file it wrote came back \
+             tagged — it runs under a tracked parent (a shell inside a tracked aterm.app, or an \
+             agent started from a tagged binary such as a natively installed `claude`), so even \
+             an untagged toolchain would write tagged files from here\n",
+        );
+    }
+    msg.push_str(atpkg::provenance::WHAT_IT_BREAKS);
+    msg.push_str("\nfix:  ");
+    msg.push_str(atpkg::provenance::REMEDY);
+    msg.push_str(
+        "\nor:   with the toolchain clean, run this cut as a launchd job — `launchctl submit \
+         -l aterm-cut -- <path to cargo-ship> ship cut …` — so the cutter is neither a \
+         descendant of aterm.app nor of an agent (docs/RELEASING.md)",
+    );
+    Err(Error::new(msg))
+}
+
 /// The x86_64 compat slice builds on upstream stable (buildplan.rs pins
 /// `RUSTUP_TOOLCHAIN=stable`), so probe STABLE's installed targets — a bare
 /// `rustup target list` would resolve the repo's `trust` toolchain via
@@ -961,5 +1063,116 @@ mod toolchain_pin_tests {
         let after = pin_first_success(&cell, || Ok(PathBuf::from("/seal/beta/bin")))
             .expect("the retry resolves");
         assert_eq!(after, Path::new("/seal/beta/bin"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_gate_tests {
+    use super::*;
+
+    /// Clean toolchain, untracked cutter: silent pass.
+    #[test]
+    fn a_clean_toolchain_under_an_untracked_cutter_passes() {
+        assert!(provenance_verdict(&[], false).is_ok());
+    }
+
+    /// The v0.83.0 shape: a tagged trustc. The refusal names the path, the attribute,
+    /// the post-claim failure it pre-empts, and both remedies.
+    #[test]
+    fn a_tagged_trustc_is_refused_before_the_claim_with_the_remedies() {
+        let trustc = PathBuf::from(
+            "/Users//me/Library/Application Support/aterm/pkg/store/trust/8590/bin/trustc",
+        );
+        let err = provenance_verdict(&[("trustc", trustc.clone())], false)
+            .expect_err("a tagged compiler must not cut");
+        let msg = err.to_string();
+        assert!(msg.contains(&trustc.display().to_string()), "{msg}");
+        assert!(msg.contains("trustc:"), "{msg}");
+        assert!(msg.contains("BEFORE the claim"), "{msg}");
+        assert!(msg.contains("proof_snapshot.py"), "what it breaks: {msg}");
+        assert!(
+            msg.contains("xattr -d"),
+            "why nothing here can fix it: {msg}"
+        );
+        assert!(msg.contains("TRUST_STAGE2_BIN"), "remedy 1: {msg}");
+        assert!(
+            msg.contains("aterm pkg uninstall <program> && aterm pkg install <program>"),
+            "remedy 2: {msg}"
+        );
+        assert!(msg.contains("launchctl submit"), "remedy 3: {msg}");
+        assert!(
+            !msg.contains("cutter PROCESS is provenance-tracked"),
+            "not measured tracked: {msg}"
+        );
+    }
+
+    /// A clean toolchain does not save a tracked cutter process: the tag follows the
+    /// parent too, and the probe write is what shows it.
+    #[test]
+    fn a_tracked_cutter_process_is_refused_even_with_a_clean_toolchain() {
+        let err = provenance_verdict(&[], true).expect_err("a tracked cutter must not cut");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cutter PROCESS is provenance-tracked"),
+            "{msg}"
+        );
+        assert!(msg.contains("probe file"), "{msg}");
+        assert!(msg.contains("launchctl submit"), "{msg}");
+    }
+
+    /// Every carrier is named, in the order checked — the operator should not fix one
+    /// and discover the next.
+    #[test]
+    fn every_carrier_is_named_at_once() {
+        let err = provenance_verdict(
+            &[
+                ("trustc", PathBuf::from("/s/bin/trustc")),
+                ("targo", PathBuf::from("/s/bin/targo")),
+                ("the cutter's own binary", PathBuf::from("/t/cargo-ship")),
+            ],
+            true,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        let a = msg.find("trustc: /s/bin/trustc").expect("trustc named");
+        let b = msg.find("targo: /s/bin/targo").expect("targo named");
+        let c = msg
+            .find("the cutter's own binary: /t/cargo-ship")
+            .expect("cutter named");
+        assert!(a < b && b < c, "{msg}");
+    }
+
+    /// The predicate the gate reads, on a real file with a synthetic attribute: listed
+    /// where set, absent where not, and a missing path is an error (which the gate turns
+    /// into a refusal, never a pass).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_gate_reads_the_attribute_through_listxattr() {
+        let d = env::temp_dir().join(format!("aterm-release-provenance-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let tagged = d.join("trustc");
+        let clean = d.join("targo");
+        fs::write(&tagged, b"x").unwrap();
+        fs::write(&clean, b"x").unwrap();
+        let out = Command::new("/usr/bin/xattr")
+            .args(["-w", "user.aterm.probe", "1"])
+            .arg(&tagged)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            atpkg::provenance::xattr_names(&tagged)
+                .unwrap()
+                .iter()
+                .any(|n| n == "user.aterm.probe")
+        );
+        assert!(!atpkg::provenance::carries(&clean, "user.aterm.probe"));
+        assert!(atpkg::provenance::xattr_names(&d.join("absent")).is_err());
+        let _ = fs::remove_dir_all(&d);
     }
 }

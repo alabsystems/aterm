@@ -33,7 +33,13 @@
 //! INSIDE an aterm session; and [`ensure_rc_sources_hooks`] adds a marker-bounded block
 //! to the user's `~/.zshrc` / `~/.bashrc` / fish config so an ORDINARY interactive shell
 //! — Terminal.app, iTerm, VS Code, ssh, an agent's shell — gets the managed tools too.
-//! It edits only rc files that already exist and never creates one.
+//! It edits only rc files that already exist and never creates one, and it never OPENS
+//! one that resolves under a macOS-protected folder ([`crate::protected`]): the wiring
+//! runs unattended (the six-hourly pass, the first-launch seed), and a dotfiles repo
+//! under `~/Documents` or iCloud Drive reached through a symlinked `~/.zshrc` — or a
+//! symlinked `~/.config` — would otherwise raise the folder consent dialog in aterm's
+//! name with nobody at the screen (2026-09-12, TCC audit). Such an rc is left as it is;
+//! `aterm pkg doctor`'s PATH line is the way in.
 //!
 //! That second half is new. Until it landed, a Terminal.app shell reached managed tools
 //! only via `aterm <tool>` / `atpkg run` or a PATH line the user pasted by hand, which
@@ -194,6 +200,9 @@ const RC_END: &str = "# <<< atpkg shell integration <<<";
 /// * every step is best-effort — wiring PATH must never fail an install.
 #[cfg(unix)]
 fn ensure_rc_sources_hooks(home: &Path) {
+    // Both sides of the protected-root comparison canonical: `$TMPDIR` and a home
+    // reached through a link both spell `/private/…` once resolved.
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     for (rc, hook) in [
         (".zshrc", "00-atpkg.zsh"),
         (".bashrc", "00-atpkg.bash"),
@@ -201,8 +210,39 @@ fn ensure_rc_sources_hooks(home: &Path) {
     ] {
         let rc_path = home.join(rc);
         // Never CREATE an rc: a shell the user does not use should not gain one, and a
-        // file we invent is a file we own forever.
-        let Ok(existing) = fs::read_to_string(&rc_path) else {
+        // file we invent is a file we own forever. `lstat` and `realpath` are
+        // metadata-only (design §1.5) and gated nowhere, so finding out where the rc
+        // really lives costs no consent.
+        if fs::symlink_metadata(&rc_path).is_err() {
+            continue;
+        }
+        // Write to the FILE the rc names, never over a link: a symlinked rc (stow,
+        // yadm/chezmoi, home-manager, a dotfiles repo) renamed over became a detached
+        // 0644 copy the dotfile never saw (2026-09-12, audit K12). Resolved for a
+        // REGULAR rc too: `~/.config` is itself a link in the same setups, and the file
+        // it leads to is the one every call below would open. A dangling link, or
+        // anything that is not a regular file, is left alone.
+        let Ok(real) = fs::canonicalize(&rc_path) else {
+            continue;
+        };
+        // THE CONSENT FENCE (2026-09-12, TCC audit). This runs on the six-hourly pass
+        // and at the first-launch seed, with nobody at the screen. A dotfile that
+        // resolves under `~/Documents`, iCloud Drive or a mounted volume is opened by
+        // the read below, and that open is exactly what raises the macOS folder dialog
+        // — in aterm's name, at a moment nobody chose, parking this pass on a modal
+        // that has no timeout. The rc stays unwired; the owner can wire it by hand from
+        // a shell (a deliberate touch, which may prompt), and `aterm pkg doctor` prints
+        // the PATH line either way.
+        if crate::protected::under_protected_root(&canonical_home, &real) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&real) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(existing) = fs::read_to_string(&real) else {
             continue;
         };
         if existing.contains(RC_BEGIN) {
@@ -225,12 +265,41 @@ fn ensure_rc_sources_hooks(home: &Path) {
              {RC_END}\n"
         ));
         // Same temp+rename discipline the hook files use: a reader never sees a
-        // half-written rc, and a failure leaves the original untouched.
-        let tmp = rc_path.with_extension(format!("atpkg-{}.tmp", std::process::id()));
-        if fs::write(&tmp, next).is_ok() && fs::rename(&tmp, &rc_path).is_err() {
+        // half-written rc, and a failure leaves the original untouched. The temp sits
+        // beside the REAL file (same filesystem, so the rename replaces it and not the
+        // link) and carries its mode, so a 0600 rc stays 0600. A directory we cannot
+        // write (a link into the read-only /nix/store) fails here and changes nothing.
+        let Some(name) = real.file_name() else {
+            continue;
+        };
+        let tmp = real.with_file_name(format!(
+            ".{}.atpkg-{}.tmp",
+            name.to_string_lossy().trim_start_matches('.'),
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp);
+        let written = create_rc_temp(&tmp)
+            .and_then(|mut f| io::Write::write_all(&mut f, next.as_bytes()))
+            .and_then(|()| fs::set_permissions(&tmp, meta.permissions()))
+            .and_then(|()| fs::rename(&tmp, &real));
+        if written.is_err() {
             let _ = fs::remove_file(&tmp);
         }
     }
+}
+
+/// Create the rc rewrite's temp file: exclusively, and born `0600`. It is filled with the
+/// WHOLE rc before the rc's own mode is applied, so a umask-default (usually `0644`)
+/// temp left a `0600` rc's contents readable by other users until that chmod
+/// (2026-09-12, review of audit K12). The real mode is set just before the rename.
+#[cfg(unix)]
+fn create_rc_temp(tmp: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)
 }
 
 /// Put `aterm` and `atpkg` in `~/.local/bin` when we are running from an app bundle.
@@ -283,7 +352,9 @@ fn ensure_command_links(home: &Path) {
     let Some(macos) = exe.parent() else {
         return;
     };
-    let bin = home.join(".local/bin");
+    let Some(bin) = command_links_dir(home) else {
+        return;
+    };
     if fs::create_dir_all(&bin).is_err() {
         return;
     }
@@ -310,6 +381,37 @@ fn ensure_command_links(home: &Path) {
             Err(_) => {}
         }
         let _ = std::os::unix::fs::symlink(&target, &link);
+    }
+}
+
+/// Where the `aterm`/`atpkg` command links go — `~/.local/bin` — or `None` when that
+/// directory RESOLVES under a root macOS guards with a consent dialog (a `~/.local` that
+/// is itself a link into a dotfiles repo under `~/Documents`): creating the directory,
+/// or a link inside it, is a gated write, and [`ensure_command_links`] runs unattended
+/// (the same fence as [`ensure_rc_sources_hooks`]; `crate::protected`).
+///
+/// The nearest EXISTING ancestor decides where a create would land, and `canonicalize`
+/// is metadata-only (design §1.5), so this touches nothing consent-gated itself. A home
+/// that cannot be resolved at all yields the plain path: there is nothing to refuse
+/// against, and `create_dir_all` answers for itself.
+#[cfg(unix)]
+fn command_links_dir(home: &Path) -> Option<std::path::PathBuf> {
+    let bin = home.join(".local/bin");
+    let mut probe = bin.as_path();
+    let real = loop {
+        match fs::canonicalize(probe) {
+            Ok(real) => break real.join(bin.strip_prefix(probe).unwrap_or(Path::new(""))),
+            Err(_) => match probe.parent() {
+                Some(parent) if parent.starts_with(home) => probe = parent,
+                _ => return Some(bin),
+            },
+        }
+    };
+    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if crate::protected::under_protected_root(&canonical_home, &real) {
+        None
+    } else {
+        Some(bin)
     }
 }
 
@@ -402,6 +504,202 @@ mod tests {
         assert_eq!(twice.matches(RC_BEGIN).count(), 1, "exactly one block");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A symlinked rc (GNU stow, yadm/chezmoi symlink mode, home-manager, any dotfiles
+    /// repo) gets the block written THROUGH the link, and stays a link. Until 2026-09-12
+    /// the temp file was renamed over the rc path, which replaces the LINK: `~/.zshrc`
+    /// became a detached regular 0644 copy, the dotfile never got the block, and later
+    /// edits to the dotfiles repo silently stopped reaching the shell (audit K12).
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_writes_through_a_symlinked_rc_and_keeps_it_a_link_and_its_mode() {
+        let home = tmp("rcsymlink");
+        let dot = home.join("dotfiles");
+        fs::create_dir_all(&dot).unwrap();
+        let target = dot.join("zshrc");
+        fs::write(&target, "export FOO=1\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = home.join(".zshrc");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // A dangling link is refused, never replaced by a file of our own.
+        let gone = dot.join("bashrc-not-checked-out");
+        std::os::unix::fs::symlink(&gone, home.join(".bashrc")).unwrap();
+        // A regular 0600 rc keeps its mode across the rewrite.
+        let fish = home.join(".config/fish/config.fish");
+        fs::create_dir_all(fish.parent().unwrap()).unwrap();
+        fs::write(&fish, "set -x FOO 1\n").unwrap();
+        fs::set_permissions(&fish, fs::Permissions::from_mode(0o600)).unwrap();
+
+        ensure_rc_sources_hooks(&home);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rc must stay a symlink"
+        );
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        let through = fs::read_to_string(&target).unwrap();
+        assert!(
+            through.contains(RC_BEGIN),
+            "the block lands in the dotfile: {through}"
+        );
+        assert!(through.starts_with("export FOO=1\n"), "{through}");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a 0600 rc must not widen"
+        );
+        assert!(
+            fs::symlink_metadata(home.join(".bashrc"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+                && !gone.exists(),
+            "a dangling rc link is left exactly as it was"
+        );
+        assert!(fs::read_to_string(&fish).unwrap().contains(RC_BEGIN));
+        assert_eq!(
+            fs::metadata(&fish).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "a regular 0600 rc must not widen either"
+        );
+
+        ensure_rc_sources_hooks(&home);
+        assert_eq!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .matches(RC_BEGIN)
+                .count(),
+            1,
+            "exactly one block through the link"
+        );
+        for dir in [&home, &dot, &fish.parent().unwrap().to_path_buf()] {
+            let strays: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains("atpkg-") && n.ends_with(".tmp"))
+                .collect();
+            assert!(
+                strays.is_empty(),
+                "temp files left in {}: {strays:?}",
+                dir.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// THE CONSENT FENCE. The wiring runs on the six-hourly pass and the first-launch
+    /// seed, and a dotfiles repo commonly lives under `~/Documents` (or iCloud Drive)
+    /// with `~/.zshrc` — or the whole of `~/.config` — symlinked into it. Opening that
+    /// file from an unattended pass raises the macOS folder dialog in aterm's name with
+    /// nobody at the screen (2026-09-12, TCC audit). So an rc that RESOLVES under a
+    /// protected root is left exactly as it was — through a symlinked rc, and through a
+    /// symlinked parent of a regular rc — while an rc beside it that resolves somewhere
+    /// ordinary is still wired.
+    #[cfg(unix)]
+    #[test]
+    fn rc_wiring_never_opens_an_rc_that_resolves_under_a_protected_folder() {
+        let home = tmp("rcprotected");
+        let docs = home.join("Documents").join("dotfiles");
+        fs::create_dir_all(docs.join("config").join("fish")).unwrap();
+        // ~/.zshrc -> ~/Documents/dotfiles/zshrc
+        let zshrc = docs.join("zshrc");
+        fs::write(&zshrc, "export FOO=1\n").unwrap();
+        std::os::unix::fs::symlink(&zshrc, home.join(".zshrc")).unwrap();
+        // ~/.config -> ~/Documents/dotfiles/config, with a REGULAR config.fish inside
+        // it: the rc path itself is not a link, its parent is.
+        let fish = docs.join("config").join("fish").join("config.fish");
+        fs::write(&fish, "set -x FOO 1\n").unwrap();
+        std::os::unix::fs::symlink(docs.join("config"), home.join(".config")).unwrap();
+        // ~/.bashrc -> ~/dotfiles/bashrc: a link into an ORDINARY directory, the control.
+        let plain = home.join("dotfiles");
+        fs::create_dir_all(&plain).unwrap();
+        let bashrc = plain.join("bashrc");
+        fs::write(&bashrc, "export BAR=1\n").unwrap();
+        std::os::unix::fs::symlink(&bashrc, home.join(".bashrc")).unwrap();
+
+        ensure_rc_sources_hooks(&home);
+
+        assert_eq!(
+            fs::read_to_string(&zshrc).unwrap(),
+            "export FOO=1\n",
+            "an rc reached through a link into Documents is left exactly as it was"
+        );
+        assert_eq!(
+            fs::read_to_string(&fish).unwrap(),
+            "set -x FOO 1\n",
+            "a regular rc under a symlinked ~/.config that resolves into Documents too"
+        );
+        assert!(
+            fs::read_to_string(&bashrc).unwrap().contains(RC_BEGIN),
+            "the control: a link into an ordinary directory is still wired"
+        );
+        // Nothing was written anywhere under the protected root — not even a temp.
+        let mut stack = vec![home.join("Documents")];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                assert!(!name.contains("atpkg"), "wrote {name:?} under Documents");
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The same fence for the command links: `~/.local/bin` is created and written on
+    /// every pass, and a `~/.local` that is itself a link into a dotfiles repo under a
+    /// protected root would make that create the gated write.
+    #[cfg(unix)]
+    #[test]
+    fn command_links_stay_out_of_a_protected_local_bin() {
+        let home = tmp("cmdlinks");
+        // Ordinary: nothing exists yet — the directory would be created under $HOME.
+        assert_eq!(command_links_dir(&home), Some(home.join(".local/bin")));
+        // Ordinary: ~/.local is a real directory.
+        fs::create_dir_all(home.join(".local")).unwrap();
+        assert_eq!(command_links_dir(&home), Some(home.join(".local/bin")));
+        fs::remove_dir_all(home.join(".local")).unwrap();
+        // ~/.local -> ~/Documents/dotlocal: a create under it would land in Documents.
+        let dot = home.join("Documents").join("dotlocal");
+        fs::create_dir_all(&dot).unwrap();
+        std::os::unix::fs::symlink(&dot, home.join(".local")).unwrap();
+        assert_eq!(
+            command_links_dir(&home),
+            None,
+            "refused: resolves under Documents"
+        );
+        // …and once bin/ exists inside it, still refused.
+        fs::create_dir_all(dot.join("bin")).unwrap();
+        assert_eq!(command_links_dir(&home), None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// The rc rewrite's temp holds the WHOLE rc before its real mode is applied, so it is
+    /// born 0600: created with the umask default (0644 under the usual 022) it left a
+    /// 0600 rc's contents readable by other users until the chmod that followed
+    /// (2026-09-12, review of audit K12). Observed at creation, before any write or chmod.
+    #[cfg(unix)]
+    #[test]
+    fn rc_temp_is_never_created_wider_than_0600() {
+        let dir = tmp("rctemp");
+        let path = dir.join(".zshrc.atpkg-1.tmp");
+        let f = create_rc_temp(&path).unwrap();
+        assert_eq!(
+            f.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the temp must be private from the instant it exists"
+        );
+        drop(f);
+        assert!(
+            create_rc_temp(&path).is_err(),
+            "exclusive: an existing temp is never opened and truncated"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
